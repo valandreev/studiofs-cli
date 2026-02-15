@@ -9,16 +9,15 @@ studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
 studiofs-cache.workspace = true
 studiofs-data.workspace = true
-winfsp = { version = "0.12", features = ["windows-62"] }
-winfsp-sys = "0.12"
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 
-[dependencies.windows]
-version = "0.62"
-features = ["Win32_Foundation"]
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.12", features = ["windows-62"] }
+winfsp-sys = "0.12"
+windows = { version = "0.62", features = ["Win32_Foundation"] }
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 winfsp = { workspace = true }

@@ -6,7 +6,7 @@ members = [
     "crates/studiofs-cache",
     "crates/studiofs-vfs",
     "crates/studiofs-fuse",
-    "crates/studiofs-winfsp", "debug_probe",
+    "crates/studiofs-winfsp",
 ]
 resolver = "3"
 

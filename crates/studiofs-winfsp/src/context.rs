@@ -1,17 +1,18 @@
+#![cfg(windows)]
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use studiofs_meta::{FileType, InodeAttr, Ino, ROOT_INO};
+use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
-use winfsp::filesystem::*;
-use winfsp::U16CStr;
-use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::Foundation::NTSTATUS;
+use winfsp::U16CStr;
+use winfsp::filesystem::*;
+use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -51,8 +52,8 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     info.allocation_size = (attr.size + 4095) & !4095;
 
     info.file_attributes = match attr.kind {
-        FileType::Directory => 0x10,  // FILE_ATTRIBUTE_DIRECTORY
-        _ => 0x80,                     // FILE_ATTRIBUTE_NORMAL
+        FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
+        _ => 0x80,                   // FILE_ATTRIBUTE_NORMAL
     };
 
     // Convert timestamps (seconds since epoch → Windows FILETIME)
@@ -244,7 +245,8 @@ impl FileSystemContext for StudioFsContext {
 
         debug!(
             ino = attr.ino,
-            is_dir, "create {:?}",
+            is_dir,
+            "create {:?}",
             file_name.to_string_lossy()
         );
         Ok(StudioFileHandle::new(attr.ino, is_dir))
@@ -378,12 +380,7 @@ impl FileSystemContext for StudioFsContext {
         Ok(cursor)
     }
 
-    fn cleanup(
-        &self,
-        context: &Self::FileContext,
-        _file_name: Option<&U16CStr>,
-        _flags: u32,
-    ) {
+    fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, _flags: u32) {
         // Clear cached dir entries
         *context.dir_entries.lock() = None;
     }
@@ -472,7 +469,7 @@ impl FileSystemContext for StudioFsContext {
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         out_volume_info.total_size = 1024 * 1024 * 1024 * 1024; // 1 TB
-        out_volume_info.free_size = 1024 * 1024 * 1024 * 512;   // 512 GB
+        out_volume_info.free_size = 1024 * 1024 * 1024 * 512; // 512 GB
         out_volume_info.set_volume_label("StudioFS");
         Ok(())
     }

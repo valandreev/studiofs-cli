@@ -8,7 +8,7 @@ use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use studiofs_meta::{FileType, Ino, ROOT_INO};
+use studiofs_meta::FileType;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
