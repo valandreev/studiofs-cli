@@ -1,0 +1,16 @@
+[package]
+name = "studiofs-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+studiofs-meta.workspace = true
+studiofs-data.workspace = true
+studiofs-cache.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true

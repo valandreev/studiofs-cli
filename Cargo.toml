@@ -1,0 +1,70 @@
+[workspace]
+members = [
+    "crates/studiofs",
+    "crates/studiofs-meta",
+    "crates/studiofs-data",
+    "crates/studiofs-cache",
+    "crates/studiofs-vfs",
+    "crates/studiofs-fuse",
+    "crates/studiofs-winfsp",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+repository = "https://github.com/user/studiofs"
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Storage
+opendal = { version = "0.51", features = ["services-s3"] }
+
+# Metadata
+redb = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Bytes
+bytes = "1"
+
+# Cache
+lru = "0.12"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Platform - FUSE (Linux/macOS)
+fuser = "0.15"
+
+# Platform - WinFSP (Windows)
+winfsp = "0.5"
+
+# Utils
+parking_lot = "0.12"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+
+# Internal crates
+studiofs-meta = { path = "crates/studiofs-meta" }
+studiofs-data = { path = "crates/studiofs-data" }
+studiofs-cache = { path = "crates/studiofs-cache" }
+studiofs-vfs = { path = "crates/studiofs-vfs" }
+studiofs-fuse = { path = "crates/studiofs-fuse" }
+studiofs-winfsp = { path = "crates/studiofs-winfsp" }

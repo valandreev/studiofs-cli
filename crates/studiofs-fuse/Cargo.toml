@@ -1,0 +1,12 @@
+[package]
+name = "studiofs-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+studiofs-vfs.workspace = true
+fuser.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

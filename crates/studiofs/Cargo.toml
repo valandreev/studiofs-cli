@@ -1,0 +1,30 @@
+[package]
+name = "studiofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "studiofs"
+path = "src/main.rs"
+
+[dependencies]
+studiofs-meta.workspace = true
+studiofs-data.workspace = true
+studiofs-cache.workspace = true
+studiofs-vfs.workspace = true
+
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+# TODO: re-enable when winfsp bindgen issue is resolved
+# [target.'cfg(unix)'.dependencies]
+# studiofs-fuse.workspace = true
+
+# [target.'cfg(windows)'.dependencies]
+# studiofs-winfsp.workspace = true

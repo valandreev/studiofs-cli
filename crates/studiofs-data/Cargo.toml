@@ -1,0 +1,14 @@
+[package]
+name = "studiofs-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+studiofs-meta.workspace = true
+opendal.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
