@@ -17,13 +17,13 @@ const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("setti
 /// Counters: counter_name -> u64 (as bytes)
 const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
 
-/// Inodes: ino (u64) -> InodeAttr (bincode)
+/// Inodes: ino (u64) -> InodeAttr (postcard)
 const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes");
 
-/// Directory entries: (parent_ino, name) as bytes -> DirEntryValue (bincode)
+/// Directory entries: (parent_ino, name) as bytes -> DirEntryValue (postcard)
 const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dentries");
 
-/// Chunks: (ino, chunk_index) as bytes -> Vec<Slice> (bincode)
+/// Chunks: (ino, chunk_index) as bytes -> Vec<Slice> (postcard)
 const CHUNKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
 
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
@@ -61,14 +61,14 @@ fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
 }
 
-// ─── Bincode helpers ─────────────────────────────────────────────────────────
+// ─── Postcard helpers ────────────────────────────────────────────────────────
 
-fn bincode_encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
-    bincode::serialize(val).map_err(|e| MetaError::Serialization(e.to_string()))
+fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
+    postcard::to_stdvec(val).map_err(|e| MetaError::Serialization(e.to_string()))
 }
 
-fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
-    bincode::deserialize(bytes).map_err(|e| MetaError::Serialization(e.to_string()))
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
+    postcard::from_bytes(bytes).map_err(|e| MetaError::Serialization(e.to_string()))
 }
 
 // ─── RedbMetaEngine ──────────────────────────────────────────────────────────
@@ -268,11 +268,11 @@ impl MetaEngine for RedbMetaEngine {
             .get(ino)
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::InodeNotFound(ino))?;
-        bincode_decode(entry.value())
+        decode(entry.value())
     }
 
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
-        let data = bincode_encode(attr)?;
+        let data = encode(attr)?;
         let txn = self
             .db
             .begin_write()
@@ -326,7 +326,7 @@ impl MetaEngine for RedbMetaEngine {
                 parent,
                 name: String::from_utf8_lossy(name).to_string(),
             })?;
-        bincode_decode(entry.value())
+        decode(entry.value())
     }
 
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
@@ -358,7 +358,7 @@ impl MetaEngine for RedbMetaEngine {
             if decoded_parent != parent {
                 break;
             }
-            let entry_val: DirEntryValue = bincode_decode(value.value())?;
+            let entry_val: DirEntryValue = decode(value.value())?;
             entries.push(DirEntry {
                 name: name.to_vec(),
                 ino: entry_val.ino,
@@ -371,7 +371,7 @@ impl MetaEngine for RedbMetaEngine {
 
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        let data = bincode_encode(entry)?;
+        let data = encode(entry)?;
         let txn = self
             .db
             .begin_write()
@@ -420,7 +420,7 @@ impl MetaEngine for RedbMetaEngine {
                     parent,
                     name: String::from_utf8_lossy(name).to_string(),
                 })?;
-            entry_val = bincode_decode(removed.value())?;
+            entry_val = decode(removed.value())?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -442,7 +442,7 @@ impl MetaEngine for RedbMetaEngine {
             .get(encoded_key.as_slice())
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
-            Some(entry) => bincode_decode(entry.value()),
+            Some(entry) => decode(entry.value()),
             None => Ok(Vec::new()),
         }
     }
@@ -462,12 +462,12 @@ impl MetaEngine for RedbMetaEngine {
                 .get(encoded_key.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
-                Some(entry) => bincode_decode(entry.value())?,
+                Some(entry) => decode(entry.value())?,
                 None => Vec::new(),
             };
             slices.push(slice.clone());
 
-            let data = bincode_encode(&slices)?;
+            let data = encode(&slices)?;
             table
                 .insert(encoded_key.as_slice(), data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -479,7 +479,7 @@ impl MetaEngine for RedbMetaEngine {
 
     fn set_chunk_slices(&self, key: &ChunkKey, slices: &[Slice]) -> MetaResult<()> {
         let encoded_key = encode_chunk_key(key);
-        let data = bincode_encode(&slices.to_vec())?;
+        let data = encode(&slices.to_vec())?;
         let txn = self
             .db
             .begin_write()
