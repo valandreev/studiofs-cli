@@ -61,7 +61,7 @@ pub fn run(
         .unwrap_or_else(|| meta_dir.join("cache"));
 
     // Create VFS
-    let _vfs = Arc::new(StudioVfs::new(
+    let vfs = Arc::new(StudioVfs::new(
         meta.clone(),
         data.clone(),
         mem_cache.clone(),
@@ -71,13 +71,26 @@ pub fn run(
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
 
-    // TODO: Start platform-specific FUSE mount
-    // On Windows: use studiofs-winfsp
-    // On Unix: use studiofs-fuse
-    info!("FUSE mount not yet implemented — VFS is ready");
-    println!();
-    println!("⚠ FUSE mount is not yet implemented. VFS layer is ready.");
-    println!("  The init/metadata/data layers are functional.");
+    // Create a tokio runtime for async ops in FUSE callbacks
+    let rt = Arc::new(
+        tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?,
+    );
+
+    // Start platform-specific FUSE mount
+    #[cfg(windows)]
+    {
+        info!("starting WinFSP mount at {mount_point}");
+        studiofs_winfsp::mount_and_serve(vfs, rt, mount_point, &format_info.name)
+            .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
+    }
+
+    #[cfg(unix)]
+    {
+        info!("starting FUSE mount at {mount_point}");
+        studiofs_fuse::mount_and_serve(vfs, rt, mount_point)
+            .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
+    }
 
     Ok(())
 }

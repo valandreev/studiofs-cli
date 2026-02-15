@@ -6,7 +6,12 @@ license.workspace = true
 
 [dependencies]
 studiofs-vfs.workspace = true
+studiofs-meta.workspace = true
+studiofs-cache.workspace = true
+studiofs-data.workspace = true
 fuser.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true

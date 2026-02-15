@@ -54,7 +54,7 @@ anyhow = "1"
 fuser = "0.15"
 
 # Platform - WinFSP (Windows)
-winfsp = "0.5"
+winfsp = "0.12"
 
 # Utils
 parking_lot = "0.12"

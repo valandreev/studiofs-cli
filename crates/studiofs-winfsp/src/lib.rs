@@ -1,6 +1,74 @@
 //! StudioFS WinFSP backend for Windows.
 //!
-//! Uses `winfsp-rs` crate to expose StudioVfs as a Windows drive.
+//! Implements `winfsp::filesystem::FileSystemContext` to expose the VFS
+//! as a Windows drive letter via the WinFSP (Windows File System Proxy) driver.
 
-// This crate only compiles on Windows.
-// On Linux/macOS, studiofs-fuse is used instead.
+mod context;
+
+pub use context::StudioFsContext;
+
+/// Start the WinFSP filesystem, mount, and block until unmounted.
+pub fn mount_and_serve(
+    vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
+    rt: std::sync::Arc<tokio::runtime::Runtime>,
+    mount_point: &str,
+    _volume_label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use winfsp::host::{FileSystemHost, VolumeParams};
+
+    let mut volume_params = VolumeParams::new();
+    volume_params.case_sensitive_search(true);
+    volume_params.case_preserved_names(true);
+    volume_params.unicode_on_disk(true);
+    volume_params.persistent_acls(false);
+    volume_params.reparse_points(false);
+    volume_params.named_streams(false);
+    volume_params.read_only_volume(false);
+    volume_params.post_cleanup_when_modified_only(true);
+    volume_params.sector_size(512);
+    volume_params.sectors_per_allocation_unit(1);
+    volume_params.max_component_length(255);
+    volume_params.volume_serial_number(0x5354_4644); // "STFD"
+    volume_params.filesystem_name("StudioFS");
+
+    let context = StudioFsContext::new(vfs, rt);
+
+    let mut host = FileSystemHost::new(volume_params, context)?;
+    host.mount(mount_point)?;
+
+    tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
+    host.start()?;
+
+    // Block until Ctrl+C
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    *SHUTDOWN_TX.lock().unwrap() = Some(tx);
+    unsafe {
+        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+    }
+    let _ = rx.recv(); // blocks
+
+    tracing::info!("unmounting StudioFS from {mount_point}");
+    host.stop();
+    host.unmount();
+
+    Ok(())
+}
+
+static SHUTDOWN_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+}
+
+unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+    if let Ok(guard) = SHUTDOWN_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(());
+        }
+    }
+    1 // TRUE — handled
+}
