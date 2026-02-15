@@ -23,10 +23,10 @@ async-trait = "0.1"
 futures = "0.3"
 
 # Storage
-opendal = { version = "0.51", features = ["services-s3"] }
+opendal = { version = "0.55", features = ["services-s3"] }
 
 # Metadata
-redb = "2"
+redb = "3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -44,14 +44,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 
 # Cache
-lru = "0.12"
+lru = "0.16"
 
 # Error handling
 thiserror = "2"
 anyhow = "1"
 
 # Platform - FUSE (Linux/macOS)
-fuser = "0.15"
+fuser = "0.16"
+libc = "0.2"
 
 # Platform - WinFSP (Windows)
 winfsp = "0.12"

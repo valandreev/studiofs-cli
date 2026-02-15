@@ -4,7 +4,7 @@
 
 use crate::engine::*;
 use crate::types::*;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::debug;
