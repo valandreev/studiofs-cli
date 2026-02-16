@@ -27,3 +27,7 @@ studiofs-fuse.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 studiofs-winfsp.workspace = true
+winreg = "0.55"
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp.workspace = true
