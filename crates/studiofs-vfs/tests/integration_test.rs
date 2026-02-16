@@ -11,6 +11,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
+use studiofs_cache::disk::DiskCache;
 use studiofs_cache::memory::MemoryCache;
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::RedbMetaEngine;
@@ -35,7 +36,16 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> StudioVfs {
 
     let mem_cache = MemoryCache::new(64 * 1024 * 1024); // 64 MiB
 
-    StudioVfs::new(Arc::new(meta), Arc::new(data), Arc::new(mem_cache))
+    let cache_dir = tmp.path().join("cache");
+    let disk_cache =
+        DiskCache::new(&cache_dir, 1024 * 1024 * 1024).expect("failed to create DiskCache");
+
+    StudioVfs::new(
+        Arc::new(meta),
+        Arc::new(data),
+        Arc::new(mem_cache),
+        Arc::new(disk_cache),
+    )
 }
 
 /// Ensure the test bucket exists.
