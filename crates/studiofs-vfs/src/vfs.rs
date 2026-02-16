@@ -63,6 +63,8 @@ pub struct StudioVfs {
     // Using a simple mutex for now. In a real system, this should be more granular/concurrent.
     // For now, let's wrap the whole map in a Mutex.
     pending_writes: Arc<tokio::sync::Mutex<std::collections::HashMap<(Ino, u32, u32), BytesMut>>>,
+    // Notify background uploader when new slices are pending
+    upload_notify: Arc<tokio::sync::Notify>,
 }
 
 impl StudioVfs {
@@ -79,6 +81,7 @@ impl StudioVfs {
             mem_cache,
             disk_cache,
             pending_writes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            upload_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -474,18 +477,12 @@ impl StudioVfs {
         // JuiceFS: "Block is basic storage unit... 4MiB default"
         // If we have < 4MiB (eof), we still upload.
         
-        // Upload to S3
-        // Note: block_idx passed to put_block is effectively 0 for this new slice?
-        // Wait, `slice` has `pos`. `put_block` uses (slice_id, block_index).
-        // If we make a NEW slice for *just this block*, then inside that slice:
-        // - slice size = data.len()
-        // - it has 1 block (index 0) if len <= 4MB.
-        // - Wait, `put_block` takes `block_index`. 
-        // If this slice corresponds to a 4MB range in file, it is ONE block.
-        // So for this slice_id, we put block_index=0.
-        
-        self.data.put_block(slice_id, 0, Bytes::copy_from_slice(data)).await?;
+        // Writeback: write to disk cache, mark as pending, defer S3 upload.
         self.disk_cache.put(slice_id, 0, data)?;
+        self.meta.add_pending_slice(slice_id)?;
+
+        // Notify background uploader
+        self.upload_notify.notify_one();
 
         // Update Chunk Metadata
         let chunk_key = ChunkKey::new(ino, chunk_idx);
@@ -503,6 +500,69 @@ impl StudioVfs {
         self.meta.append_chunk_slice(&chunk_key, &slice)?;
         
         debug!(ino, chunk_idx, block_idx, len=data.len(), "flushed block");
+        Ok(())
+    }
+
+    // ─── Background Tasks ────────────────────────────────────────────────────────
+
+    /// Spawn the background uploader task.
+    ///
+    /// This should be called once after creating the VFS.
+    pub fn spawn_background_uploader(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                // Wait for notification or timeout (to retry failed uploads)
+                let notify = self.upload_notify.notified();
+                tokio::select! {
+                    _ = notify => {},
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {},
+                }
+
+                // Process pending slices
+                // We use a pragmatic approach: fetch all, process one by one.
+                // In a real system, we'd want a more sophisticated queue.
+                match self.meta.get_pending_slices() {
+                    Ok(slices) => {
+                        for slice_id in slices {
+                            if let Err(e) = self.process_pending_slice(slice_id).await {
+                                tracing::error!("failed to upload slice {}: {}", slice_id, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to get pending slices: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Process a single pending slice: read from disk -> upload to S3 -> remove pending.
+    async fn process_pending_slice(&self, slice_id: u64) -> VfsResult<()> {
+        // Read from disk cache (expect full block)
+        // We use block_idx 0 because we treat each slice as a single block for now (upto 4MB).
+        // Larger slices would need iteration, but our write path enforces 4MB blocks.
+        let data = self.disk_cache.get(slice_id, 0, BLOCK_SIZE)?;
+        
+        if let Some(bytes) = data {
+            // Upload to S3
+            self.data.put_block(slice_id, 0, Bytes::copy_from_slice(&bytes)).await?;
+            // Mark as uploaded
+            self.meta.remove_pending_slice(slice_id)?;
+            info!("background upload complete: slice {}", slice_id);
+        } else {
+             // Slice not found in disk cache?
+             // This is bad. It means we lost data or it wasn't written correctly.
+             // Or maybe it was evicted? (Should not evict dirty slices!)
+             // For now, log error. Recovery is hard if data is gone from disk.
+             tracing::error!("integrity error: pending slice {} not found in disk cache", slice_id);
+             // Should we remove it from pending checking S3?
+             // If it's not on disk, maybe it IS on S3 already?
+             if self.data.get_block(slice_id, 0, BLOCK_SIZE).await.is_ok() {
+                 self.meta.remove_pending_slice(slice_id)?;
+                 tracing::warn!("slice {} was missing from disk but found on S3, recovered", slice_id);
+             }
+        }
         Ok(())
     }
 }

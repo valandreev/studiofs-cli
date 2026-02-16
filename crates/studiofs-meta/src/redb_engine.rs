@@ -26,6 +26,9 @@ const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dent
 /// Chunks: (ino, chunk_index) as bytes -> Vec<Slice> (postcard)
 const CHUNKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
 
+/// Pending Slices: slice_id (u64) -> () (unit)
+const PENDING_SLICES: TableDefinition<u64, ()> = TableDefinition::new("pending_slices");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -94,6 +97,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(CHUNKS_TABLE);
+            let _ = txn.open_table(PENDING_SLICES);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -560,6 +564,64 @@ impl MetaEngine for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(id)
+    }
+
+    // ─── Pending Slices (Writeback) ──────────────────────────────────────
+
+    fn add_pending_slice(&self, slice_id: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_SLICES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(slice_id, ())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_pending_slice(&self, slice_id: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_SLICES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .remove(slice_id)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_pending_slices(&self) -> MetaResult<Vec<u64>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(PENDING_SLICES)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        
+        // Iterate all keys
+        let slices: Vec<u64> = table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value())
+            .collect();
+        
+        Ok(slices)
     }
 }
 

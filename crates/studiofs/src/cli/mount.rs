@@ -87,6 +87,13 @@ pub fn run(
             .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?,
     );
 
+    // Spawn background tasks
+    {
+        let vfs = vfs.clone();
+        let _guard = rt.enter();
+        vfs.spawn_background_uploader();
+    }
+
     // Start platform-specific FUSE mount
     #[cfg(windows)]
     {

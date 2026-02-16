@@ -107,6 +107,17 @@ pub trait MetaEngine: Send + Sync {
     /// Allocate a new globally unique slice ID.
     fn next_slice_id(&self) -> MetaResult<u64>;
 
+    // ─── Pending Slices (Writeback) ──────────────────────────────────────
+
+    /// Mark a slice as pending upload.
+    fn add_pending_slice(&self, slice_id: u64) -> MetaResult<()>;
+
+    /// Remove a slice from pending list (after successful upload).
+    fn remove_pending_slice(&self, slice_id: u64) -> MetaResult<()>;
+
+    /// Get all pending slices.
+    fn get_pending_slices(&self) -> MetaResult<Vec<u64>>;
+
     // ─── High-Level Operations ───────────────────────────────────────────
 
     /// Create a new file: allocate inode, set attrs, add dentry.
