@@ -126,10 +126,6 @@ EXAMPLES:
   MinIO (local):
     studiofs init dev --endpoint http://127.0.0.1:9000 \\
       --bucket test-bucket --access-key minioadmin --secret-key minioadmin
-
-  Custom metadata directory:
-    studiofs init myvolume --endpoint https://s3.example.com \\
-      --bucket data --access-key KEY --secret-key SECRET --meta-dir /var/lib/studiofs
 ")]
     Init {
         /// Volume name (used as S3 key prefix — must be unique per bucket)
@@ -154,10 +150,6 @@ EXAMPLES:
         /// S3 region (defaults to us-east-1 for MinIO compatibility)
         #[arg(long, default_value = "")]
         region: String,
-
-        /// Directory to store the metadata database
-        #[arg(long, default_value = ".studiofs")]
-        meta_dir: PathBuf,
     },
 
     /// Mount a filesystem volume as a local drive
@@ -191,9 +183,6 @@ SIZE FORMATS:
         /// Mount point: drive letter on Windows (Z:), directory path on Unix (/mnt/studio)
         mount_point: String,
 
-        /// Path to metadata database directory
-        #[arg(long, default_value = ".studiofs")]
-        meta_dir: PathBuf,
 
         /// Disk cache directory (defaults to <meta-dir>/cache)
         #[arg(long)]
@@ -216,15 +205,10 @@ SIZE FORMATS:
     #[command(after_help = "\
 EXAMPLES:
   studiofs status myvolume
-  studiofs status myvolume --meta-dir /var/lib/studiofs
 ")]
     Status {
         /// Volume name
         name: String,
-
-        /// Path to metadata database directory
-        #[arg(long, default_value = ".studiofs")]
-        meta_dir: PathBuf,
     },
 }
 
@@ -252,8 +236,8 @@ fn main() -> anyhow::Result<()> {
             access_key,
             secret_key,
             region,
-            meta_dir,
         } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::init::run(
                 &name,
                 &endpoint,
@@ -267,12 +251,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Mount {
             name,
             mount_point,
-            meta_dir,
             cache_dir,
             cache_size,
             memory_limit,
             foreground,
         } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::mount::run(
                 &name,
                 &mount_point,
@@ -283,7 +267,8 @@ fn main() -> anyhow::Result<()> {
                 foreground,
             )?;
         }
-        Commands::Status { name, meta_dir } => {
+        Commands::Status { name } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::status::run(&name, &meta_dir)?;
         }
     }

@@ -166,6 +166,16 @@ impl DataStore {
         Ok(self.op.exists(&key).await?)
     }
 
+    /// Check if the storage backend is accessible and the bucket exists.
+    pub async fn check(&self) -> DataResult<()> {
+        self.op.check().await.map_err(DataError::from)
+    }
+
+    /// Check if a specific path exists (can be used to check bucket access).
+    pub async fn exists(&self, path: &str) -> DataResult<bool> {
+        self.op.exists(path).await.map_err(DataError::from)
+    }
+
     /// Get the underlying operator (for advanced use).
     pub fn operator(&self) -> &Operator {
         &self.op

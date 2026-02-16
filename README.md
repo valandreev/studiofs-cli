@@ -134,8 +134,7 @@ studiofs init my-volume \
   --bucket my-bucket \
   --access-key AKIAIOSFODNN7EXAMPLE \
   --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
-  --region us-east-1 \
-  --meta-dir ./.studiofs
+  --region us-east-1
 ```
 
 **Output:**
@@ -144,7 +143,7 @@ studiofs init my-volume \
   UUID:     a1b2c3d4-e5f6-...
   Endpoint: https://s3.amazonaws.com
   Bucket:   my-bucket
-  Metadata: ".studiofs/my-volume.db"
+  Metadata: "~/.studiofs/meta/my-volume/my-volume.db"
 
 Run `studiofs mount my-volume <mount-point>` to mount.
 ```
@@ -159,7 +158,6 @@ Run `studiofs mount my-volume <mount-point>` to mount.
 | `--access-key` | ✅ | — | S3 access key ID |
 | `--secret-key` | ✅ | — | S3 secret access key |
 | `--region` | ❌ | `""` | AWS region (auto-defaults to `us-east-1` for MinIO) |
-| `--meta-dir` | ❌ | `.studiofs` | Directory to store the metadata database |
 
 > **Note:** The S3 bucket must already exist — `studiofs init` does **not** create it.
 
@@ -170,14 +168,14 @@ Run `studiofs mount my-volume <mount-point>` to mount.
 #### Windows
 Mount to a drive letter:
 ```powershell
-studiofs mount my-volume Z: --meta-dir ./.studiofs
+studiofs mount my-volume Z:
 ```
 
 #### Linux / macOS
 Mount to a directory (must exist):
 ```bash
 mkdir -p /mnt/studio
-studiofs mount my-volume /mnt/studio --meta-dir ./.studiofs
+studiofs mount my-volume /mnt/studio
 ```
 
 **Output:**
@@ -195,7 +193,6 @@ The process blocks while the filesystem is mounted. Press `Ctrl+C` to unmount.
 |------|---------|-------------|
 | `<name>` | — | Volume name (must be initialized) |
 | `<mount-point>` | — | Drive letter (Windows) or path (Unix) |
-| `--meta-dir` | `.studiofs` | Path to metadata database directory |
 | `--cache-dir` | `<meta-dir>/cache` | Path to disk cache directory |
 | `--cache-size` | `100GB` | Max disk cache size (`KB`, `MB`, `GB`, `TB`) |
 | `--memory-limit` | `1GB` | Max in-memory cache size (`KB`, `MB`, `GB`, `TB`) |
@@ -207,7 +204,7 @@ The process blocks while the filesystem is mounted. Press `Ctrl+C` to unmount.
 ### 3. Check Volume Status
 
 ```bash
-studiofs status my-volume --meta-dir ./.studiofs
+studiofs status my-volume
 ```
 
 **Output:**
@@ -225,7 +222,7 @@ StudioFS Volume Status
   Used space: 1073741824 bytes
   Next inode: 43
   Next slice: 128
-  Metadata:   ".studiofs/my-volume.db"
+  Metadata:   "~/.studiofs/meta/my-volume/my-volume.db"
 ```
 
 ---
