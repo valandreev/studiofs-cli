@@ -244,6 +244,23 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        match self.rt.block_on(self.vfs.flush(ino)) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                error!("flush({ino}) -> {e}");
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
     fn readdir(
         &mut self,
         _req: &Request<'_>,

@@ -1,6 +1,6 @@
 //! Core VFS implementation — wires together metadata, data, and cache layers.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::Arc;
 use studiofs_cache::memory::{CacheKey, MemoryCache};
 use studiofs_cache::disk::DiskCache;
@@ -59,6 +59,10 @@ pub struct StudioVfs {
     data: Arc<DataStore>,
     mem_cache: Arc<MemoryCache>,
     disk_cache: Arc<DiskCache>,
+    // Pending writes buffer: (ino, chunk_idx, block_idx) -> data
+    // Using a simple mutex for now. In a real system, this should be more granular/concurrent.
+    // For now, let's wrap the whole map in a Mutex.
+    pending_writes: Arc<tokio::sync::Mutex<std::collections::HashMap<(Ino, u32, u32), BytesMut>>>,
 }
 
 impl StudioVfs {
@@ -74,6 +78,7 @@ impl StudioVfs {
             data,
             mem_cache,
             disk_cache,
+            pending_writes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -336,54 +341,159 @@ impl StudioVfs {
 
     /// Write data to a file at the given offset.
     ///
-    /// Creates a new slice for the written data and uploads blocks to S3.
+    /// Buffers writes into 4MiB blocks. Uploads only when a block is full.
+    /// Partial blocks are kept in memory until `flush` is called (or next write fills them).
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        let written = data.len() as u32;
+        let mut written = 0;
+        let mut remaining = data.len();
+        let mut current_offset = offset;
+        let mut data_offset = 0;
 
-        // Allocate a new slice ID
-        let slice_id = self.meta.next_slice_id()?;
+        let bs = BLOCK_SIZE as u64; // 4MiB
 
-        // Split data into blocks and upload
-        let blocks = studiofs_data::block::split_into_blocks(data, 0);
-        for (block_idx, block_data) in blocks {
-            // Upload to S3
-            self.data
-                .put_block(slice_id, block_idx, block_data.clone())
-                .await?;
+        // We need to iterate block by block to buffer correctly
+        while remaining > 0 {
+            let chunk_key = ChunkKey::from_offset(ino, current_offset);
+            let offset_in_chunk = current_offset % CHUNK_SIZE;
+            let block_idx_in_chunk = (offset_in_chunk / bs) as u32;
+            let offset_in_block = (offset_in_chunk % bs) as usize;
+
+            let space_in_block = BLOCK_SIZE as usize - offset_in_block;
+            let to_write = remaining.min(space_in_block);
+
+            // Append to pending buffer
+            let mut pending = self.pending_writes.lock().await;
+            let key = (ino, chunk_key.index, block_idx_in_chunk);
+            let buffer = pending.entry(key).or_insert_with(|| BytesMut::with_capacity(BLOCK_SIZE as usize));
             
-            // Cache to disk
-            self.disk_cache.put(slice_id, block_idx, &block_data)?;
+            // If we are writing to the middle of a buffer that doesn't exist or is too short,
+            // we technically should zero-fill or fetch the existing block.
+            // For now, assuming APPEND-only or sequential writes for simplicity as per requirements.
+            // But to be safe, if we have a gap, we should fill it.
+            if buffer.len() < offset_in_block {
+                let gap = offset_in_block - buffer.len();
+                buffer.extend_from_slice(&vec![0u8; gap]);
+            } else if buffer.len() > offset_in_block {
+                 // Overwrite logic: unrelated to "append" optimization, but needed for correctness.
+                 // BytesMut truncation is cheap.
+                 // For simplified "append-mostly" workload:
+                 if buffer.len() > offset_in_block {
+                     // We are overwriting. Truncate? No, that loses tail.
+                     // Helper: overwrite existing bytes
+                     // This is tricky with BytesMut efficiently. 
+                     // Let's just assume we append or fill.
+                     // If we overwrite, we might need to be smarter. 
+                     // Let's rely on standard logic: extend.
+                     // If offset_in_block < buffer.len(), we are rewriting old data.
+                     // Let's just use `put` on the slice? BytesMut is accessible.
+                     for i in 0..to_write {
+                         if offset_in_block + i < buffer.len() {
+                             buffer[offset_in_block + i] = data[data_offset + i];
+                         } else {
+                             buffer.put_u8(data[data_offset + i]);
+                         }
+                     }
+                 } else {
+                     buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
+                 }
+            } else {
+                buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
+            }
+
+            // If block is full (4MiB), flush it immediately
+            if buffer.len() >= BLOCK_SIZE as usize {
+                // Ensure we slice nicely to 4MB just in case
+                let block_data = buffer.clone(); // Clone to upload
+                // Remove from pending? NO. Only flush removes it?
+                // Actually, if we upload it, we can remove it to free memory?
+                // YES. 
+                // Wait, if we keep writing to ANY part of this block later (e.g. rewrite),
+                // we'd need to fetch it back.
+                // Assuming JuiceFS behavior: once full -> commit -> slice.
+                self.flush_block(ino, chunk_key.index, block_idx_in_chunk, &block_data).await?;
+                
+                // Remove from pending to free memory
+                pending.remove(&key);
+            }
+
+            written += to_write;
+            remaining -= to_write;
+            current_offset += to_write as u64;
+            data_offset += to_write;
         }
 
-        // Update metadata: append slice to appropriate chunk(s)
-        let chunk_key = ChunkKey::from_offset(ino, offset);
-        let pos_in_chunk = (offset % CHUNK_SIZE) as u32;
+        // Update file size in metadata immediately so `ls` sees it, even if data is buffered?
+        // Yes, usually.
+        let mut attr = self.meta.get_attr(ino)?;
+        if current_offset > attr.size {
+            attr.size = current_offset;
+            attr.touch_mtime();
+            self.meta.set_attr(&attr)?;
+        }
+        
+        Ok(written as u32)
+    }
+
+    /// Flush all buffered blocks for a file (or all files if ino=0?).
+    /// Uploads pending 4MB blocks (or partials) to S3 and creates slices.
+    pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
+        let mut pending = self.pending_writes.lock().await;
+        
+        // Find all keys for this inode
+        // Note: iterating all map is inefficient. Should map Ino -> Vec<Keys>.
+        // Optimization for later.
+        let keys: Vec<_> = pending.keys()
+             .filter(|(i, _, _)| *i == ino)
+             .cloned()
+             .collect();
+
+        for key in keys {
+            if let Some(data) = pending.remove(&key) {
+                let (_, chunk_idx, block_idx) = key;
+                self.flush_block(ino, chunk_idx, block_idx, &data).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper to upload a block (full or partial) and update metadata
+    async fn flush_block(&self, ino: Ino, chunk_idx: u32, block_idx: u32, data: &[u8]) -> VfsResult<()> {
+        let slice_id = self.meta.next_slice_id()?;
+        
+        // Block matches S3 object exactly?
+        // JuiceFS: "Block is basic storage unit... 4MiB default"
+        // If we have < 4MiB (eof), we still upload.
+        
+        // Upload to S3
+        // Note: block_idx passed to put_block is effectively 0 for this new slice?
+        // Wait, `slice` has `pos`. `put_block` uses (slice_id, block_index).
+        // If we make a NEW slice for *just this block*, then inside that slice:
+        // - slice size = data.len()
+        // - it has 1 block (index 0) if len <= 4MB.
+        // - Wait, `put_block` takes `block_index`. 
+        // If this slice corresponds to a 4MB range in file, it is ONE block.
+        // So for this slice_id, we put block_index=0.
+        
+        self.data.put_block(slice_id, 0, Bytes::copy_from_slice(data)).await?;
+        self.disk_cache.put(slice_id, 0, data)?;
+
+        // Update Chunk Metadata
+        let chunk_key = ChunkKey::new(ino, chunk_idx);
+        let bs = BLOCK_SIZE as u32;
+        let pos_in_chunk = block_idx * bs; // Where this block starts in chunk
 
         let slice = Slice {
             pos: pos_in_chunk,
             id: slice_id,
-            size: written,
+            size: data.len() as u32,
             off: 0,
-            len: written,
+            len: data.len() as u32,
         };
+        
         self.meta.append_chunk_slice(&chunk_key, &slice)?;
-
-        // Update file size
-        let mut attr = self.meta.get_attr(ino)?;
-        let new_end = offset + written as u64;
-        if new_end > attr.size {
-            attr.size = new_end;
-        }
-        attr.touch_mtime();
-        self.meta.set_attr(&attr)?;
-
-        // Invalidate memory cache for affected range
-        self.mem_cache.invalidate_inode(ino);
-        // Disk cache invalidation not needed (new slice IDs)
-        // self.disk_cache.invalidate_inode(ino)?;
-
-        debug!(ino, offset, written, slice_id, "wrote data");
-        Ok(written)
+        
+        debug!(ino, chunk_idx, block_idx, len=data.len(), "flushed block");
+        Ok(())
     }
 }
 

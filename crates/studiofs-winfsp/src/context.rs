@@ -491,8 +491,14 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         if let Some(ctx) = context {
+            // Flush pending writes to S3
+            self.rt
+                .block_on(self.vfs.flush(ctx.ino))
+                .map_err(vfs_to_winfsp_err)?;
+
             let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
             *file_info = attr_to_file_info(&attr);
+            debug!(ino = ctx.ino, "flush");
         }
         Ok(())
     }
