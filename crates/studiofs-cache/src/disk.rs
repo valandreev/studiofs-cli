@@ -36,8 +36,8 @@ struct CacheEntry {
 /// Key for a disk cache entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct DiskCacheKey {
-    ino: Ino,
-    offset: u64,
+    slice_id: u64,
+    block_index: u32,
 }
 
 /// Persistent disk cache with size-based and free-space-based eviction.
@@ -87,21 +87,36 @@ impl DiskCache {
             return Ok(());
         }
 
-        for entry in fs::read_dir(&self.cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(key) = self.parse_cache_filename(&path) {
-                    let meta = entry.metadata()?;
-                    let size = meta.len();
-                    entries.insert(
-                        key,
-                        CacheEntry {
-                            size,
-                            last_access: Instant::now(),
-                        },
-                    );
-                    total_size += size;
+        // Recursive scan
+        let mut stack = vec![self.cache_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let read_dir = match fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+
+            for entry in read_dir {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.is_file() {
+                    if let Some(key) = self.parse_cache_filename(&path) {
+                        if let Ok(meta) = entry.metadata() {
+                            let size = meta.len();
+                            entries.insert(
+                                key,
+                                CacheEntry {
+                                    size,
+                                    last_access: Instant::now(),
+                                },
+                            );
+                            total_size += size;
+                        }
+                    }
                 }
             }
         }
@@ -112,32 +127,41 @@ impl DiskCache {
     }
 
     /// Get the file path for a cache entry.
-    fn cache_path(&self, ino: Ino, offset: u64) -> PathBuf {
-        self.cache_dir.join(format!("{ino}_{offset}"))
+    /// Format: `cache_dir/{hash1}/{hash2}/{sliceId}_{blockIndex}_{blockSize}`
+    fn cache_path(&self, slice_id: u64, block_index: u32, block_size: u32) -> PathBuf {
+        let hash1 = slice_id / 1_000_000;
+        let hash2 = slice_id / 1_000;
+        let filename = format!("{}_{}_{}", slice_id, block_index, block_size);
+        
+        self.cache_dir
+            .join(hash1.to_string())
+            .join(hash2.to_string())
+            .join(filename)
     }
 
     /// Parse a cache filename back to a key.
     fn parse_cache_filename(&self, path: &Path) -> Option<DiskCacheKey> {
         let name = path.file_name()?.to_str()?;
         let mut parts = name.split('_');
-        let ino: Ino = parts.next()?.parse().ok()?;
-        let offset: u64 = parts.next()?.parse().ok()?;
-        Some(DiskCacheKey { ino, offset })
+        let slice_id: u64 = parts.next()?.parse().ok()?;
+        let block_index: u32 = parts.next()?.parse().ok()?;
+        // block_size is the 3rd part, but we don't need it for the key
+        Some(DiskCacheKey { slice_id, block_index })
     }
 
     /// Read a block from disk cache.
-    pub fn get(&self, ino: Ino, offset: u64) -> DiskCacheResult<Option<Bytes>> {
-        let path = self.cache_path(ino, offset);
+    pub fn get(&self, slice_id: u64, block_index: u32, block_size: u32) -> DiskCacheResult<Option<Bytes>> {
+        let path = self.cache_path(slice_id, block_index, block_size);
         if !path.exists() {
             return Ok(None);
         }
 
         let mut file = fs::File::open(&path)?;
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(block_size as usize);
         file.read_to_end(&mut data)?;
 
         // Update last access time
-        let key = DiskCacheKey { ino, offset };
+        let key = DiskCacheKey { slice_id, block_index };
         if let Some(entry) = self.entries.lock().get_mut(&key) {
             entry.last_access = Instant::now();
         }
@@ -146,17 +170,24 @@ impl DiskCache {
     }
 
     /// Write a block to disk cache.
-    pub fn put(&self, ino: Ino, offset: u64, data: &[u8]) -> DiskCacheResult<()> {
+    pub fn put(&self, slice_id: u64, block_index: u32, data: &[u8]) -> DiskCacheResult<()> {
         let size = data.len() as u64;
+        let block_size = data.len() as u32;
 
         // Evict if needed
         self.evict_to_fit(size)?;
 
-        let path = self.cache_path(ino, offset);
+        let path = self.cache_path(slice_id, block_index, block_size);
+        
+        // Ensure parent dirs exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
         let mut file = fs::File::create(&path)?;
         file.write_all(data)?;
 
-        let key = DiskCacheKey { ino, offset };
+        let key = DiskCacheKey { slice_id, block_index };
         let mut entries = self.entries.lock();
         if let Some(old) = entries.insert(
             key,
@@ -173,24 +204,12 @@ impl DiskCache {
     }
 
     /// Remove all cache entries for an inode.
-    pub fn invalidate_inode(&self, ino: Ino) -> DiskCacheResult<()> {
-        let mut entries = self.entries.lock();
-        let mut current = self.current_size.lock();
-
-        let keys_to_remove: Vec<DiskCacheKey> = entries
-            .keys()
-            .filter(|k| k.ino == ino)
-            .cloned()
-            .collect();
-
-        for key in keys_to_remove {
-            if let Some(entry) = entries.remove(&key) {
-                *current = current.saturating_sub(entry.size);
-                let path = self.cache_path(key.ino, key.offset);
-                let _ = fs::remove_file(&path);
-            }
-        }
-
+    ///
+    /// NOTE: With slice-based caching, we don't have an easy way to invalidate
+    /// all blocks for a file. However, since new writes generate new slice IDs,
+    /// old blocks naturally become cold and will be LRU evicted.
+    pub fn invalidate_inode(&self, _ino: Ino) -> DiskCacheResult<()> {
+        // No-op for now
         Ok(())
     }
 
@@ -211,14 +230,33 @@ impl DiskCache {
 
             if let Some(key) = lru_key {
                 if let Some(entry) = entries.remove(&key) {
-                    let path = self.cache_path(key.ino, key.offset);
+                    // We can't easily reconstruct the full path for removal without storing block_size
+                    // But we can approximate or find the file.
+                    // Actually, let's just make parse_cache_filename more robust or store path?
+                    // For now, we only store key. We can scan directory or just ignore file removal error if name guess failed?
+                    // Better: entries should probably store expected block_size too?
+                    // Or we just rely on the fact that file name is `{slice}_{block}_{size}`.
+                    // We need `block_size` to reconstruct path.
+                    // Let's check `entries` value. `CacheEntry` has `size`.
+                    // So we can assume `block_size` == `entry.size` (mostly true for full blocks).
+                    // If it's a partial block... we write `block_size` in filename.
+                    // S3 blocks are usually 4MB.
+                    
+                    let block_size = entry.size as u32; // This might be wrong if we wrote < 4MB.
+                    // But wait, `put` writes `block_size` into filename.
+                    // And `scan_existing` reads `meta.len()`.
+                    // If we trust `entry.size` matches the filename size...
+                    
+                    let path = self.cache_path(key.slice_id, key.block_index, block_size);
                     if let Err(e) = fs::remove_file(&path) {
-                        warn!("failed to remove cache file {:?}: {e}", path);
+                         // Try to find the file if size mismatch?
+                         // For now just warn.
+                         warn!("failed to remove cache file {:?}: {e}", path);
                     }
                     *current = current.saturating_sub(entry.size);
                     debug!(
-                        ino = key.ino,
-                        offset = key.offset,
+                        slice_id = key.slice_id,
+                        block_idx = key.block_index,
                         "evicted from disk cache"
                     );
                 }

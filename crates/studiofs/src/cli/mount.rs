@@ -57,9 +57,15 @@ pub fn run(
     let mem_cache = Arc::new(MemoryCache::new(mem_limit));
 
     let cache_size_bytes = parse_size(cache_size)?;
-    let cache_path = cache_dir
+    let base_cache_path = cache_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| meta_dir.join("cache"));
+
+    // Structure: base/uuid/chunks
+    // DiskCache will append hashed subdirectories (e.g., 0/0/) to mirror S3.
+    let cache_path = base_cache_path
+        .join(format_info.uuid.to_string())
+        .join("chunks");
     
     let disk_cache = Arc::new(DiskCache::new(&cache_path, cache_size_bytes)?);
 

@@ -145,7 +145,8 @@ impl StudioVfs {
         let attr = self.meta.unlink(parent, name)?;
         // Invalidate caches
         self.mem_cache.invalidate_inode(attr.ino);
-        self.disk_cache.invalidate_inode(attr.ino)?;
+        // Disk cache invalidation by inode is no longer supported/needed
+        // self.disk_cache.invalidate_inode(attr.ino)?;
         Ok(())
     }
 
@@ -189,24 +190,14 @@ impl StudioVfs {
             }
         }
 
-        // Try disk cache next
-        if let Some(data) = self.disk_cache.get(ino, offset)? {
-            if data.len() >= effective_size {
-                debug!(ino, offset, size = effective_size, "disk cache hit");
-                // Populate memory cache
-                self.mem_cache.put(cache_key, data.clone());
-                return Ok(data.slice(..effective_size));
-            }
-        }
-
         // Fetch from S3 via chunk/slice resolution
+        // This will now handle disk cache internally per-block
         let data = self.read_from_storage(ino, offset, effective_size, &attr).await?;
 
         // Store in memory cache
         self.mem_cache.put(cache_key, data.clone());
         
-        // Store in disk cache
-        self.disk_cache.put(ino, offset, &data)?;
+        // Disk cache population moved to read_from_storage -> fetch_slice_range
 
         Ok(data)
     }
@@ -283,22 +274,54 @@ impl StudioVfs {
 
             let to_read = remaining.min(block_actual_size - offset_in_block);
 
-            let block_data = if offset_in_block == 0 && to_read == block_actual_size {
-                // Read full block
-                self.data
-                    .get_block(slice_id, block_idx, block_actual_size as u32)
-                    .await?
+            // Try disk cache first
+            let block_actual_u32 = block_actual_size as u32;
+            let cached_block = self.disk_cache.get(slice_id, block_idx, block_actual_u32)?;
+
+            let block_data = if let Some(data) = cached_block {
+                if offset_in_block == 0 && to_read == block_actual_size {
+                    data
+                } else {
+                     data.slice(offset_in_block as usize..(offset_in_block + to_read) as usize)
+                }
             } else {
-                // Read partial block (range request)
-                self.data
-                    .get_block_range(
-                        slice_id,
-                        block_idx,
-                        block_actual_size as u32,
-                        offset_in_block,
-                        to_read,
-                    )
-                    .await?
+                // Disk cache miss — fetch from S3
+                let fetched_data = if offset_in_block == 0 && to_read == block_actual_size {
+                    // Read full block
+                    self.data
+                        .get_block(slice_id, block_idx, block_actual_u32)
+                        .await?
+                } else {
+                    // Read partial block (range request)
+                    // NOTE: use get_block_range only if we don't want to cache the full block.
+                    // But for L2 cache, we usually want to cache the full block?
+                    // If we only read a range, we can't cache the full block unless we download it all.
+                    // For performance, if we have a disk cache, maybe we SHOULD download the full block?
+                    // For now, let's stick to range read if it's partial, but we WON'T cache it to disk
+                    // unless we fetched the whole thing.
+                    
+                    // Optimization: If cache is enabled, maybe always fetch full block?
+                    // Let's keep it simple: only cache if we fetched full block or if we decide to fetch full block.
+                    // Since specific requirement wasn't to change read behavior aggressively,
+                    // let's stick to existing logic but only put to cache if we have full block.
+                    
+                    self.data
+                        .get_block_range(
+                            slice_id,
+                            block_idx,
+                            block_actual_u32,
+                            offset_in_block,
+                            to_read,
+                        )
+                        .await?
+                };
+
+                // Populate disk cache if we fetched a full block (and it matches expected size)
+                if fetched_data.len() as u64 == block_actual_size {
+                     self.disk_cache.put(slice_id, block_idx, &fetched_data)?;
+                }
+                
+                fetched_data
             };
 
             result.extend_from_slice(&block_data);
@@ -323,9 +346,13 @@ impl StudioVfs {
         // Split data into blocks and upload
         let blocks = studiofs_data::block::split_into_blocks(data, 0);
         for (block_idx, block_data) in blocks {
+            // Upload to S3
             self.data
-                .put_block(slice_id, block_idx, block_data)
+                .put_block(slice_id, block_idx, block_data.clone())
                 .await?;
+            
+            // Cache to disk
+            self.disk_cache.put(slice_id, block_idx, &block_data)?;
         }
 
         // Update metadata: append slice to appropriate chunk(s)
@@ -352,7 +379,8 @@ impl StudioVfs {
 
         // Invalidate memory cache for affected range
         self.mem_cache.invalidate_inode(ino);
-        self.disk_cache.invalidate_inode(ino)?;
+        // Disk cache invalidation not needed (new slice IDs)
+        // self.disk_cache.invalidate_inode(ino)?;
 
         debug!(ino, offset, written, slice_id, "wrote data");
         Ok(written)
