@@ -16,6 +16,7 @@
   - [1. Initialize a Volume](#1-initialize-a-volume)
   - [2. Mount the Filesystem](#2-mount-the-filesystem)
   - [3. Check Volume Status](#3-check-volume-status)
+  - [4. Destroy a Volume](#4-destroy-a-volume)
 - [CLI Reference](#cli-reference)
 - [Using with MinIO (Local Testing)](#using-with-minio-local-testing)
 - [Using with AWS S3](#using-with-aws-s3)
@@ -227,6 +228,38 @@ StudioFS Volume Status
 
 ---
 
+### 4. Destroy a Volume
+
+> **WARNING:** This action is irreversible. It deletes all S3 data and local metadata.
+
+```bash
+studiofs destroy my-volume
+```
+
+**Interactive Confirmation:**
+1.  The command will warn you about data loss.
+2.  Type `y` to proceed.
+3.  Type the volume name (`my-volume`) to confirm.
+
+**Output:**
+```
+Creating S3 client...
+WARNING: You are about to DESTROY volume 'my-volume'.
+This will permanently delete:
+  1. All data in S3 bucket 'my-bucket' with prefix 'my-volume/'
+  2. ALL local metadata and cache at "C:\Users\User\.studiofs\meta\my-volume"
+
+Do you want to proceed? [y/N]: y
+To confirm, please type the volume name 'my-volume' again: my-volume
+Deleting data from S3...
+✓ S3 data deleted.
+Deleting local metadata and cache...
+✓ Local files deleted.
+Volume 'my-volume' destroyed successfully.
+```
+
+---
+
 ## CLI Reference
 
 ```
@@ -236,6 +269,7 @@ Commands:
   init      Initialize a new filesystem volume
   mount     Mount a filesystem
   status    Show filesystem status
+  destroy   Permanently destroy a volume
 
 Global Options:
   --log-level <LEVEL>   Log level: trace, debug, info, warn, error [default: info]

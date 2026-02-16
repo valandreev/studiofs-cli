@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::io::Write;
-use tracing::{info, warn};
+use tracing::warn;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{MetaEngine, RedbMetaEngine};
 
@@ -26,9 +26,19 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
     println!("WARNING: You are about to DESTROY volume '{}'.", name);
     println!("This will permanently delete:");
     println!("  1. All data in S3 bucket '{}' with prefix '{}/'", format_info.bucket, name);
-    println!("  2. Local metadata database at {:?}", db_path);
+    println!("  2. ALL local metadata and cache at {:?}", meta_dir);
     println!();
-    print!("Are you SURE? Type '{}' to confirm: ", name);
+    
+    print!("Do you want to proceed? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase() != "y" {
+        println!("Aborting.");
+        return Ok(());
+    }
+
+    print!("To confirm, please type the volume name '{}' again: ", name);
     std::io::stdout().flush()?;
 
     let mut input = String::new();
@@ -50,20 +60,13 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
     })?;
     println!("✓ S3 data deleted.");
 
-    // 5. Delete metadata DB and cache
-    println!("Deleting local metadata...");
-    if db_path.exists() {
-        std::fs::remove_file(&db_path)?;
-    }
-    
-    // Also try to delete cache dir if it exists in default location
-    let cache_dir = meta_dir.join("cache");
-    if cache_dir.exists() {
-        // We do a best-effort cleanup of cache
-        let _ = std::fs::remove_dir_all(&cache_dir);
+    // 5. Delete metadata directory
+    println!("Deleting local metadata and cache...");
+    if meta_dir.exists() {
+        std::fs::remove_dir_all(meta_dir)?;
     }
 
-    println!("✓ Local metadata deleted.");
+    println!("✓ Local files deleted.");
     println!("Volume '{}' destroyed successfully.", name);
 
     Ok(())
