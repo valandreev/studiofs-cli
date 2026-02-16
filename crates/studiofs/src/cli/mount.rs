@@ -91,7 +91,8 @@ pub fn run(
     {
         let vfs = vfs.clone();
         let _guard = rt.enter();
-        vfs.spawn_background_uploader();
+        vfs.clone().spawn_background_uploader();
+        vfs.spawn_background_gc();
     }
 
     // Start platform-specific FUSE mount

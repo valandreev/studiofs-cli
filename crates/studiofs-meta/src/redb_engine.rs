@@ -29,6 +29,9 @@ const CHUNKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks
 /// Pending Slices: slice_id (u64) -> () (unit)
 const PENDING_SLICES: TableDefinition<u64, ()> = TableDefinition::new("pending_slices");
 
+/// Deleted Slices (GC): slice_id (u64) -> length (u32)
+const DELETED_SLICES: TableDefinition<u64, u32> = TableDefinition::new("deleted_slices");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -98,6 +101,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(CHUNKS_TABLE);
             let _ = txn.open_table(PENDING_SLICES);
+            let _ = txn.open_table(DELETED_SLICES);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -489,10 +493,38 @@ impl MetaEngine for RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
-            let mut table = txn
+            // GC Logic: Find old slices that are being replaced
+            let mut chunks_table = txn
                 .open_table(CHUNKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
+            
+            if let Some(old_entry) = chunks_table
+                .get(encoded_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let old_slices: Vec<Slice> = decode(old_entry.value())?;
+                // Simple strategy: Mark ALL old slices as deleted.
+                // If a slice is repurposed (rare in our write-once model), it would be a problem.
+                // But we use unique slice IDs.
+                
+                let mut deleted_table = txn
+                    .open_table(DELETED_SLICES)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                for slice in old_slices {
+                    // Optimization: check if new slices contain this ID?
+                    // If we overwrite *partially*, we might reuse slices.
+                    // But currently `set_chunk_slices` replaces the whole list.
+                    // Let's check if the ID is present in new `slices`.
+                    if !slices.iter().any(|s| s.id == slice.id) {
+                        deleted_table
+                            .insert(slice.id, slice.len)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+            }
+
+            chunks_table
                 .insert(encoded_key.as_slice(), data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -526,6 +558,19 @@ impl MetaEngine for RedbMetaEngine {
             };
 
             for key in &keys_to_remove {
+                // GC Logic: Mark slices as deleted
+                if let Some(entry) = table.get(key.as_slice()).map_err(|e| MetaError::Storage(e.to_string()))? {
+                    let slices: Vec<Slice> = decode(entry.value())?;
+                    let mut deleted_table = txn
+                        .open_table(DELETED_SLICES)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    for slice in slices {
+                        deleted_table
+                             .insert(slice.id, slice.len)
+                             .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+
                 table
                     .remove(key.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -533,10 +578,6 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        if cfg!(debug_assertions) {
-            debug!("removed all chunks for inode {ino}");
-        }
         Ok(())
     }
 
@@ -619,6 +660,64 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .filter_map(|r| r.ok())
             .map(|(k, _)| k.value())
+            .collect();
+        
+        Ok(slices)
+    }
+
+    // ─── Garbage Collection ──────────────────────────────────────────────
+
+    fn add_deleted_slice(&self, slice_id: u64, length: u32) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DELETED_SLICES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(slice_id, length)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_deleted_slice(&self, slice_id: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DELETED_SLICES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .remove(slice_id)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_deleted_slices(&self) -> MetaResult<Vec<(u64, u32)>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(DELETED_SLICES)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        
+        // Iterate all keys
+        let slices: Vec<(u64, u32)> = table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k.value(), v.value()))
             .collect();
         
         Ok(slices)

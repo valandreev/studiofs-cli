@@ -7,7 +7,7 @@ use studiofs_cache::disk::DiskCache;
 use studiofs_data::store::DataStore;
 use studiofs_meta::*;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug, Error)]
 pub enum VfsError {
@@ -549,7 +549,7 @@ impl StudioVfs {
             self.data.put_block(slice_id, 0, Bytes::copy_from_slice(&bytes)).await?;
             // Mark as uploaded
             self.meta.remove_pending_slice(slice_id)?;
-            info!("background upload complete: slice {}", slice_id);
+            debug!("background upload complete: slice {}", slice_id);
         } else {
              // Slice not found in disk cache?
              // This is bad. It means we lost data or it wasn't written correctly.
@@ -564,6 +564,48 @@ impl StudioVfs {
              }
         }
         Ok(())
+    }
+
+    /// Spawn a background task to handle garbage collection.
+    pub fn spawn_background_gc(self: Arc<Self>) {
+        tokio::spawn(async move {
+            // GC interval: 10 minutes
+            let interval = tokio::time::Duration::from_secs(600);
+            
+            loop {
+                tokio::time::sleep(interval).await;
+
+                // Process deleted slices
+                match self.meta.get_deleted_slices() {
+                    Ok(slices) => {
+                        if !slices.is_empty() {
+                            info!("starting GC: {} slices to delete", slices.len());
+                        }
+                        for (slice_id, length) in slices {
+                            // Delete from S3 (best effort)
+                            if let Err(e) = self.data.delete_block(slice_id, 0, length).await {
+                                tracing::warn!("failed to delete slice {} from S3: {}", slice_id, e);
+                            }
+
+                            // Delete from Disk Cache
+                            if let Err(e) = self.disk_cache.remove(slice_id, 0, length) {
+                                tracing::warn!("failed to delete slice {} from disk cache: {}", slice_id, e);
+                            }
+
+                            // Remove from metadata (commit deletion)
+                            if let Err(e) = self.meta.remove_deleted_slice(slice_id) {
+                                tracing::error!("failed to remove deleted slice {}: {}", slice_id, e);
+                            } else {
+                                debug!("GC complete: slice {}", slice_id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to get deleted slices: {}", e);
+                    }
+                }
+            }
+        });
     }
 }
 

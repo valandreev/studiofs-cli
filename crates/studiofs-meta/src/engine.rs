@@ -118,6 +118,17 @@ pub trait MetaEngine: Send + Sync {
     /// Get all pending slices.
     fn get_pending_slices(&self) -> MetaResult<Vec<u64>>;
 
+    // ─── Garbage Collection ──────────────────────────────────────────────
+
+    /// Mark a slice as deleted (candidate for GC).
+    fn add_deleted_slice(&self, slice_id: u64, length: u32) -> MetaResult<()>;
+
+    /// Remove a slice from deleted list (after GC).
+    fn remove_deleted_slice(&self, slice_id: u64) -> MetaResult<()>;
+
+    /// Get all deleted slices (id, length).
+    fn get_deleted_slices(&self) -> MetaResult<Vec<(u64, u32)>>;
+
     // ─── High-Level Operations ───────────────────────────────────────────
 
     /// Create a new file: allocate inode, set attrs, add dentry.

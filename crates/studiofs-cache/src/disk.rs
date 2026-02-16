@@ -203,6 +203,22 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Remove a block from disk cache.
+    pub fn remove(&self, slice_id: u64, block_index: u32, block_size: u32) -> DiskCacheResult<()> {
+        let path = self.cache_path(slice_id, block_index, block_size);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+
+        let key = DiskCacheKey { slice_id, block_index };
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.remove(&key) {
+            *self.current_size.lock() -= entry.size;
+        }
+
+        Ok(())
+    }
+
     /// Remove all cache entries for an inode.
     ///
     /// NOTE: With slice-based caching, we don't have an easy way to invalidate
