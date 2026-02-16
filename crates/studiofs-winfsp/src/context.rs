@@ -506,7 +506,10 @@ impl FileSystemContext for StudioFsContext {
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         out_volume_info.total_size = 1024 * 1024 * 1024 * 1024; // 1 TB
         out_volume_info.free_size = 1024 * 1024 * 1024 * 512; // 512 GB
-        out_volume_info.set_volume_label("StudioFS");
+        
+        // Use volume name from VFS
+        let name = self.vfs.volume_name().unwrap_or_else(|_| "StudioFS".to_string());
+        out_volume_info.set_volume_label(&name);
         Ok(())
     }
 }

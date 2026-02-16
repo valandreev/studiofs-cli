@@ -87,6 +87,16 @@ impl StudioVfs {
         &self.meta
     }
 
+    /// Get volume name.
+    pub fn volume_name(&self) -> VfsResult<String> {
+        Ok(self.meta.get_format_info()?.name)
+    }
+
+    /// Get volume UUID.
+    pub fn uuid(&self) -> VfsResult<String> {
+        Ok(self.meta.get_format_info()?.uuid)
+    }
+
     // ─── Attribute Operations ────────────────────────────────────────────
 
     /// Get file attributes.
