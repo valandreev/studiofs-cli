@@ -176,6 +176,19 @@ impl DataStore {
         self.op.exists(path).await.map_err(DataError::from)
     }
 
+    /// Delete all data associated with this volume.
+    ///
+    /// WARNING: This deletes everything under `{volume_name}/`.
+    pub async fn delete_volume_data(&self) -> DataResult<()> {
+        let prefix = format!("{}/", self.volume_name);
+        info!("deleting all objects with prefix: {}", prefix);
+
+        // Delete all objects with the given prefix
+        self.op.remove_all(&prefix).await?;
+
+        Ok(())
+    }
+
     /// Get the underlying operator (for advanced use).
     pub fn operator(&self) -> &Operator {
         &self.op

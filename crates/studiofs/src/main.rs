@@ -210,6 +210,15 @@ EXAMPLES:
         /// Volume name
         name: String,
     },
+
+    /// Permanently destroy a volume
+    #[command(long_about = "\
+Permanently destroy a volume, deleting all data from S3 and removing local metadata.
+WARNING: This action is irreversible.")]
+    Destroy {
+        /// Volume name to destroy
+        name: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -270,6 +279,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Status { name } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::status::run(&name, &meta_dir)?;
+        }
+        Commands::Destroy { name } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::destroy::run(&name, &meta_dir)?;
         }
     }
 

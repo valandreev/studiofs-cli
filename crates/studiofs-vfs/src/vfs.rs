@@ -3,6 +3,7 @@
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use studiofs_cache::memory::{CacheKey, MemoryCache};
+use studiofs_cache::disk::DiskCache;
 use studiofs_data::store::DataStore;
 use studiofs_meta::*;
 use thiserror::Error;
@@ -18,6 +19,9 @@ pub enum VfsError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("disk cache error: {0}")]
+    DiskCache(#[from] studiofs_cache::disk::DiskCacheError),
 
     #[error("{0}")]
     Other(String),
@@ -54,6 +58,7 @@ pub struct StudioVfs {
     meta: Arc<RedbMetaEngine>,
     data: Arc<DataStore>,
     mem_cache: Arc<MemoryCache>,
+    disk_cache: Arc<DiskCache>,
 }
 
 impl StudioVfs {
@@ -62,11 +67,13 @@ impl StudioVfs {
         meta: Arc<RedbMetaEngine>,
         data: Arc<DataStore>,
         mem_cache: Arc<MemoryCache>,
+        disk_cache: Arc<DiskCache>,
     ) -> Self {
         Self {
             meta,
             data,
             mem_cache,
+            disk_cache,
         }
     }
 
@@ -138,6 +145,7 @@ impl StudioVfs {
         let attr = self.meta.unlink(parent, name)?;
         // Invalidate caches
         self.mem_cache.invalidate_inode(attr.ino);
+        self.disk_cache.invalidate_inode(attr.ino)?;
         Ok(())
     }
 
@@ -181,11 +189,24 @@ impl StudioVfs {
             }
         }
 
+        // Try disk cache next
+        if let Some(data) = self.disk_cache.get(ino, offset)? {
+            if data.len() >= effective_size {
+                debug!(ino, offset, size = effective_size, "disk cache hit");
+                // Populate memory cache
+                self.mem_cache.put(cache_key, data.clone());
+                return Ok(data.slice(..effective_size));
+            }
+        }
+
         // Fetch from S3 via chunk/slice resolution
         let data = self.read_from_storage(ino, offset, effective_size, &attr).await?;
 
         // Store in memory cache
         self.mem_cache.put(cache_key, data.clone());
+        
+        // Store in disk cache
+        self.disk_cache.put(ino, offset, &data)?;
 
         Ok(data)
     }
@@ -331,6 +352,7 @@ impl StudioVfs {
 
         // Invalidate memory cache for affected range
         self.mem_cache.invalidate_inode(ino);
+        self.disk_cache.invalidate_inode(ino)?;
 
         debug!(ino, offset, written, slice_id, "wrote data");
         Ok(written)

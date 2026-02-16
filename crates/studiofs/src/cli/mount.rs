@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use studiofs_cache::disk::DiskCache;
 use studiofs_cache::MemoryCache;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{MetaEngine, RedbMetaEngine};
@@ -55,16 +56,19 @@ pub fn run(
     let mem_limit = parse_size(memory_limit)? as usize;
     let mem_cache = Arc::new(MemoryCache::new(mem_limit));
 
-    let _cache_size_bytes = parse_size(cache_size)?;
-    let _cache_path = cache_dir
+    let cache_size_bytes = parse_size(cache_size)?;
+    let cache_path = cache_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| meta_dir.join("cache"));
+    
+    let disk_cache = Arc::new(DiskCache::new(&cache_path, cache_size_bytes)?);
 
     // Create VFS
     let vfs = Arc::new(StudioVfs::new(
         meta.clone(),
         data.clone(),
         mem_cache.clone(),
+        disk_cache.clone(),
     ));
 
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
