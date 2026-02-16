@@ -7,6 +7,7 @@ use tracing::info;
 use uuid::Uuid;
 use std::io::Write;
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_config::BehaviorVersion;
 
 async fn create_s3_bucket(
     endpoint: &str,
@@ -30,6 +31,7 @@ async fn create_s3_bucket(
     );
 
     let mut config_builder = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
         .region(region_obj)
         .credentials_provider(credentials)
         .force_path_style(true); // Usually needed for MinIO/S3-compatible

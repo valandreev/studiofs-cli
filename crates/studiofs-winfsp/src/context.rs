@@ -380,9 +380,39 @@ impl FileSystemContext for StudioFsContext {
         Ok(cursor)
     }
 
-    fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, _flags: u32) {
+    fn set_delete(&self, context: &Self::FileContext, _file_name: &U16CStr, delete_file: bool) -> winfsp::Result<()> {
+        if delete_file && context.is_dir {
+            // Check if directory is empty
+            let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
+            if !entries.is_empty() {
+                return Err(winfsp::FspError::from(STATUS_DIRECTORY_NOT_EMPTY));
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
         // Clear cached dir entries
         *context.dir_entries.lock() = None;
+
+        // FspCleanupDelete = 0x01
+        if flags & 0x01 != 0 {
+            if let Some(fname) = file_name {
+                if let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname) {
+                    let res = if context.is_dir {
+                        self.vfs.rmdir(parent_ino, &name)
+                    } else {
+                        self.vfs.unlink(parent_ino, &name)
+                    };
+
+                    if let Err(e) = res {
+                        error!("cleanup delete failed: {:?}", e);
+                    } else {
+                        debug!(ino = context.ino, "cleanup delete");
+                    }
+                }
+            }
+        }
     }
 
     fn overwrite(
