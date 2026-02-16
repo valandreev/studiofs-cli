@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! StudioFS FUSE backend for Linux and macOS using `fuser`.
 //!
 //! Implements `fuser::Filesystem` to expose StudioVfs via FUSE.

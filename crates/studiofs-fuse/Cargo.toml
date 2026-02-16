@@ -9,10 +9,11 @@ studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
 studiofs-cache.workspace = true
 studiofs-data.workspace = true
+[target.'cfg(unix)'.dependencies]
 fuser.workspace = true
+libc.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
-libc.workspace = true
