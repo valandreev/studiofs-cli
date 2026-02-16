@@ -346,10 +346,10 @@ File
 
 **S3 Object Key Format:**
 ```
-{volume}/chunks/{hash1}/{hash2}/{sliceId}_{blockIndex}_{blockSize}
+{volume}/data/chunks/{hash1}/{hash2}/{sliceId}_{blockIndex}_{blockSize}
 ```
 
-Example: `my-volume/chunks/0/0/1_0_4194304` = slice 1, block 0, 4 MiB.
+Example: `my-volume/data/chunks/0/0/1_0_4194304` = slice 1, block 0, 4 MiB.
 
 ---
 

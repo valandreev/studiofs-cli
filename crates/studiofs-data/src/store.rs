@@ -77,11 +77,11 @@ impl DataStore {
 
     /// Get the S3 object key for a block.
     ///
-    /// Format: `{volume}/chunks/{hash}/{sliceId}_{blockIndex}_{blockSize}`
+    /// Format: `{volume}/data/chunks/{hash}/{sliceId}_{blockIndex}_{blockSize}`
     pub fn block_key(&self, slice_id: u64, block_index: u32, block_size: u32) -> String {
         let hash = self.hash_path(slice_id);
         format!(
-            "{}/chunks/{}/{}_{}_{}",
+            "{}/data/chunks/{}/{}_{}_{}",
             self.volume_name, hash, slice_id, block_index, block_size
         )
     }
