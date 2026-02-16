@@ -59,10 +59,8 @@ pub struct StudioVfs {
     data: Arc<DataStore>,
     mem_cache: Arc<MemoryCache>,
     disk_cache: Arc<DiskCache>,
-    // Pending writes buffer: (ino, chunk_idx, block_idx) -> data
-    // Using a simple mutex for now. In a real system, this should be more granular/concurrent.
-    // For now, let's wrap the whole map in a Mutex.
-    pending_writes: Arc<tokio::sync::Mutex<std::collections::HashMap<(Ino, u32, u32), BytesMut>>>,
+    // Pending writes buffer: (ino, chunk_idx, block_idx) -> (start_offset_in_block, data)
+    pending_writes: Arc<tokio::sync::Mutex<std::collections::HashMap<(Ino, u32, u32), (u32, BytesMut)>>>,
     // Notify background uploader when new slices are pending
     upload_notify: Arc<tokio::sync::Notify>,
 }
@@ -235,18 +233,67 @@ impl StudioVfs {
         while remaining > 0 {
             let chunk_key = ChunkKey::from_offset(ino, current_offset);
             let chunk_offset = current_offset - (chunk_key.index as u64 * CHUNK_SIZE);
+            let in_chunk = (CHUNK_SIZE - chunk_offset).min(remaining as u64) as u32;
 
-            let slices = self.meta.get_chunk_slices(&chunk_key)?;
+            let mut slices = self.meta.get_chunk_slices(&chunk_key)?;
 
-            // Resolve the latest view of the data at this offset
-            let resolved = resolve_slices(&slices, chunk_offset as u32, remaining as u32);
+            // ─── Read-through: check pending writes ───
+            // Pending writes take absolute precedence as they are the very latest data.
+            {
+                let pending = self.pending_writes.lock().await;
+                // Find all pending blocks for this chunk
+                for ((p_ino, p_chunk, p_block), (p_start_off, p_data)) in pending.iter() {
+                    if *p_ino == ino && *p_chunk == chunk_key.index {
+                        let bs = BLOCK_SIZE as u32;
+                        let final_pos = (*p_block * bs) + *p_start_off;
+                        
+                        // Create a "virtual" slice. ID=u64::MAX signals it's in-memory.
+                        slices.push(Slice {
+                            pos: final_pos,
+                            id: u64::MAX,
+                            size: p_data.len() as u32,
+                            off: 0,
+                            len: p_data.len() as u32,
+                        });
+                    }
+                }
+            }
+
+            // Resolve segments within the range that fits in THIS chunk
+            let resolved = resolve_slices(&slices, chunk_offset as u32, in_chunk);
+
+            if resolved.is_empty() {
+                // Entire remaining part of chunk is a hole
+                result.extend_from_slice(&vec![0u8; in_chunk as usize]);
+                remaining -= in_chunk as usize;
+                current_offset += in_chunk as u64;
+                continue;
+            }
 
             for segment in &resolved {
                 if segment.slice_id == 0 {
-                    // Hole — zero-filled
+                    // Hole
                     result.extend_from_slice(&vec![0u8; segment.len as usize]);
+                } else if segment.slice_id == u64::MAX {
+                    // ─── Memory hit from pending_writes ───
+                    let pending = self.pending_writes.lock().await;
+                    let bs = BLOCK_SIZE as u32;
+                    let block_idx = ((current_offset % CHUNK_SIZE) / bs as u64) as u32;
+                    let key = (ino, chunk_key.index, block_idx);
+                    
+                    if let Some((_, data)) = pending.get(&key) {
+                        result.extend_from_slice(&data[segment.off as usize..(segment.off + segment.len) as usize]);
+                    } else {
+                        // Segment was removed from pending while we were reading?
+                        // This can happen if a background flush finished between loops.
+                        // Fallback: try storage (it should be there now).
+                        let block_data = self
+                            .fetch_slice_range(segment.slice_id, segment.slice_size, segment.off, segment.len)
+                            .await?;
+                        result.extend_from_slice(&block_data);
+                    }
                 } else {
-                    // Fetch blocks from S3
+                    // Fetch blocks from S3/Disk
                     let block_data = self
                         .fetch_slice_range(segment.slice_id, segment.slice_size, segment.off, segment.len)
                         .await?;
@@ -254,14 +301,6 @@ impl StudioVfs {
                 }
                 remaining -= segment.len as usize;
                 current_offset += segment.len as u64;
-            }
-
-            if resolved.is_empty() {
-                // No slices cover this region — it's a hole
-                let in_chunk = (CHUNK_SIZE - chunk_offset).min(remaining as u64) as usize;
-                result.extend_from_slice(&vec![0u8; in_chunk]);
-                remaining -= in_chunk;
-                current_offset += in_chunk as u64;
             }
         }
 
@@ -377,55 +416,44 @@ impl StudioVfs {
             // Append to pending buffer
             let mut pending = self.pending_writes.lock().await;
             let key = (ino, chunk_key.index, block_idx_in_chunk);
-            let buffer = pending.entry(key).or_insert_with(|| BytesMut::with_capacity(BLOCK_SIZE as usize));
+            let (start_off, buffer) = pending.entry(key).or_insert_with(|| (offset_in_block as u32, BytesMut::with_capacity(BLOCK_SIZE as usize)));
             
-            // If we are writing to the middle of a buffer that doesn't exist or is too short,
-            // we technically should zero-fill or fetch the existing block.
-            // For now, assuming APPEND-only or sequential writes for simplicity as per requirements.
-            // But to be safe, if we have a gap, we should fill it.
-            if buffer.len() < offset_in_block {
-                let gap = offset_in_block - buffer.len();
-                buffer.extend_from_slice(&vec![0u8; gap]);
-            } else if buffer.len() > offset_in_block {
-                 // Overwrite logic: unrelated to "append" optimization, but needed for correctness.
-                 // BytesMut truncation is cheap.
-                 // For simplified "append-mostly" workload:
-                 if buffer.len() > offset_in_block {
-                     // We are overwriting. Truncate? No, that loses tail.
-                     // Helper: overwrite existing bytes
-                     // This is tricky with BytesMut efficiently. 
-                     // Let's just assume we append or fill.
-                     // If we overwrite, we might need to be smarter. 
-                     // Let's rely on standard logic: extend.
-                     // If offset_in_block < buffer.len(), we are rewriting old data.
-                     // Let's just use `put` on the slice? BytesMut is accessible.
-                     for i in 0..to_write {
-                         if offset_in_block + i < buffer.len() {
-                             buffer[offset_in_block + i] = data[data_offset + i];
-                         } else {
-                             buffer.put_u8(data[data_offset + i]);
-                         }
+            // If we are writing outside the current buffered range, flush and restart
+            let buf_end = *start_off + buffer.len() as u32;
+            if (offset_in_block as u32) < *start_off || (offset_in_block as u32) > buf_end {
+                // Gap or jump! Flush current part.
+                let data = buffer.clone();
+                let old_start = *start_off;
+                self.flush_block(ino, chunk_key.index, block_idx_in_chunk, old_start, &data).await?;
+                
+                // Reset buffer to new start
+                *start_off = offset_in_block as u32;
+                buffer.clear();
+            }
+
+            // Relative offset in current buffer
+            let rel_off = (offset_in_block as u32 - *start_off) as usize;
+
+            if rel_off < buffer.len() {
+                 // Overwrite/Append mix
+                 for i in 0..to_write {
+                     let p = rel_off + i;
+                     if p < buffer.len() {
+                         buffer[p] = data[data_offset + i];
+                     } else {
+                         buffer.put_u8(data[data_offset + i]);
                      }
-                 } else {
-                     buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
                  }
             } else {
+                // Clean append to buffer
                 buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
             }
 
             // If block is full (4MiB), flush it immediately
             if buffer.len() >= BLOCK_SIZE as usize {
-                // Ensure we slice nicely to 4MB just in case
-                let block_data = buffer.clone(); // Clone to upload
-                // Remove from pending? NO. Only flush removes it?
-                // Actually, if we upload it, we can remove it to free memory?
-                // YES. 
-                // Wait, if we keep writing to ANY part of this block later (e.g. rewrite),
-                // we'd need to fetch it back.
-                // Assuming JuiceFS behavior: once full -> commit -> slice.
-                self.flush_block(ino, chunk_key.index, block_idx_in_chunk, &block_data).await?;
-                
-                // Remove from pending to free memory
+                let data = buffer.clone();
+                let off = *start_off;
+                self.flush_block(ino, chunk_key.index, block_idx_in_chunk, off, &data).await?;
                 pending.remove(&key);
             }
 
@@ -435,8 +463,7 @@ impl StudioVfs {
             data_offset += to_write;
         }
 
-        // Update file size in metadata immediately so `ls` sees it, even if data is buffered?
-        // Yes, usually.
+        // Update file size in metadata immediately
         let mut attr = self.meta.get_attr(ino)?;
         if current_offset > attr.size {
             attr.size = current_offset;
@@ -447,39 +474,33 @@ impl StudioVfs {
         Ok(written as u32)
     }
 
-    /// Flush all buffered blocks for a file (or all files if ino=0?).
-    /// Uploads pending 4MB blocks (or partials) to S3 and creates slices.
+    /// Flush all buffered blocks for a file.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         let mut pending = self.pending_writes.lock().await;
         
-        // Find all keys for this inode
-        // Note: iterating all map is inefficient. Should map Ino -> Vec<Keys>.
-        // Optimization for later.
         let keys: Vec<_> = pending.keys()
              .filter(|(i, _, _)| *i == ino)
              .cloned()
              .collect();
 
         for key in keys {
-            if let Some(data) = pending.remove(&key) {
+            if let Some((start_off, data)) = pending.remove(&key) {
                 let (_, chunk_idx, block_idx) = key;
-                self.flush_block(ino, chunk_idx, block_idx, &data).await?;
+                self.flush_block(ino, chunk_idx, block_idx, start_off, &data).await?;
             }
         }
         Ok(())
     }
 
     /// Helper to upload a block (full or partial) and update metadata
-    async fn flush_block(&self, ino: Ino, chunk_idx: u32, block_idx: u32, data: &[u8]) -> VfsResult<()> {
+    async fn flush_block(&self, ino: Ino, chunk_idx: u32, block_idx: u32, start_off: u32, data: &[u8]) -> VfsResult<()> {
+        if data.is_empty() { return Ok(()); }
         let slice_id = self.meta.next_slice_id()?;
-        
-        // Block matches S3 object exactly?
-        // JuiceFS: "Block is basic storage unit... 4MiB default"
-        // If we have < 4MiB (eof), we still upload.
         
         // Writeback: write to disk cache, mark as pending, defer S3 upload.
         self.disk_cache.put(slice_id, 0, data)?;
-        self.meta.add_pending_slice(slice_id)?;
+        self.meta.add_pending_slice(slice_id, data.len() as u32)?;
+        // debug!("flush_block ino={} slice={} len={}", ino, slice_id, data.len());
 
         // Notify background uploader
         self.upload_notify.notify_one();
@@ -487,10 +508,12 @@ impl StudioVfs {
         // Update Chunk Metadata
         let chunk_key = ChunkKey::new(ino, chunk_idx);
         let bs = BLOCK_SIZE as u32;
-        let pos_in_chunk = block_idx * bs; // Where this block starts in chunk
+        
+        // Final position in chunk
+        let final_pos = (block_idx * bs) + start_off;
 
         let slice = Slice {
-            pos: pos_in_chunk,
+            pos: final_pos,
             id: slice_id,
             size: data.len() as u32,
             off: 0,
@@ -499,7 +522,7 @@ impl StudioVfs {
         
         self.meta.append_chunk_slice(&chunk_key, &slice)?;
         
-        debug!(ino, chunk_idx, block_idx, len=data.len(), "flushed block");
+        debug!(ino, chunk_idx, final_pos, len=data.len(), "flushed block segment");
         Ok(())
     }
 
@@ -511,20 +534,15 @@ impl StudioVfs {
     pub fn spawn_background_uploader(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
-                // Wait for notification or timeout (to retry failed uploads)
-                let notify = self.upload_notify.notified();
-                tokio::select! {
-                    _ = notify => {},
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {},
-                }
+                // Wait for notification
+                self.upload_notify.notified().await;
 
-                // Process pending slices
-                // We use a pragmatic approach: fetch all, process one by one.
+                // Process all pending slices
                 // In a real system, we'd want a more sophisticated queue.
                 match self.meta.get_pending_slices() {
                     Ok(slices) => {
-                        for slice_id in slices {
-                            if let Err(e) = self.process_pending_slice(slice_id).await {
+                        for (slice_id, length) in slices {
+                            if let Err(e) = self.process_pending_slice(slice_id, length).await {
                                 tracing::error!("failed to upload slice {}: {}", slice_id, e);
                             }
                         }
@@ -538,11 +556,11 @@ impl StudioVfs {
     }
 
     /// Process a single pending slice: read from disk -> upload to S3 -> remove pending.
-    async fn process_pending_slice(&self, slice_id: u64) -> VfsResult<()> {
+    async fn process_pending_slice(&self, slice_id: u64, length: u32) -> VfsResult<()> {
         // Read from disk cache (expect full block)
         // We use block_idx 0 because we treat each slice as a single block for now (upto 4MB).
         // Larger slices would need iteration, but our write path enforces 4MB blocks.
-        let data = self.disk_cache.get(slice_id, 0, BLOCK_SIZE)?;
+        let data = self.disk_cache.get(slice_id, 0, length)?;
         
         if let Some(bytes) = data {
             // Upload to S3
@@ -558,7 +576,7 @@ impl StudioVfs {
              tracing::error!("integrity error: pending slice {} not found in disk cache", slice_id);
              // Should we remove it from pending checking S3?
              // If it's not on disk, maybe it IS on S3 already?
-             if self.data.get_block(slice_id, 0, BLOCK_SIZE).await.is_ok() {
+             if self.data.get_block(slice_id, 0, length).await.is_ok() {
                  self.meta.remove_pending_slice(slice_id)?;
                  tracing::warn!("slice {} was missing from disk but found on S3, recovered", slice_id);
              }

@@ -110,13 +110,13 @@ pub trait MetaEngine: Send + Sync {
     // ─── Pending Slices (Writeback) ──────────────────────────────────────
 
     /// Mark a slice as pending upload.
-    fn add_pending_slice(&self, slice_id: u64) -> MetaResult<()>;
+    fn add_pending_slice(&self, slice_id: u64, length: u32) -> MetaResult<()>;
 
     /// Remove a slice from pending list (after successful upload).
     fn remove_pending_slice(&self, slice_id: u64) -> MetaResult<()>;
 
-    /// Get all pending slices.
-    fn get_pending_slices(&self) -> MetaResult<Vec<u64>>;
+    /// Get all pending slices (id, length).
+    fn get_pending_slices(&self) -> MetaResult<Vec<(u64, u32)>>;
 
     // ─── Garbage Collection ──────────────────────────────────────────────
 

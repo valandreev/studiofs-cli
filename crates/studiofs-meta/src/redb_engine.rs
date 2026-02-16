@@ -26,8 +26,8 @@ const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dent
 /// Chunks: (ino, chunk_index) as bytes -> Vec<Slice> (postcard)
 const CHUNKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
 
-/// Pending Slices: slice_id (u64) -> () (unit)
-const PENDING_SLICES: TableDefinition<u64, ()> = TableDefinition::new("pending_slices");
+/// Pending Slices: slice_id (u64) -> length (u32)
+const PENDING_SLICES: TableDefinition<u64, u32> = TableDefinition::new("pending_slices");
 
 /// Deleted Slices (GC): slice_id (u64) -> length (u32)
 const DELETED_SLICES: TableDefinition<u64, u32> = TableDefinition::new("deleted_slices");
@@ -609,7 +609,7 @@ impl MetaEngine for RedbMetaEngine {
 
     // ─── Pending Slices (Writeback) ──────────────────────────────────────
 
-    fn add_pending_slice(&self, slice_id: u64) -> MetaResult<()> {
+    fn add_pending_slice(&self, slice_id: u64, length: u32) -> MetaResult<()> {
         let txn = self
             .db
             .begin_write()
@@ -619,7 +619,7 @@ impl MetaEngine for RedbMetaEngine {
                 .open_table(PENDING_SLICES)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
-                .insert(slice_id, ())
+                .insert(slice_id, length)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         txn.commit()
@@ -645,7 +645,7 @@ impl MetaEngine for RedbMetaEngine {
         Ok(())
     }
 
-    fn get_pending_slices(&self) -> MetaResult<Vec<u64>> {
+    fn get_pending_slices(&self) -> MetaResult<Vec<(u64, u32)>> {
         let txn = self
             .db
             .begin_read()
@@ -655,11 +655,11 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         
         // Iterate all keys
-        let slices: Vec<u64> = table
+        let slices: Vec<(u64, u32)> = table
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .filter_map(|r| r.ok())
-            .map(|(k, _)| k.value())
+            .map(|(k, v)| (k.value(), v.value()))
             .collect();
         
         Ok(slices)

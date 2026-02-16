@@ -412,6 +412,13 @@ impl FileSystemContext for StudioFsContext {
                     }
                 }
             }
+        } else {
+            // Not deleting — flush buffered writes
+            // WinFSP "Cleanup" with no delete flag is the standard place to flush.
+            // We use block_on because we are in a WinFSP thread context.
+            if let Err(e) = self.rt.block_on(self.vfs.flush(context.ino)) {
+                error!(ino = context.ino, "cleanup flush failed: {:?}", e);
+            }
         }
     }
 
