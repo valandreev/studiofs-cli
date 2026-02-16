@@ -14,3 +14,9 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+opendal.workspace = true
+bytes.workspace = true
