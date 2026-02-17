@@ -1,6 +1,6 @@
-//! Disk cache — persistent block cache with LRU eviction and disk space monitoring.
+//! DiskCache — persistent object cache with LRU eviction and disk space monitoring.
 //!
-//! Blocks are stored as individual files in a cache directory.
+//! Objects are stored as individual files in a cache directory, keyed by their 64-bit hash.
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -9,9 +9,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use studiofs_meta::Ino;
+use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
@@ -20,6 +20,12 @@ pub enum DiskCacheError {
 
     #[error("cache directory not found: {0}")]
     NoCacheDir(String),
+
+    #[error("task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    #[error("other: {0}")]
+    Other(String),
 }
 
 pub type DiskCacheResult<T> = Result<T, DiskCacheError>;
@@ -27,18 +33,14 @@ pub type DiskCacheResult<T> = Result<T, DiskCacheError>;
 /// Entry in the LRU tracking.
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    /// Size of cached data in bytes.
+    /// Size of cached object in bytes.
     size: u64,
     /// Last access time (for LRU).
     last_access: Instant,
 }
 
-/// Key for a disk cache entry.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct DiskCacheKey {
-    slice_id: u64,
-    block_index: u32,
-}
+/// Key for a disk cache entry (Object ID / Hash).
+type ObjectId = u64;
 
 /// Persistent disk cache with size-based and free-space-based eviction.
 pub struct DiskCache {
@@ -48,22 +50,26 @@ pub struct DiskCache {
     /// Minimum free disk space ratio (0.0-1.0, default 0.15 = 15%).
     min_free_ratio: f64,
     /// Track cached entries for LRU eviction.
-    entries: Mutex<BTreeMap<DiskCacheKey, CacheEntry>>,
+    entries: Mutex<BTreeMap<ObjectId, CacheEntry>>,
+    /// Set of pinned objects (prevent eviction).
+    pinned: Mutex<std::collections::HashSet<ObjectId>>,
     /// Current total cache size.
     current_size: Mutex<u64>,
 }
 
 impl DiskCache {
     /// Create a new disk cache.
-    pub fn new(cache_dir: impl AsRef<Path>, max_size_bytes: u64) -> DiskCacheResult<Self> {
+    pub fn new(cache_dir: impl AsRef<Path>, max_size_bytes: u64) -> DiskCacheResult<Arc<Self>> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&cache_dir)?;
+        let objects_dir = cache_dir.join("objects");
+        fs::create_dir_all(&objects_dir)?;
 
         let cache = Self {
-            cache_dir,
+            cache_dir: objects_dir, // We primarily work in the objects subdir
             max_size: max_size_bytes,
             min_free_ratio: 0.15,
             entries: Mutex::new(BTreeMap::new()),
+            pinned: Mutex::new(std::collections::HashSet::new()),
             current_size: Mutex::new(0),
         };
 
@@ -75,6 +81,22 @@ impl DiskCache {
             cache.cache_dir,
             cache.max_size / (1024 * 1024 * 1024)
         );
+        
+        // Wrap in Arc for background monitoring
+        let cache = Arc::new(cache);
+        
+        // Spawn background GC monitor
+        let monitor_cache = cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
+            loop {
+                interval.tick().await;
+                if let Err(e) = monitor_cache.enforce_limits().await {
+                    error!("disk cache background GC failed: {}", e);
+                }
+            }
+        });
+
         Ok(cache)
     }
 
@@ -104,14 +126,14 @@ impl DiskCache {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.is_file() {
-                    if let Some(key) = self.parse_cache_filename(&path) {
+                    if let Some(id) = self.parse_filename(&path) {
                         if let Ok(meta) = entry.metadata() {
                             let size = meta.len();
                             entries.insert(
-                                key,
+                                id,
                                 CacheEntry {
                                     size,
-                                    last_access: Instant::now(),
+                                    last_access: Instant::now(), // Assume recent? Or file mtime? Mtime better but costly.
                                 },
                             );
                             total_size += size;
@@ -126,71 +148,91 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Get the file path for a cache entry.
-    /// Format: `cache_dir/{hash1}/{hash2}/{sliceId}_{blockIndex}_{blockSize}`
-    fn cache_path(&self, slice_id: u64, block_index: u32, block_size: u32) -> PathBuf {
-        let hash1 = slice_id / 1_000_000;
-        let hash2 = slice_id / 1_000;
-        let filename = format!("{}_{}_{}", slice_id, block_index, block_size);
+    /// Get the file path for an object.
+    fn object_path(&self, id: ObjectId) -> PathBuf {
+        let hash_str = format!("{:016x}", id); // 16 chars hex
+        let prefix = &hash_str[0..2];
+        let sub_prefix = &hash_str[2..4];
         
         self.cache_dir
-            .join(hash1.to_string())
-            .join(hash2.to_string())
-            .join(filename)
+            .join(prefix)
+            .join(sub_prefix)
+            .join(&hash_str)
     }
 
-    /// Parse a cache filename back to a key.
-    fn parse_cache_filename(&self, path: &Path) -> Option<DiskCacheKey> {
+    /// Parse a filename back to ObjectId.
+    fn parse_filename(&self, path: &Path) -> Option<ObjectId> {
         let name = path.file_name()?.to_str()?;
-        let mut parts = name.split('_');
-        let slice_id: u64 = parts.next()?.parse().ok()?;
-        let block_index: u32 = parts.next()?.parse().ok()?;
-        // block_size is the 3rd part, but we don't need it for the key
-        Some(DiskCacheKey { slice_id, block_index })
+        u64::from_str_radix(name, 16).ok()
     }
 
-    /// Read a block from disk cache.
-    pub fn get(&self, slice_id: u64, block_index: u32, block_size: u32) -> DiskCacheResult<Option<Bytes>> {
-        let path = self.cache_path(slice_id, block_index, block_size);
-        if !path.exists() {
-            return Ok(None);
+    /// Read an object from disk cache.
+    pub async fn get_object(&self, id: ObjectId) -> DiskCacheResult<Option<Bytes>> {
+        let path = self.object_path(id);
+        
+        let data = tokio::task::spawn_blocking(move || -> std::io::Result<Option<Bytes>> {
+            if !path.exists() {
+                return Ok(None);
+            }
+            let mut file = fs::File::open(&path)?;
+            let mut data = Vec::new(); // We don't know size easily without lookup
+            file.read_to_end(&mut data)?;
+            Ok(Some(Bytes::from(data)))
+        }).await??;
+
+        if data.is_some() {
+            // Update last access time
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.get_mut(&id) {
+                entry.last_access = Instant::now();
+            } else {
+                 // Inconsistency? Re-add
+                 if let Some(d) = &data {
+                     entries.insert(id, CacheEntry {
+                         size: d.len() as u64,
+                         last_access: Instant::now(),
+                     });
+                 }
+            }
         }
 
-        let mut file = fs::File::open(&path)?;
-        let mut data = Vec::with_capacity(block_size as usize);
-        file.read_to_end(&mut data)?;
-
-        // Update last access time
-        let key = DiskCacheKey { slice_id, block_index };
-        if let Some(entry) = self.entries.lock().get_mut(&key) {
-            entry.last_access = Instant::now();
-        }
-
-        Ok(Some(Bytes::from(data)))
+        Ok(data)
     }
 
-    /// Write a block to disk cache.
-    pub fn put(&self, slice_id: u64, block_index: u32, data: &[u8]) -> DiskCacheResult<()> {
+    /// Write an object to disk cache.
+    pub async fn put_object(&self, id: ObjectId, data: &[u8]) -> DiskCacheResult<()> {
         let size = data.len() as u64;
-        let block_size = data.len() as u32;
 
         // Evict if needed
-        self.evict_to_fit(size)?;
+        self.reserve_space(size).await?;
 
-        let path = self.cache_path(slice_id, block_index, block_size);
+        let path = self.object_path(id);
+        let data_vec = data.to_vec(); // Clone data for the thread
         
-        // Ensure parent dirs exist
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            // Ensure parent dirs exist
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
+            // Atomic write: write to temp then rename
+            // BUT: temp file needs to be on same volume.
+            // We use a `.tmp` suffix on the final path.
+            let tmp_path = path.with_extension("tmp");
+            
+            {
+                let mut file = fs::File::create(&tmp_path)?;
+                file.write_all(&data_vec)?;
+                // file.sync_all()?; // OMITTED FOR PERFORMANCE
+            }
+            
+            fs::rename(&tmp_path, &path)?;
+            Ok(())
+        }).await??;
 
-        let mut file = fs::File::create(&path)?;
-        file.write_all(data)?;
-
-        let key = DiskCacheKey { slice_id, block_index };
         let mut entries = self.entries.lock();
         if let Some(old) = entries.insert(
-            key,
+            id,
             CacheEntry {
                 size,
                 last_access: Instant::now(),
@@ -203,85 +245,107 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Remove a block from disk cache.
-    pub fn remove(&self, slice_id: u64, block_index: u32, block_size: u32) -> DiskCacheResult<()> {
-        let path = self.cache_path(slice_id, block_index, block_size);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
+    /// Delete an object from cache.
+    pub async fn remove_object(&self, id: ObjectId) -> DiskCacheResult<()> {
+        let path = self.object_path(id);
+        
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            if path.exists() {
+                fs::remove_file(&path)?;
+            }
+            Ok(())
+        }).await??;
 
-        let key = DiskCacheKey { slice_id, block_index };
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.remove(&key) {
+        if let Some(entry) = entries.remove(&id) {
             *self.current_size.lock() -= entry.size;
         }
 
         Ok(())
     }
 
-    /// Remove all cache entries for an inode.
-    ///
-    /// NOTE: With slice-based caching, we don't have an easy way to invalidate
-    /// all blocks for a file. However, since new writes generate new slice IDs,
-    /// old blocks naturally become cold and will be LRU evicted.
-    pub fn invalidate_inode(&self, _ino: Ino) -> DiskCacheResult<()> {
-        // No-op for now
-        Ok(())
+    /// Check if object exists.
+    pub fn exists(&self, id: ObjectId) -> bool {
+        self.entries.lock().contains_key(&id)
     }
 
-    /// Evict LRU entries until we have space for `needed` bytes.
-    fn evict_to_fit(&self, needed: u64) -> DiskCacheResult<()> {
-        let mut entries = self.entries.lock();
-        let mut current = self.current_size.lock();
+    /// Reserve space for `needed` bytes by evicting LRU.
+    /// Also checks free disk space.
+    pub async fn reserve_space(&self, needed: u64) -> DiskCacheResult<()> {
+        self.evict_lru(needed).await
+    }
 
-        // Check disk space
-        let needs_space_eviction = self.is_disk_space_low();
+    /// Enforce size and disk space limits (Background GC).
+    pub async fn enforce_limits(&self) -> DiskCacheResult<()> {
+        self.evict_lru(0).await
+    }
 
-        while *current + needed > self.max_size || needs_space_eviction {
-            // Find LRU entry
-            let lru_key = entries
-                .iter()
-                .min_by_key(|(_, v)| v.last_access)
-                .map(|(k, _)| k.clone());
+    /// Pin an object to prevent it from being evicted.
+    pub fn pin(&self, id: ObjectId) {
+        self.pinned.lock().insert(id);
+    }
 
-            if let Some(key) = lru_key {
-                if let Some(entry) = entries.remove(&key) {
-                    // We can't easily reconstruct the full path for removal without storing block_size
-                    // But we can approximate or find the file.
-                    // Actually, let's just make parse_cache_filename more robust or store path?
-                    // For now, we only store key. We can scan directory or just ignore file removal error if name guess failed?
-                    // Better: entries should probably store expected block_size too?
-                    // Or we just rely on the fact that file name is `{slice}_{block}_{size}`.
-                    // We need `block_size` to reconstruct path.
-                    // Let's check `entries` value. `CacheEntry` has `size`.
-                    // So we can assume `block_size` == `entry.size` (mostly true for full blocks).
-                    // If it's a partial block... we write `block_size` in filename.
-                    // S3 blocks are usually 4MB.
-                    
-                    let block_size = entry.size as u32; // This might be wrong if we wrote < 4MB.
-                    // But wait, `put` writes `block_size` into filename.
-                    // And `scan_existing` reads `meta.len()`.
-                    // If we trust `entry.size` matches the filename size...
-                    
-                    let path = self.cache_path(key.slice_id, key.block_index, block_size);
-                    if let Err(e) = fs::remove_file(&path) {
-                         // Try to find the file if size mismatch?
-                         // For now just warn.
-                         warn!("failed to remove cache file {:?}: {e}", path);
-                    }
-                    *current = current.saturating_sub(entry.size);
-                    debug!(
-                        slice_id = key.slice_id,
-                        block_idx = key.block_index,
-                        "evicted from disk cache"
-                    );
+    /// Unpin an object, allowing it to be evicted.
+    pub fn unpin(&self, id: ObjectId) {
+        self.pinned.lock().remove(&id);
+    }
+
+    /// Evict LRU entries until we fit `incoming_size` AND satisfy disk space requirements.
+    async fn evict_lru(&self, incoming_size: u64) -> DiskCacheResult<()> {
+        loop {
+            // 1. Check if we satisfy constraints
+            let needs_eviction = {
+                let current = *self.current_size.lock();
+                if current + incoming_size > self.max_size {
+                    true
+                } else {
+                    // Size is OK, check disk space (async)
+                    false
                 }
+            };
+
+            let needs_eviction = if needs_eviction {
+                true
             } else {
+                // Only check disk space if size is fine
+                self.is_disk_space_low().await
+            };
+
+            if !needs_eviction {
                 break;
             }
 
-            // Re-check after eviction
-            if *current + needed <= self.max_size && !self.is_disk_space_low() {
+            // 2. Need eviction, find candidate
+            let (to_evict, path_to_delete) = {
+                let mut entries = self.entries.lock();
+                let pinned = self.pinned.lock();
+
+                let lru_id = entries
+                    .iter()
+                    .filter(|(k, _)| !pinned.contains(k)) // Skip pinned
+                    .min_by_key(|(_, v)| v.last_access)
+                    .map(|(k, _)| *k);
+
+                match lru_id {
+                    Some(id) => {
+                         let entry = entries.remove(&id).unwrap(); // safe query
+                         *self.current_size.lock() -= entry.size;
+                         debug!(id = %format!("{:x}", id), "evicted from disk cache");
+                         (Some(id), self.object_path(id))
+                    }
+                    None => (None, PathBuf::new())
+                }
+            }; 
+
+            if let Some(_id) = to_evict {
+                // Perform deletion outside lock
+                let path = path_to_delete;
+                let path_clone = path.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || fs::remove_file(&path_clone)).await? {
+                     warn!("failed to remove cache file {:?}: {}", path, e);
+                }
+            } else {
+                // No more candidates
                 break;
             }
         }
@@ -290,24 +354,31 @@ impl DiskCache {
     }
 
     /// Check if disk space is below the minimum free ratio.
-    fn is_disk_space_low(&self) -> bool {
-        match get_free_disk_space(&self.cache_dir) {
-            Some((free, total)) => {
-                let ratio = free as f64 / total as f64;
-                if ratio < self.min_free_ratio {
-                    warn!(
-                        "disk space low: {:.1}% free ({} / {} bytes)",
-                        ratio * 100.0,
-                        free,
-                        total
-                    );
-                    true
-                } else {
-                    false
+    /// Made async-friendly (blocking call wrapped).
+    async fn is_disk_space_low(&self) -> bool {
+        let path = self.cache_dir.clone();
+        let min_ratio = self.min_free_ratio;
+        
+        tokio::task::spawn_blocking(move || {
+            match get_free_disk_space(&path) {
+                Some((free, total)) => {
+                    if total == 0 { return false; }
+                    let ratio = free as f64 / total as f64;
+                    if ratio < min_ratio {
+                        warn!(
+                            "disk space low: {:.1}% free ({} / {} bytes)",
+                            ratio * 100.0,
+                            free,
+                            total
+                        );
+                        true
+                    } else {
+                        false
+                    }
                 }
+                None => false,
             }
-            None => false, // can't check, assume OK
-        }
+        }).await.unwrap_or(false)
     }
 
     /// Current cache size in bytes.

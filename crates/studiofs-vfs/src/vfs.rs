@@ -2,15 +2,18 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::Arc;
-use studiofs_cache::memory::{CacheKey, MemoryCache};
+use studiofs_cache::memory::MemoryCache;
 use studiofs_cache::disk::DiskCache;
 use studiofs_data::store::DataStore;
 use studiofs_data::object::{
-    self, create_object, read_object, hash_object, ObjectPayload, ObjectKind, Objectlink,
+    create_object, read_object, hash_object, ObjectPayload, ObjectKind, Objectlink,
 };
 use studiofs_meta::*;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, error};
+use studiofs_cache::writeback::{WritebackManager, PendingOp};
+use parking_lot::Mutex;
+
 
 #[derive(Debug, Error)]
 pub enum VfsError {
@@ -25,6 +28,9 @@ pub enum VfsError {
 
     #[error("disk cache error: {0}")]
     DiskCache(#[from] studiofs_cache::disk::DiskCacheError),
+
+    #[error("task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
 
     #[error("{0}")]
     Other(String),
@@ -57,15 +63,30 @@ impl Default for VfsConfig {
 }
 
 /// The core VFS — satisfies filesystem operations using metadata + data + cache.
+#[derive(Clone)]
 pub struct StudioVfs {
     meta: Arc<RedbMetaEngine>,
     data: Arc<DataStore>,
     mem_cache: Arc<MemoryCache>,
     disk_cache: Arc<DiskCache>,
-    // Pending writes buffer: (ino, chunk_idx, block_idx) -> (start_offset_in_block, data)
-    pending_writes: Arc<tokio::sync::Mutex<std::collections::HashMap<(Ino, u32, u32), (u32, BytesMut)>>>,
-    // Notify background uploader when new slices are pending
-    upload_notify: Arc<tokio::sync::Notify>,
+    
+    // RAM buffer for current blocks: (ino, chunk_idx, block_idx) -> (start_offset_in_block, data)
+    pending_writes: Arc<Mutex<std::collections::HashMap<(Ino, u32, u32), (u32, BytesMut)>>>,
+    
+    // Memory cache for Attributes (size, mtime) to avoid Redb hits on every write
+    dirty_attrs: Arc<Mutex<std::collections::HashMap<Ino, InodeAttr>>>,
+    
+    // Pending links (completed blocks not yet committed to metadata): ino -> list of links
+    pending_links: Arc<Mutex<std::collections::HashMap<Ino, Vec<Objectlink>>>>,
+    
+    // Track active disk flush tasks
+    active_flushes: Arc<Mutex<std::collections::HashMap<Ino, Vec<tokio::task::JoinHandle<VfsResult<()>>>>>>,
+    
+    // Limit global concurrent disk flushes (e.g. 32)
+    flush_semaphore: Arc<tokio::sync::Semaphore>,
+    
+    // Writeback Manager for persistent queuing
+    writeback: Arc<WritebackManager>,
 }
 
 impl StudioVfs {
@@ -74,16 +95,91 @@ impl StudioVfs {
         meta: Arc<RedbMetaEngine>,
         data: Arc<DataStore>,
         mem_cache: Arc<MemoryCache>,
-        disk_cache: Arc<DiskCache>,
-    ) -> Self {
-        Self {
+        
+        // Configs
+        cache_dir: &str,
+        cache_size: u64,
+    ) -> VfsResult<Arc<Self>> {
+        // Init Disk Cache
+        let disk_cache = DiskCache::new(cache_dir, cache_size)?; // Use provided size
+        
+        // Init Writeback Manager
+        let (writeback, upload_rx) = WritebackManager::new(cache_dir, disk_cache.clone());
+
+        let vfs = Arc::new(Self {
             meta,
             data,
             mem_cache,
             disk_cache,
-            pending_writes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            upload_notify: Arc::new(tokio::sync::Notify::new()),
-        }
+            pending_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            dirty_attrs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_links: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            active_flushes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            flush_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
+            writeback,
+        });
+
+        // Spawn Upload Worker
+        let vfs_clone = vfs.clone();
+        tokio::spawn(async move {
+            vfs_clone.background_uploader(upload_rx).await;
+        });
+
+        Ok(vfs)
+    }
+    
+    /// Background task to process pending uploads.
+    /// Background task to process pending uploads.
+    async fn background_uploader(self: Arc<Self>, rx: tokio::sync::mpsc::UnboundedReceiver<PendingOp>) {
+        info!("background uploader started");
+        
+        use futures::stream::StreamExt;
+        
+        let self_ref = &self;
+        // Use a simpler approach: spawn a task for each upload, but limit concurrency via a semaphore or just buffer_unordered on a stream of futures.
+        // Since rx is a receiver, we can turn it into a stream.
+        
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        
+        const CONCURRENCY: usize = 32; // Parallel uploads
+
+        stream.for_each_concurrent(CONCURRENCY, |op| async move {
+            // 1. Read from DiskCache (async)
+            let data_opt = match self_ref.disk_cache.get_object(op.object_id).await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("disk cache error for {}: {}", op.object_id, e);
+                    return;
+                }
+            };
+            
+            if let Some(data) = data_opt {
+                // 2. Upload to S3 (if not exists)
+                let id_str = format!("{:016x}", op.object_id);
+                let key = self_ref.data.object_key(&id_str);
+                
+                // Optimistic check
+                let needs_upload = match self_ref.data.exists(&key).await {
+                     Ok(exists) => !exists,
+                     Err(_) => true, 
+                };
+                
+                if needs_upload {
+                     if let Err(e) = self_ref.data.put_object(&id_str, data).await {
+                         error!("failed to upload object {}: {}", op.object_id, e);
+                         // Retry logic would go here, maybe re-queue?
+                         return; 
+                     }
+                }
+                
+                // 3. Mark Complete
+                self_ref.writeback.complete(&op);
+                debug!("background upload complete: {}", op.object_id);
+
+            } else {
+                error!("pending upload object {} missing from disk cache", op.object_id);
+            }
+        }).await;
     }
 
     /// Get metadata engine reference.
@@ -105,12 +201,18 @@ impl StudioVfs {
 
     /// Get file attributes.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        // 1. Check dirty attrs cache (RAM speed)
+        if let Some(attr) = self.dirty_attrs.lock().get(&ino) {
+            return Ok(attr.clone());
+        }
+        
+        // 2. Fetch from Redb
         Ok(self.meta.get_attr(ino)?)
     }
 
     /// Set file attributes (partial update).
     pub fn setattr(&self, ino: Ino, size: Option<u64>) -> VfsResult<InodeAttr> {
-        let mut attr = self.meta.get_attr(ino)?;
+        let mut attr = self.getattr(ino)?;
 
         if let Some(new_size) = size {
             attr.size = new_size;
@@ -118,6 +220,12 @@ impl StudioVfs {
         }
 
         attr.touch_mtime();
+        
+        // Store in dirty cache IMMEDIATELY
+        self.dirty_attrs.lock().insert(ino, attr.clone());
+        
+        // Commit asynchronously or on flush? 
+        // For setattr, let's commit immediately to Redb to be safe, but we've already updated the cache.
         self.meta.set_attr(&attr)?;
         Ok(attr)
     }
@@ -200,23 +308,72 @@ impl StudioVfs {
         }
         let effective_size = (end - offset) as usize;
 
-        // Try memory cache first
-        let cache_key = CacheKey::new(ino, offset);
-        if let Some(data) = self.mem_cache.get(&cache_key) {
-            if data.len() >= effective_size {
-                debug!(ino, offset, size = effective_size, "memory cache hit");
-                return Ok(data.slice(..effective_size));
+        // Read loop (block aligned)
+        let mut result = BytesMut::with_capacity(effective_size);
+        let mut current_offset = offset;
+        let mut remaining = effective_size;
+
+        while remaining > 0 {
+            let block_start = (current_offset / BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+            let offset_in_block = (current_offset - block_start) as usize;
+
+            
+            // Should we clamp available to BLOCK_SIZE? Yes.
+            let block_len = if block_start + BLOCK_SIZE as u64 > attr.size {
+                (attr.size - block_start) as usize
+            } else {
+                BLOCK_SIZE as usize
+            };
+            
+            // Try cache
+            let cache_key = studiofs_cache::memory::CacheKey::new(ino, block_start);
+            let block_data: Bytes;
+            
+            if let Some(cached) = self.mem_cache.get(&cache_key) {
+                 block_data = cached;
+            } else {
+                 // Fetch full block (or up to EOF)
+                 block_data = self.read_from_storage(ino, block_start, block_len, &attr).await?;
+                 
+                 // Cache it
+                 self.mem_cache.put(cache_key, block_data.clone());
             }
+
+            // Copy slice
+            let to_copy = remaining.min(block_data.len().saturating_sub(offset_in_block));
+            if to_copy == 0 {
+                 break; // EOF or error
+            }
+
+            result.extend_from_slice(&block_data[offset_in_block..offset_in_block + to_copy]);
+
+            current_offset += to_copy as u64;
+            remaining -= to_copy;
         }
 
-        // Fetch from S3 via chunk/slice resolution
-        // This will now handle disk cache internally per-block
-        let data = self.read_from_storage(ino, offset, effective_size, &attr).await?;
+        Ok(result.freeze())
 
-        // Store in memory cache
-        self.mem_cache.put(cache_key, data.clone());
-        
-        // Disk cache population moved to read_from_storage -> fetch_slice_range
+    }
+
+    /// Resolve chunk/slice/block data from S3 storage.
+    /// Fetch object data from Disk Cache or S3.
+    async fn get_object_with_cache(&self, object_id: &str) -> VfsResult<Bytes> {
+        let oid_u64 = u64::from_str_radix(object_id, 16).map_err(|e| VfsError::Other(e.to_string()))?;
+
+        // 1. Try Disk Cache
+        if let Some(data) = self.disk_cache.get_object(oid_u64).await? {
+            // debug!("disk cache hit: {}", object_id);
+            return Ok(data);
+        }
+
+        debug!("disk cache miss: {}, fetching from S3", object_id);
+
+        // 2. Fetch from S3
+        let data = self.data.get_object(object_id).await
+            .map_err(|e| VfsError::Data(e))?;
+
+        // 3. Populate Disk Cache
+        self.disk_cache.put_object(oid_u64, &data).await?;
 
         Ok(data)
     }
@@ -236,8 +393,13 @@ impl StudioVfs {
         };
 
         // 2. Fetch & Parse Root Object
-        let root_bytes = self.data.get_object(&root_id).await
-            .map_err(|e| VfsError::Data(e))?;
+        let root_bytes = match self.get_object_with_cache(&root_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("failed to read root object {}: {}", root_id, e);
+                return Err(e);
+            }
+        };
         
         let root_payload_bytes = read_object(&root_bytes)
             .map_err(|e| VfsError::Other(e.to_string()))?;
@@ -246,69 +408,83 @@ impl StudioVfs {
              .map_err(|e| VfsError::Other(e.to_string()))?;
 
         // 3. Resolve Data
-        let mut result = BytesMut::with_capacity(size);
-        let mut remaining = size;
-        let mut current_offset = offset;
+        let mut result = BytesMut::zeroed(size);
+        let current_offset = offset;
 
         match root_payload.kind {
             ObjectKind::Data => {
                 // Single object file. Assume it starts at 0.
                 if current_offset < root_payload.data.len() as u64 {
-                    let end = (current_offset + remaining as u64).min(root_payload.data.len() as u64);
+                    let end = (current_offset + size as u64).min(root_payload.data.len() as u64);
                     let len = (end - current_offset) as usize;
-                    result.extend_from_slice(&root_payload.data[current_offset as usize..end as usize]);
-                    remaining -= len;
-                }
-                // Fill rest with zeroes if any
-                if remaining > 0 {
-                    result.extend_from_slice(&vec![0u8; remaining]);
+                    result[0..len].copy_from_slice(&root_payload.data[current_offset as usize..end as usize]);
                 }
             }
             ObjectKind::Meta => {
-                // Tree traversal
-                while remaining > 0 {
-                     if let Some(link) = root_payload.find_child(current_offset) {
-                         // Fetch child
-                         // Optimization: cache child objects?
-                         let child_bytes = self.data.get_object(&link.object_id).await?;
-                         let child_payload_bytes = read_object(&child_bytes)
-                             .map_err(|e| VfsError::Other(e.to_string()))?;
-                         let child_payload = ObjectPayload::from_bytes(&child_payload_bytes)
-                             .map_err(|e| VfsError::Other(e.to_string()))?;
-                         
-                         match child_payload.kind {
-                             ObjectKind::Data => {
-                                 // Calculate relative offset
-                                 let off_in_child = current_offset - link.offset;
-                                 let available = (link.length as u64).saturating_sub(off_in_child);
-                                 let to_read = (remaining as u64).min(available) as usize;
-                                 
-                                 if to_read > 0 {
-                                     result.extend_from_slice(&child_payload.data[off_in_child as usize..off_in_child as usize + to_read]);
-                                     remaining -= to_read;
-                                     current_offset += to_read as u64;
-                                 } else {
-                                     // Should not happen if find_child is correct
-                                     break; 
-                                 }
-                             }
-                             ObjectKind::Meta => {
-                                 // Nested tree? For now, we only support 1 level of nesting (Root -> Data).
-                                 // Recursing would need a separate function.
-                                 // Let's error or skip. 
-                                 return Err(VfsError::Other("Nested meta objects not yet supported".into()));
-                             }
-                         }
-                     } else {
-                         // Hole
-                         // Find next child to determine hole size, or just 1 byte?
-                         // Optim: skip to next child start or end of read
-                         // For now, read 4KB zeroes?
-                         let hole_size = remaining.min(4096);
-                         result.extend_from_slice(&vec![0u8; hole_size]);
-                         remaining -= hole_size;
-                         current_offset += hole_size as u64;
-                     }
+                // Identify all children overlapping the requested range
+                let end_offset = offset + size as u64;
+                let children_to_fetch: Vec<Objectlink> = root_payload.children.iter()
+                    .filter(|child| {
+                        let child_end = child.offset + child.length as u64;
+                        // Overlap check
+                        !(end_offset <= child.offset || offset >= child_end)
+                    })
+                    .cloned()
+                    .collect();
+
+                if children_to_fetch.is_empty() {
+                    return Ok(result.freeze());
+                }
+
+                // Parallel fetch
+                use futures::stream::{self, StreamExt};
+                
+                // Concurrency limit
+                const CONCURRENCY: usize = 16; 
+
+                let fetch_stream = stream::iter(children_to_fetch)
+                    .map(|link| {
+                        let self_ref = &self;
+                        async move {
+                            let child_bytes = self_ref.get_object_with_cache(&link.object_id).await?;
+                            let child_payload_bytes = read_object(&child_bytes)
+                                .map_err(|e| VfsError::Other(e.to_string()))?;
+                            let child_payload = ObjectPayload::from_bytes(&child_payload_bytes)
+                                .map_err(|e| VfsError::Other(e.to_string()))?;
+                            
+                            Ok::<_, VfsError>((link, child_payload))
+                        }
+                    })
+                    .buffer_unordered(CONCURRENCY);
+
+                let mut stream = fetch_stream;
+                
+                while let Some(fetch_result) = stream.next().await {
+                    match fetch_result {
+                        Ok((link, payload)) => {
+                            if let ObjectKind::Data = payload.kind {
+                                // Calculate overlap with request
+                                // Request: [offset, offset + size)
+                                // Child: [link.offset, link.offset + link.length)
+                                
+                                let start = offset.max(link.offset);
+                                let end = (offset + size as u64).min(link.offset + link.length as u64);
+                                
+                                if start < end {
+                                    let len = (end - start) as usize;
+                                    let dest_off = (start - offset) as usize;
+                                    let src_off = (start - link.offset) as usize;
+                                    
+                                    result[dest_off..dest_off + len]
+                                        .copy_from_slice(&payload.data[src_off..src_off + len]);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("failed to fetch child object: {}", e);
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -316,87 +492,7 @@ impl StudioVfs {
         Ok(result.freeze())
     }
 
-    /// Fetch a range of data from a slice by reading the appropriate blocks.
-    async fn fetch_slice_range(
-        &self,
-        slice_id: u64,
-        slice_size: u32,
-        off_in_slice: u32,
-        len: u32,
-    ) -> VfsResult<Bytes> {
-        let bs = BLOCK_SIZE as u64;
-        let mut result = BytesMut::with_capacity(len as usize);
-        let mut remaining = len as u64;
-        let mut pos = off_in_slice as u64;
 
-        while remaining > 0 {
-            let block_idx = (pos / bs) as u32;
-            let offset_in_block = pos % bs;
-            let block_actual_size = if (block_idx + 1) as u64 * bs > slice_size as u64 {
-                slice_size as u64 - block_idx as u64 * bs
-            } else {
-                bs
-            };
-
-            let to_read = remaining.min(block_actual_size - offset_in_block);
-
-            // Try disk cache first
-            let block_actual_u32 = block_actual_size as u32;
-            let cached_block = self.disk_cache.get(slice_id, block_idx, block_actual_u32)?;
-
-            let block_data = if let Some(data) = cached_block {
-                if offset_in_block == 0 && to_read == block_actual_size {
-                    data
-                } else {
-                     data.slice(offset_in_block as usize..(offset_in_block + to_read) as usize)
-                }
-            } else {
-                // Disk cache miss — fetch from S3
-                let fetched_data = if offset_in_block == 0 && to_read == block_actual_size {
-                    // Read full block
-                    self.data
-                        .get_block(slice_id, block_idx, block_actual_u32)
-                        .await?
-                } else {
-                    // Read partial block (range request)
-                    // NOTE: use get_block_range only if we don't want to cache the full block.
-                    // But for L2 cache, we usually want to cache the full block?
-                    // If we only read a range, we can't cache the full block unless we download it all.
-                    // For performance, if we have a disk cache, maybe we SHOULD download the full block?
-                    // For now, let's stick to range read if it's partial, but we WON'T cache it to disk
-                    // unless we fetched the whole thing.
-                    
-                    // Optimization: If cache is enabled, maybe always fetch full block?
-                    // Let's keep it simple: only cache if we fetched full block or if we decide to fetch full block.
-                    // Since specific requirement wasn't to change read behavior aggressively,
-                    // let's stick to existing logic but only put to cache if we have full block.
-                    
-                    self.data
-                        .get_block_range(
-                            slice_id,
-                            block_idx,
-                            block_actual_u32,
-                            offset_in_block,
-                            to_read,
-                        )
-                        .await?
-                };
-
-                // Populate disk cache if we fetched a full block (and it matches expected size)
-                if fetched_data.len() as u64 == block_actual_size {
-                     self.disk_cache.put(slice_id, block_idx, &fetched_data)?;
-                }
-                
-                fetched_data
-            };
-
-            result.extend_from_slice(&block_data);
-            pos += to_read;
-            remaining -= to_read;
-        }
-
-        Ok(result.freeze())
-    }
 
     // ─── Write Path ──────────────────────────────────────────────────────
 
@@ -405,14 +501,13 @@ impl StudioVfs {
     /// Buffers writes into 4MiB blocks. Uploads only when a block is full.
     /// Partial blocks are kept in memory until `flush` is called (or next write fills them).
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        let mut written = 0;
+        let mut written = 0u64;
         let mut remaining = data.len();
         let mut current_offset = offset;
         let mut data_offset = 0;
 
         let bs = BLOCK_SIZE as u64; // 4MiB
 
-        // We need to iterate block by block to buffer correctly
         while remaining > 0 {
             let chunk_key = ChunkKey::from_offset(ino, current_offset);
             let offset_in_chunk = current_offset % CHUNK_SIZE;
@@ -421,238 +516,224 @@ impl StudioVfs {
 
             let space_in_block = BLOCK_SIZE as usize - offset_in_block;
             let to_write = remaining.min(space_in_block);
-
-            // Append to pending buffer
-            let mut pending = self.pending_writes.lock().await;
-            let key = (ino, chunk_key.index, block_idx_in_chunk);
-            let (start_off, buffer) = pending.entry(key).or_insert_with(|| (offset_in_block as u32, BytesMut::with_capacity(BLOCK_SIZE as usize)));
             
-            // If we are writing outside the current buffered range, flush and restart
-            let buf_end = *start_off + buffer.len() as u32;
-            if (offset_in_block as u32) < *start_off || (offset_in_block as u32) > buf_end {
-                // Gap or jump! Flush current part.
-                let data = buffer.clone();
-                let old_start = *start_off;
-                self.flush_block(ino, chunk_key.index, block_idx_in_chunk, old_start, &data).await?;
+            // LOCK: Rapid sync access to buffers
+            let mut flush_gap_data = None;
+            let mut flush_full_data = None;
+            {
+                let mut pending = self.pending_writes.lock();
+                let key = (ino, chunk_key.index, block_idx_in_chunk);
+                let (start_off, buffer) = pending.entry(key).or_insert_with(|| (offset_in_block as u32, BytesMut::with_capacity(BLOCK_SIZE as usize)));
                 
-                // Reset buffer to new start
-                *start_off = offset_in_block as u32;
-                buffer.clear();
-            }
+                // If we are writing outside the current buffered range, flush and restart
+                let buf_end = *start_off + buffer.len() as u32;
+                if (offset_in_block as u32) < *start_off || (offset_in_block as u32) > buf_end {
+                    flush_gap_data = Some((buffer.clone().freeze(), *start_off));
+                    *start_off = offset_in_block as u32;
+                    buffer.clear();
+                }
 
-            // Relative offset in current buffer
-            let rel_off = (offset_in_block as u32 - *start_off) as usize;
-
-            if rel_off < buffer.len() {
-                 // Overwrite/Append mix
-                 for i in 0..to_write {
-                     let p = rel_off + i;
-                     if p < buffer.len() {
-                         buffer[p] = data[data_offset + i];
-                     } else {
-                         buffer.put_u8(data[data_offset + i]);
+                // Append to buffer
+                let rel_off = (offset_in_block as u32 - *start_off) as usize;
+                if rel_off < buffer.len() {
+                     for i in 0..to_write {
+                         let p = rel_off + i;
+                         if p < buffer.len() { buffer[p] = data[data_offset + i]; } else { buffer.put_u8(data[data_offset + i]); }
                      }
-                 }
-            } else {
-                // Clean append to buffer
-                buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
-            }
+                } else {
+                    buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
+                }
 
-            // If block is full (4MiB), flush it immediately
-            if buffer.len() >= BLOCK_SIZE as usize {
-                let data = buffer.clone();
-                let off = *start_off;
-                self.flush_block(ino, chunk_key.index, block_idx_in_chunk, off, &data).await?;
-                pending.remove(&key);
-            }
+                if buffer.len() >= BLOCK_SIZE as usize {
+                    flush_full_data = Some((buffer.clone().freeze(), *start_off));
+                    pending.remove(&key);
+                }
+            } // UNLOCK
 
-            written += to_write;
+            // ASYNC FLUSH tasks
+            if let Some((d, off)) = flush_gap_data { self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d); }
+            if let Some((d, off)) = flush_full_data { self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d); }
+
+            written += to_write as u64;
             remaining -= to_write;
             current_offset += to_write as u64;
             data_offset += to_write;
         }
 
-        // Update file size in metadata immediately
-        let mut attr = self.meta.get_attr(ino)?;
-        if current_offset > attr.size {
-            attr.size = current_offset;
-            attr.touch_mtime();
-            self.meta.set_attr(&attr)?;
+        // Update file size in RAM CACHE only (very fast)
+        {
+            let mut dirty = self.dirty_attrs.lock();
+            let attr = dirty.entry(ino).or_insert_with(|| self.meta.get_attr(ino).expect("attr exists"));
+            if current_offset > attr.size {
+                attr.size = current_offset;
+                attr.touch_mtime();
+            }
         }
         
         Ok(written as u32)
     }
 
+    /// Internal helper to spawn a background flush task.
+    fn flush_later(&self, ino: Ino, chunk_idx: u32, block_idx: u32, start_off: u32, data: Bytes) {
+        let vfs = self.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = vfs.flush_semaphore.acquire().await.map_err(|e| VfsError::Other(e.to_string()))?;
+
+            if start_off == 0 && data.len() == BLOCK_SIZE as usize {
+                let key_offset = (chunk_idx as u64 * CHUNK_SIZE) + (block_idx as u64 * BLOCK_SIZE as u64);
+                let cache_key = studiofs_cache::memory::CacheKey::new(ino, key_offset);
+                vfs.mem_cache.put(cache_key, data.clone());
+            }
+
+            if let Some(link) = vfs.flush_block_internal(ino, chunk_idx, block_idx, start_off, data).await? {
+                vfs.pending_links.lock().entry(ino).or_default().push(link);
+            }
+            Ok(())
+        });
+
+        let mut flushes = self.active_flushes.lock();
+        let vec = flushes.entry(ino).or_default();
+        vec.push(handle);
+        if vec.len() > 256 { vec.retain(|h| !h.is_finished()); }
+    }
+
     /// Flush all buffered blocks for a file.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
-        let mut pending = self.pending_writes.lock().await;
-        
-        let keys: Vec<_> = pending.keys()
-             .filter(|(i, _, _)| *i == ino)
-             .cloned()
-             .collect();
-
-        for key in keys {
-            if let Some((start_off, data)) = pending.remove(&key) {
-                let (_, chunk_idx, block_idx) = key;
-                self.flush_block(ino, chunk_idx, block_idx, start_off, &data).await?;
+        // 1. Extract all remaining partial buffers
+        let mut entries_to_flush = Vec::new();
+        {
+            let mut pending = self.pending_writes.lock();
+            let keys: Vec<_> = pending.keys().filter(|(i, _, _)| *i == ino).cloned().collect();
+            for key in keys {
+                if let Some((start_off, data)) = pending.remove(&key) {
+                    let (_, chunk_idx, block_idx) = key;
+                    entries_to_flush.push((chunk_idx, block_idx, start_off, data.freeze()));
+                }
             }
         }
+        
+        // 2. Start flushes for remaining buffers
+        for (chunk_idx, block_idx, start_off, data) in entries_to_flush {
+            self.flush_later(ino, chunk_idx, block_idx, start_off, data);
+        }
+
+        // 3. Await ALL active flushes for this inode
+        let handles = self.active_flushes.lock().remove(&ino).unwrap_or_default();
+        for h in handles { h.await.map_err(|e| VfsError::Join(e))??; }
+        
+        // 4. Collect and clear pending links
+        let pending_links_vec = self.pending_links.lock().remove(&ino).unwrap_or_default();
+
+        // 5. Commit to metadata
+        if !pending_links_vec.is_empty() {
+            self.commit_uploads(ino, pending_links_vec).await?;
+        }
+        
+        // 6. Finalize dirty attributes to Redb
+        if let Some(attr) = self.dirty_attrs.lock().remove(&ino) {
+            self.meta.set_attr(&attr)?;
+        }
+
         Ok(())
     }
 
-    /// Helper to upload a block (full or partial) and update metadata
-    async fn flush_block(&self, ino: Ino, chunk_idx: u32, block_idx: u32, start_off: u32, data: &[u8]) -> VfsResult<()> {
-        if data.is_empty() { return Ok(()); }
+    /// Helper to upload a block (full or partial) to Disk Cache & Writeback Queue.
+    async fn flush_block_internal(&self, ino: Ino, chunk_idx: u32, block_idx: u32, start_off: u32, data: Bytes) -> VfsResult<Option<Objectlink>> {
+        if data.is_empty() { return Ok(None); }
         
-        // 1. Create & Upload Data Object
-        let payload = ObjectPayload::new_data(data.to_vec());
-        let payload_bytes = payload.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?;
-        let object_bytes = create_object(&payload_bytes);
-        let object_id = hash_object(&object_bytes);
+        let data_vec = data.to_vec();
         
-        // Check if exists? (Content addressable)
-        if !self.data.exists(&self.data.object_key(&object_id)).await? {
-             self.data.put_object(&object_id, Bytes::from(object_bytes)).await?;
-        }
+        // 1. Offload CPU-intensive compression and hashing
+        let (object_id, object_bytes, length) = tokio::task::spawn_blocking(move || {
+             let payload = ObjectPayload::new_data(data_vec);
+             let length = payload.data.len() as u32;
+             let payload_bytes = payload.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?;
+             let object_bytes = create_object(&payload_bytes);
+             let object_id = hash_object(&object_bytes);
+             Ok::<_, VfsError>((object_id, object_bytes, length))
+        }).await??;
 
-        // 2. Update Root (Meta Object)
-        // TODO: This uses a Global Lock implicitly effectively via Redb transaction inside MetaEngine? 
-        // No, we need to be careful about race conditions if multiple writers.
-        // For now, simple read-update-write loop.
+        // 2. Write to Disk Cache & Writeback Queue
+        let oid_u64 = u64::from_str_radix(&object_id, 16).map_err(|e| VfsError::Other(e.to_string()))?;
+        self.disk_cache.put_object(oid_u64, &object_bytes).await?;
         
-        let mut children = Vec::new();
-        if let Some(root_id) = self.meta.get_data_root(ino)? {
-            // Fetch existing root
-            let root_bytes = self.data.get_object(&root_id).await?;
-            let root_payload_bytes = read_object(&root_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
-            let root_payload = ObjectPayload::from_bytes(&root_payload_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
-            
-            match root_payload.kind {
-                 ObjectKind::Meta => children = root_payload.children,
-                 ObjectKind::Data => {
-                     // Upgrade single-object file to Meta
-                     // The old object covered 0..len
-                     // We don't have its length explicitly stored in payload... 
-                     // payload.data.len() is the length!
-                     let len = root_payload.data.len() as u32;
-                     // We need the ID of the old object to link to it. 
-                     // Wait, we only have the payload bytes. 
-                     // We need to re-hash or store the ID? 
-                     // We just read `root_id`, that IS the ID.
-                     children.push(Objectlink {
-                         offset: 0,
-                         length: len,
-                         object_id: root_id,
-                     });
-                 }
-            }
-        }
-
-        // 3. Update Children List (Remove overlaps, insert new)
-        let bs = BLOCK_SIZE as u32; // 4MB
-        // Usually chunk_idx is part of offset logic.
-        // offset = chunk_idx * CHUNK_SIZE + block_idx * BLOCK_SIZE + start_off
-        // CHUNK_SIZE = 64MB, BLOCK_SIZE = 4MB
-        let offset = (chunk_idx as u64 * CHUNK_SIZE) + (block_idx as u64 * bs as u64) + start_off as u64;
-        let length = data.len() as u32;
-        let end = offset + length as u64;
-
-        // Simple filter: remove any child that is fully covered or overlaps?
-        // To be safe and simple: remove anything overlapping and re-insert?
-        // Or better: keep it simple append-only log? 
-        // The read path needs to handle overlaps (last win).
-        // My `find_child` implementation assumes non-overlapping or first-match?
-        // `find_child` does linear search. If I always append, later entries are at end.
-        // `find` returns first match. `rev().find()` would return last match.
-        // Let's use `rev()` in `read_from_storage`? Or ensure no overlaps here.
-        // Let's Filter out overlaps here.
+        let bs = BLOCK_SIZE as u64;
+        let offset = (chunk_idx as u64 * CHUNK_SIZE) + (block_idx as u64 * bs) + start_off as u64;
         
-        children.retain(|child| {
-            let child_end = child.offset + child.length as u64;
-            // Keep if NO overlap
-            // Overlap if: start < child_end && end > child_start
-            ! (offset < child_end && end > child.offset)
-        });
+        self.writeback.submit(ino, offset, oid_u64).await;
 
-        children.push(Objectlink {
+        Ok(Some(Objectlink {
             offset,
             length,
             object_id,
-        });
+        }))
+    }
+
+
+
+    /// Commit all pending uploads for an inode to the metadata.
+    async fn commit_uploads(&self, ino: Ino, new_links: Vec<Objectlink>) -> VfsResult<()> {
+        if new_links.is_empty() { return Ok(()); }
         
-        // Sort by offset for cleaner tree
+        // 1. Fetch current root
+        let mut children = Vec::new();
+        if let Some(root_id) = self.meta.get_data_root(ino)? {
+            // Fetch existing root (use cache!)
+            if let Ok(root_bytes) = self.get_object_with_cache(&root_id).await {
+                if let Ok(root_payload_bytes) = read_object(&root_bytes) {
+                     if let Ok(root_payload) = ObjectPayload::from_bytes(&root_payload_bytes) {
+                         match root_payload.kind {
+                             ObjectKind::Meta => children = root_payload.children,
+                             ObjectKind::Data => {
+                                 let len = root_payload.data.len() as u32;
+                                 children.push(Objectlink {
+                                     offset: 0,
+                                     length: len,
+                                     object_id: root_id,
+                                 });
+                             }
+                         }
+                     }
+                }
+            }
+        }
+
+        // 2. Merge new links
+        for link in new_links {
+             // Remove overlaps
+             let link_end = link.offset + link.length as u64;
+             children.retain(|child| {
+                 let child_end = child.offset + child.length as u64;
+                 ! (link.offset < child_end && link_end > child.offset)
+             });
+             children.push(link);
+        }
+        
         children.sort_by_key(|c| c.offset);
 
-        // 4. Create New Root
-        let new_root = ObjectPayload::new_meta(children);
-        let new_root_bytes = create_object(&new_root.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?);
-        let new_root_id = hash_object(&new_root_bytes);
+        // 3. Create New Root
+        let (new_root_id, new_root_bytes) = tokio::task::spawn_blocking(move || {
+            let new_root = ObjectPayload::new_meta(children);
+            let new_root_bytes = create_object(&new_root.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?);
+            let new_root_id = hash_object(&new_root_bytes);
+            Ok::<_, VfsError>((new_root_id, new_root_bytes))
+        }).await??;
         
-        self.data.put_object(&new_root_id, Bytes::from(new_root_bytes)).await?;
+        // Write to Disk Cache & Queue
+        let root_oid_u64 = u64::from_str_radix(&new_root_id, 16).map_err(|e| VfsError::Other(e.to_string()))?;
+        self.disk_cache.put_object(root_oid_u64, &new_root_bytes).await?;
+        self.writeback.submit(ino, 0, root_oid_u64).await;
+        
+        // Update Redb Transactionally (Locally)
         self.meta.set_data_root(ino, &new_root_id)?;
         
-        debug!("flushed block: ino={} offset={} len={} new_root={}", ino, offset, length, new_root_id);
+        debug!("consumed uploads and updated root: ino={} new_root={}", ino, new_root_id);
         Ok(())
     }
 
     // ─── Background Tasks ────────────────────────────────────────────────────────
 
-    /// Spawn the background uploader task.
-    ///
-    /// This should be called once after creating the VFS.
-    pub fn spawn_background_uploader(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                // Wait for notification
-                self.upload_notify.notified().await;
 
-                // Process all pending slices
-                // In a real system, we'd want a more sophisticated queue.
-                match self.meta.get_pending_slices() {
-                    Ok(slices) => {
-                        for (slice_id, length) in slices {
-                            if let Err(e) = self.process_pending_slice(slice_id, length).await {
-                                tracing::error!("failed to upload slice {}: {}", slice_id, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("failed to get pending slices: {}", e);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Process a single pending slice: read from disk -> upload to S3 -> remove pending.
-    async fn process_pending_slice(&self, slice_id: u64, length: u32) -> VfsResult<()> {
-        // Read from disk cache (expect full block)
-        // We use block_idx 0 because we treat each slice as a single block for now (upto 4MB).
-        // Larger slices would need iteration, but our write path enforces 4MB blocks.
-        let data = self.disk_cache.get(slice_id, 0, length)?;
-        
-        if let Some(bytes) = data {
-            // Upload to S3
-            self.data.put_block(slice_id, 0, Bytes::copy_from_slice(&bytes)).await?;
-            // Mark as uploaded
-            self.meta.remove_pending_slice(slice_id)?;
-            debug!("background upload complete: slice {}", slice_id);
-        } else {
-             // Slice not found in disk cache?
-             // This is bad. It means we lost data or it wasn't written correctly.
-             // Or maybe it was evicted? (Should not evict dirty slices!)
-             // For now, log error. Recovery is hard if data is gone from disk.
-             tracing::error!("integrity error: pending slice {} not found in disk cache", slice_id);
-             // Should we remove it from pending checking S3?
-             // If it's not on disk, maybe it IS on S3 already?
-             if self.data.get_block(slice_id, 0, length).await.is_ok() {
-                 self.meta.remove_pending_slice(slice_id)?;
-                 tracing::warn!("slice {} was missing from disk but found on S3, recovered", slice_id);
-             }
-        }
-        Ok(())
-    }
 
     /// Spawn a background task to handle garbage collection.
     pub fn spawn_background_gc(self: Arc<Self>) {
@@ -676,7 +757,7 @@ impl StudioVfs {
                             }
 
                             // Delete from Disk Cache
-                            if let Err(e) = self.disk_cache.remove(slice_id, 0, length) {
+                            if let Err(e) = self.disk_cache.remove_object(slice_id).await {
                                 tracing::warn!("failed to delete slice {} from disk cache: {}", slice_id, e);
                             }
 
@@ -694,165 +775,5 @@ impl StudioVfs {
                 }
             }
         });
-    }
-}
-
-// ─── Slice Resolution ────────────────────────────────────────────────────────
-
-/// A resolved data segment after flattening overlapping slices.
-#[derive(Debug)]
-struct ResolvedSegment {
-    /// Slice ID (0 = hole).
-    slice_id: u64,
-    /// Total size of the original slice (needed for block calculations).
-    slice_size: u32,
-    /// Offset within the slice.
-    off: u32,
-    /// Length of data in this segment.
-    len: u32,
-}
-
-/// Resolve overlapping slices for a given range within a chunk.
-///
-/// Later slices in the list take precedence (same as JuiceFS).
-/// Returns a list of non-overlapping segments covering the requested range.
-fn resolve_slices(slices: &[Slice], offset: u32, size: u32) -> Vec<ResolvedSegment> {
-    if slices.is_empty() || size == 0 {
-        return vec![ResolvedSegment {
-            slice_id: 0,
-            slice_size: size,
-            off: 0,
-            len: size,
-        }];
-    }
-
-    let end = offset + size;
-
-    // Build a coverage map: for each byte position, which slice covers it?
-    // We use a simpler approach: iterate slices in order (later wins) and
-    // build intervals.
-
-    // Create an interval list: [(start, end, slice_idx)]
-    // where later entries override earlier ones
-    let mut coverage: Vec<(u32, u32, Option<usize>)> = vec![(offset, end, None)];
-
-    for (idx, slice) in slices.iter().enumerate() {
-        let s_start = slice.pos + slice.off;
-        let s_end = slice.pos + slice.off + slice.len;
-
-        // Clip to our range of interest
-        let clip_start = s_start.max(offset);
-        let clip_end = s_end.min(end);
-        if clip_start >= clip_end {
-            continue;
-        }
-
-        // Split existing coverage intervals
-        let mut new_coverage = Vec::new();
-        for &(c_start, c_end, c_slice) in &coverage {
-            if clip_start <= c_start && clip_end >= c_end {
-                // Fully covered by new slice
-                new_coverage.push((c_start, c_end, Some(idx)));
-            } else if clip_start > c_start && clip_end < c_end {
-                // New slice splits this interval into 3 parts
-                new_coverage.push((c_start, clip_start, c_slice));
-                new_coverage.push((clip_start, clip_end, Some(idx)));
-                new_coverage.push((clip_end, c_end, c_slice));
-            } else if clip_start <= c_start && clip_end > c_start && clip_end < c_end {
-                // Overlaps beginning
-                new_coverage.push((c_start, clip_end, Some(idx)));
-                new_coverage.push((clip_end, c_end, c_slice));
-            } else if clip_start > c_start && clip_start < c_end && clip_end >= c_end {
-                // Overlaps end
-                new_coverage.push((c_start, clip_start, c_slice));
-                new_coverage.push((clip_start, c_end, Some(idx)));
-            } else {
-                // No overlap
-                new_coverage.push((c_start, c_end, c_slice));
-            }
-        }
-        coverage = new_coverage;
-    }
-
-    // Convert coverage to resolved segments
-    coverage
-        .iter()
-        .filter(|(s, e, _)| s < e)
-        .map(|&(start, end, slice_idx)| match slice_idx {
-            Some(idx) => {
-                let slice = &slices[idx];
-                let off_in_slice = (start - slice.pos) + slice.off;
-                ResolvedSegment {
-                    slice_id: slice.id,
-                    slice_size: slice.size,
-                    off: off_in_slice,
-                    len: end - start,
-                }
-            }
-            None => ResolvedSegment {
-                slice_id: 0,
-                slice_size: 0,
-                off: 0,
-                len: end - start,
-            },
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resolve_empty_slices() {
-        let segments = resolve_slices(&[], 0, 1024);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].slice_id, 0); // hole
-        assert_eq!(segments[0].len, 1024);
-    }
-
-    #[test]
-    fn test_resolve_single_slice() {
-        let slices = vec![Slice {
-            pos: 0,
-            id: 1,
-            size: 4096,
-            off: 0,
-            len: 4096,
-        }];
-        let segments = resolve_slices(&slices, 0, 4096);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].slice_id, 1);
-        assert_eq!(segments[0].len, 4096);
-    }
-
-    #[test]
-    fn test_resolve_overlapping_slices() {
-        // Slice 1 covers 0..4096, Slice 2 covers 1024..3072
-        // Result: [0..1024 from S1, 1024..3072 from S2, 3072..4096 from S1]
-        let slices = vec![
-            Slice {
-                pos: 0,
-                id: 1,
-                size: 4096,
-                off: 0,
-                len: 4096,
-            },
-            Slice {
-                pos: 1024,
-                id: 2,
-                size: 2048,
-                off: 0,
-                len: 2048,
-            },
-        ];
-        let segments = resolve_slices(&slices, 0, 4096);
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].slice_id, 1);
-        assert_eq!(segments[0].len, 1024);
-        assert_eq!(segments[1].slice_id, 2);
-        assert_eq!(segments[1].len, 2048);
-        assert_eq!(segments[2].slice_id, 1);
-        assert_eq!(segments[2].len, 1024);
     }
 }

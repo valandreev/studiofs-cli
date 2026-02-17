@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Cursor};
 use thiserror::Error;
