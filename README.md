@@ -35,10 +35,11 @@
 | **Multi-tier caching** | L1 in-memory cache + L2 disk cache for near-local read speeds |
 | **Cross-platform** | Windows (WinFSP), Linux & macOS (FUSE) — single codebase |
 | **S3-compatible** | Works with AWS S3, MinIO, GCS, Wasabi, Backblaze B2, and any S3-compatible service |
-| **Write-back uploads** | Writes are cached locally and uploaded to S3 asynchronously |
+| **Log-structured** | Writes are immutable objects (Copy-on-Write), enabling lock-free snapshots and crash consistency |
+| **Compression** | Transparent **LZ4** compression for all data objects (high speed, low CPU) |
 | **Fast metadata** | Local metadata engine powered by [Redb](https://redb.org/) — zero-copy reads, ACID transactions |
-| **Compact serialization** | [Postcard](https://github.com/jamesmunns/postcard) binary serialization — 3–10× smaller than JSON |
-| **Block-level dedup** | Data is split into 4 MiB blocks; identical blocks share the same S3 key |
+| **Content-Addressable** | Data is stored as immutable objects addressed by their hash (CAS), enabling automatic deduplication |
+
 
 ---
 
@@ -61,8 +62,8 @@
 ├────────────────┬──────────────────────────┤
 │   Metadata     │      Data Store          │
 │  studiofs-meta │     studiofs-data        │
-│  (Redb + Post- │     (OpenDAL → S3)       │
-│   card)        │                          │
+│  (Redb: Inodes │     (OpenDAL → S3)       │
+│   + Data Roots)│    (LZ4 Objects)         │
 ├────────────────┴──────────────────────────┤
 │               Cache Layer                  │
 │     studiofs-cache (LRU memory cache)      │
@@ -70,8 +71,8 @@
 ```
 
 **Data flow:**
-1. **Write:** App → FUSE → VFS → split into 4 MiB blocks → upload to S3 + store metadata in Redb
-2. **Read:** App → FUSE → VFS → check L1 memory cache → check L2 disk cache → fetch from S3
+1. **Write:** App → FUSE → VFS → Buffer (4 MiB) → Compress → Upload S3 Object → Update `Data Root` in Redb
+2. **Read:** App → FUSE → VFS → Memory Cache → Fetch S3 Object → Decompress → Traverse Object Tree
 
 ---
 
@@ -362,28 +363,35 @@ studiofs mount prod-volume /mnt/studio \
 
 ## Data Model
 
-StudioFS uses a hierarchical data model inspired by [JuiceFS](https://juicefs.com/):
+StudioFS uses a **Log-Structured Object Tree** architecture, similar to LucidLink or Btrfs/ZFS but adapted for object storage:
 
 ```
-File
- └── Chunks (64 MiB each — logical division)
-      └── Slices (variable-size write units within a chunk)
-           └── Blocks (4 MiB each — actual S3 objects)
+Inode (Redb)
+ └── Data Root (Hash of Root Object)
+      │
+      ▼
+   Root Object (S3)
+   ├── [Meta] Child Link (Offset: 0, Len: 4MB, Hash: ...)
+   │    └── Data Object (LZ4 Compressed)
+   │
+   └── [Meta] Child Link (Offset: 4MB, Len: 2MB, Hash: ...)
+        └── Data Object (LZ4 Compressed)
 ```
 
 | Concept | Size | Stored in | Description |
 |---------|------|-----------|-------------|
-| **Inode** | — | Redb (local) | File/directory metadata (size, mode, timestamps) |
-| **Chunk** | 64 MiB | Redb (local) | Logical division of a file; maps offset → slices |
-| **Slice** | Variable | Redb (local) | A contiguous write; later slices override earlier ones |
-| **Block** | 4 MiB | S3 (remote) | The physical storage unit uploaded to object storage |
+| **Inode** | — | Redb (local) | File/directory metadata (size, mode, timestamps) and **Data Root** |
+| **Object** | Max 64 MB | S3 (remote) | Immutable unit of storage. Can be **Meta** (pointers) or **Data** (payload) |
+| **Payload**| Variable | S3 (inside Object)| LZ4-compressed byte stream |
+| **Header** | Fixed | S3 (inside Object)| Magic `STFS`, Version, Original/Compressed Size, XXH64 Checksum |
 
-**S3 Object Key Format:**
+**S3 Object Key Format (CAS):**
 ```
-{volume}/data/chunks/{hash1}/{hash2}/{sliceId}_{blockIndex}_{blockSize}
+{volume}/objects/{ab}/{cd}/{hash_id}
 ```
+Objects are content-addressable. The path is derived solely from the hash of the object's content (Header + Compressed Payload).
 
-Example: `my-volume/data/chunks/0/0/1_0_4194304` = slice 1, block 0, 4 MiB.
+Example: `my-volume/objects/a1/b2/a1b2c3d4...`
 
 ---
 

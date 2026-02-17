@@ -86,6 +86,18 @@ impl DataStore {
         )
     }
 
+    /// Get the S3 object key for a generic object (content-addressable).
+    /// Format: `{volume}/objects/{ab}/{cd}/{id}`
+    pub fn object_key(&self, object_id: &str) -> String {
+        if object_id.len() < 4 {
+             return format!("{}/objects/{}", self.volume_name, object_id);
+        }
+        format!(
+            "{}/objects/{}/{}/{}",
+            self.volume_name, &object_id[0..2], &object_id[2..4], object_id
+        )
+    }
+
     /// Hash path for distributing objects (same as JuiceFS without HashPrefix).
     fn hash_path(&self, slice_id: u64) -> String {
         format!("{}/{}", slice_id / 1_000_000, slice_id / 1_000)
@@ -138,6 +150,22 @@ impl DataStore {
             .range(offset..offset + length)
             .await?
             .to_bytes();
+        Ok(data)
+    }
+
+    /// Upload a generic object to S3.
+    pub async fn put_object(&self, object_id: &str, data: Bytes) -> DataResult<()> {
+        let key = self.object_key(object_id);
+        debug!("uploading object: {key} ({} bytes)", data.len());
+        self.op.write(&key, data).await?;
+        Ok(())
+    }
+
+    /// Download a generic object from S3.
+    pub async fn get_object(&self, object_id: &str) -> DataResult<Bytes> {
+        let key = self.object_key(object_id);
+        debug!("downloading object: {key}");
+        let data = self.op.read(&key).await?.to_bytes();
         Ok(data)
     }
 

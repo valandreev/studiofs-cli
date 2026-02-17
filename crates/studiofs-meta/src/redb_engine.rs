@@ -32,6 +32,9 @@ const PENDING_SLICES: TableDefinition<u64, u32> = TableDefinition::new("pending_
 /// Deleted Slices (GC): slice_id (u64) -> length (u32)
 const DELETED_SLICES: TableDefinition<u64, u32> = TableDefinition::new("deleted_slices");
 
+/// Data Roots: ino (u64) -> object_id (String)
+const DATA_ROOTS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("data_roots");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -102,6 +105,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(CHUNKS_TABLE);
             let _ = txn.open_table(PENDING_SLICES);
             let _ = txn.open_table(DELETED_SLICES);
+            let _ = txn.open_table(DATA_ROOTS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -721,6 +725,41 @@ impl MetaEngine for RedbMetaEngine {
             .collect();
         
         Ok(slices)
+    }
+
+    // ─── Data Roots (New Architecture) ───────────────────────────────────
+
+    fn get_data_root(&self, ino: Ino) -> MetaResult<Option<String>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(DATA_ROOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let root = table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|v| v.value().to_string());
+        Ok(root)
+    }
+
+    fn set_data_root(&self, ino: Ino, object_id: &str) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DATA_ROOTS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(ino, object_id)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
     }
 }
 

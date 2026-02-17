@@ -5,6 +5,9 @@ use std::sync::Arc;
 use studiofs_cache::memory::{CacheKey, MemoryCache};
 use studiofs_cache::disk::DiskCache;
 use studiofs_data::store::DataStore;
+use studiofs_data::object::{
+    self, create_object, read_object, hash_object, ObjectPayload, ObjectKind, Objectlink,
+};
 use studiofs_meta::*;
 use thiserror::Error;
 use tracing::{debug, info};
@@ -226,81 +229,87 @@ impl StudioVfs {
         size: usize,
         _attr: &InodeAttr,
     ) -> VfsResult<Bytes> {
+        // 1. Get Data Root
+        let root_id = match self.meta.get_data_root(ino)? {
+            Some(id) => id,
+            None => return Ok(BytesMut::zeroed(size).freeze()),
+        };
+
+        // 2. Fetch & Parse Root Object
+        let root_bytes = self.data.get_object(&root_id).await
+            .map_err(|e| VfsError::Data(e))?;
+        
+        let root_payload_bytes = read_object(&root_bytes)
+            .map_err(|e| VfsError::Other(e.to_string()))?;
+        
+        let root_payload = ObjectPayload::from_bytes(&root_payload_bytes)
+             .map_err(|e| VfsError::Other(e.to_string()))?;
+
+        // 3. Resolve Data
         let mut result = BytesMut::with_capacity(size);
         let mut remaining = size;
         let mut current_offset = offset;
 
-        while remaining > 0 {
-            let chunk_key = ChunkKey::from_offset(ino, current_offset);
-            let chunk_offset = current_offset - (chunk_key.index as u64 * CHUNK_SIZE);
-            let in_chunk = (CHUNK_SIZE - chunk_offset).min(remaining as u64) as u32;
-
-            let mut slices = self.meta.get_chunk_slices(&chunk_key)?;
-
-            // ─── Read-through: check pending writes ───
-            // Pending writes take absolute precedence as they are the very latest data.
-            {
-                let pending = self.pending_writes.lock().await;
-                // Find all pending blocks for this chunk
-                for ((p_ino, p_chunk, p_block), (p_start_off, p_data)) in pending.iter() {
-                    if *p_ino == ino && *p_chunk == chunk_key.index {
-                        let bs = BLOCK_SIZE as u32;
-                        let final_pos = (*p_block * bs) + *p_start_off;
-                        
-                        // Create a "virtual" slice. ID=u64::MAX signals it's in-memory.
-                        slices.push(Slice {
-                            pos: final_pos,
-                            id: u64::MAX,
-                            size: p_data.len() as u32,
-                            off: 0,
-                            len: p_data.len() as u32,
-                        });
-                    }
+        match root_payload.kind {
+            ObjectKind::Data => {
+                // Single object file. Assume it starts at 0.
+                if current_offset < root_payload.data.len() as u64 {
+                    let end = (current_offset + remaining as u64).min(root_payload.data.len() as u64);
+                    let len = (end - current_offset) as usize;
+                    result.extend_from_slice(&root_payload.data[current_offset as usize..end as usize]);
+                    remaining -= len;
+                }
+                // Fill rest with zeroes if any
+                if remaining > 0 {
+                    result.extend_from_slice(&vec![0u8; remaining]);
                 }
             }
-
-            // Resolve segments within the range that fits in THIS chunk
-            let resolved = resolve_slices(&slices, chunk_offset as u32, in_chunk);
-
-            if resolved.is_empty() {
-                // Entire remaining part of chunk is a hole
-                result.extend_from_slice(&vec![0u8; in_chunk as usize]);
-                remaining -= in_chunk as usize;
-                current_offset += in_chunk as u64;
-                continue;
-            }
-
-            for segment in &resolved {
-                if segment.slice_id == 0 {
-                    // Hole
-                    result.extend_from_slice(&vec![0u8; segment.len as usize]);
-                } else if segment.slice_id == u64::MAX {
-                    // ─── Memory hit from pending_writes ───
-                    let pending = self.pending_writes.lock().await;
-                    let bs = BLOCK_SIZE as u32;
-                    let block_idx = ((current_offset % CHUNK_SIZE) / bs as u64) as u32;
-                    let key = (ino, chunk_key.index, block_idx);
-                    
-                    if let Some((_, data)) = pending.get(&key) {
-                        result.extend_from_slice(&data[segment.off as usize..(segment.off + segment.len) as usize]);
-                    } else {
-                        // Segment was removed from pending while we were reading?
-                        // This can happen if a background flush finished between loops.
-                        // Fallback: try storage (it should be there now).
-                        let block_data = self
-                            .fetch_slice_range(segment.slice_id, segment.slice_size, segment.off, segment.len)
-                            .await?;
-                        result.extend_from_slice(&block_data);
-                    }
-                } else {
-                    // Fetch blocks from S3/Disk
-                    let block_data = self
-                        .fetch_slice_range(segment.slice_id, segment.slice_size, segment.off, segment.len)
-                        .await?;
-                    result.extend_from_slice(&block_data);
+            ObjectKind::Meta => {
+                // Tree traversal
+                while remaining > 0 {
+                     if let Some(link) = root_payload.find_child(current_offset) {
+                         // Fetch child
+                         // Optimization: cache child objects?
+                         let child_bytes = self.data.get_object(&link.object_id).await?;
+                         let child_payload_bytes = read_object(&child_bytes)
+                             .map_err(|e| VfsError::Other(e.to_string()))?;
+                         let child_payload = ObjectPayload::from_bytes(&child_payload_bytes)
+                             .map_err(|e| VfsError::Other(e.to_string()))?;
+                         
+                         match child_payload.kind {
+                             ObjectKind::Data => {
+                                 // Calculate relative offset
+                                 let off_in_child = current_offset - link.offset;
+                                 let available = (link.length as u64).saturating_sub(off_in_child);
+                                 let to_read = (remaining as u64).min(available) as usize;
+                                 
+                                 if to_read > 0 {
+                                     result.extend_from_slice(&child_payload.data[off_in_child as usize..off_in_child as usize + to_read]);
+                                     remaining -= to_read;
+                                     current_offset += to_read as u64;
+                                 } else {
+                                     // Should not happen if find_child is correct
+                                     break; 
+                                 }
+                             }
+                             ObjectKind::Meta => {
+                                 // Nested tree? For now, we only support 1 level of nesting (Root -> Data).
+                                 // Recursing would need a separate function.
+                                 // Let's error or skip. 
+                                 return Err(VfsError::Other("Nested meta objects not yet supported".into()));
+                             }
+                         }
+                     } else {
+                         // Hole
+                         // Find next child to determine hole size, or just 1 byte?
+                         // Optim: skip to next child start or end of read
+                         // For now, read 4KB zeroes?
+                         let hole_size = remaining.min(4096);
+                         result.extend_from_slice(&vec![0u8; hole_size]);
+                         remaining -= hole_size;
+                         current_offset += hole_size as u64;
+                     }
                 }
-                remaining -= segment.len as usize;
-                current_offset += segment.len as u64;
             }
         }
 
@@ -495,34 +504,95 @@ impl StudioVfs {
     /// Helper to upload a block (full or partial) and update metadata
     async fn flush_block(&self, ino: Ino, chunk_idx: u32, block_idx: u32, start_off: u32, data: &[u8]) -> VfsResult<()> {
         if data.is_empty() { return Ok(()); }
-        let slice_id = self.meta.next_slice_id()?;
         
-        // Writeback: write to disk cache, mark as pending, defer S3 upload.
-        self.disk_cache.put(slice_id, 0, data)?;
-        self.meta.add_pending_slice(slice_id, data.len() as u32)?;
-        // debug!("flush_block ino={} slice={} len={}", ino, slice_id, data.len());
+        // 1. Create & Upload Data Object
+        let payload = ObjectPayload::new_data(data.to_vec());
+        let payload_bytes = payload.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?;
+        let object_bytes = create_object(&payload_bytes);
+        let object_id = hash_object(&object_bytes);
+        
+        // Check if exists? (Content addressable)
+        if !self.data.exists(&self.data.object_key(&object_id)).await? {
+             self.data.put_object(&object_id, Bytes::from(object_bytes)).await?;
+        }
 
-        // Notify background uploader
-        self.upload_notify.notify_one();
+        // 2. Update Root (Meta Object)
+        // TODO: This uses a Global Lock implicitly effectively via Redb transaction inside MetaEngine? 
+        // No, we need to be careful about race conditions if multiple writers.
+        // For now, simple read-update-write loop.
+        
+        let mut children = Vec::new();
+        if let Some(root_id) = self.meta.get_data_root(ino)? {
+            // Fetch existing root
+            let root_bytes = self.data.get_object(&root_id).await?;
+            let root_payload_bytes = read_object(&root_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
+            let root_payload = ObjectPayload::from_bytes(&root_payload_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
+            
+            match root_payload.kind {
+                 ObjectKind::Meta => children = root_payload.children,
+                 ObjectKind::Data => {
+                     // Upgrade single-object file to Meta
+                     // The old object covered 0..len
+                     // We don't have its length explicitly stored in payload... 
+                     // payload.data.len() is the length!
+                     let len = root_payload.data.len() as u32;
+                     // We need the ID of the old object to link to it. 
+                     // Wait, we only have the payload bytes. 
+                     // We need to re-hash or store the ID? 
+                     // We just read `root_id`, that IS the ID.
+                     children.push(Objectlink {
+                         offset: 0,
+                         length: len,
+                         object_id: root_id,
+                     });
+                 }
+            }
+        }
 
-        // Update Chunk Metadata
-        let chunk_key = ChunkKey::new(ino, chunk_idx);
-        let bs = BLOCK_SIZE as u32;
-        
-        // Final position in chunk
-        let final_pos = (block_idx * bs) + start_off;
+        // 3. Update Children List (Remove overlaps, insert new)
+        let bs = BLOCK_SIZE as u32; // 4MB
+        // Usually chunk_idx is part of offset logic.
+        // offset = chunk_idx * CHUNK_SIZE + block_idx * BLOCK_SIZE + start_off
+        // CHUNK_SIZE = 64MB, BLOCK_SIZE = 4MB
+        let offset = (chunk_idx as u64 * CHUNK_SIZE) + (block_idx as u64 * bs as u64) + start_off as u64;
+        let length = data.len() as u32;
+        let end = offset + length as u64;
 
-        let slice = Slice {
-            pos: final_pos,
-            id: slice_id,
-            size: data.len() as u32,
-            off: 0,
-            len: data.len() as u32,
-        };
+        // Simple filter: remove any child that is fully covered or overlaps?
+        // To be safe and simple: remove anything overlapping and re-insert?
+        // Or better: keep it simple append-only log? 
+        // The read path needs to handle overlaps (last win).
+        // My `find_child` implementation assumes non-overlapping or first-match?
+        // `find_child` does linear search. If I always append, later entries are at end.
+        // `find` returns first match. `rev().find()` would return last match.
+        // Let's use `rev()` in `read_from_storage`? Or ensure no overlaps here.
+        // Let's Filter out overlaps here.
         
-        self.meta.append_chunk_slice(&chunk_key, &slice)?;
+        children.retain(|child| {
+            let child_end = child.offset + child.length as u64;
+            // Keep if NO overlap
+            // Overlap if: start < child_end && end > child_start
+            ! (offset < child_end && end > child.offset)
+        });
+
+        children.push(Objectlink {
+            offset,
+            length,
+            object_id,
+        });
         
-        debug!(ino, chunk_idx, final_pos, len=data.len(), "flushed block segment");
+        // Sort by offset for cleaner tree
+        children.sort_by_key(|c| c.offset);
+
+        // 4. Create New Root
+        let new_root = ObjectPayload::new_meta(children);
+        let new_root_bytes = create_object(&new_root.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?);
+        let new_root_id = hash_object(&new_root_bytes);
+        
+        self.data.put_object(&new_root_id, Bytes::from(new_root_bytes)).await?;
+        self.meta.set_data_root(ino, &new_root_id)?;
+        
+        debug!("flushed block: ino={} offset={} len={} new_root={}", ino, offset, length, new_root_id);
         Ok(())
     }
 

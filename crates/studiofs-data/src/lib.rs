@@ -4,6 +4,7 @@
 //! Blocks are 4MiB units that correspond to slices within chunks.
 
 pub mod block;
+pub mod object;
 pub mod store;
 
 pub use store::{DataStore, DataStoreConfig};

@@ -129,6 +129,14 @@ pub trait MetaEngine: Send + Sync {
     /// Get all deleted slices (id, length).
     fn get_deleted_slices(&self) -> MetaResult<Vec<(u64, u32)>>;
 
+    // ─── Data Roots (New Architecture) ───────────────────────────────────
+
+    /// Get the data root object ID for an inode.
+    fn get_data_root(&self, ino: Ino) -> MetaResult<Option<String>>;
+
+    /// Set the data root object ID for an inode.
+    fn set_data_root(&self, ino: Ino, object_id: &str) -> MetaResult<()>;
+
     // ─── High-Level Operations ───────────────────────────────────────────
 
     /// Create a new file: allocate inode, set attrs, add dentry.
