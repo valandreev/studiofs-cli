@@ -168,8 +168,8 @@ file.write_all(&data_vec)?;
 **Почему:** Единый `Mutex<LruCache>` — точка contention при ≥4 параллельных читателях. При шардировании по `(ino XOR (offset >> 22)) % N` блокировки не пересекаются.
 
 **Что сделать:**
-- [ ] **4.1** Добавить в `Cargo.toml` studiofs-cache: уже есть `parking_lot` — достаточно.
-- [ ] **4.2** Заменить структуру `MemoryCache`:
+- [x] **4.1** Добавить в `Cargo.toml` studiofs-cache: уже есть `parking_lot` — достаточно.
+- [x] **4.2** Заменить структуру `MemoryCache`:
   ```rust
   const SHARD_COUNT: usize = 64;
   
@@ -180,16 +180,16 @@ file.write_all(&data_vec)?;
       max_bytes: usize,
   }
   ```
-- [ ] **4.3** Реализовать `fn shard_idx(key: &CacheKey) -> usize`:
+- [x] **4.3** Реализовать `fn shard_idx(key: &CacheKey) -> usize`:
   ```rust
   fn shard_idx(key: &CacheKey) -> usize {
       ((key.ino ^ (key.offset >> 22)) as usize) % SHARD_COUNT
   }
   ```
-- [ ] **4.4** Обновить `get()`, `put()`, `remove()`, `invalidate_inode()` для работы с шардами.
-- [ ] **4.5** `current_bytes()` — читать из `AtomicUsize` (lock-free).
-- [ ] **4.6** `invalidate_inode()` — итерировать по всем шардам; взять lock на каждый последовательно (acceptable, редкая операция).
-- [ ] **4.7** Прогнать все существующие тесты `cargo test -p studiofs-cache`.
+- [x] **4.4** Обновить `get()`, `put()`, `remove()`, `invalidate_inode()` для работы с шардами.
+- [x] **4.5** `current_bytes()` — читать из `AtomicUsize` (lock-free).
+- [x] **4.6** `invalidate_inode()` — итерировать по всем шардам; взять lock на каждый последовательно (acceptable, редкая операция).
+- [x] **4.7** Прогнать все существующие тесты `cargo test -p studiofs-cache`.
 
 ---
 
@@ -198,10 +198,10 @@ file.write_all(&data_vec)?;
 **Файл:** `crates/studiofs-cache/src/disk.rs`
 
 **Что сделать:**
-- [ ] **4.8** Шардировать `entries: Mutex<BTreeMap<ObjectId, CacheEntry>>` аналогично: `entries: Vec<Mutex<BTreeMap<ObjectId, CacheEntry>>>` с `SHARD_COUNT = 256`.
-- [ ] **4.9** `current_size` → `AtomicU64` (lock-free).
-- [ ] **4.10** `find_lru_candidate()` — итерировать по всем шардам, возвращать глобальный LRU (допустима небольшая неточность — approximate LRU).
-- [ ] **4.11** Обновить тесты.
+- [x] **4.8** Шардировать `entries: Mutex<BTreeMap<ObjectId, CacheEntry>>` аналогично: `entries: Vec<Mutex<BTreeMap<ObjectId, CacheEntry>>>` с `SHARD_COUNT = 256`.
+- [x] **4.9** `current_size` → `AtomicU64` (lock-free).
+- [x] **4.10** `find_lru_candidate()` — итерировать по всем шардам, возвращать глобальный LRU (допустима небольшая неточность — approximate LRU).
+- [x] **4.11** Обновить тесты.
 
 ---
 

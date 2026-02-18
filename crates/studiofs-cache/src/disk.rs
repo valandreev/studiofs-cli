@@ -15,10 +15,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // =============================================================================
@@ -107,6 +108,16 @@ struct CacheEntry {
 /// Key for a disk cache entry (Object ID / Block ID).
 type ObjectId = u64;
 
+/// Number of shards for the LRU entries map.
+/// 256 shards means O(1) lock contention at 16+ concurrent readers.
+const ENTRIES_SHARD_COUNT: usize = 256;
+
+/// Map an ObjectId to a shard index.
+#[inline]
+fn entries_shard(id: ObjectId) -> usize {
+    (id as usize) % ENTRIES_SHARD_COUNT
+}
+
 // =============================================================================
 // DiskCache Implementation
 // =============================================================================
@@ -118,17 +129,18 @@ type ObjectId = u64;
 /// - Disk space monitoring - evict if free space < target_free_ratio
 /// - Minimum size guarantee - never evict below min_size
 /// - Pinned objects - prevent eviction of pending uploads
+/// - Sharded entry map (256 shards) for reduced lock contention
 pub struct DiskCache {
     /// Cache directory for objects.
     cache_dir: PathBuf,
     /// Configuration.
     config: DiskCacheConfig,
-    /// Track cached entries for LRU eviction.
-    entries: Mutex<BTreeMap<ObjectId, CacheEntry>>,
-    /// Set of pinned objects (prevent eviction).
+    /// Sharded LRU entry tracking (256 shards by id % 256).
+    entries: Vec<Mutex<BTreeMap<ObjectId, CacheEntry>>>,
+    /// Set of pinned objects (prevent eviction). Pinning is rare, single mutex is fine.
     pinned: Mutex<std::collections::HashSet<ObjectId>>,
-    /// Current total cache size.
-    current_size: Mutex<u64>,
+    /// Current total cache size (lock-free).
+    current_size: AtomicU64,
 }
 
 impl DiskCache {
@@ -152,9 +164,11 @@ impl DiskCache {
         let cache = Self {
             cache_dir: objects_dir,
             config,
-            entries: Mutex::new(BTreeMap::new()),
+            entries: (0..ENTRIES_SHARD_COUNT)
+                .map(|_| Mutex::new(BTreeMap::new()))
+                .collect(),
             pinned: Mutex::new(std::collections::HashSet::new()),
-            current_size: Mutex::new(0),
+            current_size: AtomicU64::new(0),
         };
 
         // Scan existing cache on startup
@@ -187,14 +201,15 @@ impl DiskCache {
 
     /// Scan existing cache files and populate LRU tracking.
     fn scan_existing(&self) -> DiskCacheResult<()> {
-        let mut entries = self.entries.lock();
         let mut total_size = 0u64;
 
         if !self.cache_dir.exists() {
             return Ok(());
         }
 
-        // Recursive scan
+        // Collect all (id, size) pairs first, then distribute to shards.
+        let mut found: Vec<(ObjectId, u64)> = Vec::new();
+
         let mut stack = vec![self.cache_dir.clone()];
         while let Some(dir) = stack.pop() {
             let read_dir = match fs::read_dir(&dir) {
@@ -213,23 +228,26 @@ impl DiskCache {
                 } else if path.is_file() {
                     if let Some(id) = self.parse_filename(&path) {
                         if let Ok(meta) = entry.metadata() {
-                            let size = meta.len();
-                            entries.insert(
-                                id,
-                                CacheEntry {
-                                    size,
-                                    last_access: Instant::now(),
-                                },
-                            );
-                            total_size += size;
+                            found.push((id, meta.len()));
+                            total_size += meta.len();
                         }
                     }
                 }
             }
         }
 
-        *self.current_size.lock() = total_size;
-        debug!("scanned {} existing cache entries ({total_size} bytes)", entries.len());
+        // Distribute into shards
+        for (id, size) in found {
+            self.entries[entries_shard(id)].lock().insert(
+                id,
+                CacheEntry { size, last_access: Instant::now() },
+            );
+        }
+        self.current_size.store(total_size, Ordering::Relaxed);
+
+        debug!(
+            "scanned existing cache entries: total_size={total_size} bytes"
+        );
         Ok(())
     }
 
@@ -279,18 +297,16 @@ impl DiskCache {
         }).await??;
 
         if data.is_some() {
-            // Update last access time
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.get_mut(&id) {
+            // Update last access time in the correct shard.
+            let mut shard = self.entries[entries_shard(id)].lock();
+            if let Some(entry) = shard.get_mut(&id) {
                 entry.last_access = Instant::now();
-            } else {
-                // Inconsistency? Re-add
-                if let Some(d) = &data {
-                    entries.insert(id, CacheEntry {
-                        size: d.len() as u64,
-                        last_access: Instant::now(),
-                    });
-                }
+            } else if let Some(d) = &data {
+                // Inconsistency (e.g. written externally) — re-register.
+                shard.insert(id, CacheEntry {
+                    size: d.len() as u64,
+                    last_access: Instant::now(),
+                });
             }
         }
 
@@ -340,17 +356,14 @@ impl DiskCache {
             Ok(())
         }).await??;
 
-        let mut entries = self.entries.lock();
-        if let Some(old) = entries.insert(
+        let mut shard = self.entries[entries_shard(id)].lock();
+        if let Some(old) = shard.insert(
             id,
-            CacheEntry {
-                size,
-                last_access: Instant::now(),
-            },
+            CacheEntry { size, last_access: Instant::now() },
         ) {
-            *self.current_size.lock() -= old.size;
+            self.current_size.fetch_sub(old.size, Ordering::Relaxed);
         }
-        *self.current_size.lock() += size;
+        self.current_size.fetch_add(size, Ordering::Relaxed);
 
         Ok(())
     }
@@ -366,9 +379,9 @@ impl DiskCache {
             Ok(())
         }).await??;
 
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.remove(&id) {
-            *self.current_size.lock() -= entry.size;
+        let mut shard = self.entries[entries_shard(id)].lock();
+        if let Some(entry) = shard.remove(&id) {
+            self.current_size.fetch_sub(entry.size, Ordering::Relaxed);
         }
 
         Ok(())
@@ -376,7 +389,7 @@ impl DiskCache {
 
     /// Check if object exists.
     pub fn exists(&self, id: ObjectId) -> bool {
-        self.entries.lock().contains_key(&id)
+        self.entries[entries_shard(id)].lock().contains_key(&id)
     }
 
     /// Reserve space for `needed` bytes by evicting LRU.
@@ -419,7 +432,7 @@ impl DiskCache {
 
         loop {
             // Check if we have enough space
-            let current = *self.current_size.lock();
+            let current = self.current_size.load(Ordering::Relaxed);
             let size_ok = current + needed_bytes <= self.config.max_size;
 
             // Check disk space
@@ -430,7 +443,7 @@ impl DiskCache {
             }
 
             // Don't evict below minimum
-            if current.saturating_sub(evicted) <= min_size {
+            if current <= min_size {
                 warn!(
                     "cache at minimum size ({}GB), cannot evict further",
                     min_size / (1024 * 1024 * 1024)
@@ -451,18 +464,18 @@ impl DiskCache {
                     // Delete the file
                     self.delete_object(object_id).await?;
 
-                    // Update tracking
-                    let entry_size = {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.remove(&object_id) {
-                            *self.current_size.lock() -= entry.size;
+                    // Update tracking via shard
+                    let evicted_size = {
+                        let mut shard = self.entries[entries_shard(object_id)].lock();
+                        if let Some(entry) = shard.remove(&object_id) {
+                            self.current_size.fetch_sub(entry.size, Ordering::Relaxed);
                             Some(entry.size)
                         } else {
                             None
                         }
                     };
 
-                    if let Some(size) = entry_size {
+                    if let Some(size) = evicted_size {
                         evicted += size;
                         debug!(
                             id = %format!("{:016x}", object_id),
@@ -483,18 +496,25 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Find the LRU candidate for eviction.
+    /// Find the LRU candidate for eviction (approximate global LRU across all shards).
     fn find_lru_candidate(&self) -> DiskCacheResult<Option<ObjectId>> {
-        let entries = self.entries.lock();
         let pinned = self.pinned.lock();
+        let mut best: Option<(ObjectId, Instant)> = None;
 
-        let lru_id = entries
-            .iter()
-            .filter(|(k, _)| !pinned.contains(k))
-            .min_by_key(|(_, v)| v.last_access)
-            .map(|(k, _)| *k);
+        for shard in &self.entries {
+            let s = shard.lock();
+            for (k, v) in s.iter() {
+                if pinned.contains(k) {
+                    continue;
+                }
+                let is_older = best.map_or(true, |(_, t)| v.last_access < t);
+                if is_older {
+                    best = Some((*k, v.last_access));
+                }
+            }
+        }
 
-        Ok(lru_id)
+        Ok(best.map(|(id, _)| id))
     }
 
     /// Delete an object file from disk.
@@ -539,9 +559,9 @@ impl DiskCache {
         }).await.unwrap_or(false)
     }
 
-    /// Current cache size in bytes.
+    /// Current cache size in bytes (lock-free).
     pub fn current_size(&self) -> u64 {
-        *self.current_size.lock()
+        self.current_size.load(Ordering::Relaxed)
     }
 
     /// Get cache configuration.
@@ -640,9 +660,11 @@ mod tests {
         let cache = DiskCache {
             cache_dir: config.cache_dir.join("objects"),
             config,
-            entries: Mutex::new(BTreeMap::new()),
+            entries: (0..ENTRIES_SHARD_COUNT)
+                .map(|_| Mutex::new(BTreeMap::new()))
+                .collect(),
             pinned: Mutex::new(std::collections::HashSet::new()),
-            current_size: Mutex::new(0),
+            current_size: AtomicU64::new(0),
         };
 
         // Test path generation
