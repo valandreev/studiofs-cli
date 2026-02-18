@@ -406,6 +406,7 @@ impl StudioVfs {
     // =========================================================================
 
     /// Read file data at the given offset.
+    /// Uses parallel block fetching (up to 16 concurrent blocks) for improved throughput.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         let attr = self.getattr(ino)?;
 
@@ -416,43 +417,85 @@ impl StudioVfs {
         }
         let effective_size = (end - offset) as usize;
 
-        let mut result = BytesMut::with_capacity(effective_size);
-        let mut current_offset = offset;
-        let mut remaining = effective_size;
+        // Pre-compute all blocks needed
+        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new(); // (block_index, offset_in_block, to_copy)
+        let mut cur = offset;
+        while cur < end {
+            let idx = block_index_from_offset(cur, self.block_size);
+            let off_in = offset_within_block(cur, self.block_size) as usize;
+            let space = self.block_size as usize - off_in;
+            let to_copy = (end - cur).min(space as u64) as usize;
+            blocks_needed.push((idx, off_in, to_copy));
+            cur += to_copy as u64;
+        }
 
-        while remaining > 0 {
-            let block_index = block_index_from_offset(current_offset, self.block_size);
-            let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
-
-            // Check pending blocks first (writes not yet flushed)
-            let block_data = {
-                let pending = self.state.pending_blocks.lock();
-                if let Some(pending_block) = pending.get(&(ino, block_index)) {
-                    // Use pending data
-                    pending_block.data.clone().freeze()
-                } else {
-                    // Read from storage
-                    drop(pending);
-                    self.read_block(ino, block_index).await?
-                }
-            };
-
-            // Copy slice
-            let to_copy = remaining.min(block_data.len().saturating_sub(offset_in_block));
-            if to_copy == 0 {
-                // Hole or missing block - fill with zeros
-                let zeros = remaining.min(self.block_size as usize - offset_in_block);
-                result.extend(std::iter::repeat(0u8).take(zeros));
-                current_offset += zeros as u64;
-                remaining -= zeros;
+        // If only one block, read sequentially to avoid overhead
+        if blocks_needed.len() == 1 {
+            let (block_idx, off_in, to_copy) = blocks_needed[0];
+            let block_data = self.read_block_or_pending(ino, block_idx).await?;
+            let slice = if to_copy == 0 {
+                vec![0u8; to_copy]
             } else {
-                result.extend_from_slice(&block_data[offset_in_block..offset_in_block + to_copy]);
-                current_offset += to_copy as u64;
-                remaining -= to_copy;
+                block_data[off_in..off_in + to_copy].to_vec()
+            };
+            return Ok(Bytes::from(slice));
+        }
+
+        // Parallel fetch with concurrency limit (16 concurrent reads)
+        const CONCURRENT_LIMIT: usize = 16;
+        let semaphore = Arc::new(Semaphore::new(CONCURRENT_LIMIT));
+
+        let fetch_futures: Vec<_> = blocks_needed
+            .iter()
+            .map(|(idx, _, _)| {
+                let sem = semaphore.clone();
+                let block_idx = *idx;
+                async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    self.read_block_or_pending(ino, block_idx).await
+                }
+            })
+            .collect();
+
+        // Execute all fetches in parallel
+        let fetched = futures::future::join_all(fetch_futures).await;
+
+        // Assemble result
+        let mut result = BytesMut::with_capacity(effective_size);
+        for (i, block_result) in fetched.iter().enumerate() {
+            let (_block_idx, off_in, to_copy) = blocks_needed[i];
+            match block_result {
+                Ok(block_data) => {
+                    let slice = if to_copy == 0 || off_in >= block_data.len() {
+                        vec![0u8; to_copy]
+                    } else {
+                        let actual_copy = to_copy.min(block_data.len() - off_in);
+                        block_data[off_in..off_in + actual_copy].to_vec()
+                    };
+                    result.extend_from_slice(&slice);
+                }
+                Err(_) => {
+                    // Missing block - fill with zeros
+                    result.extend(std::iter::repeat(0u8).take(to_copy));
+                }
             }
         }
 
         Ok(result.freeze())
+    }
+
+    /// Read a block from storage or pending writes. Helper for parallel reads.
+    async fn read_block_or_pending(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
+        // Check pending blocks first (writes not yet flushed)
+        {
+            let pending = self.state.pending_blocks.lock();
+            if let Some(pending_block) = pending.get(&(ino, block_index)) {
+                return Ok(pending_block.data.clone().freeze());
+            }
+        }
+
+        // Read from storage
+        self.read_block(ino, block_index).await
     }
 
     /// Read a single block from storage.

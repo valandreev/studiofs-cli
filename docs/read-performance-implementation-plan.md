@@ -214,8 +214,8 @@ file.write_all(&data_vec)?;
 **Почему:** Текущий `while remaining > 0` читает блоки **последовательно**. Запрос на 16 МБ = 4 последовательных чтения по 4 МБ. Параллельный fetch даёт линейный прирост до насыщения диска/сети.
 
 **Что сделать:**
-- [ ] **5.1** Добавить в `Cargo.toml` studiofs-vfs: `futures = "0.3"` (уже есть).
-- [ ] **5.2** Вычислить список всех нужных блоков до начала чтения:
+- [x] **5.1** Добавить в `Cargo.toml` studiofs-vfs: `futures = "0.3"` (уже есть).
+- [x] **5.2** Вычислить список всех нужных блоков до начала чтения:
   ```rust
   let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new(); // (block_index, offset_in_block, to_copy)
   let mut cur = offset;
@@ -228,19 +228,25 @@ file.write_all(&data_vec)?;
       cur += to_copy as u64;
   }
   ```
-- [ ] **5.3** Параллельный fetch через `futures::future::join_all`:
+- [x] **5.3** Параллельный fetch через `futures::future::join_all`:
   ```rust
-  let fetched: Vec<VfsResult<Bytes>> = futures::future::join_all(
-      blocks_needed.iter().map(|(idx, _, _)| {
-          // check pending_blocks first, then read_block
-          async move { self.read_block_or_pending(ino, *idx).await }
+  let fetch_futures: Vec<_> = blocks_needed
+      .iter()
+      .map(|(idx, _, _)| {
+          let sem = semaphore.clone();
+          let block_idx = *idx;
+          async move {
+              let _permit = sem.acquire().await.unwrap();
+              self.read_block_or_pending(ino, block_idx).await
+          }
       })
-  ).await;
+      .collect();
+  let fetched = futures::future::join_all(fetch_futures).await;
   ```
-- [ ] **5.4** Собрать результаты в порядке запроса (порядок гарантирован `join_all`).
-- [ ] **5.5** Ограничить параллелизм: использовать `futures::stream::FuturesOrdered` + `buffer_unordered(N)` с `N = 16` чтобы не перегружать S3 при промахах кэша.
-- [ ] **5.6** Тест: чтение 16 МБ файла — сравнить с seq чтением по корректности и скорости.
-- [ ] **5.7** Замерить throughput (ожидается +2–4× для больших sequential reads при cache-miss).
+- [x] **5.4** Собрать результаты в порядке запроса (порядок гарантирован `join_all`).
+- [x] **5.5** Ограничить параллелизм: использовать `Semaphore` с `CONCURRENT_LIMIT = 16` чтобы не перегружать S3 при премахах кэша.
+- [x] **5.6** Тест: чтение 16 МБ файла — сравнить с seq чтением по корректности и скорости.
+- [x] **5.7** Замерить throughput (ожидается +2–4× для больших sequential reads при cache-miss).
 
 ---
 
