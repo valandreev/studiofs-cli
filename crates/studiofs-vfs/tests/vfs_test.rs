@@ -1,6 +1,6 @@
-//! Integration tests for VFS v2 - Block-based architecture.
+//! Integration tests for the StudioFS VFS layer.
 //!
-//! Tests the new block-based VFS implementation with:
+//! Tests the block-based VFS implementation with:
 //! - Sequential block IDs
 //! - Immutable blocks
 //! - LZ4 compression
@@ -10,7 +10,7 @@
 //!   minio server C:\minio --console-address ":9001"
 //!
 //! Run with:
-//!   cargo test -p studiofs-vfs --test vfs_v2_test -- --ignored
+//!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::time::Duration;
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_data::object::{create_object, read_object, format_object_key};
 use studiofs_meta::{RedbMetaEngine, MetaEngine, FormatInfo, types::BlockRef};
-use studiofs_vfs::vfs_v2::StudioVfs;
+use studiofs_vfs::StudioVfs;
 
 // =============================================================================
 // Test Helpers
@@ -28,7 +28,7 @@ use studiofs_vfs::vfs_v2::StudioVfs;
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
     FormatInfo {
-        name: format!("vfs-v2-test-{volume_suffix}"),
+        name: format!("vfs-test-{volume_suffix}"),
         uuid: format!("test-uuid-{volume_suffix}"),
         endpoint: "http://127.0.0.1:9000".into(),
         bucket: "studiofs-test".into(),
@@ -40,8 +40,8 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
     }
 }
 
-/// Create a fresh VFS v2 instance backed by a temporary redb and MinIO.
-fn make_vfs_v2(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
+/// Create a fresh VFS instance backed by a temporary redb and MinIO.
+fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
 
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("failed to open RedbMetaEngine"));
@@ -58,7 +58,7 @@ fn make_vfs_v2(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let cache_dir_str = cache_dir.to_str().unwrap();
     let cache_size = 1024 * 1024 * 1024; // 1 GiB
 
-    StudioVfs::new(meta, data, None, cache_dir_str, cache_size).expect("failed to create StudioVfs v2")
+    StudioVfs::new(meta, data, None, cache_dir_str, cache_size).expect("failed to create StudioVfs")
 }
 
 /// Ensure the test bucket exists.
@@ -82,10 +82,10 @@ async fn ensure_bucket() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_create_write_read_file() {
+async fn test_create_write_read_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "cwr");
+    let vfs = make_vfs(&tmp, "cwr");
 
     // Create a file in root directory (inode 1)
     let attr = vfs.create(1, b"hello.txt", 0, 0, 0o644).unwrap();
@@ -111,10 +111,10 @@ async fn v2_create_write_read_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_write_read_large_file() {
+async fn test_write_read_large_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "large");
+    let vfs = make_vfs(&tmp, "large");
 
     let attr = vfs.create(1, b"big.bin", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -136,10 +136,10 @@ async fn v2_write_read_large_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_write_at_offset() {
+async fn test_write_at_offset() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "offset");
+    let vfs = make_vfs(&tmp, "offset");
 
     let attr = vfs.create(1, b"offset.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -163,10 +163,10 @@ async fn v2_write_at_offset() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_overwrite_and_read() {
+async fn test_overwrite_and_read() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "overwrite");
+    let vfs = make_vfs(&tmp, "overwrite");
 
     let attr = vfs.create(1, b"over.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -192,10 +192,10 @@ async fn v2_overwrite_and_read() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_block_allocation() {
+async fn test_block_allocation() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "blocks");
+    let vfs = make_vfs(&tmp, "blocks");
 
     let attr = vfs.create(1, b"blocks.bin", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -228,10 +228,10 @@ async fn v2_block_allocation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_partial_block() {
+async fn test_partial_block() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "partial");
+    let vfs = make_vfs(&tmp, "partial");
 
     let attr = vfs.create(1, b"partial.bin", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -256,10 +256,10 @@ async fn v2_partial_block() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_directory_operations() {
+async fn test_directory_operations() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "dirs");
+    let vfs = make_vfs(&tmp, "dirs");
 
     // Create a subdirectory
     let dir_attr = vfs.mkdir(1, b"subdir", 0, 0, 0o755).unwrap();
@@ -301,10 +301,10 @@ async fn v2_directory_operations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_rename_file() {
+async fn test_rename_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "rename");
+    let vfs = make_vfs(&tmp, "rename");
 
     let attr = vfs.create(1, b"old.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -334,10 +334,10 @@ async fn v2_rename_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_truncate_file() {
+async fn test_truncate_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "truncate");
+    let vfs = make_vfs(&tmp, "truncate");
 
     let attr = vfs.create(1, b"trunc.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -375,10 +375,10 @@ async fn v2_truncate_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_pending_deletions_gc() {
+async fn test_pending_deletions_gc() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "gc");
+    let vfs = make_vfs(&tmp, "gc");
 
     let attr = vfs.create(1, b"gc_test.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -411,7 +411,7 @@ async fn v2_pending_deletions_gc() {
 // =============================================================================
 
 #[tokio::test]
-async fn v2_block_ref_flags() {
+async fn test_block_ref_flags() {
     // Test BlockRef flags
     let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
     assert!(full_block.is_compressed());
@@ -427,7 +427,7 @@ async fn v2_block_ref_flags() {
 }
 
 #[tokio::test]
-async fn v2_object_format() {
+async fn test_object_format() {
     let original_data = b"Test data for object format v2";
     
     // Create object
@@ -439,7 +439,7 @@ async fn v2_object_format() {
 }
 
 #[tokio::test]
-async fn v2_object_key_format() {
+async fn test_object_key_format() {
     let uuid = "550e8400-e29b-41d4-a716-446655440000";
     let object_id: u64 = 0x1234;
     
@@ -453,10 +453,10 @@ async fn v2_object_key_format() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn v2_sequential_write_performance() {
+async fn test_sequential_write_performance() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs_v2(&tmp, "perf");
+    let vfs = make_vfs(&tmp, "perf");
 
     let attr = vfs.create(1, b"perf.bin", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -493,4 +493,46 @@ async fn v2_sequential_write_performance() {
     println!("Read: {:.2} MiB/s ({} bytes in {:?})", read_mbps, size, read_duration);
     
     assert_eq!(data.len(), size);
+}
+/// Test attribute cache with TTL and invalidation on writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_attr_cache_ttl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "attr_cache");
+
+    // Create a file
+    let file_attr = vfs.create(1, b"test.txt", 0, 0, 0o644).unwrap();
+    let ino = file_attr.ino;
+
+    // First getattr — loads from redb, populates cache
+    let attr1 = vfs.getattr(ino).unwrap();
+    assert_eq!(attr1.ino, ino);
+    assert_eq!(attr1.size, 0);
+
+    // Second getattr immediately — should hit read-through cache (no redb read)
+    let attr2 = vfs.getattr(ino).unwrap();
+    assert_eq!(attr2.ino, ino);
+    assert_eq!(attr2.size, 0);
+
+    // Write data via write() — should not immediately invalidate cache
+    vfs.write(ino, 0, b"hello").await.unwrap();
+
+    // Getattr should return value from dirty_attrs (written but not flushed)
+    let attr3 = vfs.getattr(ino).unwrap();
+    assert_eq!(attr3.size, 5); // size updated by write path
+
+    // Flush the file
+    vfs.flush(ino).await.unwrap();
+
+    // After flush, read-through cache was invalidated, should re-fetch
+    // (but dirty_attrs is cleared, so it comes from redb now)
+    let attr4 = vfs.getattr(ino).unwrap();
+    assert_eq!(attr4.size, 5);
+
+    // Setattr should invalidate cache
+    vfs.setattr(ino, Some(10)).unwrap();
+
+    // Next getattr should see the new size from dirty_attrs
+    let attr5 = vfs.getattr(ino).unwrap();
+    assert_eq!(attr5.size, 10);
 }

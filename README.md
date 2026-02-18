@@ -72,8 +72,8 @@
 └─────────────────────┬───────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────┐
-│              VFS Layer (v2)                 │
-│    studiofs-vfs/src/vfs_v2.rs               │
+│              VFS Layer                      │
+│    studiofs-vfs/src/vfs.rs                  │
 │  - Path resolution                          │
 │  - Block allocation/deallocation            │
 │  - Read/write orchestration                 │
@@ -423,13 +423,13 @@ studiofs mount prod-volume /mnt/studio \
 
 ### Initializing the Filesystem
 
-The core VFS is implemented in [`studiofs-vfs/src/vfs_v2.rs`](crates/studiofs-vfs/src/vfs_v2.rs). To use it programmatically:
+The core VFS is implemented in [`studiofs-vfs/src/vfs.rs`](crates/studiofs-vfs/src/vfs.rs). To use it programmatically:
 
 ```rust
 use std::sync::Arc;
 use studiofs_meta::{RedbMetaEngine, FormatInfo};
 use studiofs_data::store::{DataStore, DataStoreConfig};
-use studiofs_vfs::vfs_v2::StudioVfs;
+use studiofs_vfs::StudioVfs;
 
 // 1. Create metadata engine
 let meta = Arc::new(RedbMetaEngine::open("/path/to/meta.db")?);
@@ -453,10 +453,13 @@ meta.set_format_info(&format_info)?;
 let data_config = DataStoreConfig::from(&format_info);
 let data = Arc::new(DataStore::new(&data_config)?);
 
-// 4. Create VFS
+// 4. Create VFS (with optional memory cache)
+use studiofs_cache::memory::MemoryCache;
+let mem_cache = Arc::new(MemoryCache::new(512 * 1024 * 1024)); // 512 MiB
 let vfs = StudioVfs::new(
     meta.clone(),
     data,
+    Some(mem_cache),
     "/path/to/cache",
     50 * 1024 * 1024 * 1024, // 50 GB
 )?;
@@ -465,7 +468,7 @@ let vfs = StudioVfs::new(
 ### Basic Operations
 
 ```rust
-use studiofs_vfs::vfs_v2::StudioVfs;
+use studiofs_vfs::StudioVfs;
 
 // Create a file
 let attr = vfs.create(1, b"hello.txt", 0, 0, 0o644)?;
@@ -608,8 +611,8 @@ cargo test
 # Start MinIO first
 minio server C:\minio --console-address ":9001"
 
-# VFS v2 integration tests
-cargo test -p studiofs-vfs --test vfs_v2_test -- --ignored
+# VFS integration tests
+cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 # All integration tests
 cargo test -p studiofs-data --test integration_test -- --ignored

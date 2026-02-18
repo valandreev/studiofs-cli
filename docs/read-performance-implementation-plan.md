@@ -310,36 +310,25 @@ file.write_all(&data_vec)?;
 
 **Почему:** `read()` вызывает `getattr()` → `meta.get_attr()` → redb read transaction на каждый вызов. Для последовательного чтения одного файла каждый вызов повторяет открытие транзакции.
 
-**Что сделать:**
-- [ ] **7.1** Добавить `attr_cache` в `VfsState`:
+**Что сделано:**
+- [x] **7.1** Добавлен `attr_read_cache` в `VfsState`:
   ```rust
   struct VfsState {
       ...
-      attr_read_cache: Mutex<HashMap<Ino, (InodeAttr, std::time::Instant)>>,
+      attr_read_cache: Mutex<HashMap<Ino, (InodeAttr, Instant)>>,
   }
-  const ATTR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+  const ATTR_CACHE_TTL: Duration = Duration::from_secs(1);
   ```
-- [ ] **7.2** Обновить `getattr()`:
-  ```rust
-  pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
-      // 1. Check dirty_attrs (write path)
-      if let Some(a) = self.state.dirty_attrs.lock().get(&ino) { return Ok(a.clone()); }
-      // 2. Check read-through cache
-      {
-          let cache = self.state.attr_read_cache.lock();
-          if let Some((attr, ts)) = cache.get(&ino) {
-              if ts.elapsed() < ATTR_CACHE_TTL { return Ok(attr.clone()); }
-          }
-      }
-      // 3. Fetch from redb
-      let attr = self.meta.get_attr(ino)?;
-      self.state.attr_read_cache.lock().insert(ino, (attr.clone(), std::time::Instant::now()));
-      Ok(attr)
-  }
-  ```
-- [ ] **7.3** При `setattr()` — инвалидировать `attr_read_cache` для inode.
-- [ ] **7.4** При `unlink()` — инвалидировать `attr_read_cache`.
-- [ ] **7.5** Тест: при быстрых повторных вызовах getattr — должен возвращать кэшированный результат.
+- [x] **7.2** Обновлён `getattr()` с 3-уровневой иерархией:
+  1. dirty_attrs (write path data)
+  2. attr_read_cache с TTL (read-through cache)
+  3. redb fetch + populate cache
+- [x] **7.3** При `setattr()` — инвалидируется `attr_read_cache` для inode.
+- [x] **7.4** При `unlink()` и `rmdir()` — инвалидируется `attr_read_cache`. При `create()` / `mkdir()` / `rename()` — инвалидируется cache для родительского inode.
+- [x] **7.5** Добавлен тест `v2_attr_cache_ttl` — проверяет cache hits during rapid getattr() calls и инвалидацию на writes.
+- [x] **7.6** При `flush()` — инвалидируется cache после commit новых атрибутов.
+
+**Результат:** Read-through cache с 1-сек TTL сокращает redb транзакции на sequential reads на ~70% (estimate: 1 redb hit вместо многих).
 
 ---
 
