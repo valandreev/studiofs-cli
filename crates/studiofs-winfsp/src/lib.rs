@@ -31,6 +31,9 @@ pub fn mount_and_serve(
     volume_params.max_component_length(255);
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
     volume_params.filesystem_name("StudioFS");
+    // Cache file/dir info for 1 second to reduce metadata queries on redb
+    volume_params.file_info_timeout(1000);
+    volume_params.dir_info_timeout(1000);
 
     let context = StudioFsContext::new(vfs, rt);
 

@@ -374,6 +374,8 @@ impl StudioVfs {
                 block_data_mut = cached.into();
             } else {
                 let block_data = self.read_from_storage(ino, block_start, block_len).await?;
+                // OPTIMIZATION: Populate memory cache immediately to avoid read amplification
+                self.mem_cache.put(cache_key, block_data.clone());
                 block_data_mut = block_data.into();
             }
 

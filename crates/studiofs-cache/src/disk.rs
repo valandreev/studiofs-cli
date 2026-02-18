@@ -259,7 +259,9 @@ impl DiskCache {
                 Err(e) => return Err(e),
             };
 
-            let mut data = Vec::new();
+            // Pre-allocate buffer based on file size to avoid Vec reallocations during read_to_end
+            let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            let mut data = Vec::with_capacity(file_len);
             file.read_to_end(&mut data)?;
 
             debug!("[DISK-CACHE-READ] id={:016x} size={} path={:?}", id, data.len(), path);
@@ -311,8 +313,10 @@ impl DiskCache {
             {
                 let mut file = fs::File::create(&tmp_path)?;
                 file.write_all(&data_vec)?;
-                // IMPORTANT: sync_all() is required for data integrity on Windows
-                file.sync_all()?;
+                // NOTE: sync_all() omitted for disk cache writes.
+                // Disk cache contains data that is always re-fetchable from S3,
+                // so fsync is not required for correctness (trade-off: can survive crashes at cost of re-fetching).
+                // Keep fsync ONLY for writeback journal (critical metadata).
             }
 
             fs::rename(&tmp_path, &path)?;
