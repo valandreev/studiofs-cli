@@ -15,11 +15,24 @@ pub fn mount_and_serve(
     mount_point: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fs = StudioFuseFs::new(vfs, rt);
-    let options = vec![
+    let mut options = vec![
         fuser::MountOption::FSName("studiofs".into()),
         fuser::MountOption::AutoUnmount,
         fuser::MountOption::AllowOther,
+        // Do NOT add DefaultPermissions here: it would make the kernel enforce
+        // POSIX mode/uid/gid from getattr() in-kernel.  Old volumes have the
+        // root inode stored with uid=0/gid=0 (historic default), so the kernel
+        // would see the mounting user as "other" (r-x only) and block writes.
+        // Instead we implement access() → ok() so the FUSE daemon decides.
     ];
+    // macOS-specific options:
+    //  noappledouble – suppress creation of ._  AppleDouble resource files
+    //  volname       – display name in Finder
+    #[cfg(target_os = "macos")]
+    {
+        options.push(fuser::MountOption::CUSTOM("noappledouble".into()));
+        options.push(fuser::MountOption::CUSTOM("volname=StudioFS".into()));
+    }
     tracing::info!("mounting StudioFS at {mount_point}");
     fuser::mount2(fs, mount_point, &options)?;
     Ok(())

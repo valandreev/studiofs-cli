@@ -195,8 +195,10 @@ pub fn run(
     };
     engine.set_format_info(&format_info)?;
 
-    // Initialize root inode
-    engine.init_root()?;
+    // Initialize root inode owned by the current user
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    engine.init_root(uid, gid)?;
 
     info!("volume {name:?} initialized successfully");
     println!("✓ Volume '{}' initialized", name);

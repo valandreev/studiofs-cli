@@ -146,7 +146,8 @@ impl RedbMetaEngine {
     }
 
     /// Initialize a fresh filesystem with root inode.
-    pub fn init_root(&self) -> MetaResult<()> {
+    /// `uid` and `gid` are used as the owner of the root directory.
+    pub fn init_root(&self, uid: u32, gid: u32) -> MetaResult<()> {
         // Check if root already exists
         if self.get_attr(ROOT_INO).is_ok() {
             debug!("root inode already exists, skipping init");
@@ -159,8 +160,8 @@ impl RedbMetaEngine {
         self.set_counter(counters::USED_SPACE, 0)?;
         self.set_counter(counters::TOTAL_INODES, 1)?;
 
-        // Create root directory inode
-        let root_attr = InodeAttr::new_dir(ROOT_INO, ROOT_INO, 0, 0, 0o755);
+        // Create root directory inode owned by the initializing user
+        let root_attr = InodeAttr::new_dir(ROOT_INO, ROOT_INO, uid, gid, 0o755);
         self.set_attr(&root_attr)?;
 
         debug!("initialized root inode");
@@ -1037,7 +1038,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let engine = RedbMetaEngine::open(&path).unwrap();
-        engine.init_root().unwrap();
+        engine.init_root(1000, 1000).unwrap();
         // Leak dir so it isn't dropped
         std::mem::forget(dir);
         engine

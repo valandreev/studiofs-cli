@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use studiofs_meta::FileType;
 use studiofs_vfs::StudioVfs;
@@ -18,7 +18,11 @@ const TTL: Duration = Duration::from_secs(1);
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Convert InodeAttr to fuser FileAttr.
-fn to_fuse_attr(attr: &studiofs_meta::InodeAttr) -> FileAttr {
+/// `mount_uid`/`mount_gid` are used to remap inodes that were created with
+/// uid=0/gid=0 (the old default) so that the mounting user owns them.
+fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32) -> FileAttr {
+    let uid = if attr.uid == 0 { mount_uid } else { attr.uid };
+    let gid = if attr.gid == 0 { mount_gid } else { attr.gid };
     FileAttr {
         ino: attr.ino,
         size: attr.size,
@@ -34,8 +38,8 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr) -> FileAttr {
         },
         perm: attr.mode,
         nlink: attr.nlink as u32,
-        uid: attr.uid,
-        gid: attr.gid,
+        uid,
+        gid,
         rdev: 0,
         blksize: 512,
         flags: 0,
@@ -55,11 +59,18 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
 pub struct StudioFuseFs {
     vfs: Arc<StudioVfs>,
     rt: Arc<Runtime>,
+    /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
+    /// the DB are remapped to this so macOS permission checks don't block writes.
+    mount_uid: u32,
+    /// GID of the user that mounted the filesystem.
+    mount_gid: u32,
 }
 
 impl StudioFuseFs {
     pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
-        Self { vfs, rt }
+        let mount_uid = unsafe { libc::getuid() };
+        let mount_gid = unsafe { libc::getgid() };
+        Self { vfs, rt, mount_uid, mount_gid }
     }
 }
 
@@ -67,7 +78,7 @@ impl Filesystem for StudioFuseFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_bytes = name.to_string_lossy().as_bytes().to_vec();
         match self.vfs.lookup(parent, &name_bytes) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
             Err(e) => {
                 debug!("lookup({parent}, {:?}) -> {e}", name);
                 reply.error(libc::ENOENT);
@@ -77,7 +88,7 @@ impl Filesystem for StudioFuseFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.vfs.getattr(ino) {
-            Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr)),
+            Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 debug!("getattr({ino}) -> {e}");
                 reply.error(libc::ENOENT);
@@ -99,7 +110,7 @@ impl Filesystem for StudioFuseFs {
             .vfs
             .mkdir(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
         {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
             Err(e) => {
                 error!("mkdir({parent}, {:?}) -> {e}", name);
                 reply.error(libc::EIO);
@@ -122,7 +133,7 @@ impl Filesystem for StudioFuseFs {
             .vfs
             .create(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
         {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
             Err(e) => {
                 error!("mknod({parent}, {:?}) -> {e}", name);
                 reply.error(libc::EIO);
@@ -146,7 +157,7 @@ impl Filesystem for StudioFuseFs {
             .create(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
         {
             Ok(attr) => {
-                reply.created(&TTL, &to_fuse_attr(&attr), 0, 0, 0);
+                reply.created(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0, 0, 0);
             }
             Err(e) => {
                 error!("create({parent}, {:?}) -> {e}", name);
@@ -331,7 +342,7 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyAttr,
     ) {
         match self.vfs.setattr(ino, size) {
-            Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr)),
+            Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 error!("setattr({ino}) -> {e}");
                 reply.error(libc::EIO);
@@ -351,5 +362,47 @@ impl Filesystem for StudioFuseFs {
             255,                // namelen
             4096,               // frsize
         );
+    }
+
+    // macOS calls access() to determine if writing is allowed.
+    // With DefaultPermissions set the kernel already checked mode bits,
+    // so we just say OK here.
+    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    // macOS Finder queries extended attributes extensively.
+    // We don't support them, so return ENOATTR (macOS) / ENODATA (Linux).
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        #[cfg(target_os = "macos")]
+        reply.error(libc::ENOATTR);
+        #[cfg(not(target_os = "macos"))]
+        reply.error(libc::ENODATA);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
     }
 }
