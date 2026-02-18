@@ -34,7 +34,7 @@ use studiofs_meta::types::{BlockRef, BlockFlags, block_index_from_offset, offset
 use thiserror::Error;
 use tracing::{debug, info, error, warn};
 use parking_lot::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
 
 // =============================================================================
 // Error Types
@@ -143,6 +143,11 @@ struct VfsState {
     /// Compressed object data waiting for S3 upload (used when store_decompressed=true).
     /// Maps object_id -> compressed STFS bytes. Removed once the upload completes.
     pending_upload_data: Mutex<std::collections::HashMap<u64, bytes::Bytes>>,
+    /// In-flight S3 block fetches for request coalescing.
+    /// When multiple readers request the same block concurrently, only the first
+    /// issues an S3 GET; the rest wait for a broadcast notification and then
+    /// read from the newly-populated cache.
+    inflight_fetches: Mutex<std::collections::HashMap<(Ino, u32), broadcast::Sender<()>>>,
 }
 
 // =============================================================================
@@ -211,6 +216,7 @@ impl StudioVfs {
                 dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                 attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                 pending_upload_data: Mutex::new(std::collections::HashMap::new()),
+                inflight_fetches: Mutex::new(std::collections::HashMap::new()),
             }),
             upload_semaphore: Arc::new(Semaphore::new(32)),
             upload_retries: 3,
@@ -548,7 +554,11 @@ impl StudioVfs {
         self.read_block(ino, block_index).await
     }
 
-    /// Read a single block from storage.
+    /// Read a single block from storage, with in-flight request coalescing.
+    ///
+    /// When multiple concurrent reads target the same block (common with OS readahead),
+    /// only the first request fetches from S3. Subsequent requests wait for the first
+    /// to complete and then read from the now-populated cache.
     async fn read_block(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
         // Get block reference from metadata
         let block_ref = self.meta.get_file_block(ino, block_index)?
@@ -565,45 +575,80 @@ impl StudioVfs {
 
         // L2: Try disk cache
         if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
-            if self.store_decompressed {
-                // Cache holds raw decompressed bytes — return directly, no decompress needed
-                // Promote to L1
-                if let Some(mc) = &self.mem_cache {
-                    mc.put(mem_key, cached.clone());
-                }
-                return Ok(cached);
+            let result = if self.store_decompressed {
+                cached
             } else {
-                // Cache holds a compressed STFS object — decompress before returning
-                let decompressed = Bytes::from(read_object(&cached)?);
-                // Promote to L1
+                Bytes::from(read_object(&cached)?)
+            };
+            if let Some(mc) = &self.mem_cache {
+                mc.put(mem_key, result.clone());
+            }
+            return Ok(result);
+        }
+
+        // L3: Fetch from S3 with in-flight coalescing
+        loop {
+            // Check if another task is already fetching this block
+            let maybe_rx = {
+                let inflight = self.state.inflight_fetches.lock();
+                inflight.get(&(ino, block_index)).map(|tx| tx.subscribe())
+            };
+
+            if let Some(mut rx) = maybe_rx {
+                // Another task is fetching this block — wait for completion
+                let _ = rx.recv().await;
+
+                // Re-check caches (should now be populated)
+                if let Some(mc) = &self.mem_cache {
+                    if let Some(cached) = mc.get(&mem_key) {
+                        return Ok(cached);
+                    }
+                }
+                if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
+                    let result = if self.store_decompressed {
+                        cached
+                    } else {
+                        Bytes::from(read_object(&cached)?)
+                    };
+                    if let Some(mc) = &self.mem_cache {
+                        mc.put(mem_key, result.clone());
+                    }
+                    return Ok(result);
+                }
+                // Original fetch failed — loop and try to become the fetcher ourselves
+                continue;
+            }
+
+            // No in-flight fetch — register ourselves as the fetcher
+            let (tx, _) = broadcast::channel::<()>(1);
+            self.state.inflight_fetches.lock().insert((ino, block_index), tx.clone());
+
+            // Fetch from S3
+            let result = async {
+                let key = format_object_key(&self.volume_uuid, block_ref.object_id);
+                let compressed = self.data.get_object(&key).await?;
+                let decompressed = Bytes::from(read_object(&compressed)?);
+
+                if self.store_decompressed {
+                    self.disk_cache.put_object(block_ref.object_id, &decompressed).await?;
+                } else {
+                    self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
+                }
+
                 if let Some(mc) = &self.mem_cache {
                     mc.put(mem_key, decompressed.clone());
                 }
-                return Ok(decompressed);
+
+                Ok::<Bytes, VfsError>(decompressed)
             }
+            .await;
+
+            // Clean up and notify waiters (regardless of success/failure)
+            self.state.inflight_fetches.lock().remove(&(ino, block_index));
+            let _ = tx.send(());
+
+            return result;
         }
-
-        // L3: Fetch from S3
-        let key = format_object_key(&self.volume_uuid, block_ref.object_id);
-        let compressed = self.data.get_object(&key).await?;
-
-        // Decompress
-        let decompressed = Bytes::from(read_object(&compressed)?);
-
-        if self.store_decompressed {
-            // Cache decompressed bytes for zero-decompress future reads
-            self.disk_cache.put_object(block_ref.object_id, &decompressed).await?;
-        } else {
-            // Cache compressed STFS object (S3-compatible format)
-            self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
-        }
-
-        // Promote to L1
-        if let Some(mc) = &self.mem_cache {
-            mc.put(mem_key, decompressed.clone());
-        }
-
-        Ok(decompressed)
     }
 
     // =========================================================================
@@ -611,6 +656,10 @@ impl StudioVfs {
     // =========================================================================
 
     /// Write data to a file at the given offset.
+    ///
+    /// Full blocks are flushed eagerly (compress + cache + writeback submit) so that
+    /// the final `flush()` only handles the last partial block, eliminating the
+    /// end-of-write stall where all blocks were previously processed at once.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         if data.is_empty() {
             return Ok(0);
@@ -620,6 +669,7 @@ impl StudioVfs {
         let mut remaining = data.len();
         let mut current_offset = offset;
         let mut data_offset = 0;
+        let mut full_blocks: Vec<(u32, Bytes)> = Vec::new();
 
         while remaining > 0 {
             let block_index = block_index_from_offset(current_offset, self.block_size);
@@ -627,24 +677,27 @@ impl StudioVfs {
             let space_in_block = self.block_size as usize - offset_in_block;
             let to_write = remaining.min(space_in_block);
 
-            // Get or create pending block
-            {
+            // Load existing block data if needed (outside lock to avoid holding
+            // parking_lot::Mutex across .await)
+            let need_load = !self.state.pending_blocks.lock().contains_key(&(ino, block_index));
+            if need_load {
+                let existing_data = match self.read_block_if_exists(ino, block_index).await {
+                    Ok(Some(d)) => d,
+                    _ => Bytes::new(),
+                };
                 let mut pending = self.state.pending_blocks.lock();
-                
-                // Check if block already in pending cache
+                // Double-check: another write call might have inserted while we loaded
                 if !pending.contains_key(&(ino, block_index)) {
-                    // Try to read existing block data from storage
-                    let existing_data = match self.read_block_if_exists(ino, block_index).await {
-                        Ok(Some(data)) => data,
-                        _ => Bytes::new(),
-                    };
-                    
                     pending.insert((ino, block_index), PendingBlock {
                         data: BytesMut::from(existing_data.as_ref()),
                         dirty: false,
                     });
                 }
-                
+            }
+
+            // Write data into the pending block (brief lock)
+            {
+                let mut pending = self.state.pending_blocks.lock();
                 let pending_block = pending.get_mut(&(ino, block_index)).unwrap();
 
                 // Ensure buffer is large enough
@@ -658,6 +711,12 @@ impl StudioVfs {
                     &data[data_offset..data_offset + to_write]
                 );
                 pending_block.dirty = true;
+
+                // If block is now full → extract for eager flush
+                if pending_block.data.len() >= self.block_size as usize {
+                    let pb = pending.remove(&(ino, block_index)).unwrap();
+                    full_blocks.push((block_index, pb.data.freeze()));
+                }
             }
 
             written += to_write as u64;
@@ -673,6 +732,20 @@ impl StudioVfs {
             if current_offset > attr.size {
                 attr.size = current_offset;
                 attr.touch_mtime();
+            }
+        }
+
+        // Eagerly flush full blocks in parallel (compress + cache + submit to writeback).
+        // This spreads the work across the entire write duration instead of
+        // doing it all at once in the final flush() call.
+        if !full_blocks.is_empty() {
+            let flush_futs: Vec<_> = full_blocks
+                .into_iter()
+                .map(|(block_index, block_data)| self.flush_block(ino, block_index, block_data))
+                .collect();
+            let results = futures::future::join_all(flush_futs).await;
+            for r in results {
+                r?;
             }
         }
 
@@ -712,6 +785,10 @@ impl StudioVfs {
     }
 
     /// Flush all buffered blocks for a file.
+    ///
+    /// With eager flushing in `write()`, most full blocks are already flushed.
+    /// This handles only the remaining dirty blocks (typically just the last partial block).
+    /// Remaining blocks are flushed in parallel for best performance.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         // Extract all pending blocks for this inode
         let blocks_to_flush: Vec<(u32, Bytes)> = {
@@ -732,9 +809,16 @@ impl StudioVfs {
             blocks
         };
 
-        // Flush each block
-        for (block_index, data) in blocks_to_flush {
-            self.flush_block(ino, block_index, data).await?;
+        // Flush remaining blocks in parallel
+        if !blocks_to_flush.is_empty() {
+            let flush_futs: Vec<_> = blocks_to_flush
+                .into_iter()
+                .map(|(block_index, data)| self.flush_block(ino, block_index, data))
+                .collect();
+            let results = futures::future::join_all(flush_futs).await;
+            for r in results {
+                r?;
+            }
         }
 
         // Commit dirty attributes
