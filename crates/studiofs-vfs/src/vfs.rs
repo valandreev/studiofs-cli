@@ -10,7 +10,7 @@ use studiofs_data::object::{
 };
 use studiofs_meta::*;
 use thiserror::Error;
-use tracing::{debug, info, error};
+use tracing::{debug, info, error, warn};
 use studiofs_cache::writeback::{WritebackManager, PendingOp};
 use parking_lot::Mutex;
 
@@ -70,8 +70,11 @@ pub struct StudioVfs {
     mem_cache: Arc<MemoryCache>,
     disk_cache: Arc<DiskCache>,
     
-    // RAM buffer for current blocks: (ino, chunk_idx, block_idx) -> (start_offset_in_block, data)
+    // RAM buffer for currently being written blocks
     pending_writes: Arc<Mutex<std::collections::HashMap<(Ino, u32, u32), (u32, BytesMut)>>>,
+    
+    // RAM buffer for blocks currently in-flight to disk/S3
+    flushing_blocks: Arc<Mutex<std::collections::HashMap<(Ino, u32, u32), (u32, Bytes)>>>,
     
     // Memory cache for Attributes (size, mtime) to avoid Redb hits on every write
     dirty_attrs: Arc<Mutex<std::collections::HashMap<Ino, InodeAttr>>>,
@@ -85,8 +88,17 @@ pub struct StudioVfs {
     // Limit global concurrent disk flushes (e.g. 32)
     flush_semaphore: Arc<tokio::sync::Semaphore>,
     
+    // Sequential prefetch tracker: Ino -> last_requested_offset
+    last_reads: Arc<Mutex<std::collections::HashMap<Ino, u64>>>,
+    
     // Writeback Manager for persistent queuing
     writeback: Arc<WritebackManager>,
+    
+    // Sharded locks for commit_uploads serialization (Ino % 32)
+    commit_locks: Vec<Arc<tokio::sync::Mutex<()>>>,
+    
+    // Links currently being committed (visible to Read during commit)
+    committing_links: Arc<Mutex<std::collections::HashMap<Ino, Vec<Objectlink>>>>,
 }
 
 impl StudioVfs {
@@ -112,11 +124,17 @@ impl StudioVfs {
             mem_cache,
             disk_cache,
             pending_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            flushing_blocks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dirty_attrs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_links: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_flushes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             flush_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
+            last_reads: Arc::new(Mutex::new(std::collections::HashMap::new())),
             writeback,
+            
+            // Initialize 32 commit locks
+            commit_locks: (0..32).map(|_| Arc::new(tokio::sync::Mutex::new(()))).collect(),
+            committing_links: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
 
         // Spawn Upload Worker
@@ -299,7 +317,7 @@ impl StudioVfs {
     ///
     /// Read path: memory cache → disk cache (TODO) → S3
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
-        let attr = self.meta.get_attr(ino)?;
+        let attr = self.getattr(ino)?;
 
         // Clamp read to file size
         let end = (offset + size as u64).min(attr.size);
@@ -312,6 +330,25 @@ impl StudioVfs {
         let mut result = BytesMut::with_capacity(effective_size);
         let mut current_offset = offset;
         let mut remaining = effective_size;
+
+        // SEQUENTIAL PREFETCH LOGIC
+        {
+            let mut last_reads = self.last_reads.lock();
+            let last_off = last_reads.get(&ino).cloned().unwrap_or(0);
+            
+            // If this read starts where the last one ended (or within 4KB gap), it's sequential
+            if offset == last_off || (offset > last_off && offset < last_off + 4096) {
+                // Trigger prefetch for the next N blocks (e.g. 4 blocks = 16MB)
+                let next_block_start = ((offset + size as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+                for i in 0..4 {
+                    let prefetch_off = next_block_start + (i as u64 * BLOCK_SIZE as u64);
+                    if prefetch_off < attr.size {
+                        self.prefetch_block(ino, prefetch_off, &attr);
+                    }
+                }
+            }
+            last_reads.insert(ino, offset + size as u64);
+        }
 
         while remaining > 0 {
             let block_start = (current_offset / BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
@@ -327,17 +364,44 @@ impl StudioVfs {
             
             // Try cache
             let cache_key = studiofs_cache::memory::CacheKey::new(ino, block_start);
-            let block_data: Bytes;
+            let mut block_data_mut: BytesMut;
             
             if let Some(cached) = self.mem_cache.get(&cache_key) {
-                 block_data = cached;
+                 block_data_mut = cached.into();
             } else {
-                 // Fetch full block (or up to EOF)
-                 block_data = self.read_from_storage(ino, block_start, block_len, &attr).await?;
-                 
-                 // Cache it
+                 let block_data = self.read_from_storage(ino, block_start, block_len).await?;
                  self.mem_cache.put(cache_key, block_data.clone());
+                 block_data_mut = block_data.into();
             }
+
+            let bkey = (ino, (block_start / CHUNK_SIZE) as u32, ((block_start % CHUNK_SIZE) / BLOCK_SIZE as u64) as u32);
+
+            // 1. OVERLAY flushing_blocks (In-flight to disk)
+            {
+                if let Some((start_off, buffer)) = self.flushing_blocks.lock().get(&bkey) {
+                    let start = *start_off as usize;
+                    let len = buffer.len();
+                    if start < block_data_mut.len() {
+                        let to_copy = len.min(block_data_mut.len() - start);
+                        block_data_mut[start..start + to_copy].copy_from_slice(&buffer[..to_copy]);
+                    }
+                }
+            }
+
+            // 2. OVERLAY pending_writes (RAM buffers) - most recent data wins
+            {
+                let pending = self.pending_writes.lock();
+                if let Some((start_off, buffer)) = pending.get(&bkey) {
+                    let start = *start_off as usize;
+                    let len = buffer.len();
+                    if start < block_data_mut.len() {
+                        let to_copy = len.min(block_data_mut.len() - start);
+                        block_data_mut[start..start + to_copy].copy_from_slice(&buffer[..to_copy]);
+                    }
+                }
+            }
+            
+            let block_data = block_data_mut.freeze();
 
             // Copy slice
             let to_copy = remaining.min(block_data.len().saturating_sub(offset_in_block));
@@ -352,10 +416,30 @@ impl StudioVfs {
         }
 
         Ok(result.freeze())
-
     }
 
-    /// Resolve chunk/slice/block data from S3 storage.
+    /// Fetch a block asynchronously into the MemoryCache.
+    fn prefetch_block(&self, ino: Ino, offset: u64, attr: &InodeAttr) {
+        let cache_key = studiofs_cache::memory::CacheKey::new(ino, offset);
+        if self.mem_cache.get(&cache_key).is_some() {
+             return; // Already cached
+        }
+        
+        let vfs = self.clone();
+        let attr_clone = attr.clone();
+        tokio::spawn(async move {
+            let block_len = if offset + BLOCK_SIZE as u64 > attr_clone.size {
+                 (attr_clone.size - offset) as usize
+            } else {
+                 BLOCK_SIZE as usize
+            };
+            if let Ok(data) = vfs.read_from_storage(ino, offset, block_len).await {
+                 vfs.mem_cache.put(cache_key, data);
+            }
+        });
+    }
+
+    /// Resolve chunk/slice/block data from S3 storage, merging pending links.
     /// Fetch object data from Disk Cache or S3.
     async fn get_object_with_cache(&self, object_id: &str) -> VfsResult<Bytes> {
         let oid_u64 = u64::from_str_radix(object_id, 16).map_err(|e| VfsError::Other(e.to_string()))?;
@@ -378,112 +462,134 @@ impl StudioVfs {
         Ok(data)
     }
 
-    /// Resolve chunk/slice/block data from S3 storage.
+    /// Resolve chunk/slice/block data from S3 storage, merging pending links using "Paint Layers".
     async fn read_from_storage(
         &self,
         ino: Ino,
         offset: u64,
         size: usize,
-        _attr: &InodeAttr,
     ) -> VfsResult<Bytes> {
-        // 1. Get Data Root
-        let root_id = match self.meta.get_data_root(ino)? {
-            Some(id) => id,
-            None => return Ok(BytesMut::zeroed(size).freeze()),
-        };
+        // 1. Get Data Root from Meta
+        let meta_root_id = self.meta.get_data_root(ino)?;
 
-        // 2. Fetch & Parse Root Object
-        let root_bytes = match self.get_object_with_cache(&root_id).await {
-            Ok(b) => b,
-            Err(e) => {
-                error!("failed to read root object {}: {}", root_id, e);
-                return Err(e);
+        // 2. Collect ALL links in LAYERS (Oldest -> Newest)
+        // Layer 0: Metadata (Base)
+        let mut meta_links = Vec::new();
+        if let Some(root_id) = meta_root_id {
+            if let Ok(root_bytes) = self.get_object_with_cache(&root_id).await {
+                if let Ok(root_payload_bytes) = read_object(&root_bytes) {
+                     if let Ok(root_payload) = ObjectPayload::from_bytes(&root_payload_bytes) {
+                         match root_payload.kind {
+                             ObjectKind::Meta => meta_links = root_payload.children,
+                             ObjectKind::Data => {
+                                 meta_links.push(Objectlink {
+                                     offset: 0,
+                                     length: root_payload.data.len() as u32,
+                                     object_id: root_id,
+                                 });
+                             }
+                         }
+                     }
+                }
             }
+        }
+        
+        // Layer 1: Committing Links (Middle)
+        // These are links that are currently being committed to metadata (race window)
+        let committing_links_snapshot = {
+            self.committing_links.lock().get(&ino).cloned().unwrap_or_default()
         };
-        
-        let root_payload_bytes = read_object(&root_bytes)
-            .map_err(|e| VfsError::Other(e.to_string()))?;
-        
-        let root_payload = ObjectPayload::from_bytes(&root_payload_bytes)
-             .map_err(|e| VfsError::Other(e.to_string()))?;
 
-        // 3. Resolve Data
+        // Layer 2: Pending Links (Top)
+        // These are links that have been flushed to disk but not yet committed
+        let pending_links_snapshot = {
+            self.pending_links.lock().get(&ino).cloned().unwrap_or_default()
+        };
+
+        // Combine into ordered layers
+        // We want to process them in order: Meta -> Committing -> Pending.
+        // But for efficient reading, we should gather ALL relevant links and fetch them.
+        // The core idea of "Paint Layers":
+        // Initialize buffer with 0.
+        // Iterate layers from bottom up.
+        // For each link in layer: copy data to buffer (overwriting previous).
+
+        let end_offset = offset + size as u64;
+
+        // Collect fetch tasks: (LayerIndex, LinkIndex, ObjectLink)
+        // LayerIndex 0=Meta, 1=Committing, 2=Pending
+        let mut fetch_tasks = Vec::new();
+        
+        let layers = vec![meta_links, committing_links_snapshot, pending_links_snapshot];
+        
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            for link in layer {
+                // Check intersection
+                let link_end = link.offset + link.length as u64;
+                if !(end_offset <= link.offset || offset >= link_end) {
+                    fetch_tasks.push((layer_idx, link.clone()));
+                }
+            }
+        }
+
+        if fetch_tasks.is_empty() {
+             return Ok(BytesMut::zeroed(size).freeze());
+        }
+
+        // Parallel Fetch
+        use futures::stream::{self, StreamExt};
+        const CONCURRENCY: usize = 16;
+
+        let fetch_stream = stream::iter(fetch_tasks)
+            .map(|(layer_idx, link)| {
+                let self_ref = &self;
+                async move {
+                    let child_bytes = self_ref.get_object_with_cache(&link.object_id).await?;
+                    let child_payload_bytes = read_object(&child_bytes)
+                        .map_err(|e| VfsError::Other(e.to_string()))?;
+                    let child_payload = ObjectPayload::from_bytes(&child_payload_bytes)
+                        .map_err(|e| VfsError::Other(e.to_string()))?;
+                    Ok::<_, VfsError>((layer_idx, link, child_payload))
+                }
+            })
+            .buffer_unordered(CONCURRENCY);
+
+        // Collect results into a buffer to sort by LayerIndex
+        let mut results = Vec::new();
+        let mut stream = fetch_stream;
+        while let Some(res) = stream.next().await {
+            match res {
+                Ok(val) => results.push(val),
+                Err(e) => {
+                    // Log error but continue? Or fail? 
+                    // Fail prevents partial data returns which is safer.
+                    return Err(e);
+                }
+            }
+        }
+        
+        // Sort by LayerIndex (asc) then Offset (asc)
+        // Stable sort to keep relative order if needed?
+        // LayerIndex is crucial.
+        results.sort_by_key(|(layer_idx, link, _)| (*layer_idx, link.offset));
+
+        // PAINT
         let mut result = BytesMut::zeroed(size);
-        let current_offset = offset;
-
-        match root_payload.kind {
-            ObjectKind::Data => {
-                // Single object file. Assume it starts at 0.
-                if current_offset < root_payload.data.len() as u64 {
-                    let end = (current_offset + size as u64).min(root_payload.data.len() as u64);
-                    let len = (end - current_offset) as usize;
-                    result[0..len].copy_from_slice(&root_payload.data[current_offset as usize..end as usize]);
-                }
-            }
-            ObjectKind::Meta => {
-                // Identify all children overlapping the requested range
-                let end_offset = offset + size as u64;
-                let children_to_fetch: Vec<Objectlink> = root_payload.children.iter()
-                    .filter(|child| {
-                        let child_end = child.offset + child.length as u64;
-                        // Overlap check
-                        !(end_offset <= child.offset || offset >= child_end)
-                    })
-                    .cloned()
-                    .collect();
-
-                if children_to_fetch.is_empty() {
-                    return Ok(result.freeze());
-                }
-
-                // Parallel fetch
-                use futures::stream::{self, StreamExt};
+        for (_, link, payload) in results {
+            if let ObjectKind::Data = payload.kind {
+                let start = offset.max(link.offset);
+                let end = (offset + size as u64).min(link.offset + link.length as u64);
                 
-                // Concurrency limit
-                const CONCURRENCY: usize = 16; 
-
-                let fetch_stream = stream::iter(children_to_fetch)
-                    .map(|link| {
-                        let self_ref = &self;
-                        async move {
-                            let child_bytes = self_ref.get_object_with_cache(&link.object_id).await?;
-                            let child_payload_bytes = read_object(&child_bytes)
-                                .map_err(|e| VfsError::Other(e.to_string()))?;
-                            let child_payload = ObjectPayload::from_bytes(&child_payload_bytes)
-                                .map_err(|e| VfsError::Other(e.to_string()))?;
-                            
-                            Ok::<_, VfsError>((link, child_payload))
-                        }
-                    })
-                    .buffer_unordered(CONCURRENCY);
-
-                let mut stream = fetch_stream;
-                
-                while let Some(fetch_result) = stream.next().await {
-                    match fetch_result {
-                        Ok((link, payload)) => {
-                            if let ObjectKind::Data = payload.kind {
-                                // Calculate overlap with request
-                                // Request: [offset, offset + size)
-                                // Child: [link.offset, link.offset + link.length)
-                                
-                                let start = offset.max(link.offset);
-                                let end = (offset + size as u64).min(link.offset + link.length as u64);
-                                
-                                if start < end {
-                                    let len = (end - start) as usize;
-                                    let dest_off = (start - offset) as usize;
-                                    let src_off = (start - link.offset) as usize;
-                                    
-                                    result[dest_off..dest_off + len]
-                                        .copy_from_slice(&payload.data[src_off..src_off + len]);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            tracing::error!("failed to fetch child object: {}", e);
-                            return Err(e);
-                        }
+                if start < end {
+                    let len = (end - start) as usize;
+                    let dest_off = (start - offset) as usize;
+                    let src_off = (start - link.offset) as usize;
+                    
+                    if src_off + len <= payload.data.len() {
+                        result[dest_off..dest_off + len].copy_from_slice(&payload.data[src_off..src_off + len]);
+                    } else {
+                        // Truncated payload?
+                        warn!("payload data shorter than expected: {} < {}", payload.data.len(), src_off + len);
                     }
                 }
             }
@@ -528,7 +634,11 @@ impl StudioVfs {
                 // If we are writing outside the current buffered range, flush and restart
                 let buf_end = *start_off + buffer.len() as u32;
                 if (offset_in_block as u32) < *start_off || (offset_in_block as u32) > buf_end {
-                    flush_gap_data = Some((buffer.clone().freeze(), *start_off));
+                    // Gap or jump! Flush current part.
+                    let data = buffer.clone().freeze();
+                    flush_gap_data = Some((data, *start_off));
+                    
+                    // Reset buffer to new start
                     *start_off = offset_in_block as u32;
                     buffer.clear();
                 }
@@ -544,15 +654,30 @@ impl StudioVfs {
                     buffer.extend_from_slice(&data[data_offset..data_offset + to_write]);
                 }
 
+                // Invalidate MemoryCache to ensure subsequent reads see new data
+                let key_offset = (chunk_key.index as u64 * CHUNK_SIZE) + (block_idx_in_chunk as u64 * BLOCK_SIZE as u64);
+                let cache_key = studiofs_cache::memory::CacheKey::new(ino, key_offset);
+                self.mem_cache.remove(&cache_key);
+
                 if buffer.len() >= BLOCK_SIZE as usize {
-                    flush_full_data = Some((buffer.clone().freeze(), *start_off));
+                    // ATOMIC TRANSFER to in-flight state
+                    let data_bytes = buffer.clone().freeze();
+                    self.flushing_blocks.lock().insert(key, (*start_off, data_bytes.clone()));
+                    
+                    flush_full_data = Some((data_bytes, *start_off));
                     pending.remove(&key);
                 }
             } // UNLOCK
 
             // ASYNC FLUSH tasks
-            if let Some((d, off)) = flush_gap_data { self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d); }
-            if let Some((d, off)) = flush_full_data { self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d); }
+            if let Some((d, off)) = flush_gap_data {
+                self.flushing_blocks.lock().insert((ino, chunk_key.index, block_idx_in_chunk), (off, d.clone()));
+                self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d);
+            }
+            if let Some((d, off)) = flush_full_data {
+                // Already inserted into flushing_blocks inside the lock above
+                self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d);
+            }
 
             written += to_write as u64;
             remaining -= to_write;
@@ -588,7 +713,11 @@ impl StudioVfs {
             if let Some(link) = vfs.flush_block_internal(ino, chunk_idx, block_idx, start_off, data).await? {
                 vfs.pending_links.lock().entry(ino).or_default().push(link);
             }
-            Ok(())
+            
+            // Remove from in-flight tracker
+            vfs.flushing_blocks.lock().remove(&(ino, chunk_idx, block_idx));
+            
+            Ok::<(), VfsError>(())
         });
 
         let mut flushes = self.active_flushes.lock();
@@ -603,11 +732,15 @@ impl StudioVfs {
         let mut entries_to_flush = Vec::new();
         {
             let mut pending = self.pending_writes.lock();
+            let mut flushing = self.flushing_blocks.lock();
+            
             let keys: Vec<_> = pending.keys().filter(|(i, _, _)| *i == ino).cloned().collect();
             for key in keys {
                 if let Some((start_off, data)) = pending.remove(&key) {
                     let (_, chunk_idx, block_idx) = key;
-                    entries_to_flush.push((chunk_idx, block_idx, start_off, data.freeze()));
+                    let data_frozen = data.freeze();
+                    flushing.insert(key, (start_off, data_frozen.clone()));
+                    entries_to_flush.push((chunk_idx, block_idx, start_off, data_frozen));
                 }
             }
         }
@@ -621,8 +754,20 @@ impl StudioVfs {
         let handles = self.active_flushes.lock().remove(&ino).unwrap_or_default();
         for h in handles { h.await.map_err(|e| VfsError::Join(e))??; }
         
-        // 4. Collect and clear pending links
-        let pending_links_vec = self.pending_links.lock().remove(&ino).unwrap_or_default();
+        // 4. Collect pending links
+        // CRITICAL: Move to committing_links BEFORE removing from pending_links to avoid stale reads.
+        let pending_links_vec = {
+            let mut pending = self.pending_links.lock();
+            let mut committing = self.committing_links.lock();
+            
+            if let Some(links) = pending.remove(&ino) {
+                // Insert into committing_links so read() sees them during commit
+                committing.insert(ino, links.clone());
+                links
+            } else {
+                Vec::new()
+            }
+        };
 
         // 5. Commit to metadata
         if !pending_links_vec.is_empty() {
@@ -674,7 +819,20 @@ impl StudioVfs {
     /// Commit all pending uploads for an inode to the metadata.
     async fn commit_uploads(&self, ino: Ino, new_links: Vec<Objectlink>) -> VfsResult<()> {
         if new_links.is_empty() { return Ok(()); }
+
+        // 0. Acquire Commit Lock (Serialize metadata updates for this inode)
+        let lock_idx = (ino % 32) as usize;
+        let _commit_guard = self.commit_locks[lock_idx].lock().await;
+
+        // 0b. Store in committing_links (Make visible to Read)
+        {
+            let mut committing = self.committing_links.lock();
+            committing.insert(ino, new_links.clone());
+        }
         
+        // Ensure cleanup even on error (using a scope guard or defer would be better, but manual limits scope)
+        // We will clear it at the end.
+
         // 1. Fetch current root
         let mut children = Vec::new();
         if let Some(root_id) = self.meta.get_data_root(ino)? {
@@ -698,15 +856,39 @@ impl StudioVfs {
             }
         }
 
-        // 2. Merge new links
-        for link in new_links {
-             // Remove overlaps
-             let link_end = link.offset + link.length as u64;
-             children.retain(|child| {
+        // 2. Merge new links with OVERLAP HANDLING
+        // We must process new links one by one.
+        for new_link in new_links {
+             let mut i = 0;
+             while i < children.len() {
+                 let child = &children[i];
                  let child_end = child.offset + child.length as u64;
-                 ! (link.offset < child_end && link_end > child.offset)
-             });
-             children.push(link);
+                 let link_end = new_link.offset + new_link.length as u64;
+                 
+                 // Check overlap
+                 if new_link.offset < child_end && link_end > child.offset {
+                     // Overlap detected! We must SPLINTER the existing child.
+                     // 1. Remove child
+                     let child_to_splinter = children.remove(i);
+                     
+                     // 2. splinter it
+                     // This is async, so we might need to be careful about iteration index?
+                     // We are inside async fn, so await is fine.
+                     let splinters = self.splinter_object(ino, child_to_splinter, &new_link).await?;
+                     
+                     // 3. Insert splinters
+                     for s in splinters {
+                         children.insert(i, s);
+                         i += 1;
+                     }
+                     // Don't increment i here, effectively checking the *next* child in the list
+                 } else {
+                     i += 1;
+                 }
+             }
+             children.push(new_link);
+             // Sort to keep order for next pass
+             children.sort_by_key(|c| c.offset);
         }
         
         children.sort_by_key(|c| c.offset);
@@ -726,9 +908,104 @@ impl StudioVfs {
         
         // Update Redb Transactionally (Locally)
         self.meta.set_data_root(ino, &new_root_id)?;
+
+        // 4. Clear committing_links
+        {
+            self.committing_links.lock().remove(&ino);
+        }
         
         debug!("consumed uploads and updated root: ino={} new_root={}", ino, new_root_id);
         Ok(())
+    }
+
+
+
+    /// Split an existing object into parts that do NOT overlap with the `overwrite` link.
+    /// Returns 0, 1, or 2 new links (Head and/or Tail).
+    async fn splinter_object(&self, ino: Ino, original: Objectlink, overwrite: &Objectlink) -> VfsResult<Vec<Objectlink>> {
+        let mut result = Vec::new();
+        let orig_end = original.offset + original.length as u64;
+        let over_end = overwrite.offset + overwrite.length as u64;
+
+        // Check/Calculate Head (part of original BEFORE overwrite)
+        let head_len = if overwrite.offset > original.offset {
+            (overwrite.offset - original.offset) as u32
+        } else { 0 };
+
+        // Check/Calculate Tail (part of original AFTER overwrite)
+        let tail_len = if over_end < orig_end {
+            (orig_end - over_end) as u32
+        } else { 0 };
+
+        if head_len == 0 && tail_len == 0 {
+            return Ok(result); // Completely covered, nothing to keep
+        }
+
+        // We need the data.
+        let data_bytes = self.get_object_with_cache(&original.object_id).await?;
+        let full_data = read_object(&data_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
+        
+        // Sanity check
+        if full_data.len() != original.length as usize {
+            warn!("splinter: original object length mismatch expected {} got {}", original.length, full_data.len());
+        }
+
+        // Create HEAD
+        if head_len > 0 {
+            let len = head_len as usize;
+            if len <= full_data.len() {
+                let head_data = &full_data[0..len];
+                let (hid, hbytes) = self.create_object_blob(head_data).await?;
+                
+                // Persist
+                let hoid = u64::from_str_radix(&hid, 16).unwrap_or(0);
+                self.disk_cache.put_object(hoid, &hbytes).await?;
+                
+                // Use correct file offset for journaling
+                self.writeback.submit(ino, original.offset, hoid).await;
+                             
+                result.push(Objectlink {
+                    offset: original.offset,
+                    length: head_len,
+                    object_id: hid,
+                });
+            }
+        }
+
+        // Create TAIL
+        if tail_len > 0 {
+            let start_in_obj = (original.length - tail_len) as usize;
+            if start_in_obj < full_data.len() {
+                let tail_data = &full_data[start_in_obj..];
+                let (tid, tbytes) = self.create_object_blob(tail_data).await?;
+                
+                let toid = u64::from_str_radix(&tid, 16).unwrap_or(0);
+                self.disk_cache.put_object(toid, &tbytes).await?;
+                
+                // Use correct file offset for journaling
+                self.writeback.submit(ino, over_end, toid).await; 
+                
+                result.push(Objectlink {
+                    offset: over_end,
+                    length: tail_len,
+                    object_id: tid,
+                });
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Helper to create object bytes (compressed/hashed) off-thread
+    async fn create_object_blob(&self, data: &[u8]) -> VfsResult<(String, Vec<u8>)> {
+        let data_vec = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+             let payload = ObjectPayload::new_data(data_vec);
+             let payload_bytes = payload.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?;
+             let object_bytes = create_object(&payload_bytes);
+             let object_id = hash_object(&object_bytes);
+             Ok((object_id, object_bytes))
+        }).await?
     }
 
     // ─── Background Tasks ────────────────────────────────────────────────────────
