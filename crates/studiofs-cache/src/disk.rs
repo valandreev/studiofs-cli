@@ -9,10 +9,11 @@
 //! Objects are stored as individual files in a cache directory, keyed by their 64-bit ID.
 
 use bytes::Bytes;
+use memmap2::MmapOptions;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::sync::Arc;
@@ -72,6 +73,10 @@ pub struct DiskCacheConfig {
     pub target_free_ratio: f64,
     /// Cache directory path.
     pub cache_dir: PathBuf,
+    /// Store decompressed block data instead of compressed STFS objects.
+    /// Faster reads (no decompression on cache hit), uses more disk space.
+    /// Should be true for low-compressibility workloads (VFX, already-compressed media).
+    pub store_decompressed: bool,
 }
 
 impl Default for DiskCacheConfig {
@@ -81,6 +86,7 @@ impl Default for DiskCacheConfig {
             min_size: MIN_DISK_CACHE_SIZE,
             target_free_ratio: DEFAULT_FREE_RATIO,
             cache_dir: PathBuf::from(".cache"),
+            store_decompressed: true,
         }
     }
 }
@@ -133,6 +139,7 @@ impl DiskCache {
             min_size: MIN_DISK_CACHE_SIZE,
             target_free_ratio: DEFAULT_FREE_RATIO,
             cache_dir: cache_dir.as_ref().to_path_buf(),
+            store_decompressed: true,
         };
         Self::with_config(config)
     }
@@ -250,7 +257,7 @@ impl DiskCache {
 
         let data = tokio::task::spawn_blocking(move || -> std::io::Result<Option<Bytes>> {
             // Direct open to avoid TOCTOU race (Time-Of-Check-Time-Of-Use)
-            let mut file = match fs::File::open(&path) {
+            let file = match fs::File::open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     debug!("[DISK-CACHE-MISS] id={:016x} path={:?}", id, path);
@@ -259,14 +266,16 @@ impl DiskCache {
                 Err(e) => return Err(e),
             };
 
-            // Pre-allocate buffer based on file size to avoid Vec reallocations during read_to_end
-            let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-            let mut data = Vec::with_capacity(file_len);
-            file.read_to_end(&mut data)?;
+            // Use mmap for efficient reads: OS page cache manages prefetching,
+            // and the map is immediately copied and dropped so the file is
+            // not held open after this function returns (safe for LRU eviction).
+            let mmap = unsafe { MmapOptions::new().map(&file)? };
+            let bytes = Bytes::copy_from_slice(&mmap);
+            // mmap and file are dropped here — file is closed before eviction can run
 
-            debug!("[DISK-CACHE-READ] id={:016x} size={} path={:?}", id, data.len(), path);
+            debug!("[DISK-CACHE-READ] id={:016x} size={} path={:?}", id, bytes.len(), path);
 
-            Ok(Some(Bytes::from(data)))
+            Ok(Some(bytes))
         }).await??;
 
         if data.is_some() {

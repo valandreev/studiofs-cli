@@ -35,11 +35,11 @@
 **Почему:** `file.sync_all()` — это fsync; для кэша, данные которого можно всегда перечитать из S3, это бессмысленная задержка 50–500 мкс на блок.
 
 **Что сделать:**
-- [ ] **1.1** Удалить строку `file.sync_all()?;` из `put_object()` (блок `spawn_blocking`).
-- [ ] **1.2** Убедиться, что `sync_all()` **остаётся** в `writeback.rs` → `submit()` (журнал — критические данные, fsync обязателен).
-- [ ] **1.3** Добавить комментарий: `// sync_all omitted: cache data is re-fetchable from S3`.
-- [ ] **1.4** Прогнать тест `cargo test -p studiofs-cache`.
-- [ ] **1.5** Замерить throughput записи в DiskCache (ожидается рост в 5–10×).
+- [x] **1.1** Удалить строку `file.sync_all()?;` из `put_object()` (блок `spawn_blocking`).
+- [x] **1.2** Убедиться, что `sync_all()` **остаётся** в `writeback.rs` → `submit()` (журнал — критические данные, fsync обязателен).
+- [x] **1.3** Добавить комментарий: `// sync_all omitted: cache data is re-fetchable from S3`.
+- [x] **1.4** Прогнать тест `cargo test -p studiofs-cache`.
+- [x] **1.5** Замерить throughput записи в DiskCache (ожидается рост в 5–10×).
 
 **Diff-пример:**
 ```rust
@@ -61,13 +61,13 @@ file.write_all(&data_vec)?;
 **Почему:** `read_to_end` с пустым `Vec` для 4 МБ блока делает 2–3 реаллокации; `with_capacity` устраняет их.
 
 **Что сделать:**
-- [ ] **1.6** Заменить `let mut data = Vec::new();` на:
+- [x] **1.6** Заменить `let mut data = Vec::new();` на:
   ```rust
   let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
   let mut data = Vec::with_capacity(file_len);
   ```
-- [ ] **1.7** Убедиться, что `file.metadata()` вызывается на уже открытом файловом дескрипторе (без доп. syscall на открытие).
-- [ ] **1.8** Прогнать `cargo test -p studiofs-cache`.
+- [x] **1.7** Убедиться, что `file.metadata()` вызывается на уже открытом файловом дескрипторе (без доп. syscall на открытие).
+- [x] **1.8** Прогнать `cargo test -p studiofs-cache`.
 
 ---
 
@@ -78,12 +78,12 @@ file.write_all(&data_vec)?;
 **Почему:** `file_info_timeout` позволяет WinFSP кэшировать атрибуты файлов, сокращая число вызовов `GetFileInfo`/`getattr` → меньше redb транзакций.
 
 **Что сделать:**
-- [ ] **1.9** После `volume_params.sector_size(512);` добавить:
+- [x] **1.9** После `volume_params.sector_size(512);` добавить:
   ```rust
   volume_params.file_info_timeout(1000); // cache file info for 1 second
   volume_params.dir_info_timeout(1000);  // cache dir info for 1 second
   ```
-- [ ] **1.10** Проверить корректность работы `overwrite`/`set_file_size` — при кэшированных атрибутах необходимо сбрасывать кэш на модификацию (WinFSP делает это автоматически на write-path операциях).
+- [x] **1.10** Проверить корректность работы `overwrite`/`set_file_size` — при кэшированных атрибутах необходимо сбрасывать кэш на модификацию (WinFSP делает это автоматически на write-path операциях).
 
 ---
 
@@ -98,7 +98,7 @@ file.write_all(&data_vec)?;
 **Компромисс:** Дисковое пространство увеличивается пропорционально ratio сжатия (~1.5–3×); для медиаданных (VFX) сжимаемость низка, поэтому потери небольшие.
 
 **Что сделать:**
-- [ ] **2.1** Добавить флаг в `DiskCacheConfig`:
+- [x] **2.1** Добавить флаг в `DiskCacheConfig`:
   ```rust
   pub struct DiskCacheConfig {
       ...
@@ -106,11 +106,11 @@ file.write_all(&data_vec)?;
       pub store_decompressed: bool,
   }
   ```
-- [ ] **2.2** В `vfs_v2.rs` → `read_block()`: при **промахе кэша** после fetch из S3:
+- [x] **2.2** В `vfs_v2.rs` → `read_block()`: при **промахе кэша** после fetch из S3:
   - Декомпрессировать `read_object(&data)` → `decompressed`
   - Сохранить в DiskCache **декомпрессированное**: `disk_cache.put_object(id, &decompressed)`
   - Вернуть `Bytes::from(decompressed)` (данные уже готовы)
-- [ ] **2.3** В `vfs_v2.rs` → `read_block()`: при **попадании кэша**:
+- [x] **2.3** В `vfs_v2.rs` → `read_block()`: при **попадании кэша**:
   ```rust
   // Если store_decompressed=true — данные уже decompressed, возвращаем напрямую
   if let Some(data) = self.disk_cache.get_object(block_ref.object_id).await? {
@@ -118,8 +118,8 @@ file.write_all(&data_vec)?;
       return Ok(Bytes::from(data.to_vec()));
   }
   ```
-- [ ] **2.4** При записи блоков (`flush_block()`): данные сохраняются в DiskCache **до** загрузки на S3 — сохранять тоже в декомпрессированном виде (объект для S3 создаётся отдельно через `create_object()`).
-- [ ] **2.5** Убедиться, что writeback queue (`writeback.submit()`) получает ссылку на сжатый объект для S3, а не на данные DiskCache.
+- [x] **2.4** При записи блоков (`flush_block()`): данные сохраняются в DiskCache **до** загрузки на S3 — сохранять тоже в декомпрессированном виде (объект для S3 создаётся отдельно через `create_object()`).
+- [x] **2.5** Убедиться, что writeback queue (`writeback.submit()`) получает ссылку на сжатый объект для S3, а не на данные DiskCache.
 - [ ] **2.6** Добавить тест: запись 4 МБ блока → DiskCache hit → данные совпадают с оригиналом.
 - [ ] **2.7** Замерить DiskCache hit throughput (ожидается +2–3×).
 
@@ -132,11 +132,11 @@ file.write_all(&data_vec)?;
 **Почему:** `spawn_blocking` + `read_to_end` — это thread context switch + vector grow. mmap позволяет ядру OS управлять page cache и даёт zero-copy semantics.
 
 **Что сделать:**
-- [ ] **3.1** Добавить зависимость в `crates/studiofs-cache/Cargo.toml`:
+- [x] **3.1** Добавить зависимость в `crates/studiofs-cache/Cargo.toml`:
   ```toml
   memmap2 = "0.9"
   ```
-- [ ] **3.2** Реализовать `get_object_mmap()` как альтернативу `get_object()`:
+- [x] **3.2** Реализовать `get_object_mmap()` как альтернативу `get_object()`:
   ```rust
   pub fn get_object_sync(&self, id: ObjectId) -> DiskCacheResult<Option<Bytes>> {
       let path = self.object_path(id);
@@ -152,7 +152,7 @@ file.write_all(&data_vec)?;
       Ok(Some(Bytes::copy_from_slice(&mmap)))
   }
   ```
-- [ ] **3.3** Обновить `get_object()` — использовать sync mmap (без `spawn_blocking`) или вызывать `get_object_sync()` из `spawn_blocking`.
+- [x] **3.3** Обновить `get_object()` — использовать sync mmap (без `spawn_blocking`) или вызывать `get_object_sync()` из `spawn_blocking`.
 - [ ] **3.4** Оценить: при `store_decompressed=true` + mmap — прямой возврат slice файла без аллокаций (максимальная эффективность).
 - [ ] **3.5** Тест: корректность данных при mmap чтении.
 - [ ] **3.6** Бенчмарк: ожидается +50–100% vs `read_to_end`.

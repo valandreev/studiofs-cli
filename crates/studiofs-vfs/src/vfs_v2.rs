@@ -86,6 +86,10 @@ pub struct VfsConfig {
     pub max_concurrent_uploads: usize,
     /// Upload retry count.
     pub upload_retries: u32,
+    /// Store decompressed blocks in disk cache for faster reads.
+    /// On cache hit, no decompression is needed. Uses slightly more disk space
+    /// but is a net win for low-compressibility content (VFX, compressed media).
+    pub store_decompressed: bool,
 }
 
 impl Default for VfsConfig {
@@ -97,6 +101,7 @@ impl Default for VfsConfig {
             block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
             max_concurrent_uploads: 32,
             upload_retries: 3,
+            store_decompressed: true,
         }
     }
 }
@@ -124,6 +129,9 @@ struct VfsState {
     pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
     /// Dirty attributes cache.
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
+    /// Compressed object data waiting for S3 upload (used when store_decompressed=true).
+    /// Maps object_id -> compressed STFS bytes. Removed once the upload completes.
+    pending_upload_data: Mutex<std::collections::HashMap<u64, bytes::Bytes>>,
 }
 
 // =============================================================================
@@ -151,6 +159,10 @@ pub struct StudioVfs {
     upload_semaphore: Arc<Semaphore>,
     /// Upload retry count.
     upload_retries: u32,
+    /// Whether disk cache stores decompressed block data.
+    /// When true: cache reads skip decompression; uploads re-use pre-compressed data
+    /// from pending_upload_data instead of compressing again.
+    store_decompressed: bool,
 }
 
 impl StudioVfs {
@@ -182,9 +194,11 @@ impl StudioVfs {
             state: Arc::new(VfsState {
                 pending_blocks: Mutex::new(std::collections::HashMap::new()),
                 dirty_attrs: Mutex::new(std::collections::HashMap::new()),
+                pending_upload_data: Mutex::new(std::collections::HashMap::new()),
             }),
             upload_semaphore: Arc::new(Semaphore::new(32)),
             upload_retries: 3,
+            store_decompressed: true,
         });
 
         // Spawn Upload Worker
@@ -448,22 +462,33 @@ impl StudioVfs {
             .ok_or(VfsError::BlockNotFound(ino, block_index))?;
 
         // Try disk cache first
-        if let Some(data) = self.disk_cache.get_object(block_ref.object_id).await? {
-            // Decompress using read_object
-            let decompressed = read_object(&data)?;
-            return Ok(Bytes::from(decompressed));
+        if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
+            if self.store_decompressed {
+                // Cache holds raw decompressed bytes — return directly, no decompress needed
+                return Ok(cached);
+            } else {
+                // Cache holds a compressed STFS object — decompress before returning
+                let decompressed = read_object(&cached)?;
+                return Ok(Bytes::from(decompressed));
+            }
         }
 
         // Fetch from S3
         let key = format_object_key(&self.volume_uuid, block_ref.object_id);
-        let data = self.data.get_object(&key).await?;
+        let compressed = self.data.get_object(&key).await?;
 
-        // Store in disk cache
-        self.disk_cache.put_object(block_ref.object_id, &data).await?;
+        // Decompress
+        let decompressed = Bytes::from(read_object(&compressed)?);
 
-        // Decompress using read_object
-        let decompressed = read_object(&data)?;
-        Ok(Bytes::from(decompressed))
+        if self.store_decompressed {
+            // Cache decompressed bytes for zero-decompress future reads
+            self.disk_cache.put_object(block_ref.object_id, &decompressed).await?;
+        } else {
+            // Cache compressed STFS object (S3-compatible format)
+            self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
+        }
+
+        Ok(decompressed)
     }
 
     // =========================================================================
@@ -548,22 +573,27 @@ impl StudioVfs {
         };
 
         // Try disk cache first
-        if let Some(data) = self.disk_cache.get_object(block_ref.object_id).await? {
-            // Decompress using read_object
-            let decompressed = read_object(&data)?;
-            return Ok(Some(Bytes::from(decompressed)));
+        if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
+            if self.store_decompressed {
+                return Ok(Some(cached));
+            } else {
+                let decompressed = read_object(&cached)?;
+                return Ok(Some(Bytes::from(decompressed)));
+            }
         }
 
         // Fetch from S3
         let key = format_object_key(&self.volume_uuid, block_ref.object_id);
-        let data = self.data.get_object(&key).await?;
+        let compressed = self.data.get_object(&key).await?;
+        let decompressed = Bytes::from(read_object(&compressed)?);
 
-        // Store in disk cache
-        self.disk_cache.put_object(block_ref.object_id, &data).await?;
+        if self.store_decompressed {
+            self.disk_cache.put_object(block_ref.object_id, &decompressed).await?;
+        } else {
+            self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
+        }
 
-        // Decompress using read_object
-        let decompressed = read_object(&data)?;
-        Ok(Some(Bytes::from(decompressed)))
+        Ok(Some(decompressed))
     }
 
     /// Flush all buffered blocks for a file.
@@ -608,11 +638,18 @@ impl StudioVfs {
         // Allocate block ID
         let object_id = self.meta.next_block_id()?;
 
-        // Create object with header (includes compression)
-        let object_data = create_object(&data)?;
+        // Create compressed STFS object (needed for S3 upload in all cases)
+        let compressed = Bytes::from(create_object(&data)?);
 
-        // Write to disk cache
-        self.disk_cache.put_object(object_id, &object_data).await?;
+        if self.store_decompressed {
+            // Cache the decompressed block — no decompress needed on future cache hits.
+            // The compressed version is stashed in pending_upload_data until upload completes.
+            self.disk_cache.put_object(object_id, &data).await?;
+            self.state.pending_upload_data.lock().insert(object_id, compressed);
+        } else {
+            // Cache the compressed STFS object (traditional path)
+            self.disk_cache.put_object(object_id, &compressed).await?;
+        }
 
         // Submit to writeback queue
         let file_offset = block_index as u64 * self.block_size as u64;
@@ -669,9 +706,26 @@ impl StudioVfs {
     async fn process_upload(&self, op: PendingOp) -> VfsResult<()> {
         let _permit = self.upload_semaphore.acquire().await.unwrap();
 
-        // Read from disk cache
-        let data = self.disk_cache.get_object(op.object_id).await?
-            .ok_or_else(|| VfsError::Other(format!("object {} missing from disk cache", op.object_id)))?;
+        // Get the compressed STFS object to upload.
+        // When store_decompressed=true the disk cache holds raw bytes, so we use
+        // the pre-compressed data stashed in pending_upload_data instead.
+        // Fallback: re-compress from disk cache (handles restarts / edge-cases).
+        let data: Bytes = if self.store_decompressed {
+            // First try the pre-compressed stash (zero extra work)
+            let stashed = self.state.pending_upload_data.lock().remove(&op.object_id);
+            if let Some(compressed) = stashed {
+                compressed
+            } else {
+                // Fallback: the stash was lost (e.g. process restart) — re-compress
+                let decompressed = self.disk_cache.get_object(op.object_id).await?
+                    .ok_or_else(|| VfsError::Other(format!("object {} missing from disk cache", op.object_id)))?;
+                Bytes::from(create_object(&decompressed)?)
+            }
+        } else {
+            // Disk cache holds compressed STFS object directly
+            self.disk_cache.get_object(op.object_id).await?
+                .ok_or_else(|| VfsError::Other(format!("object {} missing from disk cache", op.object_id)))?
+        };
 
         // Format S3 key
         let key = format_object_key(&self.volume_uuid, op.object_id);
