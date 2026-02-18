@@ -23,10 +23,10 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr) -> FileAttr {
         ino: attr.ino,
         size: attr.size,
         blocks: (attr.size + 511) / 512,
-        atime: UNIX_EPOCH + Duration::from_secs(attr.atime_secs as u64),
-        mtime: UNIX_EPOCH + Duration::from_secs(attr.mtime_secs as u64),
-        ctime: UNIX_EPOCH + Duration::from_secs(attr.ctime_secs as u64),
-        crtime: UNIX_EPOCH + Duration::from_secs(attr.ctime_secs as u64),
+        atime: UNIX_EPOCH + Duration::from_nanos(attr.atime.max(0) as u64),
+        mtime: UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64),
+        ctime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
+        crtime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
         kind: match attr.kind {
             FileType::RegularFile => FuseFileType::RegularFile,
             FileType::Directory => FuseFileType::Directory,
@@ -296,6 +296,7 @@ impl Filesystem for StudioFuseFs {
             idx = 2;
         }
 
+        #[allow(deprecated)]
         for (i, entry) in entries.iter().enumerate() {
             let entry_idx = i + 2;
             if entry_idx < idx {
