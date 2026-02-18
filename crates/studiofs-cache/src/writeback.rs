@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let mut data = vec![0u8; JOURNAL_ENTRY_SIZE];
+        let data = vec![0u8; JOURNAL_ENTRY_SIZE];
         // No magic at start
         assert!(JournalEntry::decode(&data).is_err());
     }

@@ -14,7 +14,6 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_data::object::{create_object, read_object, format_object_key};
@@ -277,6 +276,7 @@ async fn test_directory_operations() {
 
     // Readdir should return both files
     let entries = vfs.readdir(dir_ino).unwrap();
+    #[allow(deprecated)]
     let names: Vec<String> = entries
         .iter()
         .map(|e| String::from_utf8_lossy(&e.name).to_string())
