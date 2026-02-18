@@ -79,7 +79,7 @@ pub fn run(
     let vfs = StudioVfs::new(
         meta.clone(),
         data.clone(),
-        mem_cache.clone(),
+        Some(mem_cache.clone()),
         cache_path_str,
         cache_size_bytes, // Pass the cache size
     ).map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
@@ -88,11 +88,7 @@ pub fn run(
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
 
-    // Spawn background tasks
-    {
-        // background_uploader is now spawned internally by StudioVfs::new
-        vfs.clone().spawn_background_gc();
-    }
+    // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
 
     // Start platform-specific FUSE mount
     #[cfg(windows)]

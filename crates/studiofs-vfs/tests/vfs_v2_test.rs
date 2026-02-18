@@ -58,7 +58,7 @@ fn make_vfs_v2(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let cache_dir_str = cache_dir.to_str().unwrap();
     let cache_size = 1024 * 1024 * 1024; // 1 GiB
 
-    StudioVfs::new(meta, data, cache_dir_str, cache_size).expect("failed to create StudioVfs v2")
+    StudioVfs::new(meta, data, None, cache_dir_str, cache_size).expect("failed to create StudioVfs v2")
 }
 
 /// Ensure the test bucket exists.

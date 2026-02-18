@@ -5,4 +5,6 @@
 pub mod vfs;
 pub mod vfs_v2;
 
-pub use vfs::{StudioVfs, VfsConfig, VfsError};
+// V2 is the active implementation (block-based architecture).
+// V1 (vfs module) kept for reference / format-migration tooling.
+pub use vfs_v2::{StudioVfs, VfsConfig, VfsError, VfsResult};

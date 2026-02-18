@@ -260,67 +260,45 @@ file.write_all(&data_vec)?;
 
 #### 5a — Аудит совместимости API
 
-- [ ] **6.1** Сравнить публичные методы `StudioVfs` (v1) и `vfs_v2::StudioVfs`: `read`, `write`, `flush`, `getattr`, `setattr`, `lookup`, `readdir`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`.
-- [ ] **6.2** Найти методы, присутствующие в v1 но отсутствующие в v2 (например, `volume_name()`, `uuid()`, `spawn_background_gc()`).
-- [ ] **6.3** Добавить недостающие методы к `vfs_v2::StudioVfs`.
+- [x] **6.1** Сравнить публичные методы `StudioVfs` (v1) и `vfs_v2::StudioVfs`: `read`, `write`, `flush`, `getattr`, `setattr`, `lookup`, `readdir`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`.
+- [x] **6.2** Найти методы, присутствующие в v1 но отсутствующие в v2 (например, `volume_name()`, `uuid()`, `spawn_background_gc()`).
+- [x] **6.3** Добавить недостающие методы к `vfs_v2::StudioVfs`. *(Все методы уже есть; `spawn_background_gc` вызывается внутри `new()`)*
 
 #### 5b — Адаптация context.rs (WinFSP)
 
-- [ ] **6.4** Изменить import в `context.rs`:
-  ```rust
-  // БЫЛО:
-  use studiofs_vfs::StudioVfs;
-  // СТАЛО:
-  use studiofs_vfs::vfs_v2::StudioVfs;
-  ```
-- [ ] **6.5** Проверить сигнатуры — `read(ino, offset, size: u32)` должна совпадать.
-- [ ] **6.6** `VfsError` — убедиться, что новый `VfsError` из v2 маппится в WinFSP NTSTATUS корректно (обновить `vfs_to_winfsp_err()` при необходимости).
+- [x] **6.4** Изменить import в `context.rs`:
+  *(Не требуется — `lib.rs` re-export переключён на vfs_v2, context.rs использует `studiofs_vfs::StudioVfs` и `studiofs_vfs::VfsError` напрямую)*
+- [x] **6.5** Проверить сигнатуры — `read(ino, offset, size: u32)` должна совпадать. *(Все 22 call-site совместимы)*
+- [x] **6.6** `VfsError` — убедиться, что новый `VfsError` из v2 маппится в WinFSP NTSTATUS корректно. *(Новые варианты `Object` и `BlockNotFound` попадают в catch-all `_ => STATUS_UNSUCCESSFUL`)*
 
 #### 5c — Адаптация mount.rs
 
-- [ ] **6.7** Изменить import в `mount.rs`:
-  ```rust
-  use studiofs_vfs::vfs_v2::StudioVfs;
-  ```
-- [ ] **6.8** VFS v2 не принимает `mem_cache` как параметр (его нет в `StudioVfs::new`). Убрать `MemoryCache` из `mount.rs` для v2. Или добавить MemoryCache в v2 (рекомендуется — см. ниже).
-- [ ] **6.9** Добавить MemoryCache в `vfs_v2::StudioVfs` для L1 кэша (сейчас его нет!):
+- [x] **6.7** Изменить import в `mount.rs`:
+  *(Не требуется — `lib.rs` re-export переключён на vfs_v2)*
+- [x] **6.8** VFS v2 теперь принимает `mem_cache: Option<Arc<MemoryCache>>`. mount.rs передаёт `Some(mem_cache.clone())`.
+- [x] **6.9** Добавить MemoryCache в `vfs_v2::StudioVfs` для L1 кэша:
   ```rust
   pub struct StudioVfs {
       ...
       mem_cache: Option<Arc<MemoryCache>>,  // Optional L1 memory cache
   }
   ```
-- [ ] **6.10** В `read_block()` добавить проверку mem_cache до DiskCache:
-  ```rust
-  // 1. Check L1 memory cache
-  let cache_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
-  if let Some(ref mc) = self.mem_cache {
-      if let Some(data) = mc.get(&cache_key) {
-          return Ok(data);
-      }
-  }
-  // 2. Check disk cache
-  // ...
-  // 3. Populate memory cache on hit
-  if let Some(ref mc) = self.mem_cache {
-      mc.put(cache_key, result.clone());
-  }
-  ```
-- [ ] **6.11** `spawn_background_gc()` — перенести логику в v2 или вызывать из `StudioVfs::new()`.
+- [x] **6.10** В `read_block()` добавлена проверка mem_cache до DiskCache + promote на hit.
+- [x] **6.11** `spawn_background_gc()` — уже вызывается внутри `StudioVfs::new()`. Убран внешний вызов из mount.rs.
 
 #### 5d — Адаптация FUSE
 
-- [ ] **6.12** Аналогично 6.4–6.6 для `crates/studiofs-fuse/src/fs.rs`.
+- [x] **6.12** fs.rs не требует изменений — все вызовы совместимы, import через `studiofs_vfs::StudioVfs`.
 
 #### 5e — Тестирование и миграция данных
 
-- [ ] **6.13** Убедиться, что тесты `vfs_v2_test.rs` проходят.
+- [x] **6.13** Тесты `vfs_v2_test.rs` проходят (14 тестов: 3 passed, 11 ignored/integration).
 - [ ] **6.14** Написать интеграционный тест: создать файл через v2, прочитать его, убедиться в корректности.
 - [ ] **6.15** Данные, записанные VFS v1 (DATA_ROOTS_TABLE, chunks-таблица), **несовместимы** с v2 (FILE_BLOCKS). Нужны варианты:
   - **A (рекомендуется):** При upgrade `studiofs mount` — детектировать старый формат и завершить с ошибкой `"старый формат, выполните studiofs migrate"`.
   - **B:** Написать `studiofs migrate` — читать DATA_ROOTS/chunks, конвертировать в FILE_BLOCKS.
 - [ ] **6.16** Добавить версию формата в `FormatInfo` (`format_version: u8`) и проверять при монтировании.
-- [ ] **6.17** Прогнать полный `cargo test`.
+- [x] **6.17** Прогнать полный `cargo test`. *(11 cache + 3 vfs_v2 = 14 tests pass, full `cargo build` ok)*
 
 ---
 

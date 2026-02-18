@@ -24,6 +24,7 @@
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use studiofs_cache::disk::{DiskCache, DEFAULT_DISK_CACHE_SIZE};
+use studiofs_cache::memory::{MemoryCache, CacheKey};
 use studiofs_cache::writeback::{WritebackManager, PendingOp};
 use studiofs_data::object::{create_object, read_object, format_object_key};
 use studiofs_data::store::DataStore;
@@ -148,6 +149,8 @@ pub struct StudioVfs {
     disk_cache: Arc<DiskCache>,
     /// Writeback manager.
     writeback: Arc<WritebackManager>,
+    /// Optional L1 in-memory block cache.
+    mem_cache: Option<Arc<MemoryCache>>,
     /// Block size in bytes.
     block_size: u32,
     /// Volume UUID for S3 key prefix.
@@ -170,6 +173,7 @@ impl StudioVfs {
     pub fn new(
         meta: Arc<RedbMetaEngine>,
         data: Arc<DataStore>,
+        mem_cache: Option<Arc<MemoryCache>>,
         cache_dir: &str,
         cache_size: u64,
     ) -> VfsResult<Arc<Self>> {
@@ -189,6 +193,7 @@ impl StudioVfs {
             data,
             disk_cache,
             writeback,
+            mem_cache,
             block_size,
             volume_uuid,
             state: Arc::new(VfsState {
@@ -504,19 +509,36 @@ impl StudioVfs {
         let block_ref = self.meta.get_file_block(ino, block_index)?
             .ok_or(VfsError::BlockNotFound(ino, block_index))?;
 
-        // Try disk cache first
-        if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
-            if self.store_decompressed {
-                // Cache holds raw decompressed bytes — return directly, no decompress needed
+        let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
+
+        // L1: Try memory cache first
+        if let Some(mc) = &self.mem_cache {
+            if let Some(cached) = mc.get(&mem_key) {
                 return Ok(cached);
-            } else {
-                // Cache holds a compressed STFS object — decompress before returning
-                let decompressed = read_object(&cached)?;
-                return Ok(Bytes::from(decompressed));
             }
         }
 
-        // Fetch from S3
+        // L2: Try disk cache
+        if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
+            if self.store_decompressed {
+                // Cache holds raw decompressed bytes — return directly, no decompress needed
+                // Promote to L1
+                if let Some(mc) = &self.mem_cache {
+                    mc.put(mem_key, cached.clone());
+                }
+                return Ok(cached);
+            } else {
+                // Cache holds a compressed STFS object — decompress before returning
+                let decompressed = Bytes::from(read_object(&cached)?);
+                // Promote to L1
+                if let Some(mc) = &self.mem_cache {
+                    mc.put(mem_key, decompressed.clone());
+                }
+                return Ok(decompressed);
+            }
+        }
+
+        // L3: Fetch from S3
         let key = format_object_key(&self.volume_uuid, block_ref.object_id);
         let compressed = self.data.get_object(&key).await?;
 
@@ -529,6 +551,11 @@ impl StudioVfs {
         } else {
             // Cache compressed STFS object (S3-compatible format)
             self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
+        }
+
+        // Promote to L1
+        if let Some(mc) = &self.mem_cache {
+            mc.put(mem_key, decompressed.clone());
         }
 
         Ok(decompressed)

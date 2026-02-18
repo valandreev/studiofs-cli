@@ -15,7 +15,7 @@ use std::sync::Arc;
 use studiofs_cache::memory::MemoryCache;
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::RedbMetaEngine;
-use studiofs_vfs::StudioVfs;
+use studiofs_vfs::vfs::StudioVfs;
 
 /// Create a fresh VFS backed by a temporary redb and MinIO.
 fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> StudioVfs {
