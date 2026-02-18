@@ -126,6 +126,11 @@ EXAMPLES:
   MinIO (local):
     studiofs init dev --endpoint http://127.0.0.1:9000 \\
       --bucket test-bucket --access-key minioadmin --secret-key minioadmin
+
+  Custom block size (8 MiB instead of default 4 MiB):
+    studiofs init custom --endpoint http://127.0.0.1:9000 \\
+      --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
+      --block-size 8MB
 ")]
     Init {
         /// Volume name (used as S3 key prefix — must be unique per bucket)
@@ -150,6 +155,11 @@ EXAMPLES:
         /// S3 region (defaults to us-east-1 for MinIO compatibility)
         #[arg(long, default_value = "")]
         region: String,
+
+        /// Block size in bytes (e.g. 4MB, 8MB, 16MB). Defaults to 4MB if not specified.
+        /// Larger blocks reduce metadata overhead but increase memory usage per operation.
+        #[arg(long)]
+        block_size: Option<String>,
     },
 
     /// Mount a filesystem volume as a local drive
@@ -245,6 +255,7 @@ fn main() -> anyhow::Result<()> {
             access_key,
             secret_key,
             region,
+            block_size,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::init::run(
@@ -255,6 +266,7 @@ fn main() -> anyhow::Result<()> {
                 &secret_key,
                 &region,
                 &meta_dir,
+                block_size.as_deref(),
             )?;
         }
         Commands::Mount {

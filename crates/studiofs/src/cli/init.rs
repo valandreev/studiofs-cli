@@ -10,6 +10,39 @@ use std::io::Write;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_config::BehaviorVersion;
 
+/// Parse a size string like "4MB", "1GB" into bytes.
+/// Supports KB, MB, GB, TB suffixes. Defaults to bytes if no suffix.
+fn parse_size(size_str: &str) -> anyhow::Result<u32> {
+    let size_str = size_str.trim().to_uppercase();
+    
+    let (num_part, suffix) = if let Some(pos) = size_str.find(|c: char| c.is_alphabetic()) {
+        (&size_str[..pos], &size_str[pos..])
+    } else {
+        (&size_str[..], "")
+    };
+    
+    let num: u64 = num_part.trim().parse()
+        .map_err(|_| anyhow::anyhow!("Invalid number in size: {}", size_str))?;
+    
+    let multiplier = match suffix {
+        "" => 1,
+        "B" => 1,
+        "KB" => 1024,
+        "MB" => 1024 * 1024,
+        "GB" => 1024 * 1024 * 1024,
+        "TB" => 1024 * 1024 * 1024 * 1024,
+        _ => return Err(anyhow::anyhow!("Unknown size suffix: {}", suffix)),
+    };
+    
+    let bytes = num.saturating_mul(multiplier);
+    
+    if bytes > u32::MAX as u64 {
+        return Err(anyhow::anyhow!("Block size too large: {} (max 4GB)", size_str));
+    }
+    
+    Ok(bytes as u32)
+}
+
 async fn create_s3_bucket(
     endpoint: &str,
     bucket: &str,
@@ -61,6 +94,7 @@ pub fn run(
     secret_key: &str,
     region: &str,
     meta_dir: &Path,
+    block_size: Option<&str>,
 ) -> anyhow::Result<()> {
     // 1. Verify S3 credentials and bucket accessibility
     println!("🔍 Verifying S3 connection...");
@@ -139,6 +173,13 @@ pub fn run(
 
     let engine = RedbMetaEngine::open(&db_path)?;
 
+    // Parse block size if provided, otherwise use default
+    let actual_block_size = if let Some(size_str) = block_size {
+        parse_size(size_str)?
+    } else {
+        DEFAULT_BLOCK_SIZE
+    };
+
     // Store format info
     let format_info = FormatInfo {
         name: name.to_string(),
@@ -148,7 +189,7 @@ pub fn run(
         access_key: access_key.to_string(),
         secret_key: secret_key.to_string(),
         region: region.to_string(),
-        block_size: DEFAULT_BLOCK_SIZE,
+        block_size: actual_block_size,
         #[allow(deprecated)]
         chunk_size: CHUNK_SIZE,
     };
@@ -159,12 +200,66 @@ pub fn run(
 
     info!("volume {name:?} initialized successfully");
     println!("✓ Volume '{}' initialized", name);
-    println!("  UUID:     {}", format_info.uuid);
-    println!("  Endpoint: {}", endpoint);
-    println!("  Bucket:   {}", bucket);
-    println!("  Metadata: {:?}", db_path);
+    println!("  UUID:       {}", format_info.uuid);
+    println!("  Block size: {} bytes ({} MiB)", actual_block_size, actual_block_size / (1024 * 1024));
+    println!("  Endpoint:   {}", endpoint);
+    println!("  Bucket:     {}", bucket);
+    println!("  Metadata:   {:?}", db_path);
     println!();
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_size_bytes() {
+        assert_eq!(parse_size("100").unwrap(), 100);
+        assert_eq!(parse_size("100B").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_parse_size_kb() {
+        assert_eq!(parse_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_size("512KB").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_mb() {
+        assert_eq!(parse_size("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("4MB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_size("8MB").unwrap(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_gb() {
+        assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_case_insensitive() {
+        assert_eq!(parse_size("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("4MB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_size("8mB").unwrap(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_whitespace() {
+        assert_eq!(parse_size("  4MB  ").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_size("4 MB").unwrap(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_invalid_suffix() {
+        assert!(parse_size("4XB").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_invalid_number() {
+        assert!(parse_size("abcMB").is_err());
+    }
 }
