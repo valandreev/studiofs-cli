@@ -1,6 +1,12 @@
-//! DiskCache — persistent object cache with LRU eviction and disk space monitoring.
+//! DiskCache - persistent object cache with LRU eviction and disk space monitoring.
 //!
-//! Objects are stored as individual files in a cache directory, keyed by their 64-bit hash.
+//! Architecture v2 Key Changes:
+//! - Default disk cache size: 50 GB (was 100 GB)
+//! - Minimum disk cache size: 1 GB (don't evict below this)
+//! - Target free disk space: 10% (was 15%)
+//! - Objects keyed by sequential block ID (not content hash)
+//!
+//! Objects are stored as individual files in a cache directory, keyed by their 64-bit ID.
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -12,6 +18,27 @@ use std::time::Instant;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn, error};
+use uuid::Uuid;
+
+// =============================================================================
+// Configuration Constants (v2 Architecture)
+// =============================================================================
+
+/// Default disk cache size: 50 GB
+pub const DEFAULT_DISK_CACHE_SIZE: u64 = 50 * 1024 * 1024 * 1024;
+
+/// Minimum disk cache size: 1 GB (don't evict below this)
+pub const MIN_DISK_CACHE_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+
+/// Target free disk space ratio: 10%
+pub const DEFAULT_FREE_RATIO: f64 = 0.10;
+
+/// GC interval: 60 seconds
+pub const GC_INTERVAL_SECS: u64 = 60;
+
+// =============================================================================
+// Error Types
+// =============================================================================
 
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
@@ -30,6 +57,38 @@ pub enum DiskCacheError {
 
 pub type DiskCacheResult<T> = Result<T, DiskCacheError>;
 
+// =============================================================================
+// Cache Configuration
+// =============================================================================
+
+/// Configuration for disk cache behavior.
+#[derive(Debug, Clone)]
+pub struct DiskCacheConfig {
+    /// Maximum disk cache size in bytes.
+    pub max_size: u64,
+    /// Minimum disk cache size in bytes (don't evict below this).
+    pub min_size: u64,
+    /// Target free disk space ratio (0.0-1.0).
+    pub target_free_ratio: f64,
+    /// Cache directory path.
+    pub cache_dir: PathBuf,
+}
+
+impl Default for DiskCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_size: DEFAULT_DISK_CACHE_SIZE,
+            min_size: MIN_DISK_CACHE_SIZE,
+            target_free_ratio: DEFAULT_FREE_RATIO,
+            cache_dir: PathBuf::from(".cache"),
+        }
+    }
+}
+
+// =============================================================================
+// Internal Types
+// =============================================================================
+
 /// Entry in the LRU tracking.
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -39,16 +98,25 @@ struct CacheEntry {
     last_access: Instant,
 }
 
-/// Key for a disk cache entry (Object ID / Hash).
+/// Key for a disk cache entry (Object ID / Block ID).
 type ObjectId = u64;
 
+// =============================================================================
+// DiskCache Implementation
+// =============================================================================
+
 /// Persistent disk cache with size-based and free-space-based eviction.
+///
+/// Key features:
+/// - LRU eviction when cache exceeds max_size
+/// - Disk space monitoring - evict if free space < target_free_ratio
+/// - Minimum size guarantee - never evict below min_size
+/// - Pinned objects - prevent eviction of pending uploads
 pub struct DiskCache {
+    /// Cache directory for objects.
     cache_dir: PathBuf,
-    /// Maximum cache size in bytes (default 100 GB).
-    max_size: u64,
-    /// Minimum free disk space ratio (0.0-1.0, default 0.15 = 15%).
-    min_free_ratio: f64,
+    /// Configuration.
+    config: DiskCacheConfig,
     /// Track cached entries for LRU eviction.
     entries: Mutex<BTreeMap<ObjectId, CacheEntry>>,
     /// Set of pinned objects (prevent eviction).
@@ -58,16 +126,25 @@ pub struct DiskCache {
 }
 
 impl DiskCache {
-    /// Create a new disk cache.
+    /// Create a new disk cache with default configuration.
     pub fn new(cache_dir: impl AsRef<Path>, max_size_bytes: u64) -> DiskCacheResult<Arc<Self>> {
-        let cache_dir = cache_dir.as_ref().to_path_buf();
-        let objects_dir = cache_dir.join("objects");
+        let config = DiskCacheConfig {
+            max_size: max_size_bytes,
+            min_size: MIN_DISK_CACHE_SIZE,
+            target_free_ratio: DEFAULT_FREE_RATIO,
+            cache_dir: cache_dir.as_ref().to_path_buf(),
+        };
+        Self::with_config(config)
+    }
+
+    /// Create a new disk cache with custom configuration.
+    pub fn with_config(config: DiskCacheConfig) -> DiskCacheResult<Arc<Self>> {
+        let objects_dir = config.cache_dir.join("objects");
         fs::create_dir_all(&objects_dir)?;
 
         let cache = Self {
-            cache_dir: objects_dir, // We primarily work in the objects subdir
-            max_size: max_size_bytes,
-            min_free_ratio: 0.15,
+            cache_dir: objects_dir,
+            config,
             entries: Mutex::new(BTreeMap::new()),
             pinned: Mutex::new(std::collections::HashSet::new()),
             current_size: Mutex::new(0),
@@ -77,18 +154,19 @@ impl DiskCache {
         cache.scan_existing()?;
 
         info!(
-            "disk cache initialized: dir={:?}, max={}GB",
+            "disk cache initialized: dir={:?}, max={}GB, min={}GB",
             cache.cache_dir,
-            cache.max_size / (1024 * 1024 * 1024)
+            cache.config.max_size / (1024 * 1024 * 1024),
+            cache.config.min_size / (1024 * 1024 * 1024)
         );
-        
+
         // Wrap in Arc for background monitoring
         let cache = Arc::new(cache);
-        
+
         // Spawn background GC monitor
         let monitor_cache = cache.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(GC_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 if let Err(e) = monitor_cache.enforce_limits().await {
@@ -133,7 +211,7 @@ impl DiskCache {
                                 id,
                                 CacheEntry {
                                     size,
-                                    last_access: Instant::now(), // Assume recent? Or file mtime? Mtime better but costly.
+                                    last_access: Instant::now(),
                                 },
                             );
                             total_size += size;
@@ -153,7 +231,7 @@ impl DiskCache {
         let hash_str = format!("{:016x}", id); // 16 chars hex
         let prefix = &hash_str[0..2];
         let sub_prefix = &hash_str[2..4];
-        
+
         self.cache_dir
             .join(prefix)
             .join(sub_prefix)
@@ -169,14 +247,23 @@ impl DiskCache {
     /// Read an object from disk cache.
     pub async fn get_object(&self, id: ObjectId) -> DiskCacheResult<Option<Bytes>> {
         let path = self.object_path(id);
-        
+
         let data = tokio::task::spawn_blocking(move || -> std::io::Result<Option<Bytes>> {
-            if !path.exists() {
-                return Ok(None);
-            }
-            let mut file = fs::File::open(&path)?;
-            let mut data = Vec::new(); // We don't know size easily without lookup
+            // Direct open to avoid TOCTOU race (Time-Of-Check-Time-Of-Use)
+            let mut file = match fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("[DISK-CACHE-MISS] id={:016x} path={:?}", id, path);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+
+            let mut data = Vec::new();
             file.read_to_end(&mut data)?;
+
+            debug!("[DISK-CACHE-READ] id={:016x} size={} path={:?}", id, data.len(), path);
+
             Ok(Some(Bytes::from(data)))
         }).await??;
 
@@ -186,13 +273,13 @@ impl DiskCache {
             if let Some(entry) = entries.get_mut(&id) {
                 entry.last_access = Instant::now();
             } else {
-                 // Inconsistency? Re-add
-                 if let Some(d) = &data {
-                     entries.insert(id, CacheEntry {
-                         size: d.len() as u64,
-                         last_access: Instant::now(),
-                     });
-                 }
+                // Inconsistency? Re-add
+                if let Some(d) = &data {
+                    entries.insert(id, CacheEntry {
+                        size: d.len() as u64,
+                        last_access: Instant::now(),
+                    });
+                }
             }
         }
 
@@ -203,30 +290,40 @@ impl DiskCache {
     pub async fn put_object(&self, id: ObjectId, data: &[u8]) -> DiskCacheResult<()> {
         let size = data.len() as u64;
 
+        debug!("[DISK-CACHE-WRITE] id={:016x} size={}", id, size);
+
         // Evict if needed
         self.reserve_space(size).await?;
 
         let path = self.object_path(id);
-        let data_vec = data.to_vec(); // Clone data for the thread
-        
+        let data_vec = data.to_vec();
+
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             // Ensure parent dirs exist
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            
+
             // Atomic write: write to temp then rename
-            // BUT: temp file needs to be on same volume.
-            // We use a `.tmp` suffix on the final path.
-            let tmp_path = path.with_extension("tmp");
-            
+            // Use UUID to avoid collisions with concurrent writers for the same object
+            let tmp_path = path.with_extension(format!("tmp.{}", Uuid::new_v4()));
+
             {
                 let mut file = fs::File::create(&tmp_path)?;
                 file.write_all(&data_vec)?;
-                // file.sync_all()?; // OMITTED FOR PERFORMANCE
+                // IMPORTANT: sync_all() is required for data integrity on Windows
+                file.sync_all()?;
             }
-            
+
             fs::rename(&tmp_path, &path)?;
+
+            // Verify file was written correctly
+            if let Ok(metadata) = fs::metadata(&path) {
+                debug!("[DISK-CACHE-WRITE-OK] path={:?} written_size={}", path, metadata.len());
+            } else {
+                warn!("[DISK-CACHE-WRITE-FAIL] path={:?} - file not found after rename!", path);
+            }
+
             Ok(())
         }).await??;
 
@@ -248,7 +345,7 @@ impl DiskCache {
     /// Delete an object from cache.
     pub async fn remove_object(&self, id: ObjectId) -> DiskCacheResult<()> {
         let path = self.object_path(id);
-        
+
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             if path.exists() {
                 fs::remove_file(&path)?;
@@ -272,12 +369,12 @@ impl DiskCache {
     /// Reserve space for `needed` bytes by evicting LRU.
     /// Also checks free disk space.
     pub async fn reserve_space(&self, needed: u64) -> DiskCacheResult<()> {
-        self.evict_lru(needed).await
+        self.evict_for(needed).await
     }
 
     /// Enforce size and disk space limits (Background GC).
     pub async fn enforce_limits(&self) -> DiskCacheResult<()> {
-        self.evict_lru(0).await
+        self.evict_for(0).await
     }
 
     /// Pin an object to prevent it from being evicted.
@@ -290,86 +387,134 @@ impl DiskCache {
         self.pinned.lock().remove(&id);
     }
 
-    /// Evict LRU entries until we fit `incoming_size` AND satisfy disk space requirements.
-    async fn evict_lru(&self, incoming_size: u64) -> DiskCacheResult<()> {
+    /// Check if an object is pinned.
+    pub fn is_pinned(&self, id: ObjectId) -> bool {
+        self.pinned.lock().contains(&id)
+    }
+
+    /// Evict blocks to make room for new data.
+    ///
+    /// Eviction policy (v2):
+    /// 1. Check if cache + needed > max_size -> need eviction
+    /// 2. Check if disk space < target_free_ratio -> need eviction
+    /// 3. Don't evict below min_size
+    /// 4. Skip pinned blocks (pending upload)
+    /// 5. Evict LRU blocks
+    async fn evict_for(&self, needed_bytes: u64) -> DiskCacheResult<()> {
+        let mut evicted = 0u64;
+        let min_size = self.config.min_size;
+
         loop {
-            // 1. Check if we satisfy constraints
-            let needs_eviction = {
-                let current = *self.current_size.lock();
-                if current + incoming_size > self.max_size {
-                    true
-                } else {
-                    // Size is OK, check disk space (async)
-                    false
-                }
-            };
+            // Check if we have enough space
+            let current = *self.current_size.lock();
+            let size_ok = current + needed_bytes <= self.config.max_size;
 
-            let needs_eviction = if needs_eviction {
-                true
-            } else {
-                // Only check disk space if size is fine
-                self.is_disk_space_low().await
-            };
+            // Check disk space
+            let disk_ok = !self.is_disk_space_low().await;
 
-            if !needs_eviction {
+            if size_ok && disk_ok {
                 break;
             }
 
-            // 2. Need eviction, find candidate
-            let (to_evict, path_to_delete) = {
-                let mut entries = self.entries.lock();
-                let pinned = self.pinned.lock();
+            // Don't evict below minimum
+            if current.saturating_sub(evicted) <= min_size {
+                warn!(
+                    "cache at minimum size ({}GB), cannot evict further",
+                    min_size / (1024 * 1024 * 1024)
+                );
+                break;
+            }
 
-                let lru_id = entries
-                    .iter()
-                    .filter(|(k, _)| !pinned.contains(k)) // Skip pinned
-                    .min_by_key(|(_, v)| v.last_access)
-                    .map(|(k, _)| *k);
+            // Find LRU candidate
+            let candidate = self.find_lru_candidate()?;
 
-                match lru_id {
-                    Some(id) => {
-                         let entry = entries.remove(&id).unwrap(); // safe query
-                         *self.current_size.lock() -= entry.size;
-                         debug!(id = %format!("{:x}", id), "evicted from disk cache");
-                         (Some(id), self.object_path(id))
+            match candidate {
+                Some(object_id) => {
+                    // Skip pinned blocks
+                    if self.is_pinned(object_id) {
+                        continue;
                     }
-                    None => (None, PathBuf::new())
-                }
-            }; 
 
-            if let Some(_id) = to_evict {
-                // Perform deletion outside lock
-                let path = path_to_delete;
-                let path_clone = path.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || fs::remove_file(&path_clone)).await? {
-                     warn!("failed to remove cache file {:?}: {}", path, e);
+                    // Delete the file
+                    self.delete_object(object_id).await?;
+
+                    // Update tracking
+                    let entry_size = {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.remove(&object_id) {
+                            *self.current_size.lock() -= entry.size;
+                            Some(entry.size)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(size) = entry_size {
+                        evicted += size;
+                        debug!(
+                            id = %format!("{:016x}", object_id),
+                            evicted_size = size,
+                            total_evicted = evicted,
+                            "evicted from disk cache"
+                        );
+                    }
                 }
-            } else {
-                // No more candidates
-                break;
+                None => break, // No evictable blocks
             }
+        }
+
+        if evicted > 0 {
+            info!("evicted {} bytes from disk cache", evicted);
         }
 
         Ok(())
     }
 
-    /// Check if disk space is below the minimum free ratio.
-    /// Made async-friendly (blocking call wrapped).
+    /// Find the LRU candidate for eviction.
+    fn find_lru_candidate(&self) -> DiskCacheResult<Option<ObjectId>> {
+        let entries = self.entries.lock();
+        let pinned = self.pinned.lock();
+
+        let lru_id = entries
+            .iter()
+            .filter(|(k, _)| !pinned.contains(k))
+            .min_by_key(|(_, v)| v.last_access)
+            .map(|(k, _)| *k);
+
+        Ok(lru_id)
+    }
+
+    /// Delete an object file from disk.
+    async fn delete_object(&self, id: ObjectId) -> DiskCacheResult<()> {
+        let path = self.object_path(id);
+
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            if path.exists() {
+                fs::remove_file(&path)?;
+            }
+            Ok(())
+        }).await??;
+
+        Ok(())
+    }
+
+    /// Check if disk space is below the target free ratio.
     async fn is_disk_space_low(&self) -> bool {
         let path = self.cache_dir.clone();
-        let min_ratio = self.min_free_ratio;
-        
+        let target_ratio = self.config.target_free_ratio;
+
         tokio::task::spawn_blocking(move || {
             match get_free_disk_space(&path) {
                 Some((free, total)) => {
                     if total == 0 { return false; }
                     let ratio = free as f64 / total as f64;
-                    if ratio < min_ratio {
+                    if ratio < target_ratio {
                         warn!(
-                            "disk space low: {:.1}% free ({} / {} bytes)",
+                            "disk space low: {:.1}% free ({} / {} bytes), target: {:.1}%",
                             ratio * 100.0,
                             free,
-                            total
+                            total,
+                            target_ratio * 100.0
                         );
                         true
                     } else {
@@ -385,7 +530,16 @@ impl DiskCache {
     pub fn current_size(&self) -> u64 {
         *self.current_size.lock()
     }
+
+    /// Get cache configuration.
+    pub fn config(&self) -> &DiskCacheConfig {
+        &self.config
+    }
 }
+
+// =============================================================================
+// Platform-specific Disk Space Functions
+// =============================================================================
 
 /// Get free and total disk space for the partition containing the given path.
 #[cfg(windows)]
@@ -446,4 +600,40 @@ fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
 #[cfg(not(any(windows, unix)))]
 fn get_free_disk_space(_path: &Path) -> Option<(u64, u64)> {
     None
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = DiskCacheConfig::default();
+        assert_eq!(config.max_size, DEFAULT_DISK_CACHE_SIZE);
+        assert_eq!(config.min_size, MIN_DISK_CACHE_SIZE);
+        assert!((config.target_free_ratio - DEFAULT_FREE_RATIO).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_object_path_format() {
+        let config = DiskCacheConfig {
+            cache_dir: PathBuf::from("/tmp/cache"),
+            ..Default::default()
+        };
+        let cache = DiskCache {
+            cache_dir: config.cache_dir.join("objects"),
+            config,
+            entries: Mutex::new(BTreeMap::new()),
+            pinned: Mutex::new(std::collections::HashSet::new()),
+            current_size: Mutex::new(0),
+        };
+
+        // Test path generation
+        let path = cache.object_path(0x123456789abcdef0);
+        assert!(path.ends_with("12/34/123456789abcdef0"));
+    }
 }

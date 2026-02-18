@@ -16,6 +16,7 @@ lz4_flex = "0.12.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true }
+bitflags = "2.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

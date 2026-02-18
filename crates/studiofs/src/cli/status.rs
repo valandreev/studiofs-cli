@@ -18,7 +18,7 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
     let total_inodes = engine.get_counter(counters::TOTAL_INODES)?;
     let used_space = engine.get_counter(counters::USED_SPACE)?;
     let next_inode = engine.get_counter(counters::NEXT_INODE)?;
-    let next_slice = engine.get_counter(counters::NEXT_SLICE_ID)?;
+    let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
 
     println!("StudioFS Volume Status");
     println!("──────────────────────");
@@ -32,7 +32,7 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
     println!("  Inodes:     {}", total_inodes);
     println!("  Used space: {} bytes", used_space);
     println!("  Next inode: {}", next_inode);
-    println!("  Next slice: {}", next_slice);
+    println!("  Next block: {}", next_block);
     println!("  Metadata:   {:?}", db_path);
 
     Ok(())

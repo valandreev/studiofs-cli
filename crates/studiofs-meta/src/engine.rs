@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! MetaEngine trait — abstract interface for metadata storage.
 //!
 //! This trait defines all metadata operations. The default implementation is `RedbMetaEngine`,
@@ -90,22 +91,67 @@ pub trait MetaEngine: Send + Sync {
     /// Remove a directory entry by name. Returns the removed entry.
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
 
-    // ─── Chunks / Slices ─────────────────────────────────────────────────
+    // ─── Chunks / Slices (Legacy - Deprecated) ─────────────────────────────
 
     /// Get all slices for a chunk.
+    #[deprecated(since = "0.2.0", note = "Use get_file_block instead")]
     fn get_chunk_slices(&self, key: &ChunkKey) -> MetaResult<Vec<Slice>>;
 
     /// Append a slice to a chunk.
+    #[deprecated(since = "0.2.0", note = "Use set_file_block instead")]
     fn append_chunk_slice(&self, key: &ChunkKey, slice: &Slice) -> MetaResult<()>;
 
     /// Replace all slices in a chunk (used after compaction).
+    #[deprecated(since = "0.2.0", note = "Use set_file_block instead")]
     fn set_chunk_slices(&self, key: &ChunkKey, slices: &[Slice]) -> MetaResult<()>;
 
     /// Remove all chunk data for an inode (used when deleting a file).
     fn remove_file_chunks(&self, ino: Ino) -> MetaResult<()>;
 
     /// Allocate a new globally unique slice ID.
+    #[deprecated(since = "0.2.0", note = "Use next_block_id instead")]
     fn next_slice_id(&self) -> MetaResult<u64>;
+
+    // ─── File Blocks (New Architecture v2) ────────────────────────────────
+
+    /// Get a specific block reference for a file.
+    /// Key: (inode, block_index)
+    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
+
+    /// Set a block reference for a file.
+    /// Returns the old block reference if it existed (for GC marking).
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>>;
+
+    /// Get all block references for a file.
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
+
+    /// Remove all blocks for a file (used when deleting).
+    /// Returns the list of removed block IDs for GC.
+    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>;
+
+    /// Remove a single block for a file (used in truncate).
+    /// Returns the removed block ID if it existed.
+    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>>;
+
+    /// Allocate a new sequential block ID.
+    fn next_block_id(&self) -> MetaResult<u64>;
+
+    // ─── Pending Deletions (GC for v2 Architecture) ───────────────────────
+
+    /// Add a block to pending deletions (mark for GC).
+    /// The timestamp is used for grace period.
+    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>;
+
+    /// Remove a block from pending deletions (after GC).
+    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()>;
+
+    /// Get all pending deletions (object_id, timestamp).
+    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
 
     // ─── Pending Slices (Writeback) ──────────────────────────────────────
 
@@ -272,13 +318,7 @@ pub trait MetaEngine: Send + Sync {
     }
 
     /// Rename a file or directory.
-    fn rename(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> MetaResult<()> {
+    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
         let entry = self.remove_entry(parent, name)?;
 
         // If target exists, remove it first

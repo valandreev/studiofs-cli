@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! redb implementation of MetaEngine.
 //!
 //! Uses redb as an embedded ACID KV store for all filesystem metadata.
@@ -35,6 +36,14 @@ const DELETED_SLICES: TableDefinition<u64, u32> = TableDefinition::new("deleted_
 /// Data Roots: ino (u64) -> object_id (String)
 const DATA_ROOTS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("data_roots");
 
+/// File Blocks (v2 architecture): (ino, block_index) -> BlockRef (postcard)
+/// Key encoding: ino (8 bytes LE) + block_index (4 bytes LE)
+const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_blocks");
+
+/// Pending Deletions (v2 GC): object_id (u64) -> deletion_timestamp (i64)
+const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
+    TableDefinition::new("pending_deletions");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -68,6 +77,26 @@ fn chunk_prefix(ino: Ino) -> [u8; 8] {
 /// The prefix for scanning all dentries of a parent inode.
 fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
+}
+
+/// Encode a file block key: ino (8 bytes LE) + block_index (4 bytes LE).
+fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[..8].copy_from_slice(&ino.to_le_bytes());
+    buf[8..12].copy_from_slice(&block_index.to_le_bytes());
+    buf
+}
+
+/// Decode a file block key back to (ino, block_index).
+fn decode_file_block_key(key: &[u8]) -> (Ino, u32) {
+    let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
+    let block_index = u32::from_le_bytes(key[8..12].try_into().unwrap());
+    (ino, block_index)
+}
+
+/// The prefix for scanning all blocks of an inode.
+fn file_block_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
 }
 
 // ─── Postcard helpers ────────────────────────────────────────────────────────
@@ -106,6 +135,8 @@ impl RedbMetaEngine {
             let _ = txn.open_table(PENDING_SLICES);
             let _ = txn.open_table(DELETED_SLICES);
             let _ = txn.open_table(DATA_ROOTS_TABLE);
+            let _ = txn.open_table(FILE_BLOCKS_TABLE);
+            let _ = txn.open_table(PENDING_DELETIONS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -124,7 +155,7 @@ impl RedbMetaEngine {
 
         // Set initial counters
         self.set_counter(counters::NEXT_INODE, ROOT_INO + 1)?;
-        self.set_counter(counters::NEXT_SLICE_ID, 1)?;
+        self.set_counter(counters::NEXT_BLOCK_ID, 1)?;
         self.set_counter(counters::USED_SPACE, 0)?;
         self.set_counter(counters::TOTAL_INODES, 1)?;
 
@@ -501,7 +532,7 @@ impl MetaEngine for RedbMetaEngine {
             let mut chunks_table = txn
                 .open_table(CHUNKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            
+
             if let Some(old_entry) = chunks_table
                 .get(encoded_key.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -510,7 +541,7 @@ impl MetaEngine for RedbMetaEngine {
                 // Simple strategy: Mark ALL old slices as deleted.
                 // If a slice is repurposed (rare in our write-once model), it would be a problem.
                 // But we use unique slice IDs.
-                
+
                 let mut deleted_table = txn
                     .open_table(DELETED_SLICES)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -563,15 +594,18 @@ impl MetaEngine for RedbMetaEngine {
 
             for key in &keys_to_remove {
                 // GC Logic: Mark slices as deleted
-                if let Some(entry) = table.get(key.as_slice()).map_err(|e| MetaError::Storage(e.to_string()))? {
+                if let Some(entry) = table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
                     let slices: Vec<Slice> = decode(entry.value())?;
                     let mut deleted_table = txn
                         .open_table(DELETED_SLICES)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     for slice in slices {
                         deleted_table
-                             .insert(slice.id, slice.len)
-                             .map_err(|e| MetaError::Storage(e.to_string()))?;
+                            .insert(slice.id, slice.len)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
                 }
 
@@ -585,30 +619,9 @@ impl MetaEngine for RedbMetaEngine {
         Ok(())
     }
 
+    #[allow(deprecated)]
     fn next_slice_id(&self) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let id;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            id = match table
-                .get(counters::NEXT_SLICE_ID)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 1,
-            };
-            table
-                .insert(counters::NEXT_SLICE_ID, id + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(id)
+        self.next_block_id()
     }
 
     // ─── Pending Slices (Writeback) ──────────────────────────────────────
@@ -657,7 +670,7 @@ impl MetaEngine for RedbMetaEngine {
         let table = txn
             .open_table(PENDING_SLICES)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        
+
         // Iterate all keys
         let slices: Vec<(u64, u32)> = table
             .iter()
@@ -665,7 +678,7 @@ impl MetaEngine for RedbMetaEngine {
             .filter_map(|r| r.ok())
             .map(|(k, v)| (k.value(), v.value()))
             .collect();
-        
+
         Ok(slices)
     }
 
@@ -715,7 +728,7 @@ impl MetaEngine for RedbMetaEngine {
         let table = txn
             .open_table(DELETED_SLICES)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        
+
         // Iterate all keys
         let slices: Vec<(u64, u32)> = table
             .iter()
@@ -723,7 +736,7 @@ impl MetaEngine for RedbMetaEngine {
             .filter_map(|r| r.ok())
             .map(|(k, v)| (k.value(), v.value()))
             .collect();
-        
+
         Ok(slices)
     }
 
@@ -761,6 +774,259 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
+
+    // --- File Blocks (v2 Architecture) -------------------------------------
+
+    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
+        let key = encode_file_block_key(ino, block_index);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(entry) => {
+                let block: BlockRef = decode(entry.value())?;
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>> {
+        let key = encode_file_block_key(ino, block_index);
+        let data = encode(block)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let old_block;
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // Get old block if exists (for GC)
+            old_block = if let Some(entry) = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let old: BlockRef = decode(entry.value())?;
+                Some(old)
+            } else {
+                None
+            };
+
+            table
+                .insert(key.as_slice(), data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(old_block)
+    }
+
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let prefix = file_block_prefix(ino);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut blocks = Vec::new();
+
+        // Scan all keys starting with the inode prefix
+        let mut range_end = prefix.to_vec();
+        // Increment last byte to get exclusive upper bound
+        *range_end.last_mut().unwrap() += 1;
+
+        let iter = table
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for result in iter {
+            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value();
+            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
+            if decoded_ino != ino {
+                break;
+            }
+            let block: BlockRef = decode(value.value())?;
+            blocks.push((block_index, block));
+        }
+
+        // Sort by block index for sequential access
+        blocks.sort_by_key(|(idx, _)| *idx);
+        Ok(blocks)
+    }
+
+    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let removed_ids;
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // Collect keys to remove
+            let mut range_end = prefix.to_vec();
+            *range_end.last_mut().unwrap() += 1;
+
+            // First pass: collect all block IDs
+            let blocks_to_remove: Vec<(Vec<u8>, u64)> = {
+                let iter = table
+                    .range(prefix.as_slice()..range_end.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                iter.filter_map(|r| r.ok())
+                    .filter_map(|(k, v)| {
+                        let block: BlockRef = decode(v.value()).ok()?;
+                        Some((k.value().to_vec(), block.object_id))
+                    })
+                    .collect()
+            };
+
+            // Extract just the IDs for return
+            removed_ids = blocks_to_remove.iter().map(|(_, id)| *id).collect();
+
+            // Remove all entries
+            for (key, _) in &blocks_to_remove {
+                table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(removed_ids)
+    }
+
+    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
+        let key = encode_file_block_key(ino, block_index);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let removed_id;
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            if let Some(entry) = table
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let block: BlockRef = decode(entry.value())?;
+                removed_id = Some(block.object_id);
+            } else {
+                removed_id = None;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(removed_id)
+    }
+
+    fn next_block_id(&self) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let id;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            id = match table
+                .get(counters::NEXT_BLOCK_ID)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 1, // Start from 1
+            };
+            table
+                .insert(counters::NEXT_BLOCK_ID, id + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(id)
+    }
+
+    // --- Pending Deletions (v2 GC) -----------------------------------------
+
+    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(object_id, timestamp)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .remove(object_id)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(PENDING_DELETIONS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        // Iterate all entries
+        let deletions: Vec<(u64, i64)> = table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k.value(), v.value()))
+            .collect();
+
+        Ok(deletions)
+    }
 }
 
 #[cfg(test)]
@@ -788,7 +1054,7 @@ mod tests {
             access_key: "minioadmin".into(),
             secret_key: "minioadmin".into(),
             region: "".into(),
-            block_size: BLOCK_SIZE,
+            block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
         };
         engine.set_format_info(&info).unwrap();
@@ -892,6 +1158,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_chunk_slices() {
         let engine = temp_engine();
         let key = ChunkKey::new(2, 0);
@@ -899,18 +1166,18 @@ mod tests {
         let slice1 = Slice {
             pos: 0,
             id: 1,
-            size: BLOCK_SIZE,
+            size: DEFAULT_BLOCK_SIZE,
             off: 0,
-            len: BLOCK_SIZE,
+            len: DEFAULT_BLOCK_SIZE,
         };
         engine.append_chunk_slice(&key, &slice1).unwrap();
 
         let slice2 = Slice {
-            pos: BLOCK_SIZE,
+            pos: DEFAULT_BLOCK_SIZE,
             id: 2,
-            size: BLOCK_SIZE,
+            size: DEFAULT_BLOCK_SIZE,
             off: 0,
-            len: BLOCK_SIZE,
+            len: DEFAULT_BLOCK_SIZE,
         };
         engine.append_chunk_slice(&key, &slice2).unwrap();
 
@@ -926,5 +1193,116 @@ mod tests {
         let ino1 = engine.next_inode().unwrap();
         let ino2 = engine.next_inode().unwrap();
         assert_eq!(ino2, ino1 + 1);
+    }
+
+    // === v2 Architecture Tests ===
+
+    #[test]
+    fn test_file_block_operations() {
+        let engine = temp_engine();
+
+        // Create a file
+        let attr = engine
+            .create_file(ROOT_INO, b"test_blocks.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        // Initially no blocks
+        assert!(engine.get_file_block(ino, 0).unwrap().is_none());
+        assert!(engine.get_file_blocks(ino).unwrap().is_empty());
+
+        // Add a block
+        let block1 = BlockRef::new_full(1, 4 * 1024 * 1024);
+        let old = engine.set_file_block(ino, 0, &block1).unwrap();
+        assert!(old.is_none()); // No previous block
+
+        // Retrieve the block
+        let retrieved = engine.get_file_block(ino, 0).unwrap().unwrap();
+        assert_eq!(retrieved.object_id, 1);
+        assert_eq!(retrieved.length, 4 * 1024 * 1024);
+        assert!(retrieved.is_compressed());
+        assert!(!retrieved.is_partial());
+
+        // Add another block
+        let block2 = BlockRef::new_partial(2, 1000);
+        engine.set_file_block(ino, 1, &block2).unwrap();
+
+        // Get all blocks
+        let all_blocks = engine.get_file_blocks(ino).unwrap();
+        assert_eq!(all_blocks.len(), 2);
+        assert_eq!(all_blocks[0].0, 0); // block index
+        assert_eq!(all_blocks[0].1.object_id, 1);
+        assert_eq!(all_blocks[1].0, 1); // block index
+        assert_eq!(all_blocks[1].1.object_id, 2);
+        assert!(all_blocks[1].1.is_partial());
+    }
+
+    #[test]
+    fn test_file_block_overwrite_returns_old() {
+        let engine = temp_engine();
+
+        // Create a file
+        let attr = engine
+            .create_file(ROOT_INO, b"test_overwrite.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        // Add a block
+        let block1 = BlockRef::new_full(1, 4 * 1024 * 1024);
+        engine.set_file_block(ino, 0, &block1).unwrap();
+
+        // Overwrite with new block
+        let block2 = BlockRef::new_full(2, 4 * 1024 * 1024);
+        let old = engine.set_file_block(ino, 0, &block2).unwrap();
+
+        // Old block should be returned for GC
+        assert!(old.is_some());
+        let old_block = old.unwrap();
+        assert_eq!(old_block.object_id, 1);
+
+        // Current block should be the new one
+        let current = engine.get_file_block(ino, 0).unwrap().unwrap();
+        assert_eq!(current.object_id, 2);
+    }
+
+    #[test]
+    fn test_remove_file_blocks() {
+        let engine = temp_engine();
+
+        // Create a file
+        let attr = engine
+            .create_file(ROOT_INO, b"test_remove.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        // Add multiple blocks
+        for i in 0..5 {
+            let block = BlockRef::new_full(i as u64 + 1, 4 * 1024 * 1024);
+            engine.set_file_block(ino, i, &block).unwrap();
+        }
+
+        // Verify blocks exist
+        assert_eq!(engine.get_file_blocks(ino).unwrap().len(), 5);
+
+        // Remove all blocks
+        let removed_ids = engine.remove_file_blocks(ino).unwrap();
+        assert_eq!(removed_ids.len(), 5);
+        assert_eq!(removed_ids, vec![1, 2, 3, 4, 5]);
+
+        // Verify no blocks remain
+        assert!(engine.get_file_blocks(ino).unwrap().is_empty());
+        assert!(engine.get_file_block(ino, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_next_block_id() {
+        let engine = temp_engine();
+
+        let id1 = engine.next_block_id().unwrap();
+        let id2 = engine.next_block_id().unwrap();
+        let id3 = engine.next_block_id().unwrap();
+
+        assert_eq!(id2, id1 + 1);
+        assert_eq!(id3, id2 + 1);
     }
 }

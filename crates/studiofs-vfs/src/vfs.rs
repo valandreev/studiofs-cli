@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Core VFS implementation — wires together metadata, data, and cache layers.
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -5,6 +6,7 @@ use std::sync::Arc;
 use studiofs_cache::memory::MemoryCache;
 use studiofs_cache::disk::DiskCache;
 use studiofs_data::store::DataStore;
+#[allow(deprecated)]
 use studiofs_data::object::{
     create_object, read_object, hash_object, ObjectPayload, ObjectKind, Objectlink,
 };
@@ -362,28 +364,41 @@ impl StudioVfs {
                 BLOCK_SIZE as usize
             };
             
-            // Try cache
+            let bkey = (ino, (block_start / CHUNK_SIZE) as u32, ((block_start % CHUNK_SIZE) / BLOCK_SIZE as u64) as u32);
             let cache_key = studiofs_cache::memory::CacheKey::new(ino, block_start);
+            
+            // Step 1: Get base block data (from cache or storage)
             let mut block_data_mut: BytesMut;
             
             if let Some(cached) = self.mem_cache.get(&cache_key) {
-                 block_data_mut = cached.into();
+                block_data_mut = cached.into();
             } else {
-                 let block_data = self.read_from_storage(ino, block_start, block_len).await?;
-                 self.mem_cache.put(cache_key, block_data.clone());
-                 block_data_mut = block_data.into();
+                let block_data = self.read_from_storage(ino, block_start, block_len).await?;
+                block_data_mut = block_data.into();
             }
 
-            let bkey = (ino, (block_start / CHUNK_SIZE) as u32, ((block_start % CHUNK_SIZE) / BLOCK_SIZE as u64) as u32);
-
+            // Step 2: Apply overlays from flushing_blocks and pending_writes
+            // Track if we applied any overlay to update cache afterwards
+            let mut applied_overlay = false;
+            
             // 1. OVERLAY flushing_blocks (In-flight to disk)
             {
                 if let Some((start_off, buffer)) = self.flushing_blocks.lock().get(&bkey) {
                     let start = *start_off as usize;
                     let len = buffer.len();
-                    if start < block_data_mut.len() {
-                        let to_copy = len.min(block_data_mut.len() - start);
-                        block_data_mut[start..start + to_copy].copy_from_slice(&buffer[..to_copy]);
+                    
+                    debug!(
+                        "[READ-OVERLAY-FLUSHING] ino={} bkey=({},{},{}) start_off={} buffer.len()={} block_data_mut.len()={}",
+                        ino, bkey.0, bkey.1, bkey.2, start, len, block_data_mut.len()
+                    );
+                    
+                    if start < block_data_mut.len() && len > 0 {
+                        let to_copy = len.min(block_data_mut.len() - start).min(buffer.len());
+                        
+                        if to_copy > 0 {
+                            block_data_mut[start..start + to_copy].copy_from_slice(&buffer[..to_copy]);
+                            applied_overlay = true;
+                        }
                     }
                 }
             }
@@ -394,11 +409,27 @@ impl StudioVfs {
                 if let Some((start_off, buffer)) = pending.get(&bkey) {
                     let start = *start_off as usize;
                     let len = buffer.len();
-                    if start < block_data_mut.len() {
-                        let to_copy = len.min(block_data_mut.len() - start);
-                        block_data_mut[start..start + to_copy].copy_from_slice(&buffer[..to_copy]);
+                    
+                    debug!(
+                        "[READ-OVERLAY-PENDING] ino={} bkey=({},{},{}) start_off={} buffer.len()={} block_data_mut.len()={}",
+                        ino, bkey.0, bkey.1, bkey.2, start, len, block_data_mut.len()
+                    );
+                    
+                    if start < block_data_mut.len() && len > 0 {
+                        let to_copy = len.min(block_data_mut.len() - start).min(buffer.len());
+                        
+                        if to_copy > 0 {
+                            block_data_mut[start..start + to_copy].copy_from_slice(&buffer[..to_copy]);
+                            applied_overlay = true;
+                        }
                     }
                 }
+            }
+            
+            // Step 3: Update cache with final overlaid data if we applied any overlay
+            // This ensures the cache always contains the correct merged data
+            if applied_overlay {
+                self.mem_cache.put(cache_key, block_data_mut.clone().freeze());
             }
             
             let block_data = block_data_mut.freeze();
@@ -419,10 +450,23 @@ impl StudioVfs {
     }
 
     /// Fetch a block asynchronously into the MemoryCache.
+    /// Only caches if there are no pending modifications for this block.
     fn prefetch_block(&self, ino: Ino, offset: u64, attr: &InodeAttr) {
         let cache_key = studiofs_cache::memory::CacheKey::new(ino, offset);
         if self.mem_cache.get(&cache_key).is_some() {
              return; // Already cached
+        }
+        
+        // Calculate block key for pending writes check
+        let bkey = (ino, (offset / CHUNK_SIZE) as u32, ((offset % CHUNK_SIZE) / BLOCK_SIZE as u64) as u32);
+        
+        // Don't prefetch if there are pending modifications - they would be overwritten
+        {
+            let pending = self.pending_writes.lock();
+            let flushing = self.flushing_blocks.lock();
+            if pending.contains_key(&bkey) || flushing.contains_key(&bkey) {
+                return; // Block has pending modifications, skip prefetch
+            }
         }
         
         let vfs = self.clone();
@@ -628,14 +672,24 @@ impl StudioVfs {
             let mut flush_full_data = None;
             {
                 let mut pending = self.pending_writes.lock();
+                let mut flushing = self.flushing_blocks.lock();  // Lock flushing_blocks too!
                 let key = (ino, chunk_key.index, block_idx_in_chunk);
                 let (start_off, buffer) = pending.entry(key).or_insert_with(|| (offset_in_block as u32, BytesMut::with_capacity(BLOCK_SIZE as usize)));
                 
                 // If we are writing outside the current buffered range, flush and restart
                 let buf_end = *start_off + buffer.len() as u32;
                 if (offset_in_block as u32) < *start_off || (offset_in_block as u32) > buf_end {
+                    // DEBUG: Log gap detection (normal for random writes)
+                    debug!(
+                        "[WRITE-GAP] ino={} offset={} block_idx={} start_off={} buf_end={} offset_in_block={} - GAP DETECTED (flushing current buffer)",
+                        ino, current_offset, block_idx_in_chunk, *start_off, buf_end, offset_in_block
+                    );
+                    
                     // Gap or jump! Flush current part.
+                    // CRITICAL: Insert into flushing_blocks IMMEDIATELY while holding both locks
+                    // to prevent race condition where read sees empty cache and no flushing data
                     let data = buffer.clone().freeze();
+                    flushing.insert(key, (*start_off, data.clone()));
                     flush_gap_data = Some((data, *start_off));
                     
                     // Reset buffer to new start
@@ -645,6 +699,23 @@ impl StudioVfs {
 
                 // Append to buffer
                 let rel_off = (offset_in_block as u32 - *start_off) as usize;
+                
+                // DEBUG: Log buffer state before write
+                debug!(
+                    "[WRITE-BUFFER] ino={} offset={} start_off={} buffer.len()={} rel_off={} to_write={}",
+                    ino, current_offset, *start_off, buffer.len(), rel_off, to_write
+                );
+                
+                // BUG DETECTION: Check if we're extending beyond current buffer without filling gap
+                if rel_off > buffer.len() {
+                    error!(
+                        "[WRITE-BUG] ino={} GAP IN BUFFER! rel_off={} > buffer.len()={}. This creates uninitialized bytes!",
+                        ino, rel_off, buffer.len()
+                    );
+                    // Fill the gap with zeros
+                    buffer.resize(rel_off, 0);
+                }
+                
                 if rel_off < buffer.len() {
                      for i in 0..to_write {
                          let p = rel_off + i;
@@ -662,20 +733,18 @@ impl StudioVfs {
                 if buffer.len() >= BLOCK_SIZE as usize {
                     // ATOMIC TRANSFER to in-flight state
                     let data_bytes = buffer.clone().freeze();
-                    self.flushing_blocks.lock().insert(key, (*start_off, data_bytes.clone()));
+                    flushing.insert(key, (*start_off, data_bytes.clone()));
                     
                     flush_full_data = Some((data_bytes, *start_off));
                     pending.remove(&key);
                 }
             } // UNLOCK
 
-            // ASYNC FLUSH tasks
+            // ASYNC FLUSH tasks (flushing_blocks already populated inside lock)
             if let Some((d, off)) = flush_gap_data {
-                self.flushing_blocks.lock().insert((ino, chunk_key.index, block_idx_in_chunk), (off, d.clone()));
                 self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d);
             }
             if let Some((d, off)) = flush_full_data {
-                // Already inserted into flushing_blocks inside the lock above
                 self.flush_later(ino, chunk_key.index, block_idx_in_chunk, off, d);
             }
 
@@ -783,6 +852,7 @@ impl StudioVfs {
     }
 
     /// Helper to upload a block (full or partial) to Disk Cache & Writeback Queue.
+    #[allow(deprecated)]
     async fn flush_block_internal(&self, ino: Ino, chunk_idx: u32, block_idx: u32, start_off: u32, data: Bytes) -> VfsResult<Option<Objectlink>> {
         if data.is_empty() { return Ok(None); }
         
@@ -793,7 +863,7 @@ impl StudioVfs {
              let payload = ObjectPayload::new_data(data_vec);
              let length = payload.data.len() as u32;
              let payload_bytes = payload.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?;
-             let object_bytes = create_object(&payload_bytes);
+             let object_bytes = create_object(&payload_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
              let object_id = hash_object(&object_bytes);
              Ok::<_, VfsError>((object_id, object_bytes, length))
         }).await??;
@@ -894,9 +964,11 @@ impl StudioVfs {
         children.sort_by_key(|c| c.offset);
 
         // 3. Create New Root
+        #[allow(deprecated)]
         let (new_root_id, new_root_bytes) = tokio::task::spawn_blocking(move || {
             let new_root = ObjectPayload::new_meta(children);
-            let new_root_bytes = create_object(&new_root.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?);
+            let new_root_bytes = create_object(&new_root.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?)
+                .map_err(|e| VfsError::Other(e.to_string()))?;
             let new_root_id = hash_object(&new_root_bytes);
             Ok::<_, VfsError>((new_root_id, new_root_bytes))
         }).await??;
@@ -997,12 +1069,13 @@ impl StudioVfs {
     }
 
     /// Helper to create object bytes (compressed/hashed) off-thread
+    #[allow(deprecated)]
     async fn create_object_blob(&self, data: &[u8]) -> VfsResult<(String, Vec<u8>)> {
         let data_vec = data.to_vec();
         tokio::task::spawn_blocking(move || {
              let payload = ObjectPayload::new_data(data_vec);
              let payload_bytes = payload.to_bytes().map_err(|e| VfsError::Other(e.to_string()))?;
-             let object_bytes = create_object(&payload_bytes);
+             let object_bytes = create_object(&payload_bytes).map_err(|e| VfsError::Other(e.to_string()))?;
              let object_id = hash_object(&object_bytes);
              Ok((object_id, object_bytes))
         }).await?

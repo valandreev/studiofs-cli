@@ -1,6 +1,7 @@
 #![cfg(windows)]
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
+#![allow(deprecated)]
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -10,8 +11,8 @@ use studiofs_vfs::StudioVfs;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
-use winfsp::U16CStr;
 use winfsp::filesystem::*;
+use winfsp::U16CStr;
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
@@ -56,11 +57,12 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
         _ => 0x80,                   // FILE_ATTRIBUTE_NORMAL
     };
 
-    // Convert timestamps (seconds since epoch → Windows FILETIME)
-    info.creation_time = unix_to_filetime(attr.ctime_secs as u64);
-    info.last_access_time = unix_to_filetime(attr.atime_secs as u64);
-    info.last_write_time = unix_to_filetime(attr.mtime_secs as u64);
-    info.change_time = unix_to_filetime(attr.mtime_secs as u64);
+    // Convert timestamps (nanoseconds since epoch → Windows FILETIME)
+    // FILETIME is 100ns intervals since 1601-01-01
+    info.creation_time = unix_nanos_to_filetime(attr.ctime);
+    info.last_access_time = unix_nanos_to_filetime(attr.atime);
+    info.last_write_time = unix_nanos_to_filetime(attr.mtime);
+    info.change_time = unix_nanos_to_filetime(attr.mtime);
 
     // Use inode as index
     info.index_number = attr.ino;
@@ -69,10 +71,14 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     info
 }
 
-/// Convert Unix timestamp (secs since epoch) to Windows FILETIME (100ns since 1601-01-01).
-fn unix_to_filetime(unix_secs: u64) -> u64 {
-    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
-    unix_secs * 10_000_000 + EPOCH_DIFF
+/// Convert Unix timestamp (nanoseconds since epoch) to Windows FILETIME (100ns since 1601-01-01).
+fn unix_nanos_to_filetime(unix_nanos: i64) -> u64 {
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000; // Difference between 1601-01-01 and 1970-01-01 in 100ns intervals
+    const NANOS_PER_100NS: i64 = 100;
+
+    // Convert nanoseconds to 100ns intervals
+    let intervals = unix_nanos / NANOS_PER_100NS;
+    (intervals as u64).saturating_add(EPOCH_DIFF)
 }
 
 /// Resolve a WinFSP path to an inode by walking the directory tree.
@@ -380,7 +386,12 @@ impl FileSystemContext for StudioFsContext {
         Ok(cursor)
     }
 
-    fn set_delete(&self, context: &Self::FileContext, _file_name: &U16CStr, delete_file: bool) -> winfsp::Result<()> {
+    fn set_delete(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        delete_file: bool,
+    ) -> winfsp::Result<()> {
         if delete_file && context.is_dir {
             // Check if directory is empty
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -513,9 +524,12 @@ impl FileSystemContext for StudioFsContext {
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         out_volume_info.total_size = 1024 * 1024 * 1024 * 1024; // 1 TB
         out_volume_info.free_size = 1024 * 1024 * 1024 * 512; // 512 GB
-        
+
         // Use volume name from VFS
-        let name = self.vfs.volume_name().unwrap_or_else(|_| "StudioFS".to_string());
+        let name = self
+            .vfs
+            .volume_name()
+            .unwrap_or_else(|_| "StudioFS".to_string());
         out_volume_info.set_volume_label(&name);
         Ok(())
     }

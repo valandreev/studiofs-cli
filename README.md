@@ -10,6 +10,11 @@
 
 - [Key Features](#key-features)
 - [Architecture](#architecture)
+  - [System Components](#system-components)
+  - [Block Storage Model](#block-storage-model)
+  - [Write Path](#write-path)
+  - [Read Path](#read-path)
+  - [Transaction Model](#transaction-model)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Getting Started](#getting-started)
@@ -20,7 +25,14 @@
 - [CLI Reference](#cli-reference)
 - [Using with MinIO (Local Testing)](#using-with-minio-local-testing)
 - [Using with AWS S3](#using-with-aws-s3)
-- [Data Model](#data-model)
+- [Programming Guide](#programming-guide)
+  - [Initializing the Filesystem](#initializing-the-filesystem)
+  - [Basic Operations](#basic-operations)
+  - [Block Management](#block-management)
+- [Technical Details](#technical-details)
+  - [Redb Integration](#redb-integration)
+  - [Metadata Schema](#metadata-schema)
+  - [Cache Architecture](#cache-architecture)
 - [Project Structure](#project-structure)
 - [Development](#development)
 - [Technologies](#technologies)
@@ -32,47 +44,131 @@
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-tier caching** | L1 in-memory cache + L2 disk cache for near-local read speeds |
+| **Immutable Block Storage** | Files are split into fixed-size blocks (default 4MB). Each block has a sequential ID and is never modified after creation. |
+| **Sequential Block IDs** | Blocks use sequential IDs instead of content hashes — simpler and faster, no deduplication overhead. |
+| **Multi-tier Caching** | L1 in-memory cache (fixed 1GB) + L2 disk cache (configurable, default 50GB) |
+| **Write-back with Journaling** | Writes return immediately after caching; background upload worker handles S3 persistence with crash recovery |
+| **Block-level GC** | Deleted/overwritten blocks go to pending deletions table; background GC removes after grace period |
 | **Cross-platform** | Windows (WinFSP), Linux & macOS (FUSE) — single codebase |
 | **S3-compatible** | Works with AWS S3, MinIO, GCS, Wasabi, Backblaze B2, and any S3-compatible service |
-| **Log-structured** | Writes are immutable objects (Copy-on-Write), enabling lock-free snapshots and crash consistency |
-| **Compression** | Transparent **LZ4** compression for all data objects (high speed, low CPU) |
-| **Fast metadata** | Local metadata engine powered by [Redb](https://redb.org/) — zero-copy reads, ACID transactions |
-| **Content-Addressable** | Data is stored as immutable objects addressed by their hash (CAS), enabling automatic deduplication |
-
+| **LZ4 Compression** | Transparent LZ4 compression for all data blocks |
+| **Fast Metadata** | Local metadata engine powered by [Redb](https://redb.org/) — ACID transactions |
 
 ---
 
 ## Architecture
 
+### System Components
+
 ```
-┌───────────────────────────────────────────┐
-│               User Application             │
-└─────────────────────┬─────────────────────┘
-                      │  POSIX / Win32 I/O
-┌─────────────────────▼─────────────────────┐
-│            FUSE / WinFSP Bridge            │
+┌─────────────────────────────────────────────┐
+│           User Application                   │
+│         (File I/O Operations)                │
+└─────────────────────┬───────────────────────┘
+                      │ POSIX / Win32 I/O
+┌─────────────────────▼───────────────────────┐
+│            FUSE / WinFSP Bridge              │
 │   studiofs-fuse (unix) │ studiofs-winfsp   │
-└─────────────────────┬─────────────────────┘
+└─────────────────────┬───────────────────────┘
                       │
-┌─────────────────────▼─────────────────────┐
-│              Virtual Filesystem            │
-│         studiofs-vfs (path resolution,     │
-│         chunk/slice/block mapping)         │
-├────────────────┬──────────────────────────┤
-│   Metadata     │      Data Store          │
-│  studiofs-meta │     studiofs-data        │
-│  (Redb: Inodes │     (OpenDAL → S3)       │
-│   + Data Roots)│    (LZ4 Objects)         │
-├────────────────┴──────────────────────────┤
-│               Cache Layer                  │
-│     studiofs-cache (LRU memory cache)      │
-└───────────────────────────────────────────┘
+┌─────────────────────▼───────────────────────┐
+│              VFS Layer (v2)                 │
+│    studiofs-vfs/src/vfs_v2.rs               │
+│  - Path resolution                          │
+│  - Block allocation/deallocation            │
+│  - Read/write orchestration                 │
+├────────────────────┬────────────────────────┤
+│   Metadata Engine  │    Data Store          │
+│  studiofs-meta     │   studiofs-data        │
+│  - Inode attrs    │   - S3 via OpenDAL    │
+│  - Block refs     │   - Object format     │
+│  - Pending GC     │   - LZ4 compression   │
+├────────────────────┴────────────────────────┤
+│            Cache Layer                       │
+│     studiofs-cache                          │
+│  - DiskCache (50GB default)                │
+│  - WritebackManager (journal)              │
+│  - Background upload worker                │
+└─────────────────────────────────────────────┘
 ```
 
-**Data flow:**
-1. **Write:** App → FUSE → VFS → Buffer (4 MiB) → Compress → Upload S3 Object → Update `Data Root` in Redb
-2. **Read:** App → FUSE → VFS → Memory Cache → Fetch S3 Object → Decompress → Traverse Object Tree
+### Block Storage Model
+
+StudioFS v2 uses a **block-based architecture** with immutable storage:
+
+```
+File (Inode)
+  │
+  ▼
+Block 0 ──► BlockRef { object_id: 1, offset: 0, length: 4194304, flags: COMPRESSED }
+  │
+  ▼
+Block 1 ──► BlockRef { object_id: 2, offset: 0, length: 4194304, flags: COMPRESSED }
+  │
+  ▼
+Block 2 ──► BlockRef { object_id: 3, offset: 0, length: 1048576, flags: COMPRESSED | PARTIAL }
+```
+
+Each block reference (`BlockRef`) contains:
+- **`object_id`**: Sequential ID of the S3 object
+- **`offset`**: Offset within the block (always 0 for full blocks)
+- **`length`**: Actual data length (less than block size for partial blocks)
+- **`flags`**: Compression and partial block indicators
+
+### Write Path
+
+```
+Application
+     │
+     ▼
+┌──────────────────────────────┐
+│ 1. Split data into blocks    │
+│ 2. Compress with LZ4         │
+│ 3. Allocate sequential ID    │
+│ 4. Store in disk cache       │
+│ 5. Queue for async upload    │
+└──────────────────────────────┘
+     │
+     ▼ (returns immediately)
+Application
+
+Background Worker:
+     │
+     ▼
+┌──────────────────────────────┐
+│ 1. Scan pending journal      │
+│ 2. Upload to S3             │
+│ 3. Mark complete            │
+│ 4. Delete journal entry     │
+└──────────────────────────────┘
+```
+
+### Read Path
+
+```
+Application
+     │
+     ▼
+┌──────────────────────────────┐
+│ 1. Get block refs from meta  │
+│ 2. Check memory cache       │
+│ 3. Check disk cache         │
+│ 4. Fetch from S3 if needed  │
+│ 5. Decompress LZ4           │
+│ 6. Assemble response        │
+└──────────────────────────────┘
+     │
+     ▼
+Application
+```
+
+### Transaction Model
+
+The metadata engine uses **redb** for ACID transactions:
+
+1. **Write Transactions**: All metadata updates (block allocation, file creation) use redb's `begin_write()` + `commit()`
+2. **Read Transactions**: Use `begin_read()` for consistent snapshots
+3. **Crash Recovery**: The writeback manager maintains a binary journal. On startup, it scans the journal and resumes any incomplete uploads
 
 ---
 
@@ -83,19 +179,14 @@
 
 ### Windows
 - [WinFSP](https://winfsp.dev/) — install the stable release
-- The `WINFSP_DIR` environment variable must point to WinFSP's installation directory (e.g. `C:\Program Files (x86)\WinFsp`)
+- The `WINFSP_DIR` environment variable must point to WinFSP's installation directory
 
 ### Linux
 - FUSE 3 development libraries:
   ```bash
-  # Debian / Ubuntu
-  sudo apt install fuse3 libfuse3-dev pkg-config
-
-  # Fedora
-  sudo dnf install fuse3-devel
-
-  # Arch
-  sudo pacman -S fuse3
+  sudo apt install fuse3 libfuse3-dev pkg-config  # Debian/Ubuntu
+  sudo dnf install fuse3-devel                     # Fedora
+  sudo pacman -S fuse3                             # Arch
   ```
 
 ### macOS
@@ -128,7 +219,7 @@ The binary is at `target/release/studiofs` (or `target\release\studiofs.exe` on 
 
 ### 1. Initialize a Volume
 
-Before mounting, you need to create a **volume** — this stores S3 connection details and initializes the metadata database.
+Before mounting, create a **volume** with S3 connection details:
 
 ```bash
 studiofs init my-volume \
@@ -168,13 +259,11 @@ Run `studiofs mount my-volume <mount-point>` to mount.
 ### 2. Mount the Filesystem
 
 #### Windows
-Mount to a drive letter:
 ```powershell
 studiofs mount my-volume Z:
 ```
 
 #### Linux / macOS
-Mount to a directory (must exist):
 ```bash
 mkdir -p /mnt/studio
 studiofs mount my-volume /mnt/studio
@@ -184,10 +273,10 @@ studiofs mount my-volume /mnt/studio
 ```
 ✓ Volume 'my-volume' ready to mount at 'Z:'
   Memory limit: 1GB
-  Cache size:   100GB
+  Cache size:   50GB
 ```
 
-The process blocks while the filesystem is mounted. Press `Ctrl+C` to unmount.
+The process blocks while mounted. Press `Ctrl+C` to unmount.
 
 #### Mount Options
 
@@ -196,9 +285,8 @@ The process blocks while the filesystem is mounted. Press `Ctrl+C` to unmount.
 | `<name>` | — | Volume name (must be initialized) |
 | `<mount-point>` | — | Drive letter (Windows) or path (Unix) |
 | `--cache-dir` | `<meta-dir>/cache` | Path to disk cache directory |
-| `--cache-size` | `100GB` | Max disk cache size (`KB`, `MB`, `GB`, `TB`) |
-| `--memory-limit` | `1GB` | Max in-memory cache size (`KB`, `MB`, `GB`, `TB`) |
-| `--foreground` | `false` | Run in foreground (keep the terminal attached) |
+| `--cache-size` | `50GB` | Max disk cache size (`KB`, `MB`, `GB`, `TB`) |
+| `--foreground` | `false` | Run in foreground |
 | `--log-level` | `info` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error` |
 
 ---
@@ -218,12 +306,8 @@ StudioFS Volume Status
   Endpoint:   https://s3.amazonaws.com
   Bucket:     my-bucket
   Block size: 4 MiB
-  Chunk size: 64 MiB
 
   Inodes:     42
-  Used space: 1073741824 bytes
-  Next inode: 43
-  Next slice: 128
   Metadata:   "~/.studiofs/meta/my-volume/my-volume.db"
 ```
 
@@ -237,26 +321,13 @@ StudioFS Volume Status
 studiofs destroy my-volume
 ```
 
-**Interactive Confirmation:**
-1.  The command will warn you about data loss.
-2.  Type `y` to proceed.
-3.  Type the volume name (`my-volume`) to confirm.
-
-**Output:**
+Interactive confirmation required. Output:
 ```
-Creating S3 client...
 WARNING: You are about to DESTROY volume 'my-volume'.
-This will permanently delete:
-  1. All data in S3 bucket 'my-bucket' with prefix 'my-volume/'
-  2. ALL local metadata and cache at "C:\Users\User\.studiofs\meta\my-volume"
-
+This will permanently delete all data in S3 and local metadata.
 Do you want to proceed? [y/N]: y
 To confirm, please type the volume name 'my-volume' again: my-volume
-Deleting data from S3...
-✓ S3 data deleted.
-Deleting local metadata and cache...
-✓ Local files deleted.
-Volume 'my-volume' destroyed successfully.
+✓ Volume 'my-volume' destroyed successfully.
 ```
 
 ---
@@ -282,15 +353,10 @@ Global Options:
 
 ## Using with MinIO (Local Testing)
 
-[MinIO](https://min.io/) is a great way to test StudioFS locally without AWS credentials.
-
 ### 1. Start MinIO
 
 ```powershell
-# Create data directory
 mkdir C:\minio
-
-# Start server
 minio server C:\minio --console-address ":9001"
 ```
 
@@ -299,7 +365,7 @@ Web console: http://127.0.0.1:9001
 
 ### 2. Create a Bucket
 
-Open the MinIO web console at http://127.0.0.1:9001, log in, and create a bucket (e.g. `my-bucket`).
+Open the MinIO web console, log in, and create a bucket (e.g., `my-bucket`).
 
 ### 3. Initialize & Mount
 
@@ -326,24 +392,17 @@ echo "Hello, StudioFS!" > Z:\hello.txt
 
 # Read it back
 cat Z:\hello.txt
-
-# Check status
-studiofs status local-test
 ```
 
 ---
 
 ## Using with AWS S3
 
-### 1. Create an S3 Bucket
-
 ```bash
+# Create bucket
 aws s3 mb s3://my-studiofs-bucket --region us-east-1
-```
 
-### 2. Initialize & Mount
-
-```bash
+# Initialize & mount
 studiofs init prod-volume \
   --endpoint https://s3.amazonaws.com \
   --bucket my-studiofs-bucket \
@@ -353,45 +412,151 @@ studiofs init prod-volume \
 
 studiofs mount prod-volume /mnt/studio \
   --memory-limit 4GB \
-  --cache-size 500GB \
-  --cache-dir /var/cache/studiofs
+  --cache-size 500GB
 ```
 
 > **Tip:** For best performance, set `--memory-limit` to ~25% of available RAM and `--cache-dir` to a fast SSD.
 
 ---
 
-## Data Model
+## Programming Guide
 
-StudioFS uses a **Log-Structured Object Tree** architecture, similar to LucidLink or Btrfs/ZFS but adapted for object storage:
+### Initializing the Filesystem
 
+The core VFS is implemented in [`studiofs-vfs/src/vfs_v2.rs`](crates/studiofs-vfs/src/vfs_v2.rs). To use it programmatically:
+
+```rust
+use std::sync::Arc;
+use studiofs_meta::{RedbMetaEngine, FormatInfo};
+use studiofs_data::store::{DataStore, DataStoreConfig};
+use studiofs_vfs::vfs_v2::StudioVfs;
+
+// 1. Create metadata engine
+let meta = Arc::new(RedbMetaEngine::open("/path/to/meta.db")?);
+meta.init_root()?;
+
+// 2. Set format info
+let format_info = FormatInfo {
+    name: "my-volume".into(),
+    uuid: "uuid-123".into(),
+    endpoint: "http://127.0.0.1:9000".into(),
+    bucket: "my-bucket".into(),
+    access_key: "minioadmin".into(),
+    secret_key: "minioadmin".into(),
+    region: "us-east-1".into(),
+    block_size: 4 * 1024 * 1024, // 4 MiB
+    chunk_size: 64 * 1024 * 1024, // deprecated
+};
+meta.set_format_info(&format_info)?;
+
+// 3. Create data store
+let data_config = DataStoreConfig::from(&format_info);
+let data = Arc::new(DataStore::new(&data_config)?);
+
+// 4. Create VFS
+let vfs = StudioVfs::new(
+    meta.clone(),
+    data,
+    "/path/to/cache",
+    50 * 1024 * 1024 * 1024, // 50 GB
+)?;
 ```
-Inode (Redb)
- └── Data Root (Hash of Root Object)
-      │
-      ▼
-   Root Object (S3)
-   ├── [Meta] Child Link (Offset: 0, Len: 4MB, Hash: ...)
-   │    └── Data Object (LZ4 Compressed)
-   │
-   └── [Meta] Child Link (Offset: 4MB, Len: 2MB, Hash: ...)
-        └── Data Object (LZ4 Compressed)
+
+### Basic Operations
+
+```rust
+use studiofs_vfs::vfs_v2::StudioVfs;
+
+// Create a file
+let attr = vfs.create(1, b"hello.txt", 0, 0, 0o644)?;
+let ino = attr.ino;
+
+// Write data
+let payload = b"Hello, StudioFS v2!";
+let written = vfs.write(ino, 0, payload).await?;
+assert_eq!(written as usize, payload.len());
+
+// Flush to storage
+vfs.flush(ino).await?;
+
+// Read data back
+let data = vfs.read(ino, 0, payload.len() as u32).await?;
+assert_eq!(&data[..], payload);
+
+// Get attributes
+let attr = vfs.getattr(ino)?;
+println!("File size: {} bytes", attr.size);
 ```
 
-| Concept | Size | Stored in | Description |
-|---------|------|-----------|-------------|
-| **Inode** | — | Redb (local) | File/directory metadata (size, mode, timestamps) and **Data Root** |
-| **Object** | Max 64 MB | S3 (remote) | Immutable unit of storage. Can be **Meta** (pointers) or **Data** (payload) |
-| **Payload**| Variable | S3 (inside Object)| LZ4-compressed byte stream |
-| **Header** | Fixed | S3 (inside Object)| Magic `STFS`, Version, Original/Compressed Size, XXH64 Checksum |
+### Block Management
 
-**S3 Object Key Format (CAS):**
-```
-{volume}/objects/{ab}/{cd}/{hash_id}
-```
-Objects are content-addressable. The path is derived solely from the hash of the object's content (Header + Compressed Payload).
+The VFS automatically manages blocks. Key operations:
 
-Example: `my-volume/objects/a1/b2/a1b2c3d4...`
+```rust
+// Truncate file to new size
+vfs.setattr(ino, Some(5 * 1024 * 1024)).await?; // 5 MiB
+
+// Get block references for a file
+let blocks = vfs.meta().get_file_blocks(ino)?;
+for (block_idx, block_ref) in blocks {
+    println!("Block {}: object_id={}, length={}", 
+             block_idx, block_ref.object_id, block_ref.length);
+}
+
+// Delete file (marks all blocks for GC)
+vfs.unlink(1, b"hello.txt")?;
+```
+
+---
+
+## Technical Details
+
+### Redb Integration
+
+StudioFS uses [redb](https://redb.org/) as the embedded metadata store. Key integration points:
+
+1. **ACID Transactions**: Every metadata operation wraps in `begin_write()` + `commit()`
+2. **Key-Value Model**: All data is stored as serialized bytes (via `postcard`)
+3. **Table Definitions**: Static `TableDefinition` constants for type safety
+
+```rust
+// Example: Reading file blocks
+let txn = db.begin_read()?;
+let table = txn.open_table(FILE_BLOCKS_TABLE)?;
+let key = encode_file_block_key(ino, block_index);
+let entry = table.get(key.as_slice())?;
+let block: BlockRef = postcard::from_bytes(entry.value())?;
+```
+
+### Metadata Schema
+
+The metadata schema is defined in [`studiofs-meta/src/types.rs`](crates/studiofs-meta/src/types.rs):
+
+| Table | Key | Value | Description |
+|-------|-----|-------|-------------|
+| `attributes` | `ino (u64)` | `InodeAttr` | File/directory metadata |
+| `directory_map` | `(parent_ino, name_hash)` | `DirEntryValue` | Directory entries |
+| `file_blocks` | `(ino, block_index)` | `BlockRef` | Block references |
+| `pending_deletions` | `object_id (u64)` | `timestamp (i64)` | GC queue |
+| `counters` | `name (&str)` | `u64` | Next IDs, used space |
+| `format_info` | `"format"` | `FormatInfo` | Volume configuration |
+
+### Cache Architecture
+
+The cache layer ([`studiofs-cache`](crates/studiofs-cache/)) provides:
+
+1. **DiskCache**: Persistent block storage with LRU eviction
+   - Default size: 50 GB
+   - Minimum size: 1 GB
+   - Target free disk space: 10%
+
+2. **WritebackManager**: Async upload with crash recovery
+   - Binary journal format (43 bytes per entry)
+   - Status tracking: Pending → Uploading → Complete
+
+3. **Background Workers**:
+   - Upload worker: Max 32 concurrent uploads, exponential backoff retry
+   - GC worker: Runs every 10 minutes, 1-hour grace period before deletion
 
 ---
 
@@ -402,10 +567,10 @@ studiofs/
 ├── Cargo.toml                    # Workspace root
 ├── crates/
 │   ├── studiofs/                 # CLI binary (init, mount, status)
-│   ├── studiofs-vfs/             # Core VFS (path resolution, read/write logic)
-│   ├── studiofs-meta/            # Metadata engine (Redb + Postcard)
+│   ├── studiofs-vfs/             # Core VFS (v2 implementation)
+│   ├── studiofs-meta/            # Metadata engine (Redb)
 │   ├── studiofs-data/            # S3 data store (OpenDAL)
-│   ├── studiofs-cache/           # Multi-tier cache (LRU memory)
+│   ├── studiofs-cache/           # Cache management
 │   ├── studiofs-fuse/            # FUSE bridge (Linux/macOS)
 │   └── studiofs-winfsp/          # WinFSP bridge (Windows)
 └── README.md
@@ -413,13 +578,13 @@ studiofs/
 
 | Crate | Purpose |
 |-------|---------|
-| `studiofs` | CLI entry point — parses arguments, wires components, starts FUSE |
-| `studiofs-vfs` | Core filesystem logic — translates file ops to chunk/slice/block ops |
-| `studiofs-meta` | Local metadata engine — inode table, directory entries, chunk→slice maps |
-| `studiofs-data` | S3 block I/O — upload, download, delete, range reads via OpenDAL |
-| `studiofs-cache` | In-memory LRU cache for hot blocks |
-| `studiofs-fuse` | Linux/macOS FUSE adapter (`fuser` crate) |
-| `studiofs-winfsp` | Windows FUSE adapter (`winfsp` crate) |
+| `studiofs` | CLI entry point |
+| `studiofs-vfs` | Core filesystem logic — block allocation, read/write |
+| `studiofs-meta` | Metadata engine — inodes, block refs, GC |
+| `studiofs-data` | S3 I/O via OpenDAL |
+| `studiofs-cache` | Disk cache, writeback, journal |
+| `studiofs-fuse` | Linux/macOS FUSE adapter |
+| `studiofs-winfsp` | Windows FUSE adapter |
 
 ---
 
@@ -440,16 +605,17 @@ cargo test
 ### Run Integration Tests (requires MinIO)
 
 ```bash
-# Start MinIO first (see "Using with MinIO" section)
+# Start MinIO first
+minio server C:\minio --console-address ":9001"
 
-# DataStore-level tests (block CRUD)
-cargo test -p studiofs-data --test integration_test -- --ignored --test-threads=1
+# VFS v2 integration tests
+cargo test -p studiofs-vfs --test vfs_v2_test -- --ignored
 
-# VFS-level tests (full file lifecycle: create → write → read → verify)
-cargo test -p studiofs-vfs --test integration_test -- --ignored --test-threads=1
+# All integration tests
+cargo test -p studiofs-data --test integration_test -- --ignored
 ```
 
-> **Note:** `--test-threads=1` is required to prevent opendal's HTTP connection pool from being torn down during parallel test execution.
+> **Note:** `--test-threads=1` may be required to prevent connection pool issues.
 
 ### Debug Logging
 
@@ -465,12 +631,13 @@ Available log levels: `trace`, `debug`, `info`, `warn`, `error`.
 
 | Component | Technology | Why |
 |-----------|-----------|-----|
-| Language | **Rust** | Memory safety, zero-cost abstractions, cross-platform |
-| Storage | [OpenDAL](https://opendal.apache.org/) | Universal S3-compatible client with async I/O |
-| Metadata | [Redb](https://redb.org/) | Lightweight embedded key-value store, ACID, zero-copy |
-| Serialization | [Postcard](https://github.com/jamesmunns/postcard) | Compact binary format, `#[no_std]` compatible |
-| FUSE (Windows) | [WinFSP](https://winfsp.dev/) | Mature, well-tested Windows FUSE implementation |
-| FUSE (Unix) | [fuser](https://github.com/cbeuw/fuser) | Pure Rust FUSE library, supports FUSE3 |
+| Language | **Rust** | Memory safety, zero-cost abstractions |
+| Storage | [OpenDAL](https://opendal.apache.org/) | Universal S3-compatible client |
+| Metadata | [Redb](https://redb.org/) | Embedded KV store, ACID, zero-copy |
+| Serialization | [Postcard](https://github.com/jamesmunns/postcard) | Compact binary format |
+| Compression | [lz4_flex](https://github.com/PSeitz/lz4_flex) | Fast LZ4 compression |
+| FUSE (Windows) | [WinFSP](https://winfsp.dev/) | Windows FUSE implementation |
+| FUSE (Unix) | [fuser](https://github.com/cbeuw/fuser) | Pure Rust FUSE3 library |
 | Async runtime | [Tokio](https://tokio.rs/) | Industry-standard async runtime |
 | CLI | [Clap](https://clap.rs/) | Derive-based argument parsing |
 

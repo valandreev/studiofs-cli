@@ -15,6 +15,7 @@ tracing.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
 libc.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

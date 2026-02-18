@@ -183,6 +183,14 @@ impl DataStore {
         Ok(())
     }
 
+    /// Delete a generic object from S3.
+    pub async fn delete_object(&self, object_id: &str) -> DataResult<()> {
+        let key = self.object_key(object_id);
+        debug!("deleting object: {key}");
+        self.op.delete(&key).await?;
+        Ok(())
+    }
+
     /// Check if a block exists in S3.
     pub async fn block_exists(
         &self,
