@@ -14,6 +14,9 @@ pub fn mount_and_serve(
     rt: std::sync::Arc<tokio::runtime::Runtime>,
     mount_point: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Keep a reference for persist_cache() after fuser::mount2() returns
+    // (vfs is moved into StudioFuseFs below).
+    let vfs_ref = vfs.clone();
     let fs = StudioFuseFs::new(vfs, rt);
     let mut options = vec![
         fuser::MountOption::FSName("studiofs".into()),
@@ -35,5 +38,8 @@ pub fn mount_and_serve(
     }
     tracing::info!("mounting StudioFS at {mount_point}");
     fuser::mount2(fs, mount_point, &options)?;
+    // fuser::mount2 returns when the filesystem is unmounted.
+    // Persist the slab index now so the cache survives remounts.
+    vfs_ref.persist_cache();
     Ok(())
 }

@@ -1107,6 +1107,19 @@ impl StudioVfs {
             }
         }
     }
+
+    /// Persist the disk cache index to disk.
+    ///
+    /// Should be called before unmounting so the slab index survives across
+    /// remounts. The `Drop` impl on `SlabStore` also persists on exit, but
+    /// calling this explicitly gives a clean, logged persist at a known point.
+    pub fn persist_cache(&self) {
+        if let Err(e) = self.disk_cache.persist() {
+            error!("failed to persist disk cache on shutdown: {}", e);
+        } else {
+            tracing::info!("disk cache index persisted");
+        }
+    }
 }
 
 // =============================================================================

@@ -37,6 +37,8 @@ pub fn mount_and_serve(
     volume_params.file_info_timeout(100);   // 100ms: quick invalidation on overwrites
     volume_params.dir_info_timeout(1000);   // 1s: dir entries change less frequently
 
+    // Keep a reference for persist_cache() on shutdown (vfs is moved into context).
+    let vfs_ref = vfs.clone();
     let context = StudioFsContext::new(vfs, rt);
 
     let mut host = FileSystemHost::new(volume_params, context)?;
@@ -54,6 +56,9 @@ pub fn mount_and_serve(
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
+    // Persist the slab index before tearing down WinFSP so the cache
+    // survives the remount without falling back to object storage.
+    vfs_ref.persist_cache();
     host.stop();
     host.unmount();
 

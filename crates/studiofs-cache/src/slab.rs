@@ -764,6 +764,17 @@ impl SlabStore {
     }
 }
 
+impl Drop for SlabStore {
+    fn drop(&mut self) {
+        // Best-effort persist on any exit path (normal shutdown, Ctrl+C, panic unwind).
+        if let Err(e) = self.persist_index() {
+            // Use eprintln! because the tracing subscriber may already be torn down
+            // by the time Drop runs during process shutdown.
+            eprintln!("[studiofs] SlabStore: failed to persist index on drop: {e}");
+        }
+    }
+}
+
 // =============================================================================
 // Utility
 // =============================================================================
