@@ -259,7 +259,8 @@ pub struct SlabStore {
     /// Slab directory.
     slab_dir: PathBuf,
     /// All open slabs (permanently mmap'd).
-    slabs: RwLock<Vec<Arc<Slab>>>,
+    /// Slots can be `None` when an empty slab has been cleaned up and its file deleted.
+    slabs: RwLock<Vec<Option<Arc<Slab>>>>,
     /// Object index: object_id → slab entry.
     index: RwLock<HashMap<ObjectId, SlabEntry>>,
     /// LRU ordering for eviction: (last_access, object_id).
@@ -313,11 +314,13 @@ impl SlabStore {
 
         // Read from slab — just pointer arithmetic on the persistent mmap
         let slabs = self.slabs.read();
-        if entry.slab_id as usize >= slabs.len() {
-            warn!("slab_id {} out of range for object {:016x}", entry.slab_id, id);
-            return None;
-        }
-        let slab = &slabs[entry.slab_id as usize];
+        let slab = match slabs.get(entry.slab_id as usize).and_then(|s| s.as_ref()) {
+            Some(s) => s,
+            None => {
+                warn!("slab {} missing/cleaned for object {:016x}", entry.slab_id, id);
+                return None;
+            }
+        };
         let data = slab.read_slice(entry.offset, entry.length);
         let bytes = Bytes::copy_from_slice(data);
 
@@ -346,7 +349,7 @@ impl SlabStore {
         // Write data to slab
         {
             let slabs = self.slabs.read();
-            slabs[slab_id as usize].write_at(offset, data);
+            slabs[slab_id as usize].as_ref().unwrap().write_at(offset, data);
         }
 
         // Register in index
@@ -388,9 +391,9 @@ impl SlabStore {
         if let Some(entry) = entry {
             // Free the region in the slab
             let slabs = self.slabs.read();
-            if (entry.slab_id as usize) < slabs.len() {
+            if let Some(slab) = slabs.get(entry.slab_id as usize).and_then(|s| s.as_ref()) {
                 let aligned = align_up(entry.length, ALLOC_ALIGN);
-                slabs[entry.slab_id as usize].free(entry.offset, entry.length);
+                slab.free(entry.offset, entry.length);
                 self.total_data_bytes
                     .fetch_sub(aligned as u64, Ordering::Relaxed);
             }
@@ -441,9 +444,11 @@ impl SlabStore {
         // Try existing slabs first
         {
             let slabs = self.slabs.read();
-            for (i, slab) in slabs.iter().enumerate() {
-                if let Some((offset, aligned)) = slab.allocate(size) {
-                    return Ok((i as u16, offset, aligned));
+            for (i, slot) in slabs.iter().enumerate() {
+                if let Some(slab) = slot {
+                    if let Some((offset, aligned)) = slab.allocate(size) {
+                        return Ok((i as u16, offset, aligned));
+                    }
                 }
             }
         }
@@ -452,7 +457,7 @@ impl SlabStore {
         let slab_id = self.create_slab()?;
 
         let slabs = self.slabs.read();
-        if let Some((offset, aligned)) = slabs[slab_id as usize].allocate(size) {
+        if let Some((offset, aligned)) = slabs[slab_id as usize].as_ref().unwrap().allocate(size) {
             Ok((slab_id, offset, aligned))
         } else {
             Err(io::Error::new(
@@ -475,7 +480,7 @@ impl SlabStore {
         );
 
         let slab = Slab::open_or_create(&path, self.slab_file_size)?;
-        slabs.push(Arc::new(slab));
+        slabs.push(Some(Arc::new(slab)));
 
         Ok(slab_id)
     }
@@ -603,11 +608,12 @@ impl SlabStore {
         for i in 0..slab_count {
             let path = self.slab_dir.join(format!("slab_{:04}.dat", i));
             if !path.exists() {
-                warn!("[SLAB-RECOVER] slab_{:04}.dat missing, stopping recovery", i);
-                break;
+                info!("[SLAB-RECOVER] slab_{:04}.dat missing (was empty/deleted), skipping", i);
+                slabs.push(None);
+                continue;
             }
             let slab = Slab::open_existing(&path)?;
-            slabs.push(Arc::new(slab));
+            slabs.push(Some(Arc::new(slab)));
         }
 
         // Read index entries
@@ -676,7 +682,7 @@ impl SlabStore {
     /// Rebuild slab free lists from the index (called during recovery).
     fn rebuild_free_lists(
         &self,
-        slabs: &[Arc<Slab>],
+        slabs: &[Option<Arc<Slab>>],
         index: &HashMap<ObjectId, SlabEntry>,
     ) {
         // Collect allocated regions per slab
@@ -688,7 +694,11 @@ impl SlabStore {
             }
         }
 
-        for (i, slab) in slabs.iter().enumerate() {
+        for (i, slot) in slabs.iter().enumerate() {
+            let slab = match slot {
+                Some(s) => s,
+                None => continue,
+            };
             let mut regions = slab_allocated[i].clone();
             regions.sort_by_key(|(offset, _)| *offset);
 
@@ -762,15 +772,66 @@ impl SlabStore {
 
         Ok(())
     }
+
+    /// Delete slab files that are completely empty (all data freed).
+    ///
+    /// A slab is empty when `free_bytes == capacity`.  Dropping the `Arc<Slab>`
+    /// unmaps the file, after which we delete it from disk so that physical
+    /// disk space is actually reclaimed.
+    ///
+    /// Returns the number of slab files deleted.
+    pub fn cleanup_empty_slabs(&self) -> usize {
+        let mut slabs = self.slabs.write();
+        let mut deleted = 0;
+
+        for (i, slot) in slabs.iter_mut().enumerate() {
+            let is_empty = slot
+                .as_ref()
+                .map_or(false, |s| s.free_bytes.load(Ordering::Relaxed) == s.capacity);
+
+            if is_empty {
+                let path = self.slab_dir.join(format!("slab_{:04}.dat", i));
+                // Drop the Arc<Slab> — this unmaps the file.
+                *slot = None;
+                // Delete the physical file to reclaim disk space.
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        info!(
+                            "[SLAB-CLEANUP] deleted empty slab_{:04}.dat — physical disk space freed",
+                            i
+                        );
+                        deleted += 1;
+                    }
+                    Err(e) => {
+                        warn!("[SLAB-CLEANUP] failed to delete slab_{:04}.dat: {}", i, e);
+                    }
+                }
+            }
+        }
+
+        deleted
+    }
 }
 
 impl Drop for SlabStore {
     fn drop(&mut self) {
-        // Best-effort persist on any exit path (normal shutdown, Ctrl+C, panic unwind).
+        // Persist current state so the next mount recovers correctly.
         if let Err(e) = self.persist_index() {
-            // Use eprintln! because the tracing subscriber may already be torn down
-            // by the time Drop runs during process shutdown.
             eprintln!("[studiofs] SlabStore: failed to persist index on drop: {e}");
+        }
+
+        // Delete empty slab files to reclaim physical disk space on shutdown.
+        // get_mut() avoids poisoned-lock issues during unwind.
+        let slabs = self.slabs.get_mut();
+        for (i, slot) in slabs.iter_mut().enumerate() {
+            let is_empty = slot
+                .as_ref()
+                .map_or(false, |s| s.free_bytes.load(Ordering::Relaxed) == s.capacity);
+            if is_empty {
+                let path = self.slab_dir.join(format!("slab_{:04}.dat", i));
+                *slot = None; // drop Slab → unmap
+                let _ = fs::remove_file(&path);
+            }
         }
     }
 }

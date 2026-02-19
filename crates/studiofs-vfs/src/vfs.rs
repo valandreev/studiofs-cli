@@ -167,6 +167,10 @@ struct VfsState {
     dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
     /// Approximate total bytes currently held in `dirty_mem` (for backpressure).
     dirty_bytes: AtomicUsize,
+    /// Inodes that have been unlinked.  The background slab flusher checks this
+    /// set before calling `flush_block()` to avoid re-inserting evicted blocks
+    /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
+    deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
 }
 
 // =============================================================================
@@ -257,6 +261,7 @@ impl StudioVfs {
                 inflight_fetches: Mutex::new(std::collections::HashMap::new()),
                 dirty_mem: Mutex::new(std::collections::HashMap::new()),
                 dirty_bytes: AtomicUsize::new(0),
+                deleted_inodes: Mutex::new(std::collections::HashSet::new()),
             }),
             upload_semaphore: Arc::new(Semaphore::new(32)),
             upload_retries: 3,
@@ -396,13 +401,16 @@ impl StudioVfs {
             for block_idx in (new_last_block + 1)..=old_last_block {
                 // Remove the block and get its ID for GC
                 if let Some(object_id) = self.meta.remove_file_block(ino, block_idx)? {
-                    // Mark old block for deletion
+                    // Mark old block for deletion (S3 cleanup via background GC)
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     self.meta.add_pending_deletion(object_id, timestamp)?;
                     debug!("marking block {} for deletion (truncate)", object_id);
+
+                    // Immediately evict this block from all cache tiers.
+                    self.evict_block_from_caches(ino, block_idx, object_id);
                 }
             }
         }
@@ -470,22 +478,49 @@ impl StudioVfs {
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let attr = self.meta.unlink(parent, name)?;
 
+        // Mark this inode as deleted FIRST — the background slab flusher checks
+        // this set to avoid re-inserting evicted blocks (race condition fix).
+        self.state.deleted_inodes.lock().insert(attr.ino);
+
         // Remove all blocks and mark for GC
         let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
+        let cache_size_before = self.disk_cache.current_size();
+        info!(
+            "unlink ino={}: removed {} block refs, object_ids={:?}, cache_size_before={}",
+            attr.ino,
+            removed_ids.len(),
+            removed_ids,
+            cache_size_before,
+        );
 
-        // Add to pending deletions
+        // Add to pending deletions (for eventual S3 deletion via background GC)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        for object_id in removed_ids {
-            self.meta.add_pending_deletion(object_id, timestamp)?;
+        for object_id in &removed_ids {
+            self.meta.add_pending_deletion(*object_id, timestamp)?;
             debug!("marking object {} for deletion (unlink)", object_id);
         }
 
         // Clear pending blocks buffer
         self.state.pending_blocks.lock().retain(|(ino, _), _| *ino != attr.ino);
+
+        // Immediately evict all cached blocks for this inode — no need to wait for GC.
+        self.evict_inode_from_caches(attr.ino, &removed_ids);
+
+        // Delete empty slab files so physical disk space is reclaimed.
+        let slabs_deleted = self.disk_cache.cleanup_empty_slabs();
+
+        let cache_size_after = self.disk_cache.current_size();
+        info!(
+            "unlink ino={}: cache_size_after={}, freed={} bytes, slabs_deleted={}",
+            attr.ino,
+            cache_size_after,
+            cache_size_before.saturating_sub(cache_size_after),
+            slabs_deleted,
+        );
 
         // Clear dirty attrs and read-through cache
         self.state.dirty_attrs.lock().remove(&attr.ino);
@@ -517,6 +552,98 @@ impl StudioVfs {
             self.state.attr_read_cache.lock().remove(&new_parent);
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Cache Eviction Helpers
+    // =========================================================================
+
+    /// Immediately evict **all** blocks for `ino` from every cache tier.
+    ///
+    /// Called by `unlink()` so that deleted file data is no longer occupying
+    /// disk / RAM space without waiting for the next background GC run.
+    fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
+        // L1 — in-memory LRU: remove all blocks for this inode in one pass.
+        if let Some(mc) = &self.mem_cache {
+            mc.invalidate_inode(ino);
+        }
+
+        // L1.5 — dirty memory buffer (Phase 5): drain blocks buffered post-flush.
+        {
+            let mut dirty = self.state.dirty_mem.lock();
+            let removed_bytes: usize = dirty
+                .iter()
+                .filter(|((i, _), _)| *i == ino)
+                .map(|(_, d)| d.len())
+                .sum();
+            dirty.retain(|(i, _), _| *i != ino);
+            if removed_bytes > 0 {
+                self.state
+                    .dirty_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(removed_bytes))
+                    })
+                    .ok();
+                debug!("evict_inode L1.5: ino={} freed {} bytes from dirty_mem", ino, removed_bytes);
+            }
+        }
+
+        // L2 — slab disk cache: remove by object_id (O(1) HashMap lookup each).
+        let mut l2_evicted = 0;
+        for &object_id in object_ids {
+            if self.disk_cache.exists(object_id) {
+                self.disk_cache.remove_object_sync(object_id);
+                l2_evicted += 1;
+            }
+        }
+        if l2_evicted > 0 {
+            debug!("evict_inode L2: ino={} evicted {} objects from slab cache", ino, l2_evicted);
+        }
+
+        // Clean up pre-compressed upload data stashed for these objects.
+        {
+            let mut upload_data = self.state.pending_upload_data.lock();
+            for &object_id in object_ids {
+                upload_data.remove(&object_id);
+            }
+        }
+
+        // Cancel any coalesced in-flight S3 fetches for this inode.
+        self.state.inflight_fetches.lock().retain(|(i, _), _| *i != ino);
+
+        // Invalidate readahead state for this inode.
+        self.readahead.evict(ino);
+    }
+
+    /// Immediately evict a single block from every cache tier.
+    ///
+    /// Called by `truncate_blocks()` for each block that is removed by a
+    /// truncation.
+    fn evict_block_from_caches(&self, ino: Ino, block_index: u32, object_id: u64) {
+        // L1 — in-memory LRU.
+        if let Some(mc) = &self.mem_cache {
+            let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
+            mc.remove(&mem_key);
+        }
+
+        // L1.5 — dirty memory buffer.
+        {
+            let mut dirty = self.state.dirty_mem.lock();
+            if let Some(data) = dirty.remove(&(ino, block_index)) {
+                self.state
+                    .dirty_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(data.len()))
+                    })
+                    .ok();
+            }
+        }
+
+        // L2 — slab disk cache.
+        self.disk_cache.remove_object_sync(object_id);
+
+        // Cancel in-flight S3 fetch for this specific block.
+        self.state.inflight_fetches.lock().remove(&(ino, block_index));
     }
 
     // =========================================================================
@@ -1083,6 +1210,27 @@ impl StudioVfs {
         }
 
         for (ino, block_index) in keys {
+            // ── Race-condition guard ──────────────────────────────────────
+            // If unlink() deleted this inode between snapshot and now, skip
+            // the block — otherwise flush_block would re-insert it into the
+            // slab cache and metadata, undoing the eviction.
+            if self.state.deleted_inodes.lock().contains(&ino) {
+                let removed = self.state.dirty_mem.lock().remove(&(ino, block_index));
+                if let Some(data) = removed {
+                    self.state
+                        .dirty_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(data.len()))
+                        })
+                        .ok();
+                }
+                debug!(
+                    "slab flusher: skipping deleted inode {} block {}",
+                    ino, block_index
+                );
+                continue;
+            }
+
             // Clone the data while holding a brief lock.
             let data = {
                 let dirty = self.state.dirty_mem.lock();

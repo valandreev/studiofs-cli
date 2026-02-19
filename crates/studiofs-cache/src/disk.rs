@@ -198,9 +198,23 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Delete an object from cache (synchronous — no async overhead).
+    ///
+    /// Prefer this over `remove_object()` when calling from a sync context
+    /// (e.g. `unlink`, `truncate_blocks`).
+    pub fn remove_object_sync(&self, id: ObjectId) {
+        self.store.remove(id);
+    }
+
     /// Check if object exists.
     pub fn exists(&self, id: ObjectId) -> bool {
         self.store.contains(id)
+    }
+
+    /// Delete slab files that are completely empty after eviction.
+    /// Returns the number of slab files deleted.
+    pub fn cleanup_empty_slabs(&self) -> usize {
+        self.store.cleanup_empty_slabs()
     }
 
     /// Reserve space for `needed` bytes by evicting LRU.
