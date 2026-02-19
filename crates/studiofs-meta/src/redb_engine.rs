@@ -435,14 +435,41 @@ impl MetaEngine for RedbMetaEngine {
         let table = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let entry = table
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .ok_or_else(|| MetaError::EntryNotFound {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            })?;
-        decode(entry.value())
+        
+        // Fast path: try exact-case match first
+        if let Ok(Some(entry)) = table.get(key.as_slice()) {
+            return decode(entry.value());
+        }
+        
+        // Slow path: case-insensitive search by scanning parent's entries
+        // This is critical for Windows compatibility: files like "Image.jpg" and "image.jpg"
+        // must resolve to the same inode (Windows is case-insensitive)
+        let name_lower = String::from_utf8_lossy(name).to_lowercase();
+        let prefix = dentry_prefix(parent);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        
+        let iter = table
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        
+        for result in iter {
+            let (k, v) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = k.value();
+            let (decoded_parent, stored_name) = decode_dentry_key(key_bytes);
+            if decoded_parent != parent {
+                break;
+            }
+            let stored_name_lower = String::from_utf8_lossy(stored_name).to_lowercase();
+            if stored_name_lower == name_lower {
+                return decode(v.value());
+            }
+        }
+        
+        Err(MetaError::EntryNotFound {
+            parent,
+            name: String::from_utf8_lossy(name).to_string(),
+        })
     }
 
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {

@@ -105,7 +105,12 @@ pub type VfsResult<T> = Result<T, VfsError>;
 
 /// Validate a filename (directory entry name).
 ///
-/// Rejects: empty, longer than 255 bytes, contains '/', dots-only (`.`, `..`).
+/// Rejects:
+/// - Empty names
+/// - Names longer than 255 bytes
+/// - Names containing '/' (path separator)
+/// - Dots-only names (`.`, `..`)
+/// - Names containing Windows-invalid characters: < > : " \ | ? *
 fn validate_name(name: &[u8]) -> VfsResult<()> {
     if name.is_empty() {
         return Err(VfsError::InvalidName("name is empty".into()));
@@ -116,11 +121,17 @@ fn validate_name(name: &[u8]) -> VfsResult<()> {
             name.len()
         )));
     }
-    if name.contains(&b'/') {
-        return Err(VfsError::InvalidName(
-            "name contains '/'".into(),
-        ));
+    
+    // Check for Unix path separator and Windows-invalid characters
+    let invalid_chars = b"/<>:\"|\\?*";
+    if let Some(pos) = name.iter().position(|&b| invalid_chars.contains(&b)) {
+        let char_display = name[pos] as char;
+        return Err(VfsError::InvalidName(format!(
+            "name contains invalid character '{}'",
+            char_display
+        )));
     }
+    
     if name == b"." || name == b".." {
         return Err(VfsError::InvalidName(
             "name is '.' or '..'".into(),
@@ -2197,6 +2208,43 @@ mod tests {
         ));
         assert!(matches!(
             validate_name(b".."),
+            Err(VfsError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_name_windows_special_chars() {
+        // Test each Windows-invalid character: < > : " \ | ? *
+        assert!(matches!(
+            validate_name(b"file<name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file>name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file:name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file\"name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file\\name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file|name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file?name"),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b"file*name"),
             Err(VfsError::InvalidName(_))
         ));
     }
