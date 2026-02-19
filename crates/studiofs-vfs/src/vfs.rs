@@ -22,8 +22,9 @@
 //! 4. Assemble response
 
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use studiofs_cache::disk::{DiskCache, DEFAULT_DISK_CACHE_SIZE};
 use studiofs_cache::memory::{MemoryCache, CacheKey};
@@ -129,6 +130,109 @@ impl Default for VfsConfig {
 }
 
 // =============================================================================
+// Open File Handle Tracking
+// =============================================================================
+
+/// Flags associated with an open file descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFlags(u32);
+
+impl OpenFlags {
+    pub const RDONLY: Self  = Self(0x01);
+    pub const WRONLY: Self  = Self(0x02);
+    pub const RDWR: Self    = Self(0x04);
+    pub const APPEND: Self  = Self(0x08);
+
+    pub const fn empty() -> Self { Self(0) }
+
+    pub const fn bits(self) -> u32 { self.0 }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOr for OpenFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+}
+
+/// Information about a single open file descriptor.
+#[derive(Clone, Debug)]
+pub struct OpenFile {
+    pub ino: Ino,
+    pub flags: OpenFlags,
+}
+
+/// Per-VFS handle table tracking all open file descriptors.
+struct HandleTable {
+    /// Monotonically increasing file handle counter.
+    next_fh: AtomicU64,
+    /// All open handles: fh → OpenFile.
+    handles: parking_lot::RwLock<HashMap<u64, OpenFile>>,
+    /// Inode → number of currently open file descriptors.
+    open_counts: Mutex<HashMap<Ino, u32>>,
+    /// Inodes that were unlinked while still open (deferred deletion).
+    orphans: Mutex<std::collections::HashSet<Ino>>,
+}
+
+impl HandleTable {
+    fn new() -> Self {
+        Self {
+            next_fh: AtomicU64::new(1),
+            handles: parking_lot::RwLock::new(HashMap::new()),
+            open_counts: Mutex::new(HashMap::new()),
+            orphans: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Allocate a new file handle and register it.
+    fn open(&self, ino: Ino, flags: OpenFlags) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.handles.write().insert(fh, OpenFile { ino, flags });
+        *self.open_counts.lock().entry(ino).or_insert(0) += 1;
+        fh
+    }
+
+    /// Look up an open file handle.
+    fn get(&self, fh: u64) -> Option<OpenFile> {
+        self.handles.read().get(&fh).cloned()
+    }
+
+    /// Close a file handle.  Returns `(ino, remaining_open_count)`.
+    fn close(&self, fh: u64) -> Option<(Ino, u32)> {
+        let open_file = self.handles.write().remove(&fh)?;
+        let mut counts = self.open_counts.lock();
+        let count = counts.get_mut(&open_file.ino)?;
+        *count = count.saturating_sub(1);
+        let remaining = *count;
+        if remaining == 0 {
+            counts.remove(&open_file.ino);
+        }
+        Some((open_file.ino, remaining))
+    }
+
+    /// Get the number of open handles for an inode.
+    fn open_count(&self, ino: Ino) -> u32 {
+        self.open_counts.lock().get(&ino).copied().unwrap_or(0)
+    }
+
+    /// Mark an inode as orphan (unlinked while open).
+    fn mark_orphan(&self, ino: Ino) {
+        self.orphans.lock().insert(ino);
+    }
+
+    /// Check if inode is an orphan and remove the mark. Returns true if it was.
+    fn take_orphan(&self, ino: Ino) -> bool {
+        self.orphans.lock().remove(&ino)
+    }
+}
+
+// =============================================================================
 // Pending Block (Write Buffer)
 // =============================================================================
 
@@ -215,6 +319,8 @@ pub struct StudioVfs {
     /// Maximum total bytes allowed in the dirty-write memory buffer before
     /// `flush()` / `write()` apply backpressure.
     max_dirty_bytes: usize,
+    /// Handle table: tracks all open file descriptors.
+    handle_table: HandleTable,
 }
 
 impl StudioVfs {
@@ -270,6 +376,7 @@ impl StudioVfs {
             prefetch_tx,
             dirty_flush_tx,
             max_dirty_bytes: 2 * 1024 * 1024 * 1024,
+            handle_table: HandleTable::new(),
         });
 
         // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
@@ -443,6 +550,106 @@ impl StudioVfs {
         Ok(self.meta.readdir(ino)?)
     }
 
+    // =========================================================================
+    // File Handle Operations
+    // =========================================================================
+
+    /// Open a file and allocate a file handle.
+    ///
+    /// Called by FUSE `open()` / WinFSP `open()`.
+    /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
+    pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
+        // Verify the inode exists
+        let _attr = self.getattr(ino)?;
+
+        // If O_TRUNC requested, truncate to 0
+        if trunc {
+            self.setattr(ino, Some(0))?;
+        }
+
+        let fh = self.handle_table.open(ino, flags);
+        debug!("open_file ino={} fh={} flags={:#x}", ino, fh, flags.bits());
+        Ok(fh)
+    }
+
+    /// Release (close) a file handle.
+    ///
+    /// If the inode was unlinked while this handle was open (orphan) and this
+    /// was the last open handle, perform the deferred deletion now.
+    pub async fn release_fh(&self, fh: u64) -> VfsResult<()> {
+        let Some((ino, remaining)) = self.handle_table.close(fh) else {
+            debug!("release_fh: unknown fh={}", fh);
+            return Ok(());
+        };
+        debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
+
+        if remaining == 0 && self.handle_table.take_orphan(ino) {
+            // Last handle closed on an unlinked file — final cleanup
+            info!("orphan cleanup: ino={} (last fd closed)", ino);
+
+            self.state.deleted_inodes.lock().insert(ino);
+
+            let removed_ids = self.meta.remove_file_blocks(ino)?;
+            if !removed_ids.is_empty() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                for &object_id in &removed_ids {
+                    self.meta.add_pending_deletion(object_id, timestamp)?;
+                }
+                self.state.pending_blocks.lock().retain(|(i, _), _| *i != ino);
+                self.evict_inode_from_caches(ino, &removed_ids);
+                self.disk_cache.cleanup_empty_slabs();
+            }
+
+            self.meta.remove_attr(ino)?;
+            self.state.dirty_attrs.lock().remove(&ino);
+            self.state.attr_read_cache.lock().remove(&ino);
+        }
+        Ok(())
+    }
+
+    /// Flush data for a file handle (per-fd close in POSIX).
+    ///
+    /// Called by FUSE `flush()`.  Flushes pending writes for the inode.
+    pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
+        if let Some(open_file) = self.handle_table.get(fh) {
+            self.flush(open_file.ino).await?;
+        }
+        Ok(())
+    }
+
+    /// fsync — flush data (and optionally metadata) to durable storage.
+    ///
+    /// 1. Flushes pending write buffer to the dirty-mem / slab pipeline.
+    /// 2. If `!datasync`, also commits dirty attrs to redb.
+    ///
+    /// S3 upload remains async — same as LucidLink behaviour.
+    pub async fn fsync(&self, ino: Ino, datasync: bool) -> VfsResult<()> {
+        // Flush pending write buffer
+        self.flush(ino).await?;
+
+        // If full fsync (not datasync), also persist dirty attributes to redb
+        if !datasync {
+            if let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
+                self.meta.set_attr(&attr)?;
+                self.state.attr_read_cache.lock().remove(&ino);
+            }
+        }
+        Ok(())
+    }
+
+    /// Get information about an open file handle.
+    pub fn get_open_file(&self, fh: u64) -> Option<OpenFile> {
+        self.handle_table.get(fh)
+    }
+
+    /// Get the number of open handles for an inode.
+    pub fn open_count(&self, ino: Ino) -> u32 {
+        self.handle_table.open_count(ino)
+    }
+
     /// Create a regular file.
     pub fn create(
         &self,
@@ -474,56 +681,98 @@ impl StudioVfs {
     }
 
     /// Remove a file.
+    ///
+    /// If the file has open handles, the dentry is removed and nlink
+    /// decremented, but the inode and blocks are kept alive (orphan).
+    /// Actual cleanup happens in `release_fh()` when the last handle closes.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        let attr = self.meta.unlink(parent, name)?;
+        // First, look up the entry to get the ino so we can check open handles.
+        let entry = self.meta.lookup(parent, name)?;
+        let ino = entry.ino;
 
-        // Mark this inode as deleted FIRST — the background slab flusher checks
-        // this set to avoid re-inserting evicted blocks (race condition fix).
-        self.state.deleted_inodes.lock().insert(attr.ino);
+        let open_handles = self.handle_table.open_count(ino);
 
-        // Remove all blocks and mark for GC
-        let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
-        let cache_size_before = self.disk_cache.current_size();
-        info!(
-            "unlink ino={}: removed {} block refs, object_ids={:?}, cache_size_before={}",
-            attr.ino,
-            removed_ids.len(),
-            removed_ids,
-            cache_size_before,
-        );
+        if open_handles > 0 {
+            // Open-unlink: remove dentry + decrement nlink, but keep inode alive.
+            let ev = self.meta.remove_entry(parent, name)?;
+            if ev.kind == FileType::Directory {
+                return Err(VfsError::Meta(MetaError::IsADirectory(ino)));
+            }
 
-        // Add to pending deletions (for eventual S3 deletion via background GC)
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            let mut attr = self.meta.get_attr(ino)?;
+            attr.nlink = attr.nlink.saturating_sub(1);
+            self.meta.set_attr(&attr)?;
 
-        for object_id in &removed_ids {
-            self.meta.add_pending_deletion(*object_id, timestamp)?;
-            debug!("marking object {} for deletion (unlink)", object_id);
+            // Update parent mtime
+            if let Ok(mut parent_attr) = self.meta.get_attr(parent) {
+                parent_attr.touch_mtime();
+                let _ = self.meta.set_attr(&parent_attr);
+            }
+
+            // Mark as orphan — release_fh will do the real cleanup
+            self.handle_table.mark_orphan(ino);
+            info!(
+                "unlink ino={}: {} open handles, deferred cleanup (orphan)",
+                ino, open_handles
+            );
+
+            // Invalidate read-through cache (name no longer resolves)
+            self.state.attr_read_cache.lock().remove(&ino);
+        } else {
+            // No open handles — immediate full cleanup via meta.unlink()
+            let attr = self.meta.unlink(parent, name)?;
+
+            // Mark this inode as deleted FIRST — the background slab flusher checks
+            // this set to avoid re-inserting evicted blocks (race condition fix).
+            self.state.deleted_inodes.lock().insert(attr.ino);
+
+            // Remove all blocks and mark for GC
+            let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
+            let cache_size_before = self.disk_cache.current_size();
+            info!(
+                "unlink ino={}: removed {} block refs, object_ids={:?}, cache_size_before={}",
+                attr.ino,
+                removed_ids.len(),
+                removed_ids,
+                cache_size_before,
+            );
+
+            // Add to pending deletions (for eventual S3 deletion via background GC)
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for object_id in &removed_ids {
+                self.meta.add_pending_deletion(*object_id, timestamp)?;
+                debug!("marking object {} for deletion (unlink)", object_id);
+            }
+
+            // Clear pending blocks buffer
+            self.state
+                .pending_blocks
+                .lock()
+                .retain(|(ino, _), _| *ino != attr.ino);
+
+            // Immediately evict all cached blocks for this inode — no need to wait for GC.
+            self.evict_inode_from_caches(attr.ino, &removed_ids);
+
+            // Delete empty slab files so physical disk space is reclaimed.
+            let slabs_deleted = self.disk_cache.cleanup_empty_slabs();
+
+            let cache_size_after = self.disk_cache.current_size();
+            info!(
+                "unlink ino={}: cache_size_after={}, freed={} bytes, slabs_deleted={}",
+                attr.ino,
+                cache_size_after,
+                cache_size_before.saturating_sub(cache_size_after),
+                slabs_deleted,
+            );
+
+            // Clear dirty attrs and read-through cache
+            self.state.dirty_attrs.lock().remove(&attr.ino);
+            self.state.attr_read_cache.lock().remove(&attr.ino);
         }
-
-        // Clear pending blocks buffer
-        self.state.pending_blocks.lock().retain(|(ino, _), _| *ino != attr.ino);
-
-        // Immediately evict all cached blocks for this inode — no need to wait for GC.
-        self.evict_inode_from_caches(attr.ino, &removed_ids);
-
-        // Delete empty slab files so physical disk space is reclaimed.
-        let slabs_deleted = self.disk_cache.cleanup_empty_slabs();
-
-        let cache_size_after = self.disk_cache.current_size();
-        info!(
-            "unlink ino={}: cache_size_after={}, freed={} bytes, slabs_deleted={}",
-            attr.ino,
-            cache_size_after,
-            cache_size_before.saturating_sub(cache_size_after),
-            slabs_deleted,
-        );
-
-        // Clear dirty attrs and read-through cache
-        self.state.dirty_attrs.lock().remove(&attr.ino);
-        self.state.attr_read_cache.lock().remove(&attr.ino);
 
         Ok(())
     }
@@ -1460,5 +1709,77 @@ mod tests {
         assert_eq!(offset_within_block(100, block_size), 100);
         assert_eq!(offset_within_block(4 * 1024 * 1024, block_size), 0);
         assert_eq!(offset_within_block(4 * 1024 * 1024 + 100, block_size), 100);
+    }
+
+    // =========================================================================
+    // HandleTable Unit Tests
+    // =========================================================================
+
+    #[test]
+    fn test_handle_table_open_close() {
+        let ht = HandleTable::new();
+        let fh1 = ht.open(10, OpenFlags::RDONLY);
+        let fh2 = ht.open(10, OpenFlags::RDWR);
+        let fh3 = ht.open(20, OpenFlags::WRONLY);
+
+        assert_ne!(fh1, fh2);
+        assert_ne!(fh2, fh3);
+
+        // Open count
+        assert_eq!(ht.open_count(10), 2);
+        assert_eq!(ht.open_count(20), 1);
+        assert_eq!(ht.open_count(99), 0);
+
+        // Get
+        let of1 = ht.get(fh1).unwrap();
+        assert_eq!(of1.ino, 10);
+        assert!(of1.flags.contains(OpenFlags::RDONLY));
+
+        let of3 = ht.get(fh3).unwrap();
+        assert_eq!(of3.ino, 20);
+
+        assert!(ht.get(99999).is_none());
+
+        // Close fh1 — ino 10 still has 1 open
+        let (ino, remaining) = ht.close(fh1).unwrap();
+        assert_eq!(ino, 10);
+        assert_eq!(remaining, 1);
+        assert_eq!(ht.open_count(10), 1);
+
+        // Close fh2 — ino 10 now at 0
+        let (ino, remaining) = ht.close(fh2).unwrap();
+        assert_eq!(ino, 10);
+        assert_eq!(remaining, 0);
+        assert_eq!(ht.open_count(10), 0);
+
+        // Double-close returns None
+        assert!(ht.close(fh1).is_none());
+    }
+
+    #[test]
+    fn test_handle_table_orphans() {
+        let ht = HandleTable::new();
+        let _fh = ht.open(42, OpenFlags::RDWR);
+
+        // Not an orphan yet
+        assert!(!ht.take_orphan(42));
+
+        // Mark as orphan
+        ht.mark_orphan(42);
+
+        // take_orphan returns true and clears it
+        assert!(ht.take_orphan(42));
+        assert!(!ht.take_orphan(42)); // second call returns false
+    }
+
+    #[test]
+    fn test_open_flags_bitwise() {
+        let f = OpenFlags::RDWR | OpenFlags::APPEND;
+        assert!(f.contains(OpenFlags::RDWR));
+        assert!(f.contains(OpenFlags::APPEND));
+        assert!(!f.contains(OpenFlags::WRONLY));
+
+        let f2 = f.union(OpenFlags::WRONLY);
+        assert!(f2.contains(OpenFlags::WRONLY));
     }
 }

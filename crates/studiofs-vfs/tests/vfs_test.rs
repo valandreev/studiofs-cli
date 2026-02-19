@@ -18,7 +18,7 @@ use std::sync::Arc;
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_data::object::{create_object, read_object, format_object_key};
 use studiofs_meta::{RedbMetaEngine, MetaEngine, FormatInfo, types::BlockRef};
-use studiofs_vfs::StudioVfs;
+use studiofs_vfs::{OpenFlags, StudioVfs};
 
 // =============================================================================
 // Test Helpers
@@ -534,4 +534,159 @@ async fn test_attr_cache_ttl() {
     // Next getattr should see the new size from dirty_attrs
     let attr5 = vfs.getattr(ino).unwrap();
     assert_eq!(attr5.size, 10);
+}
+
+// =============================================================================
+// Handle Tracking Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_open_file_and_release() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "handle1");
+
+    let attr = vfs.create(1, b"handle.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Open a file handle
+    let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+    assert_ne!(fh, 0);
+
+    // Check open count
+    assert_eq!(vfs.open_count(ino), 1);
+
+    // Get the open file info
+    let of = vfs.get_open_file(fh).unwrap();
+    assert_eq!(of.ino, ino);
+
+    // Write through handle
+    vfs.write(ino, 0, b"via handle").await.unwrap();
+    vfs.flush_fh(fh).await.unwrap();
+
+    // Release the handle
+    vfs.release_fh(fh).await.unwrap();
+    assert_eq!(vfs.open_count(ino), 0);
+
+    // Data should persist after release
+    let data = vfs.read(ino, 0, 10).await.unwrap();
+    assert_eq!(&data[..], b"via handle");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_open_trunc() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "handle_trunc");
+
+    let attr = vfs.create(1, b"trunc.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write some data
+    vfs.write(ino, 0, b"existing data").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Open with trunc=true
+    let fh = vfs.open_file(ino, OpenFlags::RDWR, true).unwrap();
+
+    // File should be truncated
+    let attr = vfs.getattr(ino).unwrap();
+    assert_eq!(attr.size, 0);
+
+    vfs.release_fh(fh).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_open_unlink_deferred_cleanup() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "orphan");
+
+    let attr = vfs.create(1, b"orphan.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write data
+    vfs.write(ino, 0, b"orphan data").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Open a handle
+    let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+    // Unlink while handle is open — should defer cleanup
+    vfs.unlink(1, b"orphan.txt").unwrap();
+
+    // File is no longer findable by name
+    assert!(vfs.lookup(1, b"orphan.txt").is_err());
+
+    // But data is still accessible via ino (the handle keeps it alive)
+    let data = vfs.read(ino, 0, 11).await.unwrap();
+    assert_eq!(&data[..], b"orphan data");
+
+    // Release the last handle — orphan cleanup should happen
+    vfs.release_fh(fh).await.unwrap();
+
+    // Inode should be gone now
+    assert!(vfs.getattr(ino).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_multiple_handles_open_unlink() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "multi_handle");
+
+    let attr = vfs.create(1, b"multi.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    vfs.write(ino, 0, b"multi-handle data").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Open two handles
+    let fh1 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+    let fh2 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+    assert_eq!(vfs.open_count(ino), 2);
+
+    // Unlink while both handles open
+    vfs.unlink(1, b"multi.txt").unwrap();
+
+    // Release first handle — inode should still exist (one handle left)
+    vfs.release_fh(fh1).await.unwrap();
+    assert_eq!(vfs.open_count(ino), 1);
+    let data = vfs.read(ino, 0, 17).await.unwrap();
+    assert_eq!(&data[..], b"multi-handle data");
+
+    // Release second handle — now cleanup should happen
+    vfs.release_fh(fh2).await.unwrap();
+    assert!(vfs.getattr(ino).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_fsync() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "fsync");
+
+    let attr = vfs.create(1, b"fsync.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    vfs.write(ino, 0, b"fsync test data").await.unwrap();
+
+    // fsync should flush data
+    vfs.fsync(ino, false).await.unwrap();
+
+    // Data should be readable
+    let data = vfs.read(ino, 0, 15).await.unwrap();
+    assert_eq!(&data[..], b"fsync test data");
+
+    // datasync=true should also work
+    vfs.write(ino, 0, b"datasync test!!").await.unwrap();
+    vfs.fsync(ino, true).await.unwrap();
+
+    let data = vfs.read(ino, 0, 15).await.unwrap();
+    assert_eq!(&data[..], b"datasync test!!");
 }

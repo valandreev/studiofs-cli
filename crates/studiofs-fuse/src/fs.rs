@@ -9,11 +9,27 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use studiofs_meta::FileType;
-use studiofs_vfs::{StudioVfs, VfsError};
+use studiofs_vfs::{OpenFlags, StudioVfs, VfsError};
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 
 const TTL: Duration = Duration::from_secs(1);
+
+/// Convert POSIX O_* flags to our OpenFlags.
+fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
+    let access = flags & libc::O_ACCMODE;
+    let mut f = match access {
+        libc::O_RDONLY => OpenFlags::RDONLY,
+        libc::O_WRONLY => OpenFlags::WRONLY,
+        libc::O_RDWR => OpenFlags::RDWR,
+        _ => OpenFlags::RDONLY,
+    };
+    if flags & libc::O_APPEND != 0 {
+        f = f | OpenFlags::APPEND;
+    }
+    let trunc = flags & libc::O_TRUNC != 0;
+    (f, trunc)
+}
 
 // ─── Error Mapping ───────────────────────────────────────────────────────────
 
@@ -169,7 +185,7 @@ impl Filesystem for StudioFuseFs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name_bytes = name.to_string_lossy().as_bytes().to_vec();
@@ -178,7 +194,23 @@ impl Filesystem for StudioFuseFs {
             .create(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
         {
             Ok(attr) => {
-                reply.created(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0, 0, 0);
+                // Open a handle for the newly created file
+                let (open_flags, _trunc) = posix_flags_to_open_flags(flags);
+                match self.vfs.open_file(attr.ino, open_flags, false) {
+                    Ok(fh) => {
+                        reply.created(
+                            &TTL,
+                            &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
+                            0,
+                            fh,
+                            0,
+                        );
+                    }
+                    Err(e) => {
+                        error!("create open_file({}) -> {e}", attr.ino);
+                        reply.error(vfs_err_to_errno(&e));
+                    }
+                }
             }
             Err(e) => {
                 error!("create({parent}, {:?}) -> {e}", name);
@@ -230,9 +262,15 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // We don't track file handles — just approve the open.
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let (open_flags, trunc) = posix_flags_to_open_flags(flags);
+        match self.vfs.open_file(ino, open_flags, trunc) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => {
+                error!("open({ino}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
     }
 
     fn read(
@@ -280,14 +318,62 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        match self.rt.block_on(self.vfs.flush(ino)) {
+        // flush_fh uses the handle to resolve the ino, but if fh==0
+        // (old path / no handle), fall back to ino-based flush.
+        if fh != 0 {
+            match self.rt.block_on(self.vfs.flush_fh(fh)) {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    error!("flush_fh({fh}) -> {e}");
+                    reply.error(vfs_err_to_errno(&e));
+                }
+            }
+        } else {
+            match self.rt.block_on(self.vfs.flush(ino)) {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    error!("flush({ino}) -> {e}");
+                    reply.error(vfs_err_to_errno(&e));
+                }
+            }
+        }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.rt.block_on(self.vfs.release_fh(fh)) {
             Ok(()) => reply.ok(),
             Err(e) => {
-                error!("flush({ino}) -> {e}");
+                error!("release({ino}, fh={fh}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.rt.block_on(self.vfs.fsync(ino, datasync)) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                error!("fsync({ino}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
         }

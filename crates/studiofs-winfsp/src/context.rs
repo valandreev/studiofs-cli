@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
-use studiofs_vfs::StudioVfs;
+use studiofs_vfs::{OpenFlags, StudioVfs};
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
@@ -31,15 +31,18 @@ pub struct StudioFileHandle {
     ino: Ino,
     #[allow(dead_code)]
     is_dir: bool,
+    /// VFS file handle (0 for directories).
+    fh: u64,
     /// Cached directory entries for readdir pagination.
     dir_entries: Mutex<Option<Vec<studiofs_meta::DirEntry>>>,
 }
 
 impl StudioFileHandle {
-    fn new(ino: Ino, is_dir: bool) -> Self {
+    fn new(ino: Ino, is_dir: bool, fh: u64) -> Self {
         Self {
             ino,
             is_dir,
+            fh,
             dir_entries: Mutex::new(None),
         }
     }
@@ -216,15 +219,26 @@ impl FileSystemContext for StudioFsContext {
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;
 
-        debug!(ino = attr.ino, "open {:?}", file_name.to_string_lossy());
-        Ok(StudioFileHandle::new(
-            attr.ino,
-            attr.kind == FileType::Directory,
-        ))
+        let is_dir = attr.kind == FileType::Directory;
+        let fh = if is_dir {
+            0
+        } else {
+            self.vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .map_err(vfs_to_winfsp_err)?
+        };
+
+        debug!(ino = attr.ino, fh, "open {:?}", file_name.to_string_lossy());
+        Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
     }
 
     fn close(&self, context: Self::FileContext) {
-        debug!(ino = context.ino, "close");
+        debug!(ino = context.ino, fh = context.fh, "close");
+        if context.fh != 0 {
+            if let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
+                error!(ino = context.ino, fh = context.fh, "release_fh failed: {:?}", e);
+            }
+        }
         drop(context);
     }
 
@@ -253,16 +267,25 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?
         };
 
+        let fh = if is_dir {
+            0
+        } else {
+            self.vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .map_err(vfs_to_winfsp_err)?
+        };
+
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;
 
         debug!(
             ino = attr.ino,
             is_dir,
+            fh,
             "create {:?}",
             file_name.to_string_lossy()
         );
-        Ok(StudioFileHandle::new(attr.ino, is_dir))
+        Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
     }
 
     fn get_file_info(
@@ -431,9 +454,14 @@ impl FileSystemContext for StudioFsContext {
         } else {
             // Not deleting — flush buffered writes
             // WinFSP "Cleanup" with no delete flag is the standard place to flush.
-            // We use block_on because we are in a WinFSP thread context.
-            if let Err(e) = self.rt.block_on(self.vfs.flush(context.ino)) {
-                error!(ino = context.ino, "cleanup flush failed: {:?}", e);
+            if context.fh != 0 {
+                if let Err(e) = self.rt.block_on(self.vfs.flush_fh(context.fh)) {
+                    error!(ino = context.ino, "cleanup flush_fh failed: {:?}", e);
+                }
+            } else {
+                if let Err(e) = self.rt.block_on(self.vfs.flush(context.ino)) {
+                    error!(ino = context.ino, "cleanup flush failed: {:?}", e);
+                }
             }
         }
     }
