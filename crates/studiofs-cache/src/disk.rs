@@ -1,6 +1,6 @@
 //! DiskCache - persistent object cache with LRU eviction and disk space monitoring.
 //!
-//! Architecture v2 Key Changes:
+//! Architecture Key Changes:
 //! - Default disk cache size: 50 GB (was 100 GB)
 //! - Minimum disk cache size: 1 GB (don't evict below this)
 //! - Target free disk space: 10% (was 15%)
@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // =============================================================================
-// Configuration Constants (v2 Architecture)
+// Configuration Constants
 // =============================================================================
 
 /// Default disk cache size: 50 GB
@@ -420,7 +420,7 @@ impl DiskCache {
 
     /// Evict blocks to make room for new data.
     ///
-    /// Eviction policy (v2):
+    /// Eviction policy:
     /// 1. Check if cache + needed > max_size -> need eviction
     /// 2. Check if disk space < target_free_ratio -> need eviction
     /// 3. Don't evict below min_size

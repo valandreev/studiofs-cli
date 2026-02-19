@@ -891,7 +891,7 @@ impl StudioVfs {
 
     /// Background task to process pending uploads.
     async fn background_uploader(self: Arc<Self>, mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingOp>) {
-        info!("background uploader started (v2)");
+        info!("background uploader started");
 
         while let Some(op) = rx.recv().await {
             let vfs = self.clone();
@@ -963,7 +963,7 @@ impl StudioVfs {
 
     /// Background task for garbage collection.
     async fn background_gc(self: Arc<Self>) {
-        info!("background GC started (v2)");
+        info!("background GC started");
 
         let interval = tokio::time::Duration::from_secs(600); // 10 minutes
         let grace_period = 3600i64; // 1 hour grace period

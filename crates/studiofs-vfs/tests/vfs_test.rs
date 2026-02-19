@@ -92,7 +92,7 @@ async fn test_create_write_read_file() {
     assert!(ino > 1);
 
     // Write data
-    let payload = b"Hello, StudioFS V2! This is a block-based test.";
+    let payload = b"Hello, StudioFS! This is a block-based test.";
     let written = vfs.write(ino, 0, payload).await.unwrap();
     assert_eq!(written as usize, payload.len());
 
@@ -176,8 +176,8 @@ async fn test_overwrite_and_read() {
     vfs.flush(ino).await.unwrap();
 
     // Overwrite the middle (offset 3..8)
-    let v2 = b"BBBBB";
-    vfs.write(ino, 3, v2).await.unwrap();
+    let data2 = b"BBBBB";
+    vfs.write(ino, 3, data2).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
     // Read full file — expect "AAABBBBBAA"
@@ -428,7 +428,7 @@ async fn test_block_ref_flags() {
 
 #[tokio::test]
 async fn test_object_format() {
-    let original_data = b"Test data for object format v2";
+    let original_data = b"Test data for object format";
     
     // Create object
     let object = create_object(original_data).unwrap();

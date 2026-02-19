@@ -3,7 +3,7 @@
 //!
 //! Defines the binary format for objects stored in S3.
 //!
-//! Architecture v2 Key Changes:
+//! Architecture Key Changes:
 //! - Fixed 32-byte header (was 22 bytes)
 //! - Added flags field for compression/encryption
 //! - Version bumped to 2

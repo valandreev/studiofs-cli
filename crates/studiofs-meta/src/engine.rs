@@ -112,7 +112,7 @@ pub trait MetaEngine: Send + Sync {
     #[deprecated(since = "0.2.0", note = "Use next_block_id instead")]
     fn next_slice_id(&self) -> MetaResult<u64>;
 
-    // ─── File Blocks (New Architecture v2) ────────────────────────────────
+    // ─── File Blocks (New Architecture) ──────────────────────────────────
 
     /// Get a specific block reference for a file.
     /// Key: (inode, block_index)
@@ -141,7 +141,7 @@ pub trait MetaEngine: Send + Sync {
     /// Allocate a new sequential block ID.
     fn next_block_id(&self) -> MetaResult<u64>;
 
-    // ─── Pending Deletions (GC for v2 Architecture) ───────────────────────
+    // ─── Pending Deletions (GC) ───────────────────────
 
     /// Add a block to pending deletions (mark for GC).
     /// The timestamp is used for grace period.

@@ -36,11 +36,11 @@ const DELETED_SLICES: TableDefinition<u64, u32> = TableDefinition::new("deleted_
 /// Data Roots: ino (u64) -> object_id (String)
 const DATA_ROOTS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("data_roots");
 
-/// File Blocks (v2 architecture): (ino, block_index) -> BlockRef (postcard)
+/// File Blocks: (ino, block_index) -> BlockRef (postcard)
 /// Key encoding: ino (8 bytes LE) + block_index (4 bytes LE)
 const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_blocks");
 
-/// Pending Deletions (v2 GC): object_id (u64) -> deletion_timestamp (i64)
+/// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)
 const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
     TableDefinition::new("pending_deletions");
 
@@ -776,7 +776,7 @@ impl MetaEngine for RedbMetaEngine {
         Ok(())
     }
 
-    // --- File Blocks (v2 Architecture) -------------------------------------
+    // --- File Blocks -----------------------------------------------------
 
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         let key = encode_file_block_key(ino, block_index);
@@ -971,7 +971,7 @@ impl MetaEngine for RedbMetaEngine {
         Ok(id)
     }
 
-    // --- Pending Deletions (v2 GC) -----------------------------------------
+    // --- Pending Deletions (GC) -----------------------------------------
 
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         let txn = self
@@ -1196,7 +1196,7 @@ mod tests {
         assert_eq!(ino2, ino1 + 1);
     }
 
-    // === v2 Architecture Tests ===
+    // === Architecture Tests ===
 
     #[test]
     fn test_file_block_operations() {

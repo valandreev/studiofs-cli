@@ -1,6 +1,6 @@
 //! Writeback cache - tracks dirty objects and persists pending operations.
 //!
-//! Architecture v2 Key Changes:
+//! Architecture Key Changes:
 //! - Enhanced journal format with status tracking
 //! - Binary journal format for efficiency
 //! - Recovery support for crash resilience
@@ -76,7 +76,7 @@ impl TryFrom<u8> for UploadStatus {
 pub struct JournalEntry {
     /// Object ID (sequential block ID).
     pub object_id: u64,
-    /// File offset (for backward compatibility, not used in v2).
+    /// File offset (for backward compatibility, not used in the new architecture).
     pub offset: u64,
     /// Inode number.
     pub ino: Ino,

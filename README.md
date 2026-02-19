@@ -94,7 +94,7 @@
 
 ### Block Storage Model
 
-StudioFS v2 uses a **block-based architecture** with immutable storage:
+StudioFS uses a **block-based architecture** with immutable storage:
 
 ```
 File (Inode)
@@ -475,7 +475,7 @@ let attr = vfs.create(1, b"hello.txt", 0, 0, 0o644)?;
 let ino = attr.ino;
 
 // Write data
-let payload = b"Hello, StudioFS v2!";
+let payload = b"Hello, StudioFS!";
 let written = vfs.write(ino, 0, payload).await?;
 assert_eq!(written as usize, payload.len());
 
@@ -570,7 +570,7 @@ studiofs/
 ├── Cargo.toml                    # Workspace root
 ├── crates/
 │   ├── studiofs/                 # CLI binary (init, mount, status)
-│   ├── studiofs-vfs/             # Core VFS (v2 implementation)
+│   ├── studiofs-vfs/             # Core VFS implementation
 │   ├── studiofs-meta/            # Metadata engine (Redb)
 │   ├── studiofs-data/            # S3 data store (OpenDAL)
 │   ├── studiofs-cache/           # Cache management

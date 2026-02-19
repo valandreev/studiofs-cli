@@ -1,8 +1,8 @@
 //! StudioFS Metadata Types
 //!
 //! Core types for the virtual filesystem metadata.
-//! 
-//! Architecture v2 Key Changes:
+//!
+//! Architecture Key Changes:
 //! - Files are split into fixed-size blocks (default 4MB)
 //! - Each block has a sequential ID (not content hash)
 //! - Blocks are immutable - never modified, only created/deleted
@@ -319,7 +319,7 @@ pub mod counters {
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.
     pub const TOTAL_INODES: &str = "totalInodes";
-    
+
     /// Legacy: Next available slice ID.
     /// Kept for backward compatibility during migration.
     #[deprecated(since = "0.2.0", note = "Use NEXT_BLOCK_ID instead")]
@@ -359,7 +359,10 @@ pub const BLOCK_SIZE: u32 = DEFAULT_BLOCK_SIZE;
 
 /// Legacy chunk size constant.
 /// The new architecture no longer uses chunks - files are split directly into blocks.
-#[deprecated(since = "0.2.0", note = "Chunk-based storage is deprecated, use block-based instead")]
+#[deprecated(
+    since = "0.2.0",
+    note = "Chunk-based storage is deprecated, use block-based instead"
+)]
 pub const CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Legacy directory entry with name included.
@@ -453,7 +456,7 @@ mod tests {
     #[test]
     fn test_block_index_calculation() {
         let block_size = 4 * 1024 * 1024; // 4MB
-        
+
         assert_eq!(block_index_from_offset(0, block_size), 0);
         assert_eq!(block_index_from_offset(1, block_size), 0);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024, block_size), 1);
@@ -464,7 +467,7 @@ mod tests {
     #[test]
     fn test_offset_within_block() {
         let block_size = 4 * 1024 * 1024; // 4MB
-        
+
         assert_eq!(offset_within_block(0, block_size), 0);
         assert_eq!(offset_within_block(100, block_size), 100);
         assert_eq!(offset_within_block(4 * 1024 * 1024, block_size), 0);
@@ -474,7 +477,7 @@ mod tests {
     #[test]
     fn test_blocks_for_size() {
         let block_size = 4 * 1024 * 1024; // 4MB
-        
+
         assert_eq!(blocks_for_size(0, block_size), 0);
         assert_eq!(blocks_for_size(1, block_size), 1);
         assert_eq!(blocks_for_size(4 * 1024 * 1024, block_size), 1);
