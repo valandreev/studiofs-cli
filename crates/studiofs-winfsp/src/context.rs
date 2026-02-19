@@ -274,16 +274,14 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
-        let data = self
+        // P1.3: Use read_into() to avoid intermediate Bytes allocation and memcpy
+        let len = self
             .rt
-            .block_on(self.vfs.read(context.ino, offset, buffer.len() as u32))
+            .block_on(self.vfs.read_into(context.ino, offset, buffer))
             .map_err(vfs_to_winfsp_err)?;
 
-        let len = data.len().min(buffer.len());
-        buffer[..len].copy_from_slice(&data[..len]);
-
         debug!(ino = context.ino, offset, len, "read");
-        Ok(len as u32)
+        Ok(len)
     }
 
     fn write(

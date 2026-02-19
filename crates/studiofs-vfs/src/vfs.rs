@@ -540,6 +540,95 @@ impl StudioVfs {
         Ok(result.freeze())
     }
 
+    /// Read file data directly into a provided buffer (P1.3 — avoid intermediate Bytes allocation).
+    ///
+    /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
+    /// Returns the number of bytes written.
+    pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
+        let attr = self.getattr(ino)?;
+
+        // Clamp read to file size
+        let end = (offset + buffer.len() as u64).min(attr.size);
+        if offset >= end {
+            return Ok(0);
+        }
+        let _effective_size = (end - offset) as usize;
+
+        // Pre-compute all blocks needed
+        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new(); // (block_index, offset_in_block, to_copy)
+        let mut cur = offset;
+        while cur < end {
+            let idx = block_index_from_offset(cur, self.block_size);
+            let off_in = offset_within_block(cur, self.block_size) as usize;
+            let space = self.block_size as usize - off_in;
+            let to_copy = (end - cur).min(space as u64) as usize;
+            blocks_needed.push((idx, off_in, to_copy));
+            cur += to_copy as u64;
+        }
+
+        // If only one block, read sequentially to avoid overhead
+        if blocks_needed.len() == 1 {
+            let (block_idx, off_in, to_copy) = blocks_needed[0];
+            let block_data = self.read_block_or_pending(ino, block_idx).await?;
+            let copy_len = if to_copy == 0 || off_in >= block_data.len() {
+                0
+            } else {
+                to_copy.min(block_data.len() - off_in)
+            };
+            if copy_len > 0 {
+                buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
+            }
+            return Ok(copy_len as u32);
+        }
+
+        // Parallel fetch with concurrency limit (16 concurrent reads)
+        const CONCURRENT_LIMIT: usize = 16;
+        let semaphore = Arc::new(Semaphore::new(CONCURRENT_LIMIT));
+
+        let fetch_futures: Vec<_> = blocks_needed
+            .iter()
+            .map(|(idx, _, _)| {
+                let sem = semaphore.clone();
+                let block_idx = *idx;
+                async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    self.read_block_or_pending(ino, block_idx).await
+                }
+            })
+            .collect();
+
+        // Execute all fetches in parallel
+        let fetched = futures::future::join_all(fetch_futures).await;
+
+        // Write results directly to output buffer
+        let mut written = 0usize;
+        for (i, block_result) in fetched.iter().enumerate() {
+            let (_block_idx, off_in, to_copy) = blocks_needed[i];
+            match block_result {
+                Ok(block_data) => {
+                    let copy_len = if to_copy == 0 || off_in >= block_data.len() {
+                        0
+                    } else {
+                        to_copy.min(block_data.len() - off_in)
+                    };
+                    if copy_len > 0 && written + copy_len <= buffer.len() {
+                        buffer[written..written + copy_len]
+                            .copy_from_slice(&block_data[off_in..off_in + copy_len]);
+                        written += copy_len;
+                    }
+                }
+                Err(_) => {
+                    // Missing block - fill with zeros
+                    let zeros_len = to_copy.min(buffer.len() - written);
+                    buffer[written..written + zeros_len].fill(0u8);
+                    written += zeros_len;
+                }
+            }
+        }
+
+        Ok(written as u32)
+    }
+
     /// Read a block from storage or pending writes. Helper for parallel reads.
     async fn read_block_or_pending(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
         // Check pending blocks first (writes not yet flushed)
