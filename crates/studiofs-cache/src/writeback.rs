@@ -179,13 +179,32 @@ pub struct PendingOp {
 }
 
 // =============================================================================
+// Journal Operation (for background async writes)
+// =============================================================================
+
+/// Asynchronous journal operation sent to the background journal-writer task.
+enum JournalOp {
+    /// Write a new journal entry (no fsync — best-effort crash durability).
+    Write { ino: Ino, offset: u64, object_id: u64 },
+    /// Remove a completed journal file.
+    Complete { path: PathBuf },
+}
+
+// =============================================================================
 // Writeback Manager
 // =============================================================================
 
 /// Manages persistent state of pending uploads.
+///
+/// Journal writes are decoupled from the hot write path: `submit()` is
+/// synchronous and pushes to two channels immediately:
+///  1. `sender`     → the upload worker that talks to S3
+///  2. `journal_tx` → a background task that writes journal files with
+///                    no `sync_all()` (avoids one fsync per block)
 pub struct WritebackManager {
     pending_dir: PathBuf,
     sender: mpsc::UnboundedSender<PendingOp>,
+    journal_tx: mpsc::UnboundedSender<JournalOp>,
     disk_cache: Arc<DiskCache>,
 }
 
@@ -197,13 +216,22 @@ impl WritebackManager {
         fs::create_dir_all(&pending_dir).expect("failed to create pending dir");
 
         let (tx, rx) = mpsc::unbounded_channel();
+        let (journal_tx, journal_rx) = mpsc::unbounded_channel::<JournalOp>();
+
+        // Clone for journal_writer_task — pending_dir is moved into the struct.
+        let journal_dir = pending_dir.clone();
+
         let manager = Arc::new(Self {
             pending_dir,
             sender: tx,
+            journal_tx,
             disk_cache,
         });
 
-        // Scan existing on startup (recovery)
+        // Spawn background journal writer (no fsync in hot path).
+        tokio::spawn(journal_writer_task(journal_dir, journal_rx));
+
+        // Scan existing on startup (crash recovery).
         manager.scan_and_queue();
 
         (manager, rx)
@@ -269,38 +297,21 @@ impl WritebackManager {
     }
 
     /// Submit a new pending operation.
-    /// Persists it to disk journal, then queues it in memory.
-    pub async fn submit(&self, ino: Ino, offset: u64, object_id: u64) {
-        // Pin first
+    ///
+    /// **Hot-path** — returns immediately with no disk I/O or blocking.
+    /// The journal file is written by a background task (no `sync_all()`), and
+    /// the upload op is queued for the S3 uploader immediately.
+    pub fn submit(&self, ino: Ino, offset: u64, object_id: u64) {
+        // Pin to prevent eviction before upload completes.
         self.disk_cache.pin(object_id);
 
         let filename = format!("{:016x}_{:016x}_{:016x}.journal", ino, offset, object_id);
         let path = self.pending_dir.join(&filename);
 
-        // Create journal entry
-        let entry = JournalEntry::new(ino, offset, object_id);
-        let data = entry.encode();
+        // Enqueue journal write (background, no fsync).
+        let _ = self.journal_tx.send(JournalOp::Write { ino, offset, object_id });
 
-        // Write journal file atomically
-        let path_clone = path.clone();
-        match tokio::task::spawn_blocking(move || {
-            let tmp_path = path_clone.with_extension("tmp");
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(&data)?;
-            file.sync_all()?;
-            fs::rename(&tmp_path, &path_clone)?;
-            Ok::<_, std::io::Error>(())
-        }).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                error!("failed to create journal file {:?}: {}", path, e);
-                // Continue anyway - memory queue will still work
-            }
-            Err(e) => {
-                error!("task join error creating journal: {}", e);
-            }
-        }
-
+        // Enqueue for S3 upload immediately.
         let op = PendingOp {
             ino,
             offset,
@@ -308,20 +319,18 @@ impl WritebackManager {
             journal_path: path,
             status: UploadStatus::Pending,
         };
-
         if let Err(_) = self.sender.send(op) {
             error!("failed to queue pending op (channel closed)");
         }
     }
 
-    /// Mark an operation as complete (removes journal file).
+    /// Mark an operation as complete.
+    /// Journal file removal is dispatched to the background writer (non-blocking).
     pub fn complete(&self, op: &PendingOp) {
-        if op.journal_path.exists() {
-            if let Err(e) = fs::remove_file(&op.journal_path) {
-                warn!("failed to remove journal file {:?}: {}", op.journal_path, e);
-            }
-        }
         self.disk_cache.unpin(op.object_id);
+        if !op.journal_path.as_os_str().is_empty() {
+            let _ = self.journal_tx.send(JournalOp::Complete { path: op.journal_path.clone() });
+        }
     }
 
     /// Update the status of a pending operation.
@@ -340,7 +349,8 @@ impl WritebackManager {
         {
             let mut file = File::create(&tmp_path)?;
             file.write_all(&data)?;
-            file.sync_all()?;
+            // No sync_all() — journal files are best-effort crash durability.
+            // The slab index and metadata DB are the authoritative persistence.
         }
 
         fs::rename(&tmp_path, &op.journal_path)?;
@@ -367,6 +377,48 @@ impl WritebackManager {
     /// Get the pending directory path.
     pub fn pending_dir(&self) -> &Path {
         &self.pending_dir
+    }
+}
+
+// =============================================================================
+// Background Journal Writer
+// =============================================================================
+
+/// Async task that writes / removes journal files without blocking the hot path.
+///
+/// Files are written without `sync_all()` (no per-block fsync). On a process
+/// crash some journal files may be missing; the startup scan handles recovery
+/// by re-queuing any pending journals that survived.
+async fn journal_writer_task(
+    pending_dir: PathBuf,
+    mut rx: mpsc::UnboundedReceiver<JournalOp>,
+) {
+    while let Some(op) = rx.recv().await {
+        match op {
+            JournalOp::Write { ino, offset, object_id } => {
+                let filename =
+                    format!("{:016x}_{:016x}_{:016x}.journal", ino, offset, object_id);
+                let path = pending_dir.join(&filename);
+                let tmp = path.with_extension("tmp");
+                let entry = JournalEntry::new(ino, offset, object_id);
+                let data = entry.encode();
+                // Write then rename — atomic on most filesystems, no fsync needed.
+                if let Err(e) = tokio::fs::write(&tmp, &data).await {
+                    warn!("journal_writer: write {:?} failed: {}", tmp, e);
+                    continue;
+                }
+                if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+                    warn!("journal_writer: rename {:?} failed: {}", tmp, e);
+                }
+            }
+            JournalOp::Complete { path } => {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => warn!("journal_writer: remove {:?} failed: {}", path, e),
+                }
+            }
+        }
     }
 }
 

@@ -479,12 +479,26 @@ DAY 5 (8h):
     - Prefetch scheduling
     - Separate prefetch buffer
 
+DAY 5.5 (2h):
+  ✓ Bug fix: slab index not persisted on unmount
+    - Drop for SlabStore
+    - persist_cache() on StudioVfs
+    - Explicit persist in WinFSP + FUSE before unmount
+
 DAY 6 (8h):
-  ✓ 4.1 Benchmark suite                [low, 4h]
+  ✓ Phase 5: 3-tier async write buffer [medium, 6h]
+    - flush() returns immediately (no disk I/O in hot path)
+    - Full blocks during write() → dirty_mem buffer (no compression in write thread)
+    - Background slab flusher: dirty_mem → compress → slab → upload queue
+    - Async WAL: submit() synchronous, journal files written in background without fsync
+    - Read consistency: dirty_mem checked before slab/S3 on all read paths
+    - Backpressure: write/flush stall briefly if dirty_mem > 2 GiB
+
+  ✓ 4.1 Benchmark suite                [low, 4h]  ← next
   ✓ Perf validation & tuning           [medium, 4h]
   ✓ Documentation
 
-TOTAL: ~40 hours (1 week)
+TOTAL: ~48 hours
 ```
 
 ---
