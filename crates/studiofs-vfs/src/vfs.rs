@@ -69,11 +69,65 @@ pub enum VfsError {
     #[error("lock conflict (EAGAIN)")]
     WouldBlock,
 
+    #[error("invalid filename: {0}")]
+    InvalidName(String),
+
     #[error("{0}")]
     Other(String),
 }
 
+/// Filesystem statistics returned by `statfs()`.
+#[derive(Debug, Clone)]
+pub struct StatFs {
+    /// Total number of blocks (virtual).
+    pub blocks: u64,
+    /// Free blocks.
+    pub bfree: u64,
+    /// Available blocks (same as bfree for single-user).
+    pub bavail: u64,
+    /// Number of inodes (files + dirs).
+    pub files: u64,
+    /// Free inode slots.
+    pub ffree: u64,
+    /// Block size.
+    pub bsize: u32,
+    /// Maximum filename length.
+    pub namelen: u32,
+    /// Fragment size.
+    pub frsize: u32,
+}
+
 pub type VfsResult<T> = Result<T, VfsError>;
+
+// =============================================================================
+// Filename Validation
+// =============================================================================
+
+/// Validate a filename (directory entry name).
+///
+/// Rejects: empty, longer than 255 bytes, contains '/', dots-only (`.`, `..`).
+fn validate_name(name: &[u8]) -> VfsResult<()> {
+    if name.is_empty() {
+        return Err(VfsError::InvalidName("name is empty".into()));
+    }
+    if name.len() > 255 {
+        return Err(VfsError::InvalidName(format!(
+            "name too long ({} bytes, max 255)",
+            name.len()
+        )));
+    }
+    if name.contains(&b'/') {
+        return Err(VfsError::InvalidName(
+            "name contains '/'".into(),
+        ));
+    }
+    if name == b"." || name == b".." {
+        return Err(VfsError::InvalidName(
+            "name is '.' or '..'".into(),
+        ));
+    }
+    Ok(())
+}
 
 // =============================================================================
 // Constants & Configuration
@@ -469,6 +523,34 @@ impl StudioVfs {
         self.block_size
     }
 
+    /// Get filesystem statistics.
+    ///
+    /// Returns real inode count and used space from redb counters.
+    /// Total capacity is virtual (1 PB) since the backing store is cloud.
+    pub fn statfs(&self) -> VfsResult<StatFs> {
+        use studiofs_meta::types::counters;
+        let used_inodes = self.meta.get_counter(counters::TOTAL_INODES)?;
+        let used_bytes = self.meta.get_counter(counters::USED_SPACE)?;
+        let bsize = self.block_size as u64;
+
+        // Virtual capacity: 1 PB
+        let total_bytes: u64 = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
+        let total_blocks = total_bytes / bsize;
+        let used_blocks = used_bytes / bsize;
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+
+        Ok(StatFs {
+            blocks: total_blocks,
+            bfree: free_blocks,
+            bavail: free_blocks,
+            files: used_inodes,
+            ffree: u64::MAX - used_inodes,
+            bsize: self.block_size,
+            namelen: 255,
+            frsize: self.block_size,
+        })
+    }
+
     // =========================================================================
     // Attribute Operations
     // =========================================================================
@@ -672,6 +754,10 @@ impl StudioVfs {
 
             self.state.deleted_inodes.lock().insert(ino);
 
+            // Get block sizes before removing for USED_SPACE tracking
+            let blocks = self.meta.get_file_blocks(ino)?;
+            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+
             let removed_ids = self.meta.remove_file_blocks(ino)?;
             if !removed_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
@@ -684,6 +770,14 @@ impl StudioVfs {
                 self.state.pending_blocks.lock().retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids);
                 self.disk_cache.cleanup_empty_slabs();
+            }
+
+            // Decrement USED_SPACE for orphan cleanup
+            if total_bytes > 0 {
+                self.meta.decr_counter(
+                    studiofs_meta::types::counters::USED_SPACE,
+                    total_bytes,
+                )?;
             }
 
             self.meta.remove_attr(ino)?;
@@ -830,6 +924,7 @@ impl StudioVfs {
 
     /// Create a hard link: add a new directory entry pointing to an existing inode.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
+        validate_name(new_name)?;
         let attr = self.meta.link(ino, new_parent, new_name)?;
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(&ino);
@@ -846,6 +941,7 @@ impl StudioVfs {
         gid: u32,
         mode: u16,
     ) -> VfsResult<InodeAttr> {
+        validate_name(name)?;
         let attr = self.meta.create_file(parent, name, uid, gid, mode)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
@@ -861,6 +957,7 @@ impl StudioVfs {
         gid: u32,
         mode: u16,
     ) -> VfsResult<InodeAttr> {
+        validate_name(name)?;
         let attr = self.meta.create_dir(parent, name, uid, gid, mode)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
@@ -876,6 +973,7 @@ impl StudioVfs {
         uid: u32,
         gid: u32,
     ) -> VfsResult<InodeAttr> {
+        validate_name(name)?;
         let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
         self.state.attr_read_cache.lock().remove(&parent);
         Ok(attr)
@@ -983,6 +1081,14 @@ impl StudioVfs {
                     debug!("marking object {} for deletion (unlink)", object_id);
                 }
 
+                // Decrement USED_SPACE by the file's logical size
+                if attr.size > 0 {
+                    self.meta.decr_counter(
+                        studiofs_meta::types::counters::USED_SPACE,
+                        attr.size,
+                    )?;
+                }
+
                 // Clear pending blocks buffer
                 self.state
                     .pending_blocks
@@ -1039,11 +1145,16 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
+        validate_name(new_name)?;
         let displaced_ino = self.meta.rename_atomic(parent, name, new_parent, new_name)?;
 
         // If an existing entry was overwritten, schedule GC + evict caches
         if let Some(ino) = displaced_ino {
             self.state.deleted_inodes.lock().insert(ino);
+
+            // Compute total bytes for USED_SPACE before removing blocks
+            let blocks = self.meta.get_file_blocks(ino)?;
+            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
 
             let removed_ids = self.meta.remove_file_blocks(ino)?;
             if !removed_ids.is_empty() {
@@ -1057,6 +1168,14 @@ impl StudioVfs {
                 self.state.pending_blocks.lock().retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids);
                 self.disk_cache.cleanup_empty_slabs();
+            }
+
+            // Decrement USED_SPACE for removed blocks
+            if total_bytes > 0 {
+                self.meta.decr_counter(
+                    studiofs_meta::types::counters::USED_SPACE,
+                    total_bytes,
+                )?;
             }
 
             self.state.dirty_attrs.lock().remove(&ino);
@@ -1688,7 +1807,12 @@ impl StudioVfs {
                 .unwrap_or(0);
             self.meta.add_pending_deletion(old_block.object_id, timestamp)?;
             debug!("marking old block {} for deletion (overwrite)", old_block.object_id);
+
+            // Update USED_SPACE: subtract old block size, add new block size
+            self.meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, old_block.length as u64)?;
         }
+        // Track new block in USED_SPACE counter
+        self.meta.incr_counter(studiofs_meta::types::counters::USED_SPACE, length as u64)?;
 
         debug!("flushed block {} for inode {} (object_id={})", block_index, ino, object_id);
         Ok(())
@@ -2030,5 +2154,50 @@ mod tests {
 
         let f2 = f.union(OpenFlags::WRONLY);
         assert!(f2.contains(OpenFlags::WRONLY));
+    }
+
+    #[test]
+    fn test_validate_name_valid() {
+        assert!(validate_name(b"hello.txt").is_ok());
+        assert!(validate_name(b"a").is_ok());
+        assert!(validate_name(b"...").is_ok());
+        assert!(validate_name(&vec![b'x'; 255]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_name_empty() {
+        assert!(matches!(
+            validate_name(b""),
+            Err(VfsError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_name_too_long() {
+        let long = vec![b'a'; 256];
+        assert!(matches!(
+            validate_name(&long),
+            Err(VfsError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_name_slash() {
+        assert!(matches!(
+            validate_name(b"a/b"),
+            Err(VfsError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_name_dot() {
+        assert!(matches!(
+            validate_name(b"."),
+            Err(VfsError::InvalidName(_))
+        ));
+        assert!(matches!(
+            validate_name(b".."),
+            Err(VfsError::InvalidName(_))
+        ));
     }
 }

@@ -271,6 +271,33 @@ impl MetaEngine for RedbMetaEngine {
         Ok(new_val)
     }
 
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let new_val;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current = match table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            new_val = current.saturating_sub(delta);
+            table
+                .insert(name, new_val)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(new_val)
+    }
+
     fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
         let txn = self
             .db
@@ -1784,5 +1811,26 @@ mod tests {
         // list_xattrs should only show each inode's own xattrs
         assert_eq!(engine.list_xattrs(f1.ino).unwrap().len(), 1);
         assert_eq!(engine.list_xattrs(f2.ino).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_decr_counter() {
+        let engine = temp_engine();
+        engine.set_counter("test_space", 1000).unwrap();
+        let v = engine.decr_counter("test_space", 300).unwrap();
+        assert_eq!(v, 700);
+        let v = engine.decr_counter("test_space", 700).unwrap();
+        assert_eq!(v, 0);
+        // Saturating subtraction — doesn't go below 0
+        let v = engine.decr_counter("test_space", 1).unwrap();
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_decr_counter_unset() {
+        let engine = temp_engine();
+        // Decrementing an unset counter (defaults to 0) saturates at 0
+        let v = engine.decr_counter("noexist", 42).unwrap();
+        assert_eq!(v, 0);
     }
 }

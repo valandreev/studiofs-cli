@@ -1066,3 +1066,109 @@ async fn test_xattr_multiple_attrs() {
     let val = vfs.get_xattr(attr.ino, b"user.b").unwrap();
     assert_eq!(val, Some(b"updated".to_vec()));
 }
+
+// =============================================================================
+// Phase 7 — Filename Validation Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_validate_name_create_rejects_invalid() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "validate_create");
+
+    // Empty name
+    assert!(vfs.create(1, b"", 0, 0, 0o644).is_err());
+
+    // Name with slash
+    assert!(vfs.create(1, b"a/b", 0, 0, 0o644).is_err());
+
+    // Dot names
+    assert!(vfs.create(1, b".", 0, 0, 0o644).is_err());
+    assert!(vfs.create(1, b"..", 0, 0, 0o644).is_err());
+
+    // Too long (256 bytes)
+    let long = vec![b'x'; 256];
+    assert!(vfs.create(1, &long, 0, 0, 0o644).is_err());
+
+    // Valid name should work
+    assert!(vfs.create(1, b"valid.txt", 0, 0, 0o644).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_validate_name_mkdir_rejects_invalid() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "validate_mkdir");
+
+    assert!(vfs.mkdir(1, b"", 0, 0, 0o755).is_err());
+    assert!(vfs.mkdir(1, b"a/b", 0, 0, 0o755).is_err());
+    assert!(vfs.mkdir(1, b"..", 0, 0, 0o755).is_err());
+    assert!(vfs.mkdir(1, b"valid_dir", 0, 0, 0o755).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_validate_name_rename_rejects_invalid() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "validate_rename");
+
+    vfs.create(1, b"source.txt", 0, 0, 0o644).unwrap();
+
+    // Rename to invalid name
+    assert!(vfs.rename(1, b"source.txt", 1, b"").is_err());
+    assert!(vfs.rename(1, b"source.txt", 1, b"a/b").is_err());
+    assert!(vfs.rename(1, b"source.txt", 1, b"..").is_err());
+
+    // Valid rename should work
+    assert!(vfs.rename(1, b"source.txt", 1, b"dest.txt").is_ok());
+}
+
+// =============================================================================
+// Phase 7 — statfs Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_statfs_initial() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "statfs_init");
+
+    let st = vfs.statfs().unwrap();
+
+    // Initial state: 1 inode (root), 0 used space
+    assert_eq!(st.files, 1); // root inode
+    assert!(st.bfree > 0);
+    assert!(st.bavail > 0);
+    assert_eq!(st.bsize, 4 * 1024 * 1024); // 4 MiB block size
+    assert_eq!(st.namelen, 255);
+    assert_eq!(st.blocks, st.bfree + (0 / st.bsize as u64)); // no used space yet
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_statfs_after_write() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "statfs_write");
+
+    let st_before = vfs.statfs().unwrap();
+
+    // Create a file and write data
+    let attr = vfs.create(1, b"data.bin", 0, 0, 0o644).unwrap();
+    let data = vec![0u8; 1024 * 1024]; // 1 MiB
+    vfs.write(attr.ino, 0, &data).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    let st_after = vfs.statfs().unwrap();
+
+    // Should now report more inodes (root + file = 2)
+    assert_eq!(st_after.files, st_before.files + 1);
+    // USED_SPACE should have increased
+    // blocks should show less free space (or equal if block size rounds down)
+    assert!(st_after.bfree <= st_before.bfree);
+}

@@ -28,6 +28,7 @@ const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
 const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
 const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
+const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
@@ -278,6 +279,9 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
                 winfsp::FspError::from(STATUS_UNSUCCESSFUL)
             }
         },
+        studiofs_vfs::VfsError::InvalidName(_) => {
+            winfsp::FspError::from(STATUS_INVALID_PARAMETER)
+        }
         _ => {
             error!("vfs error: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
@@ -751,8 +755,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
-        out_volume_info.total_size = 1024 * 1024 * 1024 * 1024; // 1 TB
-        out_volume_info.free_size = 1024 * 1024 * 1024 * 512; // 512 GB
+        let st = self.vfs.statfs().map_err(vfs_to_winfsp_err)?;
+        out_volume_info.total_size = st.blocks * st.bsize as u64;
+        out_volume_info.free_size = st.bfree * st.bsize as u64;
 
         // Use volume name from VFS
         let name = self

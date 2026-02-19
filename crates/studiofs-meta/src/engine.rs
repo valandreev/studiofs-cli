@@ -59,6 +59,9 @@ pub trait MetaEngine: Send + Sync {
     /// Increment a counter atomically, returns the new value.
     fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>;
 
+    /// Decrement a counter atomically (saturating at 0), returns the new value.
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>;
+
     /// Set a counter to a specific value.
     fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>;
 

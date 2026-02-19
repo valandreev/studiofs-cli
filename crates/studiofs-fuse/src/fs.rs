@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use studiofs_meta::FileType;
 use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
@@ -50,6 +50,7 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
         },
         VfsError::BlockNotFound(_, _) => libc::EIO,
         VfsError::WouldBlock => libc::EAGAIN,
+        VfsError::InvalidName(_) => libc::EINVAL,
         _ => libc::EIO,
     }
 }
@@ -481,6 +482,76 @@ impl Filesystem for StudioFuseFs {
         reply.ok();
     }
 
+    fn readdirplus(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let entries = match self.vfs.readdir(ino) {
+            Ok(e) => e,
+            Err(e) => {
+                error!("readdirplus({ino}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+                return;
+            }
+        };
+
+        let mut idx = offset as usize;
+
+        // "." entry
+        if idx == 0 {
+            let dot_attr = match self.vfs.getattr(ino) {
+                Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
+                Err(e) => {
+                    reply.error(vfs_err_to_errno(&e));
+                    return;
+                }
+            };
+            if reply.add(ino, 1, ".", &TTL, &dot_attr, 0) {
+                reply.ok();
+                return;
+            }
+            idx = 1;
+        }
+
+        // ".." entry
+        if idx == 1 {
+            let dotdot_attr = match self.vfs.getattr(ino) {
+                Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
+                Err(e) => {
+                    reply.error(vfs_err_to_errno(&e));
+                    return;
+                }
+            };
+            if reply.add(ino, 2, "..", &TTL, &dotdot_attr, 0) {
+                reply.ok();
+                return;
+            }
+            idx = 2;
+        }
+
+        // Regular entries with full attributes
+        for (i, entry) in entries.iter().enumerate() {
+            let entry_idx = i + 2;
+            if entry_idx < idx {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&entry.name);
+            let fattr = match self.vfs.getattr(entry.ino) {
+                Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
+                Err(_) => continue, // skip entries we can't stat
+            };
+            if reply.add(entry.ino, (entry_idx + 1) as i64, name.as_ref(), &TTL, &fattr, 0) {
+                break;
+            }
+        }
+
+        reply.ok();
+    }
+
     fn setattr(
         &mut self,
         _req: &Request<'_>,
@@ -533,17 +604,26 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
-        // Virtual filesystem stats
-        reply.statfs(
-            1024 * 1024 * 1024, // blocks (1TB / 1K)
-            512 * 1024 * 1024,  // bfree
-            512 * 1024 * 1024,  // bavail
-            1_000_000,          // files
-            500_000,            // ffree
-            4096,               // bsize
-            255,                // namelen
-            4096,               // frsize
-        );
+        match self.vfs.statfs() {
+            Ok(st) => reply.statfs(
+                st.blocks,
+                st.bfree,
+                st.bavail,
+                st.files,
+                st.ffree,
+                st.bsize,
+                st.namelen,
+                st.frsize,
+            ),
+            Err(e) => {
+                error!("statfs -> {e}");
+                // Fallback to hardcoded values on error
+                reply.statfs(
+                    1024 * 1024 * 1024, 512 * 1024 * 1024, 512 * 1024 * 1024,
+                    1_000_000, 500_000, 4096, 255, 4096,
+                );
+            }
+        }
     }
 
     // macOS calls access() to determine if writing is allowed.
@@ -687,5 +767,44 @@ impl Filesystem for StudioFuseFs {
     ) {
         // Report no conflicting locks (single-node simplification)
         reply.locked(start as i64, end as i64, libc::F_UNLCK, 0);
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        // For cloud FS, preallocation is a no-op — no local disk to reserve.
+        // We only extend the file size if FALLOC_FL_KEEP_SIZE is not set.
+        if mode == 0 {
+            // FALLOC_FL_KEEP_SIZE not set → extend size if needed
+            match self.vfs.getattr(ino) {
+                Ok(attr) => {
+                    let new_size = offset as u64 + length as u64;
+                    if new_size > attr.size {
+                        let args = SetattrArgs {
+                            size: Some(new_size),
+                            ..Default::default()
+                        };
+                        if let Err(e) = self.vfs.setattr(ino, args) {
+                            error!("fallocate setattr({ino}) -> {e}");
+                            reply.error(vfs_err_to_errno(&e));
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("fallocate getattr({ino}) -> {e}");
+                    reply.error(vfs_err_to_errno(&e));
+                    return;
+                }
+            }
+        }
+        reply.ok();
     }
 }
