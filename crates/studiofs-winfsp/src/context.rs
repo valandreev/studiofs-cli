@@ -352,15 +352,17 @@ impl FileSystemContext for StudioFsContext {
         _security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        trace!("get_security_by_name {:?}", file_name.to_string_lossy());
+        let path_str = file_name.to_string_lossy();
+        debug!("get_security_by_name path={:?}", path_str);
         if let Some(security) = resolve_reparse_points(file_name) {
+            debug!("  -> reparse point, returning");
             return Ok(security);
         }
 
         let attr = match resolve_path(&self.vfs, file_name) {
             Ok(a) => a,
             Err(e) => {
-                trace!("get_security_by_name FAILED {:?}: {:?}", file_name.to_string_lossy(), e);
+                debug!("  -> resolve_path FAILED: {:?}", e);
                 return Err(e);
             }
         };
@@ -384,7 +386,8 @@ impl FileSystemContext for StudioFsContext {
         _granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        trace!("open {:?}", file_name.to_string_lossy());
+        let path_str = file_name.to_string_lossy();
+        debug!("open path={:?} create_options={:#x} granted_access={:?}", path_str, _create_options, _granted_access);
         let attr = resolve_path(&self.vfs, file_name)?;
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;
@@ -398,7 +401,7 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?
         };
 
-        debug!(ino = attr.ino, fh, "open {:?}", file_name.to_string_lossy());
+        debug!(ino = attr.ino, fh, "open SUCCESS path={:?} is_dir={}", path_str, is_dir);
         Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
     }
 
@@ -480,6 +483,7 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+        debug!(ino = context.ino, "get_file_info kind={:?} size={}", attr.kind, attr.size);
         *file_info = attr_to_file_info(&attr);
         Ok(())
     }
@@ -528,10 +532,12 @@ impl FileSystemContext for StudioFsContext {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        debug!(ino = context.ino, "read_directory called");
         // Cache entries for continued readdir
         let mut cached = context.dir_entries.lock();
         if cached.is_none() {
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
+            debug!(ino = context.ino, count = entries.len(), "read_directory loaded {} entries", entries.len());
             *cached = Some(entries);
         }
 
@@ -547,9 +553,11 @@ impl FileSystemContext for StudioFsContext {
                 let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
                 *dot.file_info_mut() = attr_to_file_info(&attr);
                 if !dot.append_to_buffer(buffer, &mut cursor) {
+                    debug!("buffer full after adding '.'");
                     DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
                     return Ok(cursor);
                 }
+                debug!("added '.' entry, cursor now at {}", cursor);
             }
 
             let mut dotdot = DirInfo::<255>::new();
@@ -557,9 +565,11 @@ impl FileSystemContext for StudioFsContext {
                 if let Ok(attr) = self.vfs.getattr(context.ino) {
                     *dotdot.file_info_mut() = attr_to_file_info(&attr);
                     if !dotdot.append_to_buffer(buffer, &mut cursor) {
+                        debug!("buffer full after adding '..'");
                         DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
                         return Ok(cursor);
                     }
+                    debug!("added '..' entry, cursor now at {}", cursor);
                 }
             }
         }
@@ -582,21 +592,28 @@ impl FileSystemContext for StudioFsContext {
             let os_name = std::ffi::OsString::from(&entry_name);
             let mut dir_info = DirInfo::<255>::new();
             if dir_info.set_name(&os_name).is_err() {
+                debug!("failed to set name for entry: {}", entry_name);
                 continue;
             }
 
             let child_attr = match self.vfs.getattr(entry.ino) {
                 Ok(a) => a,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!("failed to get attr for {}: {:?}", entry_name, e);
+                    continue;
+                }
             };
             *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
             if !dir_info.append_to_buffer(buffer, &mut cursor) {
+                debug!("buffer full after adding entry '{}' (tried to add at cursor {})", entry_name, cursor);
                 break;
             }
+            debug!("added entry '{}', cursor now at {}", entry_name, cursor);
         }
 
         DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+        debug!(ino = context.ino, bytes_returned = cursor, "read_directory returning {} bytes", cursor);
         Ok(cursor)
     }
 
