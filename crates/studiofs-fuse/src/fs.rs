@@ -9,11 +9,32 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use studiofs_meta::FileType;
-use studiofs_vfs::StudioVfs;
+use studiofs_vfs::{StudioVfs, VfsError};
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 
 const TTL: Duration = Duration::from_secs(1);
+
+// ─── Error Mapping ───────────────────────────────────────────────────────────
+
+/// Map VfsError to the correct libc errno for FUSE replies.
+fn vfs_err_to_errno(e: &VfsError) -> i32 {
+    use studiofs_meta::MetaError;
+    match e {
+        VfsError::Meta(me) => match me {
+            MetaError::InodeNotFound(_) => libc::ENOENT,
+            MetaError::EntryNotFound { .. } => libc::ENOENT,
+            MetaError::EntryExists { .. } => libc::EEXIST,
+            MetaError::NotADirectory(_) => libc::ENOTDIR,
+            MetaError::IsADirectory(_) => libc::EISDIR,
+            MetaError::DirNotEmpty(_) => libc::ENOTEMPTY,
+            MetaError::NotFormatted => libc::ENODEV,
+            _ => libc::EIO,
+        },
+        VfsError::BlockNotFound(_, _) => libc::EIO,
+        _ => libc::EIO,
+    }
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -81,7 +102,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
             Err(e) => {
                 debug!("lookup({parent}, {:?}) -> {e}", name);
-                reply.error(libc::ENOENT);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -91,7 +112,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 debug!("getattr({ino}) -> {e}");
-                reply.error(libc::ENOENT);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -113,7 +134,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
             Err(e) => {
                 error!("mkdir({parent}, {:?}) -> {e}", name);
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -136,7 +157,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
             Err(e) => {
                 error!("mknod({parent}, {:?}) -> {e}", name);
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -161,7 +182,7 @@ impl Filesystem for StudioFuseFs {
             }
             Err(e) => {
                 error!("create({parent}, {:?}) -> {e}", name);
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -172,7 +193,7 @@ impl Filesystem for StudioFuseFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("unlink({parent}, {:?}) -> {e}", name);
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -183,7 +204,7 @@ impl Filesystem for StudioFuseFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("rmdir({parent}, {:?}) -> {e}", name);
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -204,7 +225,7 @@ impl Filesystem for StudioFuseFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("rename -> {e}");
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -229,7 +250,7 @@ impl Filesystem for StudioFuseFs {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 error!("read({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -250,7 +271,7 @@ impl Filesystem for StudioFuseFs {
             Ok(written) => reply.written(written),
             Err(e) => {
                 error!("write({ino}, off={offset}) -> {e}");
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -267,7 +288,7 @@ impl Filesystem for StudioFuseFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("flush({ino}) -> {e}");
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }
@@ -284,7 +305,7 @@ impl Filesystem for StudioFuseFs {
             Ok(e) => e,
             Err(e) => {
                 error!("readdir({ino}) -> {e}");
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
                 return;
             }
         };
@@ -344,7 +365,7 @@ impl Filesystem for StudioFuseFs {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 error!("setattr({ino}) -> {e}");
-                reply.error(libc::EIO);
+                reply.error(vfs_err_to_errno(&e));
             }
         }
     }

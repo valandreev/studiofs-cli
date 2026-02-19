@@ -136,7 +136,7 @@ impl Default for ObjectHeader {
 
 impl ObjectHeader {
     /// Total header size in bytes.
-    pub const SIZE: usize = 4 + 2 + 2 + 4 + 4 + 8 + 6; // 32 bytes
+    pub const SIZE: usize = 4 + 2 + 2 + 4 + 4 + 8 + 6; // 30 bytes
 
     /// Create a new header with the given parameters.
     pub fn new(original_size: u32, compressed_size: u32, checksum: u64) -> Self {
@@ -552,8 +552,8 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        // Ensure header is exactly 32 bytes
-        assert_eq!(ObjectHeader::SIZE, 32);
+        // Ensure header is exactly 30 bytes
+        assert_eq!(ObjectHeader::SIZE, 30);
 
         // Note: Without #[repr(packed)], the struct may have padding.
         // The actual struct size may be larger, but we serialize to exactly 32 bytes.

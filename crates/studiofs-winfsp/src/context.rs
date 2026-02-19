@@ -20,6 +20,8 @@ const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = NTSTATUS(0xC000_0034_u32 as i32);
 const STATUS_OBJECT_NAME_COLLISION: NTSTATUS = NTSTATUS(0xC000_0035_u32 as i32);
 const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = NTSTATUS(0xC000_0101_u32 as i32);
 const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
+const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
+const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
@@ -144,6 +146,12 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             }
             studiofs_meta::MetaError::NotADirectory(_) => {
                 winfsp::FspError::from(STATUS_NOT_A_DIRECTORY)
+            }
+            studiofs_meta::MetaError::IsADirectory(_) => {
+                winfsp::FspError::from(STATUS_FILE_IS_A_DIRECTORY)
+            }
+            studiofs_meta::MetaError::NotFormatted => {
+                winfsp::FspError::from(STATUS_UNRECOGNIZED_VOLUME)
             }
             _ => {
                 error!("metadata error: {e}");
