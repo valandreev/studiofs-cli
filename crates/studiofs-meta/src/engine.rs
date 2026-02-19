@@ -265,58 +265,23 @@ pub trait MetaEngine: Send + Sync {
         Ok(())
     }
 
-    /// Rename a file or directory.
+    /// Atomic rename: move a directory entry in a single transaction.
+    ///
+    /// Returns `Some(displaced_ino)` if the target entry was overwritten
+    /// (the displaced inode's nlink was decremented and — if zero — its
+    /// attr was removed).  The caller (VFS) is responsible for scheduling
+    /// block GC for the displaced inode.
+    fn rename_atomic(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> MetaResult<Option<Ino>>;
+
+    /// Rename a file or directory (delegates to `rename_atomic`).
     fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        let entry = self.remove_entry(parent, name)?;
-
-        // If target exists, remove it first
-        if let Ok(existing) = self.lookup(new_parent, new_name) {
-            if existing.kind == FileType::Directory {
-                // Check if target dir is empty
-                let children = self.readdir(existing.ino)?;
-                if !children.is_empty() {
-                    // Re-add original entry since we already removed it
-                    self.add_entry(parent, name, &entry)?;
-                    return Err(MetaError::DirNotEmpty(existing.ino));
-                }
-                self.remove_entry(new_parent, new_name)?;
-                self.remove_attr(existing.ino)?;
-            } else {
-                self.remove_entry(new_parent, new_name)?;
-                let mut attr = self.get_attr(existing.ino)?;
-                attr.nlink = attr.nlink.saturating_sub(1);
-                if attr.nlink == 0 {
-                    self.remove_attr(existing.ino)?;
-                    let _ = self.remove_file_blocks(existing.ino)?;
-                } else {
-                    self.set_attr(&attr)?;
-                }
-            }
-        }
-
-        self.add_entry(new_parent, new_name, &entry)?;
-
-        // Update parent inode on the moved entry if it's a dir
-        if entry.kind == FileType::Directory {
-            if let Ok(mut attr) = self.get_attr(entry.ino) {
-                attr.parent = new_parent;
-                let _ = self.set_attr(&attr);
-            }
-            // Update nlinks for parent directories
-            if parent != new_parent {
-                if let Ok(mut old_parent_attr) = self.get_attr(parent) {
-                    old_parent_attr.nlink = old_parent_attr.nlink.saturating_sub(1);
-                    old_parent_attr.touch_mtime();
-                    let _ = self.set_attr(&old_parent_attr);
-                }
-                if let Ok(mut new_parent_attr) = self.get_attr(new_parent) {
-                    new_parent_attr.nlink += 1;
-                    new_parent_attr.touch_mtime();
-                    let _ = self.set_attr(&new_parent_attr);
-                }
-            }
-        }
-
+        self.rename_atomic(parent, name, new_parent, new_name)?;
         Ok(())
     }
 }

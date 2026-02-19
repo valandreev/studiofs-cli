@@ -137,6 +137,32 @@ impl RedbMetaEngine {
         debug!("initialized root inode");
         Ok(())
     }
+
+    /// Adjust nlink of an inode within an existing write transaction.
+    fn adjust_nlink_in_txn(
+        inodes: &mut redb::Table<'_, u64, &[u8]>,
+        ino: Ino,
+        delta: i32,
+    ) -> MetaResult<()> {
+        let attr_bytes = inodes
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|g| g.value().to_vec());
+        if let Some(bytes) = attr_bytes {
+            let mut attr: InodeAttr = decode(&bytes)?;
+            if delta > 0 {
+                attr.nlink += delta as u32;
+            } else {
+                attr.nlink = attr.nlink.saturating_sub((-delta) as u32);
+            }
+            attr.touch_mtime();
+            let data = encode(&attr)?;
+            inodes
+                .insert(ino, data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 impl MetaEngine for RedbMetaEngine {
@@ -692,6 +718,132 @@ impl MetaEngine for RedbMetaEngine {
 
         Ok(deletions)
     }
+
+    // --- Atomic Rename ---------------------------------------------------
+
+    fn rename_atomic(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> MetaResult<Option<Ino>> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let displaced_ino: Option<Ino>;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // 1. Fetch and remove the source entry — copy value out immediately
+            //    so the AccessGuard is dropped before further table mutations.
+            let src_key = encode_dentry_key(parent, name);
+            let src_val_bytes = dentries
+                .remove(src_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec())
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                })?;
+            let src_entry: DirEntryValue = decode(&src_val_bytes)?;
+
+            // 2. Check if destination already exists → handle overwrite
+            let dst_key = encode_dentry_key(new_parent, new_name);
+            let dst_entry_opt: Option<DirEntryValue> = dentries
+                .get(dst_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| decode(g.value()))
+                .transpose()?;
+
+            displaced_ino = if let Some(dst_entry) = dst_entry_opt {
+                if dst_entry.kind == FileType::Directory {
+                    // Target is a directory — it must be empty
+                    let prefix = dentry_prefix(dst_entry.ino);
+                    let mut range_end = prefix.to_vec();
+                    *range_end.last_mut().unwrap() += 1;
+                    let has_children = dentries
+                        .range(prefix.as_slice()..range_end.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .next()
+                        .is_some();
+                    if has_children {
+                        // Re-insert source entry (rollback within same txn)
+                        dentries
+                            .insert(src_key.as_slice(), src_val_bytes.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        return Err(MetaError::DirNotEmpty(dst_entry.ino));
+                    }
+                    // Remove the empty dir inode
+                    inodes
+                        .remove(dst_entry.ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                } else {
+                    // Target is a file — decrement nlink, remove if zero
+                    let attr_bytes = inodes
+                        .get(dst_entry.ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|g| g.value().to_vec());
+                    if let Some(bytes) = attr_bytes {
+                        let mut attr: InodeAttr = decode(&bytes)?;
+                        attr.nlink = attr.nlink.saturating_sub(1);
+                        if attr.nlink == 0 {
+                            inodes
+                                .remove(dst_entry.ino)
+                                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        } else {
+                            let data = encode(&attr)?;
+                            inodes
+                                .insert(dst_entry.ino, data.as_slice())
+                                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        }
+                    }
+                }
+                // Remove old destination dentry
+                dentries
+                    .remove(dst_key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                Some(dst_entry.ino)
+            } else {
+                None
+            };
+
+            // 3. Insert destination entry (same value as source)
+            dentries
+                .insert(dst_key.as_slice(), src_val_bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // 4. If moving a directory between parents, update parent pointer + nlinks
+            if src_entry.kind == FileType::Directory && parent != new_parent {
+                // Update the moved directory's parent pointer
+                let dir_attr_bytes = inodes
+                    .get(src_entry.ino)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|g| g.value().to_vec());
+                if let Some(bytes) = dir_attr_bytes {
+                    let mut attr: InodeAttr = decode(&bytes)?;
+                    attr.parent = new_parent;
+                    let data = encode(&attr)?;
+                    inodes
+                        .insert(src_entry.ino, data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                // Decrement old parent nlink
+                Self::adjust_nlink_in_txn(&mut inodes, parent, -1)?;
+                // Increment new parent nlink
+                Self::adjust_nlink_in_txn(&mut inodes, new_parent, 1)?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(displaced_ino)
+    }
 }
 
 #[cfg(test)]
@@ -814,12 +966,122 @@ mod tests {
         engine
             .create_file(ROOT_INO, b"old.txt", 1000, 1000, 0o644)
             .unwrap();
-        engine
-            .rename(ROOT_INO, b"old.txt", ROOT_INO, b"new.txt")
+        // rename_atomic returns None when no overwrite
+        let displaced = engine
+            .rename_atomic(ROOT_INO, b"old.txt", ROOT_INO, b"new.txt")
             .unwrap();
+        assert!(displaced.is_none());
 
         assert!(engine.lookup(ROOT_INO, b"old.txt").is_err());
         assert!(engine.lookup(ROOT_INO, b"new.txt").is_ok());
+    }
+
+    #[test]
+    fn test_rename_overwrite_file() {
+        let engine = temp_engine();
+        let src = engine
+            .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let dst = engine
+            .create_file(ROOT_INO, b"dst.txt", 1000, 1000, 0o644)
+            .unwrap();
+
+        let displaced = engine
+            .rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt")
+            .unwrap();
+
+        // Should return the displaced inode
+        assert_eq!(displaced, Some(dst.ino));
+        // Source is gone, dest now points to src's inode
+        assert!(engine.lookup(ROOT_INO, b"src.txt").is_err());
+        let entry = engine.lookup(ROOT_INO, b"dst.txt").unwrap();
+        assert_eq!(entry.ino, src.ino);
+        // Displaced inode should be removed (nlink was 1 → 0)
+        assert!(engine.get_attr(dst.ino).is_err());
+    }
+
+    #[test]
+    fn test_rename_overwrite_empty_dir() {
+        let engine = temp_engine();
+        let file = engine
+            .create_file(ROOT_INO, b"file.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let dir = engine
+            .create_dir(ROOT_INO, b"empty_dir", 1000, 1000, 0o755)
+            .unwrap();
+
+        let displaced = engine
+            .rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"empty_dir")
+            .unwrap();
+
+        assert_eq!(displaced, Some(dir.ino));
+        assert!(engine.get_attr(dir.ino).is_err());
+        let entry = engine.lookup(ROOT_INO, b"empty_dir").unwrap();
+        assert_eq!(entry.ino, file.ino);
+    }
+
+    #[test]
+    fn test_rename_overwrite_nonempty_dir_fails() {
+        let engine = temp_engine();
+        engine
+            .create_file(ROOT_INO, b"file.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let dir = engine
+            .create_dir(ROOT_INO, b"notempty", 1000, 1000, 0o755)
+            .unwrap();
+        engine
+            .create_file(dir.ino, b"child.txt", 1000, 1000, 0o644)
+            .unwrap();
+
+        let result = engine.rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"notempty");
+        assert!(result.is_err());
+        // Source should still exist (rollback in same txn)
+        assert!(engine.lookup(ROOT_INO, b"file.txt").is_ok());
+        assert!(engine.lookup(ROOT_INO, b"notempty").is_ok());
+    }
+
+    #[test]
+    fn test_rename_move_dir_between_parents() {
+        let engine = temp_engine();
+        let dir_a = engine
+            .create_dir(ROOT_INO, b"a", 1000, 1000, 0o755)
+            .unwrap();
+        let dir_b = engine
+            .create_dir(ROOT_INO, b"b", 1000, 1000, 0o755)
+            .unwrap();
+        // root nlink = 2 + 2 subdirs = 4
+        assert_eq!(engine.get_attr(ROOT_INO).unwrap().nlink, 4);
+
+        // Create a subdir inside /a
+        let sub = engine
+            .create_dir(dir_a.ino, b"sub", 1000, 1000, 0o755)
+            .unwrap();
+        // /a nlink = 2 + 1 subdir = 3
+        assert_eq!(engine.get_attr(dir_a.ino).unwrap().nlink, 3);
+        assert_eq!(engine.get_attr(dir_b.ino).unwrap().nlink, 2);
+
+        // Move /a/sub → /b/sub
+        let displaced = engine
+            .rename_atomic(dir_a.ino, b"sub", dir_b.ino, b"sub")
+            .unwrap();
+        assert!(displaced.is_none());
+
+        // /a nlink = 2 (lost subdir)
+        assert_eq!(engine.get_attr(dir_a.ino).unwrap().nlink, 2);
+        // /b nlink = 3 (gained subdir)
+        assert_eq!(engine.get_attr(dir_b.ino).unwrap().nlink, 3);
+        // sub's parent should now be dir_b
+        assert_eq!(engine.get_attr(sub.ino).unwrap().parent, dir_b.ino);
+        // Dentry moved
+        assert!(engine.lookup(dir_a.ino, b"sub").is_err());
+        assert!(engine.lookup(dir_b.ino, b"sub").is_ok());
+    }
+
+    #[test]
+    fn test_rename_nonexistent_source() {
+        let engine = temp_engine();
+        let result = engine.rename_atomic(ROOT_INO, b"nope.txt", ROOT_INO, b"dst.txt");
+        assert!(result.is_err());
     }
 
     #[test]

@@ -537,6 +537,10 @@ impl StudioVfs {
     }
 
     /// Rename a file or directory.
+    ///
+    /// Uses `rename_atomic()` for a single-transaction metadata update.
+    /// If the rename displaces an existing file (overwrite), its blocks
+    /// are marked for GC and evicted from all cache tiers.
     pub fn rename(
         &self,
         parent: Ino,
@@ -544,8 +548,31 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
-        self.meta.rename(parent, name, new_parent, new_name)?;
-        // Invalidate both source and dest parent directory caches (entries changed)
+        let displaced_ino = self.meta.rename_atomic(parent, name, new_parent, new_name)?;
+
+        // If an existing entry was overwritten, schedule GC + evict caches
+        if let Some(ino) = displaced_ino {
+            self.state.deleted_inodes.lock().insert(ino);
+
+            let removed_ids = self.meta.remove_file_blocks(ino)?;
+            if !removed_ids.is_empty() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                for &object_id in &removed_ids {
+                    self.meta.add_pending_deletion(object_id, timestamp)?;
+                }
+                self.state.pending_blocks.lock().retain(|(i, _), _| *i != ino);
+                self.evict_inode_from_caches(ino, &removed_ids);
+                self.disk_cache.cleanup_empty_slabs();
+            }
+
+            self.state.dirty_attrs.lock().remove(&ino);
+            self.state.attr_read_cache.lock().remove(&ino);
+        }
+
+        // Invalidate source and dest parent directory caches
         self.state.attr_read_cache.lock().remove(&parent);
         if parent != new_parent {
             self.state.attr_read_cache.lock().remove(&new_parent);
