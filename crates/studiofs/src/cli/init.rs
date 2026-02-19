@@ -86,6 +86,16 @@ async fn create_s3_bucket(
     Ok(())
 }
 
+#[cfg(unix)]
+fn get_current_ids() -> (u32, u32) {
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+#[cfg(windows)]
+fn get_current_ids() -> (u32, u32) {
+    (0, 0)
+}
+
 pub fn run(
     name: &str,
     endpoint: &str,
@@ -196,8 +206,7 @@ pub fn run(
     engine.set_format_info(&format_info)?;
 
     // Initialize root inode owned by the current user
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let (uid, gid) = get_current_ids();
     engine.init_root(uid, gid)?;
 
     info!("volume {name:?} initialized successfully");
