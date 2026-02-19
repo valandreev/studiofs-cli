@@ -37,7 +37,7 @@ use thiserror::Error;
 use tracing::{debug, info, error, warn};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, Semaphore};
-use crate::readahead::ReadAheadTracker;
+use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 // =============================================================================
 // Error Types
@@ -341,6 +341,8 @@ pub struct StudioVfs {
     store_decompressed: bool,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
+    /// Directory-level prefetch tracker.
+    dir_prefetch: Arc<DirAccessTracker>,
     /// Channel sender for scheduling background prefetch tasks.
     /// The receiver lives in a spawned task that has an Arc<Self>.
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<(Ino, u32)>,
@@ -376,6 +378,7 @@ impl StudioVfs {
 
         // Init ReadAhead tracker + prefetch channel
         let readahead = Arc::new(ReadAheadTracker::new(8));
+        let dir_prefetch = Arc::new(DirAccessTracker::new(2));
         let (prefetch_tx, mut prefetch_rx) =
             tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
 
@@ -406,6 +409,7 @@ impl StudioVfs {
             upload_retries: 3,
             store_decompressed: true,
             readahead: readahead.clone(),
+            dir_prefetch,
             prefetch_tx,
             dirty_flush_tx,
             max_dirty_bytes: 2 * 1024 * 1024 * 1024,
@@ -614,7 +618,19 @@ impl StudioVfs {
 
     /// Read directory entries.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
-        Ok(self.meta.readdir(ino)?)
+        let entries = self.meta.readdir(ino)?;
+
+        // Feed the directory prefetch tracker with regular-file children.
+        let file_children: Vec<Ino> = entries
+            .iter()
+            .filter(|e| e.kind == FileType::RegularFile)
+            .map(|e| e.ino)
+            .collect();
+        if !file_children.is_empty() {
+            self.dir_prefetch.on_readdir(ino, file_children);
+        }
+
+        Ok(entries)
     }
 
     // =========================================================================
@@ -868,6 +884,32 @@ impl StudioVfs {
     /// Read the target of a symbolic link.
     pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
         Ok(self.meta.get_symlink_target(ino)?)
+    }
+
+    // =========================================================================
+    // Extended Attributes (xattr)
+    // =========================================================================
+
+    /// Get an extended attribute value.
+    pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
+        Ok(self.meta.get_xattr(ino, name)?)
+    }
+
+    /// Set an extended attribute.
+    pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
+        self.meta.set_xattr(ino, name, value, flags)?;
+        Ok(())
+    }
+
+    /// Remove an extended attribute.
+    pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
+        self.meta.remove_xattr(ino, name)?;
+        Ok(())
+    }
+
+    /// List all extended attribute names for an inode.
+    pub fn list_xattrs(&self, ino: Ino) -> VfsResult<Vec<Vec<u8>>> {
+        Ok(self.meta.list_xattrs(ino)?)
     }
 
     /// Remove a file.
@@ -1246,6 +1288,13 @@ impl StudioVfs {
                 // Best-effort; ignore send errors (worker may have exited).
                 let _ = self.prefetch_tx.send((ino, block_idx));
             }
+        }
+
+        // Directory-level prefetch: if this child is in a tracked directory
+        // and the threshold is met, prefetch block 0 of sibling files.
+        let siblings = self.dir_prefetch.on_child_read(ino);
+        for sibling_ino in siblings {
+            let _ = self.prefetch_tx.send((sibling_ino, 0));
         }
     }
 

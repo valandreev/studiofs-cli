@@ -553,27 +553,83 @@ impl Filesystem for StudioFuseFs {
         reply.ok();
     }
 
-    // macOS Finder queries extended attributes extensively.
-    // We don't support them, so return ENOATTR (macOS) / ENODATA (Linux).
     fn getxattr(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _size: u32,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
         reply: ReplyXattr,
     ) {
-        #[cfg(target_os = "macos")]
-        reply.error(libc::ENOATTR);
-        #[cfg(not(target_os = "macos"))]
-        reply.error(libc::ENODATA);
+        let key = name.as_encoded_bytes();
+        match self.vfs.get_xattr(ino, key) {
+            Ok(Some(val)) => {
+                if size == 0 {
+                    reply.size(val.len() as u32);
+                } else if val.len() <= size as usize {
+                    reply.data(&val);
+                } else {
+                    reply.error(libc::ERANGE);
+                }
+            }
+            Ok(None) => {
+                #[cfg(target_os = "macos")]
+                reply.error(libc::ENOATTR);
+                #[cfg(not(target_os = "macos"))]
+                reply.error(libc::ENODATA);
+            }
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, size: u32, reply: ReplyXattr) {
-        if size == 0 {
-            reply.size(0);
-        } else {
-            reply.data(&[]);
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let key = name.as_encoded_bytes();
+        match self.vfs.set_xattr(ino, key, value, flags as u32) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn removexattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        let key = name.as_encoded_bytes();
+        match self.vfs.remove_xattr(ino, key) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        match self.vfs.list_xattrs(ino) {
+            Ok(names) => {
+                // xattr list format: null-terminated name strings concatenated
+                let data: Vec<u8> = names
+                    .iter()
+                    .flat_map(|n| n.iter().cloned().chain(std::iter::once(0u8)))
+                    .collect();
+                if size == 0 {
+                    reply.size(data.len() as u32);
+                } else if data.len() <= size as usize {
+                    reply.data(&data);
+                } else {
+                    reply.error(libc::ERANGE);
+                }
+            }
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
         }
     }
 

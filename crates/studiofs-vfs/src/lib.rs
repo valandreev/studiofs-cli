@@ -7,4 +7,4 @@ pub mod vfs;
 
 pub use vfs::{LockKind, OpenFile, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsResult};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
-pub use readahead::ReadAheadTracker;
+pub use readahead::{DirAccessTracker, ReadAheadTracker};

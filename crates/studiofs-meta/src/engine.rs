@@ -310,6 +310,21 @@ pub trait MetaEngine: Send + Sync {
     /// Get the symlink target for the given inode.
     fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>;
 
+    // ─── Extended Attributes (xattr) ─────────────────────────────────────
+
+    /// Get an extended attribute value.
+    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
+
+    /// Set an extended attribute.
+    /// Flags: 1 = XATTR_CREATE (fail if exists), 2 = XATTR_REPLACE (fail if not exists).
+    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>;
+
+    /// Remove an extended attribute.
+    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()>;
+
+    /// List all extended attribute names for an inode.
+    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
+
     /// Create a symlink: allocate inode, store target, add dentry.
     fn create_symlink(
         &self,

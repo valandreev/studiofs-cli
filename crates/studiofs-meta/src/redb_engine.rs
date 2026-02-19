@@ -34,6 +34,9 @@ const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
 /// Symlink targets: ino (u64) -> target path (&[u8])
 const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlinks");
 
+/// Extended attributes: (ino(8) + name_bytes) -> value_bytes
+const XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("xattrs");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -76,6 +79,19 @@ fn file_block_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
 
+/// Encode an xattr key: ino (8 bytes LE) + name bytes.
+fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + name.len());
+    key.extend_from_slice(&ino.to_le_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
+/// The prefix for scanning all xattrs of an inode.
+fn xattr_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
 // ─── Postcard helpers ────────────────────────────────────────────────────────
 
 fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
@@ -111,6 +127,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(FILE_BLOCKS_TABLE);
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
             let _ = txn.open_table(SYMLINKS_TABLE);
+            let _ = txn.open_table(XATTRS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -352,6 +369,28 @@ impl MetaEngine for RedbMetaEngine {
                 .open_table(SYMLINKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let _ = symlinks.remove(ino);
+
+            // Cascade: remove all xattrs for this inode
+            let mut xattrs = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = xattr_prefix(ino);
+            let keys_to_remove: Vec<Vec<u8>> = {
+                let range = xattrs
+                    .range(prefix.as_ref()..)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                range
+                    .take_while(|r| {
+                        r.as_ref()
+                            .map(|(k, _)| k.value().starts_with(&prefix))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                    .collect()
+            };
+            for key in keys_to_remove {
+                let _ = xattrs.remove(key.as_slice());
+            }
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -962,6 +1001,114 @@ impl MetaEngine for RedbMetaEngine {
             .ok_or(MetaError::InodeNotFound(ino))?;
         Ok(raw.value().to_vec())
     }
+
+    // --- Extended Attributes (xattr) --------------------------------------
+
+    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        let key = encode_xattr_key(ino, name);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => Ok(Some(v.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let exists = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some();
+
+            // XATTR_CREATE (1): fail if exists
+            if flags & 1 != 0 && exists {
+                return Err(MetaError::EntryExists {
+                    parent: ino,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+            // XATTR_REPLACE (2): fail if not exists
+            if flags & 2 != 0 && !exists {
+                return Err(MetaError::EntryNotFound {
+                    parent: ino,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
+            table
+                .insert(key.as_slice(), value)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or(MetaError::EntryNotFound {
+                    parent: ino,
+                    name: String::from_utf8_lossy(name).to_string(),
+                })?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = xattr_prefix(ino);
+        let range = table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut names = Vec::new();
+        for item in range {
+            let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = k.value();
+            if !key_bytes.starts_with(&prefix) {
+                break;
+            }
+            // Extract name: skip the 8-byte ino prefix
+            names.push(key_bytes[8..].to_vec());
+        }
+        Ok(names)
+    }
 }
 
 #[cfg(test)]
@@ -1469,5 +1616,173 @@ mod tests {
         let unlinked3 = engine.unlink(ROOT_INO, b"c.txt").unwrap();
         assert_eq!(unlinked3.nlink, 0);
         assert!(engine.get_attr(ino).is_err());
+    }
+
+    // === xattr Tests ===
+
+    #[test]
+    fn test_xattr_set_get() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        // Set xattr
+        engine
+            .set_xattr(attr.ino, b"user.color", b"red", 0)
+            .unwrap();
+
+        // Get xattr
+        let val = engine.get_xattr(attr.ino, b"user.color").unwrap();
+        assert_eq!(val, Some(b"red".to_vec()));
+
+        // Non-existent xattr returns None
+        let none = engine.get_xattr(attr.ino, b"user.missing").unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_xattr_overwrite() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        engine
+            .set_xattr(attr.ino, b"user.tag", b"v1", 0)
+            .unwrap();
+        engine
+            .set_xattr(attr.ino, b"user.tag", b"v2", 0)
+            .unwrap();
+
+        let val = engine.get_xattr(attr.ino, b"user.tag").unwrap();
+        assert_eq!(val, Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_xattr_create_flag() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        // XATTR_CREATE on new key succeeds
+        engine.set_xattr(attr.ino, b"user.x", b"a", 1).unwrap();
+
+        // XATTR_CREATE on existing key fails
+        let result = engine.set_xattr(attr.ino, b"user.x", b"b", 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_xattr_replace_flag() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        // XATTR_REPLACE on non-existent key fails
+        let result = engine.set_xattr(attr.ino, b"user.y", b"a", 2);
+        assert!(result.is_err());
+
+        // Set it first, then REPLACE succeeds
+        engine.set_xattr(attr.ino, b"user.y", b"a", 0).unwrap();
+        engine.set_xattr(attr.ino, b"user.y", b"b", 2).unwrap();
+        let val = engine.get_xattr(attr.ino, b"user.y").unwrap();
+        assert_eq!(val, Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn test_xattr_remove() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        engine
+            .set_xattr(attr.ino, b"user.rm", b"data", 0)
+            .unwrap();
+        engine.remove_xattr(attr.ino, b"user.rm").unwrap();
+
+        let val = engine.get_xattr(attr.ino, b"user.rm").unwrap();
+        assert!(val.is_none());
+
+        // Remove non-existent xattr fails
+        let result = engine.remove_xattr(attr.ino, b"user.rm");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_xattr_list() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        engine
+            .set_xattr(attr.ino, b"user.alpha", b"1", 0)
+            .unwrap();
+        engine
+            .set_xattr(attr.ino, b"user.beta", b"2", 0)
+            .unwrap();
+        engine
+            .set_xattr(attr.ino, b"user.gamma", b"3", 0)
+            .unwrap();
+
+        let names = engine.list_xattrs(attr.ino).unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&b"user.alpha".to_vec()));
+        assert!(names.contains(&b"user.beta".to_vec()));
+        assert!(names.contains(&b"user.gamma".to_vec()));
+    }
+
+    #[test]
+    fn test_xattr_cascade_on_remove_attr() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+
+        engine
+            .set_xattr(attr.ino, b"user.keep", b"data", 0)
+            .unwrap();
+
+        // Remove the inode — xattrs should be cascade-deleted
+        engine.unlink(ROOT_INO, b"file.txt").unwrap();
+
+        // xattr should be gone
+        let names = engine.list_xattrs(attr.ino).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_xattr_isolation_between_inodes() {
+        let engine = temp_engine();
+        let f1 = engine
+            .create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
+            .unwrap();
+        let f2 = engine
+            .create_file(ROOT_INO, b"b.txt", 0, 0, 0o644)
+            .unwrap();
+
+        engine
+            .set_xattr(f1.ino, b"user.owner", b"alice", 0)
+            .unwrap();
+        engine
+            .set_xattr(f2.ino, b"user.owner", b"bob", 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.get_xattr(f1.ino, b"user.owner").unwrap(),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.get_xattr(f2.ino, b"user.owner").unwrap(),
+            Some(b"bob".to_vec())
+        );
+
+        // list_xattrs should only show each inode's own xattrs
+        assert_eq!(engine.list_xattrs(f1.ino).unwrap().len(), 1);
+        assert_eq!(engine.list_xattrs(f2.ino).unwrap().len(), 1);
     }
 }

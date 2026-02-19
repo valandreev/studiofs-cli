@@ -23,6 +23,8 @@
 
 use dashmap::DashMap;
 use studiofs_meta::types::Ino;
+use std::collections::HashSet;
+use parking_lot::Mutex;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
 const MAX_SCORE: u8 = 8;
@@ -283,5 +285,190 @@ mod tests {
         // Inode 2 should start fresh
         let p = tracker.record_read(2, 0, 0);
         assert!(p.is_empty(), "separate inodes track state independently");
+    }
+}
+
+// =============================================================================
+// Directory-Level Prefetch Tracker
+// =============================================================================
+
+/// State for a directory whose children are being accessed.
+struct DirPrefetchState {
+    /// All regular-file child inodes from readdir.
+    children: Vec<Ino>,
+    /// Map from child ino back to its parent dir ino (for reverse lookup).
+    /// How many children we've seen accessed (open/read).
+    seen: usize,
+    /// Which children have already been scheduled for prefetch.
+    prefetched: HashSet<Ino>,
+}
+
+/// Tracks directory-level access patterns.
+///
+/// When a user browses a directory (readdir) and then starts opening/reading
+/// files within it sequentially, this tracker detects the pattern and returns
+/// a list of sibling inodes whose first block should be prefetched.
+///
+/// Trigger: after `>= 2` children from the same directory are read,
+/// prefetch block 0 of the remaining siblings that haven't been accessed yet.
+pub struct DirAccessTracker {
+    /// dir_ino → prefetch state
+    dirs: Mutex<std::collections::HashMap<Ino, DirPrefetchState>>,
+    /// child_ino → parent_dir_ino (reverse lookup so on_read can find the dir)
+    child_to_dir: DashMap<Ino, Ino>,
+    /// Threshold: how many children must be read before prefetching triggers.
+    threshold: usize,
+}
+
+impl DirAccessTracker {
+    /// Create a new tracker.
+    ///
+    /// `threshold` — number of children that must be read before prefetching
+    /// the rest of the directory (typically 2).
+    pub fn new(threshold: usize) -> Self {
+        Self {
+            dirs: Mutex::new(std::collections::HashMap::new()),
+            child_to_dir: DashMap::new(),
+            threshold,
+        }
+    }
+
+    /// Called after `readdir(dir_ino)` completes.
+    ///
+    /// `children` should contain the inodes of regular-file children only
+    /// (exclude directories and symlinks — those have no data blocks).
+    pub fn on_readdir(&self, dir_ino: Ino, children: Vec<Ino>) {
+        // Register reverse mappings
+        for &child in &children {
+            self.child_to_dir.insert(child, dir_ino);
+        }
+
+        let mut dirs = self.dirs.lock();
+        dirs.insert(
+            dir_ino,
+            DirPrefetchState {
+                children,
+                seen: 0,
+                prefetched: HashSet::new(),
+            },
+        );
+    }
+
+    /// Called when a child inode is read.
+    ///
+    /// Returns a list of sibling inodes whose block 0 should be prefetched.
+    /// Returns an empty vec if the threshold hasn't been met yet, or if the
+    /// child's parent directory isn't tracked.
+    pub fn on_child_read(&self, child_ino: Ino) -> Vec<Ino> {
+        let dir_ino = match self.child_to_dir.get(&child_ino) {
+            Some(v) => *v,
+            None => return Vec::new(),
+        };
+
+        let mut dirs = self.dirs.lock();
+        let state = match dirs.get_mut(&dir_ino) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // Already counted this child? Skip.
+        if state.prefetched.contains(&child_ino) {
+            return Vec::new();
+        }
+
+        state.seen += 1;
+        state.prefetched.insert(child_ino);
+
+        // Not enough children read yet — don't prefetch.
+        if state.seen < self.threshold {
+            return Vec::new();
+        }
+
+        // Threshold met: return all un-prefetched children.
+        let to_prefetch: Vec<Ino> = state
+            .children
+            .iter()
+            .filter(|ino| !state.prefetched.contains(ino))
+            .copied()
+            .collect();
+
+        // Mark them all as prefetched.
+        for &ino in &to_prefetch {
+            state.prefetched.insert(ino);
+        }
+
+        to_prefetch
+    }
+
+    /// Remove all state for a directory (e.g. when it is deleted).
+    pub fn evict_dir(&self, dir_ino: Ino) {
+        let mut dirs = self.dirs.lock();
+        if let Some(state) = dirs.remove(&dir_ino) {
+            for child in &state.children {
+                self.child_to_dir.remove(child);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dir_prefetch_tests {
+    use super::*;
+
+    #[test]
+    fn test_no_prefetch_before_threshold() {
+        let tracker = DirAccessTracker::new(2);
+        tracker.on_readdir(100, vec![10, 11, 12, 13]);
+
+        // First child read — below threshold
+        let p = tracker.on_child_read(10);
+        assert!(p.is_empty(), "below threshold: no prefetch");
+    }
+
+    #[test]
+    fn test_prefetch_after_threshold() {
+        let tracker = DirAccessTracker::new(2);
+        tracker.on_readdir(100, vec![10, 11, 12, 13]);
+
+        tracker.on_child_read(10);
+        let p = tracker.on_child_read(11);
+        // Threshold met: should return 12, 13 (the remaining children)
+        assert_eq!(p.len(), 2);
+        assert!(p.contains(&12));
+        assert!(p.contains(&13));
+    }
+
+    #[test]
+    fn test_no_double_prefetch() {
+        let tracker = DirAccessTracker::new(2);
+        tracker.on_readdir(100, vec![10, 11, 12]);
+
+        tracker.on_child_read(10);
+        let p1 = tracker.on_child_read(11);
+        assert_eq!(p1.len(), 1); // [12]
+
+        // Reading 12 again should not return anything
+        let p2 = tracker.on_child_read(12);
+        assert!(p2.is_empty());
+    }
+
+    #[test]
+    fn test_untracked_child() {
+        let tracker = DirAccessTracker::new(2);
+        // child_ino 999 not in any tracked directory
+        let p = tracker.on_child_read(999);
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_evict_dir() {
+        let tracker = DirAccessTracker::new(2);
+        tracker.on_readdir(100, vec![10, 11, 12]);
+
+        tracker.evict_dir(100);
+
+        // After evict, children have no parent mapping
+        let p = tracker.on_child_read(10);
+        assert!(p.is_empty());
     }
 }

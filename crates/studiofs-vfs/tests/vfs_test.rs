@@ -993,3 +993,76 @@ async fn test_flock_unlock_and_relock() {
         .await
         .unwrap();
 }
+
+// =============================================================================
+// Phase 6 — xattr Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_set_get_remove() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr_basic");
+
+    let attr = vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
+
+    // Set xattr
+    vfs.set_xattr(attr.ino, b"user.color", b"blue", 0)
+        .unwrap();
+
+    // Get xattr
+    let val = vfs.get_xattr(attr.ino, b"user.color").unwrap();
+    assert_eq!(val, Some(b"blue".to_vec()));
+
+    // List xattrs
+    let names = vfs.list_xattrs(attr.ino).unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0], b"user.color");
+
+    // Remove xattr
+    vfs.remove_xattr(attr.ino, b"user.color").unwrap();
+    let val2 = vfs.get_xattr(attr.ino, b"user.color").unwrap();
+    assert!(val2.is_none());
+    assert!(vfs.list_xattrs(attr.ino).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_cascade_on_unlink() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr_cascade");
+
+    let attr = vfs.create(1, b"doomed.txt", 0, 0, 0o644).unwrap();
+    vfs.set_xattr(attr.ino, b"user.tag", b"important", 0)
+        .unwrap();
+
+    vfs.unlink(1, b"doomed.txt").unwrap();
+
+    // xattrs should be cleaned up after unlink
+    let names = vfs.list_xattrs(attr.ino).unwrap();
+    assert!(names.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_multiple_attrs() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr_multi");
+
+    let attr = vfs.create(1, b"multi.txt", 0, 0, 0o644).unwrap();
+
+    vfs.set_xattr(attr.ino, b"user.a", b"1", 0).unwrap();
+    vfs.set_xattr(attr.ino, b"user.b", b"2", 0).unwrap();
+    vfs.set_xattr(attr.ino, b"user.c", b"3", 0).unwrap();
+
+    let names = vfs.list_xattrs(attr.ino).unwrap();
+    assert_eq!(names.len(), 3);
+
+    // Overwrite one
+    vfs.set_xattr(attr.ino, b"user.b", b"updated", 0).unwrap();
+    let val = vfs.get_xattr(attr.ino, b"user.b").unwrap();
+    assert_eq!(val, Some(b"updated".to_vec()));
+}
