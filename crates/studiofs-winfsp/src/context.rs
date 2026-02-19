@@ -13,7 +13,7 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 use tokio::runtime::Runtime;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 use windows::Win32::Foundation::NTSTATUS;
 use winfsp::filesystem::*;
 use winfsp::U16CStr;
@@ -61,7 +61,12 @@ impl StudioFileHandle {
 fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     let mut info = FileInfo::default();
     info.file_size = attr.size;
-    info.allocation_size = (attr.size + 4095) & !4095;
+    // Directories always report at least one allocation unit; files round up.
+    info.allocation_size = if attr.kind == FileType::Directory {
+        4096u64.max((attr.size + 4095) & !4095)
+    } else {
+        (attr.size + 4095) & !4095
+    };
 
     info.file_attributes = match attr.kind {
         FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
@@ -82,7 +87,8 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 
     // Use inode as index
     info.index_number = attr.ino;
-    info.hard_links = 0; // WinFSP doesn't use hard links
+    // Report actual nlink count (must be ≥1 for files, ≥2 for dirs)
+    info.hard_links = if attr.nlink > 0 { attr.nlink as u32 } else { 1 };
 
     info
 }
@@ -98,6 +104,9 @@ fn unix_nanos_to_filetime(unix_nanos: i64) -> u64 {
 }
 
 /// Resolve a WinFSP path to an inode by walking the directory tree.
+///
+/// Handles `.` (current dir), `..` (parent dir), and strips trailing
+/// dots/spaces from path components (standard Windows path semantics).
 fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
     let s = path.to_string_lossy();
     let s = s.trim_start_matches('\\');
@@ -106,26 +115,57 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
         return vfs.getattr(ROOT_INO).map_err(vfs_to_winfsp_err);
     }
 
-    let mut current_ino = ROOT_INO;
+    let mut ino_stack: Vec<u64> = vec![ROOT_INO];
+
     for component in s.split('\\') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            if ino_stack.len() > 1 {
+                ino_stack.pop();
+            }
+            continue;
+        }
+        // Strip trailing dots and spaces (Win32 path normalisation)
+        let component = component.trim_end_matches(|c: char| c == '.' || c == ' ');
         if component.is_empty() {
             continue;
         }
+        let current_ino = *ino_stack.last().unwrap();
         let attr = vfs
             .lookup(current_ino, component.as_bytes())
             .map_err(vfs_to_winfsp_err)?;
-        current_ino = attr.ino;
+        ino_stack.push(attr.ino);
     }
 
-    vfs.getattr(current_ino).map_err(vfs_to_winfsp_err)
+    let final_ino = *ino_stack.last().unwrap();
+    vfs.getattr(final_ino).map_err(vfs_to_winfsp_err)
 }
 
 /// Resolve the parent directory inode for a given path.
+///
+/// Handles `.`, `..`, and trailing-dot/space stripping like `resolve_path`.
 fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u8>)> {
     let s = path.to_string_lossy();
     let s = s.trim_start_matches('\\');
 
-    let components: Vec<&str> = s.split('\\').filter(|c| !c.is_empty()).collect();
+    // Normalise components: skip `.`, resolve `..`, strip trailing dots/spaces.
+    let mut components: Vec<String> = Vec::new();
+    for raw in s.split('\\') {
+        if raw.is_empty() || raw == "." {
+            continue;
+        }
+        if raw == ".." {
+            components.pop();
+            continue;
+        }
+        let trimmed = raw.trim_end_matches(|c: char| c == '.' || c == ' ');
+        if !trimmed.is_empty() {
+            components.push(trimmed.to_string());
+        }
+    }
+
     if components.is_empty() {
         return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
     }
@@ -312,11 +352,18 @@ impl FileSystemContext for StudioFsContext {
         _security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
+        trace!("get_security_by_name {:?}", file_name.to_string_lossy());
         if let Some(security) = resolve_reparse_points(file_name) {
             return Ok(security);
         }
 
-        let attr = resolve_path(&self.vfs, file_name)?;
+        let attr = match resolve_path(&self.vfs, file_name) {
+            Ok(a) => a,
+            Err(e) => {
+                trace!("get_security_by_name FAILED {:?}: {:?}", file_name.to_string_lossy(), e);
+                return Err(e);
+            }
+        };
         let file_attributes = match attr.kind {
             FileType::Directory => 0x10u32,
             FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
@@ -337,6 +384,7 @@ impl FileSystemContext for StudioFsContext {
         _granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        trace!("open {:?}", file_name.to_string_lossy());
         let attr = resolve_path(&self.vfs, file_name)?;
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;

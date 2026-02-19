@@ -2,3 +2,4 @@ target/
 *.db
 Cargo.lock
 /docs/ideas
+docs/logs/*.*
