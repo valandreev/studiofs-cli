@@ -35,6 +35,7 @@ use thiserror::Error;
 use tracing::{debug, info, error, warn};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, Semaphore};
+use crate::readahead::ReadAheadTracker;
 
 // =============================================================================
 // Error Types
@@ -99,6 +100,10 @@ pub struct VfsConfig {
     /// On cache hit, no decompression is needed. Uses slightly more disk space
     /// but is a net win for low-compressibility content (VFX, compressed media).
     pub store_decompressed: bool,
+    /// Number of blocks to prefetch ahead when a sequential access pattern is
+    /// detected.  0 disables read-ahead entirely.  Default: 8 (= 32 MB with
+    /// 4 MB blocks).
+    pub readahead_width: u32,
 }
 
 impl Default for VfsConfig {
@@ -111,6 +116,7 @@ impl Default for VfsConfig {
             max_concurrent_uploads: 32,
             upload_retries: 3,
             store_decompressed: true,
+            readahead_width: 8,
         }
     }
 }
@@ -181,6 +187,11 @@ pub struct StudioVfs {
     /// When true: cache reads skip decompression; uploads re-use pre-compressed data
     /// from pending_upload_data instead of compressing again.
     store_decompressed: bool,
+    /// Sequential read-ahead tracker.
+    readahead: Arc<ReadAheadTracker>,
+    /// Channel sender for scheduling background prefetch tasks.
+    /// The receiver lives in a spawned task that has an Arc<Self>.
+    prefetch_tx: tokio::sync::mpsc::UnboundedSender<(Ino, u32)>,
 }
 
 impl StudioVfs {
@@ -203,6 +214,11 @@ impl StudioVfs {
         // Init Writeback Manager
         let (writeback, upload_rx) = WritebackManager::new(cache_dir, disk_cache.clone());
 
+        // Init ReadAhead tracker + prefetch channel
+        let readahead = Arc::new(ReadAheadTracker::new(8));
+        let (prefetch_tx, mut prefetch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
+
         let vfs = Arc::new(Self {
             meta,
             data,
@@ -221,6 +237,19 @@ impl StudioVfs {
             upload_semaphore: Arc::new(Semaphore::new(32)),
             upload_retries: 3,
             store_decompressed: true,
+            readahead: readahead.clone(),
+            prefetch_tx,
+        });
+
+        // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
+        let vfs_for_prefetch = vfs.clone();
+        tokio::spawn(async move {
+            while let Some((ino, block_idx)) = prefetch_rx.recv().await {
+                let v = vfs_for_prefetch.clone();
+                tokio::spawn(async move {
+                    let _ = v.read_block_for_prefetch(ino, block_idx).await;
+                });
+            }
         });
 
         // Spawn Upload Worker
@@ -462,82 +491,18 @@ impl StudioVfs {
     // =========================================================================
 
     /// Read file data at the given offset.
-    /// Uses parallel block fetching (up to 16 concurrent blocks) for improved throughput.
+    /// Delegates to `read_into()` to avoid code duplication.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         let attr = self.getattr(ino)?;
-
-        // Clamp read to file size
         let end = (offset + size as u64).min(attr.size);
         if offset >= end {
             return Ok(Bytes::new());
         }
         let effective_size = (end - offset) as usize;
-
-        // Pre-compute all blocks needed
-        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new(); // (block_index, offset_in_block, to_copy)
-        let mut cur = offset;
-        while cur < end {
-            let idx = block_index_from_offset(cur, self.block_size);
-            let off_in = offset_within_block(cur, self.block_size) as usize;
-            let space = self.block_size as usize - off_in;
-            let to_copy = (end - cur).min(space as u64) as usize;
-            blocks_needed.push((idx, off_in, to_copy));
-            cur += to_copy as u64;
-        }
-
-        // If only one block, read sequentially to avoid overhead
-        if blocks_needed.len() == 1 {
-            let (block_idx, off_in, to_copy) = blocks_needed[0];
-            let block_data = self.read_block_or_pending(ino, block_idx).await?;
-            let slice = if to_copy == 0 {
-                vec![0u8; to_copy]
-            } else {
-                block_data[off_in..off_in + to_copy].to_vec()
-            };
-            return Ok(Bytes::from(slice));
-        }
-
-        // Parallel fetch with concurrency limit (16 concurrent reads)
-        const CONCURRENT_LIMIT: usize = 16;
-        let semaphore = Arc::new(Semaphore::new(CONCURRENT_LIMIT));
-
-        let fetch_futures: Vec<_> = blocks_needed
-            .iter()
-            .map(|(idx, _, _)| {
-                let sem = semaphore.clone();
-                let block_idx = *idx;
-                async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    self.read_block_or_pending(ino, block_idx).await
-                }
-            })
-            .collect();
-
-        // Execute all fetches in parallel
-        let fetched = futures::future::join_all(fetch_futures).await;
-
-        // Assemble result
-        let mut result = BytesMut::with_capacity(effective_size);
-        for (i, block_result) in fetched.iter().enumerate() {
-            let (_block_idx, off_in, to_copy) = blocks_needed[i];
-            match block_result {
-                Ok(block_data) => {
-                    let slice = if to_copy == 0 || off_in >= block_data.len() {
-                        vec![0u8; to_copy]
-                    } else {
-                        let actual_copy = to_copy.min(block_data.len() - off_in);
-                        block_data[off_in..off_in + actual_copy].to_vec()
-                    };
-                    result.extend_from_slice(&slice);
-                }
-                Err(_) => {
-                    // Missing block - fill with zeros
-                    result.extend(std::iter::repeat(0u8).take(to_copy));
-                }
-            }
-        }
-
-        Ok(result.freeze())
+        let mut buf = vec![0u8; effective_size];
+        let written = self.read_into(ino, offset, &mut buf).await?;
+        buf.truncate(written as usize);
+        Ok(Bytes::from(buf))
     }
 
     /// Read file data directly into a provided buffer (P1.3 — avoid intermediate Bytes allocation).
@@ -578,6 +543,7 @@ impl StudioVfs {
             if copy_len > 0 {
                 buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
             }
+            self.maybe_prefetch(ino, &blocks_needed);
             return Ok(copy_len as u32);
         }
 
@@ -626,7 +592,26 @@ impl StudioVfs {
             }
         }
 
+        self.maybe_prefetch(ino, &blocks_needed);
         Ok(written as u32)
+    }
+
+    /// Trigger read-ahead prefetches if a sequential access pattern is detected.
+    /// Called after every successful `read_into()` to amortise scheduling overhead.
+    #[inline]
+    fn maybe_prefetch(&self, ino: Ino, blocks_needed: &[(u32, usize, usize)]) {
+        if blocks_needed.is_empty() || self.readahead.width == 0 {
+            return;
+        }
+        let first_block = blocks_needed[0].0;
+        let last_block = blocks_needed.last().unwrap().0;
+        let to_prefetch = self.readahead.record_read(ino, first_block, last_block);
+        for block_idx in to_prefetch {
+            if self.readahead.start_prefetch(ino, block_idx) {
+                // Best-effort; ignore send errors (worker may have exited).
+                let _ = self.prefetch_tx.send((ino, block_idx));
+            }
+        }
     }
 
     /// Read a block from storage or pending writes. Helper for parallel reads.
@@ -641,6 +626,25 @@ impl StudioVfs {
 
         // Read from storage
         self.read_block(ino, block_index).await
+    }
+
+    /// Prefetch a block into cache (called from spawned prefetch tasks).
+    ///
+    /// Like `read_block()` but silently ignores errors and always marks the
+    /// readahead inflight state as done when finished.
+    async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
+        // Skip if already in memory cache (hot L1 check before any I/O)
+        let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
+        if let Some(mc) = &self.mem_cache {
+            if mc.get(&mem_key).is_some() {
+                self.readahead.finish_prefetch(ino, block_index);
+                return;
+            }
+        }
+
+        // Fetch from disk cache or S3 (read_block handles all cache levels)
+        let _ = self.read_block(ino, block_index).await;
+        self.readahead.finish_prefetch(ino, block_index);
     }
 
     /// Read a single block from storage, with in-flight request coalescing.
