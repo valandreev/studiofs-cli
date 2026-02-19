@@ -855,6 +855,79 @@ impl MetaEngine for RedbMetaEngine {
         Ok(displaced_ino)
     }
 
+    // --- Hardlinks -------------------------------------------------------
+
+    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let result;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // 1. Ensure new_name doesn't already exist
+            let dst_key = encode_dentry_key(new_parent, new_name);
+            let existing = dentries
+                .get(dst_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some();
+            if existing {
+                return Err(MetaError::EntryExists {
+                    parent: new_parent,
+                    name: String::from_utf8_lossy(new_name).to_string(),
+                });
+            }
+
+            // 2. Increment nlink + update ctime on the target inode
+            let attr_bytes = inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec())
+                .ok_or(MetaError::InodeNotFound(ino))?;
+            let mut attr: InodeAttr = decode(&attr_bytes)?;
+            attr.nlink += 1;
+            attr.touch_ctime();
+            let data = encode(&attr)?;
+            inodes
+                .insert(ino, data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // 3. Add new dentry pointing to the existing inode
+            let entry_val = encode(&DirEntryValue {
+                ino,
+                kind: attr.kind,
+            })?;
+            dentries
+                .insert(dst_key.as_slice(), entry_val.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // 4. Touch parent mtime
+            let parent_bytes = inodes
+                .get(new_parent)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(bytes) = parent_bytes {
+                let mut parent_attr: InodeAttr = decode(&bytes)?;
+                parent_attr.touch_mtime();
+                let pdata = encode(&parent_attr)?;
+                inodes
+                    .insert(new_parent, pdata.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            result = attr;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
     // --- Symlinks --------------------------------------------------------
 
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
@@ -1315,5 +1388,86 @@ mod tests {
 
         let result = engine.create_symlink(ROOT_INO, b"existing", b"/target", 0, 0);
         assert!(result.is_err());
+    }
+
+    // === Hardlink Tests ===
+
+    #[test]
+    fn test_link_basic() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"original.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        assert_eq!(attr.nlink, 1);
+
+        // Create hardlink
+        let linked = engine.link(ino, ROOT_INO, b"hardlink.txt").unwrap();
+        assert_eq!(linked.ino, ino);
+        assert_eq!(linked.nlink, 2);
+
+        // Both names should resolve to the same inode
+        let entry1 = engine.lookup(ROOT_INO, b"original.txt").unwrap();
+        let entry2 = engine.lookup(ROOT_INO, b"hardlink.txt").unwrap();
+        assert_eq!(entry1.ino, ino);
+        assert_eq!(entry2.ino, ino);
+    }
+
+    #[test]
+    fn test_link_directory_fails() {
+        let engine = temp_engine();
+
+        let dir = engine
+            .create_dir(ROOT_INO, b"mydir", 0, 0, 0o755)
+            .unwrap();
+
+        let result = engine.link(dir.ino, ROOT_INO, b"dir_link");
+        assert!(result.is_err()); // EPERM: can't hardlink directories
+    }
+
+    #[test]
+    fn test_link_duplicate_name_fails() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .unwrap();
+        engine
+            .create_file(ROOT_INO, b"taken.txt", 0, 0, 0o644)
+            .unwrap();
+
+        let result = engine.link(attr.ino, ROOT_INO, b"taken.txt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_link_unlink_nlink_tracking() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        // Create two hardlinks: nlink should be 3
+        engine.link(ino, ROOT_INO, b"b.txt").unwrap();
+        let linked = engine.link(ino, ROOT_INO, b"c.txt").unwrap();
+        assert_eq!(linked.nlink, 3);
+
+        // Unlink one: nlink=2, inode still exists
+        let unlinked = engine.unlink(ROOT_INO, b"a.txt").unwrap();
+        assert_eq!(unlinked.nlink, 2);
+        assert!(engine.get_attr(ino).is_ok());
+
+        // Unlink another: nlink=1, still exists
+        let unlinked2 = engine.unlink(ROOT_INO, b"b.txt").unwrap();
+        assert_eq!(unlinked2.nlink, 1);
+        assert!(engine.get_attr(ino).is_ok());
+
+        // Unlink last: nlink=0, inode removed
+        let unlinked3 = engine.unlink(ROOT_INO, b"c.txt").unwrap();
+        assert_eq!(unlinked3.nlink, 0);
+        assert!(engine.get_attr(ino).is_err());
     }
 }

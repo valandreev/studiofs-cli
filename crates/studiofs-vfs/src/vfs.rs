@@ -66,6 +66,9 @@ pub enum VfsError {
     #[error("block not found: inode {0}, block {1}")]
     BlockNotFound(Ino, u32),
 
+    #[error("lock conflict (EAGAIN)")]
+    WouldBlock,
+
     #[error("{0}")]
     Other(String),
 }
@@ -166,6 +169,30 @@ impl std::ops::BitOr for OpenFlags {
 pub struct OpenFile {
     pub ino: Ino,
     pub flags: OpenFlags,
+}
+
+// =============================================================================
+// File Locking (flock)
+// =============================================================================
+
+/// File-level lock kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockKind {
+    /// Shared (read) lock.
+    Shared,
+    /// Exclusive (write) lock.
+    Exclusive,
+    /// Unlock.
+    Unlock,
+}
+
+/// Internal state for a file-level lock.
+#[derive(Debug)]
+struct FileLock {
+    kind: LockKind,
+    owner: u64,
+    /// Number of shared locks held (only meaningful when `kind == Shared`).
+    shared_count: u32,
 }
 
 /// Per-VFS handle table tracking all open file descriptors.
@@ -275,6 +302,10 @@ struct VfsState {
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
+    /// File-level locks (flock semantics).
+    file_locks: Mutex<std::collections::HashMap<Ino, FileLock>>,
+    /// Notification for waiters blocked on flock.
+    lock_notify: tokio::sync::Notify,
 }
 
 // =============================================================================
@@ -368,6 +399,8 @@ impl StudioVfs {
                 dirty_mem: Mutex::new(std::collections::HashMap::new()),
                 dirty_bytes: AtomicUsize::new(0),
                 deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+                file_locks: Mutex::new(std::collections::HashMap::new()),
+                lock_notify: tokio::sync::Notify::new(),
             }),
             upload_semaphore: Arc::new(Semaphore::new(32)),
             upload_retries: 3,
@@ -684,6 +717,110 @@ impl StudioVfs {
         self.handle_table.open_count(ino)
     }
 
+    // =========================================================================
+    // File Locking (flock)
+    // =========================================================================
+
+    /// Acquire or release a file-level lock (flock semantics).
+    ///
+    /// - `Shared`: multiple readers allowed, blocks if exclusive lock held by another owner.
+    /// - `Exclusive`: single writer, blocks if any lock held by another owner.
+    /// - `Unlock`: release the lock.
+    ///
+    /// If `blocking` is false and the lock cannot be acquired, returns `VfsError::WouldBlock`.
+    pub async fn flock(&self, ino: Ino, op: LockKind, owner: u64, blocking: bool) -> VfsResult<()> {
+        loop {
+            {
+                let mut locks = self.state.file_locks.lock();
+                match op {
+                    LockKind::Shared => {
+                        let entry = locks.entry(ino).or_insert(FileLock {
+                            kind: LockKind::Unlock,
+                            owner: 0,
+                            shared_count: 0,
+                        });
+                        match entry.kind {
+                            LockKind::Unlock | LockKind::Shared => {
+                                entry.kind = LockKind::Shared;
+                                entry.shared_count += 1;
+                                return Ok(());
+                            }
+                            LockKind::Exclusive if entry.owner == owner => {
+                                // Downgrade exclusive → shared
+                                entry.kind = LockKind::Shared;
+                                entry.shared_count = 1;
+                                return Ok(());
+                            }
+                            LockKind::Exclusive => {
+                                // Blocked by another owner's exclusive lock
+                            }
+                        }
+                    }
+                    LockKind::Exclusive => {
+                        let entry = locks.entry(ino).or_insert(FileLock {
+                            kind: LockKind::Unlock,
+                            owner: 0,
+                            shared_count: 0,
+                        });
+                        match entry.kind {
+                            LockKind::Unlock => {
+                                *entry = FileLock {
+                                    kind: LockKind::Exclusive,
+                                    owner,
+                                    shared_count: 0,
+                                };
+                                return Ok(());
+                            }
+                            LockKind::Exclusive if entry.owner == owner => {
+                                // Already held by us — re-entrant
+                                return Ok(());
+                            }
+                            _ => {
+                                // Blocked by another owner
+                            }
+                        }
+                    }
+                    LockKind::Unlock => {
+                        if let Some(entry) = locks.get_mut(&ino) {
+                            match entry.kind {
+                                LockKind::Shared => {
+                                    entry.shared_count = entry.shared_count.saturating_sub(1);
+                                    if entry.shared_count == 0 {
+                                        locks.remove(&ino);
+                                    }
+                                }
+                                LockKind::Exclusive if entry.owner == owner => {
+                                    locks.remove(&ino);
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.state.lock_notify.notify_waiters();
+                        return Ok(());
+                    }
+                }
+            }
+            // If we get here, the lock could not be acquired
+            if !blocking {
+                return Err(VfsError::WouldBlock);
+            }
+            self.state.lock_notify.notified().await;
+        }
+    }
+
+    // =========================================================================
+    // Hardlinks
+    // =========================================================================
+
+    /// Create a hard link: add a new directory entry pointing to an existing inode.
+    pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
+        let attr = self.meta.link(ino, new_parent, new_name)?;
+        // Invalidate attr caches (nlink changed)
+        self.state.attr_read_cache.lock().remove(&ino);
+        self.state.dirty_attrs.lock().remove(&ino);
+        Ok(attr)
+    }
+
     /// Create a regular file.
     pub fn create(
         &self,
@@ -775,55 +912,65 @@ impl StudioVfs {
             // No open handles — immediate full cleanup via meta.unlink()
             let attr = self.meta.unlink(parent, name)?;
 
-            // Mark this inode as deleted FIRST — the background slab flusher checks
-            // this set to avoid re-inserting evicted blocks (race condition fix).
-            self.state.deleted_inodes.lock().insert(attr.ino);
+            if attr.nlink == 0 {
+                // Inode fully removed — clean up blocks, caches, pending writes.
 
-            // Remove all blocks and mark for GC
-            let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
-            let cache_size_before = self.disk_cache.current_size();
-            info!(
-                "unlink ino={}: removed {} block refs, object_ids={:?}, cache_size_before={}",
-                attr.ino,
-                removed_ids.len(),
-                removed_ids,
-                cache_size_before,
-            );
+                // Mark this inode as deleted FIRST — the background slab flusher checks
+                // this set to avoid re-inserting evicted blocks (race condition fix).
+                self.state.deleted_inodes.lock().insert(attr.ino);
 
-            // Add to pending deletions (for eventual S3 deletion via background GC)
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+                // Remove all blocks and mark for GC
+                let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
+                let cache_size_before = self.disk_cache.current_size();
+                info!(
+                    "unlink ino={}: removed {} block refs, object_ids={:?}, cache_size_before={}",
+                    attr.ino,
+                    removed_ids.len(),
+                    removed_ids,
+                    cache_size_before,
+                );
 
-            for object_id in &removed_ids {
-                self.meta.add_pending_deletion(*object_id, timestamp)?;
-                debug!("marking object {} for deletion (unlink)", object_id);
+                // Add to pending deletions (for eventual S3 deletion via background GC)
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                for object_id in &removed_ids {
+                    self.meta.add_pending_deletion(*object_id, timestamp)?;
+                    debug!("marking object {} for deletion (unlink)", object_id);
+                }
+
+                // Clear pending blocks buffer
+                self.state
+                    .pending_blocks
+                    .lock()
+                    .retain(|(ino, _), _| *ino != attr.ino);
+
+                // Immediately evict all cached blocks for this inode — no need to wait for GC.
+                self.evict_inode_from_caches(attr.ino, &removed_ids);
+
+                // Delete empty slab files so physical disk space is reclaimed.
+                let slabs_deleted = self.disk_cache.cleanup_empty_slabs();
+
+                let cache_size_after = self.disk_cache.current_size();
+                info!(
+                    "unlink ino={}: cache_size_after={}, freed={} bytes, slabs_deleted={}",
+                    attr.ino,
+                    cache_size_after,
+                    cache_size_before.saturating_sub(cache_size_after),
+                    slabs_deleted,
+                );
+
+                // Clear dirty attrs and read-through cache
+                self.state.dirty_attrs.lock().remove(&attr.ino);
+            } else {
+                info!(
+                    "unlink ino={}: nlink={}, keeping inode alive (hardlink)",
+                    attr.ino, attr.nlink
+                );
             }
 
-            // Clear pending blocks buffer
-            self.state
-                .pending_blocks
-                .lock()
-                .retain(|(ino, _), _| *ino != attr.ino);
-
-            // Immediately evict all cached blocks for this inode — no need to wait for GC.
-            self.evict_inode_from_caches(attr.ino, &removed_ids);
-
-            // Delete empty slab files so physical disk space is reclaimed.
-            let slabs_deleted = self.disk_cache.cleanup_empty_slabs();
-
-            let cache_size_after = self.disk_cache.current_size();
-            info!(
-                "unlink ino={}: cache_size_after={}, freed={} bytes, slabs_deleted={}",
-                attr.ino,
-                cache_size_after,
-                cache_size_before.saturating_sub(cache_size_after),
-                slabs_deleted,
-            );
-
-            // Clear dirty attrs and read-through cache
-            self.state.dirty_attrs.lock().remove(&attr.ino);
             self.state.attr_read_cache.lock().remove(&attr.ino);
         }
 

@@ -5,6 +5,6 @@
 pub mod readahead;
 pub mod vfs;
 
-pub use vfs::{OpenFile, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsResult};
+pub use vfs::{LockKind, OpenFile, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsResult};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use readahead::ReadAheadTracker;

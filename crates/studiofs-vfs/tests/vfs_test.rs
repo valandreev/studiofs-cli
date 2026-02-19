@@ -18,7 +18,7 @@ use std::sync::Arc;
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_data::object::{create_object, read_object, format_object_key};
 use studiofs_meta::{RedbMetaEngine, MetaEngine, FormatInfo, types::BlockRef};
-use studiofs_vfs::{OpenFlags, StudioVfs};
+use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 
@@ -837,4 +837,159 @@ async fn test_symlink_in_readdir() {
 
     let file_entry = entries.iter().find(|e| e.name == b"file.txt").unwrap();
     assert_eq!(file_entry.kind, studiofs_meta::FileType::RegularFile);
+}
+
+// =============================================================================
+// Phase 5 — Hardlink Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_hardlink_create_and_read() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hardlink_create");
+
+    // Create a file and write data
+    let attr = vfs.create(1, b"original.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    vfs.write(ino, 0, b"hardlink data").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Create hardlink
+    let linked = vfs.link(ino, 1, b"linked.txt").unwrap();
+    assert_eq!(linked.ino, ino);
+    assert_eq!(linked.nlink, 2);
+
+    // Read data via original inode
+    let data1 = vfs.read(ino, 0, 1024).await.unwrap();
+    assert_eq!(&data1[..], b"hardlink data");
+
+    // The linked file has the same ino
+    let lookup = vfs.lookup(1, b"linked.txt").unwrap();
+    assert_eq!(lookup.ino, ino);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_hardlink_unlink_keeps_data() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hardlink_unlink");
+
+    // Create a file and write data
+    let attr = vfs.create(1, b"src.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    vfs.write(ino, 0, b"survive unlink").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Create hardlink, then remove the original
+    vfs.link(ino, 1, b"backup.txt").unwrap();
+    vfs.unlink(1, b"src.txt").unwrap();
+
+    // Inode still accessible via hardlink name
+    let lookup = vfs.lookup(1, b"backup.txt").unwrap();
+    assert_eq!(lookup.ino, ino);
+    assert_eq!(lookup.nlink, 1);
+
+    // Data still readable
+    let data = vfs.read(ino, 0, 1024).await.unwrap();
+    assert_eq!(&data[..], b"survive unlink");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_hardlink_dir_fails() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hardlink_dir_fail");
+
+    let dir = vfs.mkdir(1, b"mydir", 0, 0, 0o755).unwrap();
+    let result = vfs.link(dir.ino, 1, b"dir_link");
+    assert!(result.is_err());
+}
+
+// =============================================================================
+// Phase 5 — Flock Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_flock_exclusive_blocks() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "flock_excl");
+
+    let attr = vfs.create(1, b"locked.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Owner 1 takes exclusive lock
+    vfs.flock(ino, LockKind::Exclusive, 1, false).await.unwrap();
+
+    // Owner 2 non-blocking exclusive should fail with WouldBlock
+    let result = vfs.flock(ino, LockKind::Exclusive, 2, false).await;
+    assert!(matches!(result, Err(VfsError::WouldBlock)));
+
+    // Owner 2 non-blocking shared should also fail
+    let result2 = vfs.flock(ino, LockKind::Shared, 2, false).await;
+    assert!(matches!(result2, Err(VfsError::WouldBlock)));
+
+    // Owner 1 unlocks
+    vfs.flock(ino, LockKind::Unlock, 1, false).await.unwrap();
+
+    // Now owner 2 can take the lock
+    vfs.flock(ino, LockKind::Exclusive, 2, false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_flock_shared_allows_multiple() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "flock_shared");
+
+    let attr = vfs.create(1, b"shared.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Multiple owners can hold shared locks
+    vfs.flock(ino, LockKind::Shared, 1, false).await.unwrap();
+    vfs.flock(ino, LockKind::Shared, 2, false).await.unwrap();
+    vfs.flock(ino, LockKind::Shared, 3, false).await.unwrap();
+
+    // Exclusive lock should be blocked
+    let result = vfs.flock(ino, LockKind::Exclusive, 4, false).await;
+    assert!(matches!(result, Err(VfsError::WouldBlock)));
+
+    // Unlock all shared locks
+    vfs.flock(ino, LockKind::Unlock, 1, false).await.unwrap();
+    vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
+    vfs.flock(ino, LockKind::Unlock, 3, false).await.unwrap();
+
+    // Now exclusive should succeed
+    vfs.flock(ino, LockKind::Exclusive, 4, false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_flock_unlock_and_relock() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "flock_relock");
+
+    let attr = vfs.create(1, b"relock.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Lock, unlock, then a different owner can lock
+    vfs.flock(ino, LockKind::Exclusive, 10, false)
+        .await
+        .unwrap();
+    vfs.flock(ino, LockKind::Unlock, 10, false).await.unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 20, false)
+        .await
+        .unwrap();
+
+    // Re-entrant: same owner can re-lock
+    vfs.flock(ino, LockKind::Exclusive, 20, false)
+        .await
+        .unwrap();
 }

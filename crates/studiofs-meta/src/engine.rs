@@ -285,6 +285,23 @@ pub trait MetaEngine: Send + Sync {
         Ok(())
     }
 
+    // ─── Hardlinks ───────────────────────────────────────────────────────
+
+    /// Create a hard link in a single atomic transaction.
+    ///
+    /// Increments the inode's nlink and adds a new directory entry pointing
+    /// to the existing inode.  Directories cannot be hardlinked.
+    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Create a hard link (validates and delegates to `link_atomic`).
+    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        let attr = self.get_attr(ino)?;
+        if attr.kind == FileType::Directory {
+            return Err(MetaError::IsADirectory(ino));
+        }
+        self.link_atomic(ino, new_parent, new_name)
+    }
+
     // ─── Symlinks ────────────────────────────────────────────────────────
 
     /// Store a symlink target for the given inode.

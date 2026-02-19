@@ -9,7 +9,7 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use studiofs_meta::FileType;
-use studiofs_vfs::{OpenFlags, StudioVfs, VfsError};
+use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
@@ -49,6 +49,7 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
             _ => libc::EIO,
         },
         VfsError::BlockNotFound(_, _) => libc::EIO,
+        VfsError::WouldBlock => libc::EAGAIN,
         _ => libc::EIO,
     }
 }
@@ -266,6 +267,27 @@ impl Filesystem for StudioFuseFs {
             Ok(target) => reply.data(&target),
             Err(e) => {
                 error!("readlink({ino}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let name = newname.to_string_lossy().as_bytes().to_vec();
+        match self.vfs.link(ino, newparent, &name) {
+            Ok(attr) => {
+                let fattr = to_fuse_attr(&attr, self.mount_uid, self.mount_gid);
+                reply.entry(&TTL, &fattr, 0);
+            }
+            Err(e) => {
+                error!("link({ino}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -564,5 +586,50 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEmpty,
     ) {
         reply.ok();
+    }
+
+    fn setlk(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        typ: i32,
+        _pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        // File-level semantics only (byte ranges ignored)
+        let op = match typ {
+            libc::F_RDLCK => LockKind::Shared,
+            libc::F_WRLCK => LockKind::Exclusive,
+            libc::F_UNLCK => LockKind::Unlock,
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+        match self.rt.block_on(self.vfs.flock(ino, op, lock_owner, sleep)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn getlk(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        start: u64,
+        end: u64,
+        _typ: i32,
+        _pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        // Report no conflicting locks (single-node simplification)
+        reply.locked(start as i64, end as i64, libc::F_UNLCK, 0);
     }
 }
