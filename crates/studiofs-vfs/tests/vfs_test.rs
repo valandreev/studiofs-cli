@@ -44,7 +44,7 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
 
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("failed to open RedbMetaEngine"));
-    meta.init_root().expect("failed to initialize root inode");
+    meta.init_root(0, 0).expect("failed to initialize root inode");
 
     // Set format info
     let format_info = make_format_info(volume_suffix);
