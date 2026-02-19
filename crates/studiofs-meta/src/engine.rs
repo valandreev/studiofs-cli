@@ -284,4 +284,49 @@ pub trait MetaEngine: Send + Sync {
         self.rename_atomic(parent, name, new_parent, new_name)?;
         Ok(())
     }
+
+    // ─── Symlinks ────────────────────────────────────────────────────────
+
+    /// Store a symlink target for the given inode.
+    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()>;
+
+    /// Get the symlink target for the given inode.
+    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>;
+
+    /// Create a symlink: allocate inode, store target, add dentry.
+    fn create_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr> {
+        let parent_attr = self.get_attr(parent)?;
+        if parent_attr.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(parent));
+        }
+
+        if self.lookup(parent, name).is_ok() {
+            return Err(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            });
+        }
+
+        let ino = self.next_inode()?;
+        let attr = InodeAttr::new_symlink(ino, parent, uid, gid, target.len());
+        self.set_attr(&attr)?;
+        self.set_symlink_target(ino, target)?;
+        self.add_entry(
+            parent,
+            name,
+            &DirEntryValue {
+                ino,
+                kind: FileType::Symlink,
+            },
+        )?;
+        self.incr_counter(counters::TOTAL_INODES, 1)?;
+        Ok(attr)
+    }
 }

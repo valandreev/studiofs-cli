@@ -10,6 +10,7 @@ use fuser::{
 };
 use studiofs_meta::FileType;
 use studiofs_vfs::{OpenFlags, StudioVfs, VfsError};
+use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 
@@ -241,6 +242,35 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
+    fn symlink(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let name = link_name.to_string_lossy().as_bytes().to_vec();
+        let tgt = target.to_string_lossy().as_bytes().to_vec();
+        match self.vfs.symlink(parent, &name, &tgt, req.uid(), req.gid()) {
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
+            Err(e) => {
+                error!("symlink({parent}, {:?}) -> {e}", link_name);
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        match self.vfs.readlink(ino) {
+            Ok(target) => reply.data(&target),
+            Err(e) => {
+                error!("readlink({ino}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -433,12 +463,12 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -447,7 +477,31 @@ impl Filesystem for StudioFuseFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        match self.vfs.setattr(ino, size) {
+        let args = SetattrArgs {
+            size,
+            mode: mode.map(|m| m as u16),
+            uid,
+            gid,
+            atime: match atime {
+                Some(fuser::TimeOrNow::SpecificTime(st)) => TimeSpec::Set(
+                    st.duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                ),
+                Some(fuser::TimeOrNow::Now) => TimeSpec::Now,
+                None => TimeSpec::Omit,
+            },
+            mtime: match mtime {
+                Some(fuser::TimeOrNow::SpecificTime(st)) => TimeSpec::Set(
+                    st.duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                ),
+                Some(fuser::TimeOrNow::Now) => TimeSpec::Now,
+                None => TimeSpec::Omit,
+            },
+        };
+        match self.vfs.setattr(ino, args) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 error!("setattr({ino}) -> {e}");

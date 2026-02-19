@@ -31,6 +31,9 @@ const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("f
 const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
     TableDefinition::new("pending_deletions");
 
+/// Symlink targets: ino (u64) -> target path (&[u8])
+const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlinks");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -107,6 +110,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(FILE_BLOCKS_TABLE);
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
+            let _ = txn.open_table(SYMLINKS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -342,6 +346,12 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .remove(ino)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // Cascade: remove symlink target if exists
+            let mut symlinks = txn
+                .open_table(SYMLINKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = symlinks.remove(ino);
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -844,6 +854,41 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(displaced_ino)
     }
+
+    // --- Symlinks --------------------------------------------------------
+
+    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(SYMLINKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(ino, target)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let raw = table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .ok_or(MetaError::InodeNotFound(ino))?;
+        Ok(raw.value().to_vec())
+    }
 }
 
 #[cfg(test)]
@@ -1201,5 +1246,74 @@ mod tests {
 
         assert_eq!(id2, id1 + 1);
         assert_eq!(id3, id2 + 1);
+    }
+
+    // === Symlink Tests ===
+
+    #[test]
+    fn test_create_symlink() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_symlink(ROOT_INO, b"link1", b"/tmp/target", 1000, 1000)
+            .unwrap();
+        assert_eq!(attr.kind, FileType::Symlink);
+        assert_eq!(attr.mode, 0o777);
+        assert_eq!(attr.size, 11); // length of "/tmp/target"
+        assert_eq!(attr.uid, 1000);
+        assert_eq!(attr.gid, 1000);
+
+        // Verify target is stored
+        let target = engine.get_symlink_target(attr.ino).unwrap();
+        assert_eq!(&target, b"/tmp/target");
+
+        // Verify dentry exists
+        let looked_up = engine.lookup(ROOT_INO, b"link1").unwrap();
+        assert_eq!(looked_up.ino, attr.ino);
+        assert_eq!(looked_up.kind, FileType::Symlink);
+    }
+
+    #[test]
+    fn test_symlink_target_stored_and_retrieved() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_symlink(ROOT_INO, b"mylink", b"relative/path/to/file", 0, 0)
+            .unwrap();
+
+        let target = engine.get_symlink_target(attr.ino).unwrap();
+        assert_eq!(&target, b"relative/path/to/file");
+    }
+
+    #[test]
+    fn test_symlink_remove_cascades() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_symlink(ROOT_INO, b"cascade_link", b"/target", 0, 0)
+            .unwrap();
+        let ino = attr.ino;
+
+        // Verify symlink target exists
+        assert!(engine.get_symlink_target(ino).is_ok());
+
+        // Remove the dentry and attr
+        engine.remove_entry(ROOT_INO, b"cascade_link").unwrap();
+        engine.remove_attr(ino).unwrap();
+
+        // Symlink target should be cleaned up by remove_attr
+        assert!(engine.get_symlink_target(ino).is_err());
+    }
+
+    #[test]
+    fn test_symlink_duplicate_name_fails() {
+        let engine = temp_engine();
+
+        engine
+            .create_file(ROOT_INO, b"existing", 0, 0, 0o644)
+            .unwrap();
+
+        let result = engine.create_symlink(ROOT_INO, b"existing", b"/target", 0, 0);
+        assert!(result.is_err());
     }
 }

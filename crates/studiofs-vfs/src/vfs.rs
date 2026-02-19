@@ -461,28 +461,62 @@ impl StudioVfs {
     }
 
     /// Set file attributes (partial update).
-    pub fn setattr(&self, ino: Ino, size: Option<u64>) -> VfsResult<InodeAttr> {
+    ///
+    /// Accepts `SetattrArgs` — any field set to `None`/`Omit` is left unchanged.
+    pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
         let mut attr = self.getattr(ino)?;
+        let mut changed = false;
 
-        if let Some(new_size) = size {
-            // Truncate or extend
-            if new_size < attr.size {
-                // Truncate - may need to remove blocks
-                self.truncate_blocks(ino, new_size, attr.size)?;
+        if let Some(new_size) = args.size {
+            if new_size != attr.size {
+                if new_size < attr.size {
+                    // Truncate - may need to remove blocks
+                    self.truncate_blocks(ino, new_size, attr.size)?;
+                }
+                attr.size = new_size;
+                changed = true;
             }
-            attr.size = new_size;
         }
 
-        attr.touch_mtime();
+        if let Some(mode) = args.mode {
+            attr.mode = mode;
+            changed = true;
+        }
 
-        // Store in dirty cache
-        self.state.dirty_attrs.lock().insert(ino, attr.clone());
+        if let Some(uid) = args.uid {
+            attr.uid = uid;
+            changed = true;
+        }
 
-        // Invalidate read-through cache since we've changed the attribute
-        self.state.attr_read_cache.lock().remove(&ino);
+        if let Some(gid) = args.gid {
+            attr.gid = gid;
+            changed = true;
+        }
 
-        // Commit to metadata
-        self.meta.set_attr(&attr)?;
+        if let Some(ns) = args.atime.resolve() {
+            attr.atime = ns;
+            changed = true;
+        }
+
+        if let Some(ns) = args.mtime.resolve() {
+            attr.mtime = ns;
+            changed = true;
+        }
+
+        if changed {
+            // Always update ctime when any attribute changes
+            attr.touch_ctime();
+
+            // Store in dirty cache
+            self.state.dirty_attrs.lock().insert(ino, attr.clone());
+
+            // Invalidate read-through cache since we've changed the attribute
+            self.state.attr_read_cache.lock().remove(&ino);
+
+            // Commit to metadata
+            self.meta.set_attr(&attr)?;
+        }
+
         Ok(attr)
     }
 
@@ -564,7 +598,7 @@ impl StudioVfs {
 
         // If O_TRUNC requested, truncate to 0
         if trunc {
-            self.setattr(ino, Some(0))?;
+            self.setattr(ino, SetattrArgs::size_only(0))?;
         }
 
         let fh = self.handle_table.open(ino, flags);
@@ -678,6 +712,25 @@ impl StudioVfs {
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         Ok(attr)
+    }
+
+    /// Create a symbolic link.
+    pub fn symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> VfsResult<InodeAttr> {
+        let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
+        self.state.attr_read_cache.lock().remove(&parent);
+        Ok(attr)
+    }
+
+    /// Read the target of a symbolic link.
+    pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
+        Ok(self.meta.get_symlink_target(ino)?)
     }
 
     /// Remove a file.

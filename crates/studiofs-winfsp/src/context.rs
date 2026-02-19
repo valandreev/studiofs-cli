@@ -7,6 +7,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
 use studiofs_vfs::{OpenFlags, StudioVfs};
+use studiofs_meta::types::{SetattrArgs, TimeSpec};
+
+// Windows reparse point constants
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
@@ -23,6 +28,7 @@ const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
 const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
 const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
+const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
 
@@ -58,8 +64,13 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 
     info.file_attributes = match attr.kind {
         FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
-        _ => 0x80,                   // FILE_ATTRIBUTE_NORMAL
+        FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
+        _ => 0x80, // FILE_ATTRIBUTE_NORMAL
     };
+
+    if attr.kind == FileType::Symlink {
+        info.reparse_tag = IO_REPARSE_TAG_SYMLINK;
+    }
 
     // Convert timestamps (nanoseconds since epoch → Windows FILETIME)
     // FILETIME is 100ns intervals since 1601-01-01
@@ -131,6 +142,112 @@ fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u
     Ok((parent_ino, name))
 }
 
+/// Encode a symlink target as a Windows REPARSE_DATA_BUFFER (IO_REPARSE_TAG_SYMLINK).
+///
+/// Layout:
+///   ReparseTag                  (u32) = IO_REPARSE_TAG_SYMLINK
+///   ReparseDataLength           (u16)
+///   Reserved                    (u16) = 0
+///   SubstituteNameOffset        (u16)
+///   SubstituteNameLength        (u16)
+///   PrintNameOffset             (u16)
+///   PrintNameLength             (u16)
+///   Flags                       (u32) = SYMLINK_FLAG_RELATIVE (1)
+///   PathBuffer                  (WCHAR[])
+fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
+    // Convert target from UTF-8 bytes to a Windows path string
+    let target_str = String::from_utf8_lossy(target);
+    // Replace / with \ for Windows
+    let win_path = target_str.replace('/', "\\");
+    // Encode as UTF-16LE
+    let utf16: Vec<u16> = win_path.encode_utf16().collect();
+    let name_bytes = utf16.len() * 2; // byte length of UTF-16 name
+
+    // SubstituteName = target, PrintName = target (same content, different offsets)
+    let substitute_offset: u16 = 0;
+    let substitute_len = name_bytes as u16;
+    let print_offset = substitute_len;
+    let print_len = substitute_len;
+
+    // Symlink-specific data = 4 offsets (2 bytes each) + flags (4 bytes) + 2× path
+    let data_len: u16 = 4 * 2 + 4 + substitute_len + print_len;
+
+    // Total: 8 (header) + data_len
+    let total = 8 + data_len as usize;
+    let mut buf = vec![0u8; total];
+
+    // ReparseTag
+    buf[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+    // ReparseDataLength
+    buf[4..6].copy_from_slice(&data_len.to_le_bytes());
+    // Reserved = 0 (already zero)
+    // SubstituteNameOffset
+    buf[8..10].copy_from_slice(&substitute_offset.to_le_bytes());
+    // SubstituteNameLength
+    buf[10..12].copy_from_slice(&substitute_len.to_le_bytes());
+    // PrintNameOffset
+    buf[12..14].copy_from_slice(&print_offset.to_le_bytes());
+    // PrintNameLength
+    buf[14..16].copy_from_slice(&print_len.to_le_bytes());
+    // Flags = SYMLINK_FLAG_RELATIVE = 1
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+    // PathBuffer: SubstituteName then PrintName
+    let path_buf_offset = 20;
+    for (i, &wc) in utf16.iter().enumerate() {
+        let off = path_buf_offset + i * 2;
+        buf[off..off + 2].copy_from_slice(&wc.to_le_bytes());
+    }
+    // PrintName is same content at print_offset
+    let print_start = path_buf_offset + substitute_len as usize;
+    for (i, &wc) in utf16.iter().enumerate() {
+        let off = print_start + i * 2;
+        buf[off..off + 2].copy_from_slice(&wc.to_le_bytes());
+    }
+
+    buf
+}
+
+/// Decode a symlink target from a Windows REPARSE_DATA_BUFFER (IO_REPARSE_TAG_SYMLINK).
+/// Returns the target as UTF-8 bytes with back-slashes converted to forward slashes.
+fn decode_symlink_reparse(buffer: &[u8]) -> Option<Vec<u8>> {
+    if buffer.len() < 20 {
+        return None;
+    }
+    let tag = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    if tag != IO_REPARSE_TAG_SYMLINK {
+        return None;
+    }
+    let print_offset = u16::from_le_bytes([buffer[12], buffer[13]]) as usize;
+    let print_len = u16::from_le_bytes([buffer[14], buffer[15]]) as usize;
+    let path_buf_start = 20; // after the symlink header
+    let start = path_buf_start + print_offset;
+    let end = start + print_len;
+    if end > buffer.len() {
+        return None;
+    }
+    // Decode UTF-16LE
+    let utf16: Vec<u16> = buffer[start..end]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let s = String::from_utf16_lossy(&utf16);
+    // Convert \\ back to / for internal storage
+    let unix_path = s.replace('\\', "/");
+    Some(unix_path.into_bytes())
+}
+
+/// Convert a Windows FILETIME (100ns intervals since 1601-01-01) to a TimeSpec.
+/// Returns `TimeSpec::Omit` if the value is 0 (unchanged).
+fn filetime_to_timespec(ft: u64) -> TimeSpec {
+    if ft == 0 {
+        return TimeSpec::Omit;
+    }
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000; // 100ns intervals between 1601 and 1970
+    let intervals_since_epoch = (ft).saturating_sub(EPOCH_DIFF);
+    let nanos = intervals_since_epoch as i64 * 100; // 100ns → ns
+    TimeSpec::Set(nanos)
+}
+
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     match &e {
@@ -198,11 +315,12 @@ impl FileSystemContext for StudioFsContext {
         let attr = resolve_path(&self.vfs, file_name)?;
         let file_attributes = match attr.kind {
             FileType::Directory => 0x10u32,
+            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
             _ => 0x80u32,
         };
 
         Ok(FileSecurity {
-            reparse: false,
+            reparse: attr.kind == FileType::Symlink,
             sz_security_descriptor: 0,
             attributes: file_attributes,
         })
@@ -250,11 +368,27 @@ impl FileSystemContext for StudioFsContext {
         _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
         _security_descriptor: Option<&[c_void]>,
         _allocation_size: u64,
-        _extra_buffer: Option<&[u8]>,
-        _extra_buffer_is_reparse_point: bool,
+        extra_buffer: Option<&[u8]>,
+        extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let (parent_ino, name) = resolve_parent(&self.vfs, file_name)?;
+
+        // Handle symlink creation via reparse point buffer
+        if extra_buffer_is_reparse_point {
+            if let Some(buf) = extra_buffer {
+                if let Some(target) = decode_symlink_reparse(buf) {
+                    let attr = self
+                        .vfs
+                        .symlink(parent_ino, &name, &target, 0, 0)
+                        .map_err(vfs_to_winfsp_err)?;
+                    let info = attr_to_file_info(&attr);
+                    *file_info.as_mut() = info;
+                    debug!(ino = attr.ino, "create symlink {:?}", file_name.to_string_lossy());
+                    return Ok(StudioFileHandle::new(attr.ino, false, 0));
+                }
+            }
+        }
 
         let is_dir = (create_options & 0x01) != 0; // FILE_DIRECTORY_FILE
         let attr = if is_dir {
@@ -478,7 +612,7 @@ impl FileSystemContext for StudioFsContext {
         // Truncate to 0
         let attr = self
             .vfs
-            .setattr(context.ino, Some(0))
+            .setattr(context.ino, SetattrArgs::size_only(0))
             .map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
         Ok(())
@@ -489,12 +623,20 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         _file_attributes: u32,
         _creation_time: u64,
-        _last_access_time: u64,
-        _last_write_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+        let args = SetattrArgs {
+            atime: filetime_to_timespec(last_access_time),
+            mtime: filetime_to_timespec(last_write_time),
+            ..SetattrArgs::default()
+        };
+        let attr = self
+            .vfs
+            .setattr(context.ino, args)
+            .map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
         Ok(())
     }
@@ -508,10 +650,64 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<()> {
         let attr = self
             .vfs
-            .setattr(context.ino, Some(new_size))
+            .setattr(context.ino, SetattrArgs::size_only(new_size))
             .map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
         Ok(())
+    }
+
+    fn get_reparse_point_by_name(
+        &self,
+        file_name: &U16CStr,
+        _is_directory: bool,
+        buffer: &mut [u8],
+    ) -> winfsp::Result<u64> {
+        let attr = resolve_path(&self.vfs, file_name)?;
+        if attr.kind != FileType::Symlink {
+            return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
+        }
+        let target = self.vfs.readlink(attr.ino).map_err(vfs_to_winfsp_err)?;
+        let encoded = encode_symlink_reparse(&target);
+        let len = encoded.len().min(buffer.len());
+        buffer[..len].copy_from_slice(&encoded[..len]);
+        Ok(encoded.len() as u64)
+    }
+
+    fn get_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        buffer: &mut [u8],
+    ) -> winfsp::Result<u64> {
+        let target = self.vfs.readlink(context.ino).map_err(vfs_to_winfsp_err)?;
+        let encoded = encode_symlink_reparse(&target);
+        let len = encoded.len().min(buffer.len());
+        buffer[..len].copy_from_slice(&encoded[..len]);
+        Ok(encoded.len() as u64)
+    }
+
+    fn set_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        buffer: &[u8],
+    ) -> winfsp::Result<()> {
+        // We don't support changing an existing file into a reparse point.
+        // Symlinks are created at create() time via extra_buffer_is_reparse_point.
+        let _ = context;
+        let _ = buffer;
+        Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
+    }
+
+    fn delete_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        _buffer: &[u8],
+    ) -> winfsp::Result<()> {
+        // Reparse points (symlinks) are removed via normal unlink in cleanup.
+        let _ = context;
+        Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
     fn rename(

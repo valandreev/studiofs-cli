@@ -19,6 +19,8 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_data::object::{create_object, read_object, format_object_key};
 use studiofs_meta::{RedbMetaEngine, MetaEngine, FormatInfo, types::BlockRef};
 use studiofs_vfs::{OpenFlags, StudioVfs};
+use studiofs_meta::types::SetattrArgs;
+use studiofs_meta::types::TimeSpec;
 
 // =============================================================================
 // Test Helpers
@@ -353,7 +355,7 @@ async fn test_truncate_file() {
 
     // Truncate to 5 MiB (should remove 1 block, partial last block)
     let new_size = 5 * 1024 * 1024;
-    vfs.setattr(ino, Some(new_size)).unwrap();
+    vfs.setattr(ino, SetattrArgs::size_only(new_size)).unwrap();
 
     // Verify 2 blocks now
     let blocks = vfs.meta().get_file_blocks(ino).unwrap();
@@ -529,7 +531,7 @@ async fn test_attr_cache_ttl() {
     assert_eq!(attr4.size, 5);
 
     // Setattr should invalidate cache
-    vfs.setattr(ino, Some(10)).unwrap();
+    vfs.setattr(ino, SetattrArgs::size_only(10)).unwrap();
 
     // Next getattr should see the new size from dirty_attrs
     let attr5 = vfs.getattr(ino).unwrap();
@@ -689,4 +691,150 @@ async fn test_fsync() {
 
     let data = vfs.read(ino, 0, 15).await.unwrap();
     assert_eq!(&data[..], b"datasync test!!");
+}
+
+// =============================================================================
+// Phase 4: setattr Timestamps + Symlinks
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_setattr_timestamps() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "setattr_ts");
+
+    let attr = vfs.create(1, b"ts.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    let _original_atime = attr.atime;
+    let _original_mtime = attr.mtime;
+
+    // Set specific atime and mtime
+    let new_atime = 1_700_000_000_000_000_000i64; // some timestamp in nanos
+    let new_mtime = 1_600_000_000_000_000_000i64;
+    let args = SetattrArgs {
+        atime: TimeSpec::Set(new_atime),
+        mtime: TimeSpec::Set(new_mtime),
+        ..SetattrArgs::default()
+    };
+    let updated = vfs.setattr(ino, args).unwrap();
+    assert_eq!(updated.atime, new_atime);
+    assert_eq!(updated.mtime, new_mtime);
+    // ctime should be updated (any change touches ctime)
+    assert!(updated.ctime >= attr.ctime);
+
+    // TimeSpec::Now should set to current time
+    let args2 = SetattrArgs {
+        atime: TimeSpec::Now,
+        ..SetattrArgs::default()
+    };
+    let updated2 = vfs.setattr(ino, args2).unwrap();
+    assert!(updated2.atime > new_atime); // should be current time, which is much later
+    assert_eq!(updated2.mtime, new_mtime); // mtime unchanged (Omit)
+
+    // TimeSpec::Omit should leave value unchanged
+    let args3 = SetattrArgs {
+        atime: TimeSpec::Omit,
+        mtime: TimeSpec::Omit,
+        ..SetattrArgs::default()
+    };
+    let updated3 = vfs.setattr(ino, args3).unwrap();
+    assert_eq!(updated3.atime, updated2.atime);
+    assert_eq!(updated3.mtime, new_mtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_setattr_mode_uid_gid() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "setattr_mode");
+
+    let attr = vfs.create(1, b"chmod.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Change mode
+    let args = SetattrArgs {
+        mode: Some(0o755),
+        ..SetattrArgs::default()
+    };
+    let updated = vfs.setattr(ino, args).unwrap();
+    assert_eq!(updated.mode, 0o755);
+
+    // Change uid and gid
+    let args2 = SetattrArgs {
+        uid: Some(500),
+        gid: Some(600),
+        ..SetattrArgs::default()
+    };
+    let updated2 = vfs.setattr(ino, args2).unwrap();
+    assert_eq!(updated2.uid, 500);
+    assert_eq!(updated2.gid, 600);
+    assert_eq!(updated2.mode, 0o755); // mode unchanged
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_symlink_create_and_readlink() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "symlink_basic");
+
+    // Create a symlink
+    let attr = vfs.symlink(1, b"mylink", b"/some/target/path", 0, 0).unwrap();
+    assert_eq!(attr.kind, studiofs_meta::FileType::Symlink);
+    assert_eq!(attr.mode, 0o777);
+    assert_eq!(attr.size, 17); // length of "/some/target/path"
+
+    // Readlink
+    let target = vfs.readlink(attr.ino).unwrap();
+    assert_eq!(&target, b"/some/target/path");
+
+    // Lookup should find it
+    let looked_up = vfs.lookup(1, b"mylink").unwrap();
+    assert_eq!(looked_up.ino, attr.ino);
+    assert_eq!(looked_up.kind, studiofs_meta::FileType::Symlink);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_symlink_unlink() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "symlink_unlink");
+
+    let attr = vfs.symlink(1, b"del_link", b"/target", 0, 0).unwrap();
+    let ino = attr.ino;
+
+    // Verify exists
+    assert!(vfs.lookup(1, b"del_link").is_ok());
+
+    // Unlink symlink
+    vfs.unlink(1, b"del_link").unwrap();
+
+    // Should be gone
+    assert!(vfs.lookup(1, b"del_link").is_err());
+    assert!(vfs.getattr(ino).is_err());
+    assert!(vfs.readlink(ino).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_symlink_in_readdir() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "symlink_readdir");
+
+    // Create a regular file and a symlink
+    vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
+    vfs.symlink(1, b"link.txt", b"file.txt", 0, 0).unwrap();
+
+    let entries = vfs.readdir(1).unwrap();
+    assert_eq!(entries.len(), 2);
+
+    let link_entry = entries.iter().find(|e| e.name == b"link.txt").unwrap();
+    assert_eq!(link_entry.kind, studiofs_meta::FileType::Symlink);
+
+    let file_entry = entries.iter().find(|e| e.name == b"file.txt").unwrap();
+    assert_eq!(file_entry.kind, studiofs_meta::FileType::RegularFile);
 }

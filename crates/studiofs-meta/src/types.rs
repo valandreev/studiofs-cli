@@ -82,7 +82,7 @@ pub struct InodeAttr {
 
 impl InodeAttr {
     /// Get current time as nanoseconds since Unix epoch.
-    fn now_nanos() -> i64 {
+    pub fn now_nanos() -> i64 {
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
@@ -135,6 +135,86 @@ impl InodeAttr {
     /// Update access time to now.
     pub fn touch_atime(&mut self) {
         self.atime = Self::now_nanos();
+    }
+
+    /// Update change time only (metadata change, e.g. chmod/chown).
+    pub fn touch_ctime(&mut self) {
+        self.ctime = Self::now_nanos();
+    }
+
+    /// Create attributes for a new symlink.
+    pub fn new_symlink(ino: Ino, parent: Ino, uid: u32, gid: u32, target_len: usize) -> Self {
+        let now = Self::now_nanos();
+        Self {
+            ino,
+            kind: FileType::Symlink,
+            mode: 0o777,
+            uid,
+            gid,
+            size: target_len as u64,
+            nlink: 1,
+            mtime: now,
+            ctime: now,
+            atime: now,
+            parent,
+        }
+    }
+}
+
+// =============================================================================
+// setattr Arguments
+// =============================================================================
+
+/// What to do with a timestamp field in setattr.
+#[derive(Debug, Clone, Copy)]
+pub enum TimeSpec {
+    /// Set to the given value (nanoseconds since Unix epoch).
+    Set(i64),
+    /// Set to the current system time.
+    Now,
+    /// Leave unchanged.
+    Omit,
+}
+
+impl TimeSpec {
+    /// Resolve to a concrete nanosecond value (or `None` for `Omit`).
+    pub fn resolve(self) -> Option<i64> {
+        match self {
+            TimeSpec::Set(ns) => Some(ns),
+            TimeSpec::Now => Some(InodeAttr::now_nanos()),
+            TimeSpec::Omit => None,
+        }
+    }
+}
+
+/// Arguments for `setattr`. All `None`/`Omit` fields are left unchanged.
+#[derive(Debug, Clone)]
+pub struct SetattrArgs {
+    pub size: Option<u64>,
+    pub mode: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub atime: TimeSpec,
+    pub mtime: TimeSpec,
+}
+
+impl Default for SetattrArgs {
+    fn default() -> Self {
+        Self {
+            size: None,
+            mode: None,
+            uid: None,
+            gid: None,
+            atime: TimeSpec::Omit,
+            mtime: TimeSpec::Omit,
+        }
+    }
+}
+
+impl SetattrArgs {
+    /// Convenience: create args that only set size.
+    pub fn size_only(size: u64) -> Self {
+        Self { size: Some(size), ..Default::default() }
     }
 }
 

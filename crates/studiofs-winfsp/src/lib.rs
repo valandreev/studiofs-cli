@@ -22,7 +22,7 @@ pub fn mount_and_serve(
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
     volume_params.persistent_acls(false);
-    volume_params.reparse_points(false);
+    volume_params.reparse_points(true);
     volume_params.named_streams(false);
     volume_params.read_only_volume(false);
     volume_params.post_cleanup_when_modified_only(true);
