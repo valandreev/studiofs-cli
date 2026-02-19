@@ -1,7 +1,6 @@
 #![cfg(windows)]
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
-#![allow(deprecated)]
 use std::ffi::c_void;
 use std::sync::Arc;
 

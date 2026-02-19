@@ -307,7 +307,6 @@ impl Filesystem for StudioFuseFs {
             idx = 2;
         }
 
-        #[allow(deprecated)]
         for (i, entry) in entries.iter().enumerate() {
             let entry_idx = i + 2;
             if entry_idx < idx {

@@ -439,7 +439,6 @@ impl StudioVfs {
     }
 
     /// Read directory entries.
-    #[allow(deprecated)]
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
         Ok(self.meta.readdir(ino)?)
     }

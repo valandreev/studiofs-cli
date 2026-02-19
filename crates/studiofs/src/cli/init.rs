@@ -2,8 +2,7 @@
 
 use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
-#[allow(deprecated)]
-use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine, DEFAULT_BLOCK_SIZE, CHUNK_SIZE};
+use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine, DEFAULT_BLOCK_SIZE};
 use tracing::info;
 use uuid::Uuid;
 use std::io::Write;
@@ -200,8 +199,7 @@ pub fn run(
         secret_key: secret_key.to_string(),
         region: region.to_string(),
         block_size: actual_block_size,
-        #[allow(deprecated)]
-        chunk_size: CHUNK_SIZE,
+        chunk_size: 0,
     };
     engine.set_format_info(&format_info)?;
 

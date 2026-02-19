@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! MetaEngine trait — abstract interface for metadata storage.
 //!
 //! This trait defines all metadata operations. The default implementation is `RedbMetaEngine`,
@@ -91,27 +90,6 @@ pub trait MetaEngine: Send + Sync {
     /// Remove a directory entry by name. Returns the removed entry.
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
 
-    // ─── Chunks / Slices (Legacy - Deprecated) ─────────────────────────────
-
-    /// Get all slices for a chunk.
-    #[deprecated(since = "0.2.0", note = "Use get_file_block instead")]
-    fn get_chunk_slices(&self, key: &ChunkKey) -> MetaResult<Vec<Slice>>;
-
-    /// Append a slice to a chunk.
-    #[deprecated(since = "0.2.0", note = "Use set_file_block instead")]
-    fn append_chunk_slice(&self, key: &ChunkKey, slice: &Slice) -> MetaResult<()>;
-
-    /// Replace all slices in a chunk (used after compaction).
-    #[deprecated(since = "0.2.0", note = "Use set_file_block instead")]
-    fn set_chunk_slices(&self, key: &ChunkKey, slices: &[Slice]) -> MetaResult<()>;
-
-    /// Remove all chunk data for an inode (used when deleting a file).
-    fn remove_file_chunks(&self, ino: Ino) -> MetaResult<()>;
-
-    /// Allocate a new globally unique slice ID.
-    #[deprecated(since = "0.2.0", note = "Use next_block_id instead")]
-    fn next_slice_id(&self) -> MetaResult<u64>;
-
     // ─── File Blocks (New Architecture) ──────────────────────────────────
 
     /// Get a specific block reference for a file.
@@ -152,36 +130,6 @@ pub trait MetaEngine: Send + Sync {
 
     /// Get all pending deletions (object_id, timestamp).
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
-
-    // ─── Pending Slices (Writeback) ──────────────────────────────────────
-
-    /// Mark a slice as pending upload.
-    fn add_pending_slice(&self, slice_id: u64, length: u32) -> MetaResult<()>;
-
-    /// Remove a slice from pending list (after successful upload).
-    fn remove_pending_slice(&self, slice_id: u64) -> MetaResult<()>;
-
-    /// Get all pending slices (id, length).
-    fn get_pending_slices(&self) -> MetaResult<Vec<(u64, u32)>>;
-
-    // ─── Garbage Collection ──────────────────────────────────────────────
-
-    /// Mark a slice as deleted (candidate for GC).
-    fn add_deleted_slice(&self, slice_id: u64, length: u32) -> MetaResult<()>;
-
-    /// Remove a slice from deleted list (after GC).
-    fn remove_deleted_slice(&self, slice_id: u64) -> MetaResult<()>;
-
-    /// Get all deleted slices (id, length).
-    fn get_deleted_slices(&self) -> MetaResult<Vec<(u64, u32)>>;
-
-    // ─── Data Roots (New Architecture) ───────────────────────────────────
-
-    /// Get the data root object ID for an inode.
-    fn get_data_root(&self, ino: Ino) -> MetaResult<Option<String>>;
-
-    /// Set the data root object ID for an inode.
-    fn set_data_root(&self, ino: Ino, object_id: &str) -> MetaResult<()>;
 
     // ─── High-Level Operations ───────────────────────────────────────────
 
@@ -277,7 +225,7 @@ pub trait MetaEngine: Send + Sync {
         attr.nlink = attr.nlink.saturating_sub(1);
         if attr.nlink == 0 {
             self.remove_attr(entry.ino)?;
-            self.remove_file_chunks(entry.ino)?;
+            let _ = self.remove_file_blocks(entry.ino)?;
         } else {
             self.set_attr(&attr)?;
         }
@@ -339,7 +287,7 @@ pub trait MetaEngine: Send + Sync {
                 attr.nlink = attr.nlink.saturating_sub(1);
                 if attr.nlink == 0 {
                     self.remove_attr(existing.ino)?;
-                    self.remove_file_chunks(existing.ino)?;
+                    let _ = self.remove_file_blocks(existing.ino)?;
                 } else {
                     self.set_attr(&attr)?;
                 }

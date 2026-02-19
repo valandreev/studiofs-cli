@@ -319,11 +319,6 @@ pub mod counters {
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.
     pub const TOTAL_INODES: &str = "totalInodes";
-
-    /// Legacy: Next available slice ID.
-    /// Kept for backward compatibility during migration.
-    #[deprecated(since = "0.2.0", note = "Use NEXT_BLOCK_ID instead")]
-    pub const NEXT_SLICE_ID: &str = "nextSliceId";
 }
 
 // =============================================================================
@@ -349,26 +344,12 @@ pub fn blocks_for_size(size: u64, block_size: u32) -> u32 {
 }
 
 // =============================================================================
-// Backward Compatibility (Deprecated - will be removed in Phase 2)
+// Directory Entries (with Name)
 // =============================================================================
 
-/// Legacy constants for backward compatibility.
-/// Use DEFAULT_BLOCK_SIZE instead.
-#[deprecated(since = "0.2.0", note = "Use DEFAULT_BLOCK_SIZE instead")]
-pub const BLOCK_SIZE: u32 = DEFAULT_BLOCK_SIZE;
-
-/// Legacy chunk size constant.
-/// The new architecture no longer uses chunks - files are split directly into blocks.
-#[deprecated(
-    since = "0.2.0",
-    note = "Chunk-based storage is deprecated, use block-based instead"
-)]
-pub const CHUNK_SIZE: u64 = 64 * 1024 * 1024;
-
-/// Legacy directory entry with name included.
-/// Use DirEntryValue instead (name is now part of the key).
+/// Directory entry returned by readdir — includes the entry name.
+/// Stored in DENTRIES_TABLE as (parent_ino, name_bytes) -> DirEntryValue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[deprecated(since = "0.2.0", note = "Use DirEntryValue instead")]
 pub struct DirEntry {
     /// Entry name (filename).
     pub name: Vec<u8>,
@@ -377,73 +358,6 @@ pub struct DirEntry {
     /// File type of the child.
     pub kind: FileType,
 }
-
-/// Legacy slice structure for chunk-based storage.
-/// The new architecture uses BlockRef instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[deprecated(since = "0.2.0", note = "Use BlockRef instead")]
-pub struct Slice {
-    /// Offset of the slice within the chunk.
-    pub pos: u32,
-    /// Globally unique slice ID. ID 0 means a hole.
-    pub id: u64,
-    /// Total size of data in this slice.
-    pub size: u32,
-    /// Offset of valid data within this slice.
-    pub off: u32,
-    /// Length of valid data within this slice.
-    pub len: u32,
-}
-
-#[allow(deprecated)]
-impl Slice {
-    /// Size in bytes when binary-encoded.
-    pub const ENCODED_SIZE: usize = 24;
-
-    /// Create a "hole" slice (zero-filled region).
-    pub fn hole(pos: u32, len: u32) -> Self {
-        Self {
-            pos,
-            id: 0,
-            size: len,
-            off: 0,
-            len,
-        }
-    }
-}
-
-/// Legacy chunk key for chunk-based storage.
-/// The new architecture uses (inode, block_index) tuple directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[deprecated(since = "0.2.0", note = "Use (Ino, u32) tuple instead")]
-pub struct ChunkKey {
-    pub ino: Ino,
-    pub index: u32,
-}
-
-#[allow(deprecated)]
-impl ChunkKey {
-    pub fn new(ino: Ino, index: u32) -> Self {
-        Self { ino, index }
-    }
-
-    /// Calculate chunk key from a file offset.
-    pub fn from_offset(ino: Ino, offset: u64) -> Self {
-        Self {
-            ino,
-            index: (offset / CHUNK_SIZE) as u32,
-        }
-    }
-}
-
-/// Legacy counter name for slice IDs.
-/// Use NEXT_BLOCK_ID instead.
-#[deprecated(since = "0.2.0", note = "Use NEXT_BLOCK_ID instead")]
-pub const NEXT_SLICE_ID: &str = "nextSliceId";
-
-// Re-export in counters module for backward compatibility
-#[allow(deprecated)]
-pub use self::NEXT_SLICE_ID as legacy_NEXT_SLICE_ID;
 
 // =============================================================================
 // Tests

@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! redb implementation of MetaEngine.
 //!
 //! Uses redb as an embedded ACID KV store for all filesystem metadata.
@@ -24,18 +23,6 @@ const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes")
 /// Directory entries: (parent_ino, name) as bytes -> DirEntryValue (postcard)
 const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dentries");
 
-/// Chunks: (ino, chunk_index) as bytes -> Vec<Slice> (postcard)
-const CHUNKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
-
-/// Pending Slices: slice_id (u64) -> length (u32)
-const PENDING_SLICES: TableDefinition<u64, u32> = TableDefinition::new("pending_slices");
-
-/// Deleted Slices (GC): slice_id (u64) -> length (u32)
-const DELETED_SLICES: TableDefinition<u64, u32> = TableDefinition::new("deleted_slices");
-
-/// Data Roots: ino (u64) -> object_id (String)
-const DATA_ROOTS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("data_roots");
-
 /// File Blocks: (ino, block_index) -> BlockRef (postcard)
 /// Key encoding: ino (8 bytes LE) + block_index (4 bytes LE)
 const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_blocks");
@@ -59,19 +46,6 @@ fn decode_dentry_key(key: &[u8]) -> (Ino, &[u8]) {
     let parent = u64::from_le_bytes(key[..8].try_into().unwrap());
     let name = &key[8..];
     (parent, name)
-}
-
-/// Encode a chunk key: ino (8 bytes LE) + index (4 bytes BE).
-fn encode_chunk_key(key: &ChunkKey) -> [u8; 12] {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&key.ino.to_le_bytes());
-    buf[8..12].copy_from_slice(&key.index.to_be_bytes());
-    buf
-}
-
-/// The prefix for scanning all chunks of an inode.
-fn chunk_prefix(ino: Ino) -> [u8; 8] {
-    ino.to_le_bytes()
 }
 
 /// The prefix for scanning all dentries of a parent inode.
@@ -131,10 +105,6 @@ impl RedbMetaEngine {
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
-            let _ = txn.open_table(CHUNKS_TABLE);
-            let _ = txn.open_table(PENDING_SLICES);
-            let _ = txn.open_table(DELETED_SLICES);
-            let _ = txn.open_table(DATA_ROOTS_TABLE);
             let _ = txn.open_table(FILE_BLOCKS_TABLE);
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
             txn.commit()
@@ -470,312 +440,6 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(entry_val)
     }
-
-    // ─── Chunks / Slices ─────────────────────────────────────────────────
-
-    fn get_chunk_slices(&self, key: &ChunkKey) -> MetaResult<Vec<Slice>> {
-        let encoded_key = encode_chunk_key(key);
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(CHUNKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(encoded_key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(entry) => decode(entry.value()),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn append_chunk_slice(&self, key: &ChunkKey, slice: &Slice) -> MetaResult<()> {
-        let encoded_key = encode_chunk_key(key);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(CHUNKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let mut slices: Vec<Slice> = match table
-                .get(encoded_key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(entry) => decode(entry.value())?,
-                None => Vec::new(),
-            };
-            slices.push(slice.clone());
-
-            let data = encode(&slices)?;
-            table
-                .insert(encoded_key.as_slice(), data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn set_chunk_slices(&self, key: &ChunkKey, slices: &[Slice]) -> MetaResult<()> {
-        let encoded_key = encode_chunk_key(key);
-        let data = encode(&slices.to_vec())?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            // GC Logic: Find old slices that are being replaced
-            let mut chunks_table = txn
-                .open_table(CHUNKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            if let Some(old_entry) = chunks_table
-                .get(encoded_key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let old_slices: Vec<Slice> = decode(old_entry.value())?;
-                // Simple strategy: Mark ALL old slices as deleted.
-                // If a slice is repurposed (rare in our write-once model), it would be a problem.
-                // But we use unique slice IDs.
-
-                let mut deleted_table = txn
-                    .open_table(DELETED_SLICES)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-                for slice in old_slices {
-                    // Optimization: check if new slices contain this ID?
-                    // If we overwrite *partially*, we might reuse slices.
-                    // But currently `set_chunk_slices` replaces the whole list.
-                    // Let's check if the ID is present in new `slices`.
-                    if !slices.iter().any(|s| s.id == slice.id) {
-                        deleted_table
-                            .insert(slice.id, slice.len)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                }
-            }
-
-            chunks_table
-                .insert(encoded_key.as_slice(), data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_file_chunks(&self, ino: Ino) -> MetaResult<()> {
-        let prefix = chunk_prefix(ino);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(CHUNKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            // Collect keys to remove
-            let mut range_end = prefix.to_vec();
-            *range_end.last_mut().unwrap() += 1;
-
-            let keys_to_remove: Vec<Vec<u8>> = {
-                let iter = table
-                    .range(prefix.as_slice()..range_end.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                iter.filter_map(|r| r.ok())
-                    .map(|(k, _)| k.value().to_vec())
-                    .collect()
-            };
-
-            for key in &keys_to_remove {
-                // GC Logic: Mark slices as deleted
-                if let Some(entry) = table
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                {
-                    let slices: Vec<Slice> = decode(entry.value())?;
-                    let mut deleted_table = txn
-                        .open_table(DELETED_SLICES)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    for slice in slices {
-                        deleted_table
-                            .insert(slice.id, slice.len)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                }
-
-                table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-            }
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    #[allow(deprecated)]
-    fn next_slice_id(&self) -> MetaResult<u64> {
-        self.next_block_id()
-    }
-
-    // ─── Pending Slices (Writeback) ──────────────────────────────────────
-
-    fn add_pending_slice(&self, slice_id: u64, length: u32) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(PENDING_SLICES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(slice_id, length)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_pending_slice(&self, slice_id: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(PENDING_SLICES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .remove(slice_id)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_pending_slices(&self) -> MetaResult<Vec<(u64, u32)>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(PENDING_SLICES)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        // Iterate all keys
-        let slices: Vec<(u64, u32)> = table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.value(), v.value()))
-            .collect();
-
-        Ok(slices)
-    }
-
-    // ─── Garbage Collection ──────────────────────────────────────────────
-
-    fn add_deleted_slice(&self, slice_id: u64, length: u32) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DELETED_SLICES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(slice_id, length)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_deleted_slice(&self, slice_id: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DELETED_SLICES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .remove(slice_id)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_deleted_slices(&self) -> MetaResult<Vec<(u64, u32)>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(DELETED_SLICES)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        // Iterate all keys
-        let slices: Vec<(u64, u32)> = table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.value(), v.value()))
-            .collect();
-
-        Ok(slices)
-    }
-
-    // ─── Data Roots (New Architecture) ───────────────────────────────────
-
-    fn get_data_root(&self, ino: Ino) -> MetaResult<Option<String>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(DATA_ROOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let root = table
-            .get(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .map(|v| v.value().to_string());
-        Ok(root)
-    }
-
-    fn set_data_root(&self, ino: Ino, object_id: &str) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DATA_ROOTS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(ino, object_id)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
     // --- File Blocks -----------------------------------------------------
 
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
@@ -1056,7 +720,7 @@ mod tests {
             secret_key: "minioadmin".into(),
             region: "".into(),
             block_size: DEFAULT_BLOCK_SIZE,
-            chunk_size: CHUNK_SIZE,
+            chunk_size: 0,
         };
         engine.set_format_info(&info).unwrap();
         let loaded = engine.get_format_info().unwrap();
@@ -1156,36 +820,6 @@ mod tests {
 
         assert!(engine.lookup(ROOT_INO, b"old.txt").is_err());
         assert!(engine.lookup(ROOT_INO, b"new.txt").is_ok());
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_chunk_slices() {
-        let engine = temp_engine();
-        let key = ChunkKey::new(2, 0);
-
-        let slice1 = Slice {
-            pos: 0,
-            id: 1,
-            size: DEFAULT_BLOCK_SIZE,
-            off: 0,
-            len: DEFAULT_BLOCK_SIZE,
-        };
-        engine.append_chunk_slice(&key, &slice1).unwrap();
-
-        let slice2 = Slice {
-            pos: DEFAULT_BLOCK_SIZE,
-            id: 2,
-            size: DEFAULT_BLOCK_SIZE,
-            off: 0,
-            len: DEFAULT_BLOCK_SIZE,
-        };
-        engine.append_chunk_slice(&key, &slice2).unwrap();
-
-        let slices = engine.get_chunk_slices(&key).unwrap();
-        assert_eq!(slices.len(), 2);
-        assert_eq!(slices[0].id, 1);
-        assert_eq!(slices[1].id, 2);
     }
 
     #[test]

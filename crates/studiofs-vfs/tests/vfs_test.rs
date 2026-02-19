@@ -276,7 +276,6 @@ async fn test_directory_operations() {
 
     // Readdir should return both files
     let entries = vfs.readdir(dir_ino).unwrap();
-    #[allow(deprecated)]
     let names: Vec<String> = entries
         .iter()
         .map(|e| String::from_utf8_lossy(&e.name).to_string())
