@@ -5,6 +5,7 @@
 
 pub mod disk;
 pub mod memory;
+pub mod slab;
 pub mod writeback;
 
 pub use memory::MemoryCache;

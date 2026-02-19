@@ -1,26 +1,24 @@
 //! DiskCache - persistent object cache with LRU eviction and disk space monitoring.
 //!
-//! Architecture Key Changes:
+//! Architecture Key Changes (v2 — slab-backed):
 //! - Default disk cache size: 50 GB (was 100 GB)
 //! - Minimum disk cache size: 1 GB (don't evict below this)
 //! - Target free disk space: 10% (was 15%)
 //! - Objects keyed by sequential block ID (not content hash)
 //!
-//! Objects are stored as individual files in a cache directory, keyed by their 64-bit ID.
+//! Blocks are packed into large slab files (~2 GB each) that stay permanently
+//! memory-mapped.  Reads are a simple HashMap lookup + memcpy from the mmap —
+//! zero syscalls on cache hit.  Old file-per-block scheme is replaced entirely.
 
 use bytes::Bytes;
-use memmap2::MmapOptions;
-use parking_lot::Mutex;
-use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{error, info, warn};
+
+use crate::slab::SlabStore;
 
 // =============================================================================
 // Configuration Constants
@@ -96,27 +94,8 @@ impl Default for DiskCacheConfig {
 // Internal Types
 // =============================================================================
 
-/// Entry in the LRU tracking.
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    /// Size of cached object in bytes.
-    size: u64,
-    /// Last access time (for LRU).
-    last_access: Instant,
-}
-
 /// Key for a disk cache entry (Object ID / Block ID).
 type ObjectId = u64;
-
-/// Number of shards for the LRU entries map.
-/// 256 shards means O(1) lock contention at 16+ concurrent readers.
-const ENTRIES_SHARD_COUNT: usize = 256;
-
-/// Map an ObjectId to a shard index.
-#[inline]
-fn entries_shard(id: ObjectId) -> usize {
-    (id as usize) % ENTRIES_SHARD_COUNT
-}
 
 // =============================================================================
 // DiskCache Implementation
@@ -124,23 +103,21 @@ fn entries_shard(id: ObjectId) -> usize {
 
 /// Persistent disk cache with size-based and free-space-based eviction.
 ///
+/// v2: backed by large slab files (~2 GB each) instead of one file per block.
+/// Reads are always synchronous (HashMap lookup + memcpy from persistent mmap).
+///
 /// Key features:
 /// - LRU eviction when cache exceeds max_size
-/// - Disk space monitoring - evict if free space < target_free_ratio
-/// - Minimum size guarantee - never evict below min_size
-/// - Pinned objects - prevent eviction of pending uploads
-/// - Sharded entry map (256 shards) for reduced lock contention
+/// - Disk space monitoring — evict if free space < target_free_ratio
+/// - Minimum size guarantee — never evict below min_size
+/// - Pinned objects — prevent eviction of pending uploads
 pub struct DiskCache {
-    /// Cache directory for objects.
-    cache_dir: PathBuf,
     /// Configuration.
     config: DiskCacheConfig,
-    /// Sharded LRU entry tracking (256 shards by id % 256).
-    entries: Vec<Mutex<BTreeMap<ObjectId, CacheEntry>>>,
-    /// Set of pinned objects (prevent eviction). Pinning is rare, single mutex is fine.
-    pinned: Mutex<std::collections::HashSet<ObjectId>>,
-    /// Current total cache size (lock-free).
-    current_size: AtomicU64,
+    /// Slab-backed storage.
+    store: SlabStore,
+    /// GC interval counter — persists index every N GC runs.
+    gc_counter: AtomicU64,
 }
 
 impl DiskCache {
@@ -158,40 +135,42 @@ impl DiskCache {
 
     /// Create a new disk cache with custom configuration.
     pub fn with_config(config: DiskCacheConfig) -> DiskCacheResult<Arc<Self>> {
-        let objects_dir = config.cache_dir.join("objects");
-        fs::create_dir_all(&objects_dir)?;
+        let slab_dir = config.cache_dir.join("slabs");
+        fs::create_dir_all(&slab_dir)?;
 
-        let cache = Self {
-            cache_dir: objects_dir,
-            config,
-            entries: (0..ENTRIES_SHARD_COUNT)
-                .map(|_| Mutex::new(BTreeMap::new()))
-                .collect(),
-            pinned: Mutex::new(std::collections::HashSet::new()),
-            current_size: AtomicU64::new(0),
-        };
-
-        // Scan existing cache on startup
-        cache.scan_existing()?;
+        let store = SlabStore::open(&slab_dir, config.max_size, config.min_size)?;
 
         info!(
-            "disk cache initialized: dir={:?}, max={}GB, min={}GB",
-            cache.cache_dir,
-            cache.config.max_size / (1024 * 1024 * 1024),
-            cache.config.min_size / (1024 * 1024 * 1024)
+            "disk cache initialized (slab-backed): dir={:?}, max={}GB, min={}GB, entries={}",
+            slab_dir,
+            config.max_size / (1024 * 1024 * 1024),
+            config.min_size / (1024 * 1024 * 1024),
+            store.entry_count(),
         );
 
-        // Wrap in Arc for background monitoring
-        let cache = Arc::new(cache);
+        let cache = Arc::new(Self {
+            config,
+            store,
+            gc_counter: AtomicU64::new(0),
+        });
 
         // Spawn background GC monitor
         let monitor_cache = cache.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(GC_INTERVAL_SECS));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(GC_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 if let Err(e) = monitor_cache.enforce_limits().await {
                     error!("disk cache background GC failed: {}", e);
+                }
+
+                // Persist index every 5 GC runs (~5 min)
+                let count = monitor_cache.gc_counter.fetch_add(1, Ordering::Relaxed);
+                if count % 5 == 0 {
+                    if let Err(e) = monitor_cache.store.persist_index() {
+                        error!("failed to persist slab index: {}", e);
+                    }
                 }
             }
         });
@@ -199,197 +178,29 @@ impl DiskCache {
         Ok(cache)
     }
 
-    /// Scan existing cache files and populate LRU tracking.
-    fn scan_existing(&self) -> DiskCacheResult<()> {
-        let mut total_size = 0u64;
-
-        if !self.cache_dir.exists() {
-            return Ok(());
-        }
-
-        // Collect all (id, size) pairs first, then distribute to shards.
-        let mut found: Vec<(ObjectId, u64)> = Vec::new();
-
-        let mut stack = vec![self.cache_dir.clone()];
-        while let Some(dir) = stack.pop() {
-            let read_dir = match fs::read_dir(&dir) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-
-            for entry in read_dir {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.is_file() {
-                    if let Some(id) = self.parse_filename(&path) {
-                        if let Ok(meta) = entry.metadata() {
-                            found.push((id, meta.len()));
-                            total_size += meta.len();
-                        }
-                    }
-                }
-            }
-        }
-
-        // Distribute into shards
-        for (id, size) in found {
-            self.entries[entries_shard(id)].lock().insert(
-                id,
-                CacheEntry { size, last_access: Instant::now() },
-            );
-        }
-        self.current_size.store(total_size, Ordering::Relaxed);
-
-        debug!(
-            "scanned existing cache entries: total_size={total_size} bytes"
-        );
-        Ok(())
-    }
-
-    /// Get the file path for an object.
-    fn object_path(&self, id: ObjectId) -> PathBuf {
-        let hash_str = format!("{:016x}", id); // 16 chars hex
-        let prefix = &hash_str[0..2];
-        let sub_prefix = &hash_str[2..4];
-
-        self.cache_dir
-            .join(prefix)
-            .join(sub_prefix)
-            .join(&hash_str)
-    }
-
-    /// Parse a filename back to ObjectId.
-    fn parse_filename(&self, path: &Path) -> Option<ObjectId> {
-        let name = path.file_name()?.to_str()?;
-        u64::from_str_radix(name, 16).ok()
-    }
-
     /// Read an object from disk cache.
+    ///
+    /// **Hot path** — synchronous slab lookup + memcpy from persistent mmap.
+    /// No `spawn_blocking`, no syscalls.
     pub async fn get_object(&self, id: ObjectId) -> DiskCacheResult<Option<Bytes>> {
-        let path = self.object_path(id);
-
-        let data = tokio::task::spawn_blocking(move || -> std::io::Result<Option<Bytes>> {
-            // Direct open to avoid TOCTOU race (Time-Of-Check-Time-Of-Use)
-            let file = match fs::File::open(&path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug!("[DISK-CACHE-MISS] id={:016x} path={:?}", id, path);
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            };
-
-            // Use mmap for efficient reads: OS page cache manages prefetching,
-            // and the map is immediately copied and dropped so the file is
-            // not held open after this function returns (safe for LRU eviction).
-            let mmap = unsafe { MmapOptions::new().map(&file)? };
-            let bytes = Bytes::copy_from_slice(&mmap);
-            // mmap and file are dropped here — file is closed before eviction can run
-
-            debug!("[DISK-CACHE-READ] id={:016x} size={} path={:?}", id, bytes.len(), path);
-
-            Ok(Some(bytes))
-        }).await??;
-
-        if data.is_some() {
-            // Update last access time in the correct shard.
-            let mut shard = self.entries[entries_shard(id)].lock();
-            if let Some(entry) = shard.get_mut(&id) {
-                entry.last_access = Instant::now();
-            } else if let Some(d) = &data {
-                // Inconsistency (e.g. written externally) — re-register.
-                shard.insert(id, CacheEntry {
-                    size: d.len() as u64,
-                    last_access: Instant::now(),
-                });
-            }
-        }
-
-        Ok(data)
+        Ok(self.store.get(id))
     }
 
     /// Write an object to disk cache.
     pub async fn put_object(&self, id: ObjectId, data: &[u8]) -> DiskCacheResult<()> {
-        let size = data.len() as u64;
-
-        debug!("[DISK-CACHE-WRITE] id={:016x} size={}", id, size);
-
-        // Evict if needed
-        self.reserve_space(size).await?;
-
-        let path = self.object_path(id);
-        let data_vec = data.to_vec();
-
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            // Ensure parent dirs exist
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Atomic write: write to temp then rename
-            // Use UUID to avoid collisions with concurrent writers for the same object
-            let tmp_path = path.with_extension(format!("tmp.{}", Uuid::new_v4()));
-
-            {
-                let mut file = fs::File::create(&tmp_path)?;
-                file.write_all(&data_vec)?;
-                // NOTE: sync_all() omitted for disk cache writes.
-                // Disk cache contains data that is always re-fetchable from S3,
-                // so fsync is not required for correctness (trade-off: can survive crashes at cost of re-fetching).
-                // Keep fsync ONLY for writeback journal (critical metadata).
-            }
-
-            fs::rename(&tmp_path, &path)?;
-
-            // Verify file was written correctly
-            if let Ok(metadata) = fs::metadata(&path) {
-                debug!("[DISK-CACHE-WRITE-OK] path={:?} written_size={}", path, metadata.len());
-            } else {
-                warn!("[DISK-CACHE-WRITE-FAIL] path={:?} - file not found after rename!", path);
-            }
-
-            Ok(())
-        }).await??;
-
-        let mut shard = self.entries[entries_shard(id)].lock();
-        if let Some(old) = shard.insert(
-            id,
-            CacheEntry { size, last_access: Instant::now() },
-        ) {
-            self.current_size.fetch_sub(old.size, Ordering::Relaxed);
-        }
-        self.current_size.fetch_add(size, Ordering::Relaxed);
-
+        self.store.put(id, data)?;
         Ok(())
     }
 
     /// Delete an object from cache.
     pub async fn remove_object(&self, id: ObjectId) -> DiskCacheResult<()> {
-        let path = self.object_path(id);
-
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            if path.exists() {
-                fs::remove_file(&path)?;
-            }
-            Ok(())
-        }).await??;
-
-        let mut shard = self.entries[entries_shard(id)].lock();
-        if let Some(entry) = shard.remove(&id) {
-            self.current_size.fetch_sub(entry.size, Ordering::Relaxed);
-        }
-
+        self.store.remove(id);
         Ok(())
     }
 
     /// Check if object exists.
     pub fn exists(&self, id: ObjectId) -> bool {
-        self.entries[entries_shard(id)].lock().contains_key(&id)
+        self.store.contains(id)
     }
 
     /// Reserve space for `needed` bytes by evicting LRU.
@@ -405,17 +216,17 @@ impl DiskCache {
 
     /// Pin an object to prevent it from being evicted.
     pub fn pin(&self, id: ObjectId) {
-        self.pinned.lock().insert(id);
+        self.store.pin(id);
     }
 
     /// Unpin an object, allowing it to be evicted.
     pub fn unpin(&self, id: ObjectId) {
-        self.pinned.lock().remove(&id);
+        self.store.unpin(id);
     }
 
     /// Check if an object is pinned.
     pub fn is_pinned(&self, id: ObjectId) -> bool {
-        self.pinned.lock().contains(&id)
+        self.store.is_pinned(id)
     }
 
     /// Evict blocks to make room for new data.
@@ -425,148 +236,68 @@ impl DiskCache {
     /// 2. Check if disk space < target_free_ratio -> need eviction
     /// 3. Don't evict below min_size
     /// 4. Skip pinned blocks (pending upload)
-    /// 5. Evict LRU blocks
+    /// 5. Evict via SlabStore LRU (delegated)
     async fn evict_for(&self, needed_bytes: u64) -> DiskCacheResult<()> {
-        let mut evicted = 0u64;
-        let min_size = self.config.min_size;
+        // SlabStore already handles LRU eviction + pinning in put().
+        // Here we additionally check disk space and force eviction.
+        let current = self.store.total_bytes();
+        let size_ok = current + needed_bytes <= self.config.max_size;
+        let disk_ok = !self.is_disk_space_low().await;
 
-        loop {
-            // Check if we have enough space
-            let current = self.current_size.load(Ordering::Relaxed);
-            let size_ok = current + needed_bytes <= self.config.max_size;
-
-            // Check disk space
-            let disk_ok = !self.is_disk_space_low().await;
-
-            if size_ok && disk_ok {
-                break;
-            }
-
-            // Don't evict below minimum
-            if current <= min_size {
-                warn!(
-                    "cache at minimum size ({}GB), cannot evict further",
-                    min_size / (1024 * 1024 * 1024)
-                );
-                break;
-            }
-
-            // Find LRU candidate
-            let candidate = self.find_lru_candidate()?;
-
-            match candidate {
-                Some(object_id) => {
-                    // Skip pinned blocks
-                    if self.is_pinned(object_id) {
-                        continue;
-                    }
-
-                    // Delete the file
-                    self.delete_object(object_id).await?;
-
-                    // Update tracking via shard
-                    let evicted_size = {
-                        let mut shard = self.entries[entries_shard(object_id)].lock();
-                        if let Some(entry) = shard.remove(&object_id) {
-                            self.current_size.fetch_sub(entry.size, Ordering::Relaxed);
-                            Some(entry.size)
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(size) = evicted_size {
-                        evicted += size;
-                        debug!(
-                            id = %format!("{:016x}", object_id),
-                            evicted_size = size,
-                            total_evicted = evicted,
-                            "evicted from disk cache"
-                        );
-                    }
-                }
-                None => break, // No evictable blocks
-            }
+        if size_ok && disk_ok {
+            return Ok(());
         }
 
-        if evicted > 0 {
-            info!("evicted {} bytes from disk cache", evicted);
-        }
-
-        Ok(())
-    }
-
-    /// Find the LRU candidate for eviction (approximate global LRU across all shards).
-    fn find_lru_candidate(&self) -> DiskCacheResult<Option<ObjectId>> {
-        let pinned = self.pinned.lock();
-        let mut best: Option<(ObjectId, Instant)> = None;
-
-        for shard in &self.entries {
-            let s = shard.lock();
-            for (k, v) in s.iter() {
-                if pinned.contains(k) {
-                    continue;
-                }
-                let is_older = best.map_or(true, |(_, t)| v.last_access < t);
-                if is_older {
-                    best = Some((*k, v.last_access));
-                }
-            }
-        }
-
-        Ok(best.map(|(id, _)| id))
-    }
-
-    /// Delete an object file from disk.
-    async fn delete_object(&self, id: ObjectId) -> DiskCacheResult<()> {
-        let path = self.object_path(id);
-
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            if path.exists() {
-                fs::remove_file(&path)?;
-            }
-            Ok(())
-        }).await??;
+        // Trigger SlabStore eviction (already done in put, but force it)
+        self.store.evict_for(needed_bytes)?;
 
         Ok(())
     }
 
     /// Check if disk space is below the target free ratio.
     async fn is_disk_space_low(&self) -> bool {
-        let path = self.cache_dir.clone();
+        let path = self.config.cache_dir.clone();
         let target_ratio = self.config.target_free_ratio;
 
-        tokio::task::spawn_blocking(move || {
-            match get_free_disk_space(&path) {
-                Some((free, total)) => {
-                    if total == 0 { return false; }
-                    let ratio = free as f64 / total as f64;
-                    if ratio < target_ratio {
-                        warn!(
-                            "disk space low: {:.1}% free ({} / {} bytes), target: {:.1}%",
-                            ratio * 100.0,
-                            free,
-                            total,
-                            target_ratio * 100.0
-                        );
-                        true
-                    } else {
-                        false
-                    }
+        tokio::task::spawn_blocking(move || match get_free_disk_space(&path) {
+            Some((free, total)) => {
+                if total == 0 {
+                    return false;
                 }
-                None => false,
+                let ratio = free as f64 / total as f64;
+                if ratio < target_ratio {
+                    warn!(
+                        "disk space low: {:.1}% free ({} / {} bytes), target: {:.1}%",
+                        ratio * 100.0,
+                        free,
+                        total,
+                        target_ratio * 100.0
+                    );
+                    true
+                } else {
+                    false
+                }
             }
-        }).await.unwrap_or(false)
+            None => false,
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Current cache size in bytes (lock-free).
     pub fn current_size(&self) -> u64 {
-        self.current_size.load(Ordering::Relaxed)
+        self.store.total_bytes()
     }
 
     /// Get cache configuration.
     pub fn config(&self) -> &DiskCacheConfig {
         &self.config
+    }
+
+    /// Persist slab index to disk (call on shutdown).
+    pub fn persist(&self) -> DiskCacheResult<()> {
+        self.store.persist_index()?;
+        Ok(())
     }
 }
 
@@ -651,24 +382,79 @@ mod tests {
         assert!((config.target_free_ratio - DEFAULT_FREE_RATIO).abs() < 0.001);
     }
 
-    #[test]
-    fn test_object_path_format() {
-        let config = DiskCacheConfig {
-            cache_dir: PathBuf::from("/tmp/cache"),
-            ..Default::default()
-        };
-        let cache = DiskCache {
-            cache_dir: config.cache_dir.join("objects"),
-            config,
-            entries: (0..ENTRIES_SHARD_COUNT)
-                .map(|_| Mutex::new(BTreeMap::new()))
-                .collect(),
-            pinned: Mutex::new(std::collections::HashSet::new()),
-            current_size: AtomicU64::new(0),
-        };
+    #[tokio::test]
+    async fn test_slab_diskcache_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 100 * 1024 * 1024).unwrap();
 
-        // Test path generation
-        let path = cache.object_path(0x123456789abcdef0);
-        assert!(path.ends_with("12/34/123456789abcdef0"));
+        // Put
+        let data = vec![0xAAu8; 4096];
+        cache.put_object(1, &data).await.unwrap();
+
+        // Get
+        let got = cache.get_object(1).await.unwrap().unwrap();
+        assert_eq!(got.as_ref(), &data[..]);
+
+        // Exists
+        assert!(cache.exists(1));
+        assert!(!cache.exists(9999));
+
+        // Remove
+        cache.remove_object(1).await.unwrap();
+        assert!(!cache.exists(1));
+        let gone = cache.get_object(1).await.unwrap();
+        assert!(gone.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_slab_diskcache_large_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 100 * 1024 * 1024).unwrap();
+
+        // 4MB block (typical)
+        let data = vec![0xBBu8; 4 * 1024 * 1024];
+        cache.put_object(42, &data).await.unwrap();
+
+        let got = cache.get_object(42).await.unwrap().unwrap();
+        assert_eq!(got.len(), 4 * 1024 * 1024);
+        assert!(got.iter().all(|&b| b == 0xBB));
+    }
+
+    #[tokio::test]
+    async fn test_slab_diskcache_pin_unpin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 100 * 1024 * 1024).unwrap();
+
+        cache.put_object(1, &[1u8; 4096]).await.unwrap();
+        assert!(!cache.is_pinned(1));
+
+        cache.pin(1);
+        assert!(cache.is_pinned(1));
+
+        cache.unpin(1);
+        assert!(!cache.is_pinned(1));
+    }
+
+    #[tokio::test]
+    async fn test_slab_diskcache_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 100 * 1024 * 1024).unwrap();
+
+        cache.put_object(1, &[0xAAu8; 4096]).await.unwrap();
+        cache.put_object(1, &[0xBBu8; 8192]).await.unwrap();
+
+        let got = cache.get_object(1).await.unwrap().unwrap();
+        assert_eq!(got.len(), 8192);
+        assert!(got.iter().all(|&b| b == 0xBB));
+    }
+
+    #[tokio::test]
+    async fn test_slab_diskcache_current_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 100 * 1024 * 1024).unwrap();
+
+        assert_eq!(cache.current_size(), 0);
+        cache.put_object(1, &[0u8; 4096]).await.unwrap();
+        assert!(cache.current_size() > 0);
     }
 }
