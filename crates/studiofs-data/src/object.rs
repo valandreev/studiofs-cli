@@ -291,16 +291,37 @@ pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     // Calculate checksum of original data
     let checksum = xxh64(data, 0);
 
-    // Compress data
-    let compressed = compress(data);
+    // Pre-allocate single buffer for Header + Size Prefix (4 bytes) + LZ4 payload
+    let max_compressed_size = lz4_flex::block::get_maximum_output_size(data.len());
+    let mut object = vec![0u8; ObjectHeader::SIZE + 4 + max_compressed_size];
 
-    // Create header
-    let header = ObjectHeader::new(data.len() as u32, compressed.len() as u32, checksum);
+    // Compress payload leaving space for header and size prefix
+    let compressed_size =
+        match lz4_flex::block::compress_into(data, &mut object[ObjectHeader::SIZE + 4..]) {
+            Ok(size) => size,
+            Err(_) => {
+                return Err(ObjectError::DecompressionFailed(
+                    "LZ4 compression failed".to_string(),
+                ))
+            }
+        };
 
-    // Build complete object
-    let mut object = Vec::with_capacity(ObjectHeader::SIZE + compressed.len());
-    object.extend_from_slice(&header.to_bytes());
-    object.extend_from_slice(&compressed);
+    // Write the uncompressed size as the first 4 bytes of the payload (lz4_flex size-prepended format)
+    object[ObjectHeader::SIZE..ObjectHeader::SIZE + 4]
+        .copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+    let total_compressed_payload_size = compressed_size + 4;
+
+    // Create header and write it to the start of the buffer
+    let header = ObjectHeader::new(
+        data.len() as u32,
+        total_compressed_payload_size as u32,
+        checksum,
+    );
+    object[..ObjectHeader::SIZE].copy_from_slice(&header.to_bytes());
+
+    // Truncate vector to exact size
+    object.truncate(ObjectHeader::SIZE + total_compressed_payload_size);
 
     Ok(object)
 }
@@ -315,22 +336,41 @@ pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u
 
     let checksum = xxh64(data, 0);
 
-    let (payload, compressed_size) = if flags.contains(ObjectFlags::LZ4_COMPRESSED) {
-        let compressed = compress(data);
-        let size = compressed.len() as u32;
-        (compressed, size)
+    if flags.contains(ObjectFlags::LZ4_COMPRESSED) {
+        let max_compressed_size = lz4_flex::block::get_maximum_output_size(data.len());
+        let mut object = vec![0u8; ObjectHeader::SIZE + 4 + max_compressed_size];
+
+        let compressed_size =
+            match lz4_flex::block::compress_into(data, &mut object[ObjectHeader::SIZE + 4..]) {
+                Ok(size) => size,
+                Err(_) => {
+                    return Err(ObjectError::DecompressionFailed(
+                        "LZ4 compression failed".to_string(),
+                    ))
+                }
+            };
+
+        object[ObjectHeader::SIZE..ObjectHeader::SIZE + 4]
+            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let total_payload_size = compressed_size + 4;
+
+        let header = ObjectHeader::with_flags(
+            data.len() as u32,
+            total_payload_size as u32,
+            checksum,
+            flags,
+        );
+        object[..ObjectHeader::SIZE].copy_from_slice(&header.to_bytes());
+        object.truncate(ObjectHeader::SIZE + total_payload_size);
+        Ok(object)
     } else {
         let size = data.len() as u32;
-        (data.to_vec(), size)
-    };
-
-    let header = ObjectHeader::with_flags(data.len() as u32, compressed_size, checksum, flags);
-
-    let mut object = Vec::with_capacity(ObjectHeader::SIZE + payload.len());
-    object.extend_from_slice(&header.to_bytes());
-    object.extend_from_slice(&payload);
-
-    Ok(object)
+        let header = ObjectHeader::with_flags(size, size, checksum, flags);
+        let mut object = Vec::with_capacity(ObjectHeader::SIZE + data.len());
+        object.extend_from_slice(&header.to_bytes());
+        object.extend_from_slice(data);
+        Ok(object)
+    }
 }
 
 /// Read and decompress an object.

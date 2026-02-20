@@ -144,35 +144,7 @@ pub trait MetaEngine: Send + Sync {
         uid: u32,
         gid: u32,
         mode: u16,
-    ) -> MetaResult<InodeAttr> {
-        // Check parent is a directory
-        let parent_attr = self.get_attr(parent)?;
-        if parent_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(parent));
-        }
-
-        // Check entry doesn't exist
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        let ino = self.next_inode()?;
-        let attr = InodeAttr::new_file(ino, parent, uid, gid, mode);
-        self.set_attr(&attr)?;
-        self.add_entry(
-            parent,
-            name,
-            &DirEntryValue {
-                ino,
-                kind: FileType::RegularFile,
-            },
-        )?;
-        self.incr_counter(counters::TOTAL_INODES, 1)?;
-        Ok(attr)
-    }
+    ) -> MetaResult<InodeAttr>;
 
     /// Create a new directory: allocate inode, set attrs, add dentry, update parent nlink.
     fn create_dir(
@@ -182,91 +154,13 @@ pub trait MetaEngine: Send + Sync {
         uid: u32,
         gid: u32,
         mode: u16,
-    ) -> MetaResult<InodeAttr> {
-        let parent_attr = self.get_attr(parent)?;
-        if parent_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(parent));
-        }
-
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        let ino = self.next_inode()?;
-        let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode);
-        self.set_attr(&attr)?;
-        self.add_entry(
-            parent,
-            name,
-            &DirEntryValue {
-                ino,
-                kind: FileType::Directory,
-            },
-        )?;
-
-        // Update parent nlink (+1 for subdirectory '..')
-        let mut parent_attr = parent_attr;
-        parent_attr.nlink += 1;
-        parent_attr.touch_mtime();
-        self.set_attr(&parent_attr)?;
-
-        self.incr_counter(counters::TOTAL_INODES, 1)?;
-        Ok(attr)
-    }
+    ) -> MetaResult<InodeAttr>;
 
     /// Unlink a file: remove dentry, decrement nlink, clean up if nlink=0.
-    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        let entry = self.remove_entry(parent, name)?;
-        if entry.kind == FileType::Directory {
-            return Err(MetaError::IsADirectory(entry.ino));
-        }
-
-        let mut attr = self.get_attr(entry.ino)?;
-        attr.nlink = attr.nlink.saturating_sub(1);
-        if attr.nlink == 0 {
-            self.remove_attr(entry.ino)?;
-            let _ = self.remove_file_blocks(entry.ino)?;
-        } else {
-            self.set_attr(&attr)?;
-        }
-
-        // Update parent mtime
-        if let Ok(mut parent_attr) = self.get_attr(parent) {
-            parent_attr.touch_mtime();
-            let _ = self.set_attr(&parent_attr);
-        }
-
-        Ok(attr)
-    }
+    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
 
     /// Remove an empty directory.
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
-        let entry = self.lookup(parent, name)?;
-        if entry.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(entry.ino));
-        }
-
-        // Check if empty
-        let children = self.readdir(entry.ino)?;
-        if !children.is_empty() {
-            return Err(MetaError::DirNotEmpty(entry.ino));
-        }
-
-        self.remove_entry(parent, name)?;
-        self.remove_attr(entry.ino)?;
-
-        // Update parent nlink (-1 for removed '..')
-        if let Ok(mut parent_attr) = self.get_attr(parent) {
-            parent_attr.nlink = parent_attr.nlink.saturating_sub(1);
-            parent_attr.touch_mtime();
-            let _ = self.set_attr(&parent_attr);
-        }
-
-        Ok(())
-    }
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
 
     /// Atomic rename: move a directory entry in a single transaction.
     ///
@@ -336,32 +230,5 @@ pub trait MetaEngine: Send + Sync {
         target: &[u8],
         uid: u32,
         gid: u32,
-    ) -> MetaResult<InodeAttr> {
-        let parent_attr = self.get_attr(parent)?;
-        if parent_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(parent));
-        }
-
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        let ino = self.next_inode()?;
-        let attr = InodeAttr::new_symlink(ino, parent, uid, gid, target.len());
-        self.set_attr(&attr)?;
-        self.set_symlink_target(ino, target)?;
-        self.add_entry(
-            parent,
-            name,
-            &DirEntryValue {
-                ino,
-                kind: FileType::Symlink,
-            },
-        )?;
-        self.incr_counter(counters::TOTAL_INODES, 1)?;
-        Ok(attr)
-    }
+    ) -> MetaResult<InodeAttr>;
 }

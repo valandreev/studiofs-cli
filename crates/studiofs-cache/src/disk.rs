@@ -179,10 +179,10 @@ impl DiskCache {
 
     /// Read an object from disk cache.
     ///
-    /// **Hot path** — synchronous slab lookup + memcpy from persistent mmap.
-    /// No `spawn_blocking`, no syscalls.
+    /// **Hot path** — delegates to slab store which uses spawn_blocking
+    /// to avoid starvation on hard page faults.
     pub async fn get_object(&self, id: ObjectId) -> DiskCacheResult<Option<Bytes>> {
-        Ok(self.store.get(id))
+        Ok(self.store.get(id).await)
     }
 
     /// Write an object to disk cache.

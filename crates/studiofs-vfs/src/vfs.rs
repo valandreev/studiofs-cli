@@ -1777,9 +1777,15 @@ impl StudioVfs {
             // The compressed version is stashed in pending_upload_data until upload completes.
             self.disk_cache.put_object(object_id, &data).await?;
             self.state.pending_upload_data.lock().insert(object_id, compressed);
+            if let Some(mc) = &self.mem_cache {
+                mc.put(CacheKey::new(ino, block_index as u64 * self.block_size as u64), data.clone());
+            }
         } else {
             // Cache the compressed STFS object (traditional path)
             self.disk_cache.put_object(object_id, &compressed).await?;
+            if let Some(mc) = &self.mem_cache {
+                mc.put(CacheKey::new(ino, block_index as u64 * self.block_size as u64), data.clone());
+            }
         }
 
         // Submit to writeback queue (synchronous — no disk I/O; see WritebackManager).

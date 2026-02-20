@@ -435,12 +435,12 @@ impl MetaEngine for RedbMetaEngine {
         let table = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        
+
         // Fast path: try exact-case match first
         if let Ok(Some(entry)) = table.get(key.as_slice()) {
             return decode(entry.value());
         }
-        
+
         // Slow path: case-insensitive search by scanning parent's entries
         // This is critical for Windows compatibility: files like "Image.jpg" and "image.jpg"
         // must resolve to the same inode (Windows is case-insensitive)
@@ -448,11 +448,11 @@ impl MetaEngine for RedbMetaEngine {
         let prefix = dentry_prefix(parent);
         let mut range_end = prefix.to_vec();
         *range_end.last_mut().unwrap() += 1;
-        
+
         let iter = table
             .range(prefix.as_slice()..range_end.as_slice())
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        
+
         for result in iter {
             let (k, v) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = k.value();
@@ -465,7 +465,7 @@ impl MetaEngine for RedbMetaEngine {
                 return decode(v.value());
             }
         }
-        
+
         Err(MetaError::EntryNotFound {
             parent,
             name: String::from_utf8_lossy(name).to_string(),
@@ -1163,6 +1163,497 @@ impl MetaEngine for RedbMetaEngine {
         }
         Ok(names)
     }
+
+    // --- High-Level Operations (ACID Atomicity) --------------------------
+
+    fn create_file(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let result_attr;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let parent_bytes = inodes
+                .get(parent)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or(MetaError::InodeNotFound(parent))?
+                .value()
+                .to_vec();
+            let parent_attr: InodeAttr = decode(&parent_bytes)?;
+            if parent_attr.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(parent));
+            }
+
+            let dentry_key = encode_dentry_key(parent, name);
+            if dentries
+                .get(dentry_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some()
+            {
+                return Err(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
+            let ino = match counters
+                .get(counters::NEXT_INODE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 2,
+            };
+            counters
+                .insert(counters::NEXT_INODE, ino + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let total_inodes = match counters
+                .get(counters::TOTAL_INODES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            counters
+                .insert(counters::TOTAL_INODES, total_inodes + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let attr = InodeAttr::new_file(ino, parent, uid, gid, mode);
+            let attr_data = encode(&attr)?;
+            inodes
+                .insert(ino, attr_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let entry_val = encode(&DirEntryValue {
+                ino,
+                kind: FileType::RegularFile,
+            })?;
+            dentries
+                .insert(dentry_key.as_slice(), entry_val.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            result_attr = attr;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
+    }
+
+    fn create_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let result_attr;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let parent_bytes = inodes
+                .get(parent)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or(MetaError::InodeNotFound(parent))?
+                .value()
+                .to_vec();
+            let mut parent_attr: InodeAttr = decode(&parent_bytes)?;
+            if parent_attr.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(parent));
+            }
+
+            let dentry_key = encode_dentry_key(parent, name);
+            if dentries
+                .get(dentry_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some()
+            {
+                return Err(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
+            let ino = match counters
+                .get(counters::NEXT_INODE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 2,
+            };
+            counters
+                .insert(counters::NEXT_INODE, ino + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let total_inodes = match counters
+                .get(counters::TOTAL_INODES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            counters
+                .insert(counters::TOTAL_INODES, total_inodes + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode);
+            let attr_data = encode(&attr)?;
+            inodes
+                .insert(ino, attr_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let entry_val = encode(&DirEntryValue {
+                ino,
+                kind: FileType::Directory,
+            })?;
+            dentries
+                .insert(dentry_key.as_slice(), entry_val.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            parent_attr.nlink += 1;
+            parent_attr.touch_mtime();
+            let p_data = encode(&parent_attr)?;
+            inodes
+                .insert(parent, p_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            result_attr = attr;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
+    }
+
+    fn create_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let result_attr;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut symlinks = txn
+                .open_table(SYMLINKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let parent_bytes = inodes
+                .get(parent)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or(MetaError::InodeNotFound(parent))?
+                .value()
+                .to_vec();
+            let parent_attr: InodeAttr = decode(&parent_bytes)?;
+            if parent_attr.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(parent));
+            }
+
+            let dentry_key = encode_dentry_key(parent, name);
+            if dentries
+                .get(dentry_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some()
+            {
+                return Err(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
+            let ino = match counters
+                .get(counters::NEXT_INODE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 2,
+            };
+            counters
+                .insert(counters::NEXT_INODE, ino + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let total_inodes = match counters
+                .get(counters::TOTAL_INODES)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            counters
+                .insert(counters::TOTAL_INODES, total_inodes + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let attr = InodeAttr::new_symlink(ino, parent, uid, gid, target.len());
+            let attr_data = encode(&attr)?;
+            inodes
+                .insert(ino, attr_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let entry_val = encode(&DirEntryValue {
+                ino,
+                kind: FileType::Symlink,
+            })?;
+            dentries
+                .insert(dentry_key.as_slice(), entry_val.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            symlinks
+                .insert(ino, target)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            result_attr = attr;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
+    }
+
+    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let result_attr;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let dentry_key = encode_dentry_key(parent, name);
+            let dentry_val_bytes = dentries
+                .remove(dentry_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                })?
+                .value()
+                .to_vec();
+            let entry: DirEntryValue = decode(&dentry_val_bytes)?;
+
+            if entry.kind == FileType::Directory {
+                dentries
+                    .insert(dentry_key.as_slice(), dentry_val_bytes.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                return Err(MetaError::IsADirectory(entry.ino));
+            }
+
+            let attr_bytes = inodes
+                .get(entry.ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or(MetaError::InodeNotFound(entry.ino))?
+                .value()
+                .to_vec();
+            let mut attr: InodeAttr = decode(&attr_bytes)?;
+
+            attr.nlink = attr.nlink.saturating_sub(1);
+            if attr.nlink == 0 {
+                inodes
+                    .remove(entry.ino)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                let mut symlinks = txn
+                    .open_table(SYMLINKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = symlinks.remove(entry.ino);
+
+                let mut xattrs = txn
+                    .open_table(XATTRS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let prefix = xattr_prefix(entry.ino);
+                let keys_to_remove: Vec<Vec<u8>> = {
+                    let range = xattrs
+                        .range(prefix.as_ref()..)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    range
+                        .take_while(|r| {
+                            r.as_ref()
+                                .map(|(k, _)| k.value().starts_with(&prefix))
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                        .collect()
+                };
+                for key in keys_to_remove {
+                    let _ = xattrs.remove(key.as_slice());
+                }
+
+                let mut blocks_table = txn
+                    .open_table(FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let block_prefix = file_block_prefix(entry.ino);
+                let mut range_end = block_prefix.to_vec();
+                *range_end.last_mut().unwrap() += 1;
+
+                let keys_to_remove: Vec<Vec<u8>> = {
+                    let iter = blocks_table
+                        .range(block_prefix.as_slice()..range_end.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    iter.filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                        .collect()
+                };
+                for key in keys_to_remove {
+                    let _ = blocks_table.remove(key.as_slice());
+                }
+            } else {
+                let attr_data = encode(&attr)?;
+                inodes
+                    .insert(entry.ino, attr_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            let parent_bytes = inodes
+                .get(parent)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(bytes) = parent_bytes {
+                let mut parent_attr: InodeAttr = decode(&bytes)?;
+                parent_attr.touch_mtime();
+                let p_attr_data = encode(&parent_attr)?;
+                inodes
+                    .insert(parent, p_attr_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            result_attr = attr;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
+    }
+
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut dentries = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let dentry_key = encode_dentry_key(parent, name);
+            let dentry_val_bytes = dentries
+                .get(dentry_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                })?
+                .value()
+                .to_vec();
+            let entry: DirEntryValue = decode(&dentry_val_bytes)?;
+
+            if entry.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(entry.ino));
+            }
+
+            let prefix = dentry_prefix(entry.ino);
+            let mut range_end = prefix.to_vec();
+            *range_end.last_mut().unwrap() += 1;
+            let has_children = dentries
+                .range(prefix.as_slice()..range_end.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some();
+            if has_children {
+                return Err(MetaError::DirNotEmpty(entry.ino));
+            }
+
+            dentries
+                .remove(dentry_key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            inodes
+                .remove(entry.ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let mut xattrs = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let xattr_pfx = xattr_prefix(entry.ino);
+            let keys_to_remove: Vec<Vec<u8>> = {
+                let range = xattrs
+                    .range(xattr_pfx.as_ref()..)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                range
+                    .take_while(|r| {
+                        r.as_ref()
+                            .map(|(k, _)| k.value().starts_with(&xattr_pfx))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                    .collect()
+            };
+            for key in keys_to_remove {
+                let _ = xattrs.remove(key.as_slice());
+            }
+
+            let parent_bytes = inodes
+                .get(parent)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(bytes) = parent_bytes {
+                let mut parent_attr: InodeAttr = decode(&bytes)?;
+                parent_attr.nlink = parent_attr.nlink.saturating_sub(1);
+                parent_attr.touch_mtime();
+                let p_attr_data = encode(&parent_attr)?;
+                inodes
+                    .insert(parent, p_attr_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1619,9 +2110,7 @@ mod tests {
     fn test_link_directory_fails() {
         let engine = temp_engine();
 
-        let dir = engine
-            .create_dir(ROOT_INO, b"mydir", 0, 0, 0o755)
-            .unwrap();
+        let dir = engine.create_dir(ROOT_INO, b"mydir", 0, 0, 0o755).unwrap();
 
         let result = engine.link(dir.ino, ROOT_INO, b"dir_link");
         assert!(result.is_err()); // EPERM: can't hardlink directories
@@ -1646,9 +2135,7 @@ mod tests {
     fn test_link_unlink_nlink_tracking() {
         let engine = temp_engine();
 
-        let attr = engine
-            .create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
-            .unwrap();
+        let attr = engine.create_file(ROOT_INO, b"a.txt", 0, 0, 0o644).unwrap();
         let ino = attr.ino;
 
         // Create two hardlinks: nlink should be 3
@@ -1702,12 +2189,8 @@ mod tests {
             .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
             .unwrap();
 
-        engine
-            .set_xattr(attr.ino, b"user.tag", b"v1", 0)
-            .unwrap();
-        engine
-            .set_xattr(attr.ino, b"user.tag", b"v2", 0)
-            .unwrap();
+        engine.set_xattr(attr.ino, b"user.tag", b"v1", 0).unwrap();
+        engine.set_xattr(attr.ino, b"user.tag", b"v2", 0).unwrap();
 
         let val = engine.get_xattr(attr.ino, b"user.tag").unwrap();
         assert_eq!(val, Some(b"v2".to_vec()));
@@ -1753,9 +2236,7 @@ mod tests {
             .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
             .unwrap();
 
-        engine
-            .set_xattr(attr.ino, b"user.rm", b"data", 0)
-            .unwrap();
+        engine.set_xattr(attr.ino, b"user.rm", b"data", 0).unwrap();
         engine.remove_xattr(attr.ino, b"user.rm").unwrap();
 
         let val = engine.get_xattr(attr.ino, b"user.rm").unwrap();
@@ -1773,15 +2254,9 @@ mod tests {
             .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
             .unwrap();
 
-        engine
-            .set_xattr(attr.ino, b"user.alpha", b"1", 0)
-            .unwrap();
-        engine
-            .set_xattr(attr.ino, b"user.beta", b"2", 0)
-            .unwrap();
-        engine
-            .set_xattr(attr.ino, b"user.gamma", b"3", 0)
-            .unwrap();
+        engine.set_xattr(attr.ino, b"user.alpha", b"1", 0).unwrap();
+        engine.set_xattr(attr.ino, b"user.beta", b"2", 0).unwrap();
+        engine.set_xattr(attr.ino, b"user.gamma", b"3", 0).unwrap();
 
         let names = engine.list_xattrs(attr.ino).unwrap();
         assert_eq!(names.len(), 3);
@@ -1812,19 +2287,13 @@ mod tests {
     #[test]
     fn test_xattr_isolation_between_inodes() {
         let engine = temp_engine();
-        let f1 = engine
-            .create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
-            .unwrap();
-        let f2 = engine
-            .create_file(ROOT_INO, b"b.txt", 0, 0, 0o644)
-            .unwrap();
+        let f1 = engine.create_file(ROOT_INO, b"a.txt", 0, 0, 0o644).unwrap();
+        let f2 = engine.create_file(ROOT_INO, b"b.txt", 0, 0, 0o644).unwrap();
 
         engine
             .set_xattr(f1.ino, b"user.owner", b"alice", 0)
             .unwrap();
-        engine
-            .set_xattr(f2.ino, b"user.owner", b"bob", 0)
-            .unwrap();
+        engine.set_xattr(f2.ino, b"user.owner", b"bob", 0).unwrap();
 
         assert_eq!(
             engine.get_xattr(f1.ino, b"user.owner").unwrap(),

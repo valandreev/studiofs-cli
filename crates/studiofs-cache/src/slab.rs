@@ -303,9 +303,9 @@ impl SlabStore {
 
     /// Read an object from the store. Returns None if not found.
     ///
-    /// This is the **hot path** — no syscalls, no spawn_blocking.
-    /// Just a HashMap lookup + memcpy from the persistent mmap.
-    pub fn get(&self, id: ObjectId) -> Option<Bytes> {
+    /// This is the **hot path** — delegating to `spawn_blocking` to avoid
+    /// blocking the tokio reactor on hard page faults from the mmap.
+    pub async fn get(&self, id: ObjectId) -> Option<Bytes> {
         // Look up in index
         let entry = {
             let idx = self.index.read();
@@ -313,16 +313,31 @@ impl SlabStore {
         };
 
         // Read from slab — just pointer arithmetic on the persistent mmap
-        let slabs = self.slabs.read();
-        let slab = match slabs.get(entry.slab_id as usize).and_then(|s| s.as_ref()) {
-            Some(s) => s,
-            None => {
-                warn!("slab {} missing/cleaned for object {:016x}", entry.slab_id, id);
+        let slab_arc = {
+            let slabs = self.slabs.read();
+            match slabs.get(entry.slab_id as usize).and_then(|s| s.as_ref()) {
+                Some(s) => s.clone(), // Clone the Arc for moving into spawn_blocking
+                None => {
+                    warn!("slab {} missing/cleaned for object {:016x}", entry.slab_id, id);
+                    return None;
+                }
+            }
+        };
+
+        // Delegate the actual memory copy to a blocking pool to avoid starving
+        // the async executor if the mmap page is cold (causes a hard page fault).
+        let bytes = match tokio::task::spawn_blocking(move || {
+            let data = slab_arc.read_slice(entry.offset, entry.length);
+            Bytes::copy_from_slice(data)
+        })
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("spawn_blocking failed for slab read: {}", e);
                 return None;
             }
         };
-        let data = slab.read_slice(entry.offset, entry.length);
-        let bytes = Bytes::copy_from_slice(data);
 
         // Update LRU
         self.touch_lru(id, entry.last_access);
@@ -889,8 +904,8 @@ mod tests {
         assert_eq!(fl[0].length, len1 + len2); // Merged
     }
 
-    #[test]
-    fn test_slab_store_basic() {
+    #[tokio::test]
+    async fn test_slab_store_basic() {
         let dir = tempfile::tempdir().unwrap();
         let store = SlabStore::open(
             &dir.path().join("slabs"),
@@ -902,22 +917,22 @@ mod tests {
         // Put and get
         let data = vec![42u8; 8192];
         store.put(1, &data).unwrap();
-        let got = store.get(1).unwrap();
+        let got = store.get(1).await.unwrap();
         assert_eq!(got.as_ref(), &data[..]);
 
         // Overwrite
         let data2 = vec![99u8; 4096];
         store.put(1, &data2).unwrap();
-        let got2 = store.get(1).unwrap();
+        let got2 = store.get(1).await.unwrap();
         assert_eq!(got2.as_ref(), &data2[..]);
 
         // Remove
         store.remove(1);
-        assert!(store.get(1).is_none());
+        assert!(store.get(1).await.is_none());
     }
 
-    #[test]
-    fn test_slab_store_persistence() {
+    #[tokio::test]
+    async fn test_slab_store_persistence() {
         let dir = tempfile::tempdir().unwrap();
         let slab_dir = dir.path().join("slabs");
 
@@ -935,22 +950,22 @@ mod tests {
             let store = SlabStore::open(&slab_dir, 100 * 1024 * 1024, 1024 * 1024).unwrap();
             assert_eq!(store.entry_count(), 3);
 
-            let d1 = store.get(100).unwrap();
+            let d1 = store.get(100).await.unwrap();
             assert_eq!(d1.len(), 4096);
             assert!(d1.iter().all(|&b| b == 1));
 
-            let d2 = store.get(200).unwrap();
+            let d2 = store.get(200).await.unwrap();
             assert_eq!(d2.len(), 8192);
             assert!(d2.iter().all(|&b| b == 2));
 
-            let d3 = store.get(300).unwrap();
+            let d3 = store.get(300).await.unwrap();
             assert_eq!(d3.len(), 16384);
             assert!(d3.iter().all(|&b| b == 3));
         }
     }
 
-    #[test]
-    fn test_slab_store_eviction() {
+    #[tokio::test]
+    async fn test_slab_store_eviction() {
         let dir = tempfile::tempdir().unwrap();
         // Tiny max_size to force eviction
         let store = SlabStore::open(
@@ -967,13 +982,13 @@ mod tests {
 
         // Adding more should evict old entries
         store.put(100, &[0xAA; 4096]).unwrap();
-        assert!(store.get(100).is_some());
+        assert!(store.get(100).await.is_some());
         // Some early entries should have been evicted
         assert!(store.entry_count() <= 32);
     }
 
-    #[test]
-    fn test_slab_store_pinning() {
+    #[tokio::test]
+    async fn test_slab_store_pinning() {
         let dir = tempfile::tempdir().unwrap();
         let store = SlabStore::open(
             &dir.path().join("slabs"),
@@ -995,11 +1010,11 @@ mod tests {
         store.put(99, &[99u8; 4096]).unwrap();
 
         // Entry 1 should still exist (pinned)
-        assert!(store.get(1).is_some());
+        assert!(store.get(1).await.is_some());
     }
 
-    #[test]
-    fn test_slab_large_block() {
+    #[tokio::test]
+    async fn test_slab_large_block() {
         let dir = tempfile::tempdir().unwrap();
         let store = SlabStore::open(
             &dir.path().join("slabs"),
@@ -1012,7 +1027,7 @@ mod tests {
         let data = vec![0xBBu8; 4 * 1024 * 1024];
         store.put(42, &data).unwrap();
 
-        let got = store.get(42).unwrap();
+        let got = store.get(42).await.unwrap();
         assert_eq!(got.len(), 4 * 1024 * 1024);
         assert!(got.iter().all(|&b| b == 0xBB));
     }
