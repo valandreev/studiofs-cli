@@ -214,7 +214,10 @@ impl Default for SetattrArgs {
 impl SetattrArgs {
     /// Convenience: create args that only set size.
     pub fn size_only(size: u64) -> Self {
-        Self { size: Some(size), ..Default::default() }
+        Self {
+            size: Some(size),
+            ..Default::default()
+        }
     }
 }
 
@@ -356,6 +359,7 @@ impl Default for FormatInfo {
 
 impl FormatInfo {
     /// Create a new format info with the specified parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         uuid: String,
@@ -420,7 +424,7 @@ pub fn offset_within_block(offset: u64, block_size: u32) -> u32 {
 /// Calculate the number of blocks needed for a file of given size.
 #[inline]
 pub fn blocks_for_size(size: u64, block_size: u32) -> u32 {
-    ((size + block_size as u64 - 1) / block_size as u64) as u32
+    size.div_ceil(block_size as u64) as u32
 }
 
 // =============================================================================

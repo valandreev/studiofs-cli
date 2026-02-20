@@ -576,11 +576,10 @@ impl StudioVfs {
         // 2. Check read-through cache with TTL
         {
             let cache = self.state.attr_read_cache.lock();
-            if let Some((attr, timestamp)) = cache.get(&ino) {
-                if timestamp.elapsed() < ATTR_CACHE_TTL {
+            if let Some((attr, timestamp)) = cache.get(&ino)
+                && timestamp.elapsed() < ATTR_CACHE_TTL {
                     return Ok(attr.clone());
                 }
-            }
             // Drop lock before potentially slow redb read
         }
 
@@ -597,8 +596,8 @@ impl StudioVfs {
         let mut attr = self.getattr(ino)?;
         let mut changed = false;
 
-        if let Some(new_size) = args.size {
-            if new_size != attr.size {
+        if let Some(new_size) = args.size
+            && new_size != attr.size {
                 if new_size < attr.size {
                     // Truncate - may need to remove blocks
                     self.truncate_blocks(ino, new_size, attr.size)?;
@@ -606,7 +605,6 @@ impl StudioVfs {
                 attr.size = new_size;
                 changed = true;
             }
-        }
 
         if let Some(mode) = args.mode {
             attr.mode = mode;
@@ -819,12 +817,11 @@ impl StudioVfs {
         self.flush(ino).await?;
 
         // If full fsync (not datasync), also persist dirty attributes to redb
-        if !datasync {
-            if let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
+        if !datasync
+            && let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
                 self.meta.set_attr(&attr)?;
                 self.state.attr_read_cache.lock().remove(&ino);
             }
-        }
         Ok(())
     }
 
@@ -1457,12 +1454,11 @@ impl StudioVfs {
     async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
         // Skip if already in memory cache (hot L1 check before any I/O)
         let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
-        if let Some(mc) = &self.mem_cache {
-            if mc.get(&mem_key).is_some() {
+        if let Some(mc) = &self.mem_cache
+            && mc.get(&mem_key).is_some() {
                 self.readahead.finish_prefetch(ino, block_index);
                 return;
             }
-        }
 
         // Fetch from disk cache or S3 (read_block handles all cache levels)
         let _ = self.read_block(ino, block_index).await;
@@ -1482,11 +1478,10 @@ impl StudioVfs {
         let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
 
         // L1: Try memory cache first
-        if let Some(mc) = &self.mem_cache {
-            if let Some(cached) = mc.get(&mem_key) {
+        if let Some(mc) = &self.mem_cache
+            && let Some(cached) = mc.get(&mem_key) {
                 return Ok(cached);
             }
-        }
 
         // L2: Try disk cache
         if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
@@ -1514,11 +1509,10 @@ impl StudioVfs {
                 let _ = rx.recv().await;
 
                 // Re-check caches (should now be populated)
-                if let Some(mc) = &self.mem_cache {
-                    if let Some(cached) = mc.get(&mem_key) {
+                if let Some(mc) = &self.mem_cache
+                    && let Some(cached) = mc.get(&mem_key) {
                         return Ok(cached);
                     }
-                }
                 if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
                     let result = if self.store_decompressed {
                         cached
@@ -1602,12 +1596,10 @@ impl StudioVfs {
                 };
                 let mut pending = self.state.pending_blocks.lock();
                 // Double-check: another write call might have inserted while we loaded
-                if !pending.contains_key(&(ino, block_index)) {
-                    pending.insert((ino, block_index), PendingBlock {
+                pending.entry((ino, block_index)).or_insert_with(|| PendingBlock {
                         data: BytesMut::from(existing_data.as_ref()),
                         dirty: false,
                     });
-                }
             }
 
             // Write data into the pending block (brief lock)
@@ -1733,11 +1725,10 @@ impl StudioVfs {
 
             let mut blocks = Vec::new();
             for key in keys {
-                if let Some(pb) = pending.remove(&key) {
-                    if pb.dirty {
+                if let Some(pb) = pending.remove(&key)
+                    && pb.dirty {
                         blocks.push((key.1, pb.data.freeze()));
                     }
-                }
             }
             blocks
         };

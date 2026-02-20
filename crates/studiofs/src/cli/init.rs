@@ -95,6 +95,7 @@ fn get_current_ids() -> (u32, u32) {
     (0, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
     endpoint: &str,
@@ -142,7 +143,7 @@ pub fn run(
                         println!("   ✅ Bucket '{}' created successfully.", bucket);
                         Ok(())
                     } else {
-                        return Err(anyhow::anyhow!("Initialization cancelled: bucket missing."));
+                        Err(anyhow::anyhow!("Initialization cancelled: bucket missing."))
                     }
                 } else {
                     println!("❌ S3 verification failed!");

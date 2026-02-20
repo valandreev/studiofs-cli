@@ -13,7 +13,7 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 use tokio::runtime::Runtime;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
 use winfsp::filesystem::*;
 use winfsp::U16CStr;
@@ -59,19 +59,20 @@ impl StudioFileHandle {
 
 /// Convert InodeAttr to WinFSP FileInfo.
 fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
-    let mut info = FileInfo::default();
-    info.file_size = attr.size;
     // Directories always report at least one allocation unit; files round up.
-    info.allocation_size = if attr.kind == FileType::Directory {
-        4096u64.max((attr.size + 4095) & !4095)
-    } else {
-        (attr.size + 4095) & !4095
-    };
-
-    info.file_attributes = match attr.kind {
-        FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
-        FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-        _ => 0x80, // FILE_ATTRIBUTE_NORMAL
+    let mut info = FileInfo {
+        file_size: attr.size,
+        allocation_size: if attr.kind == FileType::Directory {
+            4096u64.max((attr.size + 4095) & !4095)
+        } else {
+            (attr.size + 4095) & !4095
+        },
+        file_attributes: match attr.kind {
+            FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
+            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
+            _ => 0x80, // FILE_ATTRIBUTE_NORMAL
+        },
+        ..Default::default()
     };
 
     if attr.kind == FileType::Symlink {
@@ -88,7 +89,7 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     // Use inode as index
     info.index_number = attr.ino;
     // Report actual nlink count (must be ≥1 for files, ≥2 for dirs)
-    info.hard_links = if attr.nlink > 0 { attr.nlink as u32 } else { 1 };
+    info.hard_links = if attr.nlink > 0 { attr.nlink } else { 1 };
 
     info
 }
@@ -128,7 +129,7 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
             continue;
         }
         // Strip trailing dots and spaces (Win32 path normalisation)
-        let component = component.trim_end_matches(|c: char| c == '.' || c == ' ');
+        let component = component.trim_end_matches(['.', ' ']);
         if component.is_empty() {
             continue;
         }
@@ -160,7 +161,7 @@ fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u
             components.pop();
             continue;
         }
-        let trimmed = raw.trim_end_matches(|c: char| c == '.' || c == ' ');
+        let trimmed = raw.trim_end_matches(['.', ' ']);
         if !trimmed.is_empty() {
             components.push(trimmed.to_string());
         }
@@ -407,11 +408,10 @@ impl FileSystemContext for StudioFsContext {
 
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
-        if context.fh != 0 {
-            if let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
+        if context.fh != 0
+            && let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
                 error!(ino = context.ino, fh = context.fh, "release_fh failed: {:?}", e);
             }
-        }
         drop(context);
     }
 
@@ -430,9 +430,9 @@ impl FileSystemContext for StudioFsContext {
         let (parent_ino, name) = resolve_parent(&self.vfs, file_name)?;
 
         // Handle symlink creation via reparse point buffer
-        if extra_buffer_is_reparse_point {
-            if let Some(buf) = extra_buffer {
-                if let Some(target) = decode_symlink_reparse(buf) {
+        if extra_buffer_is_reparse_point
+            && let Some(buf) = extra_buffer
+                && let Some(target) = decode_symlink_reparse(buf) {
                     let attr = self
                         .vfs
                         .symlink(parent_ino, &name, &target, 0, 0)
@@ -442,8 +442,6 @@ impl FileSystemContext for StudioFsContext {
                     debug!(ino = attr.ino, "create symlink {:?}", file_name.to_string_lossy());
                     return Ok(StudioFileHandle::new(attr.ino, false, 0));
                 }
-            }
-        }
 
         let is_dir = (create_options & 0x01) != 0; // FILE_DIRECTORY_FILE
         let attr = if is_dir {
@@ -561,8 +559,8 @@ impl FileSystemContext for StudioFsContext {
             }
 
             let mut dotdot = DirInfo::<255>::new();
-            if dotdot.set_name(std::ffi::OsStr::new("..")).is_ok() {
-                if let Ok(attr) = self.vfs.getattr(context.ino) {
+            if dotdot.set_name(std::ffi::OsStr::new("..")).is_ok()
+                && let Ok(attr) = self.vfs.getattr(context.ino) {
                     *dotdot.file_info_mut() = attr_to_file_info(&attr);
                     if !dotdot.append_to_buffer(buffer, &mut cursor) {
                         debug!("buffer full after adding '..'");
@@ -571,7 +569,6 @@ impl FileSystemContext for StudioFsContext {
                     }
                     debug!("added '..' entry, cursor now at {}", cursor);
                 }
-            }
         }
 
         // Get the marker name for comparison
@@ -583,11 +580,10 @@ impl FileSystemContext for StudioFsContext {
             let entry_name = String::from_utf8_lossy(&entry.name).to_string();
 
             // Skip entries at or before the marker
-            if let Some(ref m) = marker_str {
-                if entry_name.as_str() <= m.as_str() {
+            if let Some(ref m) = marker_str
+                && entry_name.as_str() <= m.as_str() {
                     continue;
                 }
-            }
 
             let os_name = std::ffi::OsString::from(&entry_name);
             let mut dir_info = DirInfo::<255>::new();
@@ -639,8 +635,8 @@ impl FileSystemContext for StudioFsContext {
 
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
-            if let Some(fname) = file_name {
-                if let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname) {
+            if let Some(fname) = file_name
+                && let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname) {
                     let res = if context.is_dir {
                         self.vfs.rmdir(parent_ino, &name)
                     } else {
@@ -653,7 +649,6 @@ impl FileSystemContext for StudioFsContext {
                         debug!(ino = context.ino, "cleanup delete");
                     }
                 }
-            }
         } else {
             // Not deleting — flush buffered writes
             // WinFSP "Cleanup" with no delete flag is the standard place to flush.
@@ -661,10 +656,8 @@ impl FileSystemContext for StudioFsContext {
                 if let Err(e) = self.rt.block_on(self.vfs.flush_fh(context.fh)) {
                     error!(ino = context.ino, "cleanup flush_fh failed: {:?}", e);
                 }
-            } else {
-                if let Err(e) = self.rt.block_on(self.vfs.flush(context.ino)) {
-                    error!(ino = context.ino, "cleanup flush failed: {:?}", e);
-                }
+            } else if let Err(e) = self.rt.block_on(self.vfs.flush(context.ino)) {
+                error!(ino = context.ino, "cleanup flush failed: {:?}", e);
             }
         }
     }

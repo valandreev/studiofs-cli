@@ -445,11 +445,10 @@ impl SlabStore {
         {
             let slabs = self.slabs.read();
             for (i, slot) in slabs.iter().enumerate() {
-                if let Some(slab) = slot {
-                    if let Some((offset, aligned)) = slab.allocate(size) {
+                if let Some(slab) = slot
+                    && let Some((offset, aligned)) = slab.allocate(size) {
                         return Ok((i as u16, offset, aligned));
                     }
-                }
             }
         }
 
@@ -787,7 +786,7 @@ impl SlabStore {
         for (i, slot) in slabs.iter_mut().enumerate() {
             let is_empty = slot
                 .as_ref()
-                .map_or(false, |s| s.free_bytes.load(Ordering::Relaxed) == s.capacity);
+                .is_some_and(|s| s.free_bytes.load(Ordering::Relaxed) == s.capacity);
 
             if is_empty {
                 let path = self.slab_dir.join(format!("slab_{:04}.dat", i));
@@ -826,7 +825,7 @@ impl Drop for SlabStore {
         for (i, slot) in slabs.iter_mut().enumerate() {
             let is_empty = slot
                 .as_ref()
-                .map_or(false, |s| s.free_bytes.load(Ordering::Relaxed) == s.capacity);
+                .is_some_and(|s| s.free_bytes.load(Ordering::Relaxed) == s.capacity);
             if is_empty {
                 let path = self.slab_dir.join(format!("slab_{:04}.dat", i));
                 *slot = None; // drop Slab → unmap

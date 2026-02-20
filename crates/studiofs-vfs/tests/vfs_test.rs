@@ -1146,7 +1146,7 @@ async fn test_statfs_initial() {
     assert!(st.bavail > 0);
     assert_eq!(st.bsize, 4 * 1024 * 1024); // 4 MiB block size
     assert_eq!(st.namelen, 255);
-    assert_eq!(st.blocks, st.bfree + (0 / st.bsize as u64)); // no used space yet
+    assert_eq!(st.blocks, st.bfree); // no used space yet
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

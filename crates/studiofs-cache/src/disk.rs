@@ -28,7 +28,7 @@ use crate::slab::SlabStore;
 pub const DEFAULT_DISK_CACHE_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 
 /// Minimum disk cache size: 1 GB (don't evict below this)
-pub const MIN_DISK_CACHE_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+pub const MIN_DISK_CACHE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Target free disk space ratio: 10%
 pub const DEFAULT_FREE_RATIO: f64 = 0.10;
@@ -167,11 +167,10 @@ impl DiskCache {
 
                 // Persist index every 5 GC runs (~5 min)
                 let count = monitor_cache.gc_counter.fetch_add(1, Ordering::Relaxed);
-                if count % 5 == 0 {
-                    if let Err(e) = monitor_cache.store.persist_index() {
+                if count.is_multiple_of(5)
+                    && let Err(e) = monitor_cache.store.persist_index() {
                         error!("failed to persist slab index: {}", e);
                     }
-                }
             }
         });
 

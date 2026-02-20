@@ -609,8 +609,10 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let mut header = ObjectHeader::default();
-        header.magic = *b"XXXX";
+        let header = ObjectHeader {
+            magic: *b"XXXX",
+            ..Default::default()
+        };
 
         let bytes = header.to_bytes();
         let result = ObjectHeader::from_bytes(&bytes);
@@ -620,8 +622,10 @@ mod tests {
 
     #[test]
     fn test_unsupported_version() {
-        let mut header = ObjectHeader::default();
-        header.version = 99;
+        let header = ObjectHeader {
+            version: 99,
+            ..Default::default()
+        };
 
         let bytes = header.to_bytes();
         let result = ObjectHeader::from_bytes(&bytes);

@@ -200,7 +200,7 @@ enum JournalOp {
 /// synchronous and pushes to two channels immediately:
 ///  1. `sender`     → the upload worker that talks to S3
 ///  2. `journal_tx` → a background task that writes journal files with
-///                    no `sync_all()` (avoids one fsync per block)
+///     no `sync_all()` (avoids one fsync per block)
 pub struct WritebackManager {
     pending_dir: PathBuf,
     sender: mpsc::UnboundedSender<PendingOp>,
@@ -257,7 +257,7 @@ impl WritebackManager {
             };
             let path = entry.path();
 
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "journal") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "journal") {
                 match self.parse_journal_file(&path) {
                     Ok(op) => {
                         // Only queue pending uploads
@@ -319,7 +319,7 @@ impl WritebackManager {
             journal_path: path,
             status: UploadStatus::Pending,
         };
-        if let Err(_) = self.sender.send(op) {
+        if self.sender.send(op).is_err() {
             error!("failed to queue pending op (channel closed)");
         }
     }

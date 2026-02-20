@@ -43,7 +43,7 @@ pub fn block_position(offset_in_slice: u32) -> (u32, u32) {
 /// Calculate how many blocks a slice of given size spans.
 pub fn block_count(slice_size: u32) -> u32 {
     let bs = DEFAULT_BLOCK_SIZE;
-    (slice_size + bs - 1) / bs
+    slice_size.div_ceil(bs)
 }
 
 #[cfg(test)]

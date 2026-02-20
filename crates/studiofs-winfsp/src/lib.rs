@@ -76,10 +76,9 @@ unsafe extern "system" {
 }
 
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
-    if let Ok(guard) = SHUTDOWN_TX.lock() {
-        if let Some(tx) = guard.as_ref() {
+    if let Ok(guard) = SHUTDOWN_TX.lock()
+        && let Some(tx) = guard.as_ref() {
             let _ = tx.send(());
         }
-    }
     1 // TRUE — handled
 }
