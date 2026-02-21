@@ -1370,6 +1370,10 @@ impl MetaEngine for RedbMetaEngine {
                 .insert(dentry_key.as_slice(), entry_val.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
+            // redb does not allow opening the same table twice in one write txn
+            // while an existing table handle is still alive.
+            drop(counters);
+
             result_attr = attr.clone();
 
             Self::append_event_in_txn(
@@ -1482,6 +1486,10 @@ impl MetaEngine for RedbMetaEngine {
             inodes
                 .insert(parent, p_data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // redb does not allow opening the same table twice in one write txn
+            // while an existing table handle is still alive.
+            drop(counters);
 
             result_attr = attr.clone();
 
@@ -1601,6 +1609,10 @@ impl MetaEngine for RedbMetaEngine {
             symlinks
                 .insert(ino, target)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // redb does not allow opening the same table twice in one write txn
+            // while an existing table handle is still alive.
+            drop(counters);
 
             result_attr = attr.clone();
 
