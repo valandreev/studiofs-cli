@@ -390,10 +390,9 @@ impl TonboMetaEngine {
                         )));
                     }
                     let backoff_ms = (20u64).saturating_mul(1u64 << retries.min(6));
-                    let _ = self
-                        .rt
-                        .lock()
-                        .block_on(tokio::time::sleep(Duration::from_millis(backoff_ms)));
+                    let _ = self.rt.lock().block_on(async {
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    });
                 }
                 Err(err) => return Err(err),
             }
@@ -925,10 +924,9 @@ impl TonboMetaEngine {
                     );
                     current_etag = remote_etag;
                     let backoff_ms = (50u64).saturating_mul(1u64 << retries.min(6));
-                    let _ = self
-                        .rt
-                        .lock()
-                        .block_on(tokio::time::sleep(Duration::from_millis(backoff_ms)));
+                    let _ = self.rt.lock().block_on(async {
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    });
                     retries = retries.saturating_add(1);
                 }
                 Err(err) => return Err(err),
@@ -992,6 +990,10 @@ impl Drop for TonboMetaEngine {
 impl MetaEngine for TonboMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
         self.flush_now()
+    }
+
+    fn sync_metadata(&self) -> MetaResult<()> {
+        self.pull_remote_snapshot()
     }
 
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
@@ -1646,21 +1648,26 @@ mod tests {
                     }
                 };
 
-                let uuid = format!("tonbo-test-{}", std::process::id());
+                let tag = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let disk_name = format!("tonbo-test-{}-{tag}", std::process::id());
+                let uuid = format!("{}-uuid", disk_name);
                 let dir1 = tempfile::tempdir().unwrap();
                 let db1 = dir1.path().join("meta1.redb");
 
                 let local1 = RedbMetaEngine::open(&db1).unwrap();
                 local1.init_root(0, 0).unwrap();
                 let format_info = FormatInfo {
-                    name: "tonbo-test".into(),
+                    name: disk_name.clone(),
                     uuid: uuid.clone(),
                     endpoint: endpoint.clone(),
                     bucket: bucket.clone(),
                     access_key: access_key.clone(),
                     secret_key: secret_key.clone(),
                     region: "us-east-1".into(),
-                    data_prefix: "tonbo-test/objects/".into(),
+                    data_prefix: format!("{disk_name}/objects/"),
                     metadata: MetadataConfig {
                         backend: MetadataBackend::Tonbo,
                         remote: Some(RemoteStoreConfig {
@@ -1669,7 +1676,7 @@ mod tests {
                             access_key: access_key.clone(),
                             secret_key: secret_key.clone(),
                             region: "us-east-1".into(),
-                            prefix: "tonbo-test/metadata/".into(),
+                            prefix: format!("{disk_name}/metadata/"),
                         }),
                         ..MetadataConfig::default()
                     },

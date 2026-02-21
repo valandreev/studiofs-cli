@@ -51,6 +51,14 @@ pub trait MetaEngine: Send + Sync {
         Ok(())
     }
 
+    /// Force metadata synchronization from remote source (if applicable).
+    ///
+    /// Used by strong-consistency paths (e.g. distributed file locks) to
+    /// guarantee refresh-before-lock-grant semantics.
+    fn sync_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     // ─── Format / Settings ───────────────────────────────────────────────
 
     /// Store format info (called during `studiofs init`).

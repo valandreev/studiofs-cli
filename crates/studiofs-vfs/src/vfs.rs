@@ -28,7 +28,7 @@ use futures::StreamExt;
 use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator, services::S3};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -152,6 +152,26 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
+const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
+const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
+const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
+
+#[derive(Clone)]
+struct DistributedFlock {
+    op: Operator,
+    prefix: String,
+    client_id: String,
+    lease_ttl: Duration,
+    retry_base_ms: u64,
+    retry_max_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RemoteLockRecord {
+    lease_until_unix: i64,
+    exclusive_owner: Option<String>,
+    shared_owners: BTreeSet<String>,
+}
 
 // =============================================================================
 // VFS Configuration
@@ -451,6 +471,8 @@ pub struct StudioVfs {
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
     janitor_lease_ttl: Duration,
+    /// Optional serverless distributed lock manager for bimodal consistency.
+    distributed_flock: Option<DistributedFlock>,
     /// Optional NATS invalidation bus listener config.
     invalidation_bus: Option<InvalidationBus>,
 }
@@ -507,6 +529,23 @@ impl StudioVfs {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
         );
+        let lock_lease_ttl = Duration::from_secs(
+            std::env::var("STUDIOFS_LOCK_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_LOCK_LEASE_TTL.as_secs()),
+        );
+        let lock_retry_base_ms = std::env::var("STUDIOFS_LOCK_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_LOCK_RETRY_BASE_MS);
+        let lock_retry_max_ms = std::env::var("STUDIOFS_LOCK_RETRY_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= lock_retry_base_ms)
+            .unwrap_or(DEFAULT_LOCK_RETRY_MAX_MS.max(lock_retry_base_ms));
 
         let janitor_lease = if format_info.metadata.backend == MetadataBackend::Tonbo {
             if let Some(remote) = &format_info.metadata.remote {
@@ -546,6 +585,50 @@ impl StudioVfs {
                         std::process::id(),
                         now_nanos
                     ),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let distributed_flock = if format_info.metadata.backend == MetadataBackend::Tonbo {
+            if let Some(remote) = &format_info.metadata.remote {
+                let mut builder = S3::default()
+                    .endpoint(&remote.endpoint)
+                    .bucket(&remote.bucket)
+                    .access_key_id(&remote.access_key)
+                    .secret_access_key(&remote.secret_key)
+                    .disable_config_load()
+                    .disable_ec2_metadata();
+                if !remote.region.is_empty() {
+                    builder = builder.region(&remote.region);
+                } else {
+                    builder = builder.region("us-east-1");
+                }
+                let op = Operator::new(builder)
+                    .map_err(|e| VfsError::Other(format!("failed to init lock operator: {e}")))?
+                    .finish();
+                let mut prefix = if remote.prefix.trim().is_empty() {
+                    format!("{}/metadata/", format_info.name)
+                } else {
+                    remote.prefix.clone()
+                };
+                if !prefix.ends_with('/') {
+                    prefix.push('/');
+                }
+                let now_nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                Some(DistributedFlock {
+                    op,
+                    prefix: format!("{prefix}locks/"),
+                    client_id: format!("{}:{}:{}", format_info.name, std::process::id(), now_nanos),
+                    lease_ttl: lock_lease_ttl,
+                    retry_base_ms: lock_retry_base_ms,
+                    retry_max_ms: lock_retry_max_ms,
                 })
             } else {
                 None
@@ -602,6 +685,7 @@ impl StudioVfs {
             janitor_skip_newer_than,
             janitor_max_deletes_per_run,
             janitor_lease_ttl,
+            distributed_flock,
             invalidation_bus,
         });
 
@@ -758,6 +842,183 @@ impl StudioVfs {
             Err(err) => {
                 warn!("janitor lease CAS update failed: {}", err);
                 false
+            }
+        }
+    }
+
+    fn lock_record_path(cfg: &DistributedFlock, ino: Ino) -> String {
+        format!("{}{}.lock", cfg.prefix, ino)
+    }
+
+    fn encode_remote_lock_record(state: &RemoteLockRecord) -> Vec<u8> {
+        let exclusive = state.exclusive_owner.as_deref().unwrap_or("-");
+        let shared = if state.shared_owners.is_empty() {
+            "-".to_string()
+        } else {
+            state.shared_owners.iter().cloned().collect::<Vec<_>>().join(",")
+        };
+        format!("{}\n{}\n{}\n", state.lease_until_unix, exclusive, shared).into_bytes()
+    }
+
+    fn decode_remote_lock_record(bytes: &[u8]) -> Option<RemoteLockRecord> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        let lease_until_unix = lines.next()?.trim().parse::<i64>().ok()?;
+        let exclusive_raw = lines.next().unwrap_or("-").trim();
+        let shared_raw = lines.next().unwrap_or("-").trim();
+        let exclusive_owner = if exclusive_raw.is_empty() || exclusive_raw == "-" {
+            None
+        } else {
+            Some(exclusive_raw.to_string())
+        };
+        let mut shared_owners = BTreeSet::new();
+        if !shared_raw.is_empty() && shared_raw != "-" {
+            for item in shared_raw.split(',') {
+                let v = item.trim();
+                if !v.is_empty() {
+                    shared_owners.insert(v.to_string());
+                }
+            }
+        }
+        Some(RemoteLockRecord {
+            lease_until_unix,
+            exclusive_owner,
+            shared_owners,
+        })
+    }
+
+    fn normalize_remote_lock_state(state: &mut RemoteLockRecord, now: i64) {
+        if state.lease_until_unix <= now {
+            state.lease_until_unix = 0;
+            state.exclusive_owner = None;
+            state.shared_owners.clear();
+        }
+    }
+
+    async fn acquire_distributed_flock(
+        &self,
+        cfg: &DistributedFlock,
+        ino: Ino,
+        op: LockKind,
+    ) -> VfsResult<bool> {
+        let path = Self::lock_record_path(cfg, ino);
+        let now = Self::now_unix_secs();
+        let lease_until = now.saturating_add(cfg.lease_ttl.as_secs() as i64);
+
+        let mut retries = 0u32;
+        loop {
+            let mut retry_later = false;
+            let (mut state, etag_opt) = match cfg.op.stat(&path).await {
+                Ok(meta) => {
+                    let etag = meta.etag().map(ToString::to_string);
+                    match cfg.op.read(&path).await {
+                        Ok(raw) => {
+                            let parsed =
+                                Self::decode_remote_lock_record(&raw.to_vec()).unwrap_or_default();
+                            (parsed, etag)
+                        }
+                        Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
+                            retry_later = true;
+                            (RemoteLockRecord::default(), None)
+                        }
+                        Err(err) => return Err(VfsError::Other(format!("lock read failed: {err}"))),
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => (RemoteLockRecord::default(), None),
+                Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
+                    retry_later = true;
+                    (RemoteLockRecord::default(), None)
+                }
+                Err(err) => return Err(VfsError::Other(format!("lock stat failed: {err}"))),
+            };
+            if retry_later {
+                retries = retries.saturating_add(1);
+                if retries >= 12 {
+                    return Ok(false);
+                }
+                let backoff_ms = (cfg.retry_base_ms.saturating_mul(1u64 << retries.min(6)))
+                    .min(cfg.retry_max_ms);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
+
+            Self::normalize_remote_lock_state(&mut state, now);
+            let mut next_state = state.clone();
+            let client = cfg.client_id.clone();
+
+            let allowed = match op {
+                LockKind::Shared => {
+                    if let Some(excl) = &state.exclusive_owner {
+                        excl == &client
+                    } else {
+                        true
+                    }
+                }
+                LockKind::Exclusive => {
+                    let excl_ok = state
+                        .exclusive_owner
+                        .as_ref()
+                        .map(|v| v == &client)
+                        .unwrap_or(true);
+                    let shared_ok =
+                        state.shared_owners.is_empty()
+                            || (state.shared_owners.len() == 1 && state.shared_owners.contains(&client));
+                    excl_ok && shared_ok
+                }
+                LockKind::Unlock => true,
+            };
+
+            if !allowed {
+                return Ok(false);
+            }
+
+            match op {
+                LockKind::Shared => {
+                    next_state.exclusive_owner = None;
+                    next_state.shared_owners.insert(client);
+                }
+                LockKind::Exclusive => {
+                    next_state.exclusive_owner = Some(client);
+                    next_state.shared_owners.clear();
+                }
+                LockKind::Unlock => {
+                    if next_state.exclusive_owner.as_deref() == Some(cfg.client_id.as_str()) {
+                        next_state.exclusive_owner = None;
+                    }
+                    next_state.shared_owners.remove(cfg.client_id.as_str());
+                }
+            }
+            next_state.lease_until_unix = lease_until;
+
+            let mut opts = WriteOptions::default();
+            if let Some(etag) = etag_opt {
+                opts.if_match = Some(etag);
+            } else {
+                opts.if_not_exists = true;
+            }
+
+            let payload = Self::encode_remote_lock_record(&next_state);
+            match cfg.op.write_options(&path, payload, opts).await {
+                Ok(_) => return Ok(true),
+                Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {
+                    retries = retries.saturating_add(1);
+                    if retries >= 12 {
+                        return Ok(false);
+                    }
+                    let backoff_ms = (cfg.retry_base_ms.saturating_mul(1u64 << retries.min(6)))
+                        .min(cfg.retry_max_ms);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
+                    retries = retries.saturating_add(1);
+                    if retries >= 12 {
+                        return Ok(false);
+                    }
+                    let backoff_ms = (cfg.retry_base_ms.saturating_mul(1u64 << retries.min(6)))
+                        .min(cfg.retry_max_ms);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(err) => return Err(VfsError::Other(format!("lock write failed: {err}"))),
             }
         }
     }
@@ -1101,7 +1362,82 @@ impl StudioVfs {
     /// If `blocking` is false and the lock cannot be acquired, returns `VfsError::WouldBlock`.
     pub async fn flock(&self, ino: Ino, op: LockKind, owner: u64, blocking: bool) -> VfsResult<()> {
         loop {
-            {
+            if op == LockKind::Unlock {
+                let had_local_lock = {
+                    let mut locks = self.state.file_locks.lock();
+                    let mut had = false;
+                    if let Some(entry) = locks.get_mut(&ino) {
+                        match entry.kind {
+                            LockKind::Shared => {
+                                had = true;
+                                entry.shared_count = entry.shared_count.saturating_sub(1);
+                                if entry.shared_count == 0 {
+                                    locks.remove(&ino);
+                                }
+                            }
+                            LockKind::Exclusive if entry.owner == owner => {
+                                had = true;
+                                locks.remove(&ino);
+                            }
+                            _ => {}
+                        }
+                    }
+                    had
+                };
+
+                if had_local_lock {
+                    if let Some(cfg) = &self.distributed_flock {
+                        // Bimodal strong mode guarantee:
+                        // flush local data + metadata before releasing distributed lock.
+                        self.flush(ino).await?;
+                        self.meta.flush_metadata()?;
+                        let _ = self.acquire_distributed_flock(cfg, ino, LockKind::Unlock).await?;
+                    }
+                    self.state.lock_notify.notify_waiters();
+                }
+                return Ok(());
+            }
+
+            let local_allowed = {
+                let locks = self.state.file_locks.lock();
+                match locks.get(&ino) {
+                    None => true,
+                    Some(entry) => match op {
+                        LockKind::Shared => {
+                            entry.kind == LockKind::Shared
+                                || (entry.kind == LockKind::Exclusive && entry.owner == owner)
+                        }
+                        LockKind::Exclusive => {
+                            entry.kind == LockKind::Unlock
+                                || (entry.kind == LockKind::Exclusive && entry.owner == owner)
+                        }
+                        LockKind::Unlock => true,
+                    },
+                }
+            };
+            if !local_allowed {
+                if !blocking {
+                    return Err(VfsError::WouldBlock);
+                }
+                self.state.lock_notify.notified().await;
+                continue;
+            }
+
+            if let Some(cfg) = &self.distributed_flock {
+                let acquired = self.acquire_distributed_flock(cfg, ino, op).await?;
+                if !acquired {
+                    if !blocking {
+                        return Err(VfsError::WouldBlock);
+                    }
+                    tokio::time::sleep(Duration::from_millis(cfg.retry_base_ms)).await;
+                    continue;
+                }
+                // Bimodal strong mode guarantee:
+                // refresh local metadata view before lock is considered granted.
+                self.meta.sync_metadata()?;
+            }
+
+            let committed = {
                 let mut locks = self.state.file_locks.lock();
                 match op {
                     LockKind::Shared => {
@@ -1113,18 +1449,15 @@ impl StudioVfs {
                         match entry.kind {
                             LockKind::Unlock | LockKind::Shared => {
                                 entry.kind = LockKind::Shared;
-                                entry.shared_count += 1;
-                                return Ok(());
+                                entry.shared_count = entry.shared_count.saturating_add(1);
+                                true
                             }
                             LockKind::Exclusive if entry.owner == owner => {
-                                // Downgrade exclusive → shared
                                 entry.kind = LockKind::Shared;
                                 entry.shared_count = 1;
-                                return Ok(());
+                                true
                             }
-                            LockKind::Exclusive => {
-                                // Blocked by another owner's exclusive lock
-                            }
+                            _ => false,
                         }
                     }
                     LockKind::Exclusive => {
@@ -1140,38 +1473,24 @@ impl StudioVfs {
                                     owner,
                                     shared_count: 0,
                                 };
-                                return Ok(());
+                                true
                             }
-                            LockKind::Exclusive if entry.owner == owner => {
-                                // Already held by us — re-entrant
-                                return Ok(());
-                            }
-                            _ => {
-                                // Blocked by another owner
-                            }
+                            LockKind::Exclusive if entry.owner == owner => true,
+                            _ => false,
                         }
                     }
-                    LockKind::Unlock => {
-                        if let Some(entry) = locks.get_mut(&ino) {
-                            match entry.kind {
-                                LockKind::Shared => {
-                                    entry.shared_count = entry.shared_count.saturating_sub(1);
-                                    if entry.shared_count == 0 {
-                                        locks.remove(&ino);
-                                    }
-                                }
-                                LockKind::Exclusive if entry.owner == owner => {
-                                    locks.remove(&ino);
-                                }
-                                _ => {}
-                            }
-                        }
-                        self.state.lock_notify.notify_waiters();
-                        return Ok(());
-                    }
+                    LockKind::Unlock => true,
                 }
+            };
+            if committed {
+                return Ok(());
             }
-            // If we get here, the lock could not be acquired
+
+            // Local conflict appeared after remote acquisition attempt.
+            // Best-effort release remote lock and retry.
+            if let Some(cfg) = &self.distributed_flock {
+                let _ = self.acquire_distributed_flock(cfg, ino, LockKind::Unlock).await;
+            }
             if !blocking {
                 return Err(VfsError::WouldBlock);
             }

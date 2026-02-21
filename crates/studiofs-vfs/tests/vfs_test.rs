@@ -16,6 +16,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use studiofs_data::object::{create_object, format_object_key, read_object};
 use studiofs_data::store::{DataStore, DataStoreConfig};
@@ -33,23 +34,38 @@ use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
-    let volume_name = format!("vfs-test-{volume_suffix}");
+    let endpoint =
+        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
+    let access_key =
+        std::env::var("STUDIOFS_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let secret_key =
+        std::env::var("STUDIOFS_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let run_id = RUN_ID.get_or_init(|| {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{}-{ts}", std::process::id())
+    });
+    let volume_name = format!("vfs-test-{volume_suffix}-{run_id}");
     FormatInfo {
         name: volume_name.clone(),
         uuid: format!("test-uuid-{volume_suffix}"),
-        endpoint: "http://127.0.0.1:9000".into(),
-        bucket: "studiofs-test".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
+        endpoint: endpoint.clone(),
+        bucket: bucket.clone(),
+        access_key: access_key.clone(),
+        secret_key: secret_key.clone(),
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig {
             backend: MetadataBackend::Tonbo,
             remote: Some(RemoteStoreConfig {
-                endpoint: "http://127.0.0.1:9000".into(),
-                bucket: "studiofs-test".into(),
-                access_key: "minioadmin".into(),
-                secret_key: "minioadmin".into(),
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
                 region: "us-east-1".into(),
                 prefix: format!("{volume_name}/metadata/"),
             }),
@@ -92,16 +108,48 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
 
 /// Ensure the test bucket exists.
 async fn ensure_bucket() {
+    use aws_config::BehaviorVersion;
+    use aws_sdk_s3::Client as S3Client;
+    use aws_sdk_s3::config::{Credentials, Region};
     use opendal::{Operator, services::S3};
+    let endpoint =
+        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
+    let access_key =
+        std::env::var("STUDIOFS_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let secret_key =
+        std::env::var("STUDIOFS_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
 
     let builder = S3::default()
-        .endpoint("http://127.0.0.1:9000")
-        .bucket("studiofs-test")
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
+        .endpoint(&endpoint)
+        .bucket(&bucket)
+        .access_key_id(&access_key)
+        .secret_access_key(&secret_key)
         .region("us-east-1");
 
     let op = Operator::new(builder).unwrap().finish();
+    if op.write(".bucket-marker", Bytes::from_static(b"ok")).await.is_ok() {
+        return;
+    }
+
+    // Fallback: explicitly create bucket if missing.
+    let shared = aws_config::defaults(BehaviorVersion::latest())
+        .credentials_provider(Credentials::new(
+            &access_key,
+            &secret_key,
+            None,
+            None,
+            "studiofs-test",
+        ))
+        .region(Region::new("us-east-1"))
+        .load()
+        .await;
+    let conf = aws_sdk_s3::config::Builder::from(&shared)
+        .endpoint_url(&endpoint)
+        .force_path_style(true)
+        .build();
+    let client = S3Client::from_conf(conf);
+    let _ = client.create_bucket().bucket(&bucket).send().await;
     let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
 }
 

@@ -49,6 +49,17 @@ Goal: replace remote redb with Tonbo (R2/MinIO) while leaving FUSE, opendal→S3
 - File blocks (same `(ino, block_index)` conflict): higher `object_id` wins.
 - `force flush` with no pending local mutations is skipped to prevent stale drop-time overwrite.
 
+### Bimodal Consistency With Global Locks (implemented)
+- Default mode: eventual consistency with CAS+merge.
+- Locked mode (per inode, advisory `flock`): strong consistency path.
+  - `flush-before-unlock`: lock holder flushes file/data+metadata before distributed unlock.
+  - `refresh-before-lock-grant`: lock requester syncs metadata view after distributed lock acquire.
+- Serverless lock backend: object-store CAS records under `<metadata-prefix>/locks/<ino>.lock`.
+- Lock lease options:
+  - `STUDIOFS_LOCK_TTL_SECS` (default 120)
+  - `STUDIOFS_LOCK_RETRY_BASE_MS` (default 25)
+  - `STUDIOFS_LOCK_RETRY_MAX_MS` (default 500)
+
 ## Phase 5 — Cache Invalidation Bus (performance)
 - Add NATS publisher on successful Tonbo commit (subject `fs.invalidate.<volume>.<ino|dir>`); listener drops cache entries immediately.
 - Bus improves freshness; correctness still guaranteed by TTL.
