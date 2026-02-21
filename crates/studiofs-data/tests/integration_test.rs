@@ -8,6 +8,7 @@
 
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use studiofs_data::store::{DataStore, DataStoreConfig};
 
 /// Atomic counter to generate unique slice IDs per test run.
@@ -20,13 +21,24 @@ fn unique_slice_id() -> u64 {
     pid * 10_000 + seq + 100_000
 }
 
+fn load_test_env() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    let _ = ONCE.get_or_init(|| {
+        let _ = dotenvy::dotenv();
+    });
+}
+
 /// MinIO default credentials and endpoint.
 fn test_config() -> DataStoreConfig {
+    load_test_env();
     DataStoreConfig {
-        endpoint: "http://127.0.0.1:9000".into(),
-        bucket: "studiofs-test".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
+        endpoint: std::env::var("STUDIOFS_MINIO_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+        bucket: std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into()),
+        access_key: std::env::var("STUDIOFS_MINIO_ACCESS_KEY")
+            .unwrap_or_else(|_| "minioadmin".into()),
+        secret_key: std::env::var("STUDIOFS_MINIO_SECRET_KEY")
+            .unwrap_or_else(|_| "minioadmin".into()),
         region: "us-east-1".into(),
         volume_name: "integration-test".into(),
     }
@@ -36,11 +48,50 @@ fn make_store() -> DataStore {
     DataStore::new(&test_config()).expect("failed to create DataStore")
 }
 
+async fn ensure_bucket() {
+    use aws_config::BehaviorVersion;
+    use aws_sdk_s3::Client as S3Client;
+    use aws_sdk_s3::config::{Credentials, Region};
+    use opendal::{Operator, services::S3};
+
+    let cfg = test_config();
+    let builder = S3::default()
+        .endpoint(&cfg.endpoint)
+        .bucket(&cfg.bucket)
+        .access_key_id(&cfg.access_key)
+        .secret_access_key(&cfg.secret_key)
+        .region(&cfg.region);
+    let op = Operator::new(builder).unwrap().finish();
+    if op.write(".bucket-marker", Bytes::from_static(b"ok")).await.is_ok() {
+        return;
+    }
+
+    let shared = aws_config::defaults(BehaviorVersion::latest())
+        .credentials_provider(Credentials::new(
+            &cfg.access_key,
+            &cfg.secret_key,
+            None,
+            None,
+            "studiofs-test",
+        ))
+        .region(Region::new(cfg.region.clone()))
+        .load()
+        .await;
+    let conf = aws_sdk_s3::config::Builder::from(&shared)
+        .endpoint_url(&cfg.endpoint)
+        .force_path_style(true)
+        .build();
+    let client = S3Client::from_conf(conf);
+    let _ = client.create_bucket().bucket(&cfg.bucket).send().await;
+    let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
+}
+
 // ────────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn put_and_get_block() {
+    ensure_bucket().await;
     let store = make_store();
 
     let payload = Bytes::from(vec![0xABu8; 1024]);
@@ -70,6 +121,7 @@ async fn put_and_get_block() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn get_block_range() {
+    ensure_bucket().await;
     let store = make_store();
 
     // Create a 4 KiB block with ascending byte pattern
@@ -100,6 +152,7 @@ async fn get_block_range() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn block_exists_lifecycle() {
+    ensure_bucket().await;
     let store = make_store();
 
     let slice_id = unique_slice_id();
@@ -140,6 +193,7 @@ async fn block_exists_lifecycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn delete_block_idempotent() {
+    ensure_bucket().await;
     let store = make_store();
 
     let slice_id = unique_slice_id();
@@ -163,6 +217,7 @@ async fn delete_block_idempotent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn large_multiblock_write() {
+    ensure_bucket().await;
     let store = make_store();
 
     let slice_id = unique_slice_id();

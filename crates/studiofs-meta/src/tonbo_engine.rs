@@ -1305,8 +1305,16 @@ mod tests {
     use aws_sdk_s3::config::{Credentials, Region};
     use aws_sdk_s3::types::{Delete, ObjectIdentifier};
     use std::collections::HashMap;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{Duration, timeout};
+
+    fn load_test_env() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        let _ = ONCE.get_or_init(|| {
+            let _ = dotenvy::dotenv();
+        });
+    }
 
     #[test]
     fn test_merge_counters_preserves_parallel_deltas() {
@@ -1616,6 +1624,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_tonbo_minio_roundtrip() {
+        load_test_env();
         use std::sync::mpsc;
         use std::sync::mpsc::RecvTimeoutError;
 
@@ -1729,6 +1738,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_tonbo_minio_stale_client_merge_same_dir() {
+        load_test_env();
         use std::sync::mpsc::{self, RecvTimeoutError};
 
         let (tx, rx) = mpsc::channel();
@@ -1867,6 +1877,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_tonbo_minio_stale_client_merge_different_dirs() {
+        load_test_env();
         use std::sync::mpsc::{self, RecvTimeoutError};
 
         let (tx, rx) = mpsc::channel();
@@ -2006,6 +2017,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_tonbo_minio_e2e_rename_then_stale_unlink() {
+        load_test_env();
         use std::sync::mpsc::{self, RecvTimeoutError};
 
         let (tx, rx) = mpsc::channel();
@@ -2165,6 +2177,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_tonbo_minio_e2e_stale_parallel_write_same_block() {
+        load_test_env();
         use std::sync::mpsc::{self, RecvTimeoutError};
 
         let (tx, rx) = mpsc::channel();
@@ -2370,6 +2383,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_tonbo_minio_e2e_stale_rename_vs_rename() {
+        load_test_env();
         use std::sync::mpsc::{self, RecvTimeoutError};
 
         let (tx, rx) = mpsc::channel();

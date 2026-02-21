@@ -14,6 +14,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +35,7 @@ use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
+    load_test_env();
     let endpoint =
         std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
     let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
@@ -75,6 +77,13 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         block_size: 4 * 1024 * 1024,  // 4 MiB
         chunk_size: 64 * 1024 * 1024, // 64 MiB (deprecated)
     }
+}
+
+fn load_test_env() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    let _ = ONCE.get_or_init(|| {
+        let _ = dotenvy::dotenv();
+    });
 }
 
 fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
@@ -758,7 +767,9 @@ fn test_crash_recovery_replays_pending_journal() {
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
-    let online_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:9000");
+    let online_endpoint =
+        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let online_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     meta.set_format_info(&online_info).unwrap();
 
     let rt = tokio::runtime::Builder::new_multi_thread()

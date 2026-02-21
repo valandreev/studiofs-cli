@@ -4,3 +4,4 @@ Cargo.lock
 /docs/ideas
 docs/logs/*.*
 *.exe
+.env

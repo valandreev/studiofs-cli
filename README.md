@@ -258,16 +258,9 @@ studiofs mount mydisk Z:
 
 ## Development
 
-Build:
-```bash
-cargo build --release
-```
-
-Run ignored integration tests (requires MinIO/NATS as appropriate):
-```bash
-cargo test --release -- --ignored
-```
+See `docs/development.md`.
 
 Useful docs:
+- `docs/development.md`
 - `docs/tonbo-cutover-plan.md`
 - `docs/metadata-schema.md`
