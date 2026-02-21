@@ -739,9 +739,9 @@ impl Filesystem for StudioFuseFs {
     ) {
         // File-level semantics only (byte ranges ignored)
         let op = match typ {
-            libc::F_RDLCK => LockKind::Shared,
-            libc::F_WRLCK => LockKind::Exclusive,
-            libc::F_UNLCK => LockKind::Unlock,
+            x if x == libc::F_RDLCK as i32 => LockKind::Shared,
+            x if x == libc::F_WRLCK as i32 => LockKind::Exclusive,
+            x if x == libc::F_UNLCK as i32 => LockKind::Unlock,
             _ => {
                 reply.error(libc::EINVAL);
                 return;
@@ -766,7 +766,7 @@ impl Filesystem for StudioFuseFs {
         reply: fuser::ReplyLock,
     ) {
         // Report no conflicting locks (single-node simplification)
-        reply.locked(start as i64, end as i64, libc::F_UNLCK, 0);
+        reply.locked(start, end, libc::F_UNLCK as i32, 0);
     }
 
     fn fallocate(
