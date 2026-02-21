@@ -37,6 +37,9 @@ const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlin
 /// Extended attributes: (ino(8) + name_bytes) -> value_bytes
 const XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("xattrs");
 
+/// Event Log: sequence_id (u64) -> MetaEvent (postcard)
+const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
+
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
 /// Encode a dentry key: parent_ino (8 bytes LE) + name bytes.
@@ -128,6 +131,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
             let _ = txn.open_table(SYMLINKS_TABLE);
             let _ = txn.open_table(XATTRS_TABLE);
+            let _ = txn.open_table(EVENT_LOG_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -182,6 +186,39 @@ impl RedbMetaEngine {
                 .insert(ino, data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Append a MetaEvent to the local event log table within an existing write transaction.
+    fn append_event_in_txn(
+        txn: &redb::WriteTransaction,
+        event: &crate::events::MetaEvent,
+    ) -> MetaResult<()> {
+        let mut counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        // Get the next sequence ID for the event log
+        let seq_id = match counters
+            .get("nextEventSeq")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => v.value(),
+            None => 1,
+        };
+        counters
+            .insert("nextEventSeq", seq_id + 1)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        // Encode and insert the event
+        let mut events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let data = encode(event)?;
+        events
+            .insert(seq_id, data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
         Ok(())
     }
 }
@@ -372,6 +409,11 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .insert(attr.ino, data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -418,6 +460,8 @@ impl MetaEngine for RedbMetaEngine {
             for key in keys_to_remove {
                 let _ = xattrs.remove(key.as_slice());
             }
+
+            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -539,6 +583,15 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .insert(key.as_slice(), data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: entry.clone(),
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -564,6 +617,14 @@ impl MetaEngine for RedbMetaEngine {
                     name: String::from_utf8_lossy(name).to_string(),
                 })?;
             entry_val = decode(removed.value())?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveEntry {
+                    parent,
+                    name: name.to_vec(),
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -624,6 +685,15 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .insert(key.as_slice(), data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetFileBlock {
+                    ino,
+                    block_index,
+                    block: block.clone(),
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -705,6 +775,8 @@ impl MetaEngine for RedbMetaEngine {
                     .remove(key.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
+
+            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveFileBlocks { ino })?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -729,6 +801,11 @@ impl MetaEngine for RedbMetaEngine {
             {
                 let block: BlockRef = decode(entry.value())?;
                 removed_id = Some(block.object_id);
+
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::RemoveFileBlock { ino, block_index },
+                )?;
             } else {
                 removed_id = None;
             }
@@ -778,6 +855,14 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .insert(object_id, timestamp)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddPendingDeletion {
+                    object_id,
+                    timestamp,
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -796,6 +881,11 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .remove(object_id)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemovePendingDeletion { object_id },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -936,6 +1026,11 @@ impl MetaEngine for RedbMetaEngine {
                     inodes
                         .insert(src_entry.ino, data.as_slice())
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                    )?;
                 }
                 // Decrement old parent nlink
                 Self::adjust_nlink_in_txn(&mut inodes, parent, -1)?;
@@ -1035,6 +1130,14 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .insert(ino, target)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetSymlinkTarget {
+                    ino,
+                    target: target.to_vec(),
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1109,6 +1212,16 @@ impl MetaEngine for RedbMetaEngine {
             table
                 .insert(key.as_slice(), value)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetXattr {
+                    ino,
+                    name: name.to_vec(),
+                    value: value.to_vec(),
+                    flags,
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1132,6 +1245,14 @@ impl MetaEngine for RedbMetaEngine {
                     parent: ino,
                     name: String::from_utf8_lossy(name).to_string(),
                 })?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveXattr {
+                    ino,
+                    name: name.to_vec(),
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1249,7 +1370,23 @@ impl MetaEngine for RedbMetaEngine {
                 .insert(dentry_key.as_slice(), entry_val.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            result_attr = attr;
+            result_attr = attr.clone();
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: DirEntryValue {
+                        ino,
+                        kind: FileType::RegularFile,
+                    },
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1346,7 +1483,29 @@ impl MetaEngine for RedbMetaEngine {
                 .insert(parent, p_data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            result_attr = attr;
+            result_attr = attr.clone();
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr {
+                    attr: parent_attr.clone(),
+                },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: DirEntryValue {
+                        ino,
+                        kind: FileType::Directory,
+                    },
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1443,7 +1602,30 @@ impl MetaEngine for RedbMetaEngine {
                 .insert(ino, target)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            result_attr = attr;
+            result_attr = attr.clone();
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetSymlinkTarget {
+                    ino,
+                    target: target.to_vec(),
+                },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: DirEntryValue {
+                        ino,
+                        kind: FileType::Symlink,
+                    },
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1648,7 +1830,26 @@ impl MetaEngine for RedbMetaEngine {
                 inodes
                     .insert(parent, p_attr_data.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr {
+                        attr: parent_attr.clone(),
+                    },
+                )?;
             }
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveAttr { ino: entry.ino },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveEntry {
+                    parent,
+                    name: name.to_vec(),
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

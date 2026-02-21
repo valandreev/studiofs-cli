@@ -4,9 +4,11 @@
 //! All filesystem structure (inodes, directory entries, chunk/slice mappings) is managed here.
 
 pub mod engine;
+pub mod events;
 pub mod redb_engine;
 pub mod types;
 
 pub use engine::{MetaEngine, MetaError, MetaResult};
+pub use events::MetaEvent;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;
