@@ -5,6 +5,7 @@
 use crate::engine::*;
 use crate::types::*;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::debug;
@@ -39,6 +40,20 @@ const XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("xattrs
 
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
+
+/// Serializable full snapshot of redb metadata state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RedbSnapshot {
+    pub settings: Vec<(String, Vec<u8>)>,
+    pub counters: Vec<(String, u64)>,
+    pub inodes: Vec<(u64, Vec<u8>)>,
+    pub dentries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
+    pub pending_deletions: Vec<(u64, i64)>,
+    pub symlinks: Vec<(u64, Vec<u8>)>,
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub event_log: Vec<(u64, Vec<u8>)>,
+}
 
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
 
@@ -219,6 +234,309 @@ impl RedbMetaEngine {
             .insert(seq_id, data.as_slice())
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
+        Ok(())
+    }
+
+    /// Export full redb state as a serializable snapshot.
+    pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut snapshot = RedbSnapshot::default();
+
+        {
+            let table = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .settings
+                    .push((k.value().to_string(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot.counters.push((k.value().to_string(), v.value()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot.inodes.push((k.value(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .dentries
+                    .push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .file_blocks
+                    .push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot.pending_deletions.push((k.value(), v.value()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(SYMLINKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot.symlinks.push((k.value(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .xattrs
+                    .push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(EVENT_LOG_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot.event_log.push((k.value(), v.value().to_vec()));
+            }
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Replace redb state with a provided snapshot.
+    pub fn import_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        {
+            let mut table = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<String> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_str());
+            }
+            for (k, v) in &snapshot.settings {
+                table
+                    .insert(k.as_str(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<String> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_str());
+            }
+            for (k, v) in &snapshot.counters {
+                table
+                    .insert(k.as_str(), *v)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key);
+            }
+            for (k, v) in &snapshot.inodes {
+                table
+                    .insert(*k, v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_slice());
+            }
+            for (k, v) in &snapshot.dentries {
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_slice());
+            }
+            for (k, v) in &snapshot.file_blocks {
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key);
+            }
+            for (k, v) in &snapshot.pending_deletions {
+                table
+                    .insert(*k, *v)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(SYMLINKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key);
+            }
+            for (k, v) in &snapshot.symlinks {
+                table
+                    .insert(*k, v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_slice());
+            }
+            for (k, v) in &snapshot.xattrs {
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(EVENT_LOG_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key);
+            }
+            for (k, v) in &snapshot.event_log {
+                table
+                    .insert(*k, v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 }
@@ -1116,6 +1434,26 @@ impl MetaEngine for RedbMetaEngine {
         Ok(result)
     }
 
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut refs = HashSet::new();
+        for item in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let block: BlockRef = decode(v.value())?;
+            refs.insert(block.object_id);
+        }
+        Ok(refs)
+    }
+
     // --- Symlinks --------------------------------------------------------
 
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
@@ -1894,6 +2232,9 @@ mod tests {
             access_key: "minioadmin".into(),
             secret_key: "minioadmin".into(),
             region: "".into(),
+            data_prefix: "test-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            version: String::new(),
             block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: 0,
         };

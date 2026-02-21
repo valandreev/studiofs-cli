@@ -13,16 +13,19 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::Arc;
 
+use studiofs_data::object::{create_object, format_object_key, read_object};
 use studiofs_data::store::{DataStore, DataStoreConfig};
-use studiofs_data::object::{create_object, read_object, format_object_key};
-use studiofs_meta::{RedbMetaEngine, MetaEngine, FormatInfo, types::BlockRef};
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
+use studiofs_meta::{
+    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine, RemoteStoreConfig,
+    types::BlockRef,
+};
+use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 
 // =============================================================================
 // Test Helpers
@@ -30,15 +33,30 @@ use studiofs_meta::types::TimeSpec;
 
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
+    let volume_name = format!("vfs-test-{volume_suffix}");
     FormatInfo {
-        name: format!("vfs-test-{volume_suffix}"),
+        name: volume_name.clone(),
         uuid: format!("test-uuid-{volume_suffix}"),
         endpoint: "http://127.0.0.1:9000".into(),
         bucket: "studiofs-test".into(),
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         region: "us-east-1".into(),
-        block_size: 4 * 1024 * 1024, // 4 MiB
+        data_prefix: format!("{volume_name}/objects/"),
+        metadata: MetadataConfig {
+            backend: MetadataBackend::Tonbo,
+            remote: Some(RemoteStoreConfig {
+                endpoint: "http://127.0.0.1:9000".into(),
+                bucket: "studiofs-test".into(),
+                access_key: "minioadmin".into(),
+                secret_key: "minioadmin".into(),
+                region: "us-east-1".into(),
+                prefix: format!("{volume_name}/metadata/"),
+            }),
+            ..MetadataConfig::default()
+        },
+        version: String::new(),
+        block_size: 4 * 1024 * 1024,  // 4 MiB
         chunk_size: 64 * 1024 * 1024, // 64 MiB (deprecated)
     }
 }
@@ -54,11 +72,13 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
 
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("failed to open RedbMetaEngine"));
-    meta.init_root(0, 0).expect("failed to initialize root inode");
+    meta.init_root(0, 0)
+        .expect("failed to initialize root inode");
 
     // Set format info
     let format_info = make_format_info(volume_suffix);
-    meta.set_format_info(&format_info).expect("failed to set format info");
+    meta.set_format_info(&format_info)
+        .expect("failed to set format info");
 
     let data_config = DataStoreConfig::from(&format_info);
     let data = Arc::new(DataStore::new(&data_config).expect("failed to create DataStore"));
@@ -97,6 +117,40 @@ async fn wait_until_exists(ds: &DataStore, path: &str, timeout: Duration) -> boo
             return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_until_absent(ds: &DataStore, path: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match ds.exists(path).await {
+            Ok(false) => return true,
+            Ok(true) => {}
+            Err(_) => return true,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn wait_until_blocks(
+    vfs: &Arc<StudioVfs>,
+    ino: u64,
+    timeout: Duration,
+) -> Option<Vec<(u32, BlockRef)>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+            && !blocks.is_empty()
+        {
+            return Some(blocks);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -227,7 +281,7 @@ async fn test_block_allocation() {
     // Write data that spans multiple blocks (4 MiB each)
     let block_size = 4 * 1024 * 1024;
     let payload: Vec<u8> = (0..block_size * 3).map(|i| (i % 256) as u8).collect();
-    
+
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
@@ -268,9 +322,12 @@ async fn test_partial_block() {
     // Verify single partial block
     let blocks = vfs.meta().get_file_blocks(ino).unwrap();
     assert_eq!(blocks.len(), 1);
-    
+
     let (_, block_ref) = &blocks[0];
-    assert!(block_ref.is_partial(), "Small file should have partial block");
+    assert!(
+        block_ref.is_partial(),
+        "Small file should have partial block"
+    );
     assert_eq!(block_ref.length as usize, payload.len());
 }
 
@@ -422,12 +479,180 @@ async fn test_pending_deletions_gc() {
 
     // Verify old block is in pending deletions
     let pending = vfs.meta().get_pending_deletions().unwrap();
-    assert!(pending.iter().any(|(id, _)| *id == old_block_id), 
-            "Old block should be in pending deletions");
+    assert!(
+        pending.iter().any(|(id, _)| *id == old_block_id),
+        "Old block should be in pending deletions"
+    );
 
     // Verify new block is different
     let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
     assert_ne!(blocks_after[0].1.object_id, old_block_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_background_janitor_removes_orphan_object() {
+    ensure_bucket().await;
+
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    // Speed up janitor cycle for this test only.
+    let _restore_interval = EnvRestore {
+        key: "STUDIOFS_JANITOR_INTERVAL_SECS",
+        old: std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS").ok(),
+    };
+    let _restore_skip = EnvRestore {
+        key: "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
+        old: std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS").ok(),
+    };
+    let _restore_max = EnvRestore {
+        key: "STUDIOFS_JANITOR_MAX_DELETES",
+        old: std::env::var("STUDIOFS_JANITOR_MAX_DELETES").ok(),
+    };
+    let _restore_lease_ttl = EnvRestore {
+        key: "STUDIOFS_JANITOR_LEASE_TTL_SECS",
+        old: std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
+        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "janitor_orphan");
+    let info = vfs.meta().get_format_info().unwrap();
+    let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
+
+    // Upload an orphan object directly to data storage (metadata doesn't reference it).
+    let orphan_id = 0xdead_beef_u64;
+    let orphan_key = format_object_key(&info.data_prefix, orphan_id);
+    if let Err(err) = ds
+        .operator()
+        .write(&orphan_key, Bytes::from_static(b"orphan-object"))
+        .await
+    {
+        if err.to_string().contains("NoSuchBucket") {
+            eprintln!("skip test_background_janitor_removes_orphan_object: {}", err);
+            return;
+        }
+        panic!("failed to write orphan object: {}", err);
+    }
+    assert!(
+        wait_until_exists(&ds, &orphan_key, Duration::from_secs(5)).await,
+        "orphan object must exist before janitor cycle"
+    );
+
+    assert!(
+        wait_until_absent(&ds, &orphan_key, Duration::from_secs(20)).await,
+        "background janitor should delete orphan object"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_background_janitor_cleans_simulated_crash_orphan() {
+    ensure_bucket().await;
+
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    // Fast janitor cycle for test.
+    let _restore_interval = EnvRestore {
+        key: "STUDIOFS_JANITOR_INTERVAL_SECS",
+        old: std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS").ok(),
+    };
+    let _restore_skip = EnvRestore {
+        key: "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
+        old: std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS").ok(),
+    };
+    let _restore_max = EnvRestore {
+        key: "STUDIOFS_JANITOR_MAX_DELETES",
+        old: std::env::var("STUDIOFS_JANITOR_MAX_DELETES").ok(),
+    };
+    let _restore_lease_ttl = EnvRestore {
+        key: "STUDIOFS_JANITOR_LEASE_TTL_SECS",
+        old: std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
+        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "janitor_crash_orphan");
+    let info = vfs.meta().get_format_info().unwrap();
+    let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
+
+    // 1) Normal write path uploads object and records metadata ref.
+    let attr = vfs.create(1, b"crash_like.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    let payload = vec![0xABu8; 512 * 1024];
+    vfs.write(ino, 0, &payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+        .expect("expected at least one block reference after flush");
+    let object_id = blocks[0].1.object_id;
+    let key = format_object_key(&info.data_prefix, object_id);
+    let object_bytes = Bytes::from(create_object(&payload).unwrap());
+    if let Err(err) = ds.operator().write(&key, object_bytes).await {
+        if err.to_string().contains("NoSuchBucket") {
+            eprintln!(
+                "skip test_background_janitor_cleans_simulated_crash_orphan: {}",
+                err
+            );
+            return;
+        }
+        panic!("failed to write simulated crash object: {}", err);
+    }
+    assert!(
+        wait_until_exists(&ds, &key, Duration::from_secs(5)).await,
+        "uploaded data object should exist before simulated crash"
+    );
+
+    // 2) Simulate crash window by "losing" metadata refs while object remains in S3.
+    let removed_ids = vfs.meta().remove_file_blocks(ino).unwrap();
+    assert!(
+        removed_ids.contains(&object_id),
+        "remove_file_blocks should drop the uploaded object reference"
+    );
+
+    // 3) Janitor should eventually detect object as orphan and delete it.
+    assert!(
+        wait_until_absent(&ds, &key, Duration::from_secs(25)).await,
+        "background janitor should clean orphan object from simulated crash"
+    );
 }
 
 #[test]
@@ -461,14 +686,8 @@ fn test_crash_recovery_replays_pending_journal() {
             .unwrap();
         let data = Arc::new(DataStore::new(&DataStoreConfig::from(&offline_info)).unwrap());
         rt.block_on(async {
-            let vfs = StudioVfs::new(
-                meta.clone(),
-                data,
-                None,
-                &cache_dir_str,
-                1024 * 1024 * 1024,
-            )
-            .unwrap();
+            let vfs = StudioVfs::new(meta.clone(), data, None, &cache_dir_str, 1024 * 1024 * 1024)
+                .unwrap();
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
             crash_file_ino = attr.ino;
             let payload = vec![0x5Au8; 2 * 1024 * 1024];
@@ -485,7 +704,10 @@ fn test_crash_recovery_replays_pending_journal() {
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
         .count();
-    assert!(pending_count > 0, "expected pending journal files after simulated crash");
+    assert!(
+        pending_count > 0,
+        "expected pending journal files after simulated crash"
+    );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
     let online_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:9000");
@@ -510,7 +732,7 @@ fn test_crash_recovery_replays_pending_journal() {
         let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
         assert!(!blocks.is_empty(), "file blocks must exist in metadata");
         let object_id = blocks[0].1.object_id;
-        let key = format_object_key(&online_info.uuid, object_id);
+        let key = format_object_key(&online_info.data_prefix, object_id);
 
         assert!(
             wait_until_exists(&data, &key, Duration::from_secs(15)).await,
@@ -525,7 +747,10 @@ fn test_crash_recovery_replays_pending_journal() {
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
         .count();
-    assert_eq!(pending_after, 0, "pending journals must be cleaned up after recovery");
+    assert_eq!(
+        pending_after, 0,
+        "pending journals must be cleaned up after recovery"
+    );
 }
 
 // =============================================================================
@@ -551,10 +776,10 @@ async fn test_block_ref_flags() {
 #[tokio::test]
 async fn test_object_format() {
     let original_data = b"Test data for object format";
-    
+
     // Create object
     let object = create_object(original_data).unwrap();
-    
+
     // Verify we can read it back
     let decompressed = read_object(&object).unwrap();
     assert_eq!(decompressed.as_slice(), original_data);
@@ -562,11 +787,11 @@ async fn test_object_format() {
 
 #[tokio::test]
 async fn test_object_key_format() {
-    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let data_prefix = "disk-a/objects/";
     let object_id: u64 = 0x1234;
-    
-    let key = format_object_key(uuid, object_id);
-    assert_eq!(key, "550e8400-e29b-41d4-a716-446655440000/blocks/0000/0000000000001234");
+
+    let key = format_object_key(data_prefix, object_id);
+    assert_eq!(key, "disk-a/objects/0000/0000000000001234");
 }
 
 // =============================================================================
@@ -586,19 +811,22 @@ async fn test_sequential_write_performance() {
     // Write 100 MiB
     let size = 100 * 1024 * 1024;
     let block_size = 4 * 1024 * 1024; // 4 MiB blocks
-    
+
     let start = std::time::Instant::now();
-    
+
     for i in 0..(size / block_size) {
         let offset = (i * block_size) as u64;
         let payload: Vec<u8> = (0..block_size).map(|j| ((i + j) % 256) as u8).collect();
         vfs.write(ino, offset, &payload).await.unwrap();
     }
-    
+
     let write_duration = start.elapsed();
     let write_mbps = (size as f64 / 1024.0 / 1024.0) / write_duration.as_secs_f64();
-    
-    println!("Write: {:.2} MiB/s ({} bytes in {:?})", write_mbps, size, write_duration);
+
+    println!(
+        "Write: {:.2} MiB/s ({} bytes in {:?})",
+        write_mbps, size, write_duration
+    );
 
     // Flush
     let flush_start = std::time::Instant::now();
@@ -611,9 +839,12 @@ async fn test_sequential_write_performance() {
     let data = vfs.read(ino, 0, size as u32).await.unwrap();
     let read_duration = read_start.elapsed();
     let read_mbps = (size as f64 / 1024.0 / 1024.0) / read_duration.as_secs_f64();
-    
-    println!("Read: {:.2} MiB/s ({} bytes in {:?})", read_mbps, size, read_duration);
-    
+
+    println!(
+        "Read: {:.2} MiB/s ({} bytes in {:?})",
+        read_mbps, size, read_duration
+    );
+
     assert_eq!(data.len(), size);
 }
 /// Test attribute cache with TTL and invalidation on writes.
@@ -902,7 +1133,9 @@ async fn test_symlink_create_and_readlink() {
     let vfs = make_vfs(&tmp, "symlink_basic");
 
     // Create a symlink
-    let attr = vfs.symlink(1, b"mylink", b"/some/target/path", 0, 0).unwrap();
+    let attr = vfs
+        .symlink(1, b"mylink", b"/some/target/path", 0, 0)
+        .unwrap();
     assert_eq!(attr.kind, studiofs_meta::FileType::Symlink);
     assert_eq!(attr.mode, 0o777);
     assert_eq!(attr.size, 17); // length of "/some/target/path"
@@ -1129,8 +1362,7 @@ async fn test_xattr_set_get_remove() {
     let attr = vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
 
     // Set xattr
-    vfs.set_xattr(attr.ino, b"user.color", b"blue", 0)
-        .unwrap();
+    vfs.set_xattr(attr.ino, b"user.color", b"blue", 0).unwrap();
 
     // Get xattr
     let val = vfs.get_xattr(attr.ino, b"user.color").unwrap();

@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -128,10 +128,7 @@ impl Slab {
 
     /// Open an existing slab file (for recovery).
     fn open_existing(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         let metadata = file.metadata()?;
         let size = metadata.len();
@@ -168,7 +165,8 @@ impl Slab {
                     free_list[i].length -= aligned_size;
                 }
 
-                self.free_bytes.fetch_sub(aligned_size as u64, Ordering::Relaxed);
+                self.free_bytes
+                    .fetch_sub(aligned_size as u64, Ordering::Relaxed);
                 return Some((offset, aligned_size));
             }
         }
@@ -224,11 +222,7 @@ impl Slab {
         let end = start + data.len();
         assert!(end <= self.mmap_len, "write_at out of bounds");
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.mmap_ptr.add(start),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.mmap_ptr.add(start), data.len());
         }
     }
 
@@ -318,7 +312,10 @@ impl SlabStore {
             match slabs.get(entry.slab_id as usize).and_then(|s| s.as_ref()) {
                 Some(s) => s.clone(), // Clone the Arc for moving into spawn_blocking
                 None => {
-                    warn!("slab {} missing/cleaned for object {:016x}", entry.slab_id, id);
+                    warn!(
+                        "slab {} missing/cleaned for object {:016x}",
+                        entry.slab_id, id
+                    );
                     return None;
                 }
             }
@@ -364,7 +361,10 @@ impl SlabStore {
         // Write data to slab
         {
             let slabs = self.slabs.read();
-            slabs[slab_id as usize].as_ref().unwrap().write_at(offset, data);
+            slabs[slab_id as usize]
+                .as_ref()
+                .unwrap()
+                .write_at(offset, data);
         }
 
         // Register in index
@@ -461,9 +461,10 @@ impl SlabStore {
             let slabs = self.slabs.read();
             for (i, slot) in slabs.iter().enumerate() {
                 if let Some(slab) = slot
-                    && let Some((offset, aligned)) = slab.allocate(size) {
-                        return Ok((i as u16, offset, aligned));
-                    }
+                    && let Some((offset, aligned)) = slab.allocate(size)
+                {
+                    return Ok((i as u16, offset, aligned));
+                }
             }
         }
 
@@ -622,7 +623,10 @@ impl SlabStore {
         for i in 0..slab_count {
             let path = self.slab_dir.join(format!("slab_{:04}.dat", i));
             if !path.exists() {
-                info!("[SLAB-RECOVER] slab_{:04}.dat missing (was empty/deleted), skipping", i);
+                info!(
+                    "[SLAB-RECOVER] slab_{:04}.dat missing (was empty/deleted), skipping",
+                    i
+                );
                 slabs.push(None);
                 continue;
             }
@@ -649,14 +653,10 @@ impl SlabStore {
 
         for i in 0..load_count {
             let base = entries_start + i * ENTRY_SIZE;
-            let object_id =
-                u64::from_le_bytes(index_data[base..base + 8].try_into().unwrap());
-            let slab_id =
-                u16::from_le_bytes(index_data[base + 8..base + 10].try_into().unwrap());
-            let offset =
-                u32::from_le_bytes(index_data[base + 10..base + 14].try_into().unwrap());
-            let length =
-                u32::from_le_bytes(index_data[base + 14..base + 18].try_into().unwrap());
+            let object_id = u64::from_le_bytes(index_data[base..base + 8].try_into().unwrap());
+            let slab_id = u16::from_le_bytes(index_data[base + 8..base + 10].try_into().unwrap());
+            let offset = u32::from_le_bytes(index_data[base + 10..base + 14].try_into().unwrap());
+            let length = u32::from_le_bytes(index_data[base + 14..base + 18].try_into().unwrap());
 
             if (slab_id as usize) >= slabs.len() {
                 continue; // Skip entries referencing missing slabs
@@ -1016,12 +1016,7 @@ mod tests {
     #[tokio::test]
     async fn test_slab_large_block() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SlabStore::open(
-            &dir.path().join("slabs"),
-            100 * 1024 * 1024,
-            0,
-        )
-        .unwrap();
+        let store = SlabStore::open(&dir.path().join("slabs"), 100 * 1024 * 1024, 0).unwrap();
 
         // Write a 4MB block (typical block size)
         let data = vec![0xBBu8; 4 * 1024 * 1024];

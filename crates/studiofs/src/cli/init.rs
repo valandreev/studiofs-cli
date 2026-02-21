@@ -1,26 +1,41 @@
 //! `studiofs init` — initialize a new filesystem volume.
 
+use std::io::Write;
 use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
-use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine, DEFAULT_BLOCK_SIZE};
+use studiofs_meta::{
+    DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine,
+    RemoteStoreConfig, TonboMetaEngine,
+};
 use tracing::info;
 use uuid::Uuid;
-use std::io::Write;
+
+fn verify_store_access(label: &str, cfg: &DataStoreConfig) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let ds = DataStore::new(cfg)?;
+        ds.check()
+            .await
+            .map_err(|e| anyhow::anyhow!("{} check failed: {}", label, e))
+    })
+}
 
 /// Parse a size string like "4MB", "1GB" into bytes.
 /// Supports KB, MB, GB, TB suffixes. Defaults to bytes if no suffix.
 fn parse_size(size_str: &str) -> anyhow::Result<u32> {
     let size_str = size_str.trim().to_uppercase();
-    
+
     let (num_part, suffix) = if let Some(pos) = size_str.find(|c: char| c.is_alphabetic()) {
         (&size_str[..pos], &size_str[pos..])
     } else {
         (&size_str[..], "")
     };
-    
-    let num: u64 = num_part.trim().parse()
+
+    let num: u64 = num_part
+        .trim()
+        .parse()
         .map_err(|_| anyhow::anyhow!("Invalid number in size: {}", size_str))?;
-    
+
     let multiplier = match suffix {
         "" => 1,
         "B" => 1,
@@ -30,13 +45,16 @@ fn parse_size(size_str: &str) -> anyhow::Result<u32> {
         "TB" => 1024 * 1024 * 1024 * 1024,
         _ => return Err(anyhow::anyhow!("Unknown size suffix: {}", suffix)),
     };
-    
+
     let bytes = num.saturating_mul(multiplier);
-    
+
     if bytes > u32::MAX as u64 {
-        return Err(anyhow::anyhow!("Block size too large: {} (max 4GB)", size_str));
+        return Err(anyhow::anyhow!(
+            "Block size too large: {} (max 4GB)",
+            size_str
+        ));
     }
-    
+
     Ok(bytes as u32)
 }
 
@@ -53,51 +71,39 @@ fn get_current_ids() -> (u32, u32) {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
+    data_endpoint: &str,
+    data_bucket: &str,
+    data_access_key: &str,
+    data_secret_key: &str,
+    data_region: &str,
+    metadata_endpoint: Option<&str>,
+    metadata_bucket: Option<&str>,
+    metadata_access_key: Option<&str>,
+    metadata_secret_key: Option<&str>,
+    metadata_region: Option<&str>,
+    metadata_same_as_data: bool,
+    metadata_cache_ttl_secs: u64,
+    metadata_flush_interval_secs: u64,
+    metadata_flush_ops_threshold: u32,
+    metadata_flush_bytes_threshold: u64,
     meta_dir: &Path,
     block_size: Option<&str>,
 ) -> anyhow::Result<()> {
-    // 1. Verify S3 credentials and bucket accessibility
-    println!("🔍 Verifying S3 connection...");
-    let rt = tokio::runtime::Runtime::new()?;
-    
-    rt.block_on(async {
-        let config = DataStoreConfig {
-            endpoint: endpoint.to_string(),
-            bucket: bucket.to_string(),
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
-            region: region.to_string(),
-            volume_name: name.to_string(),
-        };
-
-        let ds = DataStore::new(&config)?;
-        
-        match ds.check().await {
-            Ok(_) => {
-                println!("✅ S3 connection verified. Bucket '{}' is accessible.", bucket);
-                Ok(())
-            }
-            Err(e) => {
-                let err_str = format!("{}", e);
-                if err_str.contains("NotFound") || err_str.contains("404") || err_str.contains("NoSuchBucket") {
-                    println!("❌ Bucket '{}' was not found or is inaccessible.", bucket);
-                    println!("   StudioFS init uses OpenDAL only and does not auto-create buckets.");
-                    println!("   Create the bucket manually, then retry `studiofs init`.");
-                    Err(anyhow::anyhow!("Initialization cancelled: bucket missing."))
-                } else {
-                    println!("❌ S3 verification failed!");
-                    println!("   Error: {}", e);
-                    println!("   Check your Endpoint, Access Key, and Secret Key.");
-                    Err(anyhow::anyhow!("S3 verification failed"))
-                }
-            }
-        }
-    })?;
+    // 1. Verify data and metadata stores.
+    println!("🔍 Verifying data store connection...");
+    let data_cfg = DataStoreConfig {
+        endpoint: data_endpoint.to_string(),
+        bucket: data_bucket.to_string(),
+        access_key: data_access_key.to_string(),
+        secret_key: data_secret_key.to_string(),
+        region: data_region.to_string(),
+        volume_name: name.to_string(),
+    };
+    verify_store_access("data", &data_cfg)?;
+    println!(
+        "✅ Data store verified. Bucket '{}' is accessible.",
+        data_bucket
+    );
 
     println!();
 
@@ -134,15 +140,82 @@ pub fn run(
         DEFAULT_BLOCK_SIZE
     };
 
+    let metadata_prefix = format!("{name}/metadata/");
+    let data_prefix = format!("{name}/objects/");
+
+    let metadata_remote = if metadata_same_as_data {
+        Some(RemoteStoreConfig {
+            endpoint: data_endpoint.to_string(),
+            bucket: data_bucket.to_string(),
+            access_key: data_access_key.to_string(),
+            secret_key: data_secret_key.to_string(),
+            region: data_region.to_string(),
+            prefix: metadata_prefix.clone(),
+        })
+    } else {
+        let endpoint = metadata_endpoint.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--metadata-endpoint is required unless --metadata-same-as-data is used"
+            )
+        })?;
+        let bucket = metadata_bucket.ok_or_else(|| {
+            anyhow::anyhow!("--metadata-bucket is required unless --metadata-same-as-data is used")
+        })?;
+        let access_key = metadata_access_key.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--metadata-access-key is required unless --metadata-same-as-data is used"
+            )
+        })?;
+        let secret_key = metadata_secret_key.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--metadata-secret-key is required unless --metadata-same-as-data is used"
+            )
+        })?;
+        Some(RemoteStoreConfig {
+            endpoint: endpoint.to_string(),
+            bucket: bucket.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            region: metadata_region.unwrap_or("").to_string(),
+            prefix: metadata_prefix.clone(),
+        })
+    };
+    if let Some(remote) = &metadata_remote {
+        println!("🔍 Verifying metadata store connection...");
+        let metadata_cfg = DataStoreConfig {
+            endpoint: remote.endpoint.clone(),
+            bucket: remote.bucket.clone(),
+            access_key: remote.access_key.clone(),
+            secret_key: remote.secret_key.clone(),
+            region: remote.region.clone(),
+            volume_name: name.to_string(),
+        };
+        verify_store_access("metadata", &metadata_cfg)?;
+        println!(
+            "✅ Metadata store verified. Bucket '{}' is accessible.",
+            remote.bucket
+        );
+    }
+
     // Store format info
     let format_info = FormatInfo {
         name: name.to_string(),
         uuid: Uuid::new_v4().to_string(),
-        endpoint: endpoint.to_string(),
-        bucket: bucket.to_string(),
-        access_key: access_key.to_string(),
-        secret_key: secret_key.to_string(),
-        region: region.to_string(),
+        endpoint: data_endpoint.to_string(),
+        bucket: data_bucket.to_string(),
+        access_key: data_access_key.to_string(),
+        secret_key: data_secret_key.to_string(),
+        region: data_region.to_string(),
+        data_prefix,
+        metadata: MetadataConfig {
+            backend: MetadataBackend::Tonbo,
+            remote: metadata_remote,
+            cache_ttl_secs: metadata_cache_ttl_secs.max(1),
+            flush_interval_secs: metadata_flush_interval_secs.max(1),
+            flush_ops_threshold: metadata_flush_ops_threshold.max(1),
+            flush_bytes_threshold: metadata_flush_bytes_threshold.max(1),
+        },
+        version: String::new(),
         block_size: actual_block_size,
         chunk_size: 0,
     };
@@ -151,13 +224,29 @@ pub fn run(
     // Initialize root inode owned by the current user
     let (uid, gid) = get_current_ids();
     engine.init_root(uid, gid)?;
+    drop(engine);
+
+    // Seed initial remote metadata manifest for Tonbo backend.
+    if format_info.metadata.backend == MetadataBackend::Tonbo {
+        let tonbo = TonboMetaEngine::open(&db_path)?;
+        tonbo.flush_now()?;
+    }
 
     info!("volume {name:?} initialized successfully");
     println!("✓ Volume '{}' initialized", name);
     println!("  UUID:       {}", format_info.uuid);
-    println!("  Block size: {} bytes ({} MiB)", actual_block_size, actual_block_size / (1024 * 1024));
-    println!("  Endpoint:   {}", endpoint);
-    println!("  Bucket:     {}", bucket);
+    println!(
+        "  Block size: {} bytes ({} MiB)",
+        actual_block_size,
+        actual_block_size / (1024 * 1024)
+    );
+    println!("  Data endpoint: {}", data_endpoint);
+    println!("  Data bucket:   {}", data_bucket);
+    if let Some(remote) = &format_info.metadata.remote {
+        println!("  Metadata endpoint: {}", remote.endpoint);
+        println!("  Metadata bucket:   {}", remote.bucket);
+        println!("  Metadata prefix:   {}", remote.prefix);
+    }
     println!("  Metadata:   {:?}", db_path);
     println!();
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);

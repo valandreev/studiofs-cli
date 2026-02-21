@@ -13,8 +13,8 @@
 use bytes::Bytes;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
@@ -168,9 +168,10 @@ impl DiskCache {
                 // Persist index every 5 GC runs (~5 min)
                 let count = monitor_cache.gc_counter.fetch_add(1, Ordering::Relaxed);
                 if count.is_multiple_of(5)
-                    && let Err(e) = monitor_cache.store.persist_index() {
-                        error!("failed to persist slab index: {}", e);
-                    }
+                    && let Err(e) = monitor_cache.store.persist_index()
+                {
+                    error!("failed to persist slab index: {}", e);
+                }
             }
         });
 

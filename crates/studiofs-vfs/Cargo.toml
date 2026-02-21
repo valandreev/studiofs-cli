@@ -9,17 +9,18 @@ studiofs-meta.workspace = true
 studiofs-data.workspace = true
 studiofs-cache.workspace = true
 tokio.workspace = true
+async-nats.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 futures.workspace = true
+opendal.workspace = true
 tokio-stream = "0.1.18"
 dashmap.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile.workspace = true
-opendal.workspace = true
 bytes.workspace = true

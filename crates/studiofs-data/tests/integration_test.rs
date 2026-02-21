@@ -108,27 +108,33 @@ async fn block_exists_lifecycle() {
     let block_size = payload.len() as u32;
 
     // Should not exist initially (unique slice ID guarantees this)
-    assert!(!store
-        .block_exists(slice_id, block_idx, block_size)
-        .await
-        .unwrap());
+    assert!(
+        !store
+            .block_exists(slice_id, block_idx, block_size)
+            .await
+            .unwrap()
+    );
 
     // Upload
     store.put_block(slice_id, block_idx, payload).await.unwrap();
-    assert!(store
-        .block_exists(slice_id, block_idx, block_size)
-        .await
-        .unwrap());
+    assert!(
+        store
+            .block_exists(slice_id, block_idx, block_size)
+            .await
+            .unwrap()
+    );
 
     // Delete
     store
         .delete_block(slice_id, block_idx, block_size)
         .await
         .unwrap();
-    assert!(!store
-        .block_exists(slice_id, block_idx, block_size)
-        .await
-        .unwrap());
+    assert!(
+        !store
+            .block_exists(slice_id, block_idx, block_size)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

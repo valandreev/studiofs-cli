@@ -111,6 +111,14 @@ impl MemoryCache {
         }
     }
 
+    /// Clear all cached entries.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().clear();
+        }
+        self.total_bytes.store(0, Ordering::Relaxed);
+    }
+
     /// Evict LRU entries globally until we have at least `needed` bytes free.
     fn evict_to_fit(&self, needed: usize) {
         // Round-robin across shards to find and evict LRU entries until enough

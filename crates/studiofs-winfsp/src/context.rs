@@ -5,9 +5,9 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
 use studiofs_vfs::{OpenFlags, StudioVfs};
-use studiofs_meta::types::{SetattrArgs, TimeSpec};
 
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -15,8 +15,8 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
-use winfsp::filesystem::*;
 use winfsp::U16CStr;
+use winfsp::filesystem::*;
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
@@ -320,9 +320,7 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
                 winfsp::FspError::from(STATUS_UNSUCCESSFUL)
             }
         },
-        studiofs_vfs::VfsError::InvalidName(_) => {
-            winfsp::FspError::from(STATUS_INVALID_PARAMETER)
-        }
+        studiofs_vfs::VfsError::InvalidName(_) => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
         _ => {
             error!("vfs error: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
@@ -388,7 +386,10 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let path_str = file_name.to_string_lossy();
-        debug!("open path={:?} create_options={:#x} granted_access={:?}", path_str, _create_options, _granted_access);
+        debug!(
+            "open path={:?} create_options={:#x} granted_access={:?}",
+            path_str, _create_options, _granted_access
+        );
         let attr = resolve_path(&self.vfs, file_name)?;
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;
@@ -402,16 +403,25 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?
         };
 
-        debug!(ino = attr.ino, fh, "open SUCCESS path={:?} is_dir={}", path_str, is_dir);
+        debug!(
+            ino = attr.ino,
+            fh, "open SUCCESS path={:?} is_dir={}", path_str, is_dir
+        );
         Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
     }
 
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
         if context.fh != 0
-            && let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
-                error!(ino = context.ino, fh = context.fh, "release_fh failed: {:?}", e);
-            }
+            && let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh))
+        {
+            error!(
+                ino = context.ino,
+                fh = context.fh,
+                "release_fh failed: {:?}",
+                e
+            );
+        }
         drop(context);
     }
 
@@ -432,16 +442,21 @@ impl FileSystemContext for StudioFsContext {
         // Handle symlink creation via reparse point buffer
         if extra_buffer_is_reparse_point
             && let Some(buf) = extra_buffer
-                && let Some(target) = decode_symlink_reparse(buf) {
-                    let attr = self
-                        .vfs
-                        .symlink(parent_ino, &name, &target, 0, 0)
-                        .map_err(vfs_to_winfsp_err)?;
-                    let info = attr_to_file_info(&attr);
-                    *file_info.as_mut() = info;
-                    debug!(ino = attr.ino, "create symlink {:?}", file_name.to_string_lossy());
-                    return Ok(StudioFileHandle::new(attr.ino, false, 0));
-                }
+            && let Some(target) = decode_symlink_reparse(buf)
+        {
+            let attr = self
+                .vfs
+                .symlink(parent_ino, &name, &target, 0, 0)
+                .map_err(vfs_to_winfsp_err)?;
+            let info = attr_to_file_info(&attr);
+            *file_info.as_mut() = info;
+            debug!(
+                ino = attr.ino,
+                "create symlink {:?}",
+                file_name.to_string_lossy()
+            );
+            return Ok(StudioFileHandle::new(attr.ino, false, 0));
+        }
 
         let is_dir = (create_options & 0x01) != 0; // FILE_DIRECTORY_FILE
         let attr = if is_dir {
@@ -481,7 +496,10 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
-        debug!(ino = context.ino, "get_file_info kind={:?} size={}", attr.kind, attr.size);
+        debug!(
+            ino = context.ino,
+            "get_file_info kind={:?} size={}", attr.kind, attr.size
+        );
         *file_info = attr_to_file_info(&attr);
         Ok(())
     }
@@ -535,7 +553,12 @@ impl FileSystemContext for StudioFsContext {
         let mut cached = context.dir_entries.lock();
         if cached.is_none() {
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
-            debug!(ino = context.ino, count = entries.len(), "read_directory loaded {} entries", entries.len());
+            debug!(
+                ino = context.ino,
+                count = entries.len(),
+                "read_directory loaded {} entries",
+                entries.len()
+            );
             *cached = Some(entries);
         }
 
@@ -560,15 +583,16 @@ impl FileSystemContext for StudioFsContext {
 
             let mut dotdot = DirInfo::<255>::new();
             if dotdot.set_name(std::ffi::OsStr::new("..")).is_ok()
-                && let Ok(attr) = self.vfs.getattr(context.ino) {
-                    *dotdot.file_info_mut() = attr_to_file_info(&attr);
-                    if !dotdot.append_to_buffer(buffer, &mut cursor) {
-                        debug!("buffer full after adding '..'");
-                        DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-                        return Ok(cursor);
-                    }
-                    debug!("added '..' entry, cursor now at {}", cursor);
+                && let Ok(attr) = self.vfs.getattr(context.ino)
+            {
+                *dotdot.file_info_mut() = attr_to_file_info(&attr);
+                if !dotdot.append_to_buffer(buffer, &mut cursor) {
+                    debug!("buffer full after adding '..'");
+                    DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+                    return Ok(cursor);
                 }
+                debug!("added '..' entry, cursor now at {}", cursor);
+            }
         }
 
         // Get the marker name for comparison
@@ -581,9 +605,10 @@ impl FileSystemContext for StudioFsContext {
 
             // Skip entries at or before the marker
             if let Some(ref m) = marker_str
-                && entry_name.as_str() <= m.as_str() {
-                    continue;
-                }
+                && entry_name.as_str() <= m.as_str()
+            {
+                continue;
+            }
 
             let os_name = std::ffi::OsString::from(&entry_name);
             let mut dir_info = DirInfo::<255>::new();
@@ -602,14 +627,22 @@ impl FileSystemContext for StudioFsContext {
             *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
             if !dir_info.append_to_buffer(buffer, &mut cursor) {
-                debug!("buffer full after adding entry '{}' (tried to add at cursor {})", entry_name, cursor);
+                debug!(
+                    "buffer full after adding entry '{}' (tried to add at cursor {})",
+                    entry_name, cursor
+                );
                 break;
             }
             debug!("added entry '{}', cursor now at {}", entry_name, cursor);
         }
 
         DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-        debug!(ino = context.ino, bytes_returned = cursor, "read_directory returning {} bytes", cursor);
+        debug!(
+            ino = context.ino,
+            bytes_returned = cursor,
+            "read_directory returning {} bytes",
+            cursor
+        );
         Ok(cursor)
     }
 
@@ -636,19 +669,20 @@ impl FileSystemContext for StudioFsContext {
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
             if let Some(fname) = file_name
-                && let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname) {
-                    let res = if context.is_dir {
-                        self.vfs.rmdir(parent_ino, &name)
-                    } else {
-                        self.vfs.unlink(parent_ino, &name)
-                    };
+                && let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname)
+            {
+                let res = if context.is_dir {
+                    self.vfs.rmdir(parent_ino, &name)
+                } else {
+                    self.vfs.unlink(parent_ino, &name)
+                };
 
-                    if let Err(e) = res {
-                        error!("cleanup delete failed: {:?}", e);
-                    } else {
-                        debug!(ino = context.ino, "cleanup delete");
-                    }
+                if let Err(e) = res {
+                    error!("cleanup delete failed: {:?}", e);
+                } else {
+                    debug!(ino = context.ino, "cleanup delete");
                 }
+            }
         } else {
             // Not deleting — flush buffered writes
             // WinFSP "Cleanup" with no delete flag is the standard place to flush.

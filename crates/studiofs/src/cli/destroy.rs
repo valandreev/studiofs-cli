@@ -1,34 +1,46 @@
 //! `studiofs destroy` — permanently delete a volume.
 
-use std::path::Path;
 use std::io::Write;
-use tracing::warn;
+use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{MetaEngine, RedbMetaEngine};
+use tracing::warn;
 
-pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
+pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> {
     // 1. Check if volume exists (metadata DB)
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
         warn!("volume metadata not found at {:?}", db_path);
-        return Err(anyhow::anyhow!("Volume '{}' not found (metadata missing)", name));
+        return Err(anyhow::anyhow!(
+            "Volume '{}' not found (metadata missing)",
+            name
+        ));
     }
 
     // 2. Open metadata to get S3 credentials
     // We only need read access to format info
     let meta = RedbMetaEngine::open(&db_path)?;
     let format_info = meta.get_format_info()?;
-    
+
     // Close DB so we can delete it later
     drop(meta);
 
     // 3. Confirm with user
     println!("WARNING: You are about to DESTROY volume '{}'.", name);
-    println!("This will permanently delete:");
-    println!("  1. All data in S3 bucket '{}' with prefix '{}/'", format_info.bucket, name);
-    println!("  2. ALL local metadata and cache at {:?}", meta_dir);
+    if local_only {
+        println!("This will permanently delete local metadata/cache only:");
+        println!("  1. ALL local metadata and cache at {:?}", meta_dir);
+        println!("Remote data and remote metadata will be kept.");
+    } else {
+        println!("This will permanently delete:");
+        println!(
+            "  1. All data in S3 bucket '{}' with prefix '{}/'",
+            format_info.bucket, name
+        );
+        println!("  2. ALL local metadata and cache at {:?}", meta_dir);
+    }
     println!();
-    
+
     print!("Do you want to proceed? [y/N]: ");
     std::io::stdout().flush()?;
     let mut input = String::new();
@@ -43,22 +55,53 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    
+
     if input.trim() != name {
         println!("Confirmation failed. Aborting.");
         return Ok(());
     }
 
-    // 4. Initialize DataStore and delete S3 data
-    println!("Deleting data from S3...");
-    let data_config = DataStoreConfig::from(&format_info);
-    
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let ds = DataStore::new(&data_config)?;
-        ds.delete_volume_data().await
-    })?;
-    println!("✓ S3 data deleted.");
+    // 4. Initialize DataStore and delete S3 data (unless local-only)
+    if !local_only {
+        println!("Deleting data from S3...");
+        let data_config = DataStoreConfig::from(&format_info);
+
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let ds = DataStore::new(&data_config)?;
+            ds.delete_volume_data().await
+        })?;
+        println!("✓ S3 data deleted.");
+
+        if let Some(remote) = &format_info.metadata.remote {
+            let mut builder = opendal::services::S3::default()
+                .endpoint(&remote.endpoint)
+                .bucket(&remote.bucket)
+                .access_key_id(&remote.access_key)
+                .secret_access_key(&remote.secret_key)
+                .disable_config_load()
+                .disable_ec2_metadata();
+            if !remote.region.is_empty() {
+                builder = builder.region(&remote.region);
+            } else {
+                builder = builder.region("us-east-1");
+            }
+            let op = opendal::Operator::new(builder)?.finish();
+            let prefix = if remote.prefix.ends_with('/') {
+                remote.prefix.clone()
+            } else {
+                format!("{}/", remote.prefix)
+            };
+            let primary_manifest_path = format!("{}manifest.json", prefix);
+            let _ = rt.block_on(op.delete(&primary_manifest_path));
+            let legacy_manifest_by_name = format!("{}{}.manifest.json", prefix, format_info.name);
+            let _ = rt.block_on(op.delete(&legacy_manifest_by_name));
+            if !format_info.uuid.is_empty() && format_info.uuid != format_info.name {
+                let legacy_manifest_by_uuid = format!("{}{}.manifest.json", prefix, format_info.uuid);
+                let _ = rt.block_on(op.delete(&legacy_manifest_by_uuid));
+            }
+        }
+    }
 
     // 5. Delete metadata directory
     println!("Deleting local metadata and cache...");
@@ -67,7 +110,11 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
     }
 
     println!("✓ Local files deleted.");
-    println!("Volume '{}' destroyed successfully.", name);
+    if local_only {
+        println!("Volume '{}' detached locally.", name);
+    } else {
+        println!("Volume '{}' destroyed successfully.", name);
+    }
 
     Ok(())
 }

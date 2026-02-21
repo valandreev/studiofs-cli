@@ -22,9 +22,9 @@
 //! concurrent calls to `record_read()` never schedule duplicate work.
 
 use dashmap::DashMap;
-use studiofs_meta::types::Ino;
-use std::collections::HashSet;
 use parking_lot::Mutex;
+use std::collections::HashSet;
+use studiofs_meta::types::Ino;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
 const MAX_SCORE: u8 = 8;
@@ -80,8 +80,8 @@ impl ReadAheadTracker {
         // Detect sequential continuation: the new read must start exactly at
         // the block immediately after where we left off.
         // Re-reads (same block) and backward seeks both decrease the score.
-        let is_sequential = state.last_block != u32::MAX
-            && first_block == state.last_block.saturating_add(1);
+        let is_sequential =
+            state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
 
         if is_sequential {
             state.score = (state.score + 1).min(MAX_SCORE);
@@ -180,10 +180,7 @@ mod tests {
         }
         let blocks = tracker.record_read(1, last + 1, last + 1);
         // Score capped at 8 = MAX_SCORE, width=8 → at most 8 blocks prefetched
-        assert!(
-            blocks.len() <= 8,
-            "prefetch depth should not exceed width"
-        );
+        assert!(blocks.len() <= 8, "prefetch depth should not exceed width");
     }
 
     #[test]
@@ -239,10 +236,19 @@ mod tests {
     #[test]
     fn test_start_prefetch_idempotent() {
         let tracker = ReadAheadTracker::new(4);
-        assert!(tracker.start_prefetch(1, 5), "first call should return true");
-        assert!(!tracker.start_prefetch(1, 5), "second call should return false (already in-flight)");
+        assert!(
+            tracker.start_prefetch(1, 5),
+            "first call should return true"
+        );
+        assert!(
+            !tracker.start_prefetch(1, 5),
+            "second call should return false (already in-flight)"
+        );
         tracker.finish_prefetch(1, 5);
-        assert!(tracker.start_prefetch(1, 5), "after finish, should return true again");
+        assert!(
+            tracker.start_prefetch(1, 5),
+            "after finish, should return true again"
+        );
     }
 
     #[test]
@@ -254,7 +260,10 @@ mod tests {
         // Next read: blocks 4..=7 (sequential)
         let p = tracker.record_read(1, 4, 7);
         // Should prefetch 8..=N
-        assert!(!p.is_empty(), "should prefetch after sequential multi-block read");
+        assert!(
+            !p.is_empty(),
+            "should prefetch after sequential multi-block read"
+        );
         assert!(p[0] == 8, "first prefetch block should follow last read");
     }
 
@@ -270,7 +279,10 @@ mod tests {
 
         // After evict, state is gone — next read should not see sequential score
         let p = tracker.record_read(1, 6, 6);
-        assert!(p.is_empty(), "evicted inode should have no sequential score");
+        assert!(
+            p.is_empty(),
+            "evicted inode should have no sequential score"
+        );
     }
 
     #[test]

@@ -21,23 +21,27 @@
 //! 3. Decompress
 //! 4. Assemble response
 
+use crate::readahead::{DirAccessTracker, ReadAheadTracker};
+use async_nats::Client as NatsClient;
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use opendal::options::WriteOptions;
+use opendal::{EntryMode, ErrorKind, Operator, services::S3};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use studiofs_cache::disk::{DiskCache, DEFAULT_DISK_CACHE_SIZE};
-use studiofs_cache::memory::{MemoryCache, CacheKey};
-use studiofs_cache::writeback::{WritebackManager, PendingOp};
-use studiofs_data::object::{create_object, read_object, format_object_key};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use studiofs_cache::disk::{DEFAULT_DISK_CACHE_SIZE, DiskCache};
+use studiofs_cache::memory::{CacheKey, MemoryCache};
+use studiofs_cache::writeback::{PendingOp, WritebackManager};
+use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key, read_object};
 use studiofs_data::store::DataStore;
+use studiofs_meta::types::{BlockFlags, BlockRef, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
-use studiofs_meta::types::{BlockRef, BlockFlags, block_index_from_offset, offset_within_block};
 use thiserror::Error;
-use tracing::{debug, info, error, warn};
-use parking_lot::Mutex;
-use tokio::sync::{broadcast, Semaphore};
-use crate::readahead::{DirAccessTracker, ReadAheadTracker};
+use tokio::sync::{Semaphore, broadcast};
+use tracing::{debug, error, info, warn};
 
 // =============================================================================
 // Error Types
@@ -121,7 +125,7 @@ fn validate_name(name: &[u8]) -> VfsResult<()> {
             name.len()
         )));
     }
-    
+
     // Check for Unix path separator and Windows-invalid characters
     let invalid_chars = b"/<>:\"|\\?*";
     if let Some(pos) = name.iter().position(|&b| invalid_chars.contains(&b)) {
@@ -131,11 +135,9 @@ fn validate_name(name: &[u8]) -> VfsResult<()> {
             char_display
         )));
     }
-    
+
     if name == b"." || name == b".." {
-        return Err(VfsError::InvalidName(
-            "name is '.' or '..'".into(),
-        ));
+        return Err(VfsError::InvalidName("name is '.' or '..'".into()));
     }
     Ok(())
 }
@@ -146,6 +148,10 @@ fn validate_name(name: &[u8]) -> VfsResult<()> {
 
 /// Attribute cache TTL — read-through attributes are valid for 1 second.
 const ATTR_CACHE_TTL: Duration = Duration::from_secs(1);
+const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
+const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
 
 // =============================================================================
 // VFS Configuration
@@ -206,14 +212,18 @@ impl Default for VfsConfig {
 pub struct OpenFlags(u32);
 
 impl OpenFlags {
-    pub const RDONLY: Self  = Self(0x01);
-    pub const WRONLY: Self  = Self(0x02);
-    pub const RDWR: Self    = Self(0x04);
-    pub const APPEND: Self  = Self(0x08);
+    pub const RDONLY: Self = Self(0x01);
+    pub const WRONLY: Self = Self(0x02);
+    pub const RDWR: Self = Self(0x04);
+    pub const APPEND: Self = Self(0x08);
 
-    pub const fn empty() -> Self { Self(0) }
+    pub const fn empty() -> Self {
+        Self(0)
+    }
 
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
 
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
@@ -226,7 +236,9 @@ impl OpenFlags {
 
 impl std::ops::BitOr for OpenFlags {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 /// Information about a single open file descriptor.
@@ -373,6 +385,20 @@ struct VfsState {
     lock_notify: tokio::sync::Notify,
 }
 
+#[derive(Clone)]
+struct JanitorLease {
+    op: Operator,
+    lock_path: String,
+    owner_id: String,
+}
+
+#[derive(Clone)]
+struct InvalidationBus {
+    nats_url: String,
+    subject_base: String,
+    sender_id: String,
+}
+
 // =============================================================================
 // StudioVfs Implementation
 // =============================================================================
@@ -380,7 +406,7 @@ struct VfsState {
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
 pub struct StudioVfs {
     /// Metadata engine.
-    meta: Arc<RedbMetaEngine>,
+    meta: Arc<dyn MetaEngine>,
     /// Data store (S3).
     data: Arc<DataStore>,
     /// Disk cache.
@@ -391,8 +417,8 @@ pub struct StudioVfs {
     mem_cache: Option<Arc<MemoryCache>>,
     /// Block size in bytes.
     block_size: u32,
-    /// Volume UUID for S3 key prefix.
-    volume_uuid: String,
+    /// Volume data prefix for S3 object keys.
+    data_prefix: String,
     /// Internal state (mutable).
     state: Arc<VfsState>,
     // --- Upload Control ---
@@ -419,12 +445,20 @@ pub struct StudioVfs {
     max_dirty_bytes: usize,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
+    /// Optional distributed lease for janitor leader election.
+    janitor_lease: Option<JanitorLease>,
+    janitor_interval: Duration,
+    janitor_skip_newer_than: Duration,
+    janitor_max_deletes_per_run: u64,
+    janitor_lease_ttl: Duration,
+    /// Optional NATS invalidation bus listener config.
+    invalidation_bus: Option<InvalidationBus>,
 }
 
 impl StudioVfs {
     /// Create a new VFS instance.
     pub fn new(
-        meta: Arc<RedbMetaEngine>,
+        meta: Arc<dyn MetaEngine>,
         data: Arc<DataStore>,
         mem_cache: Option<Arc<MemoryCache>>,
         cache_dir: &str,
@@ -432,8 +466,93 @@ impl StudioVfs {
     ) -> VfsResult<Arc<Self>> {
         // Get volume info
         let format_info = meta.get_format_info()?;
-        let volume_uuid = format_info.uuid.clone();
+        let data_prefix = if format_info.data_prefix.trim().is_empty() {
+            format!("{}/objects/", format_info.name)
+        } else if format_info.data_prefix.ends_with('/') {
+            format_info.data_prefix.clone()
+        } else {
+            format!("{}/", format_info.data_prefix)
+        };
         let block_size = format_info.block_size;
+        let invalidation_bus = std::env::var("STUDIOFS_NATS_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|url| InvalidationBus {
+                nats_url: url,
+                subject_base: format!("fs.invalidate.{}", format_info.name),
+                sender_id: format!("pid:{}", std::process::id()),
+            });
+        let janitor_interval = Duration::from_secs(
+            std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_JANITOR_INTERVAL.as_secs()),
+        );
+        let janitor_skip_newer_than = Duration::from_secs(
+            std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs()),
+        );
+        let janitor_max_deletes_per_run = std::env::var("STUDIOFS_JANITOR_MAX_DELETES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_JANITOR_MAX_DELETES_PER_RUN);
+        let janitor_lease_ttl = Duration::from_secs(
+            std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
+        );
+
+        let janitor_lease = if format_info.metadata.backend == MetadataBackend::Tonbo {
+            if let Some(remote) = &format_info.metadata.remote {
+                let mut builder = S3::default()
+                    .endpoint(&remote.endpoint)
+                    .bucket(&remote.bucket)
+                    .access_key_id(&remote.access_key)
+                    .secret_access_key(&remote.secret_key)
+                    .disable_config_load()
+                    .disable_ec2_metadata();
+                if !remote.region.is_empty() {
+                    builder = builder.region(&remote.region);
+                } else {
+                    builder = builder.region("us-east-1");
+                }
+                let op = Operator::new(builder)
+                    .map_err(|e| VfsError::Other(format!("failed to init janitor lease operator: {e}")))?
+                    .finish();
+                let mut prefix = if remote.prefix.trim().is_empty() {
+                    format!("{}/metadata/", format_info.name)
+                } else {
+                    remote.prefix.clone()
+                };
+                if !prefix.ends_with('/') {
+                    prefix.push('/');
+                }
+                let now_nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                Some(JanitorLease {
+                    op,
+                    lock_path: format!("{}janitor.lock", prefix),
+                    owner_id: format!(
+                        "{}:{}:{}",
+                        format_info.name,
+                        std::process::id(),
+                        now_nanos
+                    ),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Init Disk Cache
         let disk_cache = DiskCache::new(cache_dir, cache_size)?;
@@ -444,8 +563,7 @@ impl StudioVfs {
         // Init ReadAhead tracker + prefetch channel
         let readahead = Arc::new(ReadAheadTracker::new(8));
         let dir_prefetch = Arc::new(DirAccessTracker::new(2));
-        let (prefetch_tx, mut prefetch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
 
         // Dirty-write memory buffer + background slab flusher channel.
         let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -457,7 +575,7 @@ impl StudioVfs {
             writeback,
             mem_cache,
             block_size,
-            volume_uuid,
+            data_prefix,
             state: Arc::new(VfsState {
                 pending_blocks: Mutex::new(std::collections::HashMap::new()),
                 dirty_attrs: Mutex::new(std::collections::HashMap::new()),
@@ -479,6 +597,12 @@ impl StudioVfs {
             dirty_flush_tx,
             max_dirty_bytes: 2 * 1024 * 1024 * 1024,
             handle_table: HandleTable::new(),
+            janitor_lease,
+            janitor_interval,
+            janitor_skip_newer_than,
+            janitor_max_deletes_per_run,
+            janitor_lease_ttl,
+            invalidation_bus,
         });
 
         // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
@@ -504,6 +628,20 @@ impl StudioVfs {
             vfs_clone.background_gc().await;
         });
 
+        // Spawn Janitor Worker (automatic orphan scan/cleanup)
+        let vfs_clone = vfs.clone();
+        tokio::spawn(async move {
+            vfs_clone.background_janitor().await;
+        });
+
+        // Spawn Invalidation Bus Listener (optional)
+        if let Some(bus) = vfs.invalidation_bus.clone() {
+            let vfs_clone = vfs.clone();
+            tokio::spawn(async move {
+                vfs_clone.background_invalidation_listener(bus).await;
+            });
+        }
+
         // Spawn Background Slab Flusher
         // Drains dirty_mem → slab → upload queue asynchronously after flush() returns.
         let vfs_clone = vfs.clone();
@@ -514,9 +652,119 @@ impl StudioVfs {
         Ok(vfs)
     }
 
+    fn now_unix_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn encode_lease_record(owner_id: &str, lease_until_unix: i64, fencing_token: u64) -> Vec<u8> {
+        format!("{owner_id}\n{lease_until_unix}\n{fencing_token}\n").into_bytes()
+    }
+
+    fn decode_lease_record(bytes: &[u8]) -> Option<(String, i64, u64)> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        let owner = lines.next()?.to_string();
+        let lease_until = lines.next()?.parse::<i64>().ok()?;
+        let fencing = lines.next()?.parse::<u64>().ok()?;
+        Some((owner, lease_until, fencing))
+    }
+
+    async fn acquire_janitor_lease(&self, lease: &JanitorLease) -> bool {
+        let now = Self::now_unix_secs();
+        let lease_until = now.saturating_add(self.janitor_lease_ttl.as_secs() as i64);
+
+        let create_payload = Self::encode_lease_record(&lease.owner_id, lease_until, 1);
+        let mut create_opts = WriteOptions::default();
+        create_opts.if_none_match = Some("*".to_string());
+        match lease
+            .op
+            .write_options(&lease.lock_path, create_payload, create_opts)
+            .await
+        {
+            Ok(_) => {
+                debug!(
+                    lock_path = lease.lock_path,
+                    owner_id = lease.owner_id,
+                    "janitor lease acquired via create"
+                );
+                return true;
+            }
+            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {}
+            Err(err) => {
+                warn!("janitor lease create failed: {}", err);
+                return false;
+            }
+        }
+
+        let stat = match lease.op.stat(&lease.lock_path).await {
+            Ok(v) => v,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // Lock disappeared between create attempt and stat; next cycle will retry.
+                return false;
+            }
+            Err(err) => {
+                warn!("janitor lease stat failed: {}", err);
+                return false;
+            }
+        };
+        let etag = stat.etag().map(ToString::to_string);
+        let current_raw = match lease.op.read(&lease.lock_path).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("janitor lease read failed: {}", err);
+                return false;
+            }
+        };
+        let (owner, current_until, fencing) =
+            match Self::decode_lease_record(&current_raw.to_vec()) {
+                Some(v) => v,
+                None => ("".to_string(), 0, 0),
+            };
+
+        if current_until > now && owner != lease.owner_id {
+            debug!(
+                lock_path = lease.lock_path,
+                lock_owner = owner,
+                lock_until = current_until,
+                now,
+                "janitor lease is held by another client"
+            );
+            return false;
+        }
+
+        let mut update_opts = WriteOptions::default();
+        if let Some(v) = etag {
+            update_opts.if_match = Some(v);
+        }
+        let update_payload =
+            Self::encode_lease_record(&lease.owner_id, lease_until, fencing.saturating_add(1));
+        match lease
+            .op
+            .write_options(&lease.lock_path, update_payload, update_opts)
+            .await
+        {
+            Ok(_) => {
+                debug!(
+                    lock_path = lease.lock_path,
+                    owner_id = lease.owner_id,
+                    "janitor lease acquired/renewed via CAS"
+                );
+                true
+            }
+            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => false,
+            Err(err) => {
+                warn!("janitor lease CAS update failed: {}", err);
+                false
+            }
+        }
+    }
+
     /// Get metadata engine reference.
-    pub fn meta(&self) -> &RedbMetaEngine {
-        &self.meta
+    pub fn meta(&self) -> &dyn MetaEngine {
+        self.meta.as_ref()
     }
 
     /// Get volume name.
@@ -577,15 +825,19 @@ impl StudioVfs {
         {
             let cache = self.state.attr_read_cache.lock();
             if let Some((attr, timestamp)) = cache.get(&ino)
-                && timestamp.elapsed() < ATTR_CACHE_TTL {
-                    return Ok(attr.clone());
-                }
+                && timestamp.elapsed() < ATTR_CACHE_TTL
+            {
+                return Ok(attr.clone());
+            }
             // Drop lock before potentially slow redb read
         }
 
         // 3. Fetch from redb and populate read-through cache
         let attr = self.meta.get_attr(ino)?;
-        self.state.attr_read_cache.lock().insert(ino, (attr.clone(), Instant::now()));
+        self.state
+            .attr_read_cache
+            .lock()
+            .insert(ino, (attr.clone(), Instant::now()));
         Ok(attr)
     }
 
@@ -597,14 +849,15 @@ impl StudioVfs {
         let mut changed = false;
 
         if let Some(new_size) = args.size
-            && new_size != attr.size {
-                if new_size < attr.size {
-                    // Truncate - may need to remove blocks
-                    self.truncate_blocks(ino, new_size, attr.size)?;
-                }
-                attr.size = new_size;
-                changed = true;
+            && new_size != attr.size
+        {
+            if new_size < attr.size {
+                // Truncate - may need to remove blocks
+                self.truncate_blocks(ino, new_size, attr.size)?;
             }
+            attr.size = new_size;
+            changed = true;
+        }
 
         if let Some(mode) = args.mode {
             attr.mode = mode;
@@ -776,17 +1029,18 @@ impl StudioVfs {
                 for &object_id in &removed_ids {
                     self.meta.add_pending_deletion(object_id, timestamp)?;
                 }
-                self.state.pending_blocks.lock().retain(|(i, _), _| *i != ino);
+                self.state
+                    .pending_blocks
+                    .lock()
+                    .retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids);
                 self.disk_cache.cleanup_empty_slabs();
             }
 
             // Decrement USED_SPACE for orphan cleanup
             if total_bytes > 0 {
-                self.meta.decr_counter(
-                    studiofs_meta::types::counters::USED_SPACE,
-                    total_bytes,
-                )?;
+                self.meta
+                    .decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
             }
 
             self.meta.remove_attr(ino)?;
@@ -817,11 +1071,10 @@ impl StudioVfs {
         self.flush(ino).await?;
 
         // If full fsync (not datasync), also persist dirty attributes to redb
-        if !datasync
-            && let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
-                self.meta.set_attr(&attr)?;
-                self.state.attr_read_cache.lock().remove(&ino);
-            }
+        if !datasync && let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
+            self.meta.set_attr(&attr)?;
+            self.state.attr_read_cache.lock().remove(&ino);
+        }
         Ok(())
     }
 
@@ -1091,10 +1344,8 @@ impl StudioVfs {
 
                 // Decrement USED_SPACE by the file's logical size
                 if attr.size > 0 {
-                    self.meta.decr_counter(
-                        studiofs_meta::types::counters::USED_SPACE,
-                        attr.size,
-                    )?;
+                    self.meta
+                        .decr_counter(studiofs_meta::types::counters::USED_SPACE, attr.size)?;
                 }
 
                 // Clear pending blocks buffer
@@ -1154,7 +1405,9 @@ impl StudioVfs {
         new_name: &[u8],
     ) -> VfsResult<()> {
         validate_name(new_name)?;
-        let displaced_ino = self.meta.rename_atomic(parent, name, new_parent, new_name)?;
+        let displaced_ino = self
+            .meta
+            .rename_atomic(parent, name, new_parent, new_name)?;
 
         // If an existing entry was overwritten, schedule GC + evict caches
         if let Some(ino) = displaced_ino {
@@ -1173,17 +1426,18 @@ impl StudioVfs {
                 for &object_id in &removed_ids {
                     self.meta.add_pending_deletion(object_id, timestamp)?;
                 }
-                self.state.pending_blocks.lock().retain(|(i, _), _| *i != ino);
+                self.state
+                    .pending_blocks
+                    .lock()
+                    .retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids);
                 self.disk_cache.cleanup_empty_slabs();
             }
 
             // Decrement USED_SPACE for removed blocks
             if total_bytes > 0 {
-                self.meta.decr_counter(
-                    studiofs_meta::types::counters::USED_SPACE,
-                    total_bytes,
-                )?;
+                self.meta
+                    .decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
             }
 
             self.state.dirty_attrs.lock().remove(&ino);
@@ -1228,7 +1482,10 @@ impl StudioVfs {
                         Some(v.saturating_sub(removed_bytes))
                     })
                     .ok();
-                debug!("evict_inode L1.5: ino={} freed {} bytes from dirty_mem", ino, removed_bytes);
+                debug!(
+                    "evict_inode L1.5: ino={} freed {} bytes from dirty_mem",
+                    ino, removed_bytes
+                );
             }
         }
 
@@ -1241,7 +1498,10 @@ impl StudioVfs {
             }
         }
         if l2_evicted > 0 {
-            debug!("evict_inode L2: ino={} evicted {} objects from slab cache", ino, l2_evicted);
+            debug!(
+                "evict_inode L2: ino={} evicted {} objects from slab cache",
+                ino, l2_evicted
+            );
         }
 
         // Clean up pre-compressed upload data stashed for these objects.
@@ -1253,7 +1513,10 @@ impl StudioVfs {
         }
 
         // Cancel any coalesced in-flight S3 fetches for this inode.
-        self.state.inflight_fetches.lock().retain(|(i, _), _| *i != ino);
+        self.state
+            .inflight_fetches
+            .lock()
+            .retain(|(i, _), _| *i != ino);
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
@@ -1287,7 +1550,10 @@ impl StudioVfs {
         self.disk_cache.remove_object_sync(object_id);
 
         // Cancel in-flight S3 fetch for this specific block.
-        self.state.inflight_fetches.lock().remove(&(ino, block_index));
+        self.state
+            .inflight_fetches
+            .lock()
+            .remove(&(ino, block_index));
     }
 
     // =========================================================================
@@ -1455,10 +1721,11 @@ impl StudioVfs {
         // Skip if already in memory cache (hot L1 check before any I/O)
         let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
         if let Some(mc) = &self.mem_cache
-            && mc.get(&mem_key).is_some() {
-                self.readahead.finish_prefetch(ino, block_index);
-                return;
-            }
+            && mc.get(&mem_key).is_some()
+        {
+            self.readahead.finish_prefetch(ino, block_index);
+            return;
+        }
 
         // Fetch from disk cache or S3 (read_block handles all cache levels)
         let _ = self.read_block(ino, block_index).await;
@@ -1472,16 +1739,19 @@ impl StudioVfs {
     /// to complete and then read from the now-populated cache.
     async fn read_block(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
         // Get block reference from metadata
-        let block_ref = self.meta.get_file_block(ino, block_index)?
+        let block_ref = self
+            .meta
+            .get_file_block(ino, block_index)?
             .ok_or(VfsError::BlockNotFound(ino, block_index))?;
 
         let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
 
         // L1: Try memory cache first
         if let Some(mc) = &self.mem_cache
-            && let Some(cached) = mc.get(&mem_key) {
-                return Ok(cached);
-            }
+            && let Some(cached) = mc.get(&mem_key)
+        {
+            return Ok(cached);
+        }
 
         // L2: Try disk cache
         if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
@@ -1510,9 +1780,10 @@ impl StudioVfs {
 
                 // Re-check caches (should now be populated)
                 if let Some(mc) = &self.mem_cache
-                    && let Some(cached) = mc.get(&mem_key) {
-                        return Ok(cached);
-                    }
+                    && let Some(cached) = mc.get(&mem_key)
+                {
+                    return Ok(cached);
+                }
                 if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
                     let result = if self.store_decompressed {
                         cached
@@ -1530,18 +1801,25 @@ impl StudioVfs {
 
             // No in-flight fetch — register ourselves as the fetcher
             let (tx, _) = broadcast::channel::<()>(1);
-            self.state.inflight_fetches.lock().insert((ino, block_index), tx.clone());
+            self.state
+                .inflight_fetches
+                .lock()
+                .insert((ino, block_index), tx.clone());
 
             // Fetch from S3
             let result = async {
-                let key = format_object_key(&self.volume_uuid, block_ref.object_id);
+                let key = format_object_key(&self.data_prefix, block_ref.object_id);
                 let compressed = self.data.get_object(&key).await?;
                 let decompressed = Bytes::from(read_object(&compressed)?);
 
                 if self.store_decompressed {
-                    self.disk_cache.put_object(block_ref.object_id, &decompressed).await?;
+                    self.disk_cache
+                        .put_object(block_ref.object_id, &decompressed)
+                        .await?;
                 } else {
-                    self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
+                    self.disk_cache
+                        .put_object(block_ref.object_id, &compressed)
+                        .await?;
                 }
 
                 if let Some(mc) = &self.mem_cache {
@@ -1553,7 +1831,10 @@ impl StudioVfs {
             .await;
 
             // Clean up and notify waiters (regardless of success/failure)
-            self.state.inflight_fetches.lock().remove(&(ino, block_index));
+            self.state
+                .inflight_fetches
+                .lock()
+                .remove(&(ino, block_index));
             let _ = tx.send(());
 
             return result;
@@ -1588,7 +1869,11 @@ impl StudioVfs {
 
             // Load existing block data if needed (outside lock to avoid holding
             // parking_lot::Mutex across .await)
-            let need_load = !self.state.pending_blocks.lock().contains_key(&(ino, block_index));
+            let need_load = !self
+                .state
+                .pending_blocks
+                .lock()
+                .contains_key(&(ino, block_index));
             if need_load {
                 let existing_data = match self.read_block_if_exists(ino, block_index).await {
                     Ok(Some(d)) => d,
@@ -1596,7 +1881,9 @@ impl StudioVfs {
                 };
                 let mut pending = self.state.pending_blocks.lock();
                 // Double-check: another write call might have inserted while we loaded
-                pending.entry((ino, block_index)).or_insert_with(|| PendingBlock {
+                pending
+                    .entry((ino, block_index))
+                    .or_insert_with(|| PendingBlock {
                         data: BytesMut::from(existing_data.as_ref()),
                         dirty: false,
                     });
@@ -1614,9 +1901,8 @@ impl StudioVfs {
                 }
 
                 // Copy data
-                pending_block.data[offset_in_block..end_pos].copy_from_slice(
-                    &data[data_offset..data_offset + to_write]
-                );
+                pending_block.data[offset_in_block..end_pos]
+                    .copy_from_slice(&data[data_offset..data_offset + to_write]);
                 pending_block.dirty = true;
 
                 // If block is now full → extract for eager flush
@@ -1635,7 +1921,9 @@ impl StudioVfs {
         // Update file size in dirty attrs
         {
             let mut dirty = self.state.dirty_attrs.lock();
-            let attr = dirty.entry(ino).or_insert_with(|| self.meta.get_attr(ino).unwrap());
+            let attr = dirty
+                .entry(ino)
+                .or_insert_with(|| self.meta.get_attr(ino).unwrap());
             if current_offset > attr.size {
                 attr.size = current_offset;
                 attr.touch_mtime();
@@ -1648,7 +1936,11 @@ impl StudioVfs {
         if !full_blocks.is_empty() {
             let total: usize = full_blocks.iter().map(|(_, d)| d.len()).sum();
             // Backpressure: stall briefly if the flusher is falling behind.
-            while self.state.dirty_bytes.load(Ordering::Relaxed).saturating_add(total)
+            while self
+                .state
+                .dirty_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(total)
                 > self.max_dirty_bytes
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1665,7 +1957,7 @@ impl StudioVfs {
 
         Ok(written as u32)
     }
-    
+
     /// Read a block if it exists, returns None if block not found.
     async fn read_block_if_exists(&self, ino: Ino, block_index: u32) -> VfsResult<Option<Bytes>> {
         // Check dirty memory buffer first: blocks live here between flush() and
@@ -1694,14 +1986,18 @@ impl StudioVfs {
         }
 
         // Fetch from S3
-        let key = format_object_key(&self.volume_uuid, block_ref.object_id);
+        let key = format_object_key(&self.data_prefix, block_ref.object_id);
         let compressed = self.data.get_object(&key).await?;
         let decompressed = Bytes::from(read_object(&compressed)?);
 
         if self.store_decompressed {
-            self.disk_cache.put_object(block_ref.object_id, &decompressed).await?;
+            self.disk_cache
+                .put_object(block_ref.object_id, &decompressed)
+                .await?;
         } else {
-            self.disk_cache.put_object(block_ref.object_id, &compressed).await?;
+            self.disk_cache
+                .put_object(block_ref.object_id, &compressed)
+                .await?;
         }
 
         Ok(Some(decompressed))
@@ -1718,17 +2014,15 @@ impl StudioVfs {
         // This function returns immediately after the in-memory move — no disk I/O.
         let blocks_to_buffer: Vec<(u32, Bytes)> = {
             let mut pending = self.state.pending_blocks.lock();
-            let keys: Vec<_> = pending.keys()
-                .filter(|(i, _)| *i == ino)
-                .cloned()
-                .collect();
+            let keys: Vec<_> = pending.keys().filter(|(i, _)| *i == ino).cloned().collect();
 
             let mut blocks = Vec::new();
             for key in keys {
                 if let Some(pb) = pending.remove(&key)
-                    && pb.dirty {
-                        blocks.push((key.1, pb.data.freeze()));
-                    }
+                    && pb.dirty
+                {
+                    blocks.push((key.1, pb.data.freeze()));
+                }
             }
             blocks
         };
@@ -1736,7 +2030,11 @@ impl StudioVfs {
         if !blocks_to_buffer.is_empty() {
             let total: usize = blocks_to_buffer.iter().map(|(_, d)| d.len()).sum();
             // Backpressure: wait if dirty buffer is saturated.
-            while self.state.dirty_bytes.load(Ordering::Relaxed).saturating_add(total)
+            while self
+                .state
+                .dirty_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(total)
                 > self.max_dirty_bytes
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1776,15 +2074,24 @@ impl StudioVfs {
             // Cache the decompressed block — no decompress needed on future cache hits.
             // The compressed version is stashed in pending_upload_data until upload completes.
             self.disk_cache.put_object(object_id, &data).await?;
-            self.state.pending_upload_data.lock().insert(object_id, compressed);
+            self.state
+                .pending_upload_data
+                .lock()
+                .insert(object_id, compressed);
             if let Some(mc) = &self.mem_cache {
-                mc.put(CacheKey::new(ino, block_index as u64 * self.block_size as u64), data.clone());
+                mc.put(
+                    CacheKey::new(ino, block_index as u64 * self.block_size as u64),
+                    data.clone(),
+                );
             }
         } else {
             // Cache the compressed STFS object (traditional path)
             self.disk_cache.put_object(object_id, &compressed).await?;
             if let Some(mc) = &self.mem_cache {
-                mc.put(CacheKey::new(ino, block_index as u64 * self.block_size as u64), data.clone());
+                mc.put(
+                    CacheKey::new(ino, block_index as u64 * self.block_size as u64),
+                    data.clone(),
+                );
             }
         }
 
@@ -1813,16 +2120,27 @@ impl StudioVfs {
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            self.meta.add_pending_deletion(old_block.object_id, timestamp)?;
-            debug!("marking old block {} for deletion (overwrite)", old_block.object_id);
+            self.meta
+                .add_pending_deletion(old_block.object_id, timestamp)?;
+            debug!(
+                "marking old block {} for deletion (overwrite)",
+                old_block.object_id
+            );
 
             // Update USED_SPACE: subtract old block size, add new block size
-            self.meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, old_block.length as u64)?;
+            self.meta.decr_counter(
+                studiofs_meta::types::counters::USED_SPACE,
+                old_block.length as u64,
+            )?;
         }
         // Track new block in USED_SPACE counter
-        self.meta.incr_counter(studiofs_meta::types::counters::USED_SPACE, length as u64)?;
+        self.meta
+            .incr_counter(studiofs_meta::types::counters::USED_SPACE, length as u64)?;
 
-        debug!("flushed block {} for inode {} (object_id={})", block_index, ino, object_id);
+        debug!(
+            "flushed block {} for inode {} (object_id={})",
+            block_index, ino, object_id
+        );
         Ok(())
     }
 
@@ -1925,7 +2243,10 @@ impl StudioVfs {
     // =========================================================================
 
     /// Background task to process pending uploads.
-    async fn background_uploader(self: Arc<Self>, mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingOp>) {
+    async fn background_uploader(
+        self: Arc<Self>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingOp>,
+    ) {
         info!("background uploader started");
 
         while let Some(op) = rx.recv().await {
@@ -1953,18 +2274,30 @@ impl StudioVfs {
                 compressed
             } else {
                 // Fallback: the stash was lost (e.g. process restart) — re-compress
-                let decompressed = self.disk_cache.get_object(op.object_id).await?
-                    .ok_or_else(|| VfsError::Other(format!("object {} missing from disk cache", op.object_id)))?;
+                let decompressed =
+                    self.disk_cache
+                        .get_object(op.object_id)
+                        .await?
+                        .ok_or_else(|| {
+                            VfsError::Other(format!(
+                                "object {} missing from disk cache",
+                                op.object_id
+                            ))
+                        })?;
                 Bytes::from(create_object(&decompressed)?)
             }
         } else {
             // Disk cache holds compressed STFS object directly
-            self.disk_cache.get_object(op.object_id).await?
-                .ok_or_else(|| VfsError::Other(format!("object {} missing from disk cache", op.object_id)))?
+            self.disk_cache
+                .get_object(op.object_id)
+                .await?
+                .ok_or_else(|| {
+                    VfsError::Other(format!("object {} missing from disk cache", op.object_id))
+                })?
         };
 
         // Format S3 key
-        let key = format_object_key(&self.volume_uuid, op.object_id);
+        let key = format_object_key(&self.data_prefix, op.object_id);
 
         // Check if already exists (optimistic)
         let needs_upload = match self.data.exists(&key).await {
@@ -2024,12 +2357,15 @@ impl StudioVfs {
                         }
 
                         // Delete from S3
-                        let key = format_object_key(&self.volume_uuid, object_id);
+                        let key = format_object_key(&self.data_prefix, object_id);
                         match self.data.delete_object(&key).await {
                             Ok(_) => {
                                 // Remove from pending deletions
                                 if let Err(e) = self.meta.remove_pending_deletion(object_id) {
-                                    warn!("failed to remove pending deletion for {}: {}", object_id, e);
+                                    warn!(
+                                        "failed to remove pending deletion for {}: {}",
+                                        object_id, e
+                                    );
                                 }
                                 deleted_count += 1;
                                 debug!("GC deleted object {}", object_id);
@@ -2046,6 +2382,211 @@ impl StudioVfs {
                 Err(e) => {
                     error!("failed to get pending deletions: {}", e);
                 }
+            }
+        }
+    }
+
+    /// Background janitor for orphaned objects:
+    /// - scans all objects under data_prefix
+    /// - compares with currently referenced block object_ids in metadata
+    /// - deletes unreferenced objects older than grace window
+    async fn background_janitor(self: Arc<Self>) {
+        info!(
+            interval_secs = self.janitor_interval.as_secs(),
+            grace_secs = self.janitor_skip_newer_than.as_secs(),
+            max_deletes = self.janitor_max_deletes_per_run,
+            "background janitor started"
+        );
+        let mut cycle: u64 = 0;
+
+        loop {
+            cycle = cycle.saturating_add(1);
+            tokio::time::sleep(self.janitor_interval).await;
+
+            if let Some(lease) = &self.janitor_lease
+                && !self.acquire_janitor_lease(lease).await
+            {
+                debug!(
+                    cycle,
+                    lock_path = lease.lock_path,
+                    "janitor cycle skipped: lease not acquired"
+                );
+                continue;
+            }
+
+            let referenced = match self.meta.get_referenced_object_ids() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor cycle failed: get_referenced_object_ids");
+                    continue;
+                }
+            };
+            let pending_map: HashMap<u64, i64> = match self.meta.get_pending_deletions() {
+                Ok(v) => v.into_iter().collect(),
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor: failed to read pending deletions");
+                    HashMap::new()
+                }
+            };
+
+            let entries = match self
+                .data
+                .operator()
+                .list_with(&self.data_prefix)
+                .recursive(true)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        cycle,
+                        prefix = self.data_prefix,
+                        error = %e,
+                        "janitor cycle failed: list data prefix"
+                    );
+                    continue;
+                }
+            };
+
+            let now = SystemTime::now();
+            let now_unix = now
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut scanned: u64 = 0;
+            let mut orphan_candidates: u64 = 0;
+            let mut deleted: u64 = 0;
+            let mut skipped_young: u64 = 0;
+            let mut skipped_unknown_age: u64 = 0;
+            let mut skipped_cap: u64 = 0;
+            let mut skipped_non_object_key: u64 = 0;
+            let mut delete_errors: u64 = 0;
+
+            for entry in entries {
+                if entry.metadata().mode() != EntryMode::FILE {
+                    continue;
+                }
+                scanned = scanned.saturating_add(1);
+                let path = entry.path();
+                let object_id = match parse_object_id_from_key(path) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        skipped_non_object_key = skipped_non_object_key.saturating_add(1);
+                        continue;
+                    }
+                };
+                if referenced.contains(&object_id) {
+                    continue;
+                }
+                orphan_candidates = orphan_candidates.saturating_add(1);
+                if deleted >= self.janitor_max_deletes_per_run {
+                    skipped_cap = skipped_cap.saturating_add(1);
+                    continue;
+                }
+
+                let mut is_old_enough = false;
+                if let Some(ts) = pending_map.get(&object_id) {
+                    let age = now_unix.saturating_sub(*ts) as u64;
+                    if age >= self.janitor_skip_newer_than.as_secs() {
+                        is_old_enough = true;
+                    }
+                } else if let Some(last_modified) = entry.metadata().last_modified() {
+                    let last_modified_st: SystemTime = last_modified.into();
+                    let age = now
+                        .duration_since(last_modified_st)
+                        .unwrap_or_else(|_| Duration::from_secs(0));
+                    if age >= self.janitor_skip_newer_than {
+                        is_old_enough = true;
+                    }
+                } else {
+                    skipped_unknown_age = skipped_unknown_age.saturating_add(1);
+                }
+
+                if !is_old_enough {
+                    skipped_young = skipped_young.saturating_add(1);
+                    continue;
+                }
+
+                if let Err(e) = self.data.operator().delete(path).await {
+                    delete_errors = delete_errors.saturating_add(1);
+                    warn!(cycle, path, error = %e, "janitor: delete failed");
+                    continue;
+                }
+                deleted = deleted.saturating_add(1);
+            }
+
+            debug!(
+                cycle,
+                scanned,
+                referenced = referenced.len(),
+                orphan_candidates,
+                deleted,
+                skipped_young,
+                skipped_unknown_age,
+                skipped_cap,
+                skipped_non_object_key,
+                delete_errors,
+                "janitor cycle complete"
+            );
+        }
+    }
+
+    fn invalidate_inode_read_caches(&self, ino: Ino) {
+        self.state.attr_read_cache.lock().remove(&ino);
+        if let Some(mc) = &self.mem_cache {
+            mc.invalidate_inode(ino);
+        }
+    }
+
+    fn invalidate_all_read_caches(&self) {
+        self.state.attr_read_cache.lock().clear();
+        if let Some(mc) = &self.mem_cache {
+            mc.clear();
+        }
+    }
+
+    async fn background_invalidation_listener(self: Arc<Self>, bus: InvalidationBus) {
+        let client: NatsClient = match async_nats::connect(&bus.nats_url).await {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("invalidation bus connect failed ({}): {}", bus.nats_url, err);
+                return;
+            }
+        };
+
+        let subject_pattern = format!("{}.>", bus.subject_base);
+        let mut sub = match client.subscribe(subject_pattern.clone()).await {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(
+                    "invalidation bus subscribe failed ({}): {}",
+                    subject_pattern, err
+                );
+                return;
+            }
+        };
+
+        info!(subject_pattern, "invalidation bus listener started");
+        while let Some(msg) = sub.next().await {
+            let source_id = std::str::from_utf8(&msg.payload)
+                .ok()
+                .unwrap_or_default()
+                .to_string();
+            if source_id == bus.sender_id {
+                continue;
+            }
+
+            let subject = msg.subject.to_string();
+            let target = subject.rsplit('.').next().unwrap_or("all");
+            if target == "all" {
+                self.invalidate_all_read_caches();
+                debug!(subject, source_id, "applied global invalidation");
+            } else if let Ok(ino) = target.parse::<u64>() {
+                self.invalidate_inode_read_caches(ino);
+                debug!(subject, source_id, ino, "applied inode invalidation");
+            } else {
+                self.invalidate_all_read_caches();
+                debug!(subject, source_id, "applied fallback global invalidation");
             }
         }
     }
@@ -2083,6 +2624,9 @@ impl StudioVfs {
 
         // Flush completion journal removals enqueued during the final upload drain.
         self.writeback.flush_journal().await;
+        if let Err(e) = self.meta.flush_metadata() {
+            warn!("VFS shutdown: metadata flush failed: {}", e);
+        }
         self.persist_cache();
     }
 }
@@ -2197,10 +2741,7 @@ mod tests {
 
     #[test]
     fn test_validate_name_empty() {
-        assert!(matches!(
-            validate_name(b""),
-            Err(VfsError::InvalidName(_))
-        ));
+        assert!(matches!(validate_name(b""), Err(VfsError::InvalidName(_))));
     }
 
     #[test]
@@ -2222,10 +2763,7 @@ mod tests {
 
     #[test]
     fn test_validate_name_dot() {
-        assert!(matches!(
-            validate_name(b"."),
-            Err(VfsError::InvalidName(_))
-        ));
+        assert!(matches!(validate_name(b"."), Err(VfsError::InvalidName(_))));
         assert!(matches!(
             validate_name(b".."),
             Err(VfsError::InvalidName(_))

@@ -38,6 +38,17 @@ Goal: replace remote redb with Tonbo (R2/MinIO) while leaving FUSE, opendal→S3
 - Verify CAS conflicts resolve via retries; TTL alone provides eventual convergence.
 - Tune TTL/flush thresholds for latency vs staleness; log divergence.
 
+### Conflict Policy (implemented)
+- CAS-only writes to `manifest.json` (no blind overwrite): `if-match` on known etag, `if_not_exists` for first create.
+- 3-way merge on CAS conflict: `base(local baseline) + local delta + latest remote`.
+- Counters:
+  - `NEXT_INODE`, `NEXT_BLOCK_ID`, `nextEventSeq` => monotonic `max(local, remote)`.
+  - additive counters (e.g. used space, inode totals) => apply `local_delta` to `remote`.
+- Inodes (same key conflict): prefer newer by `ctime`, then `mtime`, then `size`.
+- Dentries (same key conflict): deterministic winner by encoded value (effectively stable inode winner); update beats delete for same base key.
+- File blocks (same `(ino, block_index)` conflict): higher `object_id` wins.
+- `force flush` with no pending local mutations is skipped to prevent stale drop-time overwrite.
+
 ## Phase 5 — Cache Invalidation Bus (performance)
 - Add NATS publisher on successful Tonbo commit (subject `fs.invalidate.<volume>.<ino|dir>`); listener drops cache entries immediately.
 - Bus improves freshness; correctness still guaranteed by TTL.

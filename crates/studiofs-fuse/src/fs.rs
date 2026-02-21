@@ -6,11 +6,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
+    Request,
 };
 use studiofs_meta::FileType;
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
+use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 
@@ -110,7 +111,12 @@ impl StudioFuseFs {
     pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
         let mount_uid = unsafe { libc::getuid() };
         let mount_gid = unsafe { libc::getgid() };
-        Self { vfs, rt, mount_uid, mount_gid }
+        Self {
+            vfs,
+            rt,
+            mount_uid,
+            mount_gid,
+        }
     }
 }
 
@@ -118,7 +124,11 @@ impl Filesystem for StudioFuseFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_bytes = name.to_string_lossy().as_bytes().to_vec();
         match self.vfs.lookup(parent, &name_bytes) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
+            Ok(attr) => reply.entry(
+                &TTL,
+                &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
+                0,
+            ),
             Err(e) => {
                 debug!("lookup({parent}, {:?}) -> {e}", name);
                 reply.error(vfs_err_to_errno(&e));
@@ -150,7 +160,11 @@ impl Filesystem for StudioFuseFs {
             .vfs
             .mkdir(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
         {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
+            Ok(attr) => reply.entry(
+                &TTL,
+                &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
+                0,
+            ),
             Err(e) => {
                 error!("mkdir({parent}, {:?}) -> {e}", name);
                 reply.error(vfs_err_to_errno(&e));
@@ -173,7 +187,11 @@ impl Filesystem for StudioFuseFs {
             .vfs
             .create(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
         {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
+            Ok(attr) => reply.entry(
+                &TTL,
+                &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
+                0,
+            ),
             Err(e) => {
                 error!("mknod({parent}, {:?}) -> {e}", name);
                 reply.error(vfs_err_to_errno(&e));
@@ -255,7 +273,11 @@ impl Filesystem for StudioFuseFs {
         let name = link_name.to_string_lossy().as_bytes().to_vec();
         let tgt = target.to_string_lossy().as_bytes().to_vec();
         match self.vfs.symlink(parent, &name, &tgt, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid), 0),
+            Ok(attr) => reply.entry(
+                &TTL,
+                &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
+                0,
+            ),
             Err(e) => {
                 error!("symlink({parent}, {:?}) -> {e}", link_name);
                 reply.error(vfs_err_to_errno(&e));
@@ -415,14 +437,7 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
-    fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
         match self.rt.block_on(self.vfs.fsync(ino, datasync)) {
             Ok(()) => reply.ok(),
             Err(e) => {
@@ -544,7 +559,14 @@ impl Filesystem for StudioFuseFs {
                 Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
                 Err(_) => continue, // skip entries we can't stat
             };
-            if reply.add(entry.ino, (entry_idx + 1) as i64, name.as_ref(), &TTL, &fattr, 0) {
+            if reply.add(
+                entry.ino,
+                (entry_idx + 1) as i64,
+                name.as_ref(),
+                &TTL,
+                &fattr,
+                0,
+            ) {
                 break;
             }
         }
@@ -606,21 +628,20 @@ impl Filesystem for StudioFuseFs {
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         match self.vfs.statfs() {
             Ok(st) => reply.statfs(
-                st.blocks,
-                st.bfree,
-                st.bavail,
-                st.files,
-                st.ffree,
-                st.bsize,
-                st.namelen,
-                st.frsize,
+                st.blocks, st.bfree, st.bavail, st.files, st.ffree, st.bsize, st.namelen, st.frsize,
             ),
             Err(e) => {
                 error!("statfs -> {e}");
                 // Fallback to hardcoded values on error
                 reply.statfs(
-                    1024 * 1024 * 1024, 512 * 1024 * 1024, 512 * 1024 * 1024,
-                    1_000_000, 500_000, 4096, 255, 4096,
+                    1024 * 1024 * 1024,
+                    512 * 1024 * 1024,
+                    512 * 1024 * 1024,
+                    1_000_000,
+                    500_000,
+                    4096,
+                    255,
+                    4096,
                 );
             }
         }
@@ -679,13 +700,7 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
-    fn removexattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        name: &OsStr,
-        reply: ReplyEmpty,
-    ) {
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         let key = name.as_encoded_bytes();
         match self.vfs.remove_xattr(ino, key) {
             Ok(()) => reply.ok(),

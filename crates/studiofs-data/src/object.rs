@@ -302,7 +302,7 @@ pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
             Err(_) => {
                 return Err(ObjectError::DecompressionFailed(
                     "LZ4 compression failed".to_string(),
-                ))
+                ));
             }
         };
 
@@ -346,7 +346,7 @@ pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u
                 Err(_) => {
                     return Err(ObjectError::DecompressionFailed(
                         "LZ4 compression failed".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -439,23 +439,28 @@ pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
 
 /// Format object ID as S3 key path.
 ///
-/// Key format: `{volume_uuid}/blocks/{prefix}/{object_id}`
+/// Key format: `{data_prefix}{prefix}/{object_id}`
 ///
 /// Where:
-/// - `volume_uuid`: UUID of the StudioFS volume
+/// - `data_prefix`: volume data root, e.g. `mydisk/objects/`
 /// - `prefix`: First 4 hex chars of object_id for S3 partition distribution
 /// - `object_id`: 16-char hex sequential block ID
 ///
 /// # Arguments
-/// * `volume_uuid` - Volume UUID string
+/// * `data_prefix` - Volume data prefix
 /// * `object_id` - Sequential block ID
 ///
 /// # Returns
 /// S3 key path string
-pub fn format_object_key(volume_uuid: &str, object_id: u64) -> String {
+pub fn format_object_key(data_prefix: &str, object_id: u64) -> String {
+    let normalized_prefix = if data_prefix.ends_with('/') {
+        data_prefix.to_string()
+    } else {
+        format!("{}/", data_prefix)
+    };
     let hex_id = format!("{:016x}", object_id);
     let prefix = &hex_id[..4];
-    format!("{}/blocks/{}/{}", volume_uuid, prefix, hex_id)
+    format!("{}{}/{}", normalized_prefix, prefix, hex_id)
 }
 
 /// Parse object ID from S3 key.
@@ -468,8 +473,8 @@ pub fn format_object_key(volume_uuid: &str, object_id: u64) -> String {
 pub fn parse_object_id_from_key(key: &str) -> Result<u64, ObjectError> {
     let parts: Vec<&str> = key.split('/').collect();
 
-    // Expected format: {uuid}/blocks/{prefix}/{object_id}
-    if parts.len() < 4 {
+    // Expected format: {data_prefix}/{prefix}/{object_id}
+    if parts.len() < 2 {
         return Err(ObjectError::InvalidObjectId(key.to_string()));
     }
 
@@ -675,19 +680,16 @@ mod tests {
 
     #[test]
     fn test_object_key_formatting() {
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let data_prefix = "disk-a/objects/";
         let object_id: u64 = 0x1234;
 
-        let key = format_object_key(uuid, object_id);
-        assert_eq!(
-            key,
-            "550e8400-e29b-41d4-a716-446655440000/blocks/0000/0000000000001234"
-        );
+        let key = format_object_key(data_prefix, object_id);
+        assert_eq!(key, "disk-a/objects/0000/0000000000001234");
     }
 
     #[test]
     fn test_object_key_parsing() {
-        let key = "550e8400-e29b-41d4-a716-446655440000/blocks/0000/0000000000001234";
+        let key = "disk-a/objects/0000/0000000000001234";
         let object_id = parse_object_id_from_key(key).unwrap();
 
         assert_eq!(object_id, 0x1234);

@@ -54,7 +54,9 @@ impl DataStore {
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
             .access_key_id(&config.access_key)
-            .secret_access_key(&config.secret_key);
+            .secret_access_key(&config.secret_key)
+            .disable_config_load()
+            .disable_ec2_metadata();
 
         if !config.region.is_empty() {
             builder = builder.region(&config.region);
@@ -90,11 +92,14 @@ impl DataStore {
     /// Format: `{volume}/objects/{ab}/{cd}/{id}`
     pub fn object_key(&self, object_id: &str) -> String {
         if object_id.len() < 4 {
-             return format!("{}/objects/{}", self.volume_name, object_id);
+            return format!("{}/objects/{}", self.volume_name, object_id);
         }
         format!(
             "{}/objects/{}/{}/{}",
-            self.volume_name, &object_id[0..2], &object_id[2..4], object_id
+            self.volume_name,
+            &object_id[0..2],
+            &object_id[2..4],
+            object_id
         )
     }
 
@@ -104,12 +109,7 @@ impl DataStore {
     }
 
     /// Upload a block to S3.
-    pub async fn put_block(
-        &self,
-        slice_id: u64,
-        block_index: u32,
-        data: Bytes,
-    ) -> DataResult<()> {
+    pub async fn put_block(&self, slice_id: u64, block_index: u32, data: Bytes) -> DataResult<()> {
         let block_size = data.len() as u32;
         let key = self.block_key(slice_id, block_index, block_size);
         debug!("uploading block: {key} ({block_size} bytes)");

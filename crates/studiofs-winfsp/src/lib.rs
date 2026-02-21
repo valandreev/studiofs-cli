@@ -35,8 +35,8 @@ pub fn mount_and_serve(
     // WinFSP layer tuning:
     // - Shorter file_info_timeout for quick invalidation on overwrites (P1.2)
     // - Longer dir_info_timeout since directory entries change less frequently
-    volume_params.file_info_timeout(100);   // 100ms: quick invalidation on overwrites
-    volume_params.dir_info_timeout(1000);   // 1s: dir entries change less frequently
+    volume_params.file_info_timeout(100); // 100ms: quick invalidation on overwrites
+    volume_params.dir_info_timeout(1000); // 1s: dir entries change less frequently
 
     // Keep a reference for persist_cache() on shutdown (vfs is moved into context).
     let vfs_ref = vfs.clone();
@@ -77,8 +77,9 @@ unsafe extern "system" {
 
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
     if let Ok(guard) = SHUTDOWN_TX.lock()
-        && let Some(tx) = guard.as_ref() {
-            let _ = tx.send(());
-        }
+        && let Some(tx) = guard.as_ref()
+    {
+        let _ = tx.send(());
+    }
     1 // TRUE — handled
 }

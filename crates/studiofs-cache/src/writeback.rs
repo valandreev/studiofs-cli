@@ -13,6 +13,7 @@
 //! - Status: 1 byte (0=pending, 1=uploading, 2=complete)
 //! - Timestamp: 8 bytes
 
+use crate::disk::DiskCache;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,9 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use studiofs_meta::Ino;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
-use crate::disk::DiskCache;
 
 // =============================================================================
 // Journal Format Constants
@@ -127,7 +127,11 @@ impl JournalEntry {
         if data.len() < JOURNAL_ENTRY_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Journal entry too short: {} < {}", data.len(), JOURNAL_ENTRY_SIZE),
+                format!(
+                    "Journal entry too short: {} < {}",
+                    data.len(),
+                    JOURNAL_ENTRY_SIZE
+                ),
             ));
         }
 
@@ -187,7 +191,11 @@ pub struct PendingOp {
 /// Asynchronous journal operation sent to the background journal-writer task.
 enum JournalOp {
     /// Write a new journal entry (no fsync — best-effort crash durability).
-    Write { ino: Ino, offset: u64, object_id: u64 },
+    Write {
+        ino: Ino,
+        offset: u64,
+        object_id: u64,
+    },
     /// Remove a completed journal file.
     Complete { path: PathBuf },
     /// Barrier op used to wait until all prior journal ops are durably applied.
@@ -217,7 +225,10 @@ pub struct WritebackManager {
 impl WritebackManager {
     /// Create a new writeback manager.
     /// Scans the `pending_dir` and re-queues any existing operations.
-    pub fn new(cache_dir: impl AsRef<Path>, disk_cache: Arc<DiskCache>) -> (Arc<Self>, mpsc::UnboundedReceiver<PendingOp>) {
+    pub fn new(
+        cache_dir: impl AsRef<Path>,
+        disk_cache: Arc<DiskCache>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<PendingOp>) {
         let pending_dir = cache_dir.as_ref().join("pending");
         fs::create_dir_all(&pending_dir).expect("failed to create pending dir");
 
@@ -283,7 +294,10 @@ impl WritebackManager {
                             }
                         } else {
                             // Upload was in progress or complete - clean up
-                            debug!("cleaning up journal with status {:?}: {:?}", op.status, path);
+                            debug!(
+                                "cleaning up journal with status {:?}: {:?}",
+                                op.status, path
+                            );
                             if let Err(e) = fs::remove_file(&path) {
                                 warn!("failed to remove completed journal {:?}: {}", path, e);
                             }
@@ -323,7 +337,11 @@ impl WritebackManager {
         let path = self.pending_dir.join(&filename);
 
         // Enqueue journal write (background, no fsync).
-        let _ = self.journal_tx.send(JournalOp::Write { ino, offset, object_id });
+        let _ = self.journal_tx.send(JournalOp::Write {
+            ino,
+            offset,
+            object_id,
+        });
 
         // Enqueue for S3 upload immediately.
         let op = PendingOp {
@@ -345,7 +363,9 @@ impl WritebackManager {
     pub fn complete(&self, op: &PendingOp) {
         self.disk_cache.unpin(op.object_id);
         if !op.journal_path.as_os_str().is_empty() {
-            let _ = self.journal_tx.send(JournalOp::Complete { path: op.journal_path.clone() });
+            let _ = self.journal_tx.send(JournalOp::Complete {
+                path: op.journal_path.clone(),
+            });
         }
         self.mark_done();
     }
@@ -353,7 +373,11 @@ impl WritebackManager {
     /// Wait until all queued journal operations before this call are applied.
     pub async fn flush_journal(&self) {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        if self.journal_tx.send(JournalOp::Barrier { ack: tx }).is_err() {
+        if self
+            .journal_tx
+            .send(JournalOp::Barrier { ack: tx })
+            .is_err()
+        {
             return;
         }
         let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(5))).await;
@@ -432,9 +456,11 @@ impl WritebackManager {
     }
 
     fn mark_done(&self) {
-        let _ = self.pending_ops.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(1))
-        });
+        let _ = self
+            .pending_ops
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         if self.pending_ops.load(Ordering::Relaxed) == 0 {
             self.idle_notify.notify_waiters();
         }
@@ -450,15 +476,15 @@ impl WritebackManager {
 /// Files are written without `sync_all()` (no per-block fsync). On a process
 /// crash some journal files may be missing; the startup scan handles recovery
 /// by re-queuing any pending journals that survived.
-async fn journal_writer_task(
-    pending_dir: PathBuf,
-    mut rx: mpsc::UnboundedReceiver<JournalOp>,
-) {
+async fn journal_writer_task(pending_dir: PathBuf, mut rx: mpsc::UnboundedReceiver<JournalOp>) {
     while let Some(op) = rx.recv().await {
         match op {
-            JournalOp::Write { ino, offset, object_id } => {
-                let filename =
-                    format!("{:016x}_{:016x}_{:016x}.journal", ino, offset, object_id);
+            JournalOp::Write {
+                ino,
+                offset,
+                object_id,
+            } => {
+                let filename = format!("{:016x}_{:016x}_{:016x}.journal", ino, offset, object_id);
                 let path = pending_dir.join(&filename);
                 let tmp = path.with_extension("tmp");
                 let entry = JournalEntry::new(ino, offset, object_id);
@@ -472,13 +498,11 @@ async fn journal_writer_task(
                     warn!("journal_writer: rename {:?} failed: {}", tmp, e);
                 }
             }
-            JournalOp::Complete { path } => {
-                match tokio::fs::remove_file(&path).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => warn!("journal_writer: remove {:?} failed: {}", path, e),
-                }
-            }
+            JournalOp::Complete { path } => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("journal_writer: remove {:?} failed: {}", path, e),
+            },
             JournalOp::Barrier { ack } => {
                 let _ = ack.send(());
             }

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use studiofs_cache::MemoryCache;
 use studiofs_data::{DataStore, DataStoreConfig};
-use studiofs_meta::{MetaEngine, RedbMetaEngine};
+use studiofs_meta::open_meta_engine;
 use studiofs_vfs::StudioVfs;
 use tracing::info;
 
@@ -38,8 +38,8 @@ pub fn run(
     let db_path = meta_dir.join(format!("{name}.db"));
     info!("opening volume {name:?} from {db_path:?}");
 
-    // Open metadata
-    let meta = Arc::new(RedbMetaEngine::open(&db_path)?);
+    // Open metadata (redb-local or Tonbo wrapper depending on stored backend config).
+    let meta = open_meta_engine(&db_path)?;
     let format_info = meta.get_format_info()?;
 
     info!(
@@ -61,12 +61,12 @@ pub fn run(
         .unwrap_or_else(|| meta_dir.join("cache"));
 
     // DiskCache will append "objects" and "pending" subdirectories inside this UUID dir.
-    let cache_path = base_cache_path
-        .join(&format_info.uuid);
-        
-    let cache_path_str = cache_path.to_str()
+    let cache_path = base_cache_path.join(&format_info.uuid);
+
+    let cache_path_str = cache_path
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?;
-    
+
     // Create a tokio runtime for async ops in FUSE callbacks and background tasks
     let rt = Arc::new(
         tokio::runtime::Runtime::new()
@@ -82,7 +82,8 @@ pub fn run(
         Some(mem_cache.clone()),
         cache_path_str,
         cache_size_bytes, // Pass the cache size
-    ).map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
+    )
+    .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
     println!("  Memory limit: {}", memory_limit);

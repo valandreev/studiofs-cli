@@ -4,6 +4,7 @@
 //! but the design supports swapping to PostgreSQL/Redis for multi-user mode.
 
 use crate::types::*;
+use std::collections::HashSet;
 
 /// Errors from the metadata engine.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +44,13 @@ pub type MetaResult<T> = Result<T, MetaError>;
 /// All operations are synchronous (redb is sync). The VFS layer wraps them
 /// in `spawn_blocking` for async compatibility.
 pub trait MetaEngine: Send + Sync {
+    /// Flush pending metadata mutations to remote store (if any).
+    ///
+    /// Local-only engines can keep the default no-op implementation.
+    fn flush_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     // ─── Format / Settings ───────────────────────────────────────────────
 
     /// Store format info (called during `studiofs init`).
@@ -133,6 +141,13 @@ pub trait MetaEngine: Send + Sync {
 
     /// Get all pending deletions (object_id, timestamp).
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
+
+    /// Get currently referenced object IDs from FILE_BLOCKS metadata.
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        Err(MetaError::Storage(
+            "get_referenced_object_ids not implemented".to_string(),
+        ))
+    }
 
     // ─── High-Level Operations ───────────────────────────────────────────
 

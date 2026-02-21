@@ -34,7 +34,9 @@ fn init_winfsp_dll_path() {
 
         // Fallback: InstallDir
         if let Ok(install_dir) = key.get_value::<String, _>("InstallDir") {
-            let dll = PathBuf::from(&install_dir).join("bin").join("winfsp-x64.dll");
+            let dll = PathBuf::from(&install_dir)
+                .join("bin")
+                .join("winfsp-x64.dll");
             if dll.exists() {
                 return Some(dll);
             }
@@ -45,17 +47,18 @@ fn init_winfsp_dll_path() {
 
     if let Some(path) = dll_path {
         // Convert to null-terminated UTF-16 for LoadLibraryW
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
 
         // SAFETY: LoadLibraryW with a valid, null-terminated UTF-16 path.
         // Pre-loading the DLL means the delay-load resolver will find it
         // already in memory without needing to search PATH.
         let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
         if handle.is_null() {
-            eprintln!(
-                "warning: failed to load winfsp-x64.dll from {:?}",
-                path
-            );
+            eprintln!("warning: failed to load winfsp-x64.dll from {:?}", path);
         }
     } else {
         eprintln!(
@@ -96,6 +99,23 @@ EXAMPLES:
   Check volume status:
     studiofs status myvolume
 
+  Update metadata tuning for an existing volume:
+    studiofs tune-metadata myvolume --cache-ttl-secs 5 --flush-interval-secs 15
+
+  Run janitor in dry-run mode:
+    studiofs janitor myvolume --dry-run
+
+  Enable cross-client cache invalidation bus (NATS):
+    set STUDIOFS_NATS_URL=nats://127.0.0.1:4222
+    studiofs mount myvolume Z:
+
+ENV TUNING:
+  STUDIOFS_NATS_URL                 Optional NATS server URL for invalidation bus.
+  STUDIOFS_JANITOR_INTERVAL_SECS    Auto-janitor cycle interval (default: 1800).
+  STUDIOFS_JANITOR_SKIP_NEWER_SECS  Grace window for orphan deletion (default: 900).
+  STUDIOFS_JANITOR_MAX_DELETES      Max janitor deletes per cycle (default: 500).
+  STUDIOFS_JANITOR_LEASE_TTL_SECS   Janitor lease TTL in metadata store (default: 2700).
+
   Enable debug logging:
     studiofs --log-level debug mount myvolume Z:
 ")]
@@ -113,8 +133,11 @@ enum Commands {
     /// Initialize a new filesystem volume
     #[command(long_about = "\
 Initialize a new filesystem volume by creating a local metadata database and \
-storing the S3 connection details. The volume name is used as a prefix for all \
-S3 object keys, so it must be unique within the bucket.
+storing connection details for data + metadata stores.
+
+Path layout is fixed by disk name:
+  • Data objects:     <disk-name>/objects/...
+  • Metadata manifest <disk-name>/metadata/manifest.json
 
 The target S3 bucket must already exist — this command does not create it.")]
     #[command(after_help = "\
@@ -127,13 +150,26 @@ EXAMPLES:
     studiofs init dev --endpoint http://127.0.0.1:9000 \\
       --bucket test-bucket --access-key minioadmin --secret-key minioadmin
 
+  Separate metadata backend/bucket:
+    studiofs init prod --endpoint https://s3.us-east-1.amazonaws.com \\
+      --bucket data-bucket --access-key DATA_KEY --secret-key DATA_SECRET \\
+      --metadata-same-as-data false --metadata-endpoint http://127.0.0.1:9000 \\
+      --metadata-bucket meta-bucket --metadata-access-key minioadmin \\
+      --metadata-secret-key minioadmin
+
   Custom block size (8 MiB instead of default 4 MiB):
     studiofs init custom --endpoint http://127.0.0.1:9000 \\
       --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
       --block-size 8MB
+
+  Multi-client tuning (aggressive convergence):
+    studiofs init teamdisk --endpoint http://127.0.0.1:9000 \\
+      --bucket data-bucket --access-key minioadmin --secret-key minioadmin \\
+      --metadata-cache-ttl-secs 5 --metadata-flush-interval-secs 15 \\
+      --metadata-flush-ops-threshold 20 --metadata-flush-bytes-threshold 262144
 ")]
     Init {
-        /// Volume name (used as S3 key prefix — must be unique per bucket)
+        /// Disk name (used in object paths like <name>/objects and <name>/metadata)
         name: String,
 
         /// S3 endpoint URL (e.g. https://s3.amazonaws.com, http://127.0.0.1:9000)
@@ -156,10 +192,88 @@ EXAMPLES:
         #[arg(long, default_value = "")]
         region: String,
 
+        /// Reuse data endpoint/bucket/credentials for metadata.
+        /// Metadata path will still be <disk-name>/metadata/.
+        #[arg(long, default_value_t = true)]
+        metadata_same_as_data: bool,
+
+        /// Metadata endpoint URL (required when --metadata-same-as-data=false)
+        #[arg(long)]
+        metadata_endpoint: Option<String>,
+
+        /// Metadata bucket (required when --metadata-same-as-data=false)
+        #[arg(long)]
+        metadata_bucket: Option<String>,
+
+        /// Metadata access key (required when --metadata-same-as-data=false)
+        #[arg(long)]
+        metadata_access_key: Option<String>,
+
+        /// Metadata secret key (required when --metadata-same-as-data=false)
+        #[arg(long)]
+        metadata_secret_key: Option<String>,
+
+        /// Metadata region (optional, defaults to empty)
+        #[arg(long)]
+        metadata_region: Option<String>,
+
+        /// Metadata cache TTL in seconds (read-through refresh window).
+        #[arg(long, default_value_t = 20)]
+        metadata_cache_ttl_secs: u64,
+
+        /// Maximum flush interval in seconds for batched remote metadata push.
+        #[arg(long, default_value_t = 60)]
+        metadata_flush_interval_secs: u64,
+
+        /// Flush early when queued metadata ops reach this threshold.
+        #[arg(long, default_value_t = 100)]
+        metadata_flush_ops_threshold: u32,
+
+        /// Flush early when queued metadata bytes reach this threshold.
+        #[arg(long, default_value_t = 1024 * 1024)]
+        metadata_flush_bytes_threshold: u64,
+
         /// Block size in bytes (e.g. 4MB, 8MB, 16MB). Defaults to 4MB if not specified.
         /// Larger blocks reduce metadata overhead but increase memory usage per operation.
         #[arg(long)]
         block_size: Option<String>,
+    },
+
+    /// Discover and attach local cache to an existing Tonbo metadata volume
+    #[command(long_about = "\
+Attach to an existing disk by reading metadata manifest from:
+  <disk-name>/metadata/manifest.json
+
+Discovery requires only metadata endpoint/bucket/credentials + disk name.
+Data endpoint/bucket/prefix are loaded from remote metadata.")]
+    #[command(after_help = "\
+EXAMPLES:
+  studiofs discover mydisk --endpoint http://127.0.0.1:9000 \\
+    --bucket meta-bucket --access-key minioadmin --secret-key minioadmin
+")]
+    Discover {
+        /// Disk name to discover
+        name: String,
+
+        /// Metadata endpoint URL
+        #[arg(long)]
+        endpoint: String,
+
+        /// Metadata bucket
+        #[arg(long)]
+        bucket: String,
+
+        /// Metadata access key
+        #[arg(long)]
+        access_key: String,
+
+        /// Metadata secret key
+        #[arg(long)]
+        secret_key: String,
+
+        /// Metadata region
+        #[arg(long, default_value = "")]
+        region: String,
     },
 
     /// Mount a filesystem volume as a local drive
@@ -193,7 +307,6 @@ SIZE FORMATS:
         /// Mount point: drive letter on Windows (Z:), directory path on Unix (/mnt/studio)
         mount_point: String,
 
-
         /// Disk cache directory (defaults to <meta-dir>/cache)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
@@ -221,6 +334,65 @@ EXAMPLES:
         name: String,
     },
 
+    /// Update metadata cache/flush tuning for an existing volume
+    #[command(after_help = "\
+EXAMPLES:
+  studiofs tune-metadata myvolume --cache-ttl-secs 5
+  studiofs tune-metadata myvolume --flush-interval-secs 15 --flush-ops-threshold 20
+")]
+    TuneMetadata {
+        /// Volume name
+        name: String,
+
+        /// Metadata cache TTL in seconds (minimum 1)
+        #[arg(long)]
+        cache_ttl_secs: Option<u64>,
+
+        /// Metadata flush interval in seconds (minimum 1)
+        #[arg(long)]
+        flush_interval_secs: Option<u64>,
+
+        /// Metadata flush ops threshold (minimum 1)
+        #[arg(long)]
+        flush_ops_threshold: Option<u32>,
+
+        /// Metadata flush bytes threshold (minimum 1)
+        #[arg(long)]
+        flush_bytes_threshold: Option<u64>,
+    },
+
+    /// Scan data objects and remove orphaned ones (Phase 6 prototype)
+    #[command(after_help = "\
+EXAMPLES:
+  studiofs janitor myvolume --dry-run
+  studiofs janitor myvolume --max-deletes 500 --skip-newer-minutes 15
+  studiofs janitor myvolume --loop --interval-minutes 30
+")]
+    Janitor {
+        /// Volume name
+        name: String,
+
+        /// Do not delete, only report what would be deleted
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Run continuously with a sleep interval between cycles
+        #[arg(long)]
+        r#loop: bool,
+
+        /// Interval between cycles in loop mode
+        #[arg(long, default_value_t = 30)]
+        interval_minutes: u64,
+
+        /// Skip objects newer than this many minutes
+        #[arg(long, default_value_t = 15)]
+        skip_newer_minutes: u64,
+
+        /// Maximum objects to delete per cycle
+        #[arg(long, default_value_t = 500)]
+        max_deletes: u64,
+    },
+
     /// Permanently destroy a volume
     #[command(long_about = "\
 Permanently destroy a volume, deleting all data from S3 and removing local metadata.
@@ -228,6 +400,10 @@ WARNING: This action is irreversible.")]
     Destroy {
         /// Volume name to destroy
         name: String,
+
+        /// Remove only local cache/config; keep remote metadata and data.
+        #[arg(long)]
+        local: bool,
     },
 }
 
@@ -255,6 +431,16 @@ fn main() -> anyhow::Result<()> {
             access_key,
             secret_key,
             region,
+            metadata_same_as_data,
+            metadata_endpoint,
+            metadata_bucket,
+            metadata_access_key,
+            metadata_secret_key,
+            metadata_region,
+            metadata_cache_ttl_secs,
+            metadata_flush_interval_secs,
+            metadata_flush_ops_threshold,
+            metadata_flush_bytes_threshold,
             block_size,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -265,6 +451,16 @@ fn main() -> anyhow::Result<()> {
                 &access_key,
                 &secret_key,
                 &region,
+                metadata_endpoint.as_deref(),
+                metadata_bucket.as_deref(),
+                metadata_access_key.as_deref(),
+                metadata_secret_key.as_deref(),
+                metadata_region.as_deref(),
+                metadata_same_as_data,
+                metadata_cache_ttl_secs,
+                metadata_flush_interval_secs,
+                metadata_flush_ops_threshold,
+                metadata_flush_bytes_threshold,
                 &meta_dir,
                 block_size.as_deref(),
             )?;
@@ -288,13 +484,68 @@ fn main() -> anyhow::Result<()> {
                 foreground,
             )?;
         }
+        Commands::Discover {
+            name,
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
+            region,
+        } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::discovery::run(
+                &name,
+                &endpoint,
+                &bucket,
+                &access_key,
+                &secret_key,
+                &region,
+                &meta_dir,
+            )?;
+        }
         Commands::Status { name } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::status::run(&name, &meta_dir)?;
         }
-        Commands::Destroy { name } => {
+        Commands::TuneMetadata {
+            name,
+            cache_ttl_secs,
+            flush_interval_secs,
+            flush_ops_threshold,
+            flush_bytes_threshold,
+        } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::destroy::run(&name, &meta_dir)?;
+            cli::tune_metadata::run(
+                &name,
+                &meta_dir,
+                cache_ttl_secs,
+                flush_interval_secs,
+                flush_ops_threshold,
+                flush_bytes_threshold,
+            )?;
+        }
+        Commands::Destroy { name, local } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::destroy::run(&name, &meta_dir, local)?;
+        }
+        Commands::Janitor {
+            name,
+            dry_run,
+            r#loop,
+            interval_minutes,
+            skip_newer_minutes,
+            max_deletes,
+        } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::janitor::run(
+                &name,
+                &meta_dir,
+                dry_run,
+                r#loop,
+                interval_minutes,
+                skip_newer_minutes,
+                max_deletes,
+            )?;
         }
     }
 
