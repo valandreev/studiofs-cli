@@ -14,6 +14,7 @@ pub fn mount_and_serve(
     rt: std::sync::Arc<tokio::runtime::Runtime>,
     mount_point: &str,
     _volume_label: &str,
+    _foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use winfsp::host::{FileSystemHost, VolumeParams};
 
@@ -39,7 +40,7 @@ pub fn mount_and_serve(
 
     // Keep a reference for persist_cache() on shutdown (vfs is moved into context).
     let vfs_ref = vfs.clone();
-    let context = StudioFsContext::new(vfs, rt);
+    let context = StudioFsContext::new(vfs, rt.clone());
 
     let mut host = FileSystemHost::new(volume_params, context)?;
     host.mount(mount_point)?;
@@ -56,9 +57,8 @@ pub fn mount_and_serve(
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
-    // Persist the slab index before tearing down WinFSP so the cache
-    // survives the remount without falling back to object storage.
-    vfs_ref.persist_cache();
+    // Drain writeback state before tearing down WinFSP.
+    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(10)));
     host.stop();
     host.unmount();
 

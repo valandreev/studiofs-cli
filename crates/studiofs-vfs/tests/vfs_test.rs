@@ -13,6 +13,8 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
+use std::thread;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use studiofs_data::store::{DataStore, DataStoreConfig};
@@ -39,6 +41,12 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         block_size: 4 * 1024 * 1024, // 4 MiB
         chunk_size: 64 * 1024 * 1024, // 64 MiB (deprecated)
     }
+}
+
+fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
+    let mut info = make_format_info(volume_suffix);
+    info.endpoint = endpoint.to_string();
+    info
 }
 
 /// Create a fresh VFS instance backed by a temporary redb and MinIO.
@@ -75,6 +83,21 @@ async fn ensure_bucket() {
 
     let op = Operator::new(builder).unwrap().finish();
     let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
+}
+
+async fn wait_until_exists(ds: &DataStore, path: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match ds.exists(path).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 // =============================================================================
@@ -405,6 +428,104 @@ async fn test_pending_deletions_gc() {
     // Verify new block is different
     let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
     assert_ne!(blocks_after[0].1.object_id, old_block_id);
+}
+
+#[test]
+#[ignore]
+fn test_crash_recovery_replays_pending_journal() {
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+
+    let volume_suffix = format!("crash-{}", std::process::id());
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let mut crash_file_ino: u64 = 0;
+
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&offline_info).unwrap();
+
+    // Phase 1: create dirty data and pending journals while endpoint is offline.
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let data = Arc::new(DataStore::new(&DataStoreConfig::from(&offline_info)).unwrap());
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                data,
+                None,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
+            crash_file_ino = attr.ino;
+            let payload = vec![0x5Au8; 2 * 1024 * 1024];
+            vfs.write(attr.ino, 0, &payload).await.unwrap();
+            vfs.flush(attr.ino).await.unwrap();
+            // Simulate abrupt process death: drop runtime without graceful VFS shutdown.
+        });
+        rt.shutdown_background();
+    }
+
+    let pending_dir = cache_dir.join("pending");
+    let pending_count = std::fs::read_dir(&pending_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
+        .count();
+    assert!(pending_count > 0, "expected pending journal files after simulated crash");
+
+    // Phase 2: restart with healthy endpoint and verify recovery drains journals.
+    let online_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:9000");
+    meta.set_format_info(&online_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let data = Arc::new(DataStore::new(&DataStoreConfig::from(&online_info)).unwrap());
+        let _vfs = StudioVfs::new(
+            meta.clone(),
+            data.clone(),
+            None,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
+        assert!(!blocks.is_empty(), "file blocks must exist in metadata");
+        let object_id = blocks[0].1.object_id;
+        let key = format_object_key(&online_info.uuid, object_id);
+
+        assert!(
+            wait_until_exists(&data, &key, Duration::from_secs(15)).await,
+            "recovered uploader should eventually upload object {object_id}"
+        );
+    });
+
+    // Allow async journal cleanup task to remove completed files.
+    thread::sleep(Duration::from_millis(500));
+    let pending_after = std::fs::read_dir(&pending_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
+        .count();
+    assert_eq!(pending_after, 0, "pending journals must be cleaned up after recovery");
 }
 
 // =============================================================================

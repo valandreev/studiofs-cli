@@ -2062,6 +2062,29 @@ impl StudioVfs {
             tracing::info!("disk cache index persisted");
         }
     }
+
+    /// Best-effort graceful shutdown: drain dirty buffers, flush journal writes,
+    /// wait for uploader queue to quiesce, then persist cache metadata.
+    pub async fn shutdown(&self, upload_drain_timeout: Duration) {
+        info!("VFS shutdown: draining dirty memory buffer");
+        self.drain_dirty_mem().await;
+
+        info!("VFS shutdown: flushing journal writer queue");
+        self.writeback.flush_journal().await;
+
+        let drained = self.writeback.wait_for_idle(upload_drain_timeout).await;
+        if !drained {
+            warn!(
+                pending = self.writeback.pending_count(),
+                timeout_ms = upload_drain_timeout.as_millis() as u64,
+                "VFS shutdown: upload queue did not fully drain before timeout"
+            );
+        }
+
+        // Flush completion journal removals enqueued during the final upload drain.
+        self.writeback.flush_journal().await;
+        self.persist_cache();
+    }
 }
 
 // =============================================================================

@@ -17,8 +17,10 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use studiofs_meta::Ino;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 use crate::disk::DiskCache;
 
@@ -188,6 +190,8 @@ enum JournalOp {
     Write { ino: Ino, offset: u64, object_id: u64 },
     /// Remove a completed journal file.
     Complete { path: PathBuf },
+    /// Barrier op used to wait until all prior journal ops are durably applied.
+    Barrier { ack: std::sync::mpsc::Sender<()> },
 }
 
 // =============================================================================
@@ -206,6 +210,8 @@ pub struct WritebackManager {
     sender: mpsc::UnboundedSender<PendingOp>,
     journal_tx: mpsc::UnboundedSender<JournalOp>,
     disk_cache: Arc<DiskCache>,
+    pending_ops: AtomicUsize,
+    idle_notify: Notify,
 }
 
 impl WritebackManager {
@@ -226,6 +232,8 @@ impl WritebackManager {
             sender: tx,
             journal_tx,
             disk_cache,
+            pending_ops: AtomicUsize::new(0),
+            idle_notify: Notify::new(),
         });
 
         // Spawn background journal writer (no fsync in hot path).
@@ -265,8 +273,13 @@ impl WritebackManager {
                             // Pin object so it doesn't get evicted before upload
                             self.disk_cache.pin(op.object_id);
 
+                            let object_id = op.object_id;
+                            self.pending_ops.fetch_add(1, Ordering::Relaxed);
                             if self.sender.send(op).is_ok() {
                                 count += 1;
+                            } else {
+                                self.pending_ops.fetch_sub(1, Ordering::Relaxed);
+                                self.disk_cache.unpin(object_id);
                             }
                         } else {
                             // Upload was in progress or complete - clean up
@@ -304,6 +317,7 @@ impl WritebackManager {
     pub fn submit(&self, ino: Ino, offset: u64, object_id: u64) {
         // Pin to prevent eviction before upload completes.
         self.disk_cache.pin(object_id);
+        self.pending_ops.fetch_add(1, Ordering::Relaxed);
 
         let filename = format!("{:016x}_{:016x}_{:016x}.journal", ino, offset, object_id);
         let path = self.pending_dir.join(&filename);
@@ -321,6 +335,8 @@ impl WritebackManager {
         };
         if self.sender.send(op).is_err() {
             error!("failed to queue pending op (channel closed)");
+            self.disk_cache.unpin(object_id);
+            self.mark_done();
         }
     }
 
@@ -330,6 +346,38 @@ impl WritebackManager {
         self.disk_cache.unpin(op.object_id);
         if !op.journal_path.as_os_str().is_empty() {
             let _ = self.journal_tx.send(JournalOp::Complete { path: op.journal_path.clone() });
+        }
+        self.mark_done();
+    }
+
+    /// Wait until all queued journal operations before this call are applied.
+    pub async fn flush_journal(&self) {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        if self.journal_tx.send(JournalOp::Barrier { ack: tx }).is_err() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(5))).await;
+    }
+
+    /// Wait for all currently pending uploads to reach completion.
+    /// Returns false when `timeout` elapsed before draining.
+    pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.pending_ops.load(Ordering::Relaxed) == 0 {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if tokio::time::timeout(remaining, self.idle_notify.notified())
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
     }
 
@@ -378,6 +426,19 @@ impl WritebackManager {
     pub fn pending_dir(&self) -> &Path {
         &self.pending_dir
     }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending_ops.load(Ordering::Relaxed)
+    }
+
+    fn mark_done(&self) {
+        let _ = self.pending_ops.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+        if self.pending_ops.load(Ordering::Relaxed) == 0 {
+            self.idle_notify.notify_waiters();
+        }
+    }
 }
 
 // =============================================================================
@@ -417,6 +478,9 @@ async fn journal_writer_task(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => warn!("journal_writer: remove {:?} failed: {}", path, e),
                 }
+            }
+            JournalOp::Barrier { ack } => {
+                let _ = ack.send(());
             }
         }
     }

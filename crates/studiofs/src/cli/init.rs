@@ -6,8 +6,6 @@ use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine, DEFAULT_BLOCK_SIZE};
 use tracing::info;
 use uuid::Uuid;
 use std::io::Write;
-use aws_sdk_s3::config::{Credentials, Region};
-use aws_config::BehaviorVersion;
 
 /// Parse a size string like "4MB", "1GB" into bytes.
 /// Supports KB, MB, GB, TB suffixes. Defaults to bytes if no suffix.
@@ -40,49 +38,6 @@ fn parse_size(size_str: &str) -> anyhow::Result<u32> {
     }
     
     Ok(bytes as u32)
-}
-
-async fn create_s3_bucket(
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-) -> anyhow::Result<()> {
-    let region_obj = if region.is_empty() {
-        Region::new("us-east-1")
-    } else {
-        Region::new(region.to_string())
-    };
-
-    let credentials = Credentials::new(
-        access_key,
-        secret_key,
-        None,
-        None,
-        "studiofs-init",
-    );
-
-    let mut config_builder = aws_sdk_s3::config::Builder::new()
-        .behavior_version(BehaviorVersion::latest())
-        .region(region_obj)
-        .credentials_provider(credentials)
-        .force_path_style(true); // Usually needed for MinIO/S3-compatible
-
-    if !endpoint.is_empty() {
-        config_builder = config_builder.endpoint_url(endpoint);
-    }
-
-    let client = aws_sdk_s3::Client::from_conf(config_builder.build());
-
-    client
-        .create_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create bucket: {}", e))?;
-
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -128,23 +83,12 @@ pub fn run(
                 Ok(())
             }
             Err(e) => {
-                // Check if it's a "Not Found" error which usually means bucket is missing
                 let err_str = format!("{}", e);
                 if err_str.contains("NotFound") || err_str.contains("404") || err_str.contains("NoSuchBucket") {
-                    println!("❓ Bucket '{}' was not found.", bucket);
-                    print!("   Do you want to create it? [y/N]: ");
-                    std::io::stdout().flush()?;
-                    
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    if input.trim().to_lowercase() == "y" {
-                        println!("   🚀 Attempting to create bucket '{}'...", bucket);
-                        create_s3_bucket(endpoint, bucket, access_key, secret_key, region).await?;
-                        println!("   ✅ Bucket '{}' created successfully.", bucket);
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!("Initialization cancelled: bucket missing."))
-                    }
+                    println!("❌ Bucket '{}' was not found or is inaccessible.", bucket);
+                    println!("   StudioFS init uses OpenDAL only and does not auto-create buckets.");
+                    println!("   Create the bucket manually, then retry `studiofs init`.");
+                    Err(anyhow::anyhow!("Initialization cancelled: bucket missing."))
                 } else {
                     println!("❌ S3 verification failed!");
                     println!("   Error: {}", e);

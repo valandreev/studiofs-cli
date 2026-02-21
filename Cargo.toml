@@ -63,8 +63,6 @@ dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 home = "0.5"
-aws-config = "1"
-aws-sdk-s3 = "1"
 
 # Internal crates
 studiofs-meta = { path = "crates/studiofs-meta" }

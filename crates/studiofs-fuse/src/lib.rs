@@ -13,6 +13,7 @@ pub fn mount_and_serve(
     vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
     rt: std::sync::Arc<tokio::runtime::Runtime>,
     mount_point: &str,
+    foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Keep a reference for persist_cache() after fuser::mount2() returns
     // (vfs is moved into StudioFuseFs below).
@@ -36,10 +37,13 @@ pub fn mount_and_serve(
         options.push(fuser::MountOption::CUSTOM("noappledouble".into()));
         options.push(fuser::MountOption::CUSTOM("volname=StudioFS".into()));
     }
+    if foreground {
+        options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    }
     tracing::info!("mounting StudioFS at {mount_point}");
     fuser::mount2(fs, mount_point, &options)?;
     // fuser::mount2 returns when the filesystem is unmounted.
-    // Persist the slab index now so the cache survives remounts.
-    vfs_ref.persist_cache();
+    // Drain writeback state before process exit.
+    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(10)));
     Ok(())
 }
