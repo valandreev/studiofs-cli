@@ -7,6 +7,7 @@ use opendal::options::WriteOptions;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::Arc;
@@ -256,6 +257,17 @@ impl TonboMetaEngine {
         self.flush_remote_snapshot(true)
     }
 
+    fn run_on_internal_rt<F, T>(&self, fut: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.rt.lock().block_on(fut))
+        } else {
+            self.rt.lock().block_on(fut)
+        }
+    }
+
     fn publish_invalidation_all(&self) {
         let (Some(client), Some(subject_base)) = (&self.nats_client, &self.nats_subject_base) else {
             return;
@@ -264,7 +276,7 @@ impl TonboMetaEngine {
         let payload = self.invalidation_sender_id.clone().into_bytes();
         let client = client.clone();
         let fut = async move { client.publish(subject, payload.into()).await };
-        if let Err(err) = self.rt.lock().block_on(fut) {
+        if let Err(err) = self.run_on_internal_rt(fut) {
             warn!("failed to publish invalidation event: {}", err);
         }
     }
@@ -277,7 +289,7 @@ impl TonboMetaEngine {
         let fut = async {
             tokio::time::timeout(self.remote_request_timeout, remote.op.stat(path)).await
         };
-        match self.rt.lock().block_on(fut) {
+        match self.run_on_internal_rt(fut) {
             Ok(Ok(meta)) => Ok(meta),
             Ok(Err(e)) => Err(MetaError::Storage(e.to_string())),
             Err(_) => Err(MetaError::Storage(format!(
@@ -291,7 +303,7 @@ impl TonboMetaEngine {
         let fut = async {
             tokio::time::timeout(self.remote_request_timeout, remote.op.read(path)).await
         };
-        match self.rt.lock().block_on(fut) {
+        match self.run_on_internal_rt(fut) {
             Ok(Ok(buf)) => Ok(buf.to_vec()),
             Ok(Err(e)) => Err(MetaError::Storage(e.to_string())),
             Err(_) => Err(MetaError::Storage(format!(
@@ -315,7 +327,7 @@ impl TonboMetaEngine {
             )
             .await
         };
-        match self.rt.lock().block_on(fut) {
+        match self.run_on_internal_rt(fut) {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(MetaError::Storage(e.to_string())),
             Err(_) => Err(MetaError::Storage(format!(
@@ -390,7 +402,7 @@ impl TonboMetaEngine {
                         )));
                     }
                     let backoff_ms = (20u64).saturating_mul(1u64 << retries.min(6));
-                    let _ = self.rt.lock().block_on(async {
+                    let _ = self.run_on_internal_rt(async {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     });
                 }
@@ -924,7 +936,7 @@ impl TonboMetaEngine {
                     );
                     current_etag = remote_etag;
                     let backoff_ms = (50u64).saturating_mul(1u64 << retries.min(6));
-                    let _ = self.rt.lock().block_on(async {
+                    let _ = self.run_on_internal_rt(async {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     });
                     retries = retries.saturating_add(1);
