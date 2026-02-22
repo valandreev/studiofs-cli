@@ -19,36 +19,24 @@ pub fn mount_and_serve(
     use winfsp::host::{FileSystemHost, VolumeParams};
 
     let mut volume_params = VolumeParams::new();
-    // Case-insensitive search is required for proper Windows compatibility:
-    // shell extensions (7-zip), TeraCopy, and most Win32 apps expect it.
-    // resolve_path does case-insensitive fallback; open/create call set_normalized_name.
-    volume_params.case_sensitive_search(false);
+    volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
-    // Persistent ACLs enabled: we provide a full-access SD so all checks pass,
-    // and Windows apps (shell, security tab) see proper ACL support.
-    volume_params.persistent_acls(true);
+    volume_params.persistent_acls(false);
     volume_params.reparse_points(true);
     volume_params.named_streams(false);
     volume_params.read_only_volume(false);
     volume_params.post_cleanup_when_modified_only(true);
-    volume_params.flush_and_purge_on_cleanup(true);
-    // Allow kernel-mode opens — required for shell extensions (7-zip, etc.)
-    // and antivirus/indexing that access files from kernel context.
-    volume_params.allow_open_in_kernel_mode(true);
-    volume_params.pass_query_directory_pattern(true);
-    volume_params.supports_posix_unlink_rename(true);
-    volume_params.post_disposition_only_when_necessary(true);
     volume_params.sector_size(512);
     volume_params.sectors_per_allocation_unit(1);
     volume_params.max_component_length(255);
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
     volume_params.filesystem_name("StudioFS");
-    // WinFSP cache tuning:
-    // - file_info_timeout enables the Windows Cache Manager for read perf
-    // - dir_info_timeout can be longer since dir entries change less often
-    volume_params.file_info_timeout(1000); // 1s: enables Cache Manager
-    volume_params.dir_info_timeout(2000); // 2s: dir entries change less frequently
+    // WinFSP layer tuning:
+    // - Shorter file_info_timeout for quick invalidation on overwrites (P1.2)
+    // - Longer dir_info_timeout since directory entries change less frequently
+    volume_params.file_info_timeout(100); // 100ms: quick invalidation on overwrites
+    volume_params.dir_info_timeout(1000); // 1s: dir entries change less frequently
 
     // Keep a reference for persist_cache() on shutdown (vfs is moved into context).
     let vfs_ref = vfs.clone();

@@ -886,7 +886,7 @@ impl MetaEngine for RedbMetaEngine {
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            // Check exact-case existence
+            // Check existence
             if table
                 .get(key.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -896,32 +896,6 @@ impl MetaEngine for RedbMetaEngine {
                     parent,
                     name: String::from_utf8_lossy(name).to_string(),
                 });
-            }
-
-            // Case-insensitive collision check: prevent creating "File.txt"
-            // when "file.txt" already exists. This ensures cross-platform
-            // safety (Windows clients are case-insensitive).
-            let name_lower = String::from_utf8_lossy(name).to_lowercase();
-            let prefix = dentry_prefix(parent);
-            let mut range_end = prefix.to_vec();
-            *range_end.last_mut().unwrap() += 1;
-            let iter = table
-                .range(prefix.as_slice()..range_end.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for result in iter {
-                let (k, _) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
-                let key_bytes = k.value();
-                let (decoded_parent, stored_name) = decode_dentry_key(key_bytes);
-                if decoded_parent != parent {
-                    break;
-                }
-                let stored_lower = String::from_utf8_lossy(stored_name).to_lowercase();
-                if stored_lower == name_lower {
-                    return Err(MetaError::EntryExists {
-                        parent,
-                        name: String::from_utf8_lossy(name).to_string(),
-                    });
-                }
             }
 
             table
