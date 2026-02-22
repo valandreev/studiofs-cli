@@ -492,6 +492,13 @@ impl WritebackManager {
         ops
     }
 
+    /// Requeue an existing pending operation without changing pending counters.
+    ///
+    /// Use this when an in-flight upload failed temporarily and must be retried.
+    pub fn requeue(&self, op: PendingOp) -> bool {
+        self.sender.send(op).is_ok()
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending_ops.load(Ordering::Relaxed)
     }

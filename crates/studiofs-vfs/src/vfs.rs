@@ -154,6 +154,12 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
+const DEFAULT_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_REMOTE_READ_RETRIES: u32 = 1;
+const DEFAULT_REMOTE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_READ_CONCURRENCY: usize = 4;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 1;
+const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
@@ -473,6 +479,12 @@ pub struct StudioVfs {
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
     janitor_lease_ttl: Duration,
+    remote_read_timeout: Duration,
+    remote_read_retries: u32,
+    remote_upload_timeout: Duration,
+    read_concurrency: usize,
+    prefetch_concurrency: usize,
+    dir_prefetch_max_batch: usize,
     /// Optional serverless distributed lock manager for bimodal consistency.
     distributed_flock: Option<DistributedFlock>,
     /// Optional NATS invalidation bus listener config.
@@ -531,6 +543,38 @@ impl StudioVfs {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
         );
+        let remote_read_timeout = Duration::from_secs(
+            std::env::var("STUDIOFS_REMOTE_READ_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_REMOTE_READ_TIMEOUT.as_secs()),
+        );
+        let remote_read_retries = std::env::var("STUDIOFS_REMOTE_READ_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_REMOTE_READ_RETRIES);
+        let remote_upload_timeout = Duration::from_secs(
+            std::env::var("STUDIOFS_REMOTE_UPLOAD_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_REMOTE_UPLOAD_TIMEOUT.as_secs()),
+        );
+        let read_concurrency = std::env::var("STUDIOFS_READ_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_READ_CONCURRENCY);
+        let prefetch_concurrency = std::env::var("STUDIOFS_PREFETCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_PREFETCH_CONCURRENCY);
+        let dir_prefetch_max_batch = std::env::var("STUDIOFS_DIR_PREFETCH_MAX_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_DIR_PREFETCH_MAX_BATCH);
         let lock_lease_ttl = Duration::from_secs(
             std::env::var("STUDIOFS_LOCK_TTL_SECS")
                 .ok()
@@ -684,16 +728,26 @@ impl StudioVfs {
             janitor_skip_newer_than,
             janitor_max_deletes_per_run,
             janitor_lease_ttl,
+            remote_read_timeout,
+            remote_read_retries,
+            remote_upload_timeout,
+            read_concurrency,
+            prefetch_concurrency,
+            dir_prefetch_max_batch,
             distributed_flock,
             invalidation_bus,
         });
 
         // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
         let vfs_for_prefetch = vfs.clone();
+        let prefetch_limit = vfs.prefetch_concurrency.max(1);
         tokio::spawn(async move {
+            let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
             while let Some((ino, block_idx)) = prefetch_rx.recv().await {
+                let permit = prefetch_sem.clone().acquire_owned().await.unwrap();
                 let v = vfs_for_prefetch.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = v.read_block_for_prefetch(ino, block_idx).await;
                 });
             }
@@ -703,6 +757,13 @@ impl StudioVfs {
         let vfs_clone = vfs.clone();
         tokio::spawn(async move {
             vfs_clone.background_uploader(upload_rx).await;
+        });
+
+        // Warm up remote data path (DNS/TCP/TLS/session) so first cold-cache read
+        // does not pay full connection setup latency on the user request path.
+        let vfs_clone = vfs.clone();
+        tokio::spawn(async move {
+            vfs_clone.background_remote_warmup().await;
         });
 
         // Spawn GC Worker
@@ -1976,9 +2037,8 @@ impl StudioVfs {
             };
         }
 
-        // Parallel fetch with concurrency limit (16 concurrent reads)
-        const CONCURRENT_LIMIT: usize = 16;
-        let semaphore = Arc::new(Semaphore::new(CONCURRENT_LIMIT));
+        // Parallel fetch with concurrency limit.
+        let semaphore = Arc::new(Semaphore::new(self.read_concurrency.max(1)));
 
         let fetch_futures: Vec<_> = blocks_needed
             .iter()
@@ -2045,7 +2105,7 @@ impl StudioVfs {
         // Directory-level prefetch: if this child is in a tracked directory
         // and the threshold is met, prefetch block 0 of sibling files.
         let siblings = self.dir_prefetch.on_child_read(ino);
-        for sibling_ino in siblings {
+        for sibling_ino in siblings.into_iter().take(self.dir_prefetch_max_batch) {
             let _ = self.prefetch_tx.send((sibling_ino, 0));
         }
     }
@@ -2168,7 +2228,7 @@ impl StudioVfs {
             // Fetch from S3
             let result = async {
                 let key = format_object_key(&self.data_prefix, block_ref.object_id);
-                let compressed = self.data.get_by_key(&key).await?;
+                let compressed = self.get_remote_object_with_retry(&key).await?;
                 let decompressed = Bytes::from(read_object(&compressed)?);
 
                 if self.store_decompressed {
@@ -2197,6 +2257,47 @@ impl StudioVfs {
             let _ = tx.send(());
 
             return result;
+        }
+    }
+
+    async fn get_remote_object_with_retry(&self, key: &str) -> VfsResult<Bytes> {
+        let mut attempt: u32 = 0;
+        loop {
+            match tokio::time::timeout(self.remote_read_timeout, self.data.get_by_key(key)).await {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Err(e)) => {
+                    if attempt >= self.remote_read_retries {
+                        return Err(VfsError::Data(e));
+                    }
+                    warn!(
+                        attempt = attempt + 1,
+                        retries = self.remote_read_retries,
+                        key,
+                        error = %e,
+                        "remote read failed, retrying"
+                    );
+                }
+                Err(_) => {
+                    if attempt >= self.remote_read_retries {
+                        return Err(VfsError::Other(format!(
+                            "timeout while reading remote object key={} after {}ms",
+                            key,
+                            self.remote_read_timeout.as_millis()
+                        )));
+                    }
+                    warn!(
+                        attempt = attempt + 1,
+                        retries = self.remote_read_retries,
+                        key,
+                        timeout_ms = self.remote_read_timeout.as_millis() as u64,
+                        "remote read timed out, retrying"
+                    );
+                }
+            }
+
+            attempt = attempt.saturating_add(1);
+            let backoff_ms = 150u64.saturating_mul(1u64 << attempt.min(5));
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
     }
 
@@ -2346,7 +2447,7 @@ impl StudioVfs {
 
         // Fetch from S3
         let key = format_object_key(&self.data_prefix, block_ref.object_id);
-        let compressed = self.data.get_by_key(&key).await?;
+        let compressed = self.get_remote_object_with_retry(&key).await?;
         let decompressed = Bytes::from(read_object(&compressed)?);
 
         if self.store_decompressed {
@@ -2610,11 +2711,36 @@ impl StudioVfs {
 
         while let Some(op) = rx.recv().await {
             let vfs = self.clone();
+            let retry_op = op.clone();
             tokio::spawn(async move {
                 if let Err(e) = vfs.process_upload(op).await {
-                    error!("upload processing error: {}", e);
+                    warn!("upload processing error, will requeue: {}", e);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if !vfs.writeback.requeue(retry_op) {
+                        error!("failed to requeue upload op after error");
+                    }
                 }
             });
+        }
+    }
+
+    async fn background_remote_warmup(self: Arc<Self>) {
+        let timeout = self
+            .remote_read_timeout
+            .saturating_add(Duration::from_secs(2));
+        match tokio::time::timeout(timeout, self.data.check()).await {
+            Ok(Ok(())) => {
+                debug!("remote data path warmup completed");
+            }
+            Ok(Err(e)) => {
+                debug!("remote data path warmup failed: {}", e);
+            }
+            Err(_) => {
+                debug!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "remote data path warmup timed out"
+                );
+            }
         }
     }
 
@@ -2659,23 +2785,68 @@ impl StudioVfs {
         let key = format_object_key(&self.data_prefix, op.object_id);
 
         // Check if already exists (optimistic)
-        let needs_upload = match self.data.exists(&key).await {
-            Ok(exists) => !exists,
-            Err(_) => true,
-        };
+        let needs_upload =
+            match tokio::time::timeout(self.remote_upload_timeout, self.data.exists(&key)).await {
+                Ok(Ok(exists)) => !exists,
+                Ok(Err(e)) => {
+                    warn!(
+                        object_id = op.object_id,
+                        key,
+                        error = %e,
+                        "upload preflight exists() failed, proceeding with upload"
+                    );
+                    true
+                }
+                Err(_) => {
+                    warn!(
+                        object_id = op.object_id,
+                        key,
+                        timeout_ms = self.remote_upload_timeout.as_millis() as u64,
+                        "upload preflight exists() timed out, proceeding with upload"
+                    );
+                    true
+                }
+            };
 
         if needs_upload {
             // Retry loop
             let mut retries = 0;
             loop {
-                match self.data.put_by_key(&key, data.clone()).await {
-                    Ok(_) => break,
-                    Err(e) => {
+                match tokio::time::timeout(
+                    self.remote_upload_timeout,
+                    self.data.put_by_key(&key, data.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(e)) => {
                         retries += 1;
                         if retries > self.upload_retries {
                             return Err(VfsError::Data(e));
                         }
-                        warn!("upload retry {} for {}: {}", retries, op.object_id, e);
+                        warn!(
+                            "upload retry {} for {} ({}): {}",
+                            retries, op.object_id, key, e
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
+                    }
+                    Err(_) => {
+                        retries += 1;
+                        if retries > self.upload_retries {
+                            return Err(VfsError::Other(format!(
+                                "timeout while uploading object {} key={} after {}ms",
+                                op.object_id,
+                                key,
+                                self.remote_upload_timeout.as_millis()
+                            )));
+                        }
+                        warn!(
+                            retries,
+                            object_id = op.object_id,
+                            key,
+                            timeout_ms = self.remote_upload_timeout.as_millis() as u64,
+                            "upload timed out, retrying"
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
                     }
                 }
