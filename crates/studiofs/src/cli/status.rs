@@ -41,10 +41,7 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
         println!("  Meta bucket:   {}", remote.bucket);
         println!("  Meta prefix:   {}", remote.prefix);
     }
-    println!(
-        "  Meta cache TTL: {}s",
-        format_info.metadata.cache_ttl_secs
-    );
+    println!("  Meta cache TTL: {}s", format_info.metadata.cache_ttl_secs);
     println!(
         "  Meta flush interval: {}s",
         format_info.metadata.flush_interval_secs

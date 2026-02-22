@@ -97,7 +97,8 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
             let legacy_manifest_by_name = format!("{}{}.manifest.json", prefix, format_info.name);
             let _ = rt.block_on(op.delete(&legacy_manifest_by_name));
             if !format_info.uuid.is_empty() && format_info.uuid != format_info.name {
-                let legacy_manifest_by_uuid = format!("{}{}.manifest.json", prefix, format_info.uuid);
+                let legacy_manifest_by_uuid =
+                    format!("{}{}.manifest.json", prefix, format_info.uuid);
                 let _ = rt.block_on(op.delete(&legacy_manifest_by_uuid));
             }
         }

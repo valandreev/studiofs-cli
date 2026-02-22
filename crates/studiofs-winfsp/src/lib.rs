@@ -57,10 +57,11 @@ pub fn mount_and_serve(
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
-    // Drain writeback state before tearing down WinFSP.
-    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(10)));
+    // Stop WinFSP first so no new callbacks race with the shutdown drain.
     host.stop();
     host.unmount();
+    // Drain writeback state after WinFSP callbacks are quiesced.
+    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(10)));
 
     Ok(())
 }

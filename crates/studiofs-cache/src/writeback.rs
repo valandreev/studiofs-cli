@@ -451,6 +451,47 @@ impl WritebackManager {
         &self.pending_dir
     }
 
+    /// Snapshot current pending journal operations from disk.
+    ///
+    /// This is used by graceful shutdown reconciliation: if an object already
+    /// exists remotely but completion signal was lost, caller may safely
+    /// `complete()` the returned op.
+    pub fn snapshot_pending_ops(&self) -> Vec<PendingOp> {
+        let mut ops = Vec::new();
+
+        let read_dir = match fs::read_dir(&self.pending_dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                warn!("failed to read pending dir for snapshot: {}", e);
+                return ops;
+            }
+        };
+
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !(path.is_file() && path.extension().is_some_and(|ext| ext == "journal")) {
+                continue;
+            }
+
+            match self.parse_journal_file(&path) {
+                Ok(op) => {
+                    if op.status != UploadStatus::Complete {
+                        ops.push(op);
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to parse pending journal {:?}: {}", path, e);
+                }
+            }
+        }
+
+        ops
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending_ops.load(Ordering::Relaxed)
     }

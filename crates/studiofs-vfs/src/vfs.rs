@@ -35,7 +35,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::disk::{DEFAULT_DISK_CACHE_SIZE, DiskCache};
 use studiofs_cache::memory::{CacheKey, MemoryCache};
 use studiofs_cache::writeback::{PendingOp, WritebackManager};
-use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key, read_object};
+use studiofs_data::object::{
+    create_object, format_object_key, parse_object_id_from_key, read_object,
+};
 use studiofs_data::store::DataStore;
 use studiofs_meta::types::{BlockFlags, BlockRef, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
@@ -562,7 +564,9 @@ impl StudioVfs {
                     builder = builder.region("us-east-1");
                 }
                 let op = Operator::new(builder)
-                    .map_err(|e| VfsError::Other(format!("failed to init janitor lease operator: {e}")))?
+                    .map_err(|e| {
+                        VfsError::Other(format!("failed to init janitor lease operator: {e}"))
+                    })?
                     .finish();
                 let mut prefix = if remote.prefix.trim().is_empty() {
                     format!("{}/metadata/", format_info.name)
@@ -579,12 +583,7 @@ impl StudioVfs {
                 Some(JanitorLease {
                     op,
                     lock_path: format!("{}janitor.lock", prefix),
-                    owner_id: format!(
-                        "{}:{}:{}",
-                        format_info.name,
-                        std::process::id(),
-                        now_nanos
-                    ),
+                    owner_id: format!("{}:{}:{}", format_info.name, std::process::id(), now_nanos),
                 })
             } else {
                 None
@@ -802,11 +801,11 @@ impl StudioVfs {
                 return false;
             }
         };
-        let (owner, current_until, fencing) =
-            match Self::decode_lease_record(&current_raw.to_vec()) {
-                Some(v) => v,
-                None => ("".to_string(), 0, 0),
-            };
+        let (owner, current_until, fencing) = match Self::decode_lease_record(&current_raw.to_vec())
+        {
+            Some(v) => v,
+            None => ("".to_string(), 0, 0),
+        };
 
         if current_until > now && owner != lease.owner_id {
             debug!(
@@ -855,7 +854,12 @@ impl StudioVfs {
         let shared = if state.shared_owners.is_empty() {
             "-".to_string()
         } else {
-            state.shared_owners.iter().cloned().collect::<Vec<_>>().join(",")
+            state
+                .shared_owners
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
         };
         format!("{}\n{}\n{}\n", state.lease_until_unix, exclusive, shared).into_bytes()
     }
@@ -921,10 +925,14 @@ impl StudioVfs {
                             retry_later = true;
                             (RemoteLockRecord::default(), None)
                         }
-                        Err(err) => return Err(VfsError::Other(format!("lock read failed: {err}"))),
+                        Err(err) => {
+                            return Err(VfsError::Other(format!("lock read failed: {err}")));
+                        }
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::NotFound => (RemoteLockRecord::default(), None),
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    (RemoteLockRecord::default(), None)
+                }
                 Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
                     retry_later = true;
                     (RemoteLockRecord::default(), None)
@@ -960,9 +968,9 @@ impl StudioVfs {
                         .as_ref()
                         .map(|v| v == &client)
                         .unwrap_or(true);
-                    let shared_ok =
-                        state.shared_owners.is_empty()
-                            || (state.shared_owners.len() == 1 && state.shared_owners.contains(&client));
+                    let shared_ok = state.shared_owners.is_empty()
+                        || (state.shared_owners.len() == 1
+                            && state.shared_owners.contains(&client));
                     excl_ok && shared_ok
                 }
                 LockKind::Unlock => true,
@@ -1391,7 +1399,9 @@ impl StudioVfs {
                         // flush local data + metadata before releasing distributed lock.
                         self.flush(ino).await?;
                         self.meta.flush_metadata()?;
-                        let _ = self.acquire_distributed_flock(cfg, ino, LockKind::Unlock).await?;
+                        let _ = self
+                            .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
+                            .await?;
                     }
                     self.state.lock_notify.notify_waiters();
                 }
@@ -1489,7 +1499,9 @@ impl StudioVfs {
             // Local conflict appeared after remote acquisition attempt.
             // Best-effort release remote lock and retry.
             if let Some(cfg) = &self.distributed_flock {
-                let _ = self.acquire_distributed_flock(cfg, ino, LockKind::Unlock).await;
+                let _ = self
+                    .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
+                    .await;
             }
             if !blocking {
                 return Err(VfsError::WouldBlock);
@@ -1810,16 +1822,21 @@ impl StudioVfs {
 
         // L2 — slab disk cache: remove by object_id (O(1) HashMap lookup each).
         let mut l2_evicted = 0;
+        let mut l2_skipped_pinned = 0;
         for &object_id in object_ids {
+            if self.disk_cache.is_pinned(object_id) {
+                l2_skipped_pinned += 1;
+                continue;
+            }
             if self.disk_cache.exists(object_id) {
                 self.disk_cache.remove_object_sync(object_id);
                 l2_evicted += 1;
             }
         }
-        if l2_evicted > 0 {
+        if l2_evicted > 0 || l2_skipped_pinned > 0 {
             debug!(
-                "evict_inode L2: ino={} evicted {} objects from slab cache",
-                ino, l2_evicted
+                "evict_inode L2: ino={} evicted {} objects from slab cache, skipped pinned={}",
+                ino, l2_evicted, l2_skipped_pinned
             );
         }
 
@@ -1827,7 +1844,9 @@ impl StudioVfs {
         {
             let mut upload_data = self.state.pending_upload_data.lock();
             for &object_id in object_ids {
-                upload_data.remove(&object_id);
+                if !self.disk_cache.is_pinned(object_id) {
+                    upload_data.remove(&object_id);
+                }
             }
         }
 
@@ -1866,7 +1885,19 @@ impl StudioVfs {
         }
 
         // L2 — slab disk cache.
-        self.disk_cache.remove_object_sync(object_id);
+        if self.disk_cache.is_pinned(object_id) {
+            debug!(
+                "evict_block L2: skip pinned object_id={} ino={} block={}",
+                object_id, ino, block_index
+            );
+        } else {
+            self.disk_cache.remove_object_sync(object_id);
+        }
+
+        // Pending upload payload must stay until upload completion if pinned.
+        if !self.disk_cache.is_pinned(object_id) {
+            self.state.pending_upload_data.lock().remove(&object_id);
+        }
 
         // Cancel in-flight S3 fetch for this specific block.
         self.state
@@ -2377,17 +2408,9 @@ impl StudioVfs {
             let _ = self.dirty_flush_tx.send(());
         }
 
-        // Defer attribute commit until data blocks are materialized, so size/mtime
-        // never advertises bytes whose block refs are not yet present.
-        let pending_attr = self.state.dirty_attrs.lock().remove(&ino);
-
-        // Strong flush semantics for close/fsync paths:
-        // ensure dirty block data is materialized into metadata block refs
-        // before the caller continues (e.g. immediate reopen/read+checksum).
-        self.drain_dirty_mem().await;
-
-        // Commit dirty attributes synchronously after block refs are in metadata.
-        if let Some(attr) = pending_attr {
+        // Keep flush non-blocking for interactive UX: move data to dirty buffer
+        // and commit attrs; background flusher materializes block refs asynchronously.
+        if let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
             self.meta.set_attr(&attr)?;
             self.state.attr_read_cache.lock().remove(&ino);
         }
@@ -2885,7 +2908,10 @@ impl StudioVfs {
         let client: NatsClient = match async_nats::connect(&bus.nats_url).await {
             Ok(c) => c,
             Err(err) => {
-                warn!("invalidation bus connect failed ({}): {}", bus.nats_url, err);
+                warn!(
+                    "invalidation bus connect failed ({}): {}",
+                    bus.nats_url, err
+                );
                 return;
             }
         };
@@ -2940,19 +2966,102 @@ impl StudioVfs {
         }
     }
 
+    async fn flush_pending_blocks_for_shutdown(&self) {
+        let mut inos: BTreeSet<Ino> = {
+            let pending = self.state.pending_blocks.lock();
+            pending.keys().map(|(ino, _)| *ino).collect()
+        };
+        {
+            let dirty_attrs = self.state.dirty_attrs.lock();
+            inos.extend(dirty_attrs.keys().copied());
+        }
+        if inos.is_empty() {
+            return;
+        }
+
+        info!(
+            inode_count = inos.len(),
+            "VFS shutdown: flushing buffered inodes"
+        );
+        for ino in inos {
+            if let Err(e) = self.flush(ino).await {
+                warn!(ino, error = %e, "VFS shutdown: flush inode failed");
+            }
+        }
+    }
+
+    async fn reconcile_remote_completed_pending(&self) -> usize {
+        let pending_ops = self.writeback.snapshot_pending_ops();
+        if pending_ops.is_empty() {
+            return 0;
+        }
+
+        let mut reconciled = 0usize;
+        for op in pending_ops {
+            let key = format_object_key(&self.data_prefix, op.object_id);
+            match self.data.exists(&key).await {
+                Ok(true) => {
+                    self.writeback.complete(&op);
+                    reconciled += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    debug!(
+                        object_id = op.object_id,
+                        error = %e,
+                        "VFS shutdown: remote reconcile exists() failed"
+                    );
+                }
+            }
+        }
+        if reconciled > 0 {
+            info!(
+                reconciled,
+                "VFS shutdown: reconciled pending uploads already present on remote"
+            );
+        }
+        reconciled
+    }
+
     /// Best-effort graceful shutdown: drain dirty buffers, flush journal writes,
     /// wait for uploader queue to quiesce, then persist cache metadata.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
+        info!("VFS shutdown: flushing pending write buffer");
+        self.flush_pending_blocks_for_shutdown().await;
+
         info!("VFS shutdown: draining dirty memory buffer");
         self.drain_dirty_mem().await;
 
         info!("VFS shutdown: flushing journal writer queue");
         self.writeback.flush_journal().await;
 
-        let drained = self.writeback.wait_for_idle(upload_drain_timeout).await;
+        if self.writeback.pending_count() > 0 {
+            let reconciled = self.reconcile_remote_completed_pending().await;
+            if reconciled > 0 {
+                self.writeback.flush_journal().await;
+            }
+        }
+
+        let mut drained = self.writeback.wait_for_idle(upload_drain_timeout).await;
         if !drained {
+            let reconciled = self.reconcile_remote_completed_pending().await;
+            if reconciled > 0 {
+                self.writeback.flush_journal().await;
+                drained = self
+                    .writeback
+                    .wait_for_idle(Duration::from_millis(250))
+                    .await;
+            }
+        }
+
+        if !drained {
+            let pending_ops = self.writeback.snapshot_pending_ops();
+            let sample_object_ids: Vec<u64> =
+                pending_ops.iter().take(8).map(|op| op.object_id).collect();
             warn!(
                 pending = self.writeback.pending_count(),
+                pending_journal_files = pending_ops.len(),
+                pending_object_ids_sample = ?sample_object_ids,
                 timeout_ms = upload_drain_timeout.as_millis() as u64,
                 "VFS shutdown: upload queue did not fully drain before timeout"
             );

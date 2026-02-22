@@ -7,8 +7,8 @@
 //!   cargo test -p studiofs-data --test integration_test -- --ignored
 
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_data::store::{DataStore, DataStoreConfig};
 
 /// Atomic counter to generate unique slice IDs per test run.
@@ -62,7 +62,11 @@ async fn ensure_bucket() {
         .secret_access_key(&cfg.secret_key)
         .region(&cfg.region);
     let op = Operator::new(builder).unwrap().finish();
-    if op.write(".bucket-marker", Bytes::from_static(b"ok")).await.is_ok() {
+    if op
+        .write(".bucket-marker", Bytes::from_static(b"ok"))
+        .await
+        .is_ok()
+    {
         return;
     }
 

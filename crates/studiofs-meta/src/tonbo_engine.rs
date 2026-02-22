@@ -2,8 +2,8 @@ use crate::engine::{MetaEngine, MetaError, MetaResult};
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use crate::types::*;
 use async_nats::Client as NatsClient;
-use opendal::services::S3;
 use opendal::options::WriteOptions;
+use opendal::services::S3;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -163,9 +163,11 @@ impl TonboMetaEngine {
                     } else {
                         format!("{}/", raw_prefix)
                     };
-                    let mut legacy_manifest_paths = vec![format!("{}{}.manifest.json", prefix, info.name)];
+                    let mut legacy_manifest_paths =
+                        vec![format!("{}{}.manifest.json", prefix, info.name)];
                     if !info.uuid.is_empty() && info.uuid != info.name {
-                        legacy_manifest_paths.push(format!("{}{}.manifest.json", prefix, info.uuid));
+                        legacy_manifest_paths
+                            .push(format!("{}{}.manifest.json", prefix, info.uuid));
                     }
                     let default_next_inode = local
                         .get_counter(counters::NEXT_INODE)
@@ -192,7 +194,9 @@ impl TonboMetaEngine {
             .enable_all()
             .build()
             .map_err(|e| MetaError::Storage(format!("failed to create tokio runtime: {e}")))?;
-        let nats_url = std::env::var("STUDIOFS_NATS_URL").ok().filter(|s| !s.is_empty());
+        let nats_url = std::env::var("STUDIOFS_NATS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
         let nats_client = if let Some(url) = &nats_url {
             match rt.block_on(async_nats::connect(url)) {
                 Ok(client) => Some(client),
@@ -206,45 +210,45 @@ impl TonboMetaEngine {
         };
 
         let engine = Self {
-                local,
-                remote,
-                volume_name: volume_name.clone(),
-                invalidation_sender_id: format!("pid:{}", std::process::id()),
-                nats_subject_base: if nats_client.is_some() {
-                    Some(format!("fs.invalidate.{}", volume_name))
-                } else {
-                    None
-                },
-                nats_client,
-                state: Mutex::new(FlushState {
-                    pending_ops: 0,
-                    pending_bytes: 0,
-                    last_flush: Instant::now(),
-                    last_refresh: Instant::now(),
-                    etag: None,
-                }),
-                flush_interval: Duration::from_secs(flush_interval_secs.max(1)),
-                cache_ttl: Duration::from_secs(cache_ttl_secs.max(1)),
-                flush_ops_threshold: flush_ops_threshold.max(1),
-                flush_bytes_threshold: flush_bytes_threshold.max(1),
-                remote_request_timeout: Duration::from_secs(12),
-                cas_max_retries: 5,
-                sync_lock: Mutex::new(()),
-                rt: Mutex::new(rt),
-                remote_round_trips: AtomicU64::new(0),
-                cas_retries: AtomicU64::new(0),
-                cache_hits: AtomicU64::new(0),
-                cache_misses: AtomicU64::new(0),
-                ttl_expirations: AtomicU64::new(0),
-                flush_cycles: AtomicU64::new(0),
-                flushed_ops_total: AtomicU64::new(0),
-                flushed_bytes_total: AtomicU64::new(0),
-                baseline_snapshot: Mutex::new(RedbSnapshot::default()),
-                inode_ranges: Mutex::new(RangeState::default()),
-                block_ranges: Mutex::new(RangeState::default()),
-                inode_alloc_lock: Mutex::new(()),
-                block_alloc_lock: Mutex::new(()),
-            };
+            local,
+            remote,
+            volume_name: volume_name.clone(),
+            invalidation_sender_id: format!("pid:{}", std::process::id()),
+            nats_subject_base: if nats_client.is_some() {
+                Some(format!("fs.invalidate.{}", volume_name))
+            } else {
+                None
+            },
+            nats_client,
+            state: Mutex::new(FlushState {
+                pending_ops: 0,
+                pending_bytes: 0,
+                last_flush: Instant::now(),
+                last_refresh: Instant::now(),
+                etag: None,
+            }),
+            flush_interval: Duration::from_secs(flush_interval_secs.max(1)),
+            cache_ttl: Duration::from_secs(cache_ttl_secs.max(1)),
+            flush_ops_threshold: flush_ops_threshold.max(1),
+            flush_bytes_threshold: flush_bytes_threshold.max(1),
+            remote_request_timeout: Duration::from_secs(12),
+            cas_max_retries: 5,
+            sync_lock: Mutex::new(()),
+            rt: Mutex::new(rt),
+            remote_round_trips: AtomicU64::new(0),
+            cas_retries: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            ttl_expirations: AtomicU64::new(0),
+            flush_cycles: AtomicU64::new(0),
+            flushed_ops_total: AtomicU64::new(0),
+            flushed_bytes_total: AtomicU64::new(0),
+            baseline_snapshot: Mutex::new(RedbSnapshot::default()),
+            inode_ranges: Mutex::new(RangeState::default()),
+            block_ranges: Mutex::new(RangeState::default()),
+            inode_alloc_lock: Mutex::new(()),
+            block_alloc_lock: Mutex::new(()),
+        };
 
         // Best-effort initial pull so an empty local cache can hydrate from remote state.
         let _ = engine.pull_remote_snapshot();
@@ -271,7 +275,8 @@ impl TonboMetaEngine {
     }
 
     fn publish_invalidation_all(&self) {
-        let (Some(client), Some(subject_base)) = (&self.nats_client, &self.nats_subject_base) else {
+        let (Some(client), Some(subject_base)) = (&self.nats_client, &self.nats_subject_base)
+        else {
             return;
         };
         let subject = format!("{}.all", subject_base);
@@ -283,11 +288,7 @@ impl TonboMetaEngine {
         }
     }
 
-    fn remote_stat(
-        &self,
-        remote: &RemoteStore,
-        path: &str,
-    ) -> MetaResult<opendal::Metadata> {
+    fn remote_stat(&self, remote: &RemoteStore, path: &str) -> MetaResult<opendal::Metadata> {
         for attempt in 1..=REMOTE_IO_MAX_ATTEMPTS {
             let fut = async {
                 tokio::time::timeout(self.remote_request_timeout, remote.op.stat(path)).await
@@ -297,7 +298,8 @@ impl TonboMetaEngine {
                 Ok(Err(e)) => {
                     let err = MetaError::Storage(e.to_string());
                     if attempt < REMOTE_IO_MAX_ATTEMPTS && Self::is_temporary_remote_error(&err) {
-                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        let backoff_ms =
+                            REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
                         self.run_on_internal_rt(async {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         });
@@ -308,7 +310,8 @@ impl TonboMetaEngine {
                 Err(_) => {
                     let err = MetaError::Storage(format!("timeout while stat {}", path));
                     if attempt < REMOTE_IO_MAX_ATTEMPTS {
-                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        let backoff_ms =
+                            REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
                         self.run_on_internal_rt(async {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         });
@@ -331,7 +334,8 @@ impl TonboMetaEngine {
                 Ok(Err(e)) => {
                     let err = MetaError::Storage(e.to_string());
                     if attempt < REMOTE_IO_MAX_ATTEMPTS && Self::is_temporary_remote_error(&err) {
-                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        let backoff_ms =
+                            REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
                         self.run_on_internal_rt(async {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         });
@@ -342,7 +346,8 @@ impl TonboMetaEngine {
                 Err(_) => {
                     let err = MetaError::Storage(format!("timeout while read {}", path));
                     if attempt < REMOTE_IO_MAX_ATTEMPTS {
-                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        let backoff_ms =
+                            REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
                         self.run_on_internal_rt(async {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         });
@@ -375,7 +380,8 @@ impl TonboMetaEngine {
                 Ok(Err(e)) => {
                     let err = MetaError::Storage(e.to_string());
                     if attempt < REMOTE_IO_MAX_ATTEMPTS && Self::is_temporary_remote_error(&err) {
-                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        let backoff_ms =
+                            REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
                         self.run_on_internal_rt(async {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         });
@@ -386,7 +392,8 @@ impl TonboMetaEngine {
                 Err(_) => {
                     let err = MetaError::Storage(format!("timeout while write {}", path));
                     if attempt < REMOTE_IO_MAX_ATTEMPTS {
-                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        let backoff_ms =
+                            REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
                         self.run_on_internal_rt(async {
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         });
@@ -481,7 +488,9 @@ impl TonboMetaEngine {
         size: u64,
     ) -> MetaResult<u64> {
         let Some(remote) = &self.remote else {
-            return Err(MetaError::Storage("remote store not configured".to_string()));
+            return Err(MetaError::Storage(
+                "remote store not configured".to_string(),
+            ));
         };
 
         let mut state = ranges.lock();
@@ -518,7 +527,8 @@ impl TonboMetaEngine {
 
         if let Some(active) = &state.active {
             if active.remaining() <= size && state.standby.is_none() {
-                state.standby = Some(self.reserve_remote_range(remote, path, default_next, size)?);
+                state.standby =
+                    Some(self.reserve_remote_range(remote, path, default_next, size)?);
             }
         }
 
@@ -616,11 +626,7 @@ impl TonboMetaEngine {
         V: Clone + PartialEq + Ord,
     {
         Self::merge_table_delta_with(base, local, remote, |_k, l, r| {
-            if l >= r {
-                l.clone()
-            } else {
-                r.clone()
-            }
+            if l >= r { l.clone() } else { r.clone() }
         })
     }
 
@@ -656,13 +662,8 @@ impl TonboMetaEngine {
                 }
                 _ => return if l >= r { l.clone() } else { r.clone() },
             };
-            Self::encode_postcard(&chosen).unwrap_or_else(|| {
-                if l >= r {
-                    l.clone()
-                } else {
-                    r.clone()
-                }
-            })
+            Self::encode_postcard(&chosen)
+                .unwrap_or_else(|| if l >= r { l.clone() } else { r.clone() })
         })
     }
 
@@ -686,13 +687,8 @@ impl TonboMetaEngine {
                 }
                 _ => return if l >= r { l.clone() } else { r.clone() },
             };
-            Self::encode_postcard(&chosen).unwrap_or_else(|| {
-                if l >= r {
-                    l.clone()
-                } else {
-                    r.clone()
-                }
-            })
+            Self::encode_postcard(&chosen)
+                .unwrap_or_else(|| if l >= r { l.clone() } else { r.clone() })
         })
     }
 
@@ -718,13 +714,8 @@ impl TonboMetaEngine {
                 }
                 _ => return if l >= r { l.clone() } else { r.clone() },
             };
-            Self::encode_postcard(&chosen).unwrap_or_else(|| {
-                if l >= r {
-                    l.clone()
-                } else {
-                    r.clone()
-                }
-            })
+            Self::encode_postcard(&chosen)
+                .unwrap_or_else(|| if l >= r { l.clone() } else { r.clone() })
         })
     }
 
@@ -794,7 +785,11 @@ impl TonboMetaEngine {
             ),
             symlinks: Self::merge_table_delta(&base.symlinks, &local.symlinks, &remote.symlinks),
             xattrs: Self::merge_table_delta(&base.xattrs, &local.xattrs, &remote.xattrs),
-            event_log: Self::merge_table_delta(&base.event_log, &local.event_log, &remote.event_log),
+            event_log: Self::merge_table_delta(
+                &base.event_log,
+                &local.event_log,
+                &remote.event_log,
+            ),
         }
     }
 
@@ -892,7 +887,10 @@ impl TonboMetaEngine {
             if let Err(err) = self.flush_remote_snapshot(false) {
                 if Self::is_temporary_remote_error(&err) {
                     // Keep pending counters as-is and retry on next mutation/flush cycle.
-                    warn!("tonbo deferred metadata flush due to temporary remote error: {}", err);
+                    warn!(
+                        "tonbo deferred metadata flush due to temporary remote error: {}",
+                        err
+                    );
                 } else {
                     return Err(err);
                 }
@@ -1044,8 +1042,8 @@ impl TonboMetaEngine {
         let mut retries: u32 = 0;
         loop {
             manifest.snapshot = snapshot_to_write.clone();
-            let payload =
-                serde_json::to_vec(&manifest).map_err(|e| MetaError::Serialization(e.to_string()))?;
+            let payload = serde_json::to_vec(&manifest)
+                .map_err(|e| MetaError::Serialization(e.to_string()))?;
             let mut opts = WriteOptions::default();
             if let Some(ref v) = current_etag {
                 opts.if_match = Some(v.clone());
@@ -1670,8 +1668,14 @@ mod tests {
         let inodes_map: HashMap<u64, Vec<u8>> = merged.inodes.into_iter().collect();
         let dentries_map: HashMap<Vec<u8>, Vec<u8>> = merged.dentries.into_iter().collect();
 
-        assert!(dentries_map.get(&key_a).is_none(), "old source key must be gone");
-        assert!(dentries_map.get(&key_b).is_some(), "renamed target key must exist");
+        assert!(
+            dentries_map.get(&key_a).is_none(),
+            "old source key must be gone"
+        );
+        assert!(
+            dentries_map.get(&key_b).is_some(),
+            "renamed target key must exist"
+        );
         assert!(
             inodes_map.get(&ino).is_some(),
             "inode must survive when rename wins over conflicting unlink"
@@ -1865,9 +1869,10 @@ mod tests {
                 drop(tonbo2);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket)).map_err(|e| {
-                        anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                    })?;
+                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
+                        })?;
                 }
 
                 Ok(())
@@ -2000,13 +2005,19 @@ mod tests {
                 let b = verify.lookup(ROOT_INO, b"b.txt").unwrap();
                 assert!(a.ino > ROOT_INO);
                 assert!(b.ino > ROOT_INO);
-                assert_eq!(verify.get_counter(crate::types::counters::TOTAL_INODES).unwrap(), 3);
+                assert_eq!(
+                    verify
+                        .get_counter(crate::types::counters::TOTAL_INODES)
+                        .unwrap(),
+                    3
+                );
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket)).map_err(|e| {
-                        anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                    })?;
+                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
+                        })?;
                 }
 
                 Ok(())
@@ -2056,7 +2067,10 @@ mod tests {
                 let created_bucket = match rt.block_on(ensure_bucket(&client, &bucket)) {
                     Ok(v) => v,
                     Err(err) => {
-                        eprintln!("skip tonbo_minio_stale_client_merge_different_dirs: {}", err);
+                        eprintln!(
+                            "skip tonbo_minio_stale_client_merge_different_dirs: {}",
+                            err
+                        );
                         return Ok(());
                     }
                 };
@@ -2140,13 +2154,19 @@ mod tests {
                 let dir_b_e = verify.lookup(ROOT_INO, b"dir-b").unwrap();
                 verify.lookup(dir_a_e.ino, b"file-a.txt").unwrap();
                 verify.lookup(dir_b_e.ino, b"file-b.txt").unwrap();
-                assert_eq!(verify.get_counter(crate::types::counters::TOTAL_INODES).unwrap(), 5);
+                assert_eq!(
+                    verify
+                        .get_counter(crate::types::counters::TOTAL_INODES)
+                        .unwrap(),
+                    5
+                );
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket)).map_err(|e| {
-                        anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                    })?;
+                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
+                        })?;
                 }
 
                 Ok(())
@@ -2272,7 +2292,8 @@ mod tests {
                 }
 
                 // Client1 rename, client2 stale unlink old name.
-                c1.rename_atomic(ROOT_INO, b"a.txt", ROOT_INO, b"b.txt").unwrap();
+                c1.rename_atomic(ROOT_INO, b"a.txt", ROOT_INO, b"b.txt")
+                    .unwrap();
                 if let Err(err) = c1.flush_now() {
                     if is_transient_storage_err(&err) {
                         eprintln!("skip tonbo_minio_e2e_rename_then_stale_unlink: {}", err);
@@ -2305,9 +2326,10 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket)).map_err(|e| {
-                        anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                    })?;
+                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
+                        })?;
                 }
                 Ok(())
             })();
@@ -2356,7 +2378,10 @@ mod tests {
                 let created_bucket = match rt.block_on(ensure_bucket(&client, &bucket)) {
                     Ok(v) => v,
                     Err(err) => {
-                        eprintln!("skip tonbo_minio_e2e_stale_parallel_write_same_block: {}", err);
+                        eprintln!(
+                            "skip tonbo_minio_e2e_stale_parallel_write_same_block: {}",
+                            err
+                        );
                         return Ok(());
                     }
                 };
@@ -2511,9 +2536,10 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket)).map_err(|e| {
-                        anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                    })?;
+                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
+                        })?;
                 }
                 Ok(())
             })();
@@ -2636,7 +2662,8 @@ mod tests {
                 // Concurrent-intent conflict on same source key:
                 // c1: a.txt -> b.txt
                 // c2: a.txt -> c.txt
-                c1.rename_atomic(ROOT_INO, b"a.txt", ROOT_INO, b"b.txt").unwrap();
+                c1.rename_atomic(ROOT_INO, b"a.txt", ROOT_INO, b"b.txt")
+                    .unwrap();
                 if let Err(err) = c1.flush_now() {
                     if is_transient_storage_err(&err) {
                         eprintln!("skip tonbo_minio_e2e_stale_rename_vs_rename: {}", err);
@@ -2644,7 +2671,8 @@ mod tests {
                     }
                     return Err(anyhow::anyhow!(err.to_string()));
                 }
-                c2.rename_atomic(ROOT_INO, b"a.txt", ROOT_INO, b"c.txt").unwrap();
+                c2.rename_atomic(ROOT_INO, b"a.txt", ROOT_INO, b"c.txt")
+                    .unwrap();
                 if let Err(err) = c2.flush_now() {
                     if is_transient_storage_err(&err) {
                         eprintln!("skip tonbo_minio_e2e_stale_rename_vs_rename: {}", err);
@@ -2676,9 +2704,10 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket)).map_err(|e| {
-                        anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                    })?;
+                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
+                        })?;
                 }
                 Ok(())
             })();

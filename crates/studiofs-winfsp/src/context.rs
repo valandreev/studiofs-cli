@@ -413,14 +413,6 @@ impl FileSystemContext for StudioFsContext {
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
         if context.fh != 0 {
-            if let Err(e) = self.rt.block_on(self.vfs.flush_fh(context.fh)) {
-                error!(
-                    ino = context.ino,
-                    fh = context.fh,
-                    "close flush_fh failed: {:?}",
-                    e
-                );
-            }
             if let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
                 error!(
                     ino = context.ino,

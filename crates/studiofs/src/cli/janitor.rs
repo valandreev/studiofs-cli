@@ -188,7 +188,10 @@ pub fn run(
     let skip_secs = skip_newer_minutes.saturating_mul(60);
 
     println!("Janitor started for '{}'", name);
-    println!("  Mode:      {}", if dry_run { "dry-run" } else { "delete" });
+    println!(
+        "  Mode:      {}",
+        if dry_run { "dry-run" } else { "delete" }
+    );
     println!("  Prefix:    {}", prefix);
     println!("  Grace:     {} minutes", skip_newer_minutes);
     println!("  Max delete: {}", max_deletes);
@@ -215,13 +218,19 @@ pub fn run(
         println!("  skipped young:        {}", stats.skipped_young);
         println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
         println!("  skipped by cap:       {}", stats.skipped_cap);
-        println!("  {}: {}", if dry_run { "would delete" } else { "deleted" }, stats.deleted);
+        println!(
+            "  {}: {}",
+            if dry_run { "would delete" } else { "deleted" },
+            stats.deleted
+        );
         println!("  delete errors:        {}", stats.delete_errors);
 
         if !loop_mode {
             break;
         }
-        std::thread::sleep(Duration::from_secs(interval_minutes.max(1).saturating_mul(60)));
+        std::thread::sleep(Duration::from_secs(
+            interval_minutes.max(1).saturating_mul(60),
+        ));
     }
 
     Ok(())

@@ -137,7 +137,11 @@ async fn ensure_bucket() {
         .region("us-east-1");
 
     let op = Operator::new(builder).unwrap().finish();
-    if op.write(".bucket-marker", Bytes::from_static(b"ok")).await.is_ok() {
+    if op
+        .write(".bucket-marker", Bytes::from_static(b"ok"))
+        .await
+        .is_ok()
+    {
         return;
     }
 
@@ -605,7 +609,10 @@ async fn test_background_janitor_removes_orphan_object() {
         .await
     {
         if err.to_string().contains("NoSuchBucket") {
-            eprintln!("skip test_background_janitor_removes_orphan_object: {}", err);
+            eprintln!(
+                "skip test_background_janitor_removes_orphan_object: {}",
+                err
+            );
             return;
         }
         panic!("failed to write orphan object: {}", err);
