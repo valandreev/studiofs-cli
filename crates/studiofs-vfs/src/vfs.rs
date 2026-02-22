@@ -1937,8 +1937,6 @@ impl StudioVfs {
                     Ok(copy_len as u32)
                 }
                 Err(VfsError::BlockNotFound(_, _)) => {
-                    // Sparse/missing block: keep read semantics consistent with
-                    // the multi-block path by returning zero-filled bytes.
                     buffer[..to_copy].fill(0u8);
                     self.maybe_prefetch(ino, &blocks_needed);
                     Ok(to_copy as u32)
@@ -1968,7 +1966,7 @@ impl StudioVfs {
 
         // Write results directly to output buffer
         let mut written = 0usize;
-        for (i, block_result) in fetched.iter().enumerate() {
+        for (i, block_result) in fetched.into_iter().enumerate() {
             let (_block_idx, off_in, to_copy) = blocks_needed[i];
             match block_result {
                 Ok(block_data) => {
@@ -1983,12 +1981,12 @@ impl StudioVfs {
                         written += copy_len;
                     }
                 }
-                Err(_) => {
-                    // Missing block - fill with zeros
-                    let zeros_len = to_copy.min(buffer.len() - written);
+                Err(VfsError::BlockNotFound(_, _)) => {
+                    let zeros_len = to_copy.min(buffer.len().saturating_sub(written));
                     buffer[written..written + zeros_len].fill(0u8);
                     written += zeros_len;
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -2139,7 +2137,7 @@ impl StudioVfs {
             // Fetch from S3
             let result = async {
                 let key = format_object_key(&self.data_prefix, block_ref.object_id);
-                let compressed = self.data.get_object(&key).await?;
+                let compressed = self.data.get_by_key(&key).await?;
                 let decompressed = Bytes::from(read_object(&compressed)?);
 
                 if self.store_decompressed {
@@ -2317,7 +2315,7 @@ impl StudioVfs {
 
         // Fetch from S3
         let key = format_object_key(&self.data_prefix, block_ref.object_id);
-        let compressed = self.data.get_object(&key).await?;
+        let compressed = self.data.get_by_key(&key).await?;
         let decompressed = Bytes::from(read_object(&compressed)?);
 
         if self.store_decompressed {
@@ -2379,9 +2377,17 @@ impl StudioVfs {
             let _ = self.dirty_flush_tx.send(());
         }
 
-        // Commit dirty attributes synchronously — file size and mtime must be
-        // visible immediately after flush() returns.
-        if let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
+        // Defer attribute commit until data blocks are materialized, so size/mtime
+        // never advertises bytes whose block refs are not yet present.
+        let pending_attr = self.state.dirty_attrs.lock().remove(&ino);
+
+        // Strong flush semantics for close/fsync paths:
+        // ensure dirty block data is materialized into metadata block refs
+        // before the caller continues (e.g. immediate reopen/read+checksum).
+        self.drain_dirty_mem().await;
+
+        // Commit dirty attributes synchronously after block refs are in metadata.
+        if let Some(attr) = pending_attr {
             self.meta.set_attr(&attr)?;
             self.state.attr_read_cache.lock().remove(&ino);
         }
@@ -2639,7 +2645,7 @@ impl StudioVfs {
             // Retry loop
             let mut retries = 0;
             loop {
-                match self.data.put_object(&key, data.clone()).await {
+                match self.data.put_by_key(&key, data.clone()).await {
                     Ok(_) => break,
                     Err(e) => {
                         retries += 1;
@@ -2688,7 +2694,7 @@ impl StudioVfs {
 
                         // Delete from S3
                         let key = format_object_key(&self.data_prefix, object_id);
-                        match self.data.delete_object(&key).await {
+                        match self.data.delete_by_key(&key).await {
                             Ok(_) => {
                                 // Remove from pending deletions
                                 if let Err(e) = self.meta.remove_pending_deletion(object_id) {

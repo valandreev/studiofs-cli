@@ -412,15 +412,23 @@ impl FileSystemContext for StudioFsContext {
 
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
-        if context.fh != 0
-            && let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh))
-        {
-            error!(
-                ino = context.ino,
-                fh = context.fh,
-                "release_fh failed: {:?}",
-                e
-            );
+        if context.fh != 0 {
+            if let Err(e) = self.rt.block_on(self.vfs.flush_fh(context.fh)) {
+                error!(
+                    ino = context.ino,
+                    fh = context.fh,
+                    "close flush_fh failed: {:?}",
+                    e
+                );
+            }
+            if let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
+                error!(
+                    ino = context.ino,
+                    fh = context.fh,
+                    "release_fh failed: {:?}",
+                    e
+                );
+            }
         }
         drop(context);
     }
@@ -741,13 +749,19 @@ impl FileSystemContext for StudioFsContext {
         &self,
         context: &Self::FileContext,
         new_size: u64,
-        _set_allocation_size: bool,
+        set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let attr = self
-            .vfs
-            .setattr(context.ino, SetattrArgs::size_only(new_size))
-            .map_err(vfs_to_winfsp_err)?;
+        // WinFSP can call this with set_allocation_size=true to reserve capacity
+        // without changing logical EOF. We don't track allocation size separately,
+        // so treat allocation-size updates as a no-op for file length.
+        let attr = if set_allocation_size {
+            self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?
+        } else {
+            self.vfs
+                .setattr(context.ino, SetattrArgs::size_only(new_size))
+                .map_err(vfs_to_winfsp_err)?
+        };
         *file_info = attr_to_file_info(&attr);
         Ok(())
     }

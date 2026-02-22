@@ -161,11 +161,25 @@ impl DataStore {
         Ok(())
     }
 
+    /// Upload bytes to an already-formatted storage key.
+    pub async fn put_by_key(&self, key: &str, data: Bytes) -> DataResult<()> {
+        debug!("uploading by key: {key} ({} bytes)", data.len());
+        self.op.write(key, data).await?;
+        Ok(())
+    }
+
     /// Download a generic object from S3.
     pub async fn get_object(&self, object_id: &str) -> DataResult<Bytes> {
         let key = self.object_key(object_id);
         debug!("downloading object: {key}");
         let data = self.op.read(&key).await?.to_bytes();
+        Ok(data)
+    }
+
+    /// Download bytes from an already-formatted storage key.
+    pub async fn get_by_key(&self, key: &str) -> DataResult<Bytes> {
+        debug!("downloading by key: {key}");
+        let data = self.op.read(key).await?.to_bytes();
         Ok(data)
     }
 
@@ -188,6 +202,13 @@ impl DataStore {
         let key = self.object_key(object_id);
         debug!("deleting object: {key}");
         self.op.delete(&key).await?;
+        Ok(())
+    }
+
+    /// Delete an object by an already-formatted storage key.
+    pub async fn delete_by_key(&self, key: &str) -> DataResult<()> {
+        debug!("deleting by key: {key}");
+        self.op.delete(key).await?;
         Ok(())
     }
 

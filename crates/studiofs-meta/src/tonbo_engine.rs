@@ -813,6 +813,11 @@ impl TonboMetaEngine {
         matches!(err, MetaError::Storage(msg) if msg.contains("ConditionNotMatch") || msg.contains("412"))
     }
 
+    fn has_pending_local_mutations(&self) -> bool {
+        let state = self.state.lock();
+        state.pending_ops > 0 || state.pending_bytes > 0
+    }
+
     fn is_temporary_remote_error(err: &MetaError) -> bool {
         matches!(
             err,
@@ -827,6 +832,12 @@ impl TonboMetaEngine {
 
     fn maybe_refresh_ttl(&self) -> MetaResult<()> {
         if self.remote.is_none() {
+            return Ok(());
+        }
+        if self.has_pending_local_mutations() {
+            // Never refresh from remote while local, not-yet-flushed mutations exist.
+            // Pulling a stale remote snapshot here can clobber newly written block refs.
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let should_refresh = {
@@ -855,6 +866,9 @@ impl TonboMetaEngine {
             Ok(v) => Ok(v),
             Err(err) if Self::is_cache_miss(&err) => {
                 self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                if self.has_pending_local_mutations() {
+                    return Err(err);
+                }
                 self.pull_remote_snapshot()?;
                 op()
             }
@@ -1076,15 +1090,18 @@ impl TonboMetaEngine {
 
         {
             let mut state = self.state.lock();
-            state.pending_ops = 0;
-            state.pending_bytes = 0;
+            // Don't blindly zero counters: concurrent local mutations can happen
+            // while this flush is in flight. Preserve them for the next cycle.
+            state.pending_ops = state.pending_ops.saturating_sub(pending_ops);
+            state.pending_bytes = state.pending_bytes.saturating_sub(pending_bytes);
             state.last_flush = Instant::now();
             state.last_refresh = Instant::now();
             if new_etag.is_some() {
                 state.etag = new_etag;
             }
         }
-        self.local.import_snapshot(&snapshot_to_write)?;
+        // Never overwrite local state with the flushed snapshot: local may have
+        // newer mutations that happened after `local_snapshot` was taken.
         *self.baseline_snapshot.lock() = snapshot_to_write;
 
         debug!(
