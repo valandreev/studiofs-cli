@@ -24,6 +24,9 @@ pub fn open_meta_engine(path: impl AsRef<Path>) -> MetaResult<Arc<dyn MetaEngine
     let redb = RedbMetaEngine::open(path.as_ref())?;
     match redb.get_format_info() {
         Ok(info) if info.metadata.backend == MetadataBackend::Tonbo => {
+            // Redb holds an exclusive process-local open lock. Release the probe handle
+            // before opening Tonbo (which wraps its own RedbMetaEngine).
+            drop(redb);
             let tonbo = TonboMetaEngine::open(path)?;
             Ok(Arc::new(tonbo))
         }
