@@ -154,11 +154,11 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
-const DEFAULT_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(3);
-const DEFAULT_REMOTE_READ_RETRIES: u32 = 1;
-const DEFAULT_REMOTE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(20);
-const DEFAULT_READ_CONCURRENCY: usize = 4;
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 1;
+const DEFAULT_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_REMOTE_READ_RETRIES: u32 = 3;
+const DEFAULT_REMOTE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_READ_CONCURRENCY: usize = 16;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
@@ -205,7 +205,7 @@ pub struct VfsConfig {
     /// but is a net win for low-compressibility content (VFX, compressed media).
     pub store_decompressed: bool,
     /// Number of blocks to prefetch ahead when a sequential access pattern is
-    /// detected.  0 disables read-ahead entirely.  Default: 8 (= 32 MB with
+    /// detected.  0 disables read-ahead entirely.  Default: 32 (= 128 MB with
     /// 4 MB blocks).
     pub readahead_width: u32,
     /// Maximum bytes to hold in the dirty-write memory buffer before applying
@@ -225,7 +225,7 @@ impl Default for VfsConfig {
             max_concurrent_uploads: 32,
             upload_retries: 3,
             store_decompressed: true,
-            readahead_width: 8,
+            readahead_width: 32,
             max_dirty_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
@@ -687,7 +687,7 @@ impl StudioVfs {
         let (writeback, upload_rx) = WritebackManager::new(cache_dir, disk_cache.clone());
 
         // Init ReadAhead tracker + prefetch channel
-        let readahead = Arc::new(ReadAheadTracker::new(8));
+        let readahead = Arc::new(ReadAheadTracker::new(32));
         let dir_prefetch = Arc::new(DirAccessTracker::new(2));
         let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
 
@@ -1317,7 +1317,7 @@ impl StudioVfs {
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
         // Verify the inode exists
-        let _attr = self.getattr(ino)?;
+        let attr = self.getattr(ino)?;
 
         // If O_TRUNC requested, truncate to 0
         if trunc {
@@ -1326,6 +1326,25 @@ impl StudioVfs {
 
         let fh = self.handle_table.open(ino, flags);
         debug!("open_file ino={} fh={} flags={:#x}", ino, fh, flags.bits());
+
+        // Eager prefetch: when opening a regular file for reading, schedule
+        // background prefetch of the first N blocks.  This hides S3 latency
+        // for the common open→sequential-read pattern so the first read()
+        // finds data already in cache.
+        if attr.kind == studiofs_meta::types::FileType::RegularFile
+            && attr.size > 0
+            && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
+        {
+            let total_blocks =
+                ((attr.size + self.block_size as u64 - 1) / self.block_size as u64) as u32;
+            let prefetch_count = total_blocks.min(16); // first 16 blocks = 64 MB
+            for block_idx in 0..prefetch_count {
+                if self.readahead.start_prefetch(ino, block_idx) {
+                    let _ = self.prefetch_tx.send((ino, block_idx));
+                }
+            }
+        }
+
         Ok(fh)
     }
 
@@ -2224,6 +2243,21 @@ impl StudioVfs {
                 .inflight_fetches
                 .lock()
                 .insert((ino, block_index), tx.clone());
+
+            // Cold prefetch: when we hit S3 for the first time, eagerly schedule
+            // prefetches for the next N blocks so that subsequent reads don't
+            // stall.  This fires before the actual fetch so prefetches run in
+            // parallel with this request.
+            {
+                let cold_ahead = (self.readahead.width as u32).min(16);
+                for i in 1..=cold_ahead {
+                    if let Some(next_block) = block_index.checked_add(i) {
+                        if self.readahead.start_prefetch(ino, next_block) {
+                            let _ = self.prefetch_tx.send((ino, next_block));
+                        }
+                    }
+                }
+            }
 
             // Fetch from S3
             let result = async {
