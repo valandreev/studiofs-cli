@@ -1006,7 +1006,7 @@ impl TonboMetaEngine {
             (state.pending_ops, state.pending_bytes, state.etag.clone())
         };
 
-        if pending_ops == 0 && pending_bytes == 0 {
+        if !force && pending_ops == 0 && pending_bytes == 0 {
             return Ok(());
         }
 
