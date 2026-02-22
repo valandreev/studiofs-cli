@@ -1554,6 +1554,8 @@ mod tests {
             ctime: 10,
             atime: 10,
             parent: ROOT_INO,
+            crtime: 0,
+            win_attrs: 0,
         };
         let mut local_attr = base_attr.clone();
         local_attr.size = 120;

@@ -71,7 +71,7 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32)
         atime: UNIX_EPOCH + Duration::from_nanos(attr.atime.max(0) as u64),
         mtime: UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64),
         ctime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
-        crtime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
+        crtime: UNIX_EPOCH + Duration::from_nanos(attr.effective_crtime().max(0) as u64),
         kind: match attr.kind {
             FileType::RegularFile => FuseFileType::RegularFile,
             FileType::Directory => FuseFileType::Directory,
@@ -615,6 +615,15 @@ impl Filesystem for StudioFuseFs {
                 Some(fuser::TimeOrNow::Now) => TimeSpec::Now,
                 None => TimeSpec::Omit,
             },
+            crtime: match _crtime {
+                Some(st) => TimeSpec::Set(
+                    st.duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                ),
+                None => TimeSpec::Omit,
+            },
+            win_attrs: None,
         };
         match self.vfs.setattr(ino, args) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),

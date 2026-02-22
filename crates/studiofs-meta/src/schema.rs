@@ -78,6 +78,15 @@ pub struct InodeAttr {
     pub atime: i64,
     /// Parent inode (0 for root).
     pub parent: Ino,
+    /// Creation/birth time (nanoseconds since Unix epoch).
+    /// Used as Windows CreationTime and macOS crtime.
+    /// Falls back to ctime when 0 (backwards compat with older volumes).
+    #[serde(default)]
+    pub crtime: i64,
+    /// Windows file attributes (ARCHIVE, HIDDEN, SYSTEM, READONLY, etc.).
+    /// Stored as raw Win32 FILE_ATTRIBUTE_* bitmask. 0 = not set (derive from kind).
+    #[serde(default)]
+    pub win_attrs: u32,
 }
 
 impl InodeAttr {
@@ -104,6 +113,8 @@ impl InodeAttr {
             ctime: now,
             atime: now,
             parent,
+            crtime: now,
+            win_attrs: 0x10, // FILE_ATTRIBUTE_DIRECTORY
         }
     }
 
@@ -122,6 +133,8 @@ impl InodeAttr {
             ctime: now,
             atime: now,
             parent,
+            crtime: now,
+            win_attrs: 0x20, // FILE_ATTRIBUTE_ARCHIVE
         }
     }
 
@@ -157,7 +170,14 @@ impl InodeAttr {
             ctime: now,
             atime: now,
             parent,
+            crtime: now,
+            win_attrs: 0x0400, // FILE_ATTRIBUTE_REPARSE_POINT
         }
+    }
+
+    /// Get the effective creation time (falls back to ctime for old inodes).
+    pub fn effective_crtime(&self) -> i64 {
+        if self.crtime != 0 { self.crtime } else { self.ctime }
     }
 }
 
@@ -196,6 +216,10 @@ pub struct SetattrArgs {
     pub gid: Option<u32>,
     pub atime: TimeSpec,
     pub mtime: TimeSpec,
+    /// Creation/birth time.
+    pub crtime: TimeSpec,
+    /// Windows file attributes (None = don't change).
+    pub win_attrs: Option<u32>,
 }
 
 impl Default for SetattrArgs {
@@ -207,6 +231,8 @@ impl Default for SetattrArgs {
             gid: None,
             atime: TimeSpec::Omit,
             mtime: TimeSpec::Omit,
+            crtime: TimeSpec::Omit,
+            win_attrs: None,
         }
     }
 }

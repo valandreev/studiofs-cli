@@ -1214,6 +1214,16 @@ impl StudioVfs {
             changed = true;
         }
 
+        if let Some(ns) = args.crtime.resolve() {
+            attr.crtime = ns;
+            changed = true;
+        }
+
+        if let Some(wa) = args.win_attrs {
+            attr.win_attrs = wa;
+            changed = true;
+        }
+
         if changed {
             // Always update ctime when any attribute changes
             attr.touch_ctime();

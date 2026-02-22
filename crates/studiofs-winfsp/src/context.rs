@@ -12,6 +12,9 @@ use studiofs_vfs::{OpenFlags, StudioVfs};
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
@@ -67,11 +70,7 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
         } else {
             (attr.size + 4095) & !4095
         },
-        file_attributes: match attr.kind {
-            FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
-            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-            _ => 0x80, // FILE_ATTRIBUTE_NORMAL
-        },
+        file_attributes: effective_win_attrs(attr),
         ..Default::default()
     };
 
@@ -81,7 +80,7 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 
     // Convert timestamps (nanoseconds since epoch → Windows FILETIME)
     // FILETIME is 100ns intervals since 1601-01-01
-    info.creation_time = unix_nanos_to_filetime(attr.ctime);
+    info.creation_time = unix_nanos_to_filetime(attr.effective_crtime());
     info.last_access_time = unix_nanos_to_filetime(attr.atime);
     info.last_write_time = unix_nanos_to_filetime(attr.mtime);
     info.change_time = unix_nanos_to_filetime(attr.mtime);
@@ -94,6 +93,34 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     info
 }
 
+/// Derive effective Windows file attributes from InodeAttr.
+/// Uses stored win_attrs if set, otherwise derives from file type.
+fn effective_win_attrs(attr: &InodeAttr) -> u32 {
+    match attr.kind {
+        FileType::Directory => {
+            // Always include DIRECTORY bit
+            if attr.win_attrs != 0 {
+                attr.win_attrs | FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_DIRECTORY
+            }
+        }
+        FileType::Symlink => {
+            FILE_ATTRIBUTE_REPARSE_POINT
+        }
+        FileType::RegularFile => {
+            if attr.win_attrs != 0 {
+                // Stored attributes — strip type-derived bits
+                let a = attr.win_attrs & !(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
+                if a == 0 { FILE_ATTRIBUTE_NORMAL } else { a }
+            } else {
+                // Default: ARCHIVE for regular files
+                FILE_ATTRIBUTE_ARCHIVE
+            }
+        }
+    }
+}
+
 /// Convert Unix timestamp (nanoseconds since epoch) to Windows FILETIME (100ns since 1601-01-01).
 fn unix_nanos_to_filetime(unix_nanos: i64) -> u64 {
     const EPOCH_DIFF: u64 = 116_444_736_000_000_000; // Difference between 1601-01-01 and 1970-01-01 in 100ns intervals
@@ -104,84 +131,144 @@ fn unix_nanos_to_filetime(unix_nanos: i64) -> u64 {
     (intervals as u64).saturating_add(EPOCH_DIFF)
 }
 
-/// Resolve a WinFSP path to an inode by walking the directory tree.
+// ─── Path resolution (case-insensitive with fallback) ────────────────────────
+
+/// Parse a WinFSP path into normalised components.
 ///
-/// Handles `.` (current dir), `..` (parent dir), and strips trailing
-/// dots/spaces from path components (standard Windows path semantics).
-fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
+/// Handles `.` (skip), `..` (pop), trailing dots/spaces (strip).
+fn parse_components(path: &U16CStr) -> Vec<String> {
     let s = path.to_string_lossy();
     let s = s.trim_start_matches('\\');
-
-    if s.is_empty() {
-        return vfs.getattr(ROOT_INO).map_err(vfs_to_winfsp_err);
-    }
-
-    let mut ino_stack: Vec<u64> = vec![ROOT_INO];
-
-    for component in s.split('\\') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            if ino_stack.len() > 1 {
-                ino_stack.pop();
-            }
-            continue;
-        }
-        // Strip trailing dots and spaces (Win32 path normalisation)
-        let component = component.trim_end_matches(['.', ' ']);
-        if component.is_empty() {
-            continue;
-        }
-        let current_ino = *ino_stack.last().unwrap();
-        let attr = vfs
-            .lookup(current_ino, component.as_bytes())
-            .map_err(vfs_to_winfsp_err)?;
-        ino_stack.push(attr.ino);
-    }
-
-    let final_ino = *ino_stack.last().unwrap();
-    vfs.getattr(final_ino).map_err(vfs_to_winfsp_err)
-}
-
-/// Resolve the parent directory inode for a given path.
-///
-/// Handles `.`, `..`, and trailing-dot/space stripping like `resolve_path`.
-fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u8>)> {
-    let s = path.to_string_lossy();
-    let s = s.trim_start_matches('\\');
-
-    // Normalise components: skip `.`, resolve `..`, strip trailing dots/spaces.
-    let mut components: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     for raw in s.split('\\') {
         if raw.is_empty() || raw == "." {
             continue;
         }
         if raw == ".." {
-            components.pop();
+            out.pop();
             continue;
         }
         let trimmed = raw.trim_end_matches(['.', ' ']);
         if !trimmed.is_empty() {
-            components.push(trimmed.to_string());
+            out.push(trimmed.to_string());
         }
     }
+    out
+}
 
+/// Walk path components starting from ROOT_INO, with case-insensitive fallback.
+///
+/// Returns `(ino, canonical_name)` for each successfully resolved component.
+/// On exact-match miss, scans the parent directory for a case-insensitive match.
+fn walk_components(vfs: &StudioVfs, components: &[&str]) -> winfsp::Result<Vec<(Ino, String)>> {
+    let mut result = Vec::with_capacity(components.len());
+    let mut current_ino = ROOT_INO;
+
+    for &comp in components {
+        match vfs.lookup(current_ino, comp.as_bytes()) {
+            Ok(attr) => {
+                result.push((attr.ino, comp.to_string()));
+                current_ino = attr.ino;
+            }
+            Err(e) => {
+                // Only try case-insensitive fallback for EntryNotFound.
+                let is_not_found = matches!(
+                    &e,
+                    studiofs_vfs::VfsError::Meta(
+                        studiofs_meta::MetaError::EntryNotFound { .. }
+                    )
+                );
+                if !is_not_found {
+                    return Err(vfs_to_winfsp_err(e));
+                }
+                // Case-insensitive scan of parent directory
+                let entries = vfs.readdir(current_ino).map_err(vfs_to_winfsp_err)?;
+                let lower = comp.to_lowercase();
+                match entries.iter().find(|entry| {
+                    String::from_utf8_lossy(&entry.name).to_lowercase() == lower
+                }) {
+                    Some(entry) => {
+                        let canonical =
+                            String::from_utf8_lossy(&entry.name).to_string();
+                        current_ino = entry.ino;
+                        result.push((entry.ino, canonical));
+                    }
+                    None => {
+                        return Err(winfsp::FspError::from(
+                            STATUS_OBJECT_NAME_NOT_FOUND,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Build a UTF-16 normalised name from walked canonical components.
+///
+/// The result does NOT include a leading backslash — pass
+/// `Some(b'\\' as u16)` as `prefix` to `OpenFileInfo::set_normalized_name`.
+fn build_normalized(walked: &[(Ino, String)]) -> Vec<u16> {
+    walked
+        .iter()
+        .map(|(_, n)| n.as_str())
+        .collect::<Vec<_>>()
+        .join("\\")
+        .encode_utf16()
+        .collect()
+}
+
+/// Resolve a WinFSP path to an inode (case-insensitive) and its
+/// canonical normalised name (UTF-16, without leading backslash).
+fn resolve_path(
+    vfs: &StudioVfs,
+    path: &U16CStr,
+) -> winfsp::Result<(InodeAttr, Vec<u16>)> {
+    let components = parse_components(path);
+    if components.is_empty() {
+        let attr = vfs.getattr(ROOT_INO).map_err(vfs_to_winfsp_err)?;
+        return Ok((attr, vec![]));
+    }
+    let refs: Vec<&str> = components.iter().map(|s| s.as_str()).collect();
+    let walked = walk_components(vfs, &refs)?;
+    let ino = walked.last().unwrap().0;
+    let attr = vfs.getattr(ino).map_err(vfs_to_winfsp_err)?;
+    Ok((attr, build_normalized(&walked)))
+}
+
+/// Resolve the parent directory inode for a given path.
+///
+/// Returns `(parent_ino, child_name_bytes, full_normalized_utf16)`.
+/// The normalised name includes the child component (as provided by the caller,
+/// since the child may not exist yet for create operations).
+fn resolve_parent(
+    vfs: &StudioVfs,
+    path: &U16CStr,
+) -> winfsp::Result<(Ino, Vec<u8>, Vec<u16>)> {
+    let components = parse_components(path);
     if components.is_empty() {
         return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
     }
+    let child_name = components.last().unwrap().clone();
 
-    let name = components.last().unwrap().as_bytes().to_vec();
-    let mut parent_ino = ROOT_INO;
-
-    for component in &components[..components.len() - 1] {
-        let attr = vfs
-            .lookup(parent_ino, component.as_bytes())
-            .map_err(vfs_to_winfsp_err)?;
-        parent_ino = attr.ino;
+    if components.len() == 1 {
+        // Parent is root — normalised name is just the child.
+        let normalized: Vec<u16> = child_name.encode_utf16().collect();
+        return Ok((ROOT_INO, child_name.into_bytes(), normalized));
     }
 
-    Ok((parent_ino, name))
+    let parent_refs: Vec<&str> =
+        components[..components.len() - 1].iter().map(|s| s.as_str()).collect();
+    let walked = walk_components(vfs, &parent_refs)?;
+    let parent_ino = walked.last().unwrap().0;
+
+    // Full normalised path = canonical parent components + child name
+    let mut parts: Vec<&str> = walked.iter().map(|(_, n)| n.as_str()).collect();
+    parts.push(&child_name);
+    let normalized: Vec<u16> = parts.join("\\").encode_utf16().collect();
+
+    Ok((parent_ino, child_name.into_bytes(), normalized))
 }
 
 /// Encode a symlink target as a Windows REPARSE_DATA_BUFFER (IO_REPARSE_TAG_SYMLINK).
@@ -328,17 +415,75 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     }
 }
 
+// ─── Security Descriptor ─────────────────────────────────────────────────────
+
+// Win32 FFI for creating security descriptor from SDDL string.
+unsafe extern "system" {
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        StringSecurityDescriptor: *const u16,
+        StringSDRevision: u32,
+        SecurityDescriptor: *mut *mut c_void,
+        SecurityDescriptorSize: *mut u32,
+    ) -> i32;
+
+    fn LocalFree(hMem: *mut c_void) -> *mut c_void;
+}
+
+/// Create a binary security descriptor granting full access to Everyone.
+///
+/// SDDL `O:BAG:BAD:(A;OICI;FA;;;WD)`:
+///   Owner = Built-in Administrators,
+///   Group = Built-in Administrators,
+///   DACL  = Allow, Object-Inherit + Container-Inherit, Full Access, Everyone.
+fn create_full_access_sd() -> Vec<u8> {
+    // "O:BAG:BAD:(A;OICI;FA;;;WD)" null-terminated UTF-16
+    let sddl = "O:BAG:BAD:(A;OICI;FA;;;WD)";
+    let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut sd_ptr: *mut c_void = std::ptr::null_mut();
+    let mut sd_size: u32 = 0;
+
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            1, // SDDL_REVISION_1
+            &mut sd_ptr,
+            &mut sd_size,
+        )
+    };
+
+    if ok == 0 || sd_ptr.is_null() {
+        error!("failed to create security descriptor from SDDL, falling back to empty");
+        return Vec::new();
+    }
+
+    let sd = unsafe { std::slice::from_raw_parts(sd_ptr as *const u8, sd_size as usize) }.to_vec();
+    unsafe { LocalFree(sd_ptr) };
+    sd
+}
+
 // ─── FileSystemContext ───────────────────────────────────────────────────────
 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
     rt: Arc<Runtime>,
+    /// Cached binary security descriptor (full access for Everyone).
+    security_descriptor: Vec<u8>,
 }
 
 impl StudioFsContext {
     pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
-        Self { vfs, rt }
+        let security_descriptor = create_full_access_sd();
+        debug!(
+            "created security descriptor ({} bytes)",
+            security_descriptor.len()
+        );
+        Self {
+            vfs,
+            rt,
+            security_descriptor,
+        }
     }
 }
 
@@ -348,7 +493,7 @@ impl FileSystemContext for StudioFsContext {
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
-        _security_descriptor: Option<&mut [c_void]>,
+        security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let path_str = file_name.to_string_lossy();
@@ -358,22 +503,33 @@ impl FileSystemContext for StudioFsContext {
             return Ok(security);
         }
 
-        let attr = match resolve_path(&self.vfs, file_name) {
+        let (attr, _normalized) = match resolve_path(&self.vfs, file_name) {
             Ok(a) => a,
             Err(e) => {
                 debug!("  -> resolve_path FAILED: {:?}", e);
                 return Err(e);
             }
         };
-        let file_attributes = match attr.kind {
-            FileType::Directory => 0x10u32,
-            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-            _ => 0x80u32,
-        };
+        let file_attributes = effective_win_attrs(&attr);
+
+        // Copy cached security descriptor into the provided buffer
+        let sd_len = self.security_descriptor.len() as u64;
+        if let Some(buf) = security_descriptor {
+            let copy_len = (sd_len as usize).min(buf.len());
+            if copy_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.security_descriptor.as_ptr(),
+                        buf.as_mut_ptr() as *mut u8,
+                        copy_len,
+                    );
+                }
+            }
+        }
 
         Ok(FileSecurity {
             reparse: attr.kind == FileType::Symlink,
-            sz_security_descriptor: 0,
+            sz_security_descriptor: sd_len,
             attributes: file_attributes,
         })
     }
@@ -390,9 +546,12 @@ impl FileSystemContext for StudioFsContext {
             "open path={:?} create_options={:#x} granted_access={:?}",
             path_str, _create_options, _granted_access
         );
-        let attr = resolve_path(&self.vfs, file_name)?;
+        let (attr, normalized) = resolve_path(&self.vfs, file_name)?;
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;
+
+        // Report canonical name for case-insensitive mode.
+        file_info.set_normalized_name(&normalized, Some(b'\\' as u16));
 
         let is_dir = attr.kind == FileType::Directory;
         let fh = if is_dir {
@@ -430,14 +589,14 @@ impl FileSystemContext for StudioFsContext {
         file_name: &U16CStr,
         create_options: u32,
         _granted_access: FILE_ACCESS_RIGHTS,
-        _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
         _security_descriptor: Option<&[c_void]>,
         _allocation_size: u64,
         extra_buffer: Option<&[u8]>,
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let (parent_ino, name) = resolve_parent(&self.vfs, file_name)?;
+        let (parent_ino, name, normalized) = resolve_parent(&self.vfs, file_name)?;
 
         // Handle symlink creation via reparse point buffer
         if extra_buffer_is_reparse_point
@@ -450,6 +609,7 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?;
             let info = attr_to_file_info(&attr);
             *file_info.as_mut() = info;
+            file_info.set_normalized_name(&normalized, Some(b'\\' as u16));
             debug!(
                 ino = attr.ino,
                 "create symlink {:?}",
@@ -469,6 +629,27 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?
         };
 
+        // Apply Windows file attributes if provided (ARCHIVE, HIDDEN, etc.)
+        let raw_attrs = file_attributes;
+        if raw_attrs != 0 {
+            let sanitised = raw_attrs
+                & !(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL);
+            let wa = if sanitised == 0 {
+                if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_ARCHIVE }
+            } else if is_dir {
+                sanitised | FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                sanitised
+            };
+            let _ = self.vfs.setattr(
+                attr.ino,
+                SetattrArgs {
+                    win_attrs: Some(wa),
+                    ..SetattrArgs::default()
+                },
+            );
+        }
+
         let fh = if is_dir {
             0
         } else {
@@ -477,8 +658,11 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?
         };
 
+        // Re-read attr after potential win_attrs update
+        let attr = self.vfs.getattr(attr.ino).map_err(vfs_to_winfsp_err)?;
         let info = attr_to_file_info(&attr);
         *file_info.as_mut() = info;
+        file_info.set_normalized_name(&normalized, Some(b'\\' as u16));
 
         debug!(
             ino = attr.ino,
@@ -504,6 +688,37 @@ impl FileSystemContext for StudioFsContext {
         Ok(())
     }
 
+    fn get_security(
+        &self,
+        _context: &Self::FileContext,
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> winfsp::Result<u64> {
+        let sd_len = self.security_descriptor.len() as u64;
+        if let Some(buf) = security_descriptor {
+            let copy_len = (sd_len as usize).min(buf.len());
+            if copy_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.security_descriptor.as_ptr(),
+                        buf.as_mut_ptr() as *mut u8,
+                        copy_len,
+                    );
+                }
+            }
+        }
+        Ok(sd_len)
+    }
+
+    fn set_security(
+        &self,
+        _context: &Self::FileContext,
+        _security_information: u32,
+        _modification_descriptor: ModificationDescriptor,
+    ) -> winfsp::Result<()> {
+        // Accept silently — we use a fixed full-access descriptor.
+        Ok(())
+    }
+
     fn read(
         &self,
         context: &Self::FileContext,
@@ -525,19 +740,35 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         buffer: &[u8],
         offset: u64,
-        _write_to_eof: bool,
+        write_to_eof: bool,
         _constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        // Resolve actual write offset.
+        // write_to_eof means "append" — the provided offset is meaningless (-1).
+        let actual_offset = if write_to_eof {
+            self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?.size
+        } else {
+            offset
+        };
+
+        // NOTE: We intentionally do NOT enforce constrained_io clamping here.
+        // The VFS layer handles file extent management correctly: writes within
+        // or beyond EOF are fine. Attempting to clamp based on getattr() creates
+        // a race condition with set_file_size() — the Cache Manager may issue
+        // constrained writes on a different thread before set_file_size's redb
+        // transaction commits, causing getattr() to see stale size=0 and
+        // silently dropping all data.
+
         let written = self
             .rt
-            .block_on(self.vfs.write(context.ino, offset, buffer))
+            .block_on(self.vfs.write(context.ino, actual_offset, buffer))
             .map_err(vfs_to_winfsp_err)?;
 
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
 
-        debug!(ino = context.ino, offset, written, "write");
+        debug!(ino = context.ino, offset = actual_offset, written, "write");
         Ok(written)
     }
 
@@ -669,7 +900,7 @@ impl FileSystemContext for StudioFsContext {
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
             if let Some(fname) = file_name
-                && let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname)
+                && let Ok((parent_ino, name, _)) = resolve_parent(&self.vfs, fname)
             {
                 let res = if context.is_dir {
                     self.vfs.rmdir(parent_ino, &name)
@@ -699,16 +930,30 @@ impl FileSystemContext for StudioFsContext {
     fn overwrite(
         &self,
         context: &Self::FileContext,
-        _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
-        _replace_file_attributes: bool,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+        replace_file_attributes: bool,
         _allocation_size: u64,
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         // Truncate to 0
+        let mut args = SetattrArgs::size_only(0);
+
+        // Apply file attributes on overwrite
+        let raw = file_attributes;
+        if raw != 0 && replace_file_attributes {
+            let sanitised = raw
+                & !(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL);
+            args.win_attrs = Some(if sanitised == 0 {
+                FILE_ATTRIBUTE_ARCHIVE
+            } else {
+                sanitised
+            });
+        }
+
         let attr = self
             .vfs
-            .setattr(context.ino, SetattrArgs::size_only(0))
+            .setattr(context.ino, args)
             .map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
         Ok(())
@@ -717,16 +962,32 @@ impl FileSystemContext for StudioFsContext {
     fn set_basic_info(
         &self,
         context: &Self::FileContext,
-        _file_attributes: u32,
-        _creation_time: u64,
+        file_attributes: u32,
+        creation_time: u64,
         last_access_time: u64,
         last_write_time: u64,
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        // Sanitise file_attributes: strip type-derived bits that the FS manages.
+        let win_attrs = if file_attributes != 0 && file_attributes != u32::MAX {
+            // Strip DIRECTORY and REPARSE_POINT — those are derived from kind.
+            let sanitised = file_attributes
+                & !(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL);
+            Some(if sanitised == 0 {
+                FILE_ATTRIBUTE_NORMAL
+            } else {
+                sanitised
+            })
+        } else {
+            None // 0 or INVALID_FILE_ATTRIBUTES = don't change
+        };
+
         let args = SetattrArgs {
             atime: filetime_to_timespec(last_access_time),
             mtime: filetime_to_timespec(last_write_time),
+            crtime: filetime_to_timespec(creation_time),
+            win_attrs,
             ..SetattrArgs::default()
         };
         let attr = self
@@ -744,17 +1005,24 @@ impl FileSystemContext for StudioFsContext {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        // WinFSP can call this with set_allocation_size=true to reserve capacity
-        // without changing logical EOF. We don't track allocation size separately,
-        // so treat allocation-size updates as a no-op for file length.
-        let attr = if set_allocation_size {
-            self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?
+        if set_allocation_size {
+            // The Cache Manager is reserving capacity. We don't track allocation
+            // size separately, but we MUST report allocation_size >= new_size
+            // so the Cache Manager knows it can write up to that point.
+            let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+            *file_info = attr_to_file_info(&attr);
+            let requested_alloc = (new_size + 4095) & !4095;
+            if file_info.allocation_size < requested_alloc {
+                file_info.allocation_size = requested_alloc;
+            }
         } else {
-            self.vfs
+            // Actually extend/truncate the logical file size (EOF).
+            let attr = self
+                .vfs
                 .setattr(context.ino, SetattrArgs::size_only(new_size))
-                .map_err(vfs_to_winfsp_err)?
-        };
-        *file_info = attr_to_file_info(&attr);
+                .map_err(vfs_to_winfsp_err)?;
+            *file_info = attr_to_file_info(&attr);
+        }
         Ok(())
     }
 
@@ -764,7 +1032,7 @@ impl FileSystemContext for StudioFsContext {
         _is_directory: bool,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
-        let attr = resolve_path(&self.vfs, file_name)?;
+        let (attr, _) = resolve_path(&self.vfs, file_name)?;
         if attr.kind != FileType::Symlink {
             return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
         }
@@ -817,10 +1085,18 @@ impl FileSystemContext for StudioFsContext {
         _context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
-        _replace_if_exists: bool,
+        replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        let (old_parent, old_name) = resolve_parent(&self.vfs, file_name)?;
-        let (new_parent, new_name) = resolve_parent(&self.vfs, new_file_name)?;
+        let (old_parent, old_name, _) = resolve_parent(&self.vfs, file_name)?;
+        let (new_parent, new_name, _) = resolve_parent(&self.vfs, new_file_name)?;
+
+        // If replace_if_exists is false, check whether the target already exists
+        // and reject with STATUS_OBJECT_NAME_COLLISION if so.
+        if !replace_if_exists {
+            if self.vfs.lookup(new_parent, &new_name).is_ok() {
+                return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION));
+            }
+        }
 
         self.vfs
             .rename(old_parent, &old_name, new_parent, &new_name)
