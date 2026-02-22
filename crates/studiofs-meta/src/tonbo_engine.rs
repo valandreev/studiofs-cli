@@ -114,6 +114,8 @@ pub struct TonboMetaEngine {
 const INODE_RANGE_SIZE: u64 = 4_096;
 const BLOCK_RANGE_SIZE: u64 = 65_536;
 const RANGE_CAS_MAX_RETRIES: u32 = 10;
+const REMOTE_IO_MAX_ATTEMPTS: usize = 3;
+const REMOTE_IO_RETRY_BASE_MS: u64 = 80;
 
 impl TonboMetaEngine {
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
@@ -286,31 +288,71 @@ impl TonboMetaEngine {
         remote: &RemoteStore,
         path: &str,
     ) -> MetaResult<opendal::Metadata> {
-        let fut = async {
-            tokio::time::timeout(self.remote_request_timeout, remote.op.stat(path)).await
-        };
-        match self.run_on_internal_rt(fut) {
-            Ok(Ok(meta)) => Ok(meta),
-            Ok(Err(e)) => Err(MetaError::Storage(e.to_string())),
-            Err(_) => Err(MetaError::Storage(format!(
-                "timeout while stat {}",
-                path
-            ))),
+        for attempt in 1..=REMOTE_IO_MAX_ATTEMPTS {
+            let fut = async {
+                tokio::time::timeout(self.remote_request_timeout, remote.op.stat(path)).await
+            };
+            match self.run_on_internal_rt(fut) {
+                Ok(Ok(meta)) => return Ok(meta),
+                Ok(Err(e)) => {
+                    let err = MetaError::Storage(e.to_string());
+                    if attempt < REMOTE_IO_MAX_ATTEMPTS && Self::is_temporary_remote_error(&err) {
+                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        self.run_on_internal_rt(async {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        });
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = MetaError::Storage(format!("timeout while stat {}", path));
+                    if attempt < REMOTE_IO_MAX_ATTEMPTS {
+                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        self.run_on_internal_rt(async {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        });
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
+        Err(MetaError::Storage(format!("timeout while stat {}", path)))
     }
 
     fn remote_read_all(&self, remote: &RemoteStore, path: &str) -> MetaResult<Vec<u8>> {
-        let fut = async {
-            tokio::time::timeout(self.remote_request_timeout, remote.op.read(path)).await
-        };
-        match self.run_on_internal_rt(fut) {
-            Ok(Ok(buf)) => Ok(buf.to_vec()),
-            Ok(Err(e)) => Err(MetaError::Storage(e.to_string())),
-            Err(_) => Err(MetaError::Storage(format!(
-                "timeout while read {}",
-                path
-            ))),
+        for attempt in 1..=REMOTE_IO_MAX_ATTEMPTS {
+            let fut = async {
+                tokio::time::timeout(self.remote_request_timeout, remote.op.read(path)).await
+            };
+            match self.run_on_internal_rt(fut) {
+                Ok(Ok(buf)) => return Ok(buf.to_vec()),
+                Ok(Err(e)) => {
+                    let err = MetaError::Storage(e.to_string());
+                    if attempt < REMOTE_IO_MAX_ATTEMPTS && Self::is_temporary_remote_error(&err) {
+                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        self.run_on_internal_rt(async {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        });
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = MetaError::Storage(format!("timeout while read {}", path));
+                    if attempt < REMOTE_IO_MAX_ATTEMPTS {
+                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        self.run_on_internal_rt(async {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        });
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
+        Err(MetaError::Storage(format!("timeout while read {}", path)))
     }
 
     fn remote_write_options(
@@ -320,21 +362,41 @@ impl TonboMetaEngine {
         payload: Vec<u8>,
         opts: WriteOptions,
     ) -> MetaResult<()> {
-        let fut = async {
-            tokio::time::timeout(
-                self.remote_request_timeout,
-                remote.op.write_options(path, payload, opts),
-            )
-            .await
-        };
-        match self.run_on_internal_rt(fut) {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(MetaError::Storage(e.to_string())),
-            Err(_) => Err(MetaError::Storage(format!(
-                "timeout while write {}",
-                path
-            ))),
+        for attempt in 1..=REMOTE_IO_MAX_ATTEMPTS {
+            let fut = async {
+                tokio::time::timeout(
+                    self.remote_request_timeout,
+                    remote.op.write_options(path, payload.clone(), opts.clone()),
+                )
+                .await
+            };
+            match self.run_on_internal_rt(fut) {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => {
+                    let err = MetaError::Storage(e.to_string());
+                    if attempt < REMOTE_IO_MAX_ATTEMPTS && Self::is_temporary_remote_error(&err) {
+                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        self.run_on_internal_rt(async {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        });
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = MetaError::Storage(format!("timeout while write {}", path));
+                    if attempt < REMOTE_IO_MAX_ATTEMPTS {
+                        let backoff_ms = REMOTE_IO_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                        self.run_on_internal_rt(async {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        });
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
+        Err(MetaError::Storage(format!("timeout while write {}", path)))
     }
 
     fn remote_read_manifest(
@@ -751,6 +813,18 @@ impl TonboMetaEngine {
         matches!(err, MetaError::Storage(msg) if msg.contains("ConditionNotMatch") || msg.contains("412"))
     }
 
+    fn is_temporary_remote_error(err: &MetaError) -> bool {
+        matches!(
+            err,
+            MetaError::Storage(msg)
+                if msg.contains("temporary")
+                    || msg.contains("Temporary")
+                    || msg.contains("timeout")
+                    || msg.contains("timed out")
+                    || msg.contains("error sending request")
+        )
+    }
+
     fn maybe_refresh_ttl(&self) -> MetaResult<()> {
         if self.remote.is_none() {
             return Ok(());
@@ -761,7 +835,11 @@ impl TonboMetaEngine {
         };
         if should_refresh {
             self.ttl_expirations.fetch_add(1, Ordering::Relaxed);
-            self.pull_remote_snapshot()?;
+            if let Err(err) = self.pull_remote_snapshot() {
+                // Temporary remote hiccups should not break local I/O paths.
+                // Keep serving from the local snapshot and retry on next TTL.
+                warn!("tonbo ttl refresh failed, using local snapshot: {}", err);
+            }
         } else {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -797,7 +875,14 @@ impl TonboMetaEngine {
                 || state.last_flush.elapsed() >= self.flush_interval
         };
         if should_flush {
-            self.flush_remote_snapshot(false)?;
+            if let Err(err) = self.flush_remote_snapshot(false) {
+                if Self::is_temporary_remote_error(&err) {
+                    // Keep pending counters as-is and retry on next mutation/flush cycle.
+                    warn!("tonbo deferred metadata flush due to temporary remote error: {}", err);
+                } else {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -812,7 +897,18 @@ impl TonboMetaEngine {
             Ok(meta) => {
                 self.remote_round_trips.fetch_add(1, Ordering::Relaxed);
                 let etag = meta.etag().map(ToString::to_string);
-                let bytes = self.remote_read_all(remote, &remote.manifest_path)?;
+                let bytes = match self.remote_read_all(remote, &remote.manifest_path) {
+                    Ok(v) => v,
+                    Err(err) if Self::is_temporary_remote_error(&err) => {
+                        warn!(
+                            "tonbo remote read failed temporarily, using local snapshot: {}",
+                            err
+                        );
+                        self.state.lock().last_refresh = Instant::now();
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
                 let manifest: TonboManifest = serde_json::from_slice(&bytes)
                     .map_err(|e| MetaError::Serialization(e.to_string()))?;
                 self.local.import_snapshot(&manifest.snapshot)?;
@@ -828,7 +924,18 @@ impl TonboMetaEngine {
                     match self.remote_stat(remote, legacy) {
                         Ok(_legacy_meta) => {
                             self.remote_round_trips.fetch_add(1, Ordering::Relaxed);
-                            let bytes = self.remote_read_all(remote, legacy)?;
+                            let bytes = match self.remote_read_all(remote, legacy) {
+                                Ok(v) => v,
+                                Err(read_err) if Self::is_temporary_remote_error(&read_err) => {
+                                    warn!(
+                                        "tonbo legacy remote read failed temporarily, using local snapshot: {}",
+                                        read_err
+                                    );
+                                    self.state.lock().last_refresh = Instant::now();
+                                    return Ok(());
+                                }
+                                Err(read_err) => return Err(read_err),
+                            };
                             let manifest: TonboManifest = serde_json::from_slice(&bytes)
                                 .map_err(|e| MetaError::Serialization(e.to_string()))?;
                             self.local.import_snapshot(&manifest.snapshot)?;
@@ -840,6 +947,14 @@ impl TonboMetaEngine {
                             return Ok(());
                         }
                         Err(legacy_err) if Self::is_not_found(&legacy_err) => {}
+                        Err(legacy_err) if Self::is_temporary_remote_error(&legacy_err) => {
+                            warn!(
+                                "tonbo legacy remote stat failed temporarily, using local snapshot: {}",
+                                legacy_err
+                            );
+                            self.state.lock().last_refresh = Instant::now();
+                            return Ok(());
+                        }
                         Err(legacy_err) => return Err(MetaError::Storage(legacy_err.to_string())),
                     }
                 }
@@ -848,6 +963,14 @@ impl TonboMetaEngine {
                 if let Ok(s) = self.local.export_snapshot() {
                     *self.baseline_snapshot.lock() = s;
                 }
+                Ok(())
+            }
+            Err(err) if Self::is_temporary_remote_error(&err) => {
+                warn!(
+                    "tonbo remote stat failed temporarily, using local snapshot: {}",
+                    err
+                );
+                self.state.lock().last_refresh = Instant::now();
                 Ok(())
             }
             Err(err) => Err(MetaError::Storage(err.to_string())),

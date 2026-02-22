@@ -1923,17 +1923,28 @@ impl StudioVfs {
         // If only one block, read sequentially to avoid overhead
         if blocks_needed.len() == 1 {
             let (block_idx, off_in, to_copy) = blocks_needed[0];
-            let block_data = self.read_block_or_pending(ino, block_idx).await?;
-            let copy_len = if to_copy == 0 || off_in >= block_data.len() {
-                0
-            } else {
-                to_copy.min(block_data.len() - off_in)
+            return match self.read_block_or_pending(ino, block_idx).await {
+                Ok(block_data) => {
+                    let copy_len = if to_copy == 0 || off_in >= block_data.len() {
+                        0
+                    } else {
+                        to_copy.min(block_data.len() - off_in)
+                    };
+                    if copy_len > 0 {
+                        buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
+                    }
+                    self.maybe_prefetch(ino, &blocks_needed);
+                    Ok(copy_len as u32)
+                }
+                Err(VfsError::BlockNotFound(_, _)) => {
+                    // Sparse/missing block: keep read semantics consistent with
+                    // the multi-block path by returning zero-filled bytes.
+                    buffer[..to_copy].fill(0u8);
+                    self.maybe_prefetch(ino, &blocks_needed);
+                    Ok(to_copy as u32)
+                }
+                Err(e) => Err(e),
             };
-            if copy_len > 0 {
-                buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
-            }
-            self.maybe_prefetch(ino, &blocks_needed);
-            return Ok(copy_len as u32);
         }
 
         // Parallel fetch with concurrency limit (16 concurrent reads)
