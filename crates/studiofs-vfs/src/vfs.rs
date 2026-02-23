@@ -2432,10 +2432,7 @@ impl StudioVfs {
         // Allocate block ID
         let object_id = self.meta.next_block_id()?;
 
-        // Create compressed STFS object (needed for S3 upload in all cases)
-        let _compressed = Bytes::from(create_object(&data)?);
-
-        // Cache the decompressed block (re-compress at upload time).
+        // Cache the decompressed block (re-compress at upload time in process_upload).
         self.block_cache
             .put(object_id, data.clone())
             .await
@@ -2518,10 +2515,12 @@ impl StudioVfs {
     }
 
     /// Process all blocks currently in `dirty_mem`:
-    /// compress → slab write → metadata update → upload queue.
+    /// cache write → metadata update → upload queue.
     ///
-    /// Blocks are kept in `dirty_mem` until the slab write succeeds so that
+    /// Blocks are kept in `dirty_mem` until the cache write succeeds so that
     /// concurrent reads always find the data in at least one tier.
+    ///
+    /// Processes up to 8 blocks concurrently for throughput.
     async fn drain_dirty_mem(&self) {
         // Snapshot keys without removing — reads remain consistent during processing.
         let keys: Vec<(Ino, u32)> = self.state.dirty_mem.lock().keys().cloned().collect();
@@ -2529,11 +2528,9 @@ impl StudioVfs {
             return;
         }
 
+        // Prepare work items: filter deleted inodes, clone data under brief lock.
+        let mut work: Vec<(Ino, u32, Bytes)> = Vec::with_capacity(keys.len());
         for (ino, block_index) in keys {
-            // ── Race-condition guard ──────────────────────────────────────
-            // If unlink() deleted this inode between snapshot and now, skip
-            // the block — otherwise flush_block would re-insert it into the
-            // slab cache and metadata, undoing the eviction.
             if self.state.deleted_inodes.lock().contains(&ino) {
                 let removed = self.state.dirty_mem.lock().remove(&(ino, block_index));
                 if let Some(data) = removed {
@@ -2551,20 +2548,41 @@ impl StudioVfs {
                 continue;
             }
 
-            // Clone the data while holding a brief lock.
             let data = {
                 let dirty = self.state.dirty_mem.lock();
                 match dirty.get(&(ino, block_index)) {
                     Some(d) => d.clone(),
-                    None => continue, // already processed by a concurrent drain
+                    None => continue,
                 }
             };
-            let len = data.len();
+            work.push((ino, block_index, data));
+        }
 
-            // compress → slab → metadata → upload queue
-            match self.flush_block(ino, block_index, data).await {
-                Ok(()) => {
-                    // Success: remove from dirty_mem and release byte count.
+        if work.is_empty() {
+            return;
+        }
+
+        // Process blocks with bounded concurrency (8 parallel flushes).
+        let flush_sem = Arc::new(Semaphore::new(8));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (ino, block_index, data) in work {
+            let permit = flush_sem.clone().acquire_owned().await.unwrap();
+            let this = unsafe {
+                // Safety: `self` outlives all spawned tasks because we join below.
+                &*(self as *const Self)
+            };
+            let len = data.len();
+            join_set.spawn(async move {
+                let _permit = permit;
+                let result = this.flush_block(ino, block_index, data).await;
+                (ino, block_index, len, result)
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok((ino, block_index, len, Ok(()))) => {
                     self.state.dirty_mem.lock().remove(&(ino, block_index));
                     self.state
                         .dirty_bytes
@@ -2573,12 +2591,14 @@ impl StudioVfs {
                         })
                         .ok();
                 }
-                Err(e) => {
-                    // Leave in dirty_mem for retry on the next drain cycle.
+                Ok((ino, block_index, _len, Err(e))) => {
                     error!(
                         "slab flusher: flush_block failed ino={} block={}: {}",
                         ino, block_index, e
                     );
+                }
+                Err(e) => {
+                    error!("slab flusher: task panicked: {}", e);
                 }
             }
         }
@@ -2997,50 +3017,79 @@ impl StudioVfs {
     /// Best-effort graceful shutdown: drain dirty buffers, wait for pending
     /// uploads to complete, then persist cache checkpoint.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
-        info!("VFS shutdown: flushing pending write buffer");
+        let t0 = Instant::now();
+
+        // Phase 1: flush pending write buffer → dirty_mem.
+        let dirty_before = self.state.dirty_bytes.load(Ordering::Relaxed);
+        info!(
+            dirty_bytes = dirty_before,
+            pending_uploads = self.block_cache.pending_upload_count(),
+            "VFS shutdown: flushing pending write buffer"
+        );
         self.flush_pending_blocks_for_shutdown().await;
 
-        info!("VFS shutdown: draining dirty memory buffer");
+        // Phase 2: drain dirty_mem → cache + upload queue.
+        let dirty_after_flush = self.state.dirty_bytes.load(Ordering::Relaxed);
+        info!(
+            dirty_bytes = dirty_after_flush,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "VFS shutdown: draining dirty memory buffer"
+        );
         self.drain_dirty_mem().await;
+        info!(
+            pending_uploads = self.block_cache.pending_upload_count(),
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "VFS shutdown: drain complete"
+        );
 
-        if self.block_cache.pending_upload_count() > 0 {
-            let reconciled = self.reconcile_remote_completed_pending().await;
-            if reconciled > 0 {
-                info!(reconciled, "VFS shutdown: reconciled already-uploaded blocks");
-            }
-        }
-
-        let mut drained = self
-            .block_cache
-            .wait_for_uploads_idle(upload_drain_timeout)
-            .await;
-        if !drained {
-            let reconciled = self.reconcile_remote_completed_pending().await;
-            if reconciled > 0 {
-                drained = self
-                    .block_cache
-                    .wait_for_uploads_idle(Duration::from_millis(250))
-                    .await;
-            }
-        }
-
-        if !drained {
-            let pending_ops = self.block_cache.snapshot_pending_uploads();
-            let sample_object_ids: Vec<u64> =
-                pending_ops.iter().take(8).map(|op| op.object_id).collect();
-            warn!(
-                pending = self.block_cache.pending_upload_count(),
-                pending_journal_files = pending_ops.len(),
-                pending_object_ids_sample = ?sample_object_ids,
-                timeout_ms = upload_drain_timeout.as_millis() as u64,
-                "VFS shutdown: upload queue did not fully drain before timeout"
+        // Phase 3: wait for uploads to drain, reconcile already-uploaded blocks.
+        let pending = self.block_cache.pending_upload_count();
+        if pending > 0 {
+            info!(
+                pending,
+                "VFS shutdown: waiting for uploads to drain"
             );
+            let mut drained = self
+                .block_cache
+                .wait_for_uploads_idle(upload_drain_timeout)
+                .await;
+            if !drained {
+                let reconciled = self.reconcile_remote_completed_pending().await;
+                if reconciled > 0 {
+                    info!(reconciled, "VFS shutdown: reconciled already-uploaded blocks");
+                    drained = self
+                        .block_cache
+                        .wait_for_uploads_idle(Duration::from_millis(500))
+                        .await;
+                }
+            }
+            if !drained {
+                let pending_ops = self.block_cache.snapshot_pending_uploads();
+                let sample_object_ids: Vec<u64> =
+                    pending_ops.iter().take(8).map(|op| op.object_id).collect();
+                warn!(
+                    pending = self.block_cache.pending_upload_count(),
+                    pending_journal_files = pending_ops.len(),
+                    pending_object_ids_sample = ?sample_object_ids,
+                    timeout_ms = upload_drain_timeout.as_millis() as u64,
+                    "VFS shutdown: upload queue did not fully drain before timeout"
+                );
+            }
         }
 
+        // Phase 4: persist metadata + cache checkpoint.
+        info!(
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "VFS shutdown: persisting metadata"
+        );
         if let Err(e) = self.meta.flush_metadata() {
             warn!("VFS shutdown: metadata flush failed: {}", e);
         }
         self.persist_cache().await;
+        info!(
+            total_ms = t0.elapsed().as_millis() as u64,
+            "VFS shutdown: complete"
+        );
     }
 }
 

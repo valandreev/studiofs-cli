@@ -211,8 +211,14 @@ impl UploadQueue {
     // -------------------------------------------------------------------------
 
     fn mark_done(&self) {
-        let prev = self.pending_count.fetch_sub(1, Ordering::Relaxed);
-        if prev <= 1 {
+        // Saturating decrement — guards against double-complete (reconcile + uploader race).
+        let result = self.pending_count.fetch_update(
+            Ordering::Release,
+            Ordering::Acquire,
+            |v| if v > 0 { Some(v - 1) } else { None },
+        );
+        if result == Ok(1) {
+            // Was 1, now 0 — notify idle waiters.
             self.idle_notify.notify_waiters();
         }
     }
