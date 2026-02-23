@@ -1,4 +1,4 @@
-//! Core VFS implementation — Block-based architecture.
+﻿//! Core VFS implementation — Block-based architecture.
 //!
 //! Key design:
 //! - Files are split into fixed-size blocks (default 1MB)
@@ -37,7 +37,7 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     create_object, format_object_key, parse_object_id_from_key, read_object,
 };
-use studiofs_data::store::DataStore;
+use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
 use thiserror::Error;
@@ -507,7 +507,7 @@ impl StudioVfs {
     /// Create a new VFS instance.
     pub fn new(
         meta: Arc<dyn MetaEngine>,
-        data: Arc<DataStore>,
+        data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
         memory_limit: u64,
@@ -691,19 +691,17 @@ impl StudioVfs {
         // Create a read-optimised DataStore with dedicated connection pool and
         // tighter timeouts so that background uploads can never starve reads.
         let data_read = Arc::new(
-            data.clone_for_reads()
+            DataStore::with_profile(data_config, IoProfile::Read)
                 .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
         );
 
         // Create a write-optimised DataStore for uploads/deletes with moderate
         // timeout and small connection pool — WAN-friendly, won’t overwhelm the
-        // backend.  The original `data` (Default profile) is not stored.
+        // backend.
         let data_write = Arc::new(
-            data.clone_for_writes()
+            DataStore::with_profile(data_config, IoProfile::Write)
                 .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?,
         );
-        // Drop the original Default-profile DataStore — only Read + Write remain.
-        drop(data);
 
         let vfs = Arc::new(Self {
             meta,

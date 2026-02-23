@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use studiofs_data::{DataStore, DataStoreConfig};
+use studiofs_data::DataStoreConfig;
 use studiofs_meta::open_meta_engine;
 use studiofs_vfs::StudioVfs;
 use tracing::info;
@@ -46,9 +46,8 @@ pub fn run(
         format_info.name, format_info.uuid, format_info.endpoint, format_info.bucket
     );
 
-    // Set up data store
+    // Set up data store config (StudioVfs creates Read + Write connections directly)
     let data_config = DataStoreConfig::from(&format_info);
-    let data = Arc::new(DataStore::new(&data_config)?);
 
     // Set up caches
     let mem_limit = parse_size(memory_limit)?;
@@ -76,7 +75,7 @@ pub fn run(
     // StudioVfs::new returns VfsResult<Arc<Self>>
     let vfs = StudioVfs::new(
         meta.clone(),
-        data.clone(),
+        &data_config,
         cache_path_str,
         cache_size_bytes,
         mem_limit,

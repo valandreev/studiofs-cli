@@ -106,13 +106,12 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
         .expect("failed to set format info");
 
     let data_config = DataStoreConfig::from(&format_info);
-    let data = Arc::new(DataStore::new(&data_config).expect("failed to create DataStore"));
 
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap();
     let cache_size = 1024 * 1024 * 1024; // 1 GiB
 
-    StudioVfs::new(meta, data, cache_dir_str, cache_size, 512 * 1024 * 1024).expect("failed to create StudioVfs")
+    StudioVfs::new(meta, &data_config, cache_dir_str, cache_size, 512 * 1024 * 1024).expect("failed to create StudioVfs")
 }
 
 /// Ensure the test bucket exists.
@@ -790,9 +789,9 @@ fn test_crash_recovery_replays_pending_journal() {
             .worker_threads(2)
             .build()
             .unwrap();
-        let data = Arc::new(DataStore::new(&DataStoreConfig::from(&offline_info)).unwrap());
+        let offline_data_config = DataStoreConfig::from(&offline_info);
         rt.block_on(async {
-            let vfs = StudioVfs::new(meta.clone(), data, &cache_dir_str, 1024 * 1024 * 1024, 512 * 1024 * 1024)
+            let vfs = StudioVfs::new(meta.clone(), &offline_data_config, &cache_dir_str, 1024 * 1024 * 1024, 512 * 1024 * 1024)
                 .unwrap();
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
             crash_file_ino = attr.ino;
@@ -839,11 +838,11 @@ fn test_crash_recovery_replays_pending_journal() {
         .worker_threads(2)
         .build()
         .unwrap();
+    let online_data_config = DataStoreConfig::from(&online_info);
     rt.block_on(async {
-        let data = Arc::new(DataStore::new(&DataStoreConfig::from(&online_info)).unwrap());
         let _vfs = StudioVfs::new(
             meta.clone(),
-            data.clone(),
+            &online_data_config,
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
@@ -854,9 +853,10 @@ fn test_crash_recovery_replays_pending_journal() {
         assert!(!blocks.is_empty(), "file blocks must exist in metadata");
         let object_id = blocks[0].1.object_id;
         let key = format_object_key(&online_info.data_prefix, object_id);
+        let check_store = DataStore::new(&DataStoreConfig::from(&online_info)).unwrap();
 
         assert!(
-            wait_until_exists(&data, &key, Duration::from_secs(15)).await,
+            wait_until_exists(&check_store, &key, Duration::from_secs(15)).await,
             "recovered uploader should eventually upload object {object_id}"
         );
     });

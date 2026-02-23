@@ -42,7 +42,7 @@ pub enum IoProfile {
     Read,
     /// Optimised for writes (uploads, deletes): moderate timeout, small pool
     /// to avoid overwhelming the backend (WAN-friendly).
-    /// io_timeout=30s, concurrent_limit=8, retries=3.
+    /// io_timeout=30s, concurrent_limit=16, retries=3.
     Write,
 }
 
@@ -94,7 +94,7 @@ impl DataStore {
         let (meta_timeout_s, io_timeout_s, max_retries, concurrent_limit) = match profile {
             IoProfile::Default => (10, 60, 3, 128),
             IoProfile::Read   => ( 5, 20, 3,  16),
-            IoProfile::Write  => (10, 30, 3,   8),
+            IoProfile::Write  => (10, 30, 3,  16),
         };
 
         let op = Operator::new(builder)?
