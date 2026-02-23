@@ -2,27 +2,26 @@
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
 use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
 use std::sync::Arc;
 
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
 use studiofs_vfs::{OpenFlags, StudioVfs};
+use tokio::runtime::Runtime;
+use tracing::{debug, error, trace, warn};
+use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
 };
-
-// Windows reparse point constants
-const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-use tokio::runtime::Runtime;
-use tracing::{debug, error};
-use windows::Win32::Foundation::NTSTATUS;
 use winfsp::U16CStr;
 use winfsp::filesystem::*;
 use winfsp::filesystem::DirBuffer;
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
+
+// Windows reparse point constants
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -41,7 +40,6 @@ const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 /// Per-open-file context.
 pub struct StudioFileHandle {
     ino: Ino,
-    #[allow(dead_code)]
     is_dir: bool,
     /// VFS file handle (0 for directories).
     fh: u64,
@@ -62,17 +60,18 @@ impl StudioFileHandle {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Convert InodeAttr to WinFSP FileInfo.
-fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
-    // Directories always report at least one allocation unit; files round up.
-    let file_attributes = if attr.win_attrs != 0 {
-        // Use stored Windows attributes, ensuring kind-specific flags are always present
+/// Compute Win32 FILE_ATTRIBUTE_* flags from inode attributes.
+///
+/// If `win_attrs` is stored (non-zero), use it but ensure kind-specific bits
+/// (DIRECTORY, REPARSE_POINT) are always present. Otherwise derive defaults.
+fn compute_file_attributes(attr: &InodeAttr) -> u32 {
+    if attr.win_attrs != 0 {
         match attr.kind {
             FileType::Directory => attr.win_attrs | 0x10,
             FileType::Symlink => attr.win_attrs | FILE_ATTRIBUTE_REPARSE_POINT,
             _ => {
-                // Clear NORMAL (0x80) if other flags are present
                 let a = attr.win_attrs;
+                // Clear NORMAL (0x80) if other meaningful flags are present.
                 if a & !0x80 != 0 { a & !0x80 } else { a }
             }
         }
@@ -82,7 +81,12 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
             FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
             _ => 0x20, // FILE_ATTRIBUTE_ARCHIVE (default, like NTFS)
         }
-    };
+    }
+}
+
+/// Convert InodeAttr to WinFSP FileInfo.
+fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
+    let file_attributes = compute_file_attributes(attr);
 
     let mut info = FileInfo {
         file_size: attr.size,
@@ -218,56 +222,45 @@ fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u
 ///   Flags                       (u32) = SYMLINK_FLAG_RELATIVE (1)
 ///   PathBuffer                  (WCHAR[])
 fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
-    // Convert target from UTF-8 bytes to a Windows path string
     let target_str = String::from_utf8_lossy(target);
-    // Replace / with \ for Windows
     let win_path = target_str.replace('/', "\\");
-    // Encode as UTF-16LE
     let utf16: Vec<u16> = win_path.encode_utf16().collect();
-    let name_bytes = utf16.len() * 2; // byte length of UTF-16 name
+    let name_bytes = utf16.len() * 2;
 
-    // SubstituteName = target, PrintName = target (same content, different offsets)
-    let substitute_offset: u16 = 0;
     let substitute_len = name_bytes as u16;
-    let print_offset = substitute_len;
     let print_len = substitute_len;
-
-    // Symlink-specific data = 4 offsets (2 bytes each) + flags (4 bytes) + 2× path
+    // 4 offsets (2B each) + flags (4B) + 2× path
     let data_len: u16 = 4 * 2 + 4 + substitute_len + print_len;
-
-    // Total: 8 (header) + data_len
     let total = 8 + data_len as usize;
     let mut buf = vec![0u8; total];
 
-    // ReparseTag
     buf[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
-    // ReparseDataLength
     buf[4..6].copy_from_slice(&data_len.to_le_bytes());
-    // Reserved = 0 (already zero)
-    // SubstituteNameOffset
-    buf[8..10].copy_from_slice(&substitute_offset.to_le_bytes());
-    // SubstituteNameLength
+    // SubstituteNameOffset = 0 (already zero)
     buf[10..12].copy_from_slice(&substitute_len.to_le_bytes());
-    // PrintNameOffset
-    buf[12..14].copy_from_slice(&print_offset.to_le_bytes());
-    // PrintNameLength
+    buf[12..14].copy_from_slice(&substitute_len.to_le_bytes()); // PrintNameOffset
     buf[14..16].copy_from_slice(&print_len.to_le_bytes());
-    // Flags = SYMLINK_FLAG_RELATIVE = 1
-    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
-    // PathBuffer: SubstituteName then PrintName
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // SYMLINK_FLAG_RELATIVE
+
+    // Write both SubstituteName and PrintName via byte slice copy.
+    let src = unsafe {
+        std::slice::from_raw_parts(utf16.as_ptr() as *const u8, name_bytes)
+    };
     let path_buf_offset = 20;
-    for (i, &wc) in utf16.iter().enumerate() {
-        let off = path_buf_offset + i * 2;
-        buf[off..off + 2].copy_from_slice(&wc.to_le_bytes());
-    }
-    // PrintName is same content at print_offset
-    let print_start = path_buf_offset + substitute_len as usize;
-    for (i, &wc) in utf16.iter().enumerate() {
-        let off = print_start + i * 2;
-        buf[off..off + 2].copy_from_slice(&wc.to_le_bytes());
-    }
+    buf[path_buf_offset..path_buf_offset + name_bytes].copy_from_slice(src);
+    let print_start = path_buf_offset + name_bytes;
+    buf[print_start..print_start + name_bytes].copy_from_slice(src);
 
     buf
+}
+
+/// Encode a symlink reparse buffer and copy it into the output buffer.
+/// Returns the total reparse data length.
+fn write_reparse_to_buffer(target: &[u8], buffer: &mut [u8]) -> u64 {
+    let encoded = encode_symlink_reparse(target);
+    let len = encoded.len().min(buffer.len());
+    buffer[..len].copy_from_slice(&encoded[..len]);
+    encoded.len() as u64
 }
 
 /// Decode a symlink target from a Windows REPARSE_DATA_BUFFER (IO_REPARSE_TAG_SYMLINK).
@@ -389,6 +382,23 @@ impl StudioFsContext {
         let default_sd = create_default_security_descriptor();
         Self { vfs, rt, default_sd }
     }
+
+    /// Copy the cached security descriptor into the provided buffer.
+    /// Returns the full SD length (even if the buffer was smaller).
+    fn copy_sd_to_buffer(&self, buf: Option<&mut [c_void]>) -> u64 {
+        let sd = &self.default_sd;
+        if let Some(buf) = buf {
+            let copy_len = sd.len().min(buf.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sd.as_ptr(),
+                    buf.as_mut_ptr() as *mut u8,
+                    copy_len,
+                );
+            }
+        }
+        sd.len() as u64
+    }
 }
 
 impl FileSystemContext for StudioFsContext {
@@ -400,53 +410,17 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let path_str = file_name.to_string_lossy();
-        debug!("get_security_by_name path={:?}", path_str);
         if let Some(security) = resolve_reparse_points(file_name) {
-            debug!("  -> reparse point, returning");
             return Ok(security);
         }
 
-        let attr = match resolve_path(&self.vfs, file_name) {
-            Ok(a) => a,
-            Err(e) => {
-                debug!("  -> resolve_path FAILED: {:?}", e);
-                return Err(e);
-            }
-        };
-        let file_attributes = if attr.win_attrs != 0 {
-            match attr.kind {
-                FileType::Directory => attr.win_attrs | 0x10,
-                FileType::Symlink => attr.win_attrs | FILE_ATTRIBUTE_REPARSE_POINT,
-                _ => {
-                    let a = attr.win_attrs;
-                    if a & !0x80 != 0 { a & !0x80 } else { a }
-                }
-            }
-        } else {
-            match attr.kind {
-                FileType::Directory => 0x10u32,
-                FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-                _ => 0x20u32, // FILE_ATTRIBUTE_ARCHIVE
-            }
-        };
-
-        // Copy the cached security descriptor into the provided buffer
-        let sd = &self.default_sd;
-        if let Some(buf) = security_descriptor {
-            let copy_len = sd.len().min(buf.len());
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sd.as_ptr(),
-                    buf.as_mut_ptr() as *mut u8,
-                    copy_len,
-                );
-            }
-        }
+        let attr = resolve_path(&self.vfs, file_name)?;
+        let file_attributes = compute_file_attributes(&attr);
+        let sd_len = self.copy_sd_to_buffer(security_descriptor);
 
         Ok(FileSecurity {
             reparse: attr.kind == FileType::Symlink,
-            sz_security_descriptor: sd.len() as u64,
+            sz_security_descriptor: sd_len,
             attributes: file_attributes,
         })
     }
@@ -456,18 +430,7 @@ impl FileSystemContext for StudioFsContext {
         _context: &Self::FileContext,
         security_descriptor: Option<&mut [c_void]>,
     ) -> winfsp::Result<u64> {
-        let sd = &self.default_sd;
-        if let Some(buf) = security_descriptor {
-            let copy_len = sd.len().min(buf.len());
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sd.as_ptr(),
-                    buf.as_mut_ptr() as *mut u8,
-                    copy_len,
-                );
-            }
-        }
-        Ok(sd.len() as u64)
+        Ok(self.copy_sd_to_buffer(security_descriptor))
     }
 
     fn open(
@@ -477,14 +440,8 @@ impl FileSystemContext for StudioFsContext {
         _granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let path_str = file_name.to_string_lossy();
-        debug!(
-            "open path={:?} create_options={:#x} granted_access={:?}",
-            path_str, _create_options, _granted_access
-        );
         let attr = resolve_path(&self.vfs, file_name)?;
-        let info = attr_to_file_info(&attr);
-        *file_info.as_mut() = info;
+        *file_info.as_mut() = attr_to_file_info(&attr);
 
         let is_dir = attr.kind == FileType::Directory;
         let fh = if is_dir {
@@ -495,10 +452,7 @@ impl FileSystemContext for StudioFsContext {
                 .map_err(vfs_to_winfsp_err)?
         };
 
-        debug!(
-            ino = attr.ino,
-            fh, "open SUCCESS path={:?} is_dir={}", path_str, is_dir
-        );
+        debug!(ino = attr.ino, fh, is_dir, "open");
         Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
     }
 
@@ -588,10 +542,7 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
-        debug!(
-            ino = context.ino,
-            "get_file_info kind={:?} size={}", attr.kind, attr.size
-        );
+        trace!(ino = context.ino, size = attr.size, "get_file_info");
         *file_info = attr_to_file_info(&attr);
         Ok(())
     }
@@ -608,7 +559,7 @@ impl FileSystemContext for StudioFsContext {
             .block_on(self.vfs.read_into(context.ino, offset, buffer))
             .map_err(vfs_to_winfsp_err)?;
 
-        debug!(ino = context.ino, offset, len, "read");
+        trace!(ino = context.ino, offset, len, "read");
         Ok(len)
     }
 
@@ -650,7 +601,7 @@ impl FileSystemContext for StudioFsContext {
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
 
-        debug!(ino = context.ino, offset = actual_offset, written, "write");
+        trace!(ino = context.ino, offset = actual_offset, written, "write");
         Ok(written)
     }
 
@@ -661,7 +612,9 @@ impl FileSystemContext for StudioFsContext {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        debug!(ino = context.ino, "read_directory called");
+        // Constant UTF-16 names for "." and ".." — avoids heap allocation.
+        const DOT: &[u16] = &[b'.' as u16];
+        const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
 
         // On first call (no marker), populate the DirBuffer with all entries.
         if marker.is_none() {
@@ -670,8 +623,7 @@ impl FileSystemContext for StudioFsContext {
             // Add "." entry
             {
                 let mut dot = DirInfo::<255>::new();
-                let name_u16: Vec<u16> = std::ffi::OsStr::new(".").encode_wide().collect();
-                dot.set_name_raw(name_u16.as_slice())?;
+                dot.set_name_raw(DOT)?;
                 let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
                 *dot.file_info_mut() = attr_to_file_info(&attr);
                 let _ = lock.write(&mut dot);
@@ -680,8 +632,7 @@ impl FileSystemContext for StudioFsContext {
             // Add ".." entry
             {
                 let mut dotdot = DirInfo::<255>::new();
-                let name_u16: Vec<u16> = std::ffi::OsStr::new("..").encode_wide().collect();
-                dotdot.set_name_raw(name_u16.as_slice())?;
+                dotdot.set_name_raw(DOTDOT)?;
                 if let Ok(attr) = self.vfs.getattr(context.ino) {
                     *dotdot.file_info_mut() = attr_to_file_info(&attr);
                     let _ = lock.write(&mut dotdot);
@@ -693,47 +644,35 @@ impl FileSystemContext for StudioFsContext {
             debug!(
                 ino = context.ino,
                 count = entries.len(),
-                "read_directory loaded {} entries",
-                entries.len()
+                "read_directory"
             );
 
             for entry in &entries {
-                let entry_name = String::from_utf8_lossy(&entry.name).to_string();
-                let os_name = std::ffi::OsString::from(&entry_name);
-                let name_u16: Vec<u16> = os_name.encode_wide().collect();
+                let name_cow = String::from_utf8_lossy(&entry.name);
+                let name_u16: Vec<u16> = name_cow.encode_utf16().collect();
                 let mut dir_info = DirInfo::<255>::new();
                 if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
-                    debug!("failed to set name for entry: {}", entry_name);
+                    warn!("failed to set name for entry: {}", name_cow);
                     continue;
                 }
 
                 let child_attr = match self.vfs.getattr(entry.ino) {
                     Ok(a) => a,
                     Err(e) => {
-                        debug!("failed to get attr for {}: {:?}", entry_name, e);
+                        warn!("failed to get attr for {}: {:?}", name_cow, e);
                         continue;
                     }
                 };
                 *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
                 if let Err(e) = lock.write(&mut dir_info) {
-                    debug!("failed to write entry '{}' to DirBuffer: {:?}", entry_name, e);
+                    warn!("DirBuffer write failed for '{}': {:?}", name_cow, e);
                     break;
                 }
             }
-
-            // Lock is dropped here, releasing the DirBuffer
         }
 
-        // Read from the DirBuffer at the current marker position
-        let bytes = context.dir_buffer.read(marker, buffer);
-        debug!(
-            ino = context.ino,
-            bytes_returned = bytes,
-            "read_directory returning {} bytes",
-            bytes
-        );
-        Ok(bytes)
+        Ok(context.dir_buffer.read(marker, buffer))
     }
 
     fn set_delete(
@@ -867,10 +806,7 @@ impl FileSystemContext for StudioFsContext {
             return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
         }
         let target = self.vfs.readlink(attr.ino).map_err(vfs_to_winfsp_err)?;
-        let encoded = encode_symlink_reparse(&target);
-        let len = encoded.len().min(buffer.len());
-        buffer[..len].copy_from_slice(&encoded[..len]);
-        Ok(encoded.len() as u64)
+        Ok(write_reparse_to_buffer(&target, buffer))
     }
 
     fn get_reparse_point(
@@ -880,33 +816,26 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
         let target = self.vfs.readlink(context.ino).map_err(vfs_to_winfsp_err)?;
-        let encoded = encode_symlink_reparse(&target);
-        let len = encoded.len().min(buffer.len());
-        buffer[..len].copy_from_slice(&encoded[..len]);
-        Ok(encoded.len() as u64)
+        Ok(write_reparse_to_buffer(&target, buffer))
     }
 
     fn set_reparse_point(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         _file_name: &U16CStr,
-        buffer: &[u8],
+        _buffer: &[u8],
     ) -> winfsp::Result<()> {
-        // We don't support changing an existing file into a reparse point.
         // Symlinks are created at create() time via extra_buffer_is_reparse_point.
-        let _ = context;
-        let _ = buffer;
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
     fn delete_reparse_point(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
         // Reparse points (symlinks) are removed via normal unlink in cleanup.
-        let _ = context;
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
