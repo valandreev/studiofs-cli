@@ -40,7 +40,7 @@ pub fn mount_and_serve(
     volume_params.file_info_timeout(1000);
     volume_params.dir_info_timeout(1000);
 
-    // Keep a reference for persist_cache() on shutdown (vfs is moved into context).
+    // Keep a reference for shutdown() (vfs is moved into context).
     let vfs_ref = vfs.clone();
     let context = StudioFsContext::new(vfs, rt.clone());
 
@@ -62,8 +62,8 @@ pub fn mount_and_serve(
     // Stop WinFSP first so no new callbacks race with the shutdown drain.
     host.stop();
     host.unmount();
-    // Drain writeback state after WinFSP callbacks are quiesced.
-    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(10)));
+    // Drain uploads and persist cache checkpoint after WinFSP callbacks are quiesced.
+    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(30)));
 
     Ok(())
 }

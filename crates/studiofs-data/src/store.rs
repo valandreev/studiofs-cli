@@ -69,24 +69,24 @@ impl DataStore {
 
         let op = Operator::new(builder)?
             // TimeoutLayer MUST come before RetryLayer (see opendal docs).
-            // - timeout: 30s for metadata ops (stat, delete)
-            // - io_timeout: 300s per read/write — generous for 1 MiB blocks
-            //   even on congested networks; truly hung connections time out.
+            // - timeout: 10s for metadata ops (stat, delete)
+            // - io_timeout: 60s per read/write (1 MiB blocks need ~1s even at
+            //   10 Mbps; 60s catches truly hung connections)
             .layer(
                 TimeoutLayer::new()
-                    .with_timeout(Duration::from_secs(30))
-                    .with_io_timeout(Duration::from_secs(300)),
+                    .with_timeout(Duration::from_secs(10))
+                    .with_io_timeout(Duration::from_secs(60)),
             )
             // RetryLayer: exponential backoff with jitter for transient errors.
             .layer(
                 RetryLayer::new()
                     .with_max_times(3)
                     .with_min_delay(Duration::from_millis(200))
-                    .with_max_delay(Duration::from_secs(5))
+                    .with_max_delay(Duration::from_secs(3))
                     .with_jitter(),
             )
             // Limit total concurrent HTTP requests to the backend.
-            .layer(ConcurrentLimitLayer::new(256))
+            .layer(ConcurrentLimitLayer::new(128))
             .finish();
         info!(
             "connected to S3: endpoint={}, bucket={}",

@@ -1,0 +1,377 @@
+//! L2 Disk Cache — file-per-block storage on NVMe.
+//!
+//! Each cached block is a single file in a sharded directory structure:
+//!
+//! ```text
+//! {cache_dir}/blocks/{shard_hex}/{object_id:016x}.block
+//! ```
+//!
+//! Files contain **decompressed** block data (no headers, no framing).
+//! Blocks are written atomically via tmp-file + rename.
+//!
+//! This design is elastic: the cache starts at 0 bytes and grows on demand.
+//! Eviction = `unlink` — no internal fragmentation, no free-list bookkeeping.
+
+use bytes::Bytes;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{debug, warn};
+
+// =============================================================================
+// L2DiskCache
+// =============================================================================
+
+/// File-per-block disk cache on NVMe.
+pub struct L2DiskCache {
+    /// Root cache directory (contains `blocks/` subdirectory).
+    cache_dir: PathBuf,
+    /// Total cached bytes on disk (approximate — updated on put/remove).
+    total_bytes: AtomicU64,
+    /// Maximum allowed bytes.
+    max_bytes: AtomicU64,
+}
+
+impl L2DiskCache {
+    /// Open (or create) the disk cache at `cache_dir`.
+    ///
+    /// If the directory already exists, it is reused.  Shard subdirectories are
+    /// created lazily on first write to each shard.
+    pub fn open(cache_dir: impl AsRef<Path>, max_bytes: u64) -> io::Result<Self> {
+        let cache_dir = cache_dir.as_ref().to_path_buf();
+        let blocks_dir = cache_dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir)?;
+
+        let this = Self {
+            cache_dir,
+            total_bytes: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(max_bytes),
+        };
+
+        Ok(this)
+    }
+
+    /// Scan existing block files and rebuild `total_bytes`.
+    ///
+    /// Call this once at startup.  Returns the list of `(object_id, size)` pairs
+    /// found on disk, useful for reloading LRU state.
+    pub fn scan(&self) -> io::Result<Vec<(u64, u32)>> {
+        let blocks_dir = self.cache_dir.join("blocks");
+        let mut found = Vec::new();
+        let mut total: u64 = 0;
+
+        if !blocks_dir.exists() {
+            return Ok(found);
+        }
+
+        for shard_entry in std::fs::read_dir(&blocks_dir)? {
+            let shard_entry = shard_entry?;
+            if !shard_entry.file_type()?.is_dir() {
+                continue;
+            }
+            for block_entry in std::fs::read_dir(shard_entry.path())? {
+                let block_entry = block_entry?;
+                let path = block_entry.path();
+                let Some(ext) = path.extension() else {
+                    continue;
+                };
+                if ext != "block" {
+                    // Clean up stale tmp files from interrupted writes.
+                    if ext == "tmp" {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(object_id) = u64::from_str_radix(stem, 16) else {
+                    continue;
+                };
+                let size = block_entry.metadata()?.len() as u32;
+                total += size as u64;
+                found.push((object_id, size));
+            }
+        }
+
+        self.total_bytes.store(total, Ordering::Relaxed);
+        debug!(
+            blocks = found.len(),
+            total_mb = total / (1024 * 1024),
+            "L2DiskCache scan complete"
+        );
+        Ok(found)
+    }
+
+    /// Read a block from disk.  Returns `None` if not cached.
+    ///
+    /// Uses `tokio::fs` (spawn_blocking internally) so this never blocks the
+    /// tokio runtime — unlike mmap page faults.
+    pub async fn get(&self, object_id: u64) -> Option<Bytes> {
+        let path = self.block_path(object_id);
+        match tokio::fs::read(&path).await {
+            Ok(data) => Some(Bytes::from(data)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!(object_id, error = %e, "L2DiskCache read error");
+                None
+            }
+        }
+    }
+
+    /// Read a block synchronously (for non-async contexts like upload workers).
+    pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
+        let path = self.block_path(object_id);
+        match std::fs::read(&path) {
+            Ok(data) => Some(Bytes::from(data)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!(object_id, error = %e, "L2DiskCache sync read error");
+                None
+            }
+        }
+    }
+
+    /// Write a block to disk (decompressed data).
+    ///
+    /// Atomic: writes to a `.tmp` file then renames.
+    pub async fn put(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
+        let path = self.block_path(object_id);
+        let tmp_path = path.with_extension("tmp");
+
+        // Ensure shard directory exists.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        tokio::fs::write(&tmp_path, data).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
+
+        self.total_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Write a block synchronously.
+    pub fn put_sync(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
+        let path = self.block_path(object_id);
+        let tmp_path = path.with_extension("tmp");
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::fs::write(&tmp_path, data)?;
+        std::fs::rename(&tmp_path, &path)?;
+
+        self.total_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Remove a block from disk.
+    pub async fn remove(&self, object_id: u64) {
+        let path = self.block_path(object_id);
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                let size = meta.len();
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    if e.kind() != io::ErrorKind::NotFound {
+                        warn!(object_id, error = %e, "L2DiskCache remove error");
+                    }
+                } else {
+                    self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(object_id, error = %e, "L2DiskCache remove stat error");
+            }
+        }
+    }
+
+    /// Remove a block synchronously.
+    pub fn remove_sync(&self, object_id: u64) {
+        let path = self.block_path(object_id);
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let size = meta.len();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != io::ErrorKind::NotFound {
+                        warn!(object_id, error = %e, "L2DiskCache sync remove error");
+                    }
+                } else {
+                    self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(object_id, error = %e, "L2DiskCache sync remove stat error");
+            }
+        }
+    }
+
+    /// Check whether a block file exists on disk.
+    pub fn contains(&self, object_id: u64) -> bool {
+        self.block_path(object_id).exists()
+    }
+
+    /// Current approximate total bytes on disk.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Maximum allowed bytes on disk.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Resize the disk budget.
+    pub fn set_max_bytes(&self, max: u64) {
+        self.max_bytes.store(max, Ordering::Relaxed);
+    }
+
+    /// Compute the path for a given block.
+    ///
+    /// `{cache_dir}/blocks/{high_byte_hex}/{object_id:016x}.block`
+    fn block_path(&self, object_id: u64) -> PathBuf {
+        let hex = format!("{:016x}", object_id);
+        let shard = &hex[..2];
+        self.cache_dir
+            .join("blocks")
+            .join(shard)
+            .join(format!("{hex}.block"))
+    }
+
+    /// Root cache directory.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+}
+
+// =============================================================================
+// Disk space helpers
+// =============================================================================
+
+/// Returns `(free_bytes, total_bytes)` for the filesystem containing `path`.
+#[cfg(target_os = "windows")]
+pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_caller: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free_total: u64 = 0;
+    unsafe {
+        let ret = GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_caller,
+            &mut total,
+            &mut free_total,
+        );
+        if ret != 0 {
+            Some((free_caller, total))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_str()?).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
+            let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+            Some((free, total))
+        } else {
+            None
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn put_get_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+
+        let data = b"hello world block data";
+        cache.put(42, data).await.unwrap();
+
+        let got = cache.get(42).await.unwrap();
+        assert_eq!(&got[..], data);
+        assert!(cache.contains(42));
+        assert_eq!(cache.total_bytes(), data.len() as u64);
+
+        cache.remove(42).await;
+        assert!(!cache.contains(42));
+        assert_eq!(cache.total_bytes(), 0);
+        assert!(cache.get(42).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_finds_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+
+        cache.put(1, b"block1").await.unwrap();
+        cache.put(2, b"block22").await.unwrap();
+        cache.put(0xff00, b"block_ff").await.unwrap();
+
+        // Reset counter and rescan.
+        cache.total_bytes.store(0, Ordering::Relaxed);
+        let found = cache.scan().unwrap();
+        assert_eq!(found.len(), 3);
+        assert_eq!(
+            cache.total_bytes(),
+            b"block1".len() as u64 + b"block22".len() as u64 + b"block_ff".len() as u64
+        );
+    }
+
+    #[test]
+    fn block_path_sharding() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 0).unwrap();
+        // object_id = 0x00000000000000ff → shard "00" (first 2 hex chars)
+        let path = cache.block_path(0xff);
+        assert!(path.to_str().unwrap().contains("00"));
+        assert!(path.to_str().unwrap().ends_with("00000000000000ff.block"));
+
+        // object_id = 0xab00000000000000 → shard "ab"
+        let path = cache.block_path(0xab00000000000000);
+        assert!(path.to_str().unwrap().contains("ab"));
+    }
+
+    #[test]
+    fn sync_put_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+        cache.put_sync(99, b"sync data").unwrap();
+        let got = cache.get_sync(99).unwrap();
+        assert_eq!(&got[..], b"sync data");
+    }
+}

@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use studiofs_meta::types::Ino;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
-const MAX_SCORE: u8 = 32;
+const MAX_SCORE: u8 = 8;
 
 // =============================================================================
 // Internal state

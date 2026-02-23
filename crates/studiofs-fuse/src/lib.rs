@@ -15,7 +15,7 @@ pub fn mount_and_serve(
     mount_point: &str,
     foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Keep a reference for persist_cache() after fuser::mount2() returns
+    // Keep a reference for shutdown() after fuser::mount2() returns
     // (vfs is moved into StudioFuseFs below).
     let vfs_ref = vfs.clone();
     let fs = StudioFuseFs::new(vfs, rt);
@@ -43,7 +43,7 @@ pub fn mount_and_serve(
     tracing::info!("mounting StudioFS at {mount_point}");
     fuser::mount2(fs, mount_point, &options)?;
     // fuser::mount2 returns when the filesystem is unmounted.
-    // Drain writeback state before process exit.
-    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(10)));
+    // Drain uploads and persist cache checkpoint before process exit.
+    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(30)));
     Ok(())
 }

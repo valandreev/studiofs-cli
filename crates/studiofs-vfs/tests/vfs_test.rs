@@ -112,7 +112,7 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let cache_dir_str = cache_dir.to_str().unwrap();
     let cache_size = 1024 * 1024 * 1024; // 1 GiB
 
-    StudioVfs::new(meta, data, None, cache_dir_str, cache_size).expect("failed to create StudioVfs")
+    StudioVfs::new(meta, data, cache_dir_str, cache_size, 512 * 1024 * 1024).expect("failed to create StudioVfs")
 }
 
 /// Ensure the test bucket exists.
@@ -212,6 +212,31 @@ fn wait_until_blocks(
             return None;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait until at least `expected` block refs are visible in metadata.
+///
+/// After `flush()`, blocks are moved to the dirty memory buffer and processed
+/// asynchronously by the background slab flusher.  This helper polls until the
+/// expected number of blocks appear (or the timeout expires).
+fn wait_until_n_blocks(
+    vfs: &Arc<StudioVfs>,
+    ino: u64,
+    expected: usize,
+    timeout: Duration,
+) -> Option<Vec<(u32, BlockRef)>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+            && blocks.len() >= expected
+        {
+            return Some(blocks);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -346,9 +371,9 @@ async fn test_block_allocation() {
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Verify blocks were allocated
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
-    assert_eq!(blocks.len(), 3, "Should have 3 blocks for 12 MiB file");
+    // Wait for background slab flusher to materialise block refs.
+    let blocks = wait_until_n_blocks(&vfs, ino, 3, Duration::from_secs(15))
+        .expect("Should have 3 blocks for 12 MiB file");
 
     // Verify block indices
     assert_eq!(blocks[0].0, 0);
@@ -380,8 +405,9 @@ async fn test_partial_block() {
     vfs.write(ino, 0, payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Verify single partial block
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    // Wait for background slab flusher to materialise block refs.
+    let blocks = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15))
+        .expect("Should have 1 block after flush");
     assert_eq!(blocks.len(), 1);
 
     let (_, block_ref) = &blocks[0];
@@ -490,15 +516,16 @@ async fn test_truncate_file() {
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Verify 3 blocks
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    // Wait for background slab flusher to materialise all 3 block refs.
+    let blocks = wait_until_n_blocks(&vfs, ino, 3, Duration::from_secs(15))
+        .expect("Should have 3 blocks for 12 MiB file");
     assert_eq!(blocks.len(), 3);
 
     // Truncate to 5 MiB (should remove 1 block, partial last block)
     let new_size = 5 * 1024 * 1024;
     vfs.setattr(ino, SetattrArgs::size_only(new_size)).unwrap();
 
-    // Verify 2 blocks now
+    // Verify 2 blocks now (truncation is synchronous — no wait needed)
     let blocks = vfs.meta().get_file_blocks(ino).unwrap();
     assert_eq!(blocks.len(), 2);
 
@@ -529,14 +556,29 @@ async fn test_pending_deletions_gc() {
     vfs.write(ino, 0, b"initial data").await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Get the block ID
-    let blocks_before = vfs.meta().get_file_blocks(ino).unwrap();
+    // Wait for background slab flusher to materialise block refs.
+    let blocks_before = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15))
+        .expect("Should have 1 block after initial write");
     assert_eq!(blocks_before.len(), 1);
     let old_block_id = blocks_before[0].1.object_id;
 
     // Overwrite with new data (should mark old block for deletion)
     vfs.write(ino, 0, b"new data here!!").await.unwrap();
     vfs.flush(ino).await.unwrap();
+
+    // Wait for the overwrite to be flushed — the new block will have a
+    // different object_id, so poll until the block ref changes.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+            && !blocks.is_empty()
+            && blocks[0].1.object_id != old_block_id
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Timed out waiting for overwrite flush");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Verify old block is in pending deletions
     let pending = vfs.meta().get_pending_deletions().unwrap();
@@ -750,23 +792,36 @@ fn test_crash_recovery_replays_pending_journal() {
             .unwrap();
         let data = Arc::new(DataStore::new(&DataStoreConfig::from(&offline_info)).unwrap());
         rt.block_on(async {
-            let vfs = StudioVfs::new(meta.clone(), data, None, &cache_dir_str, 1024 * 1024 * 1024)
+            let vfs = StudioVfs::new(meta.clone(), data, &cache_dir_str, 1024 * 1024 * 1024, 512 * 1024 * 1024)
                 .unwrap();
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
             crash_file_ino = attr.ino;
             let payload = vec![0x5Au8; 2 * 1024 * 1024];
             vfs.write(attr.ino, 0, &payload).await.unwrap();
             vfs.flush(attr.ino).await.unwrap();
+            // Wait until the background slab flusher has materialised block
+            // refs + journal entries.  Otherwise dirty_mem hasn't been drained
+            // and no journal files exist yet.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+                    && !blocks.is_empty()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for slab flusher");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             // Simulate abrupt process death: drop runtime without graceful VFS shutdown.
         });
         rt.shutdown_background();
     }
 
-    let pending_dir = cache_dir.join("pending");
+    let pending_dir = cache_dir.join("upload");
     let pending_count = std::fs::read_dir(&pending_dir)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pending"))
         .count();
     assert!(
         pending_count > 0,
@@ -789,9 +844,9 @@ fn test_crash_recovery_replays_pending_journal() {
         let _vfs = StudioVfs::new(
             meta.clone(),
             data.clone(),
-            None,
             &cache_dir_str,
             1024 * 1024 * 1024,
+            512 * 1024 * 1024,
         )
         .unwrap();
 

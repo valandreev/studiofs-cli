@@ -2,7 +2,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use studiofs_cache::MemoryCache;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::open_meta_engine;
 use studiofs_vfs::StudioVfs;
@@ -52,15 +51,14 @@ pub fn run(
     let data = Arc::new(DataStore::new(&data_config)?);
 
     // Set up caches
-    let mem_limit = parse_size(memory_limit)? as usize;
-    let mem_cache = Arc::new(MemoryCache::new(mem_limit));
+    let mem_limit = parse_size(memory_limit)?;
 
     let cache_size_bytes = parse_size(cache_size)?;
     let base_cache_path = cache_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| meta_dir.join("cache"));
 
-    // DiskCache will append "objects" and "pending" subdirectories inside this UUID dir.
+    // BlockCache will create blocks/ and upload/ subdirectories inside this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
 
     let cache_path_str = cache_path
@@ -79,9 +77,9 @@ pub fn run(
     let vfs = StudioVfs::new(
         meta.clone(),
         data.clone(),
-        Some(mem_cache.clone()),
         cache_path_str,
-        cache_size_bytes, // Pass the cache size
+        cache_size_bytes,
+        mem_limit,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 

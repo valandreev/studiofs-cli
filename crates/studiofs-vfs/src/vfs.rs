@@ -32,9 +32,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::disk::{DEFAULT_DISK_CACHE_SIZE, DiskCache};
-use studiofs_cache::memory::{CacheKey, MemoryCache};
-use studiofs_cache::writeback::{PendingOp, WritebackManager};
+use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
+use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     create_object, format_object_key, parse_object_id_from_key, read_object,
 };
@@ -59,9 +58,6 @@ pub enum VfsError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("disk cache error: {0}")]
-    DiskCache(#[from] studiofs_cache::disk::DiskCacheError),
 
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
@@ -154,8 +150,6 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
-const DEFAULT_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_REMOTE_READ_RETRIES: u32 = 3;
 const DEFAULT_READ_CONCURRENCY: usize = 16;
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
@@ -191,25 +185,21 @@ pub struct VfsConfig {
     pub meta_path: String,
     /// Path to disk cache directory.
     pub cache_dir: String,
-    /// Maximum disk cache size in bytes.
+    /// Maximum disk cache size in bytes (L2 NVMe budget).
     pub cache_size: u64,
+    /// L1 RAM cache budget in bytes.
+    pub memory_limit: u64,
     /// Block size in bytes (default 1MB).
     pub block_size: u32,
     /// Maximum concurrent uploads.
     pub max_concurrent_uploads: usize,
-    /// Upload retry count.
-    pub upload_retries: u32,
-    /// Store decompressed blocks in disk cache for faster reads.
-    /// On cache hit, no decompression is needed. Uses slightly more disk space
-    /// but is a net win for low-compressibility content (VFX, compressed media).
-    pub store_decompressed: bool,
     /// Number of blocks to prefetch ahead when a sequential access pattern is
-    /// detected.  0 disables read-ahead entirely.  Default: 32 (= 32 MB with
+    /// detected.  0 disables read-ahead entirely.  Default: 8 (= 8 MB with
     /// 1 MB blocks).
     pub readahead_width: u32,
     /// Maximum bytes to hold in the dirty-write memory buffer before applying
     /// backpressure.  This buffer stores blocks that `flush()` has accepted
-    /// but the background slab flusher has not yet written to disk.
+    /// but the background flusher has not yet written to disk.
     /// Default: 2 GiB.
     pub max_dirty_bytes: usize,
 }
@@ -219,12 +209,11 @@ impl Default for VfsConfig {
         Self {
             meta_path: String::new(),
             cache_dir: String::new(),
-            cache_size: DEFAULT_DISK_CACHE_SIZE,
+            cache_size: DEFAULT_L2_SIZE,
+            memory_limit: DEFAULT_L1_SIZE,
             block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
             max_concurrent_uploads: 128,
-            upload_retries: 3,
-            store_decompressed: true,
-            readahead_width: 32,
+            readahead_width: 8,
             max_dirty_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
@@ -388,21 +377,18 @@ struct VfsState {
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
     attr_read_cache: Mutex<std::collections::HashMap<Ino, (InodeAttr, Instant)>>,
-    /// Compressed object data waiting for S3 upload (used when store_decompressed=true).
-    /// Maps object_id -> compressed STFS bytes. Removed once the upload completes.
-    pending_upload_data: Mutex<std::collections::HashMap<u64, bytes::Bytes>>,
     /// In-flight S3 block fetches for request coalescing.
     /// When multiple readers request the same block concurrently, only the first
     /// issues an S3 GET; the rest wait for a broadcast notification and then
     /// read from the newly-populated cache.
     inflight_fetches: Mutex<std::collections::HashMap<(Ino, u32), broadcast::Sender<()>>>,
-    /// Dirty blocks accepted by `flush()` that have not yet been written to the
-    /// slab by the background slab flusher.  Reads must consult this buffer
-    /// BEFORE falling through to the disk cache or S3.
+    /// Dirty blocks accepted by `flush()` that have not yet been written to
+    /// disk by the background flusher.  Reads must consult this buffer
+    /// BEFORE falling through to the block cache or S3.
     dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
     /// Approximate total bytes currently held in `dirty_mem` (for backpressure).
     dirty_bytes: AtomicUsize,
-    /// Inodes that have been unlinked.  The background slab flusher checks this
+    /// Inodes that have been unlinked.  The background flusher checks this
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
@@ -427,6 +413,39 @@ struct InvalidationBus {
 }
 
 // =============================================================================
+// In-flight fetch cleanup guard (panic safety)
+// =============================================================================
+
+/// RAII guard that removes the in-flight fetch entry on drop (panic path).
+///
+/// If the fetcher completes normally it calls [`defuse()`](Self::defuse) so
+/// the manual cleanup path runs instead.  If the fetcher panics the guard's
+/// `Drop` impl removes the entry and drops the [`broadcast::Sender`], which
+/// closes the channel and unblocks all waiters with `RecvError::Closed`.
+struct InFlightGuard<'a> {
+    key: (Ino, u32),
+    inflight: &'a Mutex<std::collections::HashMap<(Ino, u32), broadcast::Sender<()>>>,
+    active: bool,
+}
+
+impl InFlightGuard<'_> {
+    /// Defuse the guard after normal completion so its `Drop` is a no-op.
+    fn defuse(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // Panic path: remove entry so waiters get RecvError::Closed
+            // when the sender is dropped, and retry as fetchers.
+            let _removed = self.inflight.lock().remove(&self.key);
+        }
+    }
+}
+
+// =============================================================================
 // StudioVfs Implementation
 // =============================================================================
 
@@ -436,12 +455,8 @@ pub struct StudioVfs {
     meta: Arc<dyn MetaEngine>,
     /// Data store (S3).
     data: Arc<DataStore>,
-    /// Disk cache.
-    disk_cache: Arc<DiskCache>,
-    /// Writeback manager.
-    writeback: Arc<WritebackManager>,
-    /// Optional L1 in-memory block cache.
-    mem_cache: Option<Arc<MemoryCache>>,
+    /// Unified two-level block cache (L1 RAM + L2 NVMe) with upload queue.
+    block_cache: Arc<BlockCache>,
     /// Block size in bytes.
     block_size: u32,
     /// Volume data prefix for S3 object keys.
@@ -451,12 +466,6 @@ pub struct StudioVfs {
     // --- Upload Control ---
     /// Semaphore for limiting concurrent uploads.
     upload_semaphore: Arc<Semaphore>,
-    /// Upload retry count.
-    upload_retries: u32,
-    /// Whether disk cache stores decompressed block data.
-    /// When true: cache reads skip decompression; uploads re-use pre-compressed data
-    /// from pending_upload_data instead of compressing again.
-    store_decompressed: bool,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
     /// Directory-level prefetch tracker.
@@ -464,7 +473,7 @@ pub struct StudioVfs {
     /// Channel sender for scheduling background prefetch tasks.
     /// The receiver lives in a spawned task that has an Arc<Self>.
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<(Ino, u32)>,
-    /// Signal sender to wake the background slab flusher when new dirty blocks
+    /// Signal sender to wake the background flusher when new dirty blocks
     /// are buffered.
     dirty_flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
     /// Maximum total bytes allowed in the dirty-write memory buffer before
@@ -478,8 +487,6 @@ pub struct StudioVfs {
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
     janitor_lease_ttl: Duration,
-    remote_read_timeout: Duration,
-    remote_read_retries: u32,
     read_concurrency: usize,
     prefetch_concurrency: usize,
     dir_prefetch_max_batch: usize,
@@ -494,9 +501,9 @@ impl StudioVfs {
     pub fn new(
         meta: Arc<dyn MetaEngine>,
         data: Arc<DataStore>,
-        mem_cache: Option<Arc<MemoryCache>>,
         cache_dir: &str,
         cache_size: u64,
+        memory_limit: u64,
     ) -> VfsResult<Arc<Self>> {
         // Get volume info
         let format_info = meta.get_format_info()?;
@@ -541,17 +548,6 @@ impl StudioVfs {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
         );
-        let remote_read_timeout = Duration::from_secs(
-            std::env::var("STUDIOFS_REMOTE_READ_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_REMOTE_READ_TIMEOUT.as_secs()),
-        );
-        let remote_read_retries = std::env::var("STUDIOFS_REMOTE_READ_RETRIES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(DEFAULT_REMOTE_READ_RETRIES);
         let read_concurrency = std::env::var("STUDIOFS_READ_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -671,33 +667,30 @@ impl StudioVfs {
             None
         };
 
-        // Init Disk Cache
-        let disk_cache = DiskCache::new(cache_dir, cache_size)?;
-
-        // Init Writeback Manager
-        let (writeback, upload_rx) = WritebackManager::new(cache_dir, disk_cache.clone());
+        // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
+        let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
+        let (block_cache, upload_rx) = BlockCache::open(cache_config)
+            .map_err(|e| VfsError::Io(e))?;
+        block_cache.spawn_background_tasks();
 
         // Init ReadAhead tracker + prefetch channel
         let readahead = Arc::new(ReadAheadTracker::new(32));
         let dir_prefetch = Arc::new(DirAccessTracker::new(2));
         let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
 
-        // Dirty-write memory buffer + background slab flusher channel.
+        // Dirty-write memory buffer + background flusher channel.
         let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let vfs = Arc::new(Self {
             meta,
             data,
-            disk_cache,
-            writeback,
-            mem_cache,
+            block_cache,
             block_size,
             data_prefix,
             state: Arc::new(VfsState {
                 pending_blocks: Mutex::new(std::collections::HashMap::new()),
                 dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                 attr_read_cache: Mutex::new(std::collections::HashMap::new()),
-                pending_upload_data: Mutex::new(std::collections::HashMap::new()),
                 inflight_fetches: Mutex::new(std::collections::HashMap::new()),
                 dirty_mem: Mutex::new(std::collections::HashMap::new()),
                 dirty_bytes: AtomicUsize::new(0),
@@ -706,8 +699,6 @@ impl StudioVfs {
                 lock_notify: tokio::sync::Notify::new(),
             }),
             upload_semaphore: Arc::new(Semaphore::new(128)),
-            upload_retries: 3,
-            store_decompressed: true,
             readahead: readahead.clone(),
             dir_prefetch,
             prefetch_tx,
@@ -719,8 +710,6 @@ impl StudioVfs {
             janitor_skip_newer_than,
             janitor_max_deletes_per_run,
             janitor_lease_ttl,
-            remote_read_timeout,
-            remote_read_retries,
             read_concurrency,
             prefetch_concurrency,
             dir_prefetch_max_batch,
@@ -812,7 +801,7 @@ impl StudioVfs {
 
         let create_payload = Self::encode_lease_record(&lease.owner_id, lease_until, 1);
         let mut create_opts = WriteOptions::default();
-        create_opts.if_none_match = Some("*".to_string());
+        create_opts.if_not_exists = true;
         match lease
             .op
             .write_options(&lease.lock_path, create_payload, create_opts)
@@ -1328,20 +1317,13 @@ impl StudioVfs {
         debug!("open_file ino={} fh={} flags={:#x}", ino, fh, flags.bits());
 
         // Eager prefetch: when opening a regular file for reading, schedule
-        // background prefetch of the first N blocks.  This hides S3 latency
-        // for the common open→sequential-read pattern so the first read()
-        // finds data already in cache.
+        // background prefetch of the first block to hide initial S3 latency.
         if attr.kind == studiofs_meta::types::FileType::RegularFile
             && attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
         {
-            let total_blocks =
-                ((attr.size + self.block_size as u64 - 1) / self.block_size as u64) as u32;
-            let prefetch_count = total_blocks.min(16); // first 16 blocks = 16 MB
-            for block_idx in 0..prefetch_count {
-                if self.readahead.start_prefetch(ino, block_idx) {
-                    let _ = self.prefetch_tx.send((ino, block_idx));
-                }
+            if self.readahead.start_prefetch(ino, 0) {
+                let _ = self.prefetch_tx.send((ino, 0));
             }
         }
 
@@ -1383,7 +1365,6 @@ impl StudioVfs {
                     .lock()
                     .retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids);
-                self.disk_cache.cleanup_empty_slabs();
             }
 
             // Decrement USED_SPACE for orphan cleanup
@@ -1733,13 +1714,13 @@ impl StudioVfs {
 
                 // Remove all blocks and mark for GC
                 let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
-                let cache_size_before = self.disk_cache.current_size();
+                let l2_before = self.block_cache.l2_bytes();
                 info!(
-                    "unlink ino={}: removed {} block refs, object_ids={:?}, cache_size_before={}",
+                    "unlink ino={}: removed {} block refs, object_ids={:?}, l2_before={}",
                     attr.ino,
                     removed_ids.len(),
                     removed_ids,
-                    cache_size_before,
+                    l2_before,
                 );
 
                 // Add to pending deletions (for eventual S3 deletion via background GC)
@@ -1768,16 +1749,12 @@ impl StudioVfs {
                 // Immediately evict all cached blocks for this inode — no need to wait for GC.
                 self.evict_inode_from_caches(attr.ino, &removed_ids);
 
-                // Delete empty slab files so physical disk space is reclaimed.
-                let slabs_deleted = self.disk_cache.cleanup_empty_slabs();
-
-                let cache_size_after = self.disk_cache.current_size();
+                let l2_after = self.block_cache.l2_bytes();
                 info!(
-                    "unlink ino={}: cache_size_after={}, freed={} bytes, slabs_deleted={}",
+                    "unlink ino={}: l2_after={}, freed={} bytes",
                     attr.ino,
-                    cache_size_after,
-                    cache_size_before.saturating_sub(cache_size_after),
-                    slabs_deleted,
+                    l2_after,
+                    l2_before.saturating_sub(l2_after),
                 );
 
                 // Clear dirty attrs and read-through cache
@@ -1842,7 +1819,6 @@ impl StudioVfs {
                     .lock()
                     .retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids);
-                self.disk_cache.cleanup_empty_slabs();
             }
 
             // Decrement USED_SPACE for removed blocks
@@ -1872,12 +1848,7 @@ impl StudioVfs {
     /// Called by `unlink()` so that deleted file data is no longer occupying
     /// disk / RAM space without waiting for the next background GC run.
     fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
-        // L1 — in-memory LRU: remove all blocks for this inode in one pass.
-        if let Some(mc) = &self.mem_cache {
-            mc.invalidate_inode(ino);
-        }
-
-        // L1.5 — dirty memory buffer (Phase 5): drain blocks buffered post-flush.
+        // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
         {
             let mut dirty = self.state.dirty_mem.lock();
             let removed_bytes: usize = dirty
@@ -1900,34 +1871,23 @@ impl StudioVfs {
             }
         }
 
-        // L2 — slab disk cache: remove by object_id (O(1) HashMap lookup each).
-        let mut l2_evicted = 0;
-        let mut l2_skipped_pinned = 0;
+        // L1 + L2 — unified block cache: remove each object,
+        // but skip blocks that are pinned (pending upload — let upload complete first).
+        let mut evicted = 0;
+        let mut skipped_pinned = 0;
         for &object_id in object_ids {
-            if self.disk_cache.is_pinned(object_id) {
-                l2_skipped_pinned += 1;
+            if self.block_cache.is_pinned(object_id) {
+                skipped_pinned += 1;
                 continue;
             }
-            if self.disk_cache.exists(object_id) {
-                self.disk_cache.remove_object_sync(object_id);
-                l2_evicted += 1;
-            }
+            self.block_cache.remove_sync(object_id);
+            evicted += 1;
         }
-        if l2_evicted > 0 || l2_skipped_pinned > 0 {
+        if evicted > 0 || skipped_pinned > 0 {
             debug!(
-                "evict_inode L2: ino={} evicted {} objects from slab cache, skipped pinned={}",
-                ino, l2_evicted, l2_skipped_pinned
+                "evict_inode: ino={} evicted {} blocks, skipped pinned={}",
+                ino, evicted, skipped_pinned
             );
-        }
-
-        // Clean up pre-compressed upload data stashed for these objects.
-        {
-            let mut upload_data = self.state.pending_upload_data.lock();
-            for &object_id in object_ids {
-                if !self.disk_cache.is_pinned(object_id) {
-                    upload_data.remove(&object_id);
-                }
-            }
         }
 
         // Cancel any coalesced in-flight S3 fetches for this inode.
@@ -1945,12 +1905,6 @@ impl StudioVfs {
     /// Called by `truncate_blocks()` for each block that is removed by a
     /// truncation.
     fn evict_block_from_caches(&self, ino: Ino, block_index: u32, object_id: u64) {
-        // L1 — in-memory LRU.
-        if let Some(mc) = &self.mem_cache {
-            let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
-            mc.remove(&mem_key);
-        }
-
         // L1.5 — dirty memory buffer.
         {
             let mut dirty = self.state.dirty_mem.lock();
@@ -1964,19 +1918,14 @@ impl StudioVfs {
             }
         }
 
-        // L2 — slab disk cache.
-        if self.disk_cache.is_pinned(object_id) {
+        // L1 + L2 — unified block cache (skip if pinned for pending upload).
+        if self.block_cache.is_pinned(object_id) {
             debug!(
-                "evict_block L2: skip pinned object_id={} ino={} block={}",
+                "evict_block: skip pinned object_id={} ino={} block={}",
                 object_id, ino, block_index
             );
         } else {
-            self.disk_cache.remove_object_sync(object_id);
-        }
-
-        // Pending upload payload must stay until upload completion if pinned.
-        if !self.disk_cache.is_pinned(object_id) {
-            self.state.pending_upload_data.lock().remove(&object_id);
+            self.block_cache.remove_sync(object_id);
         }
 
         // Cancel in-flight S3 fetch for this specific block.
@@ -2156,16 +2105,15 @@ impl StudioVfs {
     /// Like `read_block()` but silently ignores errors and always marks the
     /// readahead inflight state as done when finished.
     async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
-        // Skip if already in memory cache (hot L1 check before any I/O)
-        let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
-        if let Some(mc) = &self.mem_cache
-            && mc.get(&mem_key).is_some()
-        {
-            self.readahead.finish_prefetch(ino, block_index);
-            return;
+        // Skip if block is already cached (L1 or L2) — avoid any S3 I/O.
+        if let Ok(Some(block_ref)) = self.meta.get_file_block(ino, block_index) {
+            if self.block_cache.contains(block_ref.object_id) {
+                self.readahead.finish_prefetch(ino, block_index);
+                return;
+            }
         }
 
-        // Fetch from disk cache or S3 (read_block handles all cache levels)
+        // Fetch from cache or S3 (read_block handles all cache levels)
         let _ = self.read_block(ino, block_index).await;
         self.readahead.finish_prefetch(ino, block_index);
     }
@@ -2175,6 +2123,12 @@ impl StudioVfs {
     /// When multiple concurrent reads target the same block (common with OS readahead),
     /// only the first request fetches from S3. Subsequent requests wait for the first
     /// to complete and then read from the now-populated cache.
+    ///
+    /// Safety: the check-and-insert into `inflight_fetches` is performed under
+    /// a single lock acquisition to prevent a TOCTOU race where two tasks both
+    /// see "no in-flight fetch" and both register as fetchers.  A `Drop` guard
+    /// ensures the map entry is cleaned up even if the fetch panics, so other
+    /// waiters receive `RecvError::Closed` and retry instead of hanging forever.
     async fn read_block(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
         // Get block reference from metadata
         let block_ref = self
@@ -2182,157 +2136,84 @@ impl StudioVfs {
             .get_file_block(ino, block_index)?
             .ok_or(VfsError::BlockNotFound(ino, block_index))?;
 
-        let mem_key = CacheKey::new(ino, block_index as u64 * self.block_size as u64);
-
-        // L1: Try memory cache first
-        if let Some(mc) = &self.mem_cache
-            && let Some(cached) = mc.get(&mem_key)
-        {
+        // L1 + L2: unified cache lookup (BlockCache handles promotion internally)
+        if let Some(cached) = self.block_cache.get(block_ref.object_id).await {
             return Ok(cached);
         }
 
-        // L2: Try disk cache
-        if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
-            let result = if self.store_decompressed {
-                cached
-            } else {
-                Bytes::from(read_object(&cached)?)
-            };
-            if let Some(mc) = &self.mem_cache {
-                mc.put(mem_key, result.clone());
-            }
-            return Ok(result);
-        }
-
         // L3: Fetch from S3 with in-flight coalescing
+        //
+        // The check *and* insert into the inflight map happen under one lock
+        // acquisition so that exactly one task becomes the fetcher for a given
+        // (ino, block_index).  All other concurrent readers subscribe to the
+        // broadcast channel and wait.
         loop {
-            // Check if another task is already fetching this block
-            let maybe_rx = {
-                let inflight = self.state.inflight_fetches.lock();
-                inflight.get(&(ino, block_index)).map(|tx| tx.subscribe())
+            let wait_rx = {
+                let mut inflight = self.state.inflight_fetches.lock();
+                if let Some(tx) = inflight.get(&(ino, block_index)) {
+                    Some(tx.subscribe())
+                } else {
+                    let (tx, _) = broadcast::channel::<()>(1);
+                    inflight.insert((ino, block_index), tx);
+                    None
+                }
             };
 
-            if let Some(mut rx) = maybe_rx {
-                // Another task is fetching this block — wait for completion
-                let _ = rx.recv().await;
+            if let Some(mut rx) = wait_rx {
+                let _recv = tokio::time::timeout(
+                    Duration::from_secs(300),
+                    rx.recv(),
+                )
+                .await;
 
-                // Re-check caches (should now be populated)
-                if let Some(mc) = &self.mem_cache
-                    && let Some(cached) = mc.get(&mem_key)
-                {
+                // Re-check cache (should now be populated)
+                if let Some(cached) = self.block_cache.get(block_ref.object_id).await {
                     return Ok(cached);
                 }
-                if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
-                    let result = if self.store_decompressed {
-                        cached
-                    } else {
-                        Bytes::from(read_object(&cached)?)
-                    };
-                    if let Some(mc) = &self.mem_cache {
-                        mc.put(mem_key, result.clone());
-                    }
-                    return Ok(result);
-                }
-                // Original fetch failed — loop and try to become the fetcher ourselves
+                // Fetch failed or timed out — loop and try to become fetcher.
                 continue;
             }
 
-            // No in-flight fetch — register ourselves as the fetcher
-            let (tx, _) = broadcast::channel::<()>(1);
-            self.state
-                .inflight_fetches
-                .lock()
-                .insert((ino, block_index), tx.clone());
+            // ── We are the fetcher ──────────────────────────────────────
+            let guard = InFlightGuard {
+                key: (ino, block_index),
+                inflight: &self.state.inflight_fetches,
+                active: true,
+            };
 
-            // Cold prefetch: when we hit S3 for the first time, eagerly schedule
-            // prefetches for the next N blocks so that subsequent reads don't
-            // stall.  This fires before the actual fetch so prefetches run in
-            // parallel with this request.
-            {
-                let cold_ahead = (self.readahead.width as u32).min(16);
-                for i in 1..=cold_ahead {
-                    if let Some(next_block) = block_index.checked_add(i) {
-                        if self.readahead.start_prefetch(ino, next_block) {
-                            let _ = self.prefetch_tx.send((ino, next_block));
-                        }
-                    }
-                }
-            }
-
-            // Fetch from S3
+            // Fetch from S3, decompress, store decompressed in cache
             let result = async {
                 let key = format_object_key(&self.data_prefix, block_ref.object_id);
                 let compressed = self.get_remote_object_with_retry(&key).await?;
                 let decompressed = Bytes::from(read_object(&compressed)?);
 
-                if self.store_decompressed {
-                    self.disk_cache
-                        .put_object(block_ref.object_id, &decompressed)
-                        .await?;
-                } else {
-                    self.disk_cache
-                        .put_object(block_ref.object_id, &compressed)
-                        .await?;
-                }
-
-                if let Some(mc) = &self.mem_cache {
-                    mc.put(mem_key, decompressed.clone());
-                }
+                // Always cache decompressed data (re-compress at upload time)
+                self.block_cache
+                    .put(block_ref.object_id, decompressed.clone())
+                    .await
+                    .map_err(VfsError::Io)?;
 
                 Ok::<Bytes, VfsError>(decompressed)
             }
             .await;
 
-            // Clean up and notify waiters (regardless of success/failure)
-            self.state
-                .inflight_fetches
-                .lock()
-                .remove(&(ino, block_index));
-            let _ = tx.send(());
+            // Normal completion — notify waiters, then defuse the guard.
+            if let Some(tx) = self.state.inflight_fetches.lock().remove(&(ino, block_index)) {
+                let _ = tx.send(());
+            }
+            guard.defuse();
 
             return result;
         }
     }
 
+    /// Fetch a remote object, relying on OpenDAL's `TimeoutLayer` and
+    /// `RetryLayer` for timeout / transient-error handling.
     async fn get_remote_object_with_retry(&self, key: &str) -> VfsResult<Bytes> {
-        let mut attempt: u32 = 0;
-        loop {
-            match tokio::time::timeout(self.remote_read_timeout, self.data.get_by_key(key)).await {
-                Ok(Ok(bytes)) => return Ok(bytes),
-                Ok(Err(e)) => {
-                    if attempt >= self.remote_read_retries {
-                        return Err(VfsError::Data(e));
-                    }
-                    warn!(
-                        attempt = attempt + 1,
-                        retries = self.remote_read_retries,
-                        key,
-                        error = %e,
-                        "remote read failed, retrying"
-                    );
-                }
-                Err(_) => {
-                    if attempt >= self.remote_read_retries {
-                        return Err(VfsError::Other(format!(
-                            "timeout while reading remote object key={} after {}ms",
-                            key,
-                            self.remote_read_timeout.as_millis()
-                        )));
-                    }
-                    warn!(
-                        attempt = attempt + 1,
-                        retries = self.remote_read_retries,
-                        key,
-                        timeout_ms = self.remote_read_timeout.as_millis() as u64,
-                        "remote read timed out, retrying"
-                    );
-                }
-            }
-
-            attempt = attempt.saturating_add(1);
-            let backoff_ms = 150u64.saturating_mul(1u64 << attempt.min(5));
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        }
+        self.data
+            .get_by_key(key)
+            .await
+            .map_err(VfsError::Data)
     }
 
     // =========================================================================
@@ -2341,7 +2222,7 @@ impl StudioVfs {
 
     /// Write data to a file at the given offset.
     ///
-    /// Full blocks are flushed eagerly (compress + cache + writeback submit) so that
+    /// Full blocks are flushed eagerly (compress + cache + upload submit) so that
     /// the final `flush()` only handles the last partial block, eliminating the
     /// end-of-write stall where all blocks were previously processed at once.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
@@ -2469,30 +2350,20 @@ impl StudioVfs {
             None => return Ok(None),
         };
 
-        // Try disk cache first
-        if let Some(cached) = self.disk_cache.get_object(block_ref.object_id).await? {
-            if self.store_decompressed {
-                return Ok(Some(cached));
-            } else {
-                let decompressed = read_object(&cached)?;
-                return Ok(Some(Bytes::from(decompressed)));
-            }
+        // Try unified cache (L1 + L2)
+        if let Some(cached) = self.block_cache.get(block_ref.object_id).await {
+            return Ok(Some(cached));
         }
 
-        // Fetch from S3
+        // Fetch from S3, decompress, cache decompressed
         let key = format_object_key(&self.data_prefix, block_ref.object_id);
         let compressed = self.get_remote_object_with_retry(&key).await?;
         let decompressed = Bytes::from(read_object(&compressed)?);
 
-        if self.store_decompressed {
-            self.disk_cache
-                .put_object(block_ref.object_id, &decompressed)
-                .await?;
-        } else {
-            self.disk_cache
-                .put_object(block_ref.object_id, &compressed)
-                .await?;
-        }
+        self.block_cache
+            .put(block_ref.object_id, decompressed.clone())
+            .await
+            .map_err(VfsError::Io)?;
 
         Ok(Some(decompressed))
     }
@@ -2562,36 +2433,17 @@ impl StudioVfs {
         let object_id = self.meta.next_block_id()?;
 
         // Create compressed STFS object (needed for S3 upload in all cases)
-        let compressed = Bytes::from(create_object(&data)?);
+        let _compressed = Bytes::from(create_object(&data)?);
 
-        if self.store_decompressed {
-            // Cache the decompressed block — no decompress needed on future cache hits.
-            // The compressed version is stashed in pending_upload_data until upload completes.
-            self.disk_cache.put_object(object_id, &data).await?;
-            self.state
-                .pending_upload_data
-                .lock()
-                .insert(object_id, compressed);
-            if let Some(mc) = &self.mem_cache {
-                mc.put(
-                    CacheKey::new(ino, block_index as u64 * self.block_size as u64),
-                    data.clone(),
-                );
-            }
-        } else {
-            // Cache the compressed STFS object (traditional path)
-            self.disk_cache.put_object(object_id, &compressed).await?;
-            if let Some(mc) = &self.mem_cache {
-                mc.put(
-                    CacheKey::new(ino, block_index as u64 * self.block_size as u64),
-                    data.clone(),
-                );
-            }
-        }
+        // Cache the decompressed block (re-compress at upload time).
+        self.block_cache
+            .put(object_id, data.clone())
+            .await
+            .map_err(VfsError::Io)?;
 
-        // Submit to writeback queue (synchronous — no disk I/O; see WritebackManager).
+        // Submit to upload queue (writes journal file + sends to upload worker).
         let file_offset = block_index as u64 * self.block_size as u64;
-        self.writeback.submit(ino, file_offset, object_id);
+        self.block_cache.submit_upload(ino, file_offset, object_id);
 
         // Create block reference
         let flags = if is_partial {
@@ -2739,7 +2591,7 @@ impl StudioVfs {
     /// Background task to process pending uploads.
     async fn background_uploader(
         self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingOp>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
     ) {
         info!("background uploader started");
 
@@ -2752,7 +2604,7 @@ impl StudioVfs {
                 if let Err(e) = vfs.process_upload(op, permit).await {
                     warn!("upload processing error, will requeue: {}", e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    if !vfs.writeback.requeue(retry_op) {
+                    if !vfs.block_cache.requeue_upload(retry_op) {
                         error!("failed to requeue upload op after error");
                     }
                 }
@@ -2761,9 +2613,7 @@ impl StudioVfs {
     }
 
     async fn background_remote_warmup(self: Arc<Self>) {
-        let timeout = self
-            .remote_read_timeout
-            .saturating_add(Duration::from_secs(2));
+        let timeout = Duration::from_secs(15);
         match tokio::time::timeout(timeout, self.data.check()).await {
             Ok(Ok(())) => {
                 debug!("remote data path warmup completed");
@@ -2782,72 +2632,31 @@ impl StudioVfs {
 
     /// Process a single upload operation.
     ///
-    /// OpenDAL's `TimeoutLayer` handles per-operation timeouts and `RetryLayer`
-    /// handles transient error retries with exponential backoff.  We only add a
-    /// thin application retry for the case where even the retried operation
-    /// fails (e.g. sustained outage).
+    /// The cache always stores decompressed data; we re-compress (LZ4) here
+    /// before uploading to S3.  OpenDAL's `TimeoutLayer` + `RetryLayer`
+    /// handle per-operation timeouts and transient error retries.
     async fn process_upload(
         &self,
-        op: PendingOp,
+        op: PendingUpload,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) -> VfsResult<()> {
-        // Get the compressed STFS object to upload.
-        // When store_decompressed=true the disk cache holds raw bytes, so we use
-        // the pre-compressed data stashed in pending_upload_data instead.
-        // Fallback: re-compress from disk cache (handles restarts / edge-cases).
-        let data: Bytes = if self.store_decompressed {
-            let stashed = self.state.pending_upload_data.lock().remove(&op.object_id);
-            if let Some(compressed) = stashed {
-                compressed
-            } else {
-                let decompressed =
-                    self.disk_cache
-                        .get_object(op.object_id)
-                        .await?
-                        .ok_or_else(|| {
-                            VfsError::Other(format!(
-                                "object {} missing from disk cache",
-                                op.object_id
-                            ))
-                        })?;
-                Bytes::from(create_object(&decompressed)?)
-            }
-        } else {
-            self.disk_cache
-                .get_object(op.object_id)
-                .await?
-                .ok_or_else(|| {
-                    VfsError::Other(format!("object {} missing from disk cache", op.object_id))
-                })?
-        };
+        // Read decompressed block from cache, then re-compress for S3.
+        let decompressed = self
+            .block_cache
+            .get(op.object_id)
+            .await
+            .ok_or_else(|| {
+                VfsError::Other(format!(
+                    "object {} missing from cache",
+                    op.object_id
+                ))
+            })?;
+        let compressed = Bytes::from(create_object(&decompressed)?);
 
         let key = format_object_key(&self.data_prefix, op.object_id);
+        self.data.put_by_key(&key, compressed).await?;
 
-        // Application-level retry loop.  OpenDAL RetryLayer handles transient
-        // errors internally; this outer loop covers sustained failures across
-        // the full retry budget (e.g. prolonged network partition).
-        let mut retries = 0u32;
-        loop {
-            match self.data.put_by_key(&key, data.clone()).await {
-                Ok(_) => break,
-                Err(e) => {
-                    retries += 1;
-                    if retries > self.upload_retries {
-                        return Err(VfsError::Data(e));
-                    }
-                    warn!(
-                        retries,
-                        object_id = op.object_id,
-                        key,
-                        error = %e,
-                        "upload failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_secs(1 << retries)).await;
-                }
-            }
-        }
-
-        self.writeback.complete(&op);
+        self.block_cache.complete_upload(&op);
         debug!("background upload complete: {}", op.object_id);
         Ok(())
     }
@@ -2936,6 +2745,7 @@ impl StudioVfs {
                 );
                 continue;
             }
+
 
             let referenced = match self.meta.get_referenced_object_ids() {
                 Ok(v) => v,
@@ -3056,16 +2866,12 @@ impl StudioVfs {
 
     fn invalidate_inode_read_caches(&self, ino: Ino) {
         self.state.attr_read_cache.lock().remove(&ino);
-        if let Some(mc) = &self.mem_cache {
-            mc.invalidate_inode(ino);
-        }
+        // Block data doesn't need explicit invalidation — blocks are immutable.
+        // The metadata engine will return updated block refs on next read.
     }
 
     fn invalidate_all_read_caches(&self) {
         self.state.attr_read_cache.lock().clear();
-        if let Some(mc) = &self.mem_cache {
-            mc.clear();
-        }
     }
 
     async fn background_invalidation_listener(self: Arc<Self>, bus: InvalidationBus) {
@@ -3117,17 +2923,12 @@ impl StudioVfs {
         }
     }
 
-    /// Persist the disk cache index to disk.
+    /// Persist the cache checkpoint to disk.
     ///
-    /// Should be called before unmounting so the slab index survives across
-    /// remounts. The `Drop` impl on `SlabStore` also persists on exit, but
-    /// calling this explicitly gives a clean, logged persist at a known point.
-    pub fn persist_cache(&self) {
-        if let Err(e) = self.disk_cache.persist() {
-            error!("failed to persist disk cache on shutdown: {}", e);
-        } else {
-            tracing::info!("disk cache index persisted");
-        }
+    /// Called at shutdown so the LRU state survives across remounts.
+    pub async fn persist_cache(&self) {
+        self.block_cache.shutdown().await;
+        tracing::info!("block cache checkpoint persisted");
     }
 
     async fn flush_pending_blocks_for_shutdown(&self) {
@@ -3155,25 +2956,31 @@ impl StudioVfs {
     }
 
     async fn reconcile_remote_completed_pending(&self) -> usize {
-        let pending_ops = self.writeback.snapshot_pending_ops();
+        let pending_ops = self.block_cache.snapshot_pending_uploads();
         if pending_ops.is_empty() {
             return 0;
         }
 
         let mut reconciled = 0usize;
-        for op in pending_ops {
+        for op in &pending_ops {
             let key = format_object_key(&self.data_prefix, op.object_id);
-            match self.data.exists(&key).await {
-                Ok(true) => {
-                    self.writeback.complete(&op);
+            match tokio::time::timeout(Duration::from_secs(5), self.data.exists(&key)).await {
+                Ok(Ok(true)) => {
+                    self.block_cache.complete_upload(op);
                     reconciled += 1;
                 }
-                Ok(false) => {}
-                Err(e) => {
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
                     debug!(
                         object_id = op.object_id,
                         error = %e,
                         "VFS shutdown: remote reconcile exists() failed"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        object_id = op.object_id,
+                        "VFS shutdown: remote reconcile exists() timed out, skipping"
                     );
                 }
             }
@@ -3187,8 +2994,8 @@ impl StudioVfs {
         reconciled
     }
 
-    /// Best-effort graceful shutdown: drain dirty buffers, flush journal writes,
-    /// wait for uploader queue to quiesce, then persist cache metadata.
+    /// Best-effort graceful shutdown: drain dirty buffers, wait for pending
+    /// uploads to complete, then persist cache checkpoint.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         info!("VFS shutdown: flushing pending write buffer");
         self.flush_pending_blocks_for_shutdown().await;
@@ -3196,34 +3003,33 @@ impl StudioVfs {
         info!("VFS shutdown: draining dirty memory buffer");
         self.drain_dirty_mem().await;
 
-        info!("VFS shutdown: flushing journal writer queue");
-        self.writeback.flush_journal().await;
-
-        if self.writeback.pending_count() > 0 {
+        if self.block_cache.pending_upload_count() > 0 {
             let reconciled = self.reconcile_remote_completed_pending().await;
             if reconciled > 0 {
-                self.writeback.flush_journal().await;
+                info!(reconciled, "VFS shutdown: reconciled already-uploaded blocks");
             }
         }
 
-        let mut drained = self.writeback.wait_for_idle(upload_drain_timeout).await;
+        let mut drained = self
+            .block_cache
+            .wait_for_uploads_idle(upload_drain_timeout)
+            .await;
         if !drained {
             let reconciled = self.reconcile_remote_completed_pending().await;
             if reconciled > 0 {
-                self.writeback.flush_journal().await;
                 drained = self
-                    .writeback
-                    .wait_for_idle(Duration::from_millis(250))
+                    .block_cache
+                    .wait_for_uploads_idle(Duration::from_millis(250))
                     .await;
             }
         }
 
         if !drained {
-            let pending_ops = self.writeback.snapshot_pending_ops();
+            let pending_ops = self.block_cache.snapshot_pending_uploads();
             let sample_object_ids: Vec<u64> =
                 pending_ops.iter().take(8).map(|op| op.object_id).collect();
             warn!(
-                pending = self.writeback.pending_count(),
+                pending = self.block_cache.pending_upload_count(),
                 pending_journal_files = pending_ops.len(),
                 pending_object_ids_sample = ?sample_object_ids,
                 timeout_ms = upload_drain_timeout.as_millis() as u64,
@@ -3231,12 +3037,10 @@ impl StudioVfs {
             );
         }
 
-        // Flush completion journal removals enqueued during the final upload drain.
-        self.writeback.flush_journal().await;
         if let Err(e) = self.meta.flush_metadata() {
             warn!("VFS shutdown: metadata flush failed: {}", e);
         }
-        self.persist_cache();
+        self.persist_cache().await;
     }
 }
 
