@@ -1,7 +1,7 @@
 //! Core VFS implementation — Block-based architecture.
 //!
 //! Key design:
-//! - Files are split into fixed-size blocks (default 4MB)
+//! - Files are split into fixed-size blocks (default 1MB)
 //! - Each block has a sequential ID (not content hash)
 //! - Blocks are immutable - never modified, only created/deleted
 //! - No deduplication = no reference counting overhead
@@ -156,7 +156,6 @@ const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
 const DEFAULT_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REMOTE_READ_RETRIES: u32 = 3;
-const DEFAULT_REMOTE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_READ_CONCURRENCY: usize = 16;
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
@@ -194,7 +193,7 @@ pub struct VfsConfig {
     pub cache_dir: String,
     /// Maximum disk cache size in bytes.
     pub cache_size: u64,
-    /// Block size in bytes (default 4MB).
+    /// Block size in bytes (default 1MB).
     pub block_size: u32,
     /// Maximum concurrent uploads.
     pub max_concurrent_uploads: usize,
@@ -205,8 +204,8 @@ pub struct VfsConfig {
     /// but is a net win for low-compressibility content (VFX, compressed media).
     pub store_decompressed: bool,
     /// Number of blocks to prefetch ahead when a sequential access pattern is
-    /// detected.  0 disables read-ahead entirely.  Default: 32 (= 128 MB with
-    /// 4 MB blocks).
+    /// detected.  0 disables read-ahead entirely.  Default: 32 (= 32 MB with
+    /// 1 MB blocks).
     pub readahead_width: u32,
     /// Maximum bytes to hold in the dirty-write memory buffer before applying
     /// backpressure.  This buffer stores blocks that `flush()` has accepted
@@ -222,7 +221,7 @@ impl Default for VfsConfig {
             cache_dir: String::new(),
             cache_size: DEFAULT_DISK_CACHE_SIZE,
             block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
-            max_concurrent_uploads: 32,
+            max_concurrent_uploads: 128,
             upload_retries: 3,
             store_decompressed: true,
             readahead_width: 32,
@@ -481,7 +480,6 @@ pub struct StudioVfs {
     janitor_lease_ttl: Duration,
     remote_read_timeout: Duration,
     remote_read_retries: u32,
-    remote_upload_timeout: Duration,
     read_concurrency: usize,
     prefetch_concurrency: usize,
     dir_prefetch_max_batch: usize,
@@ -554,13 +552,6 @@ impl StudioVfs {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_REMOTE_READ_RETRIES);
-        let remote_upload_timeout = Duration::from_secs(
-            std::env::var("STUDIOFS_REMOTE_UPLOAD_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_REMOTE_UPLOAD_TIMEOUT.as_secs()),
-        );
         let read_concurrency = std::env::var("STUDIOFS_READ_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -714,7 +705,7 @@ impl StudioVfs {
                 file_locks: Mutex::new(std::collections::HashMap::new()),
                 lock_notify: tokio::sync::Notify::new(),
             }),
-            upload_semaphore: Arc::new(Semaphore::new(32)),
+            upload_semaphore: Arc::new(Semaphore::new(128)),
             upload_retries: 3,
             store_decompressed: true,
             readahead: readahead.clone(),
@@ -730,7 +721,6 @@ impl StudioVfs {
             janitor_lease_ttl,
             remote_read_timeout,
             remote_read_retries,
-            remote_upload_timeout,
             read_concurrency,
             prefetch_concurrency,
             dir_prefetch_max_batch,
@@ -1347,7 +1337,7 @@ impl StudioVfs {
         {
             let total_blocks =
                 ((attr.size + self.block_size as u64 - 1) / self.block_size as u64) as u32;
-            let prefetch_count = total_blocks.min(16); // first 16 blocks = 64 MB
+            let prefetch_count = total_blocks.min(16); // first 16 blocks = 16 MB
             for block_idx in 0..prefetch_count {
                 if self.readahead.start_prefetch(ino, block_idx) {
                     let _ = self.prefetch_tx.send((ino, block_idx));
@@ -2754,10 +2744,12 @@ impl StudioVfs {
         info!("background uploader started");
 
         while let Some(op) = rx.recv().await {
+            // Acquire permit *before* spawning to bound in-flight tasks.
+            let permit = self.upload_semaphore.clone().acquire_owned().await.unwrap();
             let vfs = self.clone();
             let retry_op = op.clone();
             tokio::spawn(async move {
-                if let Err(e) = vfs.process_upload(op).await {
+                if let Err(e) = vfs.process_upload(op, permit).await {
                     warn!("upload processing error, will requeue: {}", e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     if !vfs.writeback.requeue(retry_op) {
@@ -2789,20 +2781,25 @@ impl StudioVfs {
     }
 
     /// Process a single upload operation.
-    async fn process_upload(&self, op: PendingOp) -> VfsResult<()> {
-        let _permit = self.upload_semaphore.acquire().await.unwrap();
-
+    ///
+    /// OpenDAL's `TimeoutLayer` handles per-operation timeouts and `RetryLayer`
+    /// handles transient error retries with exponential backoff.  We only add a
+    /// thin application retry for the case where even the retried operation
+    /// fails (e.g. sustained outage).
+    async fn process_upload(
+        &self,
+        op: PendingOp,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> VfsResult<()> {
         // Get the compressed STFS object to upload.
         // When store_decompressed=true the disk cache holds raw bytes, so we use
         // the pre-compressed data stashed in pending_upload_data instead.
         // Fallback: re-compress from disk cache (handles restarts / edge-cases).
         let data: Bytes = if self.store_decompressed {
-            // First try the pre-compressed stash (zero extra work)
             let stashed = self.state.pending_upload_data.lock().remove(&op.object_id);
             if let Some(compressed) = stashed {
                 compressed
             } else {
-                // Fallback: the stash was lost (e.g. process restart) — re-compress
                 let decompressed =
                     self.disk_cache
                         .get_object(op.object_id)
@@ -2816,7 +2813,6 @@ impl StudioVfs {
                 Bytes::from(create_object(&decompressed)?)
             }
         } else {
-            // Disk cache holds compressed STFS object directly
             self.disk_cache
                 .get_object(op.object_id)
                 .await?
@@ -2825,79 +2821,32 @@ impl StudioVfs {
                 })?
         };
 
-        // Format S3 key
         let key = format_object_key(&self.data_prefix, op.object_id);
 
-        // Check if already exists (optimistic)
-        let needs_upload =
-            match tokio::time::timeout(self.remote_upload_timeout, self.data.exists(&key)).await {
-                Ok(Ok(exists)) => !exists,
-                Ok(Err(e)) => {
+        // Application-level retry loop.  OpenDAL RetryLayer handles transient
+        // errors internally; this outer loop covers sustained failures across
+        // the full retry budget (e.g. prolonged network partition).
+        let mut retries = 0u32;
+        loop {
+            match self.data.put_by_key(&key, data.clone()).await {
+                Ok(_) => break,
+                Err(e) => {
+                    retries += 1;
+                    if retries > self.upload_retries {
+                        return Err(VfsError::Data(e));
+                    }
                     warn!(
+                        retries,
                         object_id = op.object_id,
                         key,
                         error = %e,
-                        "upload preflight exists() failed, proceeding with upload"
+                        "upload failed, retrying"
                     );
-                    true
-                }
-                Err(_) => {
-                    warn!(
-                        object_id = op.object_id,
-                        key,
-                        timeout_ms = self.remote_upload_timeout.as_millis() as u64,
-                        "upload preflight exists() timed out, proceeding with upload"
-                    );
-                    true
-                }
-            };
-
-        if needs_upload {
-            // Retry loop
-            let mut retries = 0;
-            loop {
-                match tokio::time::timeout(
-                    self.remote_upload_timeout,
-                    self.data.put_by_key(&key, data.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) => {
-                        retries += 1;
-                        if retries > self.upload_retries {
-                            return Err(VfsError::Data(e));
-                        }
-                        warn!(
-                            "upload retry {} for {} ({}): {}",
-                            retries, op.object_id, key, e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
-                    }
-                    Err(_) => {
-                        retries += 1;
-                        if retries > self.upload_retries {
-                            return Err(VfsError::Other(format!(
-                                "timeout while uploading object {} key={} after {}ms",
-                                op.object_id,
-                                key,
-                                self.remote_upload_timeout.as_millis()
-                            )));
-                        }
-                        warn!(
-                            retries,
-                            object_id = op.object_id,
-                            key,
-                            timeout_ms = self.remote_upload_timeout.as_millis() as u64,
-                            "upload timed out, retrying"
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
-                    }
+                    tokio::time::sleep(Duration::from_secs(1 << retries)).await;
                 }
             }
         }
 
-        // Mark complete
         self.writeback.complete(&op);
         debug!("background upload complete: {}", op.object_id);
         Ok(())

@@ -16,8 +16,8 @@ use std::time::SystemTime;
 // Constants
 // =============================================================================
 
-/// Default block size: 4 MiB (configurable at volume init).
-pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
+/// Default block size: 1 MiB (configurable at volume init).
+pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024;
 
 /// Root inode number.
 pub const ROOT_INO: Ino = 1;

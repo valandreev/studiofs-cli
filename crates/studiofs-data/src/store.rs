@@ -1,7 +1,9 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
 use bytes::Bytes;
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Operator, services::S3};
+use std::time::Duration;
 use studiofs_meta::FormatInfo;
 use thiserror::Error;
 use tracing::{debug, info};
@@ -65,7 +67,27 @@ impl DataStore {
             builder = builder.region("us-east-1");
         }
 
-        let op = Operator::new(builder)?.finish();
+        let op = Operator::new(builder)?
+            // TimeoutLayer MUST come before RetryLayer (see opendal docs).
+            // - timeout: 30s for metadata ops (stat, delete)
+            // - io_timeout: 300s per read/write — generous for 1 MiB blocks
+            //   even on congested networks; truly hung connections time out.
+            .layer(
+                TimeoutLayer::new()
+                    .with_timeout(Duration::from_secs(30))
+                    .with_io_timeout(Duration::from_secs(300)),
+            )
+            // RetryLayer: exponential backoff with jitter for transient errors.
+            .layer(
+                RetryLayer::new()
+                    .with_max_times(3)
+                    .with_min_delay(Duration::from_millis(200))
+                    .with_max_delay(Duration::from_secs(5))
+                    .with_jitter(),
+            )
+            // Limit total concurrent HTTP requests to the backend.
+            .layer(ConcurrentLimitLayer::new(256))
+            .finish();
         info!(
             "connected to S3: endpoint={}, bucket={}",
             config.endpoint, config.bucket
