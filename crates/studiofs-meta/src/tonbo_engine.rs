@@ -1301,6 +1301,40 @@ impl MetaEngine for TonboMetaEngine {
         Ok(id)
     }
 
+    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        if let Some(remote) = &self.remote {
+            let _guard = self.block_alloc_lock.lock();
+            let mut ids = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                ids.push(self.allocate_from_ranges(
+                    &self.block_ranges,
+                    &remote.block_counter_path,
+                    remote.default_next_block_id,
+                    BLOCK_RANGE_SIZE,
+                )?);
+            }
+            if let Some(&last) = ids.last() {
+                self.bump_local_counter_floor(counters::NEXT_BLOCK_ID, last.saturating_add(1))?;
+            }
+            self.on_mutation(32 * count as u64)?;
+            Ok(ids)
+        } else {
+            let ids = self.local.next_block_ids(count)?;
+            self.on_mutation(32 * count as u64)?;
+            Ok(ids)
+        }
+    }
+
+    fn flush_blocks_batch(
+        &self,
+        entries: &[crate::engine::BatchFlushEntry],
+    ) -> MetaResult<Vec<crate::engine::BatchFlushResult>> {
+        let r = self.local.flush_blocks_batch(entries)?;
+        // Count mutation bytes: ~256 per entry for block refs + pending deletions.
+        self.on_mutation(256 * entries.len() as u64)?;
+        Ok(r)
+    }
+
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         let r = self.local.add_pending_deletion(object_id, timestamp);
         if r.is_ok() {

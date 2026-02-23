@@ -35,12 +35,20 @@ pub struct L2DiskCache {
 impl L2DiskCache {
     /// Open (or create) the disk cache at `cache_dir`.
     ///
-    /// If the directory already exists, it is reused.  Shard subdirectories are
-    /// created lazily on first write to each shard.
+    /// If the directory already exists, it is reused.  All 256 shard
+    /// subdirectories are pre-created so that `put()` never needs to
+    /// call `create_dir_all` on the hot path.
     pub fn open(cache_dir: impl AsRef<Path>, max_bytes: u64) -> io::Result<Self> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
         let blocks_dir = cache_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
+
+        // Pre-create all 256 shard directories (00..ff) so put() can skip
+        // create_dir_all on every write — saves one spawn_blocking syscall per block.
+        for shard in 0u8..=255 {
+            let shard_dir = blocks_dir.join(format!("{:02x}", shard));
+            std::fs::create_dir_all(&shard_dir)?;
+        }
 
         let this = Self {
             cache_dir,
@@ -135,14 +143,12 @@ impl L2DiskCache {
     /// Write a block to disk (decompressed data).
     ///
     /// Atomic: writes to a `.tmp` file then renames.
+    ///
+    /// Shard directories are pre-created by `open()`, so no `create_dir_all`
+    /// call on the hot path.
     pub async fn put(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
         let path = self.block_path(object_id);
         let tmp_path = path.with_extension("tmp");
-
-        // Ensure shard directory exists.
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
 
         tokio::fs::write(&tmp_path, data).await?;
         tokio::fs::rename(&tmp_path, &path).await?;
@@ -153,13 +159,11 @@ impl L2DiskCache {
     }
 
     /// Write a block synchronously.
+    ///
+    /// Shard directories are pre-created by `open()`.
     pub fn put_sync(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
         let path = self.block_path(object_id);
         let tmp_path = path.with_extension("tmp");
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
 
         std::fs::write(&tmp_path, data)?;
         std::fs::rename(&tmp_path, &path)?;

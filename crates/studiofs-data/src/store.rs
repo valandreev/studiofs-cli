@@ -30,6 +30,22 @@ pub struct DataStoreConfig {
     pub volume_name: String,
 }
 
+/// I/O profile that tunes timeout and concurrency settings per use-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoProfile {
+    /// Default: balanced for mixed read/write workloads.
+    /// io_timeout=60s, concurrent_limit=128, retries=3.
+    Default,
+    /// Optimised for reads: lower timeout so stale connections fail fast,
+    /// dedicated connection pool so uploads can never starve reads.
+    /// io_timeout=20s, concurrent_limit=16, retries=3.
+    Read,
+    /// Optimised for writes (uploads, deletes): moderate timeout, small pool
+    /// to avoid overwhelming the backend (WAN-friendly).
+    /// io_timeout=30s, concurrent_limit=8, retries=3.
+    Write,
+}
+
 impl From<&FormatInfo> for DataStoreConfig {
     fn from(info: &FormatInfo) -> Self {
         Self {
@@ -47,11 +63,18 @@ impl From<&FormatInfo> for DataStoreConfig {
 pub struct DataStore {
     op: Operator,
     volume_name: String,
+    config: DataStoreConfig,
+    profile: IoProfile,
 }
 
 impl DataStore {
-    /// Create a new DataStore connected to S3.
+    /// Create a new DataStore with the default I/O profile.
     pub fn new(config: &DataStoreConfig) -> DataResult<Self> {
+        Self::with_profile(config, IoProfile::Default)
+    }
+
+    /// Create a DataStore with a specific I/O profile.
+    pub fn with_profile(config: &DataStoreConfig, profile: IoProfile) -> DataResult<Self> {
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
@@ -67,36 +90,66 @@ impl DataStore {
             builder = builder.region("us-east-1");
         }
 
+        // Per-profile tuning of timeouts, retries, and concurrency.
+        let (meta_timeout_s, io_timeout_s, max_retries, concurrent_limit) = match profile {
+            IoProfile::Default => (10, 60, 3, 128),
+            IoProfile::Read   => ( 5, 20, 3,  16),
+            IoProfile::Write  => (10, 30, 3,   8),
+        };
+
         let op = Operator::new(builder)?
             // TimeoutLayer MUST come before RetryLayer (see opendal docs).
-            // - timeout: 10s for metadata ops (stat, delete)
-            // - io_timeout: 60s per read/write (1 MiB blocks need ~1s even at
-            //   10 Mbps; 60s catches truly hung connections)
             .layer(
                 TimeoutLayer::new()
-                    .with_timeout(Duration::from_secs(10))
-                    .with_io_timeout(Duration::from_secs(60)),
+                    .with_timeout(Duration::from_secs(meta_timeout_s))
+                    .with_io_timeout(Duration::from_secs(io_timeout_s)),
             )
             // RetryLayer: exponential backoff with jitter for transient errors.
             .layer(
                 RetryLayer::new()
-                    .with_max_times(3)
+                    .with_max_times(max_retries)
                     .with_min_delay(Duration::from_millis(200))
                     .with_max_delay(Duration::from_secs(3))
                     .with_jitter(),
             )
-            // Limit total concurrent HTTP requests to the backend.
-            .layer(ConcurrentLimitLayer::new(128))
+            // Each profile gets its own connection pool — reads never compete
+            // with uploads for HTTP connections.
+            .layer(ConcurrentLimitLayer::new(concurrent_limit))
             .finish();
+
         info!(
+            profile = ?profile,
+            io_timeout_s,
+            concurrent_limit,
             "connected to S3: endpoint={}, bucket={}",
-            config.endpoint, config.bucket
+            config.endpoint, config.bucket,
         );
 
         Ok(Self {
             op,
             volume_name: config.volume_name.clone(),
+            config: config.clone(),
+            profile,
         })
+    }
+
+    /// Create a read-optimised clone with its own connection pool.
+    ///
+    /// The new store connects to the same endpoint/bucket but uses tighter
+    /// timeouts and a dedicated concurrency limit so that background uploads
+    /// can never starve read requests.
+    pub fn clone_for_reads(&self) -> DataResult<Self> {
+        Self::with_profile(&self.config, IoProfile::Read)
+    }
+
+    /// Create a write-optimised clone with its own connection pool.
+    pub fn clone_for_writes(&self) -> DataResult<Self> {
+        Self::with_profile(&self.config, IoProfile::Write)
+    }
+
+    /// The I/O profile this store was created with.
+    pub fn profile(&self) -> IoProfile {
+        self.profile
     }
 
     /// Get the S3 object key for a block.

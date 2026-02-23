@@ -13,7 +13,7 @@ pub mod types;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use engine::{MetaEngine, MetaError, MetaResult};
+pub use engine::{BatchFlushEntry, BatchFlushResult, MetaEngine, MetaError, MetaResult};
 pub use events::MetaEvent;
 pub use redb_engine::RedbMetaEngine;
 pub use tonbo_engine::TonboMetaEngine;

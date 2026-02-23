@@ -38,6 +38,11 @@ pub enum MetaEvent {
     /// Remove all blocks for a file (e.g., unlink).
     RemoveFileBlocks { ino: u64 },
 
+    /// Set multiple block references in one batch (used by drain_dirty_mem).
+    SetFileBlocksBatch {
+        blocks: Vec<(u64, u32, BlockRef)>,
+    },
+
     // ─── Target & Extended Attributes ────────────────────────────────────────
     /// Set a symlink target.
     SetSymlinkTarget { ino: u64, target: Vec<u8> },
@@ -73,6 +78,7 @@ impl MetaEvent {
             Self::SetFileBlock { ino, .. } => Some(*ino),
             Self::RemoveFileBlock { ino, .. } => Some(*ino),
             Self::RemoveFileBlocks { ino } => Some(*ino),
+            Self::SetFileBlocksBatch { blocks } => blocks.first().map(|(ino, _, _)| *ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),
             Self::SetXattr { ino, .. } => Some(*ino),
             Self::RemoveXattr { ino, .. } => Some(*ino),

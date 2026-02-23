@@ -7,4 +7,4 @@ pub mod block;
 pub mod object;
 pub mod store;
 
-pub use store::{DataStore, DataStoreConfig};
+pub use store::{DataStore, DataStoreConfig, IoProfile};

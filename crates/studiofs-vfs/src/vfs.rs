@@ -38,7 +38,7 @@ use studiofs_data::object::{
     create_object, format_object_key, parse_object_id_from_key, read_object,
 };
 use studiofs_data::store::DataStore;
-use studiofs_meta::types::{BlockFlags, BlockRef, block_index_from_offset, offset_within_block};
+use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast};
@@ -212,9 +212,9 @@ impl Default for VfsConfig {
             cache_size: DEFAULT_L2_SIZE,
             memory_limit: DEFAULT_L1_SIZE,
             block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
-            max_concurrent_uploads: 128,
+            max_concurrent_uploads: 4,
             readahead_width: 8,
-            max_dirty_bytes: 2 * 1024 * 1024 * 1024,
+            max_dirty_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -392,6 +392,9 @@ struct VfsState {
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
+    /// Flag set at shutdown to stop the background slab flusher so it cannot
+    /// race with the shutdown drain.
+    slab_flusher_stopped: std::sync::atomic::AtomicBool,
     /// File-level locks (flock semantics).
     file_locks: Mutex<std::collections::HashMap<Ino, FileLock>>,
     /// Notification for waiters blocked on flock.
@@ -453,8 +456,12 @@ impl Drop for InFlightGuard<'_> {
 pub struct StudioVfs {
     /// Metadata engine.
     meta: Arc<dyn MetaEngine>,
-    /// Data store (S3).
-    data: Arc<DataStore>,
+    /// Data store for reads — tighter timeouts, dedicated pool so uploads
+    /// never starve reads.
+    data_read: Arc<DataStore>,
+    /// Data store for writes (uploads, deletes, GC) — small pool to avoid
+    /// overwhelming the backend (WAN-friendly).
+    data_write: Arc<DataStore>,
     /// Unified two-level block cache (L1 RAM + L2 NVMe) with upload queue.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
@@ -681,9 +688,27 @@ impl StudioVfs {
         // Dirty-write memory buffer + background flusher channel.
         let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+        // Create a read-optimised DataStore with dedicated connection pool and
+        // tighter timeouts so that background uploads can never starve reads.
+        let data_read = Arc::new(
+            data.clone_for_reads()
+                .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
+        );
+
+        // Create a write-optimised DataStore for uploads/deletes with moderate
+        // timeout and small connection pool — WAN-friendly, won’t overwhelm the
+        // backend.  The original `data` (Default profile) is not stored.
+        let data_write = Arc::new(
+            data.clone_for_writes()
+                .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?,
+        );
+        // Drop the original Default-profile DataStore — only Read + Write remain.
+        drop(data);
+
         let vfs = Arc::new(Self {
             meta,
-            data,
+            data_read,
+            data_write,
             block_cache,
             block_size,
             data_prefix,
@@ -695,15 +720,16 @@ impl StudioVfs {
                 dirty_mem: Mutex::new(std::collections::HashMap::new()),
                 dirty_bytes: AtomicUsize::new(0),
                 deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+                slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
                 file_locks: Mutex::new(std::collections::HashMap::new()),
                 lock_notify: tokio::sync::Notify::new(),
             }),
-            upload_semaphore: Arc::new(Semaphore::new(128)),
+            upload_semaphore: Arc::new(Semaphore::new(4)),
             readahead: readahead.clone(),
             dir_prefetch,
             prefetch_tx,
             dirty_flush_tx,
-            max_dirty_bytes: 2 * 1024 * 1024 * 1024,
+            max_dirty_bytes: 4 * 1024 * 1024 * 1024,
             handle_table: HandleTable::new(),
             janitor_lease,
             janitor_interval,
@@ -2209,8 +2235,10 @@ impl StudioVfs {
 
     /// Fetch a remote object, relying on OpenDAL's `TimeoutLayer` and
     /// `RetryLayer` for timeout / transient-error handling.
+    ///
+    /// Uses the read-optimised DataStore with dedicated connection pool.
     async fn get_remote_object_with_retry(&self, key: &str) -> VfsResult<Bytes> {
-        self.data
+        self.data_read
             .get_by_key(key)
             .await
             .map_err(VfsError::Data)
@@ -2424,75 +2452,12 @@ impl StudioVfs {
         Ok(())
     }
 
-    /// Flush a single block to storage.
-    async fn flush_block(&self, ino: Ino, block_index: u32, data: Bytes) -> VfsResult<()> {
-        let length = data.len() as u32;
-        let is_partial = length < self.block_size;
-
-        // Allocate block ID
-        let object_id = self.meta.next_block_id()?;
-
-        // Cache the decompressed block (re-compress at upload time in process_upload).
-        self.block_cache
-            .put(object_id, data.clone())
-            .await
-            .map_err(VfsError::Io)?;
-
-        // Submit to upload queue (writes journal file + sends to upload worker).
-        let file_offset = block_index as u64 * self.block_size as u64;
-        self.block_cache.submit_upload(ino, file_offset, object_id);
-
-        // Create block reference
-        let flags = if is_partial {
-            BlockFlags::COMPRESSED_LZ4 | BlockFlags::PARTIAL_BLOCK
-        } else {
-            BlockFlags::COMPRESSED_LZ4
-        };
-
-        let block_ref = BlockRef {
-            object_id,
-            offset: 0,
-            length,
-            flags,
-        };
-
-        // Update metadata (returns old block for GC)
-        if let Some(old_block) = self.meta.set_file_block(ino, block_index, &block_ref)? {
-            // Mark old block for deletion
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            self.meta
-                .add_pending_deletion(old_block.object_id, timestamp)?;
-            debug!(
-                "marking old block {} for deletion (overwrite)",
-                old_block.object_id
-            );
-
-            // Update USED_SPACE: subtract old block size, add new block size
-            self.meta.decr_counter(
-                studiofs_meta::types::counters::USED_SPACE,
-                old_block.length as u64,
-            )?;
-        }
-        // Track new block in USED_SPACE counter
-        self.meta
-            .incr_counter(studiofs_meta::types::counters::USED_SPACE, length as u64)?;
-
-        debug!(
-            "flushed block {} for inode {} (object_id={})",
-            block_index, ino, object_id
-        );
-        Ok(())
-    }
-
     // =========================================================================
     // Background Slab Flusher
     // =========================================================================
 
     /// Woken by `dirty_flush_tx` signals and a periodic timer.
-    /// Drains the dirty memory buffer → slab → upload queue.
+    /// Drains the dirty memory buffer → L1 + metadata (batch) → L2 (background).
     async fn background_slab_flusher(
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -2510,25 +2475,44 @@ impl StudioVfs {
                 }
                 _ = timer.tick() => {}
             }
+            // Shutdown flag: stop processing so the shutdown drain can run
+            // without a concurrent race.
+            if self.state.slab_flusher_stopped.load(Ordering::Acquire) {
+                break;
+            }
             self.drain_dirty_mem().await;
         }
+        info!("background slab flusher stopped");
     }
 
-    /// Process all blocks currently in `dirty_mem`:
-    /// cache write → metadata update → upload queue.
+    /// Two-phase batched drain of `dirty_mem`.
     ///
-    /// Blocks are kept in `dirty_mem` until the cache write succeeds so that
-    /// concurrent reads always find the data in at least one tier.
+    /// **Phase 1 (fast — sub-millisecond for 64 blocks):**
+    /// 1. Take up to 64 blocks from `dirty_mem`.
+    /// 2. Allocate block IDs in one transaction (`next_block_ids`).
+    /// 3. Write all block refs + counters + pending deletions in one
+    ///    transaction (`flush_blocks_batch`) — 1 fsync instead of ~300.
+    /// 4. Insert each block into L1 RAM (`stage_l1`) — nanoseconds per block.
+    /// 5. Submit all upload journal entries.
+    /// 6. Remove blocks from `dirty_mem`, decrement `dirty_bytes` → write()
+    ///    is immediately unblocked.
     ///
-    /// Processes up to 8 blocks concurrently for throughput.
+    /// **Phase 2 (background spawn — fire-and-forget):**
+    /// Write all blocks to L2 NVMe.  Does NOT affect `dirty_bytes` or
+    /// backpressure.  Blocks are pinned in LRU and safe in L1 RAM until
+    /// both L2 and S3 upload complete.
     async fn drain_dirty_mem(&self) {
-        // Snapshot keys without removing — reads remain consistent during processing.
-        let keys: Vec<(Ino, u32)> = self.state.dirty_mem.lock().keys().cloned().collect();
+        const MAX_DRAIN_BATCH: usize = 64;
+
+        // ── Step 1: snapshot keys + filter deleted inodes ────────────────
+        let keys: Vec<(Ino, u32)> = {
+            let dirty = self.state.dirty_mem.lock();
+            dirty.keys().take(MAX_DRAIN_BATCH).cloned().collect()
+        };
         if keys.is_empty() {
             return;
         }
 
-        // Prepare work items: filter deleted inodes, clone data under brief lock.
         let mut work: Vec<(Ino, u32, Bytes)> = Vec::with_capacity(keys.len());
         for (ino, block_index) in keys {
             if self.state.deleted_inodes.lock().contains(&ino) {
@@ -2562,46 +2546,109 @@ impl StudioVfs {
             return;
         }
 
-        // Process blocks with bounded concurrency (8 parallel flushes).
-        let flush_sem = Arc::new(Semaphore::new(8));
-        let mut join_set = tokio::task::JoinSet::new();
+        // ── Step 2: allocate block IDs in one transaction ────────────────
+        let ids = match self.meta.next_block_ids(work.len() as u32) {
+            Ok(ids) => ids,
+            Err(e) => {
+                error!("slab flusher: next_block_ids failed: {}", e);
+                return;
+            }
+        };
 
-        for (ino, block_index, data) in work {
-            let permit = flush_sem.clone().acquire_owned().await.unwrap();
-            let this = unsafe {
-                // Safety: `self` outlives all spawned tasks because we join below.
-                &*(self as *const Self)
-            };
-            let len = data.len();
-            join_set.spawn(async move {
-                let _permit = permit;
-                let result = this.flush_block(ino, block_index, data).await;
-                (ino, block_index, len, result)
-            });
-        }
-
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok((ino, block_index, len, Ok(()))) => {
-                    self.state.dirty_mem.lock().remove(&(ino, block_index));
-                    self.state
-                        .dirty_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(len))
-                        })
-                        .ok();
+        // ── Step 3: batch metadata — one redb commit ─────────────────────
+        let entries: Vec<BatchFlushEntry> = work
+            .iter()
+            .zip(ids.iter())
+            .map(|((ino, block_index, data), &object_id)| {
+                let length = data.len() as u32;
+                let is_partial = length < self.block_size;
+                let flags = if is_partial {
+                    BlockFlags::COMPRESSED_LZ4 | BlockFlags::PARTIAL_BLOCK
+                } else {
+                    BlockFlags::COMPRESSED_LZ4
+                };
+                BatchFlushEntry {
+                    ino: *ino,
+                    block_index: *block_index,
+                    object_id,
+                    length,
+                    flags,
                 }
-                Ok((ino, block_index, _len, Err(e))) => {
-                    error!(
-                        "slab flusher: flush_block failed ino={} block={}: {}",
-                        ino, block_index, e
+            })
+            .collect();
+
+        let results = match self.meta.flush_blocks_batch(&entries) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("slab flusher: flush_blocks_batch failed: {}", e);
+                return;
+            }
+        };
+
+        // ── Step 4: stage L1 + submit uploads + free dirty_mem ───────────
+        let mut l2_work: Vec<(u64, Bytes)> = Vec::with_capacity(work.len());
+        let mut upload_ops: Vec<(u64, u64, u64)> = Vec::with_capacity(work.len());
+        let mut freed_bytes: usize = 0;
+
+        {
+            let mut dirty = self.state.dirty_mem.lock();
+            for (i, (ino, block_index, data)) in work.into_iter().enumerate() {
+                let object_id = ids[i];
+
+                // L1 insert (RAM, nanoseconds). Pinned so evictor won't discard.
+                self.block_cache.stage_l1(object_id, data.clone());
+
+                // Queue L2 write for Phase 2.
+                l2_work.push((object_id, data.clone()));
+
+                // Queue upload submission.
+                let file_offset = block_index as u64 * self.block_size as u64;
+                upload_ops.push((ino, file_offset, object_id));
+
+                // Remove from dirty_mem (data is now safe in L1 + metadata committed).
+                freed_bytes += data.len();
+                dirty.remove(&(ino, block_index));
+
+                if let Some(ref old_block) = results[i].old_block {
+                    debug!(
+                        "marking old block {} for deletion (overwrite)",
+                        old_block.object_id
                     );
-                }
-                Err(e) => {
-                    error!("slab flusher: task panicked: {}", e);
                 }
             }
         }
+
+        // Submit all upload journal entries.
+        self.block_cache.submit_uploads_batch(&upload_ops);
+
+        // Decrement dirty_bytes — write() backpressure is released HERE.
+        self.state
+            .dirty_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(freed_bytes))
+            })
+            .ok();
+
+        debug!(
+            "slab flusher: drained {} blocks ({} bytes), dirty_bytes={}",
+            l2_work.len(),
+            freed_bytes,
+            self.state.dirty_bytes.load(Ordering::Relaxed),
+        );
+
+        // ── Phase 2: background L2 writes (fire-and-forget) ─────────────
+        let cache = self.block_cache.clone();
+        tokio::spawn(async move {
+            for (object_id, data) in l2_work {
+                if let Err(e) = cache.commit_l2(object_id, &data).await {
+                    warn!(
+                        object_id,
+                        error = %e,
+                        "background L2 write failed (block safe in L1 + upload queue)"
+                    );
+                }
+            }
+        });
     }
 
     // =========================================================================
@@ -2634,7 +2681,7 @@ impl StudioVfs {
 
     async fn background_remote_warmup(self: Arc<Self>) {
         let timeout = Duration::from_secs(15);
-        match tokio::time::timeout(timeout, self.data.check()).await {
+        match tokio::time::timeout(timeout, self.data_read.check()).await {
             Ok(Ok(())) => {
                 debug!("remote data path warmup completed");
             }
@@ -2653,13 +2700,15 @@ impl StudioVfs {
     /// Process a single upload operation.
     ///
     /// The cache always stores decompressed data; we re-compress (LZ4) here
-    /// before uploading to S3.  OpenDAL's `TimeoutLayer` + `RetryLayer`
-    /// handle per-operation timeouts and transient error retries.
+    /// before uploading to S3.  Uses the write-optimised DataStore with short
+    /// io_timeout (15s) so stale connections fail fast and are retried on a
+    /// fresh connection.
     async fn process_upload(
         &self,
         op: PendingUpload,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) -> VfsResult<()> {
+        let t0 = Instant::now();
         // Read decompressed block from cache, then re-compress for S3.
         let decompressed = self
             .block_cache
@@ -2674,10 +2723,14 @@ impl StudioVfs {
         let compressed = Bytes::from(create_object(&decompressed)?);
 
         let key = format_object_key(&self.data_prefix, op.object_id);
-        self.data.put_by_key(&key, compressed).await?;
+        self.data_write.put_by_key(&key, compressed).await?;
 
         self.block_cache.complete_upload(&op);
-        debug!("background upload complete: {}", op.object_id);
+        debug!(
+            object_id = op.object_id,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "background upload complete"
+        );
         Ok(())
     }
 
@@ -2710,7 +2763,7 @@ impl StudioVfs {
 
                         // Delete from S3
                         let key = format_object_key(&self.data_prefix, object_id);
-                        match self.data.delete_by_key(&key).await {
+                        match self.data_write.delete_by_key(&key).await {
                             Ok(_) => {
                                 // Remove from pending deletions
                                 if let Err(e) = self.meta.remove_pending_deletion(object_id) {
@@ -2783,7 +2836,7 @@ impl StudioVfs {
             };
 
             let entries = match self
-                .data
+                .data_write
                 .operator()
                 .list_with(&self.data_prefix)
                 .recursive(true)
@@ -2860,7 +2913,7 @@ impl StudioVfs {
                     continue;
                 }
 
-                if let Err(e) = self.data.operator().delete(path).await {
+                if let Err(e) = self.data_write.operator().delete(path).await {
                     delete_errors = delete_errors.saturating_add(1);
                     warn!(cycle, path, error = %e, "janitor: delete failed");
                     continue;
@@ -2984,7 +3037,7 @@ impl StudioVfs {
         let mut reconciled = 0usize;
         for op in &pending_ops {
             let key = format_object_key(&self.data_prefix, op.object_id);
-            match tokio::time::timeout(Duration::from_secs(5), self.data.exists(&key)).await {
+            match tokio::time::timeout(Duration::from_secs(5), self.data_read.exists(&key)).await {
                 Ok(Ok(true)) => {
                     self.block_cache.complete_upload(op);
                     reconciled += 1;
@@ -3019,6 +3072,14 @@ impl StudioVfs {
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         let t0 = Instant::now();
 
+        // Phase 0: stop the background slab flusher so it cannot race with
+        // our own drain_dirty_mem().
+        self.state
+            .slab_flusher_stopped
+            .store(true, Ordering::Release);
+        // Give the flusher one tick (50ms) to notice and exit.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
         // Phase 1: flush pending write buffer → dirty_mem.
         let dirty_before = self.state.dirty_bytes.load(Ordering::Relaxed);
         info!(
@@ -3029,13 +3090,21 @@ impl StudioVfs {
         self.flush_pending_blocks_for_shutdown().await;
 
         // Phase 2: drain dirty_mem → cache + upload queue.
+        // Loop until all dirty blocks are flushed (drain_dirty_mem processes
+        // up to 64 blocks per call).
         let dirty_after_flush = self.state.dirty_bytes.load(Ordering::Relaxed);
         info!(
             dirty_bytes = dirty_after_flush,
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: draining dirty memory buffer"
         );
-        self.drain_dirty_mem().await;
+        loop {
+            let before = self.state.dirty_bytes.load(Ordering::Relaxed);
+            if before == 0 && self.state.dirty_mem.lock().is_empty() {
+                break;
+            }
+            self.drain_dirty_mem().await;
+        }
         info!(
             pending_uploads = self.block_cache.pending_upload_count(),
             elapsed_ms = t0.elapsed().as_millis() as u64,

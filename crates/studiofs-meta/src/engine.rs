@@ -6,7 +6,33 @@
 use crate::types::*;
 use std::collections::HashSet;
 
-/// Errors from the metadata engine.
+// =============================================================================
+// Batch flush types
+// =============================================================================
+
+/// Input for one block in a batched flush operation.
+///
+/// The caller pre-allocates `object_id` via [`MetaEngine::next_block_ids`]
+/// before calling [`MetaEngine::flush_blocks_batch`].
+#[derive(Debug, Clone)]
+pub struct BatchFlushEntry {
+    pub ino: Ino,
+    pub block_index: u32,
+    pub object_id: u64,
+    pub length: u32,
+    pub flags: BlockFlags,
+}
+
+/// Result for one block in a batched flush operation.
+#[derive(Debug, Clone)]
+pub struct BatchFlushResult {
+    /// The old block reference if the slot was occupied (caller should GC it).
+    pub old_block: Option<BlockRef>,
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
     #[error("inode not found: {0}")]
@@ -137,6 +163,57 @@ pub trait MetaEngine: Send + Sync {
 
     /// Allocate a new sequential block ID.
     fn next_block_id(&self) -> MetaResult<u64>;
+
+    /// Allocate `count` consecutive block IDs in a single transaction.
+    ///
+    /// Returns `count` IDs starting from the current counter value.
+    /// Default implementation calls `next_block_id()` repeatedly.
+    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        let mut ids = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            ids.push(self.next_block_id()?);
+        }
+        Ok(ids)
+    }
+
+    /// Flush a batch of block writes in a single transaction.
+    ///
+    /// For each entry:
+    /// - Sets the new `BlockRef` in `FILE_BLOCKS`
+    /// - If an old block existed at `(ino, block_index)`, adds it to pending
+    ///   deletions and adjusts `USED_SPACE`
+    /// - Increments `USED_SPACE` by the new block's length
+    ///
+    /// Returns one [`BatchFlushResult`] per entry (same order).
+    ///
+    /// Default implementation calls individual methods sequentially.
+    fn flush_blocks_batch(
+        &self,
+        entries: &[BatchFlushEntry],
+    ) -> MetaResult<Vec<BatchFlushResult>> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut results = Vec::with_capacity(entries.len());
+        for e in entries {
+            let block_ref = BlockRef {
+                object_id: e.object_id,
+                offset: 0,
+                length: e.length,
+                flags: e.flags,
+            };
+            let old = self.set_file_block(e.ino, e.block_index, &block_ref)?;
+            if let Some(ref old_block) = old {
+                self.add_pending_deletion(old_block.object_id, timestamp)?;
+                self.decr_counter(counters::USED_SPACE, old_block.length as u64)?;
+            }
+            self.incr_counter(counters::USED_SPACE, e.length as u64)?;
+            results.push(BatchFlushResult { old_block: old });
+        }
+        Ok(results)
+    }
 
     // ─── Pending Deletions (GC) ───────────────────────
 

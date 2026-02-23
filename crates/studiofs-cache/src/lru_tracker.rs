@@ -34,6 +34,8 @@ pub enum BlockLocation {
     MemoryAndDisk,
     /// Block is on disk only (L2 NVMe).
     DiskOnly,
+    /// Block is in L1 (RAM) only — background L2 write is pending.
+    MemoryOnly,
 }
 
 /// A single LRU entry.
@@ -314,7 +316,7 @@ impl LruTracker {
                     s.pinned += 1;
                 }
                 match entry.location {
-                    BlockLocation::MemoryAndDisk => {
+                    BlockLocation::MemoryAndDisk | BlockLocation::MemoryOnly => {
                         s.l1_entries += 1;
                         s.l1_bytes += sz;
                     }

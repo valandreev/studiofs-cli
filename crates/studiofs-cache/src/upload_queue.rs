@@ -151,7 +151,13 @@ impl UploadQueue {
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.pending_count.load(Ordering::Relaxed) == 0 {
+            // Register interest BEFORE checking the count.  This prevents a
+            // TOCTOU race where mark_done() fires notify_waiters() between our
+            // load() and .notified().await — losing the notification and
+            // causing a spurious full-timeout wait.
+            let notified = self.idle_notify.notified();
+
+            if self.pending_count.load(Ordering::Acquire) == 0 {
                 return true;
             }
             let now = Instant::now();
@@ -159,11 +165,13 @@ impl UploadQueue {
                 return false;
             }
             let remaining = deadline.saturating_duration_since(now);
-            if tokio::time::timeout(remaining, self.idle_notify.notified())
+            if tokio::time::timeout(remaining, notified)
                 .await
                 .is_err()
             {
-                return false;
+                // Final check after timeout — count might have reached 0 just
+                // before the deadline.
+                return self.pending_count.load(Ordering::Acquire) == 0;
             }
         }
     }

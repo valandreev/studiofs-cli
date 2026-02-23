@@ -281,6 +281,40 @@ impl BlockCache {
     }
 
     // =========================================================================
+    // Two-phase staging (Plan A)
+    // =========================================================================
+
+    /// **Phase 1 — instant.** Insert a block into L1 RAM only, track it in
+    /// the LRU as [`MemoryOnly`](BlockLocation::MemoryOnly), and pin it so
+    /// the evictor cannot discard it before L2 is written and the upload
+    /// completes.
+    ///
+    /// Called from `drain_dirty_mem` to make blocks immediately readable
+    /// without waiting for NVMe I/O.
+    pub fn stage_l1(&self, object_id: ObjectId, data: Bytes) {
+        let size = data.len() as u32;
+        self.l1.insert(object_id, data);
+        self.lru
+            .insert(object_id, size, BlockLocation::MemoryOnly, true);
+    }
+
+    /// **Phase 2 — background.** Write a block to L2 (NVMe) and promote its
+    /// LRU location from `MemoryOnly` to `MemoryAndDisk`.
+    ///
+    /// Called from a fire-and-forget background task spawned by `drain_dirty_mem`.
+    /// Does NOT unpin — the block stays pinned until the S3 upload completes.
+    pub async fn commit_l2(&self, object_id: ObjectId, data: &[u8]) -> io::Result<()> {
+        self.l2.put(object_id, data).await?;
+        self.lru
+            .set_location(object_id, BlockLocation::MemoryAndDisk);
+        // Trigger eviction check if budgets exceeded.
+        if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {
+            self.evict_notify.notify_one();
+        }
+        Ok(())
+    }
+
+    // =========================================================================
     // Upload queue delegation
     // =========================================================================
 
@@ -288,6 +322,18 @@ impl BlockCache {
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId) {
         self.lru.pin(object_id);
         self.upload_queue.submit(ino, offset, object_id);
+    }
+
+    /// Submit multiple blocks for async S3 upload in a batch.
+    ///
+    /// Each block is pinned in the LRU and a journal entry is written.
+    /// More efficient than calling `submit_upload` in a loop because it
+    /// avoids re-acquiring the LRU shard lock repeatedly.
+    pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId)]) {
+        for &(ino, offset, object_id) in ops {
+            self.lru.pin(object_id);
+            self.upload_queue.submit(ino, offset, object_id);
+        }
     }
 
     /// Mark an upload as complete.  Unpins the block.  Block stays cached.
@@ -531,6 +577,7 @@ impl BlockCache {
             buf.push(match e.location {
                 BlockLocation::DiskOnly => 0,
                 BlockLocation::MemoryAndDisk => 1,
+                BlockLocation::MemoryOnly => 2,
             });
             buf.push(if e.pinned { 1 } else { 0 });
             buf.extend_from_slice(&[0u8; 4]); // padding
@@ -591,6 +638,7 @@ fn load_checkpoint(path: &Path) -> io::Result<Vec<CheckpointEntry>> {
         let size = u32::from_le_bytes(entry_data[base + 8..base + 12].try_into().unwrap());
         let location = match entry_data[base + 12] {
             0 => BlockLocation::DiskOnly,
+            2 => BlockLocation::MemoryOnly,
             _ => BlockLocation::MemoryAndDisk,
         };
         let pinned = entry_data[base + 13] != 0;
