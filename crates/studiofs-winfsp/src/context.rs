@@ -2,12 +2,16 @@
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
 use studiofs_vfs::{OpenFlags, StudioVfs};
+use windows::Win32::Security::{
+    Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
+};
 
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -17,6 +21,7 @@ use tracing::{debug, error};
 use windows::Win32::Foundation::NTSTATUS;
 use winfsp::U16CStr;
 use winfsp::filesystem::*;
+use winfsp::filesystem::DirBuffer;
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
@@ -40,8 +45,8 @@ pub struct StudioFileHandle {
     is_dir: bool,
     /// VFS file handle (0 for directories).
     fh: u64,
-    /// Cached directory entries for readdir pagination.
-    dir_entries: Mutex<Option<Vec<studiofs_meta::DirEntry>>>,
+    /// WinFSP directory buffer for efficient directory enumeration.
+    dir_buffer: DirBuffer,
 }
 
 impl StudioFileHandle {
@@ -50,7 +55,7 @@ impl StudioFileHandle {
             ino,
             is_dir,
             fh,
-            dir_entries: Mutex::new(None),
+            dir_buffer: DirBuffer::new(),
         }
     }
 }
@@ -60,6 +65,25 @@ impl StudioFileHandle {
 /// Convert InodeAttr to WinFSP FileInfo.
 fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     // Directories always report at least one allocation unit; files round up.
+    let file_attributes = if attr.win_attrs != 0 {
+        // Use stored Windows attributes, ensuring kind-specific flags are always present
+        match attr.kind {
+            FileType::Directory => attr.win_attrs | 0x10,
+            FileType::Symlink => attr.win_attrs | FILE_ATTRIBUTE_REPARSE_POINT,
+            _ => {
+                // Clear NORMAL (0x80) if other flags are present
+                let a = attr.win_attrs;
+                if a & !0x80 != 0 { a & !0x80 } else { a }
+            }
+        }
+    } else {
+        match attr.kind {
+            FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
+            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
+            _ => 0x20, // FILE_ATTRIBUTE_ARCHIVE (default, like NTFS)
+        }
+    };
+
     let mut info = FileInfo {
         file_size: attr.size,
         allocation_size: if attr.kind == FileType::Directory {
@@ -67,11 +91,7 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
         } else {
             (attr.size + 4095) & !4095
         },
-        file_attributes: match attr.kind {
-            FileType::Directory => 0x10, // FILE_ATTRIBUTE_DIRECTORY
-            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-            _ => 0x80, // FILE_ATTRIBUTE_NORMAL
-        },
+        file_attributes,
         ..Default::default()
     };
 
@@ -81,7 +101,8 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 
     // Convert timestamps (nanoseconds since epoch → Windows FILETIME)
     // FILETIME is 100ns intervals since 1601-01-01
-    info.creation_time = unix_nanos_to_filetime(attr.ctime);
+    // Use effective_crtime() for creation_time: actual birth time, falling back to ctime
+    info.creation_time = unix_nanos_to_filetime(attr.effective_crtime());
     info.last_access_time = unix_nanos_to_filetime(attr.atime);
     info.last_write_time = unix_nanos_to_filetime(attr.mtime);
     info.change_time = unix_nanos_to_filetime(attr.mtime);
@@ -290,6 +311,31 @@ fn filetime_to_timespec(ft: u64) -> TimeSpec {
     TimeSpec::Set(nanos)
 }
 
+/// Create a binary security descriptor granting full access to Everyone.
+///
+/// SDDL: Owner=BUILTIN\Administrators, Group=same, DACL=Protected:
+///   - Full Access for SYSTEM
+///   - Full Access for BUILTIN\Administrators
+///   - Full Access for Everyone
+fn create_default_security_descriptor() -> Vec<u8> {
+    let sddl = windows::core::w!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl,
+            1, // SDDL_REVISION_1
+            &mut psd,
+            None,
+        )
+        .expect("Failed to create security descriptor from SDDL");
+        let len = GetSecurityDescriptorLength(psd) as usize;
+        let bytes = std::slice::from_raw_parts(psd.0 as *const u8, len).to_vec();
+        // Free the LocalAlloc'd descriptor
+        windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(psd.0 as *mut _)));
+        bytes
+    }
+}
+
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     match &e {
@@ -334,11 +380,14 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
     rt: Arc<Runtime>,
+    /// Cached binary security descriptor (Everyone = Full Access).
+    default_sd: Vec<u8>,
 }
 
 impl StudioFsContext {
     pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
-        Self { vfs, rt }
+        let default_sd = create_default_security_descriptor();
+        Self { vfs, rt, default_sd }
     }
 }
 
@@ -348,7 +397,7 @@ impl FileSystemContext for StudioFsContext {
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
-        _security_descriptor: Option<&mut [c_void]>,
+        security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let path_str = file_name.to_string_lossy();
@@ -365,17 +414,60 @@ impl FileSystemContext for StudioFsContext {
                 return Err(e);
             }
         };
-        let file_attributes = match attr.kind {
-            FileType::Directory => 0x10u32,
-            FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-            _ => 0x80u32,
+        let file_attributes = if attr.win_attrs != 0 {
+            match attr.kind {
+                FileType::Directory => attr.win_attrs | 0x10,
+                FileType::Symlink => attr.win_attrs | FILE_ATTRIBUTE_REPARSE_POINT,
+                _ => {
+                    let a = attr.win_attrs;
+                    if a & !0x80 != 0 { a & !0x80 } else { a }
+                }
+            }
+        } else {
+            match attr.kind {
+                FileType::Directory => 0x10u32,
+                FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
+                _ => 0x20u32, // FILE_ATTRIBUTE_ARCHIVE
+            }
         };
+
+        // Copy the cached security descriptor into the provided buffer
+        let sd = &self.default_sd;
+        if let Some(buf) = security_descriptor {
+            let copy_len = sd.len().min(buf.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sd.as_ptr(),
+                    buf.as_mut_ptr() as *mut u8,
+                    copy_len,
+                );
+            }
+        }
 
         Ok(FileSecurity {
             reparse: attr.kind == FileType::Symlink,
-            sz_security_descriptor: 0,
+            sz_security_descriptor: sd.len() as u64,
             attributes: file_attributes,
         })
+    }
+
+    fn get_security(
+        &self,
+        _context: &Self::FileContext,
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> winfsp::Result<u64> {
+        let sd = &self.default_sd;
+        if let Some(buf) = security_descriptor {
+            let copy_len = sd.len().min(buf.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sd.as_ptr(),
+                    buf.as_mut_ptr() as *mut u8,
+                    copy_len,
+                );
+            }
+        }
+        Ok(sd.len() as u64)
     }
 
     fn open(
@@ -523,21 +615,42 @@ impl FileSystemContext for StudioFsContext {
     fn write(
         &self,
         context: &Self::FileContext,
-        buffer: &[u8],
+        mut buffer: &[u8],
         offset: u64,
-        _write_to_eof: bool,
-        _constrained_io: bool,
+        write_to_eof: bool,
+        constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        // Resolve actual write offset
+        let actual_offset = if write_to_eof {
+            let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+            attr.size
+        } else {
+            offset
+        };
+
+        // Constrained I/O: paging writes must not extend the file beyond its current size
+        if constrained_io {
+            let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+            let fsize = attr.size;
+            if actual_offset >= fsize {
+                return Ok(0);
+            }
+            let max_len = (fsize - actual_offset) as usize;
+            if buffer.len() > max_len {
+                buffer = &buffer[..max_len];
+            }
+        }
+
         let written = self
             .rt
-            .block_on(self.vfs.write(context.ino, offset, buffer))
+            .block_on(self.vfs.write(context.ino, actual_offset, buffer))
             .map_err(vfs_to_winfsp_err)?;
 
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
 
-        debug!(ino = context.ino, offset, written, "write");
+        debug!(ino = context.ino, offset = actual_offset, written, "write");
         Ok(written)
     }
 
@@ -549,9 +662,33 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
         debug!(ino = context.ino, "read_directory called");
-        // Cache entries for continued readdir
-        let mut cached = context.dir_entries.lock();
-        if cached.is_none() {
+
+        // On first call (no marker), populate the DirBuffer with all entries.
+        if marker.is_none() {
+            let lock = context.dir_buffer.acquire(true, None)?;
+
+            // Add "." entry
+            {
+                let mut dot = DirInfo::<255>::new();
+                let name_u16: Vec<u16> = std::ffi::OsStr::new(".").encode_wide().collect();
+                dot.set_name_raw(name_u16.as_slice())?;
+                let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+                *dot.file_info_mut() = attr_to_file_info(&attr);
+                let _ = lock.write(&mut dot);
+            }
+
+            // Add ".." entry
+            {
+                let mut dotdot = DirInfo::<255>::new();
+                let name_u16: Vec<u16> = std::ffi::OsStr::new("..").encode_wide().collect();
+                dotdot.set_name_raw(name_u16.as_slice())?;
+                if let Ok(attr) = self.vfs.getattr(context.ino) {
+                    *dotdot.file_info_mut() = attr_to_file_info(&attr);
+                    let _ = lock.write(&mut dotdot);
+                }
+            }
+
+            // Add all directory entries
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
             debug!(
                 ino = context.ino,
@@ -559,91 +696,44 @@ impl FileSystemContext for StudioFsContext {
                 "read_directory loaded {} entries",
                 entries.len()
             );
-            *cached = Some(entries);
-        }
 
-        let entries = cached.as_ref().unwrap();
-        let mut cursor = 0u32;
-
-        let has_marker = !marker.is_none();
-
-        // Add "." and ".." first (only on first call, no marker)
-        if !has_marker {
-            let mut dot = DirInfo::<255>::new();
-            if dot.set_name(std::ffi::OsStr::new(".")).is_ok() {
-                let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
-                *dot.file_info_mut() = attr_to_file_info(&attr);
-                if !dot.append_to_buffer(buffer, &mut cursor) {
-                    debug!("buffer full after adding '.'");
-                    DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-                    return Ok(cursor);
-                }
-                debug!("added '.' entry, cursor now at {}", cursor);
-            }
-
-            let mut dotdot = DirInfo::<255>::new();
-            if dotdot.set_name(std::ffi::OsStr::new("..")).is_ok()
-                && let Ok(attr) = self.vfs.getattr(context.ino)
-            {
-                *dotdot.file_info_mut() = attr_to_file_info(&attr);
-                if !dotdot.append_to_buffer(buffer, &mut cursor) {
-                    debug!("buffer full after adding '..'");
-                    DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-                    return Ok(cursor);
-                }
-                debug!("added '..' entry, cursor now at {}", cursor);
-            }
-        }
-
-        // Get the marker name for comparison
-        let marker_str: Option<String> = marker
-            .inner_as_cstr()
-            .map(|c| c.to_string_lossy().to_string());
-
-        for entry in entries {
-            let entry_name = String::from_utf8_lossy(&entry.name).to_string();
-
-            // Skip entries at or before the marker
-            if let Some(ref m) = marker_str
-                && entry_name.as_str() <= m.as_str()
-            {
-                continue;
-            }
-
-            let os_name = std::ffi::OsString::from(&entry_name);
-            let mut dir_info = DirInfo::<255>::new();
-            if dir_info.set_name(&os_name).is_err() {
-                debug!("failed to set name for entry: {}", entry_name);
-                continue;
-            }
-
-            let child_attr = match self.vfs.getattr(entry.ino) {
-                Ok(a) => a,
-                Err(e) => {
-                    debug!("failed to get attr for {}: {:?}", entry_name, e);
+            for entry in &entries {
+                let entry_name = String::from_utf8_lossy(&entry.name).to_string();
+                let os_name = std::ffi::OsString::from(&entry_name);
+                let name_u16: Vec<u16> = os_name.encode_wide().collect();
+                let mut dir_info = DirInfo::<255>::new();
+                if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
+                    debug!("failed to set name for entry: {}", entry_name);
                     continue;
                 }
-            };
-            *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
-            if !dir_info.append_to_buffer(buffer, &mut cursor) {
-                debug!(
-                    "buffer full after adding entry '{}' (tried to add at cursor {})",
-                    entry_name, cursor
-                );
-                break;
+                let child_attr = match self.vfs.getattr(entry.ino) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        debug!("failed to get attr for {}: {:?}", entry_name, e);
+                        continue;
+                    }
+                };
+                *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
+
+                if let Err(e) = lock.write(&mut dir_info) {
+                    debug!("failed to write entry '{}' to DirBuffer: {:?}", entry_name, e);
+                    break;
+                }
             }
-            debug!("added entry '{}', cursor now at {}", entry_name, cursor);
+
+            // Lock is dropped here, releasing the DirBuffer
         }
 
-        DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+        // Read from the DirBuffer at the current marker position
+        let bytes = context.dir_buffer.read(marker, buffer);
         debug!(
             ino = context.ino,
-            bytes_returned = cursor,
+            bytes_returned = bytes,
             "read_directory returning {} bytes",
-            cursor
+            bytes
         );
-        Ok(cursor)
+        Ok(bytes)
     }
 
     fn set_delete(
@@ -663,8 +753,6 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        // Clear cached dir entries
-        *context.dir_entries.lock() = None;
 
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
@@ -717,16 +805,26 @@ impl FileSystemContext for StudioFsContext {
     fn set_basic_info(
         &self,
         context: &Self::FileContext,
-        _file_attributes: u32,
-        _creation_time: u64,
+        file_attributes: u32,
+        creation_time: u64,
         last_access_time: u64,
         last_write_time: u64,
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        // WinFSP convention: INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't change".
+        // 0 also means "don't change" (per MSDN FILE_BASIC_INFO).
+        let win_attrs = if file_attributes != 0 && file_attributes != u32::MAX {
+            Some(file_attributes)
+        } else {
+            None
+        };
+
         let args = SetattrArgs {
             atime: filetime_to_timespec(last_access_time),
             mtime: filetime_to_timespec(last_write_time),
+            crtime: filetime_to_timespec(creation_time),
+            win_attrs,
             ..SetattrArgs::default()
         };
         let attr = self

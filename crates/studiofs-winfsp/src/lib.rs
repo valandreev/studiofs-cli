@@ -22,11 +22,13 @@ pub fn mount_and_serve(
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
-    volume_params.persistent_acls(false);
+    volume_params.persistent_acls(true);
     volume_params.reparse_points(true);
     volume_params.named_streams(false);
     volume_params.read_only_volume(false);
     volume_params.post_cleanup_when_modified_only(true);
+    // Allow kernel-mode opens — required for shell extensions (7-zip, etc.)
+    volume_params.allow_open_in_kernel_mode(true);
     volume_params.sector_size(512);
     volume_params.sectors_per_allocation_unit(1);
     volume_params.max_component_length(255);
@@ -35,8 +37,8 @@ pub fn mount_and_serve(
     // WinFSP layer tuning:
     // - Shorter file_info_timeout for quick invalidation on overwrites (P1.2)
     // - Longer dir_info_timeout since directory entries change less frequently
-    volume_params.file_info_timeout(100); // 100ms: quick invalidation on overwrites
-    volume_params.dir_info_timeout(1000); // 1s: dir entries change less frequently
+    volume_params.file_info_timeout(1000);
+    volume_params.dir_info_timeout(1000);
 
     // Keep a reference for persist_cache() on shutdown (vfs is moved into context).
     let vfs_ref = vfs.clone();
