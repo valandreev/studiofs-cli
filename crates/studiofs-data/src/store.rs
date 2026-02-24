@@ -91,10 +91,17 @@ impl DataStore {
         }
 
         // Per-profile tuning of timeouts, retries, and concurrency.
+        //
+        // Read profile: short io_timeout for FAST failure so the VFS
+        // FetchScheduler can retry immediately on a fresh connection.
+        // NO OpenDAL retries — stacking retries multiplies the stall time
+        // (OpenDAL waits 5s, retries, waits 5s again = 10s before
+        // FetchScheduler even sees the error).  FetchScheduler handles
+        // all retry logic with AIMD back-pressure.
         let (meta_timeout_s, io_timeout_s, max_retries, concurrent_limit) = match profile {
             IoProfile::Default => (10, 60, 3, 128),
-            IoProfile::Read   => ( 5, 20, 3,  16),
-            IoProfile::Write  => (10, 30, 3,  16),
+            IoProfile::Read   => ( 3,  5, 0,  16),
+            IoProfile::Write  => (10, 20, 3,  16),
         };
 
         let op = Operator::new(builder)?

@@ -399,6 +399,32 @@ impl StudioFsContext {
         }
         sd.len() as u64
     }
+
+    /// Spawn an async future on the tokio runtime and block until it completes.
+    ///
+    /// Unlike `Runtime::block_on()`, this runs the future on a tokio worker
+    /// thread (where the IO reactor is guaranteed to be running), then delivers
+    /// the result via a sync channel.  The WinFSP dispatch thread only blocks
+    /// on the channel --- it does NOT participate in polling the future.
+    ///
+    /// This is important because WinFSP uses IOCP with a limited concurrency.
+    /// `block_on` makes the current thread drive the future, which can interact
+    /// poorly with the tokio IO reactor when called from non-runtime threads.
+    fn spawn_wait<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        self.rt.spawn(async move {
+            let result = f.await;
+            let _ = tx.send(result);
+        });
+        // Park the WinFSP thread until the runtime worker finishes.
+        // unwrap: the channel can only fail if the spawned task panics,
+        // which results in an immediate WinFSP error.
+        rx.recv().expect("tokio task panicked")
+    }
 }
 
 impl FileSystemContext for StudioFsContext {
@@ -459,13 +485,11 @@ impl FileSystemContext for StudioFsContext {
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
         if context.fh != 0 {
-            if let Err(e) = self.rt.block_on(self.vfs.release_fh(context.fh)) {
-                error!(
-                    ino = context.ino,
-                    fh = context.fh,
-                    "release_fh failed: {:?}",
-                    e
-                );
+            let vfs = self.vfs.clone();
+            let fh = context.fh;
+            let ino = context.ino;
+            if let Err(e) = self.spawn_wait(async move { vfs.release_fh(fh).await }) {
+                error!(ino, fh, "release_fh failed: {:?}", e);
             }
         }
         drop(context);
@@ -553,14 +577,28 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
-        // P1.3: Use read_into() to avoid intermediate Bytes allocation and memcpy
-        let len = self
-            .rt
-            .block_on(self.vfs.read_into(context.ino, offset, buffer))
-            .map_err(vfs_to_winfsp_err)?;
+        // Spawn the async read on a tokio worker thread so the WinFSP
+        // dispatch thread doesn't participate in IO polling.  We allocate
+        // an owned buffer, copy the result back.
+        let ino = context.ino;
+        let buf_len = buffer.len();
+        let vfs = self.vfs.clone();
 
-        trace!(ino = context.ino, offset, len, "read");
-        Ok(len)
+        let result: Result<(u32, Vec<u8>), _> = self.spawn_wait(async move {
+            let mut owned = vec![0u8; buf_len];
+            let n = vfs.read_into(ino, offset, &mut owned).await?;
+            owned.truncate(n as usize);
+            Ok((n, owned))
+        });
+
+        match result {
+            Ok((n, data)) => {
+                buffer[..n as usize].copy_from_slice(&data);
+                trace!(ino, offset, n, "read");
+                Ok(n)
+            }
+            Err(e) => Err(vfs_to_winfsp_err(e)),
+        }
     }
 
     fn write(
@@ -593,9 +631,11 @@ impl FileSystemContext for StudioFsContext {
             }
         }
 
+        let ino = context.ino;
+        let data = buffer.to_vec();
+        let vfs = self.vfs.clone();
         let written = self
-            .rt
-            .block_on(self.vfs.write(context.ino, actual_offset, buffer))
+            .spawn_wait(async move { vfs.write(ino, actual_offset, &data).await })
             .map_err(vfs_to_winfsp_err)?;
 
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -713,12 +753,15 @@ impl FileSystemContext for StudioFsContext {
         } else {
             // Not deleting — flush buffered writes
             // WinFSP "Cleanup" with no delete flag is the standard place to flush.
-            if context.fh != 0 {
-                if let Err(e) = self.rt.block_on(self.vfs.flush_fh(context.fh)) {
-                    error!(ino = context.ino, "cleanup flush_fh failed: {:?}", e);
+            let vfs = self.vfs.clone();
+            let ino = context.ino;
+            let fh = context.fh;
+            if fh != 0 {
+                if let Err(e) = self.spawn_wait(async move { vfs.flush_fh(fh).await }) {
+                    error!(ino, "cleanup flush_fh failed: {:?}", e);
                 }
-            } else if let Err(e) = self.rt.block_on(self.vfs.flush(context.ino)) {
-                error!(ino = context.ino, "cleanup flush failed: {:?}", e);
+            } else if let Err(e) = self.spawn_wait(async move { vfs.flush(ino).await }) {
+                error!(ino, "cleanup flush failed: {:?}", e);
             }
         }
     }
@@ -868,8 +911,9 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<()> {
         if let Some(ctx) = context {
             // Flush pending writes to S3
-            self.rt
-                .block_on(self.vfs.flush(ctx.ino))
+            let vfs = self.vfs.clone();
+            let ino = ctx.ino;
+            self.spawn_wait(async move { vfs.flush(ino).await })
                 .map_err(vfs_to_winfsp_err)?;
 
             let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
