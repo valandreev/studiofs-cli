@@ -2,11 +2,34 @@
 
 ## Stack
 
-- Language/tooling: Rust + Cargo
-- Metadata: `redb` (local) + Tonbo manifest over S3-compatible storage
-- Object I/O: OpenDAL (`services-s3`)
-- Test object storage: MinIO (or any S3-compatible endpoint)
-- Optional invalidation bus: NATS
+- **Language:** Rust (2024 edition)
+- **Build:** Cargo workspace with 7 crates
+- **Metadata:** `redb` (local) + Tonbo manifest over S3-compatible storage
+- **Object I/O:** OpenDAL (`services-s3`)
+- **Compression:** LZ4 (`lz4_flex`) + xxh64 checksums
+- **Cache:** Two-level (RAM + NVMe) with LRU and crash-safe writeback
+- **Platform:** WinFSP (Windows), FUSE (Linux/macOS)
+- **Test storage:** MinIO (or any S3-compatible endpoint)
+- **Invalidation bus:** NATS (optional)
+
+## Project Structure
+
+```
+studiofs-cli/
+  ├── Cargo.toml                  # workspace root
+  ├── crates/
+  │   ├── studiofs/               # CLI binary
+  │   │   └── src/cli/            # subcommand modules
+  │   ├── studiofs-meta/          # metadata engine (redb + Tonbo)
+  │   ├── studiofs-data/          # S3 I/O + object format
+  │   ├── studiofs-cache/         # L1 RAM + L2 NVMe cache
+  │   ├── studiofs-vfs/           # platform-agnostic VFS core
+  │   ├── studiofs-fuse/          # FUSE bridge (Linux/macOS)
+  │   └── studiofs-winfsp/        # WinFSP bridge (Windows)
+  └── docs/                       # documentation
+```
+
+See [Architecture Overview](architecture.md) for crate dependency graph and data flows.
 
 ## Local Setup
 
@@ -79,3 +102,14 @@ Optional:
 - Reachable MinIO/S3-compatible endpoint from test environment
 - Credentials with permission to create/read/write/delete test objects
 - For invalidation bus scenarios: reachable NATS server
+
+## Related Documentation
+
+- [Architecture Overview](architecture.md) — system design and data flows
+- [Cache System](cache.md) — L1/L2 cache internals
+- [Metadata Engine](metadata.md) — redb, Tonbo sync, schema
+- [VFS Layer](vfs.md) — read/write paths, readahead, AIMD
+- [Data Layer](data-layer.md) — S3 object format, compression
+- [Platform Bridges](platform-bridges.md) — WinFSP and FUSE
+- [Configuration Reference](configuration.md) — CLI options, env vars, tuning
+- [Metadata Schema](metadata-schema.md) — schema types and compatibility
