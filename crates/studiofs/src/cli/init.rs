@@ -153,7 +153,6 @@ pub fn run(
     metadata_access_key: Option<&str>,
     metadata_secret_key: Option<&str>,
     metadata_region: Option<&str>,
-    metadata_same_as_data: bool,
     metadata_cache_ttl_secs: u64,
     metadata_flush_interval_secs: u64,
     metadata_flush_ops_threshold: u32,
@@ -165,10 +164,23 @@ pub fn run(
     let eff_data_region = if data_region.is_empty() { "us-east-1" } else { data_region };
 
     // ── Resolve metadata credentials early ───────────────────────────────────
-    // We need them before the compat check so we can determine whether the
-    // metadata store is the same as the data store.
+    // If --metadata-endpoint is provided, use a separate metadata store;
+    // otherwise fall back to the data store credentials.
     let (eff_meta_endpoint, eff_meta_bucket, eff_meta_access_key, eff_meta_secret_key, eff_meta_region) =
-        if metadata_same_as_data {
+        if let Some(ep) = metadata_endpoint {
+            let bk = metadata_bucket
+                .ok_or_else(|| anyhow::anyhow!("--metadata-bucket is required when --metadata-endpoint is provided"))?
+                .to_string();
+            let ak = metadata_access_key
+                .ok_or_else(|| anyhow::anyhow!("--metadata-access-key is required when --metadata-endpoint is provided"))?
+                .to_string();
+            let sk = metadata_secret_key
+                .ok_or_else(|| anyhow::anyhow!("--metadata-secret-key is required when --metadata-endpoint is provided"))?
+                .to_string();
+            let rg = metadata_region.unwrap_or("").to_string();
+            let rg = if rg.is_empty() { "us-east-1".to_string() } else { rg };
+            (ep.to_string(), bk, ak, sk, rg)
+        } else {
             (
                 data_endpoint.to_string(),
                 data_bucket.to_string(),
@@ -176,38 +188,6 @@ pub fn run(
                 data_secret_key.to_string(),
                 eff_data_region.to_string(),
             )
-        } else {
-            let ep = metadata_endpoint
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--metadata-endpoint is required unless --metadata-same-as-data is used"
-                    )
-                })?
-                .to_string();
-            let bk = metadata_bucket
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--metadata-bucket is required unless --metadata-same-as-data is used"
-                    )
-                })?
-                .to_string();
-            let ak = metadata_access_key
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--metadata-access-key is required unless --metadata-same-as-data is used"
-                    )
-                })?
-                .to_string();
-            let sk = metadata_secret_key
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--metadata-secret-key is required unless --metadata-same-as-data is used"
-                    )
-                })?
-                .to_string();
-            let rg = metadata_region.unwrap_or("").to_string();
-            let rg = if rg.is_empty() { "us-east-1".to_string() } else { rg };
-            (ep, bk, ak, sk, rg)
         };
 
     // Are data and metadata using the exact same physical bucket / endpoint?

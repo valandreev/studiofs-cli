@@ -153,7 +153,7 @@ EXAMPLES:
   Separate metadata backend/bucket:
     studiofs init prod --endpoint https://s3.us-east-1.amazonaws.com \\
       --bucket data-bucket --access-key DATA_KEY --secret-key DATA_SECRET \\
-      --metadata-same-as-data false --metadata-endpoint http://127.0.0.1:9000 \\
+      --metadata-endpoint http://127.0.0.1:9000 \\
       --metadata-bucket meta-bucket --metadata-access-key minioadmin \\
       --metadata-secret-key minioadmin
 
@@ -192,24 +192,19 @@ EXAMPLES:
         #[arg(long, default_value = "")]
         region: String,
 
-        /// Reuse data endpoint/bucket/credentials for metadata.
-        /// Metadata path will still be <disk-name>/metadata/.
-        #[arg(long, default_value_t = true)]
-        metadata_same_as_data: bool,
-
-        /// Metadata endpoint URL (required when --metadata-same-as-data=false)
+        /// Metadata endpoint URL (separate store; if omitted, re-uses the data endpoint/bucket)
         #[arg(long)]
         metadata_endpoint: Option<String>,
 
-        /// Metadata bucket (required when --metadata-same-as-data=false)
+        /// Metadata bucket (required when --metadata-endpoint is provided)
         #[arg(long)]
         metadata_bucket: Option<String>,
 
-        /// Metadata access key (required when --metadata-same-as-data=false)
+        /// Metadata access key (required when --metadata-endpoint is provided)
         #[arg(long)]
         metadata_access_key: Option<String>,
 
-        /// Metadata secret key (required when --metadata-same-as-data=false)
+        /// Metadata secret key (required when --metadata-endpoint is provided)
         #[arg(long)]
         metadata_secret_key: Option<String>,
 
@@ -484,7 +479,6 @@ fn main() -> anyhow::Result<()> {
             access_key,
             secret_key,
             region,
-            metadata_same_as_data,
             metadata_endpoint,
             metadata_bucket,
             metadata_access_key,
@@ -509,7 +503,6 @@ fn main() -> anyhow::Result<()> {
                 metadata_access_key.as_deref(),
                 metadata_secret_key.as_deref(),
                 metadata_region.as_deref(),
-                metadata_same_as_data,
                 metadata_cache_ttl_secs,
                 metadata_flush_interval_secs,
                 metadata_flush_ops_threshold,
