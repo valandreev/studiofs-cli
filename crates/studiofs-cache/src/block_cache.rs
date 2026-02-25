@@ -314,6 +314,34 @@ impl BlockCache {
         Ok(())
     }
 
+    /// **Phase 2 — background batch.** Write multiple blocks to L2 (NVMe) in
+    /// parallel and promote their LRU locations.
+    ///
+    /// Much more efficient than calling `commit_l2` in a loop because all
+    /// disk writes are submitted to the thread pool simultaneously, letting
+    /// the NVMe service them across multiple queues.
+    pub async fn commit_l2_batch(&self, blocks: &[(ObjectId, Bytes)]) {
+        let results = self.l2.put_batch(blocks).await;
+        for (object_id, res) in results {
+            match res {
+                Ok(()) => {
+                    self.lru
+                        .set_location(object_id, BlockLocation::MemoryAndDisk);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        object_id,
+                        error = %e,
+                        "batch L2 write failed (block safe in L1 + upload queue)"
+                    );
+                }
+            }
+        }
+        if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {
+            self.evict_notify.notify_one();
+        }
+    }
+
     // =========================================================================
     // Upload queue delegation
     // =========================================================================

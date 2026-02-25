@@ -11,11 +11,22 @@
 //!
 //! This design is elastic: the cache starts at 0 bytes and grows on demand.
 //! Eviction = `unlink` — no internal fragmentation, no free-list bookkeeping.
+//!
+//! ## Performance optimisations
+//!
+//! - **Pre-computed shard paths:** The 256 shard directory paths are built
+//!   once at open() and stored in an array, eliminating `format!` + 3×`join()`
+//!   on every hot-path call.
+//! - **Single `spawn_blocking` per put:** write + rename are combined into one
+//!   blocking call instead of two.
+//! - **Batch put/get:** `put_batch` and `get_batch` amortise thread-pool
+//!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
 use bytes::Bytes;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 // =============================================================================
@@ -26,6 +37,9 @@ use tracing::{debug, warn};
 pub struct L2DiskCache {
     /// Root cache directory (contains `blocks/` subdirectory).
     cache_dir: PathBuf,
+    /// Pre-computed shard directory paths: `shard_dirs[byte] = "{cache_dir}/blocks/{byte:02x}"`.
+    /// Avoids `format!` + `PathBuf::join` on every hot-path call.
+    shard_dirs: Arc<[PathBuf; 256]>,
     /// Total cached bytes on disk (approximate — updated on put/remove).
     total_bytes: AtomicU64,
     /// Maximum allowed bytes.
@@ -43,15 +57,18 @@ impl L2DiskCache {
         let blocks_dir = cache_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
 
-        // Pre-create all 256 shard directories (00..ff) so put() can skip
-        // create_dir_all on every write — saves one spawn_blocking syscall per block.
-        for shard in 0u8..=255 {
-            let shard_dir = blocks_dir.join(format!("{:02x}", shard));
-            std::fs::create_dir_all(&shard_dir)?;
-        }
+        // Pre-create all 256 shard directories (00..ff) and cache their paths
+        // so hot-path calls never need `format!` + `PathBuf::join`.
+        let shard_dirs: [PathBuf; 256] = std::array::from_fn(|i| {
+            let dir = blocks_dir.join(format!("{:02x}", i));
+            // Ignore errors for pre-existing dirs.
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
 
         let this = Self {
             cache_dir,
+            shard_dirs: Arc::new(shard_dirs),
             total_bytes: AtomicU64::new(0),
             max_bytes: AtomicU64::new(max_bytes),
         };
@@ -113,18 +130,51 @@ impl L2DiskCache {
 
     /// Read a block from disk.  Returns `None` if not cached.
     ///
-    /// Uses `tokio::fs` (spawn_blocking internally) so this never blocks the
-    /// tokio runtime — unlike mmap page faults.
+    /// Uses a single `spawn_blocking` so this never blocks the tokio runtime.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match tokio::fs::read(&path).await {
-            Ok(data) => Some(Bytes::from(data)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => {
+        match tokio::task::spawn_blocking(move || std::fs::read(&path)).await {
+            Ok(Ok(data)) => Some(Bytes::from(data)),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
+            Ok(Err(e)) => {
                 warn!(object_id, error = %e, "L2DiskCache read error");
                 None
             }
+            Err(e) => {
+                warn!(object_id, error = %e, "L2DiskCache join error");
+                None
+            }
         }
+    }
+
+    /// Read multiple blocks from disk in parallel.
+    ///
+    /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
+    /// the input.  Each block is read in its own `spawn_blocking` task so the
+    /// OS can schedule them across multiple NVMe queues.
+    pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
+        let mut handles = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let path = self.block_path(id);
+            handles.push((id, tokio::task::spawn_blocking(move || std::fs::read(&path))));
+        }
+        let mut results = Vec::with_capacity(handles.len());
+        for (id, handle) in handles {
+            let data = match handle.await {
+                Ok(Ok(data)) => Some(Bytes::from(data)),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
+                Ok(Err(e)) => {
+                    warn!(id, error = %e, "L2DiskCache batch read error");
+                    None
+                }
+                Err(e) => {
+                    warn!(id, error = %e, "L2DiskCache batch join error");
+                    None
+                }
+            };
+            results.push((id, data));
+        }
+        results
     }
 
     /// Read a block synchronously (for non-async contexts like upload workers).
@@ -142,20 +192,60 @@ impl L2DiskCache {
 
     /// Write a block to disk (decompressed data).
     ///
-    /// Atomic: writes to a `.tmp` file then renames.
+    /// Atomic: writes to a `.tmp` file then renames — combined in a single
+    /// `spawn_blocking` call to halve the thread-pool scheduling overhead.
     ///
     /// Shard directories are pre-created by `open()`, so no `create_dir_all`
     /// call on the hot path.
     pub async fn put(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
         let path = self.block_path(object_id);
         let tmp_path = path.with_extension("tmp");
+        let len = data.len() as u64;
+        let owned = data.to_vec();
 
-        tokio::fs::write(&tmp_path, data).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            std::fs::write(&tmp_path, &owned)?;
+            std::fs::rename(&tmp_path, &path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
 
-        self.total_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.total_bytes.fetch_add(len, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Write multiple blocks to disk in parallel.
+    ///
+    /// Each block is written in its own `spawn_blocking` task so NVMe can
+    /// service them concurrently through multiple queues.  Returns errors
+    /// for individual blocks as `(object_id, Error)`.
+    pub async fn put_batch(&self, blocks: &[(u64, Bytes)]) -> Vec<(u64, io::Result<()>)> {
+        let mut handles = Vec::with_capacity(blocks.len());
+        for (id, data) in blocks {
+            let path = self.block_path(*id);
+            let tmp_path = path.with_extension("tmp");
+            let owned = data.clone();
+            let object_id = *id;
+            handles.push((object_id, data.len() as u64, tokio::task::spawn_blocking(move || -> io::Result<()> {
+                std::fs::write(&tmp_path, &owned)?;
+                std::fs::rename(&tmp_path, &path)?;
+                Ok(())
+            })));
+        }
+        let mut results = Vec::with_capacity(handles.len());
+        for (id, len, handle) in handles {
+            let res = match handle.await {
+                Ok(Ok(())) => {
+                    self.total_bytes.fetch_add(len, Ordering::Relaxed);
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            };
+            results.push((id, res));
+        }
+        results
     }
 
     /// Write a block synchronously.
@@ -176,21 +266,31 @@ impl L2DiskCache {
     /// Remove a block from disk.
     pub async fn remove(&self, object_id: u64) {
         let path = self.block_path(object_id);
-        match tokio::fs::metadata(&path).await {
-            Ok(meta) => {
-                let size = meta.len();
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    if e.kind() != io::ErrorKind::NotFound {
-                        warn!(object_id, error = %e, "L2DiskCache remove error");
+        // Single spawn_blocking for metadata + remove.
+        let removed_size = tokio::task::spawn_blocking(move || -> u64 {
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let size = meta.len();
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => size,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+                        Err(e) => {
+                            warn!(object_id, error = %e, "L2DiskCache remove error");
+                            0
+                        }
                     }
-                } else {
-                    self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+                Err(e) => {
+                    warn!(object_id, error = %e, "L2DiskCache remove stat error");
+                    0
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                warn!(object_id, error = %e, "L2DiskCache remove stat error");
-            }
+        })
+        .await
+        .unwrap_or(0);
+        if removed_size > 0 {
+            self.total_bytes.fetch_sub(removed_size, Ordering::Relaxed);
         }
     }
 
@@ -237,14 +337,14 @@ impl L2DiskCache {
 
     /// Compute the path for a given block.
     ///
-    /// `{cache_dir}/blocks/{high_byte_hex}/{object_id:016x}.block`
+    /// Uses pre-computed shard directory paths — only one `format!` and one
+    /// `PathBuf::join` instead of three.
+    ///
+    /// `{shard_dirs[high_byte]}/{object_id:016x}.block`
+    #[inline]
     fn block_path(&self, object_id: u64) -> PathBuf {
-        let hex = format!("{:016x}", object_id);
-        let shard = &hex[..2];
-        self.cache_dir
-            .join("blocks")
-            .join(shard)
-            .join(format!("{hex}.block"))
+        let shard_byte = (object_id >> 56) as u8; // top 8 bits = first 2 hex chars
+        self.shard_dirs[shard_byte as usize].join(format!("{:016x}.block", object_id))
     }
 
     /// Root cache directory.

@@ -199,7 +199,8 @@ pub struct VfsConfig {
     /// Maximum bytes to hold in the dirty-write memory buffer before applying
     /// backpressure.  This buffer stores blocks that `flush()` has accepted
     /// but the background flusher has not yet written to disk.
-    /// Default: 2 GiB.
+    /// Default: 8 GiB.  Larger buffer absorbs write bursts better and lets
+    /// the parallel background flusher saturate NVMe.
     pub max_dirty_bytes: usize,
 }
 
@@ -213,7 +214,7 @@ impl Default for VfsConfig {
             block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
             max_concurrent_uploads: 4,
             readahead_width: 8,
-            max_dirty_bytes: 4 * 1024 * 1024 * 1024,
+            max_dirty_bytes: 8 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -382,6 +383,10 @@ struct VfsState {
     dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
     /// Approximate total bytes currently held in `dirty_mem` (for backpressure).
     dirty_bytes: AtomicUsize,
+    /// Notification fired by the background flusher each time it drains blocks
+    /// from `dirty_mem`, used for low-latency backpressure wakeup in `write()`
+    /// and `flush()` instead of polling with `sleep(5ms)`.
+    dirty_drained_notify: tokio::sync::Notify,
     /// Inodes that have been unlinked.  The background flusher checks this
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
@@ -704,6 +709,7 @@ impl StudioVfs {
                 attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                 dirty_mem: Mutex::new(std::collections::HashMap::new()),
                 dirty_bytes: AtomicUsize::new(0),
+                dirty_drained_notify: tokio::sync::Notify::new(),
                 deleted_inodes: Mutex::new(std::collections::HashSet::new()),
                 slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
                 file_locks: Mutex::new(std::collections::HashMap::new()),
@@ -714,7 +720,7 @@ impl StudioVfs {
             dir_prefetch,
             prefetch_tx,
             dirty_flush_tx,
-            max_dirty_bytes: 4 * 1024 * 1024 * 1024,
+            max_dirty_bytes: 8 * 1024 * 1024 * 1024,
             handle_table: HandleTable::new(),
             janitor_lease,
             janitor_interval,
@@ -1902,6 +1908,7 @@ impl StudioVfs {
                         Some(v.saturating_sub(removed_bytes))
                     })
                     .ok();
+                self.state.dirty_drained_notify.notify_waiters();
                 debug!(
                     "evict_inode L1.5: ino={} freed {} bytes from dirty_mem",
                     ino, removed_bytes
@@ -1947,6 +1954,7 @@ impl StudioVfs {
                         Some(v.saturating_sub(data.len()))
                     })
                     .ok();
+                self.state.dirty_drained_notify.notify_waiters();
             }
         }
 
@@ -2262,7 +2270,8 @@ impl StudioVfs {
         // The background slab flusher will process them asynchronously.
         if !full_blocks.is_empty() {
             let total: usize = full_blocks.iter().map(|(_, d)| d.len()).sum();
-            // Backpressure: stall briefly if the flusher is falling behind.
+            // Backpressure: wait until the flusher drains enough dirty bytes.
+            // Uses Notify for instant wakeup instead of polling with sleep().
             while self
                 .state
                 .dirty_bytes
@@ -2270,7 +2279,7 @@ impl StudioVfs {
                 .saturating_add(total)
                 > self.max_dirty_bytes
             {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.state.dirty_drained_notify.notified().await;
             }
             {
                 let mut dirty = self.state.dirty_mem.lock();
@@ -2344,7 +2353,7 @@ impl StudioVfs {
 
         if !blocks_to_buffer.is_empty() {
             let total: usize = blocks_to_buffer.iter().map(|(_, d)| d.len()).sum();
-            // Backpressure: wait if dirty buffer is saturated.
+            // Backpressure: wait until the flusher drains enough dirty bytes.
             while self
                 .state
                 .dirty_bytes
@@ -2352,7 +2361,7 @@ impl StudioVfs {
                 .saturating_add(total)
                 > self.max_dirty_bytes
             {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.state.dirty_drained_notify.notified().await;
             }
             {
                 let mut dirty = self.state.dirty_mem.lock();
@@ -2385,7 +2394,7 @@ impl StudioVfs {
         mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     ) {
         info!("background slab flusher started");
-        let mut timer = tokio::time::interval(Duration::from_millis(50));
+        let mut timer = tokio::time::interval(Duration::from_millis(10));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -2409,8 +2418,8 @@ impl StudioVfs {
 
     /// Two-phase batched drain of `dirty_mem`.
     ///
-    /// **Phase 1 (fast — sub-millisecond for 64 blocks):**
-    /// 1. Take up to 64 blocks from `dirty_mem`.
+    /// **Phase 1 (fast — sub-millisecond for 256 blocks):**
+    /// 1. Take up to 256 blocks from `dirty_mem`.
     /// 2. Allocate block IDs in one transaction (`next_block_ids`).
     /// 3. Write all block refs + counters + pending deletions in one
     ///    transaction (`flush_blocks_batch`) — 1 fsync instead of ~300.
@@ -2420,12 +2429,16 @@ impl StudioVfs {
     ///    is immediately unblocked.
     ///
     /// **Phase 2 (background spawn — fire-and-forget):**
-    /// Write all blocks to L2 NVMe.  Does NOT affect `dirty_bytes` or
-    /// backpressure.  Blocks are pinned in LRU and safe in L1 RAM until
-    /// both L2 and S3 upload complete.
+    /// Write all blocks to L2 NVMe **in parallel** via `commit_l2_batch`.
+    /// Does NOT affect `dirty_bytes` or backpressure.  Blocks are pinned in
+    /// LRU and safe in L1 RAM until both L2 and S3 upload complete.
     async fn drain_dirty_mem(&self) {
-        const MAX_DRAIN_BATCH: usize = 64;
+        const MAX_DRAIN_BATCH: usize = 256;
 
+        // Keep draining in a loop as long as there is work — this avoids
+        // waiting for the next timer tick / channel signal when the dirty
+        // buffer has more than MAX_DRAIN_BATCH blocks queued.
+        loop {
         // ── Step 1: snapshot keys + filter deleted inodes ────────────────
         let keys: Vec<(Ino, u32)> = {
             let dirty = self.state.dirty_mem.lock();
@@ -2446,6 +2459,7 @@ impl StudioVfs {
                             Some(v.saturating_sub(data.len()))
                         })
                         .ok();
+                    self.state.dirty_drained_notify.notify_waiters();
                 }
                 debug!(
                     "slab flusher: skipping deleted inode {} block {}",
@@ -2551,26 +2565,28 @@ impl StudioVfs {
             })
             .ok();
 
+        // Wake any write()/flush() callers blocked on backpressure.
+        self.state.dirty_drained_notify.notify_waiters();
+
+        let batch_len = l2_work.len();
         debug!(
             "slab flusher: drained {} blocks ({} bytes), dirty_bytes={}",
-            l2_work.len(),
+            batch_len,
             freed_bytes,
             self.state.dirty_bytes.load(Ordering::Relaxed),
         );
 
-        // ── Phase 2: background L2 writes (fire-and-forget) ─────────────
+        // ── Phase 2: background L2 writes (fire-and-forget, parallel) ───
         let cache = self.block_cache.clone();
         tokio::spawn(async move {
-            for (object_id, data) in l2_work {
-                if let Err(e) = cache.commit_l2(object_id, &data).await {
-                    warn!(
-                        object_id,
-                        error = %e,
-                        "background L2 write failed (block safe in L1 + upload queue)"
-                    );
-                }
-            }
+            cache.commit_l2_batch(&l2_work).await;
         });
+
+        // If we processed a full batch, there's likely more — loop immediately.
+        if batch_len < MAX_DRAIN_BATCH {
+            return;
+        }
+        } // end loop
     }
 
     // =========================================================================
