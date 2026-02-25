@@ -766,6 +766,23 @@ impl StudioVfs {
             .join();
         }
 
+        // Warm up the HTTP GET connection pool SYNCHRONOUSLY.
+        // The warmup fires real GET requests (which 404) to force TCP
+        // connections to be established.  Without this, the first burst
+        // of reads hits a cold pool and gets io_timeouts (~5s each),
+        // causing a visible stall.  3 seconds is generous for LAN.
+        {
+            let fs = fetch_scheduler.clone();
+            let timeout = Duration::from_secs(3);
+            let handle = tokio::runtime::Handle::current();
+            let _ = std::thread::spawn(move || {
+                handle.block_on(async {
+                    let _ = fs.warmup(timeout).await;
+                })
+            })
+            .join();
+        }
+
         // Spawn GC Worker
         let vfs_clone = vfs.clone();
         tokio::spawn(async move {
