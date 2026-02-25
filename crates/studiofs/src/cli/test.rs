@@ -214,7 +214,104 @@ async fn is_bucket_reachable(op: &Operator, probe_key: &str) -> bool {
     }
 }
 
-// ── Connectivity suite ────────────────────────────────────────────────────────
+// ── Programmatic compatibility check API (used by `studiofs init`) ───────────
+
+/// Result of a programmatic compatibility pre-flight run.
+///
+/// Each category reports whether ALL tests in that group passed.
+/// `suitable_for_data()` and `suitable_for_metadata()` encode the specific
+/// requirements for each use-case.
+pub(crate) struct CompatResult {
+    pub connectivity_ok: bool,
+    pub data_ok: bool,
+    pub meta_ok: bool,
+    cases: Vec<TestCase>,
+}
+
+impl CompatResult {
+    /// All tests passed.
+    #[allow(dead_code)]
+    pub fn all_ok(&self) -> bool {
+        self.connectivity_ok && self.data_ok && self.meta_ok
+    }
+
+    /// The bucket can serve as the **data** store (block I/O).
+    pub fn suitable_for_data(&self) -> bool {
+        self.connectivity_ok && self.data_ok
+    }
+
+    /// The bucket can serve as the **metadata** store (CAS / conditional writes).
+    pub fn suitable_for_metadata(&self) -> bool {
+        self.connectivity_ok && self.meta_ok
+    }
+
+    /// One-line summaries of every failed test, suitable for error output.
+    pub fn failure_summary(&self) -> Vec<String> {
+        self.cases
+            .iter()
+            .filter_map(|tc| match &tc.status {
+                Status::Fail(msg) => {
+                    Some(format!("[{}] {}: {}", tc.category.label(), tc.name, msg))
+                }
+                Status::Pass => None,
+            })
+            .collect()
+    }
+
+    /// Print the human-readable tabular report.
+    pub fn print_report(&self) {
+        print_report(&self.cases);
+    }
+}
+
+/// Run a full compatibility test against an **already-accessible** bucket.
+///
+/// Temporary objects are written under a random prefix and cleaned up before
+/// returning.  The bucket itself is never deleted.
+///
+/// Returns `Err` only for infrastructure failures (cannot build operator, etc.).
+/// Test failures are encoded in the returned `CompatResult`.
+pub(crate) fn run_compat_on_bucket(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    rt: &tokio::runtime::Runtime,
+) -> anyhow::Result<CompatResult> {
+    let uid = Uuid::new_v4().to_string();
+    let prefix = format!("studiofs-compat-{}", &uid[..8]);
+
+    let op = build_op(endpoint, bucket, access_key, secret_key, region)?;
+    let mut cases: Vec<TestCase> = Vec::new();
+
+    rt.block_on(run_connectivity(&op, &prefix, &mut cases));
+    rt.block_on(run_data_tests(&op, &prefix, &mut cases));
+    rt.block_on(run_metadata_tests(&op, &prefix, &mut cases));
+
+    // Clean up temp objects regardless of result.
+    rt.block_on(async {
+        remove_prefix(&op, &prefix).await.ok();
+    });
+
+    Ok(compat_result_from_cases(cases))
+}
+
+fn compat_result_from_cases(cases: Vec<TestCase>) -> CompatResult {
+    let all_pass = |cat: &str| -> bool {
+        let matching: Vec<_> = cases
+            .iter()
+            .filter(|tc| tc.category.label() == cat)
+            .collect();
+        !matching.is_empty() && matching.iter().all(|tc| tc.status.is_pass())
+    };
+    CompatResult {
+        connectivity_ok: all_pass("connectivity"),
+        data_ok: all_pass("data"),
+        meta_ok: all_pass("metadata"),
+        cases,
+    }
+}
 
 async fn run_connectivity(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
     println!("  ── Connectivity ──────────────────────────────────────────────────────────");
@@ -871,7 +968,7 @@ fn build_signed_headers(
     Ok(out)
 }
 
-async fn bucket_create(
+pub(crate) async fn bucket_create(
     endpoint: &str,
     bucket: &str,
     access_key: &str,
@@ -941,4 +1038,15 @@ async fn bucket_delete(
             Err(anyhow!("HTTP {status}: {body_text}"))
         }
     }
+}
+
+/// Expose the SigV4 bucket deletion for use from init.rs cleanup path.
+pub(crate) async fn bucket_delete_call(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+) -> anyhow::Result<()> {
+    bucket_delete(endpoint, bucket, access_key, secret_key, region).await
 }

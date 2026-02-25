@@ -1,4 +1,10 @@
 //! `studiofs init` — initialize a new filesystem volume.
+//!
+//! Bucket creation is automatic: if the target bucket does not exist the
+//! command will attempt to create it (AWS SigV4 signed CreateBucket).
+//! A compatibility pre-flight check is run on every storage backend before
+//! any local state is written.  On failure the command is aborted and any
+//! buckets that were created during this run are deleted.
 
 use std::io::Write;
 use std::path::Path;
@@ -10,15 +16,7 @@ use studiofs_meta::{
 use tracing::info;
 use uuid::Uuid;
 
-fn verify_store_access(label: &str, cfg: &DataStoreConfig) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let ds = DataStore::new(cfg)?;
-        ds.check()
-            .await
-            .map_err(|e| anyhow::anyhow!("{} check failed: {}", label, e))
-    })
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Parse a size string like "4MB", "1GB" into bytes.
 /// Supports KB, MB, GB, TB suffixes. Defaults to bytes if no suffix.
@@ -68,6 +66,80 @@ fn get_current_ids() -> (u32, u32) {
     (0, 0)
 }
 
+/// Ensure a bucket is accessible, creating it if necessary.
+///
+/// Returns `true` if the bucket was created by this call (and thus should be
+/// deleted if the overall init is aborted), or `false` if it already existed.
+fn ensure_bucket_accessible(
+    rt: &tokio::runtime::Runtime,
+    label: &str,
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+) -> anyhow::Result<bool> {
+    use super::test::bucket_create;
+
+    let cfg = DataStoreConfig {
+        endpoint: endpoint.to_string(),
+        bucket: bucket.to_string(),
+        access_key: access_key.to_string(),
+        secret_key: secret_key.to_string(),
+        region: region.to_string(),
+        volume_name: String::new(),
+    };
+
+    print!("  Checking {label} bucket '{bucket}'... ");
+    std::io::stdout().flush().ok();
+
+    let ds = DataStore::new(&cfg)
+        .map_err(|e| anyhow::anyhow!("cannot build {label} store client: {e}"))?;
+
+    match rt.block_on(ds.check()) {
+        Ok(()) => {
+            println!("OK (exists)");
+            return Ok(false);
+        }
+        Err(e) => {
+            println!("not found — will create ({e})");
+        }
+    }
+
+    print!("  Creating {label} bucket '{bucket}'... ");
+    std::io::stdout().flush().ok();
+    rt.block_on(bucket_create(endpoint, bucket, access_key, secret_key, region))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "bucket '{bucket}' not accessible and could not be created: {e}\n\
+                 Tip: check credentials and ensure s3:CreateBucket permission is granted."
+            )
+        })?;
+    println!("OK (created)");
+    Ok(true)
+}
+
+/// Delete a bucket during abort cleanup (best-effort, errors are logged only).
+fn cleanup_delete_bucket(
+    rt: &tokio::runtime::Runtime,
+    label: &str,
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+) {
+    use super::test::bucket_delete_call;
+    print!("    Deleting {label} bucket '{bucket}'... ");
+    std::io::stdout().flush().ok();
+    match rt.block_on(bucket_delete_call(endpoint, bucket, access_key, secret_key, region)) {
+        Ok(()) => println!("OK"),
+        Err(e) => println!("WARN — {e}"),
+    }
+}
+
+// ── Main run function ─────────────────────────────────────────────────────────
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
@@ -89,25 +161,172 @@ pub fn run(
     meta_dir: &Path,
     block_size: Option<&str>,
 ) -> anyhow::Result<()> {
-    // 1. Verify data and metadata stores.
-    println!("🔍 Verifying data store connection...");
-    let data_cfg = DataStoreConfig {
-        endpoint: data_endpoint.to_string(),
-        bucket: data_bucket.to_string(),
-        access_key: data_access_key.to_string(),
-        secret_key: data_secret_key.to_string(),
-        region: data_region.to_string(),
-        volume_name: name.to_string(),
-    };
-    verify_store_access("data", &data_cfg)?;
-    println!(
-        "✅ Data store verified. Bucket '{}' is accessible.",
-        data_bucket
-    );
+    let rt = tokio::runtime::Runtime::new()?;
+    let eff_data_region = if data_region.is_empty() { "us-east-1" } else { data_region };
 
+    // ── Resolve metadata credentials early ───────────────────────────────────
+    // We need them before the compat check so we can determine whether the
+    // metadata store is the same as the data store.
+    let (eff_meta_endpoint, eff_meta_bucket, eff_meta_access_key, eff_meta_secret_key, eff_meta_region) =
+        if metadata_same_as_data {
+            (
+                data_endpoint.to_string(),
+                data_bucket.to_string(),
+                data_access_key.to_string(),
+                data_secret_key.to_string(),
+                eff_data_region.to_string(),
+            )
+        } else {
+            let ep = metadata_endpoint
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--metadata-endpoint is required unless --metadata-same-as-data is used"
+                    )
+                })?
+                .to_string();
+            let bk = metadata_bucket
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--metadata-bucket is required unless --metadata-same-as-data is used"
+                    )
+                })?
+                .to_string();
+            let ak = metadata_access_key
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--metadata-access-key is required unless --metadata-same-as-data is used"
+                    )
+                })?
+                .to_string();
+            let sk = metadata_secret_key
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--metadata-secret-key is required unless --metadata-same-as-data is used"
+                    )
+                })?
+                .to_string();
+            let rg = metadata_region.unwrap_or("").to_string();
+            let rg = if rg.is_empty() { "us-east-1".to_string() } else { rg };
+            (ep, bk, ak, sk, rg)
+        };
+
+    // Are data and metadata using the exact same physical bucket / endpoint?
+    let meta_is_same_bucket =
+        eff_meta_endpoint == data_endpoint && eff_meta_bucket == data_bucket;
+
+    // ── 1. Ensure buckets are accessible (create if missing) ─────────────────
+    println!("Checking storage backends...");
+    println!();
+    let data_bucket_created = ensure_bucket_accessible(
+        &rt,
+        "data",
+        data_endpoint,
+        data_bucket,
+        data_access_key,
+        data_secret_key,
+        eff_data_region,
+    )?;
+
+    let meta_bucket_created = if meta_is_same_bucket {
+        false // already handled above
+    } else {
+        ensure_bucket_accessible(
+            &rt,
+            "metadata",
+            &eff_meta_endpoint,
+            &eff_meta_bucket,
+            &eff_meta_access_key,
+            &eff_meta_secret_key,
+            &eff_meta_region,
+        )?
+    };
     println!();
 
-    // 2. Check if metadata directory already exists
+    // ── 2. Compatibility pre-flight check ─────────────────────────────────────
+    println!("Running compatibility pre-flight check...");
+    println!();
+
+    println!("  [Data store: {data_endpoint} / {data_bucket}]");
+    let data_compat = super::test::run_compat_on_bucket(
+        data_endpoint,
+        data_bucket,
+        data_access_key,
+        data_secret_key,
+        eff_data_region,
+        &rt,
+    )?;
+
+    let meta_compat = if meta_is_same_bucket {
+        None // same physical bucket — reuse data result for verdict
+    } else {
+        println!();
+        println!("  [Metadata store: {} / {}]", eff_meta_endpoint, eff_meta_bucket);
+        Some(super::test::run_compat_on_bucket(
+            &eff_meta_endpoint,
+            &eff_meta_bucket,
+            &eff_meta_access_key,
+            &eff_meta_secret_key,
+            &eff_meta_region,
+            &rt,
+        )?)
+    };
+
+    // ── 3. Evaluate compat results ────────────────────────────────────────────
+    let data_ok = data_compat.suitable_for_data();
+    // When same bucket: it must also pass metadata CAS tests.
+    let meta_ok = if meta_is_same_bucket {
+        data_compat.suitable_for_metadata()
+    } else {
+        meta_compat.as_ref().map(|r| r.suitable_for_metadata()).unwrap_or(true)
+    };
+
+    if !data_ok || !meta_ok {
+        // Print full reports so the user sees exactly what failed.
+        data_compat.print_report();
+        if let Some(mc) = &meta_compat {
+            mc.print_report();
+        }
+
+        // Cleanup: delete buckets we created during this run.
+        println!("Compatibility check FAILED — cleaning up...");
+        if data_bucket_created {
+            cleanup_delete_bucket(
+                &rt,
+                "data",
+                data_endpoint,
+                data_bucket,
+                data_access_key,
+                data_secret_key,
+                eff_data_region,
+            );
+        }
+        if meta_bucket_created {
+            cleanup_delete_bucket(
+                &rt,
+                "metadata",
+                &eff_meta_endpoint,
+                &eff_meta_bucket,
+                &eff_meta_access_key,
+                &eff_meta_secret_key,
+                &eff_meta_region,
+            );
+        }
+
+        // Collect failure details for the error message.
+        let mut failures: Vec<String> = data_compat.failure_summary();
+        if let Some(mc) = &meta_compat {
+            failures.extend(mc.failure_summary());
+        }
+        let detail = failures.join("\n  ");
+        return Err(anyhow::anyhow!(
+            "Storage compatibility check failed — this backend is not suitable for StudioFS:\n  {detail}\n\nRun `studiofs test` for detailed diagnostics."
+        ));
+    }
+
+    println!("✓ Compatibility check passed.");
+    println!();
+
+    // ── 4. Check if metadata directory already exists ────────────────────────
     if meta_dir.exists() {
         println!("! Metadata directory already exists: {:?}", meta_dir);
         print!("  Do you want to CLEAR it and start fresh? [y/N]: ");
@@ -125,7 +344,7 @@ pub fn run(
         }
     }
 
-    // 3. Create metadata directory and initialize DB
+    // ── 5. Create metadata directory and initialize local DB ─────────────────
     std::fs::create_dir_all(meta_dir)?;
 
     let db_path = meta_dir.join(format!("{name}.db"));
@@ -143,61 +362,27 @@ pub fn run(
     let metadata_prefix = format!("{name}/metadata/");
     let data_prefix = format!("{name}/objects/");
 
-    let metadata_remote = if metadata_same_as_data {
+    let metadata_remote = if meta_is_same_bucket {
         Some(RemoteStoreConfig {
             endpoint: data_endpoint.to_string(),
             bucket: data_bucket.to_string(),
             access_key: data_access_key.to_string(),
             secret_key: data_secret_key.to_string(),
-            region: data_region.to_string(),
+            region: eff_data_region.to_string(),
             prefix: metadata_prefix.clone(),
         })
     } else {
-        let endpoint = metadata_endpoint.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--metadata-endpoint is required unless --metadata-same-as-data is used"
-            )
-        })?;
-        let bucket = metadata_bucket.ok_or_else(|| {
-            anyhow::anyhow!("--metadata-bucket is required unless --metadata-same-as-data is used")
-        })?;
-        let access_key = metadata_access_key.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--metadata-access-key is required unless --metadata-same-as-data is used"
-            )
-        })?;
-        let secret_key = metadata_secret_key.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--metadata-secret-key is required unless --metadata-same-as-data is used"
-            )
-        })?;
         Some(RemoteStoreConfig {
-            endpoint: endpoint.to_string(),
-            bucket: bucket.to_string(),
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
-            region: metadata_region.unwrap_or("").to_string(),
+            endpoint: eff_meta_endpoint.clone(),
+            bucket: eff_meta_bucket.clone(),
+            access_key: eff_meta_access_key.clone(),
+            secret_key: eff_meta_secret_key.clone(),
+            region: eff_meta_region.clone(),
             prefix: metadata_prefix.clone(),
         })
     };
-    if let Some(remote) = &metadata_remote {
-        println!("🔍 Verifying metadata store connection...");
-        let metadata_cfg = DataStoreConfig {
-            endpoint: remote.endpoint.clone(),
-            bucket: remote.bucket.clone(),
-            access_key: remote.access_key.clone(),
-            secret_key: remote.secret_key.clone(),
-            region: remote.region.clone(),
-            volume_name: name.to_string(),
-        };
-        verify_store_access("metadata", &metadata_cfg)?;
-        println!(
-            "✅ Metadata store verified. Bucket '{}' is accessible.",
-            remote.bucket
-        );
-    }
 
-    // Store format info
+    // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
         name: name.to_string(),
         uuid: Uuid::new_v4().to_string(),
@@ -232,6 +417,7 @@ pub fn run(
         tonbo.flush_now()?;
     }
 
+    // ── 7. Report success ─────────────────────────────────────────────────────
     info!("volume {name:?} initialized successfully");
     println!("✓ Volume '{}' initialized", name);
     println!("  UUID:       {}", format_info.uuid);
@@ -243,8 +429,10 @@ pub fn run(
     println!("  Data endpoint: {}", data_endpoint);
     println!("  Data bucket:   {}", data_bucket);
     if let Some(remote) = &format_info.metadata.remote {
-        println!("  Metadata endpoint: {}", remote.endpoint);
-        println!("  Metadata bucket:   {}", remote.bucket);
+        if !meta_is_same_bucket {
+            println!("  Metadata endpoint: {}", remote.endpoint);
+            println!("  Metadata bucket:   {}", remote.bucket);
+        }
         println!("  Metadata prefix:   {}", remote.prefix);
     }
     println!("  Metadata:   {:?}", db_path);
