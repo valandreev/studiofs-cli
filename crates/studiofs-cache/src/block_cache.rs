@@ -375,6 +375,17 @@ impl BlockCache {
         self.upload_queue.requeue(op)
     }
 
+    /// Cancel a pending upload: unpin the block, remove the journal entry,
+    /// and decrement the pending count.  Optionally removes the block data
+    /// from cache entirely (used when the owning inode was deleted).
+    pub fn cancel_upload(&self, op: &PendingUpload, remove_block: bool) {
+        self.lru.unpin(op.object_id);
+        self.upload_queue.cancel(op);
+        if remove_block {
+            self.remove_sync(op.object_id);
+        }
+    }
+
     /// Number of pending uploads.
     pub fn pending_upload_count(&self) -> usize {
         self.upload_queue.pending_count()

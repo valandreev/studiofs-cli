@@ -102,7 +102,7 @@ pub fn run(
     #[cfg(unix)]
     {
         info!("starting FUSE mount at {mount_point}");
-        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, true)
+        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, true)
             .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
     }
 

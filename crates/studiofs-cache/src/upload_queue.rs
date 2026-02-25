@@ -147,6 +147,16 @@ impl UploadQueue {
         self.sender.send(op).is_ok()
     }
 
+    /// Cancel a pending upload: remove the journal file and decrement the
+    /// pending count.  The caller is responsible for unpinning + removing the
+    /// block from cache.
+    pub fn cancel(&self, op: &PendingUpload) {
+        if !op.journal_path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&op.journal_path);
+        }
+        self.mark_done();
+    }
+
     /// Wait until all currently pending uploads complete or `timeout` elapses.
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;

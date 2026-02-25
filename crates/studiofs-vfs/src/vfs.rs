@@ -391,6 +391,10 @@ struct VfsState {
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
+    /// Object IDs that should be removed from the block cache after their
+    /// pending upload completes (or is cancelled).  Populated by
+    /// `evict_inode_from_caches()` when it encounters a pinned block.
+    pending_evictions: Mutex<std::collections::HashSet<u64>>,
     /// Flag set at shutdown to stop the background slab flusher so it cannot
     /// race with the shutdown drain.
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
@@ -711,6 +715,7 @@ impl StudioVfs {
                 dirty_bytes: AtomicUsize::new(0),
                 dirty_drained_notify: tokio::sync::Notify::new(),
                 deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+                pending_evictions: Mutex::new(std::collections::HashSet::new()),
                 slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
                 file_locks: Mutex::new(std::collections::HashMap::new()),
                 lock_notify: tokio::sync::Notify::new(),
@@ -1916,22 +1921,26 @@ impl StudioVfs {
             }
         }
 
-        // L1 + L2 — unified block cache: remove each object,
-        // but skip blocks that are pinned (pending upload — let upload complete first).
+        // L1 + L2 — unified block cache: remove each object.
+        // Blocks with a pending upload are pinned — schedule deferred eviction
+        // so they are cleaned up once the upload completes (or is cancelled by
+        // the uploader when it detects the inode is deleted).
         let mut evicted = 0;
-        let mut skipped_pinned = 0;
+        let mut deferred_pinned = 0;
         for &object_id in object_ids {
             if self.block_cache.is_pinned(object_id) {
-                skipped_pinned += 1;
+                // Record for post-upload cleanup instead of silently skipping.
+                self.state.pending_evictions.lock().insert(object_id);
+                deferred_pinned += 1;
                 continue;
             }
             self.block_cache.remove_sync(object_id);
             evicted += 1;
         }
-        if evicted > 0 || skipped_pinned > 0 {
+        if evicted > 0 || deferred_pinned > 0 {
             debug!(
-                "evict_inode: ino={} evicted {} blocks, skipped pinned={}",
-                ino, evicted, skipped_pinned
+                "evict_inode: ino={} evicted {} blocks, deferred pinned={}",
+                ino, evicted, deferred_pinned
             );
         }
 
@@ -1958,10 +1967,11 @@ impl StudioVfs {
             }
         }
 
-        // L1 + L2 — unified block cache (skip if pinned for pending upload).
+        // L1 + L2 — unified block cache (defer if pinned for pending upload).
         if self.block_cache.is_pinned(object_id) {
+            self.state.pending_evictions.lock().insert(object_id);
             debug!(
-                "evict_block: skip pinned object_id={} ino={} block={}",
+                "evict_block: deferred pinned object_id={} ino={} block={}",
                 object_id, ino, block_index
             );
         } else {
@@ -2607,10 +2617,21 @@ impl StudioVfs {
             let retry_op = op.clone();
             tokio::spawn(async move {
                 if let Err(e) = vfs.process_upload(op, permit).await {
-                    warn!("upload processing error, will requeue: {}", e);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if !vfs.block_cache.requeue_upload(retry_op) {
-                        error!("failed to requeue upload op after error");
+                    // If the inode was deleted, don't retry — cancel the upload.
+                    if vfs.state.deleted_inodes.lock().contains(&retry_op.ino) {
+                        info!(
+                            object_id = retry_op.object_id,
+                            ino = retry_op.ino,
+                            "upload failed for deleted inode, cancelling: {}", e
+                        );
+                        vfs.block_cache.cancel_upload(&retry_op, true);
+                        vfs.state.pending_evictions.lock().remove(&retry_op.object_id);
+                    } else {
+                        warn!("upload processing error, will requeue: {}", e);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if !vfs.block_cache.requeue_upload(retry_op) {
+                            error!("failed to requeue upload op after error");
+                        }
                     }
                 }
             });
@@ -2623,29 +2644,67 @@ impl StudioVfs {
     /// before uploading to S3.  Uses the write-optimised DataStore with short
     /// io_timeout (15s) so stale connections fail fast and are retried on a
     /// fresh connection.
+    ///
+    /// If the owning inode has been deleted, the upload is cancelled immediately
+    /// (no S3 write) and the block is evicted from cache.
     async fn process_upload(
         &self,
         op: PendingUpload,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) -> VfsResult<()> {
+        // ── Fast-path: inode deleted → cancel upload, skip S3 write ──────
+        let inode_deleted = self.state.deleted_inodes.lock().contains(&op.ino);
+        // Also check metadata: after a remount, `deleted_inodes` is empty but
+        // the inode may have been deleted in a prior session.  If the inode no
+        // longer exists in the metadata store, the upload is stale.
+        let inode_gone = inode_deleted || self.meta.get_attr(op.ino).is_err();
+        if inode_gone {
+            debug!(
+                object_id = op.object_id,
+                ino = op.ino,
+                "upload cancelled: inode deleted or missing"
+            );
+            self.block_cache.cancel_upload(&op, true);
+            self.state.pending_evictions.lock().remove(&op.object_id);
+            return Ok(());
+        }
+
         let t0 = Instant::now();
         // Read decompressed block from cache, then re-compress for S3.
-        let decompressed = self
-            .block_cache
-            .get(op.object_id)
-            .await
-            .ok_or_else(|| {
-                VfsError::Other(format!(
+        let decompressed = match self.block_cache.get(op.object_id).await {
+            Some(data) => data,
+            None => {
+                // Block data is missing from cache.  If the inode was deleted
+                // between our check above and now (race), cancel cleanly.
+                // Otherwise this is a genuine error — let the caller requeue.
+                if self.state.deleted_inodes.lock().contains(&op.ino) {
+                    self.block_cache.cancel_upload(&op, false);
+                    self.state.pending_evictions.lock().remove(&op.object_id);
+                    return Ok(());
+                }
+                return Err(VfsError::Other(format!(
                     "object {} missing from cache",
                     op.object_id
-                ))
-            })?;
+                )));
+            }
+        };
         let compressed = Bytes::from(create_object(&decompressed)?);
 
         let key = format_object_key(&self.data_prefix, op.object_id);
         self.data_write.put_by_key(&key, compressed).await?;
 
         self.block_cache.complete_upload(&op);
+
+        // Post-upload cleanup: if the block was marked for deferred eviction
+        // (inode was deleted while the upload was in flight), remove it now.
+        if self.state.pending_evictions.lock().remove(&op.object_id) {
+            self.block_cache.remove_sync(op.object_id);
+            debug!(
+                object_id = op.object_id,
+                "post-upload eviction: block removed (inode deleted)"
+            );
+        }
+
         debug!(
             object_id = op.object_id,
             elapsed_ms = t0.elapsed().as_millis() as u64,
