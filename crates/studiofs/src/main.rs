@@ -392,7 +392,60 @@ EXAMPLES:
         #[arg(long, default_value_t = 500)]
         max_deletes: u64,
     },
+    /// Test S3-compatible storage for StudioFS compatibility
+    #[command(long_about = "\
+Tests whether an S3-compatible backend is suitable for StudioFS by running:
+  • Data suite   — PUT/GET/HEAD/range-GET/DELETE at block sizes (1 KB, 4 MB)
+  • Metadata suite — conditional PUT (If-Match, If-None-Match) and ETag round-trip
 
+Without --bucket: a temporary bucket is created and deleted after the run.
+  Credentials must include s3:CreateBucket + s3:DeleteBucket.
+
+With --bucket: the specified bucket is used as-is. Temporary objects are removed
+  after the run, but the bucket itself is never deleted. If the bucket is not
+  accessible the test is aborted immediately.")
+]
+    #[command(after_help = "\
+EXAMPLES:
+  MinIO (local, auto-create bucket):
+    studiofs test --entrypoint http://127.0.0.1:9000 \\
+      --access-key minioadmin --secret-key minioadmin
+
+  Use an existing bucket (bucket is not deleted after test):
+    studiofs test --entrypoint http://127.0.0.1:9000 \\
+      --access-key minioadmin --secret-key minioadmin --bucket my-bucket
+
+  AWS S3:
+    studiofs test --entrypoint https://s3.us-east-1.amazonaws.com \\
+      --access-key AKIA... --secret-key wJal... --region us-east-1
+
+  Wasabi:
+    studiofs test --entrypoint https://s3.wasabisys.com \\
+      --access-key KEY --secret-key SECRET --region us-east-1
+")]
+    Test {
+        /// S3 endpoint URL (e.g. https://s3.amazonaws.com, http://127.0.0.1:9000)
+        #[arg(long)]
+        entrypoint: String,
+
+        /// S3 access key ID
+        #[arg(long)]
+        access_key: String,
+
+        /// S3 secret access key
+        #[arg(long)]
+        secret_key: String,
+
+        /// S3 region (defaults to us-east-1)
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+
+        /// Use an existing bucket for the test. Temp objects are cleaned up but the
+        /// bucket itself is never deleted. If not set, a random bucket is created and
+        /// removed after the run.
+        #[arg(long)]
+        bucket: Option<String>,
+    },
     /// Permanently destroy a volume
     #[command(long_about = "\
 Permanently destroy a volume, deleting all data from S3 and removing local metadata.
@@ -523,6 +576,15 @@ fn main() -> anyhow::Result<()> {
                 flush_ops_threshold,
                 flush_bytes_threshold,
             )?;
+        }
+        Commands::Test {
+            entrypoint,
+            access_key,
+            secret_key,
+            region,
+            bucket,
+        } => {
+            cli::test::run(&entrypoint, &access_key, &secret_key, &region, bucket.as_deref())?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
