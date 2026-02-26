@@ -118,7 +118,7 @@ const REMOTE_IO_MAX_ATTEMPTS: usize = 3;
 const REMOTE_IO_RETRY_BASE_MS: u64 = 80;
 
 impl TonboMetaEngine {
-    pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
+    pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
         let local = Arc::new(RedbMetaEngine::open(path)?);
         let info = local.get_format_info().ok();
         let volume_name = info
@@ -209,7 +209,7 @@ impl TonboMetaEngine {
             None
         };
 
-        let engine = Self {
+        let engine = Arc::new(Self {
             local,
             remote,
             volume_name: volume_name.clone(),
@@ -248,13 +248,14 @@ impl TonboMetaEngine {
             block_ranges: Mutex::new(RangeState::default()),
             inode_alloc_lock: Mutex::new(()),
             block_alloc_lock: Mutex::new(()),
-        };
+        });
 
         // Best-effort initial pull so an empty local cache can hydrate from remote state.
         let _ = engine.pull_remote_snapshot();
         if let Ok(s) = engine.local.export_snapshot() {
             *engine.baseline_snapshot.lock() = s;
         }
+        engine.spawn_background_flush_worker();
 
         Ok(engine)
     }
@@ -286,6 +287,48 @@ impl TonboMetaEngine {
         if let Err(err) = self.run_on_internal_rt(fut) {
             warn!("failed to publish invalidation event: {}", err);
         }
+    }
+
+    fn spawn_background_flush_worker(self: &Arc<Self>) {
+        if self.remote.is_none() {
+            return;
+        }
+
+        // Poll frequently enough to honor small flush intervals without
+        // introducing noticeable shutdown delays.
+        let tick = Duration::from_millis(250);
+        let weak = Arc::downgrade(self);
+        let thread_name = format!("tonbo-flush-{}", self.volume_name);
+        let _ = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(tick);
+                    let Some(engine) = weak.upgrade() else {
+                        break;
+                    };
+
+                    let should_flush = {
+                        let state = engine.state.lock();
+                        (state.pending_ops > 0 || state.pending_bytes > 0)
+                            && state.last_flush.elapsed() >= engine.flush_interval
+                    };
+                    if !should_flush {
+                        continue;
+                    }
+
+                    if let Err(err) = engine.flush_remote_snapshot(false) {
+                        if TonboMetaEngine::is_temporary_remote_error(&err) {
+                            warn!(
+                                "tonbo periodic metadata flush deferred due to temporary remote error: {}",
+                                err
+                            );
+                        } else {
+                            warn!("tonbo periodic metadata flush failed: {}", err);
+                        }
+                    }
+                }
+            });
     }
 
     fn remote_stat(&self, remote: &RemoteStore, path: &str) -> MetaResult<opendal::Metadata> {
@@ -2758,6 +2801,204 @@ mod tests {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("tonbo_minio_e2e_stale_rename_vs_rename worker thread disconnected")
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tonbo_minio_cross_client_visibility_without_explicit_flush() {
+        load_test_env();
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let endpoint = std::env::var("STUDIOFS_MINIO_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+                let access_key = std::env::var("STUDIOFS_MINIO_ACCESS_KEY")
+                    .unwrap_or_else(|_| "minioadmin".into());
+                let secret_key = std::env::var("STUDIOFS_MINIO_SECRET_KEY")
+                    .unwrap_or_else(|_| "minioadmin".into());
+                let default_bucket = format!(
+                    "studiofs-meta-test-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                );
+                let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or(default_bucket);
+
+                let rt = Builder::new_current_thread().enable_all().build().unwrap();
+                let client = rt.block_on(build_minio_client(&endpoint, &access_key, &secret_key));
+                let created_bucket = match rt.block_on(ensure_bucket(&client, &bucket)) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!(
+                            "skip tonbo_minio_cross_client_visibility_without_explicit_flush: {}",
+                            err
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let disk_name = format!(
+                    "tonbo-visibility-no-explicit-flush-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                );
+                let format_info = FormatInfo {
+                    name: disk_name.clone(),
+                    uuid: format!("{disk_name}-uuid"),
+                    endpoint: endpoint.clone(),
+                    bucket: bucket.clone(),
+                    access_key: access_key.clone(),
+                    secret_key: secret_key.clone(),
+                    region: "us-east-1".into(),
+                    data_prefix: format!("{disk_name}/objects/"),
+                    metadata: MetadataConfig {
+                        backend: MetadataBackend::Tonbo,
+                        remote: Some(RemoteStoreConfig {
+                            endpoint: endpoint.clone(),
+                            bucket: bucket.clone(),
+                            access_key: access_key.clone(),
+                            secret_key: secret_key.clone(),
+                            region: "us-east-1".into(),
+                            prefix: format!("{disk_name}/metadata/"),
+                        }),
+                        // Tight observation window for the reader.
+                        cache_ttl_secs: 1,
+                        flush_interval_secs: 2,
+                        // Keep size/ops thresholds high so this case depends on
+                        // interval-driven flushing behavior.
+                        flush_ops_threshold: 1_000_000,
+                        flush_bytes_threshold: 1 << 40,
+                    },
+                    version: String::new(),
+                    block_size: DEFAULT_BLOCK_SIZE,
+                    chunk_size: 0,
+                };
+
+                // Seed remote manifest baseline.
+                let seed_dir = tempfile::tempdir().unwrap();
+                let seed_db = seed_dir.path().join("seed.redb");
+                let seed_local = RedbMetaEngine::open(&seed_db).unwrap();
+                seed_local.init_root(0, 0).unwrap();
+                seed_local.set_format_info(&format_info).unwrap();
+                drop(seed_local);
+                let seed = TonboMetaEngine::open(&seed_db).unwrap();
+                if let Err(err) = seed.flush_now() {
+                    if is_transient_storage_err(&err) {
+                        eprintln!(
+                            "skip tonbo_minio_cross_client_visibility_without_explicit_flush: {}",
+                            err
+                        );
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!(err.to_string()));
+                }
+                drop(seed);
+
+                // Two clients from the same remote baseline.
+                let dir1 = tempfile::tempdir().unwrap();
+                let db1 = dir1.path().join("meta1.redb");
+                let local1 = RedbMetaEngine::open(&db1).unwrap();
+                local1.init_root(0, 0).unwrap();
+                local1.set_format_info(&format_info).unwrap();
+                drop(local1);
+                let c1 = TonboMetaEngine::open(&db1).unwrap();
+
+                let dir2 = tempfile::tempdir().unwrap();
+                let db2 = dir2.path().join("meta2.redb");
+                let local2 = RedbMetaEngine::open(&db2).unwrap();
+                local2.init_root(0, 0).unwrap();
+                local2.set_format_info(&format_info).unwrap();
+                drop(local2);
+                let c2 = TonboMetaEngine::open(&db2).unwrap();
+
+                // Stabilize flush baseline so the next mutation starts from
+                // "just flushed" state and cannot flush immediately by elapsed time.
+                if let Err(err) = c1.flush_now() {
+                    if is_transient_storage_err(&err) {
+                        eprintln!(
+                            "skip tonbo_minio_cross_client_visibility_without_explicit_flush: {}",
+                            err
+                        );
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!(err.to_string()));
+                }
+
+                // Writer performs a metadata mutation but does NOT call flush_now().
+                c1.create_file(ROOT_INO, b"eventual.txt", 0, 0, 0o644).unwrap();
+
+                // Reader should eventually observe the new entry after
+                // flush_interval + cache_ttl, without explicit flushes.
+                let mut observed = false;
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                while std::time::Instant::now() < deadline {
+                    match c2.lookup(ROOT_INO, b"eventual.txt") {
+                        Ok(_) => {
+                            observed = true;
+                            break;
+                        }
+                        Err(MetaError::EntryNotFound { .. }) => {}
+                        Err(err) if is_transient_storage_err(&err) => {
+                            eprintln!(
+                                "skip tonbo_minio_cross_client_visibility_without_explicit_flush: {}",
+                                err
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            return Err(anyhow::anyhow!(
+                                "unexpected lookup error while waiting for visibility: {}",
+                                err
+                            ));
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+
+                drop(c1);
+                drop(c2);
+
+                if created_bucket
+                    && let Err(e) = rt.block_on(delete_bucket_with_contents(&client, &bucket))
+                {
+                    eprintln!(
+                        "warn tonbo_minio_cross_client_visibility_without_explicit_flush: cleanup bucket '{}' failed: {}",
+                        bucket, e
+                    );
+                }
+
+                if !observed {
+                    return Err(anyhow::anyhow!(
+                        "reader did not observe writer mutation within 8s \
+                         without explicit flush_now()"
+                    ));
+                }
+                Ok(())
+            })();
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => panic!("{}", err),
+            Err(RecvTimeoutError::Timeout) => {
+                panic!(
+                    "tonbo_minio_cross_client_visibility_without_explicit_flush timed out after 90 seconds"
+                )
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "tonbo_minio_cross_client_visibility_without_explicit_flush worker thread disconnected"
+                )
             }
         }
     }

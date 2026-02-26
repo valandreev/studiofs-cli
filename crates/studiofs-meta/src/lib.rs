@@ -28,7 +28,7 @@ pub fn open_meta_engine(path: impl AsRef<Path>) -> MetaResult<Arc<dyn MetaEngine
             // before opening Tonbo (which wraps its own RedbMetaEngine).
             drop(redb);
             let tonbo = TonboMetaEngine::open(path)?;
-            Ok(Arc::new(tonbo))
+            Ok(tonbo)
         }
         _ => Ok(Arc::new(redb)),
     }
