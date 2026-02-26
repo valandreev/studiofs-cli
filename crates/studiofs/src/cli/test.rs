@@ -734,7 +734,7 @@ fn print_report(cases: &[TestCase]) {
             println!("  IMPORTANT: The metadata engine (TonboMetaEngine) relies on conditional");
             println!("  writes (If-Match / If-None-Match) for safe concurrent access. If your");
             println!("  backend does not support them, consider using a separate metadata");
-            println!("  backend that does (e.g. MinIO ≥ RELEASE.2024-*, AWS S3, Wasabi).");
+            println!("  backend that does (e.g. MinIO ≥ RELEASE.2024-*, RustFS, AWS S3).");
         }
     }
     println!();
