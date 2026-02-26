@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use studiofs_meta::DEFAULT_BLOCK_SIZE;
 
-/// Split a data buffer into 4MiB blocks.
+/// Split a data buffer into 1 MiB blocks.
 ///
 /// Returns a list of (block_index, block_data) pairs.
 pub fn split_into_blocks(data: &[u8], start_offset: u32) -> Vec<(u32, Bytes)> {
@@ -52,32 +52,35 @@ mod tests {
 
     #[test]
     fn test_split_aligned() {
-        let data = vec![0u8; 8 * 1024 * 1024]; // 8 MiB = 2 blocks
+        let bs = DEFAULT_BLOCK_SIZE as usize; // 1 MiB
+        let data = vec![0u8; 2 * bs]; // 2 blocks
         let blocks = split_into_blocks(&data, 0);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].0, 0);
-        assert_eq!(blocks[0].1.len(), DEFAULT_BLOCK_SIZE as usize);
+        assert_eq!(blocks[0].1.len(), bs);
         assert_eq!(blocks[1].0, 1);
-        assert_eq!(blocks[1].1.len(), DEFAULT_BLOCK_SIZE as usize);
+        assert_eq!(blocks[1].1.len(), bs);
     }
 
     #[test]
     fn test_split_unaligned() {
-        let data = vec![0u8; 5 * 1024 * 1024]; // 5 MiB = 1 full + 1 partial
+        let bs = DEFAULT_BLOCK_SIZE as usize; // 1 MiB
+        let data = vec![0u8; bs + 512 * 1024]; // 1 full + 0.5 MiB partial
         let blocks = split_into_blocks(&data, 0);
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].1.len(), DEFAULT_BLOCK_SIZE as usize);
-        assert_eq!(blocks[1].1.len(), 1024 * 1024); // 1 MiB
+        assert_eq!(blocks[0].1.len(), bs);
+        assert_eq!(blocks[1].1.len(), 512 * 1024);
     }
 
     #[test]
     fn test_split_with_offset() {
-        let data = vec![0u8; 1024 * 1024]; // 1 MiB
-        let blocks = split_into_blocks(&data, 3 * 1024 * 1024); // starting at 3MiB
-        // offset 3MiB is in block 0, with 1MiB remaining in that block
+        let bs = DEFAULT_BLOCK_SIZE as usize; // 1 MiB
+        let data = vec![0u8; bs / 2]; // 0.5 MiB
+        let blocks = split_into_blocks(&data, (3 * bs) as u32); // starting at block 3
+        // offset 3 MiB is in block 3, with the full block available
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].0, 0); // still block 0
-        assert_eq!(blocks[0].1.len(), 1024 * 1024);
+        assert_eq!(blocks[0].0, 3);
+        assert_eq!(blocks[0].1.len(), bs / 2);
     }
 
     #[test]
