@@ -85,9 +85,6 @@ pub fn run(
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
-    if !foreground {
-        info!("--foreground=false requested, but test mode forces foreground mount behavior");
-    }
 
     // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
 
@@ -95,14 +92,14 @@ pub fn run(
     #[cfg(windows)]
     {
         info!("starting WinFSP mount at {mount_point}");
-        studiofs_winfsp::mount_and_serve(vfs, rt, mount_point, &format_info.name, true)
+        studiofs_winfsp::mount_and_serve(vfs, rt, mount_point, &format_info.name, foreground)
             .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
     }
 
     #[cfg(unix)]
     {
         info!("starting FUSE mount at {mount_point}");
-        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, true)
+        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, foreground)
             .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
     }
 

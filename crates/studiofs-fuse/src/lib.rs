@@ -37,6 +37,12 @@ fn spawn_signal_watcher(mount_point: &str) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             tracing::info!("received shutdown signal, unmounting {mp} …");
+            // Restore default signal handlers immediately so a second Ctrl+C
+            // force-kills the process in case unmount or shutdown stalls.
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            }
             // Trigger a clean unmount so fuser::mount2() returns.
             #[cfg(target_os = "macos")]
             {
@@ -104,5 +110,9 @@ pub fn mount_and_serve(
     // Drain uploads and persist cache checkpoint before process exit.
     tracing::info!("unmounted, draining uploads …");
     rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(30)));
-    Ok(())
+    // Use process::exit to avoid blocking on tokio Runtime drop, which would
+    // wait for all background tasks (janitor, GC etc.) to complete — causing
+    // an indefinite hang after unmount on Linux/WSL.
+    tracing::info!("shutdown complete, exiting");
+    std::process::exit(0);
 }
