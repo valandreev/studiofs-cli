@@ -85,6 +85,14 @@ pub trait MetaEngine: Send + Sync {
         Ok(())
     }
 
+    /// Stable identifier used for invalidation self-echo suppression.
+    ///
+    /// Engines that publish invalidation events should override this and return
+    /// the same identifier they include in event payloads.
+    fn invalidation_sender_id(&self) -> Option<String> {
+        None
+    }
+
     // ─── Format / Settings ───────────────────────────────────────────────
 
     /// Store format info (called during `studiofs init`).

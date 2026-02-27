@@ -28,7 +28,7 @@ use futures::StreamExt;
 use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator, services::S3};
 use parking_lot::Mutex;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -491,13 +491,16 @@ impl StudioVfs {
             format!("{}/", format_info.data_prefix)
         };
         let block_size = format_info.block_size;
+        let invalidation_sender_id = meta
+            .invalidation_sender_id()
+            .unwrap_or_else(|| format!("pid:{}", std::process::id()));
         let invalidation_bus = std::env::var("STUDIOFS_NATS_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(|url| InvalidationBus {
                 nats_url: url,
                 subject_base: format!("fs.invalidate.{}", format_info.name),
-                sender_id: format!("pid:{}", std::process::id()),
+                sender_id: invalidation_sender_id.clone(),
             });
         let janitor_interval = Duration::from_secs(
             std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS")
@@ -2551,9 +2554,19 @@ impl StudioVfs {
                 let file_offset = block_index as u64 * self.block_size as u64;
                 upload_ops.push((ino, file_offset, object_id));
 
-                // Remove from dirty_mem (data is now safe in L1 + metadata committed).
-                freed_bytes += data.len();
-                dirty.remove(&(ino, block_index));
+                // Remove from dirty_mem only if we are still looking at the same
+                // payload we drained. A concurrent write may have replaced this
+                // key with newer bytes; in that case keep the new value for the
+                // next drain cycle.
+                let remove_key = dirty
+                    .get(&(ino, block_index))
+                    .map(|current| current.as_ref() == data.as_ref())
+                    .unwrap_or(false);
+                if remove_key
+                    && let Some(removed) = dirty.remove(&(ino, block_index))
+                {
+                    freed_bytes += removed.len();
+                }
 
                 if let Some(ref old_block) = results[i].old_block {
                     debug!(
@@ -2926,6 +2939,40 @@ impl StudioVfs {
         self.state.attr_read_cache.lock().clear();
     }
 
+    fn collect_referenced_object_ids(&self) -> Option<HashSet<u64>> {
+        match self.meta.get_referenced_object_ids() {
+            Ok(ids) => Some(ids),
+            Err(err) => {
+                debug!(error = %err, "invalidation: unable to read referenced object ids");
+                None
+            }
+        }
+    }
+
+    fn evict_dropped_cached_blocks(
+        &self,
+        before: &HashSet<u64>,
+        after: &HashSet<u64>,
+    ) -> (usize, usize) {
+        let mut evicted = 0usize;
+        let mut skipped_pinned = 0usize;
+        for object_id in before {
+            if after.contains(object_id) {
+                continue;
+            }
+            if self.block_cache.is_pinned(*object_id) {
+                skipped_pinned = skipped_pinned.saturating_add(1);
+                continue;
+            }
+            if !self.block_cache.contains(*object_id) {
+                continue;
+            }
+            self.block_cache.remove_sync(*object_id);
+            evicted = evicted.saturating_add(1);
+        }
+        (evicted, skipped_pinned)
+    }
+
     async fn background_invalidation_listener(self: Arc<Self>, bus: InvalidationBus) {
         let client: NatsClient = match async_nats::connect(&bus.nats_url).await {
             Ok(c) => c,
@@ -2960,17 +3007,86 @@ impl StudioVfs {
                 continue;
             }
 
+            let before_refs = self.collect_referenced_object_ids();
+            let mut synced = false;
+            for attempt in 1..=3u32 {
+                match self.meta.sync_metadata() {
+                    Ok(()) => {
+                        synced = true;
+                        break;
+                    }
+                    Err(err) => {
+                        if attempt == 3 {
+                            warn!(
+                                subject = %msg.subject,
+                                source_id,
+                                error = %err,
+                                attempt,
+                                "invalidation sync failed"
+                            );
+                        } else {
+                            debug!(
+                                subject = %msg.subject,
+                                source_id,
+                                error = %err,
+                                attempt,
+                                "invalidation sync retry"
+                            );
+                            tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        }
+                    }
+                }
+            }
+            if !synced {
+                continue;
+            }
+            let after_refs = self.collect_referenced_object_ids();
+
             let subject = msg.subject.to_string();
             let target = subject.rsplit('.').next().unwrap_or("all");
             if target == "all" {
                 self.invalidate_all_read_caches();
-                debug!(subject, source_id, "applied global invalidation");
+                if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
+                    let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
+                    debug!(
+                        subject,
+                        source_id,
+                        evicted,
+                        skipped_pinned,
+                        "applied global invalidation with selective block cache eviction"
+                    );
+                } else {
+                    debug!(subject, source_id, "applied global invalidation");
+                }
             } else if let Ok(ino) = target.parse::<u64>() {
                 self.invalidate_inode_read_caches(ino);
-                debug!(subject, source_id, ino, "applied inode invalidation");
+                if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
+                    let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
+                    debug!(
+                        subject,
+                        source_id,
+                        ino,
+                        evicted,
+                        skipped_pinned,
+                        "applied inode invalidation with selective block cache eviction"
+                    );
+                } else {
+                    debug!(subject, source_id, ino, "applied inode invalidation");
+                }
             } else {
                 self.invalidate_all_read_caches();
-                debug!(subject, source_id, "applied fallback global invalidation");
+                if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
+                    let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
+                    debug!(
+                        subject,
+                        source_id,
+                        evicted,
+                        skipped_pinned,
+                        "applied fallback global invalidation with selective block cache eviction"
+                    );
+                } else {
+                    debug!(subject, source_id, "applied fallback global invalidation");
+                }
             }
         }
     }

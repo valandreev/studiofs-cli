@@ -13,6 +13,7 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -25,7 +26,7 @@ use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
     FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine, RemoteStoreConfig,
-    types::BlockRef,
+    TonboMetaEngine, types::BlockRef,
 };
 use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 
@@ -237,6 +238,120 @@ fn wait_until_n_blocks(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn nats_test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+struct EnvVarRestore {
+    key: &'static str,
+    old: Option<String>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(v) = &self.old {
+                std::env::set_var(self.key, v);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+async fn ensure_nats(url: &str) -> bool {
+    match tokio::time::timeout(Duration::from_secs(2), async_nats::connect(url)).await {
+        Ok(Ok(client)) => {
+            drop(client);
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn wait_until<F>(timeout: Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn block_cache_path(cache_dir: &Path, object_id: u64) -> PathBuf {
+    let shard = (object_id >> 56) as u8;
+    cache_dir
+        .join("blocks")
+        .join(format!("{:02x}", shard))
+        .join(format!("{:016x}.block", object_id))
+}
+
+struct TonboTestClient {
+    _tmp: tempfile::TempDir,
+    cache_dir: PathBuf,
+    vfs: Arc<StudioVfs>,
+}
+
+fn make_tonbo_test_client(format_info: &FormatInfo, label: &str) -> TonboTestClient {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join(format!("meta-{label}.redb"));
+
+    let seed = RedbMetaEngine::open(&db_path).expect("failed to open seed RedbMetaEngine");
+    seed.init_root(0, 0).expect("failed to initialize root inode");
+    seed.set_format_info(format_info)
+        .expect("failed to set tonbo format info");
+    drop(seed);
+
+    let meta = TonboMetaEngine::open(&db_path).expect("failed to open TonboMetaEngine");
+    let data_config = DataStoreConfig::from(format_info);
+    let cache_dir = tmp.path().join(format!("cache-{label}"));
+    let vfs = StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir.to_str().unwrap(),
+        512 * 1024 * 1024,
+        256 * 1024 * 1024,
+    )
+    .expect("failed to create tonbo StudioVfs");
+
+    TonboTestClient {
+        _tmp: tmp,
+        cache_dir,
+        vfs,
+    }
+}
+
+fn make_tuned_tonbo_format_info(volume_suffix: &str) -> FormatInfo {
+    let mut info = make_format_info(volume_suffix);
+    info.block_size = 64 * 1024;
+    info.metadata.backend = MetadataBackend::Tonbo;
+    info.metadata.cache_ttl_secs = 300;
+    info.metadata.flush_interval_secs = 600;
+    // Keep auto-flush effectively disabled in these NATS tests so each scenario
+    // publishes one explicit, complete metadata snapshot at controlled points.
+    info.metadata.flush_ops_threshold = 1_000_000;
+    info.metadata.flush_bytes_threshold = 1_000_000_000;
+    info
 }
 
 // =============================================================================
@@ -1009,6 +1124,340 @@ async fn test_attr_cache_ttl() {
     // Next getattr should see the new size from dirty_attrs
     let attr5 = vfs.getattr(ino).unwrap();
     assert_eq!(attr5.size, 10);
+}
+
+// =============================================================================
+// NATS Invalidation Tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_nats_delete_updates_metadata_and_clears_cached_block() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_delete_updates_metadata_and_clears_cached_block: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-delete");
+    let writer = make_tonbo_test_client(&info, "writer-delete");
+    let reader = make_tonbo_test_client(&info, "reader-delete");
+    let wait = Duration::from_secs(15);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let attr = writer.vfs.create(1, b"nats-delete.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    let payload = vec![0xA5; info.block_size as usize];
+    writer.vfs.write(ino, 0, &payload).await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    let writer_blocks = wait_until_n_blocks(&writer.vfs, ino, 1, Duration::from_secs(15))
+        .expect("writer metadata did not materialize initial block");
+    assert!(
+        !writer_blocks.is_empty(),
+        "writer metadata missing initial block before publish"
+    );
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    let visible = wait_until(wait, || {
+        reader.vfs.lookup(1, b"nats-delete.bin").is_ok()
+    })
+    .await;
+    assert!(visible, "reader did not observe file creation");
+
+    let reader_ino = reader.vfs.lookup(1, b"nats-delete.bin").unwrap().ino;
+    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 1, Duration::from_secs(15))
+        .expect("reader metadata missing initial block after create invalidation");
+    assert!(
+        !reader_blocks.is_empty(),
+        "reader did not materialize initial block"
+    );
+    let got = reader
+        .vfs
+        .read(reader_ino, 0, payload.len() as u32)
+        .await
+        .unwrap();
+    assert_eq!(got, payload);
+
+    let block_id = reader.vfs.meta().get_file_blocks(reader_ino).unwrap()[0]
+        .1
+        .object_id;
+    let cached_path = block_cache_path(&reader.cache_dir, block_id);
+    assert!(
+        wait_until(wait, || cached_path.exists()).await,
+        "expected reader L2 cache to contain the block before delete"
+    );
+
+    let _ = reader.vfs.getattr(reader_ino).unwrap(); // prime attr_read_cache
+
+    writer.vfs.unlink(1, b"nats-delete.bin").unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    assert!(
+        wait_until(wait, || {
+            reader.vfs.lookup(1, b"nats-delete.bin").is_err()
+        })
+        .await,
+        "reader still resolves deleted entry"
+    );
+
+    assert!(
+        wait_until(wait, || reader.vfs.getattr(reader_ino).is_err()).await,
+        "reader attr cache was not invalidated after delete"
+    );
+
+    assert!(
+        wait_until(wait, || !cached_path.exists()).await,
+        "cached deleted block was not evicted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_nats_overwrite_evicts_only_changed_block_cache() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_overwrite_evicts_only_changed_block_cache: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-overwrite");
+    let writer = make_tonbo_test_client(&info, "writer-overwrite");
+    let reader = make_tonbo_test_client(&info, "reader-overwrite");
+    let wait = Duration::from_secs(15);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let bs = info.block_size as usize;
+    let block0_v1 = vec![0x11; bs];
+    let block1_static = vec![0x22; bs];
+    let mut initial = block0_v1.clone();
+    initial.extend_from_slice(&block1_static);
+
+    let attr = writer.vfs.create(1, b"nats-overwrite.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    writer.vfs.write(ino, 0, &initial).await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    let mut writer_refs_v1 = wait_until_n_blocks(&writer.vfs, ino, 2, Duration::from_secs(15))
+        .expect("writer metadata did not materialize initial two blocks");
+    writer_refs_v1.sort_by_key(|(idx, _)| *idx);
+    assert_eq!(writer_refs_v1.len(), 2);
+    let writer_old_id0 = writer_refs_v1[0].1.object_id;
+    let writer_old_id1 = writer_refs_v1[1].1.object_id;
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    assert!(
+        wait_until(wait, || {
+            reader.vfs.lookup(1, b"nats-overwrite.bin").is_ok()
+        })
+        .await,
+        "reader did not observe file creation"
+    );
+
+    let reader_ino = reader.vfs.lookup(1, b"nats-overwrite.bin").unwrap().ino;
+    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
+        .expect("reader metadata missing initial blocks after create invalidation");
+    assert_eq!(reader_blocks.len(), 2);
+    let got_v1 = reader.vfs.read(reader_ino, 0, (2 * bs) as u32).await.unwrap();
+    assert_eq!(got_v1, initial);
+
+    let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
+    refs_v1.sort_by_key(|(idx, _)| *idx);
+    assert_eq!(refs_v1.len(), 2);
+    let old_id0 = refs_v1[0].1.object_id;
+    let old_id1 = refs_v1[1].1.object_id;
+
+    let old_path0 = block_cache_path(&reader.cache_dir, old_id0);
+    let old_path1 = block_cache_path(&reader.cache_dir, old_id1);
+    assert!(
+        wait_until(wait, || old_path0.exists() && old_path1.exists()).await,
+        "reader cache did not materialize both initial blocks"
+    );
+
+    let block0_v2 = vec![0x33; bs];
+    writer.vfs.write(ino, 0, &block0_v2).await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    let writer_overwrite_ready = wait_until(wait, || {
+        let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        refs.sort_by_key(|(idx, _)| *idx);
+        refs.len() == 2
+            && refs[0].1.object_id != writer_old_id0
+            && refs[1].1.object_id == writer_old_id1
+    })
+    .await;
+    assert!(
+        writer_overwrite_ready,
+        "writer metadata did not materialize overwrite before publish"
+    );
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    let refs_updated = wait_until(wait, || {
+        let mut refs = match reader.vfs.meta().get_file_blocks(reader_ino) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        refs.sort_by_key(|(idx, _)| *idx);
+        refs.len() == 2 && refs[0].1.object_id != old_id0 && refs[1].1.object_id == old_id1
+    })
+    .await;
+    assert!(
+        refs_updated,
+        "reader metadata did not reflect selective overwrite"
+    );
+
+    assert!(
+        wait_until(wait, || !old_path0.exists() && old_path1.exists()).await,
+        "changed block cache should be evicted while unchanged block should remain"
+    );
+
+    let mut expected = block0_v2.clone();
+    expected.extend_from_slice(&block1_static);
+    let got_v2 = reader.vfs.read(reader_ino, 0, (2 * bs) as u32).await.unwrap();
+    assert_eq!(got_v2, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-append");
+    let writer = make_tonbo_test_client(&info, "writer-append");
+    let reader = make_tonbo_test_client(&info, "reader-append");
+    let wait = Duration::from_secs(15);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let bs = info.block_size as usize;
+    let block0 = vec![0x41; bs];
+    let block1 = vec![0x42; bs];
+    let mut initial = block0.clone();
+    initial.extend_from_slice(&block1);
+
+    let attr = writer.vfs.create(1, b"nats-append.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    writer.vfs.write(ino, 0, &initial).await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    let mut writer_refs_v1 = wait_until_n_blocks(&writer.vfs, ino, 2, Duration::from_secs(15))
+        .expect("writer metadata did not materialize initial two blocks");
+    writer_refs_v1.sort_by_key(|(idx, _)| *idx);
+    assert_eq!(writer_refs_v1.len(), 2);
+    let writer_id0 = writer_refs_v1[0].1.object_id;
+    let writer_id1 = writer_refs_v1[1].1.object_id;
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    assert!(
+        wait_until(wait, || {
+            reader.vfs.lookup(1, b"nats-append.bin").is_ok()
+        })
+        .await,
+        "reader did not observe file creation"
+    );
+
+    let reader_ino = reader.vfs.lookup(1, b"nats-append.bin").unwrap().ino;
+    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
+        .expect("reader metadata missing initial blocks after create invalidation");
+    assert_eq!(reader_blocks.len(), 2);
+    let got_v1 = reader.vfs.read(reader_ino, 0, (2 * bs) as u32).await.unwrap();
+    assert_eq!(got_v1, initial);
+
+    let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
+    refs_v1.sort_by_key(|(idx, _)| *idx);
+    assert_eq!(refs_v1.len(), 2);
+    let id0 = refs_v1[0].1.object_id;
+    let id1 = refs_v1[1].1.object_id;
+    let path0 = block_cache_path(&reader.cache_dir, id0);
+    let path1 = block_cache_path(&reader.cache_dir, id1);
+    assert!(
+        wait_until(wait, || path0.exists() && path1.exists()).await,
+        "reader cache did not materialize initial blocks"
+    );
+
+    let block2 = vec![0x43; bs];
+    writer.vfs.write(ino, (2 * bs) as u64, &block2).await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    let writer_append_ready = wait_until(wait, || {
+        let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        refs.sort_by_key(|(idx, _)| *idx);
+        refs.len() == 3 && refs[0].1.object_id == writer_id0 && refs[1].1.object_id == writer_id1
+    })
+    .await;
+    assert!(
+        writer_append_ready,
+        "writer metadata did not materialize append before publish"
+    );
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    let append_visible = wait_until(wait, || {
+        let mut refs = match reader.vfs.meta().get_file_blocks(reader_ino) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        refs.sort_by_key(|(idx, _)| *idx);
+        refs.len() == 3 && refs[0].1.object_id == id0 && refs[1].1.object_id == id1
+    })
+    .await;
+    assert!(append_visible, "reader metadata did not reflect appended block");
+
+    assert!(
+        path0.exists() && path1.exists(),
+        "unchanged cached blocks should be preserved after append"
+    );
+
+    let got_new = reader.vfs.read(reader_ino, (2 * bs) as u64, bs as u32).await.unwrap();
+    assert_eq!(got_new, block2);
+
+    let mut refs_after = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
+    refs_after.sort_by_key(|(idx, _)| *idx);
+    let id2 = refs_after[2].1.object_id;
+    let path2 = block_cache_path(&reader.cache_dir, id2);
+    assert!(
+        wait_until(wait, || path2.exists()).await,
+        "new appended block should be fetched and cached on read"
+    );
 }
 
 // =============================================================================

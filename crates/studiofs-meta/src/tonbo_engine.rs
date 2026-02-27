@@ -94,7 +94,7 @@ pub struct TonboMetaEngine {
     remote_request_timeout: Duration,
     cas_max_retries: u32,
     sync_lock: Mutex<()>,
-    rt: Mutex<Runtime>,
+    rt: Mutex<Option<Runtime>>,
     // Metrics
     remote_round_trips: AtomicU64,
     cas_retries: AtomicU64,
@@ -116,8 +116,14 @@ const BLOCK_RANGE_SIZE: u64 = 65_536;
 const RANGE_CAS_MAX_RETRIES: u32 = 10;
 const REMOTE_IO_MAX_ATTEMPTS: usize = 3;
 const REMOTE_IO_RETRY_BASE_MS: u64 = 80;
+static TONBO_SENDER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl TonboMetaEngine {
+    fn new_invalidation_sender_id() -> String {
+        let seq = TONBO_SENDER_SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("pid:{}:{}", std::process::id(), seq)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
         let local = Arc::new(RedbMetaEngine::open(path)?);
         let info = local.get_format_info().ok();
@@ -198,7 +204,14 @@ impl TonboMetaEngine {
             .ok()
             .filter(|s| !s.is_empty());
         let nats_client = if let Some(url) = &nats_url {
-            match rt.block_on(async_nats::connect(url)) {
+            let url = url.clone();
+            let connect = async_nats::connect(url.clone());
+            let connect_result = if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| rt.block_on(connect))
+            } else {
+                rt.block_on(connect)
+            };
+            match connect_result {
                 Ok(client) => Some(client),
                 Err(err) => {
                     warn!("failed to connect NATS at '{}': {}", url, err);
@@ -213,7 +226,7 @@ impl TonboMetaEngine {
             local,
             remote,
             volume_name: volume_name.clone(),
-            invalidation_sender_id: format!("pid:{}", std::process::id()),
+            invalidation_sender_id: Self::new_invalidation_sender_id(),
             nats_subject_base: if nats_client.is_some() {
                 Some(format!("fs.invalidate.{}", volume_name))
             } else {
@@ -234,7 +247,7 @@ impl TonboMetaEngine {
             remote_request_timeout: Duration::from_secs(12),
             cas_max_retries: 5,
             sync_lock: Mutex::new(()),
-            rt: Mutex::new(rt),
+            rt: Mutex::new(Some(rt)),
             remote_round_trips: AtomicU64::new(0),
             cas_retries: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
@@ -268,10 +281,14 @@ impl TonboMetaEngine {
     where
         F: Future<Output = T>,
     {
+        let mut rt_guard = self.rt.lock();
+        let rt = rt_guard
+            .as_mut()
+            .expect("internal tokio runtime is unavailable");
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.rt.lock().block_on(fut))
+            tokio::task::block_in_place(|| rt.block_on(fut))
         } else {
-            self.rt.lock().block_on(fut)
+            rt.block_on(fut)
         }
     }
 
@@ -811,11 +828,15 @@ impl TonboMetaEngine {
         local: &RedbSnapshot,
         remote: &RedbSnapshot,
     ) -> RedbSnapshot {
+        let inodes = Self::merge_inodes_delta(&base.inodes, &local.inodes, &remote.inodes);
+        let mut dentries = Self::merge_dentries_delta(&base.dentries, &local.dentries, &remote.dentries);
+        Self::resolve_conflicting_rename_targets(&base.dentries, &local.dentries, &remote.dentries, &mut dentries);
+
         RedbSnapshot {
             settings: Self::merge_table_delta(&base.settings, &local.settings, &remote.settings),
             counters: Self::merge_counters_delta(&base.counters, &local.counters, &remote.counters),
-            inodes: Self::merge_inodes_delta(&base.inodes, &local.inodes, &remote.inodes),
-            dentries: Self::merge_dentries_delta(&base.dentries, &local.dentries, &remote.dentries),
+            inodes,
+            dentries,
             file_blocks: Self::merge_file_blocks_delta(
                 &base.file_blocks,
                 &local.file_blocks,
@@ -834,6 +855,93 @@ impl TonboMetaEngine {
                 &remote.event_log,
             ),
         }
+    }
+
+    fn decode_dentry_map(dentries: &[(Vec<u8>, Vec<u8>)]) -> HashMap<Vec<u8>, DirEntryValue> {
+        let mut out = HashMap::with_capacity(dentries.len());
+        for (k, v) in dentries {
+            if let Some(entry) = Self::decode_postcard::<DirEntryValue>(v) {
+                out.insert(k.clone(), entry);
+            }
+        }
+        out
+    }
+
+    fn resolve_conflicting_rename_targets(
+        base: &[(Vec<u8>, Vec<u8>)],
+        local: &[(Vec<u8>, Vec<u8>)],
+        remote: &[(Vec<u8>, Vec<u8>)],
+        dentries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        let base_map = Self::decode_dentry_map(base);
+        let local_map = Self::decode_dentry_map(local);
+        let remote_map = Self::decode_dentry_map(remote);
+
+        let mut conflict_targets_by_ino: HashMap<u64, HashSet<Vec<u8>>> = HashMap::new();
+        let mut winner_key_by_ino: HashMap<u64, Vec<u8>> = HashMap::new();
+
+        for (base_key, base_entry) in base_map.iter() {
+            // We only care about a key that both sides removed.
+            if local_map.contains_key(base_key) || remote_map.contains_key(base_key) {
+                continue;
+            }
+
+            let ino = base_entry.ino;
+            let local_targets: Vec<Vec<u8>> = local_map
+                .iter()
+                .filter(|(k, v)| !base_map.contains_key(*k) && v.ino == ino)
+                .map(|(k, _)| k.clone())
+                .collect();
+            let remote_targets: Vec<Vec<u8>> = remote_map
+                .iter()
+                .filter(|(k, v)| !base_map.contains_key(*k) && v.ino == ino)
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            // Conflicting renames require both branches to introduce a new key.
+            if local_targets.is_empty() || remote_targets.is_empty() {
+                continue;
+            }
+
+            let mut all_targets = local_targets;
+            all_targets.extend(remote_targets);
+            all_targets.sort();
+            all_targets.dedup();
+            let winner = all_targets.last().cloned();
+            let Some(winner) = winner else {
+                continue;
+            };
+
+            let targets = conflict_targets_by_ino.entry(ino).or_default();
+            for k in all_targets {
+                targets.insert(k);
+            }
+            winner_key_by_ino
+                .entry(ino)
+                .and_modify(|current| {
+                    if winner > *current {
+                        *current = winner.clone();
+                    }
+                })
+                .or_insert(winner);
+        }
+
+        if conflict_targets_by_ino.is_empty() {
+            return;
+        }
+
+        dentries.retain(|(key, raw)| {
+            let Some(entry) = Self::decode_postcard::<DirEntryValue>(raw) else {
+                return true;
+            };
+            let Some(targets) = conflict_targets_by_ino.get(&entry.ino) else {
+                return true;
+            };
+            if !targets.contains(key) {
+                return true;
+            }
+            winner_key_by_ino.get(&entry.ino) == Some(key)
+        });
     }
 
     fn is_cache_miss(err: &MetaError) -> bool {
@@ -1049,8 +1157,13 @@ impl TonboMetaEngine {
             (state.pending_ops, state.pending_bytes, state.etag.clone())
         };
 
-        if !force && pending_ops == 0 && pending_bytes == 0 {
-            return Ok(());
+        // Never rewrite remote state when there are no local mutations, except
+        // bootstrap of a brand-new remote manifest (force + unknown etag).
+        // This prevents stale clients from clobbering fresher manifests on drop.
+        if pending_ops == 0 && pending_bytes == 0 {
+            if !force || etag.is_some() {
+                return Ok(());
+            }
         }
 
         let _guard = self.sync_lock.lock();
@@ -1177,6 +1290,23 @@ impl Drop for TonboMetaEngine {
             warn!("tonbo flush on drop failed: {}", err);
         }
         self.metrics_debug();
+
+        let rt = self.rt.get_mut().take();
+        if let Some(rt) = rt {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Dropping a runtime from within a Tokio worker can panic because
+                // shutdown needs blocking. Move drop to a plain OS thread.
+                if std::thread::Builder::new()
+                    .name("tonbo-rt-drop".to_string())
+                    .spawn(move || drop(rt))
+                    .is_err()
+                {
+                    // Last-resort: leak instead of panicking during Drop.
+                }
+            } else {
+                drop(rt);
+            }
+        }
     }
 }
 
@@ -1186,7 +1316,16 @@ impl MetaEngine for TonboMetaEngine {
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
+        if self.has_pending_local_mutations() {
+            // Preserve local, not-yet-pushed mutations before pulling remote.
+            // Otherwise a remote import can clobber freshly written local refs.
+            self.flush_remote_snapshot(false)?;
+        }
         self.pull_remote_snapshot()
+    }
+
+    fn invalidation_sender_id(&self) -> Option<String> {
+        Some(self.invalidation_sender_id.clone())
     }
 
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
@@ -1761,6 +1900,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_merge_conflicting_renames_keeps_single_target_for_single_link_inode() {
+        fn dentry_key(parent: u64, name: &[u8]) -> Vec<u8> {
+            let mut key = Vec::with_capacity(8 + name.len());
+            key.extend_from_slice(&parent.to_le_bytes());
+            key.extend_from_slice(name);
+            key
+        }
+
+        let ino = 300u64;
+        let key_a = dentry_key(ROOT_INO, b"a.txt");
+        let key_b = dentry_key(ROOT_INO, b"b.txt");
+        let key_c = dentry_key(ROOT_INO, b"c.txt");
+
+        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+        attr.nlink = 1;
+        attr.ctime = 20;
+        attr.mtime = 20;
+
+        let dentry = DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        };
+
+        let base = RedbSnapshot {
+            inodes: vec![(ino, postcard::to_stdvec(&attr).unwrap())],
+            dentries: vec![(key_a.clone(), postcard::to_stdvec(&dentry).unwrap())],
+            ..RedbSnapshot::default()
+        };
+        let local = RedbSnapshot {
+            inodes: vec![(ino, postcard::to_stdvec(&attr).unwrap())],
+            dentries: vec![(key_b.clone(), postcard::to_stdvec(&dentry).unwrap())],
+            ..RedbSnapshot::default()
+        };
+        let remote = RedbSnapshot {
+            inodes: vec![(ino, postcard::to_stdvec(&attr).unwrap())],
+            dentries: vec![(key_c.clone(), postcard::to_stdvec(&dentry).unwrap())],
+            ..RedbSnapshot::default()
+        };
+
+        let merged = TonboMetaEngine::merge_snapshot_with_local_delta(&base, &local, &remote);
+        let dentries_map: HashMap<Vec<u8>, Vec<u8>> = merged.dentries.into_iter().collect();
+
+        assert!(
+            dentries_map.get(&key_a).is_none(),
+            "source key must be removed after rename conflict merge"
+        );
+        let b_ok = dentries_map.get(&key_b).is_some();
+        let c_ok = dentries_map.get(&key_c).is_some();
+        assert!(b_ok ^ c_ok, "exactly one conflicting rename target must survive");
+    }
+
     async fn build_minio_client(endpoint: &str, access_key: &str, secret_key: &str) -> S3Client {
         let shared = aws_config::defaults(BehaviorVersion::latest())
             .credentials_provider(Credentials::new(
@@ -1856,6 +2047,19 @@ mod tests {
             || msg.contains("connection")
     }
 
+    fn cleanup_bucket_best_effort(rt: &tokio::runtime::Runtime, client: &S3Client, bucket: &str) {
+        if let Err(err) = rt.block_on(delete_bucket_with_contents(client, bucket)) {
+            eprintln!(
+                "warn {}: cleanup bucket '{}' failed: {}",
+                std::thread::current()
+                    .name()
+                    .unwrap_or("tonbo_minio_test_cleanup"),
+                bucket,
+                err
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn test_tonbo_minio_roundtrip() {
@@ -1948,10 +2152,7 @@ mod tests {
                 drop(tonbo2);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                        })?;
+                    cleanup_bucket_best_effort(&rt, &client, &bucket);
                 }
 
                 Ok(())
@@ -2093,10 +2294,7 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                        })?;
+                    cleanup_bucket_best_effort(&rt, &client, &bucket);
                 }
 
                 Ok(())
@@ -2242,10 +2440,7 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                        })?;
+                    cleanup_bucket_best_effort(&rt, &client, &bucket);
                 }
 
                 Ok(())
@@ -2405,10 +2600,7 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                        })?;
+                    cleanup_bucket_best_effort(&rt, &client, &bucket);
                 }
                 Ok(())
             })();
@@ -2615,10 +2807,7 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                        })?;
+                    cleanup_bucket_best_effort(&rt, &client, &bucket);
                 }
                 Ok(())
             })();
@@ -2783,10 +2972,7 @@ mod tests {
                 drop(verify);
 
                 if created_bucket {
-                    rt.block_on(delete_bucket_with_contents(&client, &bucket))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to cleanup test bucket '{}': {}", bucket, e)
-                        })?;
+                    cleanup_bucket_best_effort(&rt, &client, &bucket);
                 }
                 Ok(())
             })();
