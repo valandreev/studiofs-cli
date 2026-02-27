@@ -76,6 +76,10 @@ Detailed documentation is available in the [docs/](docs/) directory:
 - [Configuration Reference](docs/configuration.md) — all CLI options, env vars, tuning
 - [Development Guide](docs/development.md) — build, test, local setup
 
+## Co-developed with LLMs
+
+This project was co-developed with LLMs such as Claude, Codex, etc. Human maintainers are responsible for their contributions regardless of machine help.
+
 ## License
 
 GPL-3.0
