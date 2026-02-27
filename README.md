@@ -75,6 +75,7 @@ Detailed documentation is available in the [docs/](docs/) directory:
 - [Platform Bridges](docs/platform-bridges.md) — WinFSP and FUSE integration
 - [Configuration Reference](docs/configuration.md) — all CLI options, env vars, tuning
 - [Development Guide](docs/development.md) — build, test, local setup
+- [Tests Guide](docs/tests.md) — full test matrix, commands, infra setup, troubleshooting
 
 ## Co-developed with LLMs
 
