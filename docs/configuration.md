@@ -141,7 +141,7 @@ studiofs destroy <name> --local   # local-only detach
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STUDIOFS_NATS_URL` | — | NATS URL for cross-client cache invalidation |
+| `STUDIOFS_NATS_URL` | — | NATS URL for cross-client invalidation (example: `nats://127.0.0.1:4222`) |
 | `STUDIOFS_JANITOR_INTERVAL_SECS` | `1800` | Background janitor interval |
 | `STUDIOFS_JANITOR_SKIP_NEWER_SECS` | `900` | Janitor grace window for new objects |
 | `STUDIOFS_JANITOR_MAX_DELETES` | `500` | Janitor delete cap per cycle |
@@ -235,6 +235,18 @@ With NATS:
 set STUDIOFS_NATS_URL=nats://your-nats:4222
 studiofs mount mydisk Z:
 ```
+
+### NATS Setup Guide
+
+For detailed runtime behavior and recommended tuning profiles, see [NATS Invalidation Bus](nats.md).
+
+Quick recommendations:
+
+- Set `STUDIOFS_NATS_URL` on every client for the same volume.
+- Keep flush cadence aligned with freshness target:
+  - interactive: lower `flush_interval_secs` and thresholds
+  - write-heavy: higher thresholds to reduce metadata churn
+- Keep NATS close (network latency) to clients and metadata storage path.
 
 ### Large Datasets
 

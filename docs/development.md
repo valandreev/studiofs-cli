@@ -108,6 +108,7 @@ Optional:
 - [Architecture Overview](architecture.md) — system design and data flows
 - [Cache System](cache.md) — L1/L2 cache internals
 - [Metadata Engine](metadata.md) — redb, Tonbo sync, schema
+- [NATS Invalidation Bus](nats.md) — invalidation flow and recommended tuning
 - [VFS Layer](vfs.md) — read/write paths, readahead, AIMD
 - [Data Layer](data-layer.md) — S3 object format, compression
 - [Platform Bridges](platform-bridges.md) — WinFSP and FUSE

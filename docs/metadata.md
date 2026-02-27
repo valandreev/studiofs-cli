@@ -190,7 +190,10 @@ Each event has a `primary_ino()` method for partitioning/ordering.
 
 ### With NATS
 
-- After successful flush, publisher broadcasts `fs.invalidate.<volume>.all`
-- Subscribers invalidate local read caches immediately
-- Reduces effective staleness to flush interval + network latency
+- After successful metadata flush, publisher broadcasts `fs.invalidate.<volume>.all`
+- Subscribers run immediate metadata sync and invalidate read caches
+- Block cache eviction is selective: dropped object IDs are evicted, unchanged blocks remain cached
+- Effective staleness is usually bounded by flush latency + NATS delivery + sync time
 - NATS is optional — correctness never depends on it
+
+For full flow, subject model, and tuning guidance, see [NATS Invalidation Bus](nats.md).
