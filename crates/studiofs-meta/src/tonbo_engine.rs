@@ -2049,13 +2049,13 @@ mod tests {
 
     fn cleanup_bucket_best_effort(rt: &tokio::runtime::Runtime, client: &S3Client, bucket: &str) {
         if let Err(err) = rt.block_on(delete_bucket_with_contents(client, bucket)) {
-            eprintln!(
-                "warn {}: cleanup bucket '{}' failed: {}",
-                std::thread::current()
+            debug!(
+                thread = std::thread::current()
                     .name()
                     .unwrap_or("tonbo_minio_test_cleanup"),
                 bucket,
-                err
+                error = %err,
+                "cleanup bucket failed (best-effort)"
             );
         }
     }
@@ -3156,9 +3156,10 @@ mod tests {
                 if created_bucket
                     && let Err(e) = rt.block_on(delete_bucket_with_contents(&client, &bucket))
                 {
-                    eprintln!(
-                        "warn tonbo_minio_cross_client_visibility_without_explicit_flush: cleanup bucket '{}' failed: {}",
-                        bucket, e
+                    debug!(
+                        bucket,
+                        error = %e,
+                        "cleanup bucket failed (best-effort)"
                     );
                 }
 

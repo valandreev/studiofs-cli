@@ -32,6 +32,7 @@ pub fn run(
     cache_dir: Option<&Path>,
     cache_size: &str,
     memory_limit: &str,
+    nats_url: &str,
     foreground: bool,
 ) -> anyhow::Result<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
@@ -73,18 +74,20 @@ pub fn run(
 
     // Create VFS
     // StudioVfs::new returns VfsResult<Arc<Self>>
-    let vfs = StudioVfs::new(
+    let vfs = StudioVfs::new_with_nats_url(
         meta.clone(),
         &data_config,
         cache_path_str,
         cache_size_bytes,
         mem_limit,
+        Some(nats_url),
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
+    println!("  NATS:         {}", nats_url);
 
     // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
 

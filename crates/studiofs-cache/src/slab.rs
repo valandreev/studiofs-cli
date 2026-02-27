@@ -835,7 +835,11 @@ impl Drop for SlabStore {
     fn drop(&mut self) {
         // Persist current state so the next mount recovers correctly.
         if let Err(e) = self.persist_index() {
-            eprintln!("[studiofs] SlabStore: failed to persist index on drop: {e}");
+            // Temp test directories can be removed before cache teardown.
+            // Treat missing paths as expected during best-effort shutdown.
+            if e.kind() != io::ErrorKind::NotFound {
+                debug!("[SLAB-PERSIST] failed to persist index on drop: {}", e);
+            }
         }
 
         // Delete empty slab files to reclaim physical disk space on shutdown.

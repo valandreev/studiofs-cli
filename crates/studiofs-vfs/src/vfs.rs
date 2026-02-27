@@ -481,6 +481,28 @@ impl StudioVfs {
         cache_size: u64,
         memory_limit: u64,
     ) -> VfsResult<Arc<Self>> {
+        Self::new_with_nats_url(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            memory_limit,
+            None,
+        )
+    }
+
+    /// Create a new VFS instance with optional explicit NATS URL override.
+    ///
+    /// If `nats_url_override` is `Some`, that value is used and `STUDIOFS_NATS_URL`
+    /// is ignored. If it is `None`, `STUDIOFS_NATS_URL` is used when present.
+    pub fn new_with_nats_url(
+        meta: Arc<dyn MetaEngine>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        memory_limit: u64,
+        nats_url_override: Option<&str>,
+    ) -> VfsResult<Arc<Self>> {
         // Get volume info
         let format_info = meta.get_format_info()?;
         let data_prefix = if format_info.data_prefix.trim().is_empty() {
@@ -494,9 +516,15 @@ impl StudioVfs {
         let invalidation_sender_id = meta
             .invalidation_sender_id()
             .unwrap_or_else(|| format!("pid:{}", std::process::id()));
-        let invalidation_bus = std::env::var("STUDIOFS_NATS_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
+        let invalidation_bus = nats_url_override
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("STUDIOFS_NATS_URL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
             .map(|url| InvalidationBus {
                 nats_url: url,
                 subject_base: format!("fs.invalidate.{}", format_info.name),
@@ -3009,14 +3037,27 @@ impl StudioVfs {
 
             let before_refs = self.collect_referenced_object_ids();
             let mut synced = false;
-            for attempt in 1..=3u32 {
+            let mut after_refs: Option<HashSet<u64>> = None;
+            for attempt in 1..=8u32 {
                 match self.meta.sync_metadata() {
                     Ok(()) => {
+                        after_refs = self.collect_referenced_object_ids();
+                        // Remote snapshot visibility can lag slightly after writer flush.
+                        // Retry a few times when object-id set is still unchanged so
+                        // append/overwrite/delete invalidations converge deterministically.
+                        if let (Some(before), Some(after)) =
+                            (before_refs.as_ref(), after_refs.as_ref())
+                            && before == after
+                            && attempt < 8
+                        {
+                            tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                            continue;
+                        }
                         synced = true;
                         break;
                     }
                     Err(err) => {
-                        if attempt == 3 {
+                        if attempt == 8 {
                             warn!(
                                 subject = %msg.subject,
                                 source_id,
@@ -3040,7 +3081,9 @@ impl StudioVfs {
             if !synced {
                 continue;
             }
-            let after_refs = self.collect_referenced_object_ids();
+            if after_refs.is_none() {
+                after_refs = self.collect_referenced_object_ids();
+            }
 
             let subject = msg.subject.to_string();
             let target = subject.rsplit('.').next().unwrap_or("all");

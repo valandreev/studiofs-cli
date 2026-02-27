@@ -67,6 +67,7 @@ Only metadata credentials are needed. Data credentials are stored in the Tonbo m
 
 ```bash
 studiofs mount <name> <mount-point> \
+  [--nats <nats://host:port>] \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
@@ -76,6 +77,7 @@ studiofs mount <name> <mount-point> \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `mount-point` | — | Drive letter (Windows) or directory (Linux/macOS) |
+| `--nats` | `nats://127.0.0.1:4222` | NATS URL for cross-client invalidation (takes precedence over env) |
 | `--cache-dir` | Platform default | Root directory for L2 cache and journals |
 | `--cache-size` | 50 GiB | Maximum L2 disk cache size |
 | `--memory-limit` | 2 GiB | Maximum L1 memory cache size |
@@ -141,7 +143,6 @@ studiofs destroy <name> --local   # local-only detach
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STUDIOFS_NATS_URL` | — | NATS URL for cross-client invalidation (example: `nats://127.0.0.1:4222`) |
 | `STUDIOFS_JANITOR_INTERVAL_SECS` | `1800` | Background janitor interval |
 | `STUDIOFS_JANITOR_SKIP_NEWER_SECS` | `900` | Janitor grace window for new objects |
 | `STUDIOFS_JANITOR_MAX_DELETES` | `500` | Janitor delete cap per cycle |
@@ -232,8 +233,7 @@ studiofs tune-metadata mydisk --cache-ttl-secs 5 --flush-interval-secs 10
 
 With NATS:
 ```bash
-set STUDIOFS_NATS_URL=nats://your-nats:4222
-studiofs mount mydisk Z:
+studiofs mount mydisk Z: --nats nats://your-nats:4222
 ```
 
 ### NATS Setup Guide
@@ -242,7 +242,7 @@ For detailed runtime behavior and recommended tuning profiles, see [NATS Invalid
 
 Quick recommendations:
 
-- Set `STUDIOFS_NATS_URL` on every client for the same volume.
+- Pass the same `--nats` endpoint on every client for the same volume.
 - Keep flush cadence aligned with freshness target:
   - interactive: lower `flush_interval_secs` and thresholds
   - write-heavy: higher thresholds to reduce metadata churn

@@ -65,7 +65,9 @@ If NATS is unavailable:
 
 ### Baseline
 
-- Set `STUDIOFS_NATS_URL` on every client mounting the same volume.
+- Use `--nats` on every client mounting the same volume.
+- `--nats` value takes precedence over `STUDIOFS_NATS_URL`.
+- If `--nats` is not provided, `studiofs mount` defaults to `nats://127.0.0.1:4222`.
 - Keep clients and NATS in the same low-latency network segment when possible.
 - Use dedicated NATS subjects per volume (already encoded by volume name).
 
@@ -73,50 +75,76 @@ If NATS is unavailable:
 
 #### Windows (PowerShell)
 
-Temporary (current terminal session):
+Variant 1 (one-shot command):
 
 ```powershell
-$env:STUDIOFS_NATS_URL = "nats://127.0.0.1:4222"
-studiofs mount mydisk Z:
+studiofs mount mydisk Z: --nats nats://127.0.0.1:4222
 ```
 
-Persistent (user-level environment variable):
+Variant 2 (persistent PowerShell function in profile):
 
 ```powershell
-setx STUDIOFS_NATS_URL "nats://127.0.0.1:4222"
+# add to $PROFILE
+function Mount-MyDisk {
+  studiofs mount mydisk Z: --nats nats://127.0.0.1:4222
+}
 ```
 
-Open a new terminal after `setx` so the new value is visible.
+Then open a new terminal and run:
+
+```powershell
+Mount-MyDisk
+```
 
 #### macOS (zsh)
 
-Temporary (current terminal session):
+Variant 1 (one-shot command):
 
 ```bash
-export STUDIOFS_NATS_URL="nats://127.0.0.1:4222"
-studiofs mount mydisk /Volumes/mydisk
+studiofs mount mydisk /Volumes/mydisk --nats nats://127.0.0.1:4222
 ```
 
-Persistent (user shell profile):
+Variant 2 (persistent alias in `~/.zshrc`):
 
 ```bash
-echo 'export STUDIOFS_NATS_URL="nats://127.0.0.1:4222"' >> ~/.zshrc
+echo 'alias studiofs-mount-mydisk="studiofs mount mydisk /Volumes/mydisk --nats nats://127.0.0.1:4222"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Variant 3 (persistent function in `~/.zshrc`):
+
+```bash
+cat >> ~/.zshrc <<'EOF'
+studiofs_mount_mydisk() {
+  studiofs mount mydisk /Volumes/mydisk --nats nats://127.0.0.1:4222
+}
+EOF
 source ~/.zshrc
 ```
 
 #### Linux (bash)
 
-Temporary (current terminal session):
+Variant 1 (one-shot command):
 
 ```bash
-export STUDIOFS_NATS_URL="nats://127.0.0.1:4222"
-studiofs mount mydisk /mnt/mydisk
+studiofs mount mydisk /mnt/mydisk --nats nats://127.0.0.1:4222
 ```
 
-Persistent (user shell profile):
+Variant 2 (persistent alias in `~/.bashrc`):
 
 ```bash
-echo 'export STUDIOFS_NATS_URL="nats://127.0.0.1:4222"' >> ~/.bashrc
+echo 'alias studiofs-mount-mydisk="studiofs mount mydisk /mnt/mydisk --nats nats://127.0.0.1:4222"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Variant 3 (persistent function in `~/.bashrc`):
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+studiofs_mount_mydisk() {
+  studiofs mount mydisk /mnt/mydisk --nats nats://127.0.0.1:4222
+}
+EOF
 source ~/.bashrc
 ```
 
@@ -150,7 +178,7 @@ studiofs tune-metadata mydisk ^
 
 ### "Changes are not visible immediately"
 
-- Verify `STUDIOFS_NATS_URL` is set and reachable on all clients.
+- Verify every client uses the same `--nats` endpoint and that it is reachable.
 - Verify all clients mount the same volume name.
 - Verify writer actually flushed metadata (event is emitted after successful flush).
 

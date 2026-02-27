@@ -106,11 +106,9 @@ EXAMPLES:
     studiofs janitor myvolume --dry-run
 
   Enable cross-client cache invalidation bus (NATS):
-    set STUDIOFS_NATS_URL=nats://127.0.0.1:4222
-    studiofs mount myvolume Z:
+    studiofs mount myvolume Z: --nats nats://127.0.0.1:4222
 
 ENV TUNING:
-  STUDIOFS_NATS_URL                 Optional NATS server URL for invalidation bus.
   STUDIOFS_JANITOR_INTERVAL_SECS    Auto-janitor cycle interval (default: 1800).
   STUDIOFS_JANITOR_SKIP_NEWER_SECS  Grace window for orphan deletion (default: 900).
   STUDIOFS_JANITOR_MAX_DELETES      Max janitor deletes per cycle (default: 500).
@@ -289,6 +287,9 @@ EXAMPLES:
     studiofs mount myvolume Z: --memory-limit 4GB --cache-size 500GB \\
       --cache-dir D:\\cache\\studiofs
 
+  Mount with explicit NATS server:
+    studiofs mount myvolume Z: --nats nats://10.0.0.5:4222
+
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
 
@@ -313,6 +314,10 @@ SIZE FORMATS:
         /// Maximum in-memory cache size (e.g. 1GB, 512MB, 4GB)
         #[arg(long, default_value = "1GB")]
         memory_limit: String,
+
+        /// NATS URL for cross-client invalidation (CLI value overrides env; default is local NATS)
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        nats: String,
 
         /// Run in foreground (keep terminal attached)
         #[arg(long)]
@@ -517,6 +522,7 @@ fn main() -> anyhow::Result<()> {
             cache_dir,
             cache_size,
             memory_limit,
+            nats,
             foreground,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -527,6 +533,7 @@ fn main() -> anyhow::Result<()> {
                 cache_dir.as_deref(),
                 &cache_size,
                 &memory_limit,
+                &nats,
                 foreground,
             )?;
         }
