@@ -16,8 +16,8 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
@@ -72,9 +72,7 @@ impl UploadQueue {
     /// items for the VFS upload worker.
     ///
     /// Any existing `.pending` files are scanned and re-queued (crash recovery).
-    pub fn new(
-        cache_dir: impl AsRef<Path>,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<PendingUpload>) {
+    pub fn new(cache_dir: impl AsRef<Path>) -> (Arc<Self>, mpsc::UnboundedReceiver<PendingUpload>) {
         let upload_dir = cache_dir.as_ref().join("upload");
         fs::create_dir_all(&upload_dir).expect("failed to create upload dir");
 
@@ -175,10 +173,7 @@ impl UploadQueue {
                 return false;
             }
             let remaining = deadline.saturating_duration_since(now);
-            if tokio::time::timeout(remaining, notified)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(remaining, notified).await.is_err() {
                 // Final check after timeout — count might have reached 0 just
                 // before the deadline.
                 return self.pending_count.load(Ordering::Acquire) == 0;
@@ -230,11 +225,11 @@ impl UploadQueue {
 
     fn mark_done(&self) {
         // Saturating decrement — guards against double-complete (reconcile + uploader race).
-        let result = self.pending_count.fetch_update(
-            Ordering::Release,
-            Ordering::Acquire,
-            |v| if v > 0 { Some(v - 1) } else { None },
-        );
+        let result = self
+            .pending_count
+            .fetch_update(Ordering::Release, Ordering::Acquire, |v| {
+                if v > 0 { Some(v - 1) } else { None }
+            });
         if result == Ok(1) {
             // Was 1, now 0 — notify idle waiters.
             self.idle_notify.notify_waiters();
@@ -242,8 +237,7 @@ impl UploadQueue {
     }
 
     fn journal_path(&self, object_id: u64) -> PathBuf {
-        self.upload_dir
-            .join(format!("{:016x}.pending", object_id))
+        self.upload_dir.join(format!("{:016x}.pending", object_id))
     }
 
     fn write_journal(

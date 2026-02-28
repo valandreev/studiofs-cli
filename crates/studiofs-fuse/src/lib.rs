@@ -26,8 +26,14 @@ fn spawn_signal_watcher(mount_point: &str) {
     let mp = mount_point.to_string();
     // Install signal handlers (replaces the default "terminate" action).
     unsafe {
-        libc::signal(libc::SIGINT, shutdown_signal_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, shutdown_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
     }
     std::thread::Builder::new()
         .name("signal-watcher".into())

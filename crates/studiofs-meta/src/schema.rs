@@ -177,7 +177,11 @@ impl InodeAttr {
 
     /// Get the effective creation time (falls back to ctime for old inodes).
     pub fn effective_crtime(&self) -> i64 {
-        if self.crtime != 0 { self.crtime } else { self.ctime }
+        if self.crtime != 0 {
+            self.crtime
+        } else {
+            self.ctime
+        }
     }
 }
 

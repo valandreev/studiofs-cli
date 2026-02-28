@@ -15,8 +15,8 @@ use windows::Win32::Security::{
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
 };
 use winfsp::U16CStr;
-use winfsp::filesystem::*;
 use winfsp::filesystem::DirBuffer;
+use winfsp::filesystem::*;
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // Windows reparse point constants
@@ -243,9 +243,7 @@ fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
     buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // SYMLINK_FLAG_RELATIVE
 
     // Write both SubstituteName and PrintName via byte slice copy.
-    let src = unsafe {
-        std::slice::from_raw_parts(utf16.as_ptr() as *const u8, name_bytes)
-    };
+    let src = unsafe { std::slice::from_raw_parts(utf16.as_ptr() as *const u8, name_bytes) };
     let path_buf_offset = 20;
     buf[path_buf_offset..path_buf_offset + name_bytes].copy_from_slice(src);
     let print_start = path_buf_offset + name_bytes;
@@ -315,16 +313,16 @@ fn create_default_security_descriptor() -> Vec<u8> {
     let mut psd = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl,
-            1, // SDDL_REVISION_1
-            &mut psd,
-            None,
+            sddl, 1, // SDDL_REVISION_1
+            &mut psd, None,
         )
         .expect("Failed to create security descriptor from SDDL");
         let len = GetSecurityDescriptorLength(psd) as usize;
         let bytes = std::slice::from_raw_parts(psd.0 as *const u8, len).to_vec();
         // Free the LocalAlloc'd descriptor
-        windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(psd.0 as *mut _)));
+        windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+            psd.0 as *mut _,
+        )));
         bytes
     }
 }
@@ -380,7 +378,11 @@ pub struct StudioFsContext {
 impl StudioFsContext {
     pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
         let default_sd = create_default_security_descriptor();
-        Self { vfs, rt, default_sd }
+        Self {
+            vfs,
+            rt,
+            default_sd,
+        }
     }
 
     /// Copy the cached security descriptor into the provided buffer.
@@ -390,11 +392,7 @@ impl StudioFsContext {
         if let Some(buf) = buf {
             let copy_len = sd.len().min(buf.len());
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sd.as_ptr(),
-                    buf.as_mut_ptr() as *mut u8,
-                    copy_len,
-                );
+                std::ptr::copy_nonoverlapping(sd.as_ptr(), buf.as_mut_ptr() as *mut u8, copy_len);
             }
         }
         sd.len() as u64
@@ -681,11 +679,7 @@ impl FileSystemContext for StudioFsContext {
 
             // Add all directory entries
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
-            debug!(
-                ino = context.ino,
-                count = entries.len(),
-                "read_directory"
-            );
+            debug!(ino = context.ino, count = entries.len(), "read_directory");
 
             for entry in &entries {
                 let name_cow = String::from_utf8_lossy(&entry.name);
@@ -732,7 +726,6 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
             if let Some(fname) = file_name

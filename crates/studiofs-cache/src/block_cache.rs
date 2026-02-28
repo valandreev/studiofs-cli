@@ -528,10 +528,7 @@ impl BlockCache {
             if l1_used > l1_max {
                 let excess = l1_used - l1_max;
                 self.evict_l1_bytes(excess);
-                debug!(
-                    freed_mb = excess / (1024 * 1024),
-                    "L1 eviction complete"
-                );
+                debug!(freed_mb = excess / (1024 * 1024), "L1 eviction complete");
             }
 
             // Phase 2: L2 overflow → full eviction.
@@ -540,20 +537,14 @@ impl BlockCache {
             if l2_used > l2_max {
                 let excess = l2_used - l2_max;
                 self.evict_l2_bytes(excess);
-                debug!(
-                    freed_mb = excess / (1024 * 1024),
-                    "L2 eviction complete"
-                );
+                debug!(freed_mb = excess / (1024 * 1024), "L2 eviction complete");
             }
 
             // Phase 3: Disk space guard.
-            if let Some((free, total)) =
-                l2_disk::get_free_disk_space(&self.config.cache_dir)
-            {
+            if let Some((free, total)) = l2_disk::get_free_disk_space(&self.config.cache_dir) {
                 let ratio = free as f64 / total as f64;
                 if ratio < self.config.disk_free_ratio {
-                    let target_free =
-                        (total as f64 * self.config.disk_free_ratio) as u64;
+                    let target_free = (total as f64 * self.config.disk_free_ratio) as u64;
                     let need = target_free.saturating_sub(free);
                     if need > 0 {
                         warn!(
@@ -572,8 +563,7 @@ impl BlockCache {
     }
 
     async fn background_checkpoint(self: Arc<Self>) {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(CHECKPOINT_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_secs(CHECKPOINT_INTERVAL_SECS));
         loop {
             tokio::select! {
                 biased;
@@ -641,10 +631,16 @@ fn load_checkpoint(path: &Path) -> io::Result<Vec<CheckpointEntry>> {
     let data = std::fs::read(path)?;
     let header_size = checkpoint::MAGIC.len() + 2 + 4 + 4; // magic(6) + version(2) + count(4) + crc(4)
     if data.len() < header_size {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "checkpoint too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint too short",
+        ));
     }
     if &data[0..6] != checkpoint::MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checkpoint magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad checkpoint magic",
+        ));
     }
     let version = u16::from_le_bytes([data[6], data[7]]);
     if version != checkpoint::VERSION {
@@ -658,7 +654,10 @@ fn load_checkpoint(path: &Path) -> io::Result<Vec<CheckpointEntry>> {
 
     let entry_data = &data[16..];
     if entry_data.len() < count * checkpoint::ENTRY_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated checkpoint"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated checkpoint",
+        ));
     }
 
     // Verify CRC.
@@ -703,7 +702,7 @@ mod tests {
 
     fn test_config(dir: &Path) -> BlockCacheConfig {
         BlockCacheConfig {
-            l1_size: 1024 * 1024, // 1 MiB
+            l1_size: 1024 * 1024,      // 1 MiB
             l2_size: 10 * 1024 * 1024, // 10 MiB
             cache_dir: dir.to_path_buf(),
             disk_free_ratio: 0.01,
@@ -801,14 +800,8 @@ mod tests {
         let (cache, _rx) = BlockCache::open(config).unwrap();
 
         // Insert data that exceeds L1 budget.
-        cache
-            .put(1, Bytes::from(vec![0u8; 60]))
-            .await
-            .unwrap();
-        cache
-            .put(2, Bytes::from(vec![1u8; 60]))
-            .await
-            .unwrap();
+        cache.put(1, Bytes::from(vec![0u8; 60])).await.unwrap();
+        cache.put(2, Bytes::from(vec![1u8; 60])).await.unwrap();
 
         // Manually trigger L1 eviction.
         let excess = cache.l1.total_bytes().saturating_sub(cache.l1.max_bytes());
@@ -818,7 +811,10 @@ mod tests {
 
         // At least one entry should be demoted from L1 but still on L2.
         let still_in_l1 = cache.l1.len();
-        assert!(still_in_l1 < 2, "expected L1 eviction to demote at least one entry");
+        assert!(
+            still_in_l1 < 2,
+            "expected L1 eviction to demote at least one entry"
+        );
 
         // Both should still be readable (from L2).
         assert!(cache.get(1).await.is_some());

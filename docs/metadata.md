@@ -86,7 +86,7 @@ Optional NATS bus
 2. Serialize delta and PUT to S3 with `If-Match: <etag>` (CAS)
 3. On success: update baseline, reset counters
 4. On 412 conflict: pull remote manifest, merge with local changes, retry
-5. Optional: publish `fs.invalidate.<volume>.all` to NATS
+5. Optional: publish `fs.invalidate.<volume>.all` to NATS (Core or JetStream mode)
 
 **Range-based ID allocation:**
 

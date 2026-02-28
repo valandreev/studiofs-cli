@@ -33,6 +33,7 @@ Default test values:
 - `STUDIOFS_MINIO_SECRET_KEY=minioadmin`
 - `STUDIOFS_MINIO_BUCKET=studiofs-test`
 - `STUDIOFS_NATS_URL=nats://127.0.0.1:4222`
+- `STUDIOFS_NATS_DELIVERY=core`
 
 ## Infrastructure Setup
 
@@ -48,10 +49,17 @@ docker run -d --name minio \
 docker run -d --name nats -p 4222:4222 nats:2
 ```
 
+If you need JetStream mode coverage, start NATS with JetStream enabled:
+
+```bash
+docker run -d --name nats-js -p 4222:4222 nats:2 -js
+```
+
 ### Option B: Native binaries
 
 - MinIO example (Windows): `minio server C:\minio --console-address ":9001"`
 - NATS example: `nats-server -p 4222`
+- NATS with JetStream: `nats-server -js -p 4222`
 
 ## Command Matrix
 
@@ -89,6 +97,18 @@ cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-vfs --test vfs_test test_nats_ -- --ignored --nocapture
 ```
 
+JetStream mode:
+
+```bash
+STUDIOFS_NATS_DELIVERY=jetstream cargo test -p studiofs-vfs --test vfs_test test_nats_ -- --ignored --nocapture
+```
+
+PowerShell equivalent:
+
+```powershell
+$env:STUDIOFS_NATS_DELIVERY='jetstream'; cargo test -p studiofs-vfs --test vfs_test test_nats_ -- --ignored --nocapture
+```
+
 ## Test Discovery and Filtering
 
 List tests in a target:
@@ -118,11 +138,13 @@ cargo test -p studiofs-meta tonbo_minio_ -- --ignored --nocapture
 | `STUDIOFS_MINIO_SECRET_KEY` | `minioadmin` | same as above |
 | `STUDIOFS_MINIO_BUCKET` | `studiofs-test` | same as above |
 | `STUDIOFS_NATS_URL` | `nats://127.0.0.1:4222` | `studiofs-vfs` NATS tests and Tonbo invalidation wiring |
+| `STUDIOFS_NATS_DELIVERY` | `core` | Invalidation delivery mode (`core`, `auto`, `jetstream`) for runtime wiring |
 
 Note:
 
 - Runtime mount path uses CLI `--nats` (see [NATS Invalidation Bus](nats.md)).
 - Test code still uses `STUDIOFS_NATS_URL` for controllable setup.
+- For reconnect/downtime guarantees in invalidation tests, set `STUDIOFS_NATS_DELIVERY=jetstream`.
 
 ## Stress / Flake Checks
 
@@ -154,6 +176,7 @@ done
 
 - Verify `STUDIOFS_NATS_URL` points to a reachable server.
 - Confirm port `4222` is reachable.
+- If `STUDIOFS_NATS_DELIVERY=jetstream`, verify server runs with JetStream enabled.
 - Run NATS subset directly:
   - `cargo test -p studiofs-vfs --test vfs_test test_nats_ -- --ignored --nocapture`
 
@@ -173,4 +196,3 @@ Recommended CI order:
 2. `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1`
 
 This keeps fast feedback first and runs external-infra suites in a more deterministic mode.
-

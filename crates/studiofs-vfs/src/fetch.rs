@@ -13,8 +13,8 @@ use crate::aimd::{AimdConfig, AimdController};
 use bytes::Bytes;
 use dashmap::DashMap;
 use opendal::ErrorKind;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use studiofs_cache::block_cache::BlockCache;
 use studiofs_data::object::read_object;
@@ -58,10 +58,7 @@ pub enum FetchError {
     NotFound { key: String },
 
     #[error("fetch failed after {attempts} attempts: {source}")]
-    Exhausted {
-        attempts: u32,
-        source: DataError,
-    },
+    Exhausted { attempts: u32, source: DataError },
 
     #[error("object decode error: {0}")]
     Decode(#[from] studiofs_data::object::ObjectError),
@@ -170,11 +167,7 @@ impl FetchScheduler {
     /// 3. AIMD-governed concurrency for the actual HTTP request.
     /// 4. Retry with exponential backoff on transient errors.
     /// 5. Cache population on success.
-    pub async fn fetch_block(
-        &self,
-        object_id: u64,
-        key: &str,
-    ) -> Result<Bytes, FetchError> {
+    pub async fn fetch_block(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
         if let Some(cached) = self.cache.get(object_id).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -193,7 +186,9 @@ impl FetchScheduler {
                 match self.inflight.entry(object_id) {
                     dashmap::Entry::Occupied(e) => {
                         let rx = e.get().subscribe();
-                        self.metrics.singleflight_joins.fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .singleflight_joins
+                            .fetch_add(1, Ordering::Relaxed);
                         Action::Wait(rx)
                     }
                     dashmap::Entry::Vacant(e) => {
@@ -224,7 +219,10 @@ impl FetchScheduler {
                         // Fetcher failed, channel closed, or timeout.
                         // Become a new fetcher ourselves.
                         Ok(Ok(false)) | Ok(Err(_)) | Err(_) => {
-                            debug!(object_id, "singleflight: fetcher failed, becoming new fetcher");
+                            debug!(
+                                object_id,
+                                "singleflight: fetcher failed, becoming new fetcher"
+                            );
                         }
                     }
                     // Loop back to try to become the fetcher.
@@ -333,11 +331,7 @@ impl FetchScheduler {
     // ── Internal ────────────────────────────────────────────────────
 
     /// Perform the actual S3 GET with retries, AIMD permit, decompress, cache.
-    async fn do_fetch_with_retry(
-        &self,
-        object_id: u64,
-        key: &str,
-    ) -> Result<Bytes, FetchError> {
+    async fn do_fetch_with_retry(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
 
@@ -359,21 +353,17 @@ impl FetchScheduler {
             // Hard timeout per request — prevents runaway waits from
             // blocking WinFSP/FUSE dispatch threads indefinitely.
             let req_start = Instant::now();
-            let get_result = tokio::time::timeout(
-                REQUEST_TIMEOUT,
-                self.data_store.get_by_key(key),
-            )
-            .await;
+            let get_result =
+                tokio::time::timeout(REQUEST_TIMEOUT, self.data_store.get_by_key(key)).await;
             let req_ms = req_start.elapsed().as_millis();
 
             match get_result {
                 Ok(Ok(compressed)) => {
                     permit.success();
                     self.metrics.s3_fetches.fetch_add(1, Ordering::Relaxed);
-                    self.metrics.bytes_downloaded.fetch_add(
-                        compressed.len() as u64,
-                        Ordering::Relaxed,
-                    );
+                    self.metrics
+                        .bytes_downloaded
+                        .fetch_add(compressed.len() as u64, Ordering::Relaxed);
 
                     debug!(
                         object_id,

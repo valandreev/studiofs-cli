@@ -112,14 +112,21 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let cache_dir_str = cache_dir.to_str().unwrap();
     let cache_size = 1024 * 1024 * 1024; // 1 GiB
 
-    StudioVfs::new(meta, &data_config, cache_dir_str, cache_size, 512 * 1024 * 1024).expect("failed to create StudioVfs")
+    StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir_str,
+        cache_size,
+        512 * 1024 * 1024,
+    )
+    .expect("failed to create StudioVfs")
 }
 
 /// Ensure the test bucket exists.
 async fn ensure_bucket() {
-    use aws_config::BehaviorVersion;
     use aws_sdk_s3::Client as S3Client;
-    use aws_sdk_s3::config::{Credentials, Region};
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
     let endpoint =
         std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
@@ -146,7 +153,8 @@ async fn ensure_bucket() {
     }
 
     // Fallback: explicitly create bucket if missing.
-    let shared = aws_config::defaults(BehaviorVersion::latest())
+    let conf = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
         .credentials_provider(Credentials::new(
             &access_key,
             &secret_key,
@@ -155,9 +163,7 @@ async fn ensure_bucket() {
             "studiofs-test",
         ))
         .region(Region::new("us-east-1"))
-        .load()
-        .await;
-    let conf = aws_sdk_s3::config::Builder::from(&shared)
+        .http_client(SmithyHttpClientBuilder::new().build_http())
         .endpoint_url(&endpoint)
         .force_path_style(true)
         .build();
@@ -317,7 +323,8 @@ fn make_tonbo_test_client(format_info: &FormatInfo, label: &str) -> TonboTestCli
     let db_path = tmp.path().join(format!("meta-{label}.redb"));
 
     let seed = RedbMetaEngine::open(&db_path).expect("failed to open seed RedbMetaEngine");
-    seed.init_root(0, 0).expect("failed to initialize root inode");
+    seed.init_root(0, 0)
+        .expect("failed to initialize root inode");
     seed.set_format_info(format_info)
         .expect("failed to set tonbo format info");
     drop(seed);
@@ -690,7 +697,10 @@ async fn test_pending_deletions_gc() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "Timed out waiting for overwrite flush");
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for overwrite flush"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -906,8 +916,14 @@ fn test_crash_recovery_replays_pending_journal() {
             .unwrap();
         let offline_data_config = DataStoreConfig::from(&offline_info);
         rt.block_on(async {
-            let vfs = StudioVfs::new(meta.clone(), &offline_data_config, &cache_dir_str, 1024 * 1024 * 1024, 512 * 1024 * 1024)
-                .unwrap();
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &offline_data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
             crash_file_ino = attr.ino;
             let payload = vec![0x5Au8; 2 * 1024 * 1024];
@@ -923,7 +939,10 @@ fn test_crash_recovery_replays_pending_journal() {
                 {
                     break;
                 }
-                assert!(Instant::now() < deadline, "timed out waiting for slab flusher");
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for slab flusher"
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             // Simulate abrupt process death: drop runtime without graceful VFS shutdown.
@@ -1157,7 +1176,10 @@ async fn test_nats_delete_updates_metadata_and_clears_cached_block() {
     let wait = Duration::from_secs(15);
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let attr = writer.vfs.create(1, b"nats-delete.bin", 0, 0, 0o644).unwrap();
+    let attr = writer
+        .vfs
+        .create(1, b"nats-delete.bin", 0, 0, 0o644)
+        .unwrap();
     let ino = attr.ino;
     let payload = vec![0xA5; info.block_size as usize];
     writer.vfs.write(ino, 0, &payload).await.unwrap();
@@ -1170,10 +1192,7 @@ async fn test_nats_delete_updates_metadata_and_clears_cached_block() {
     );
     writer.vfs.meta().flush_metadata().unwrap();
 
-    let visible = wait_until(wait, || {
-        reader.vfs.lookup(1, b"nats-delete.bin").is_ok()
-    })
-    .await;
+    let visible = wait_until(wait, || reader.vfs.lookup(1, b"nats-delete.bin").is_ok()).await;
     assert!(visible, "reader did not observe file creation");
 
     let reader_ino = reader.vfs.lookup(1, b"nats-delete.bin").unwrap().ino;
@@ -1256,7 +1275,10 @@ async fn test_nats_overwrite_evicts_only_changed_block_cache() {
     let mut initial = block0_v1.clone();
     initial.extend_from_slice(&block1_static);
 
-    let attr = writer.vfs.create(1, b"nats-overwrite.bin", 0, 0, 0o644).unwrap();
+    let attr = writer
+        .vfs
+        .create(1, b"nats-overwrite.bin", 0, 0, 0o644)
+        .unwrap();
     let ino = attr.ino;
     writer.vfs.write(ino, 0, &initial).await.unwrap();
     writer.vfs.flush(ino).await.unwrap();
@@ -1280,7 +1302,11 @@ async fn test_nats_overwrite_evicts_only_changed_block_cache() {
     let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
         .expect("reader metadata missing initial blocks after create invalidation");
     assert_eq!(reader_blocks.len(), 2);
-    let got_v1 = reader.vfs.read(reader_ino, 0, (2 * bs) as u32).await.unwrap();
+    let got_v1 = reader
+        .vfs
+        .read(reader_ino, 0, (2 * bs) as u32)
+        .await
+        .unwrap();
     assert_eq!(got_v1, initial);
 
     let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
@@ -1337,7 +1363,11 @@ async fn test_nats_overwrite_evicts_only_changed_block_cache() {
 
     let mut expected = block0_v2.clone();
     expected.extend_from_slice(&block1_static);
-    let got_v2 = reader.vfs.read(reader_ino, 0, (2 * bs) as u32).await.unwrap();
+    let got_v2 = reader
+        .vfs
+        .read(reader_ino, 0, (2 * bs) as u32)
+        .await
+        .unwrap();
     assert_eq!(got_v2, expected);
 }
 
@@ -1374,7 +1404,10 @@ async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
     let mut initial = block0.clone();
     initial.extend_from_slice(&block1);
 
-    let attr = writer.vfs.create(1, b"nats-append.bin", 0, 0, 0o644).unwrap();
+    let attr = writer
+        .vfs
+        .create(1, b"nats-append.bin", 0, 0, 0o644)
+        .unwrap();
     let ino = attr.ino;
     writer.vfs.write(ino, 0, &initial).await.unwrap();
     writer.vfs.flush(ino).await.unwrap();
@@ -1398,7 +1431,11 @@ async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
     let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
         .expect("reader metadata missing initial blocks after create invalidation");
     assert_eq!(reader_blocks.len(), 2);
-    let got_v1 = reader.vfs.read(reader_ino, 0, (2 * bs) as u32).await.unwrap();
+    let got_v1 = reader
+        .vfs
+        .read(reader_ino, 0, (2 * bs) as u32)
+        .await
+        .unwrap();
     assert_eq!(got_v1, initial);
 
     let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
@@ -1414,7 +1451,11 @@ async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
     );
 
     let block2 = vec![0x43; bs];
-    writer.vfs.write(ino, (2 * bs) as u64, &block2).await.unwrap();
+    writer
+        .vfs
+        .write(ino, (2 * bs) as u64, &block2)
+        .await
+        .unwrap();
     writer.vfs.flush(ino).await.unwrap();
     let writer_append_ready = wait_until(wait, || {
         let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
@@ -1440,14 +1481,21 @@ async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
         refs.len() == 3 && refs[0].1.object_id == id0 && refs[1].1.object_id == id1
     })
     .await;
-    assert!(append_visible, "reader metadata did not reflect appended block");
+    assert!(
+        append_visible,
+        "reader metadata did not reflect appended block"
+    );
 
     assert!(
         path0.exists() && path1.exists(),
         "unchanged cached blocks should be preserved after append"
     );
 
-    let got_new = reader.vfs.read(reader_ino, (2 * bs) as u64, bs as u32).await.unwrap();
+    let got_new = reader
+        .vfs
+        .read(reader_ino, (2 * bs) as u64, bs as u32)
+        .await
+        .unwrap();
     assert_eq!(got_new, block2);
 
     let mut refs_after = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();

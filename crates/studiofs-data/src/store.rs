@@ -100,8 +100,8 @@ impl DataStore {
         // all retry logic with AIMD back-pressure.
         let (meta_timeout_s, io_timeout_s, max_retries, concurrent_limit) = match profile {
             IoProfile::Default => (10, 60, 3, 128),
-            IoProfile::Read   => ( 3,  5, 0,  16),
-            IoProfile::Write  => (10, 20, 3,  16),
+            IoProfile::Read => (3, 5, 0, 16),
+            IoProfile::Write => (10, 20, 3, 16),
         };
 
         let op = Operator::new(builder)?

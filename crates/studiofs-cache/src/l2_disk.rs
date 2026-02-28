@@ -25,8 +25,8 @@
 use bytes::Bytes;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 // =============================================================================
@@ -156,7 +156,10 @@ impl L2DiskCache {
         let mut handles = Vec::with_capacity(ids.len());
         for &id in ids {
             let path = self.block_path(id);
-            handles.push((id, tokio::task::spawn_blocking(move || std::fs::read(&path))));
+            handles.push((
+                id,
+                tokio::task::spawn_blocking(move || std::fs::read(&path)),
+            ));
         }
         let mut results = Vec::with_capacity(handles.len());
         for (id, handle) in handles {
@@ -227,11 +230,15 @@ impl L2DiskCache {
             let tmp_path = path.with_extension("tmp");
             let owned = data.clone();
             let object_id = *id;
-            handles.push((object_id, data.len() as u64, tokio::task::spawn_blocking(move || -> io::Result<()> {
-                std::fs::write(&tmp_path, &owned)?;
-                std::fs::rename(&tmp_path, &path)?;
-                Ok(())
-            })));
+            handles.push((
+                object_id,
+                data.len() as u64,
+                tokio::task::spawn_blocking(move || -> io::Result<()> {
+                    std::fs::write(&tmp_path, &owned)?;
+                    std::fs::rename(&tmp_path, &path)?;
+                    Ok(())
+                }),
+            ));
         }
         let mut results = Vec::with_capacity(handles.len());
         for (id, len, handle) in handles {
@@ -380,12 +387,7 @@ pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
     let mut total: u64 = 0;
     let mut free_total: u64 = 0;
     unsafe {
-        let ret = GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free_caller,
-            &mut total,
-            &mut free_total,
-        );
+        let ret = GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_caller, &mut total, &mut free_total);
         if ret != 0 {
             Some((free_caller, total))
         } else {

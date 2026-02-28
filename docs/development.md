@@ -10,7 +10,7 @@
 - **Cache:** Two-level (RAM + NVMe) with LRU and crash-safe writeback
 - **Platform:** WinFSP (Windows), FUSE (Linux/macOS)
 - **Test storage:** MinIO (or any S3-compatible endpoint)
-- **Invalidation bus:** NATS (optional)
+- **Invalidation bus:** NATS (optional, Core or JetStream delivery)
 
 ## Project Structure
 
@@ -54,6 +54,7 @@ Notes:
   - MinIO credentials: `minioadmin:minioadmin`
   - Bucket default in tests: `studiofs-test`
   - NATS URL default for local dev: `nats://127.0.0.1:4222`
+  - NATS delivery mode default: `STUDIOFS_NATS_DELIVERY=core`
 - Tests that require a bucket will try to create it if missing.
 
 ## Build
@@ -96,6 +97,7 @@ Required for custom test endpoints/credentials:
 
 Optional:
 - `STUDIOFS_NATS_URL`
+- `STUDIOFS_NATS_DELIVERY` (`core`, `auto`, `jetstream`)
 
 ## Infrastructure Requirements
 

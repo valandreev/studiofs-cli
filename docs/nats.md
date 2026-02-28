@@ -9,44 +9,59 @@ With NATS enabled, clients react to committed metadata changes immediately inste
 
 NATS is optional. Correctness does not depend on NATS availability.
 
+## Delivery Modes
+
+Delivery mode is configured by `STUDIOFS_NATS_DELIVERY`.
+
+| Mode | Value | Behavior | Reconnect / downtime behavior |
+|---|---|---|---|
+| Core (default) | `core` or unset | Core NATS publish/subscribe only | Best-effort, at-most-once delivery |
+| Auto | `auto` | Try JetStream first, fall back to Core NATS when JetStream is unavailable | Durable when JetStream is available; best-effort when fallback is active |
+| JetStream | `jetstream` | Use JetStream only (publish ACK + durable consumer ACK) | Durable for successfully ACKed publishes with redelivery; no Core fallback |
+
+For strongest "do not miss invalidations" behavior across reconnects and short outages, use `STUDIOFS_NATS_DELIVERY=jetstream` on all clients.
+
 ## Event Model
 
 - Subject namespace: `fs.invalidate.<volume>.>`
-- Currently published subject: `fs.invalidate.<volume>.all`
-- Payload: sender identifier from metadata engine (used for self-echo suppression)
+- Current publish subject: `fs.invalidate.<volume>.all`
+- Payload format: `v1|<sender_id>|<metadata_version_or_->`
+- Legacy payload (`<sender_id>`) is still accepted by subscribers for compatibility
 
-Each mounted client subscribes to `fs.invalidate.<volume>.>` for its volume.
+JetStream stream/consumer names are generated deterministically from volume/host/cache identifiers.
 
 ## Publish Path
 
 1. A mutating metadata operation updates local Tonbo/redb state.
 2. Metadata flush succeeds to remote manifest (CAS-protected write).
-3. Publisher emits invalidation message on `fs.invalidate.<volume>.all`.
+3. Publisher emits invalidation on `fs.invalidate.<volume>.all`:
+   - `core`: publish to Core NATS.
+   - `auto`: publish to JetStream (with publish ACK); on JetStream failure, fall back to Core NATS.
+   - `jetstream`: publish to JetStream (with publish ACK), no fallback.
 
-Important: no successful metadata flush means no invalidation event.  
+Important: no successful metadata flush means no invalidation event.
+Durability starts only after JetStream publish ACK; in strict `jetstream` mode a failed publish is not replayed via Core NATS.
 For low-latency propagation, configure flush cadence accordingly.
 
 ## Subscriber Path (StudioVfs)
 
 On each invalidation message:
 
-1. Ignore message if payload sender ID equals local sender ID.
+1. Ignore self-echo by comparing `sender_id` from payload.
 2. Snapshot currently referenced object IDs (`before`).
-3. Run `sync_metadata()` with short retries/backoff.
-4. Snapshot referenced object IDs again (`after`).
-5. Invalidate read caches:
-   - `.all` -> clear inode attribute read cache
-   - inode-targeted subject (reserved for future publishers) -> invalidate that inode's read cache
-6. Evict only dropped cached blocks:
-   - remove object IDs present in `before` but absent in `after`
-   - keep unchanged object IDs in cache
-   - skip pinned blocks (pending upload); eviction is deferred
+3. Run `sync_metadata()` with retries/backoff.
+4. Validate progress using metadata version token and/or changed referenced object set.
+5. Snapshot referenced object IDs again (`after`).
+6. Invalidate read caches and evict only dropped cached blocks:
+   - dropped object IDs (`before - after`) are evicted
+   - unchanged cached blocks stay hot
+   - pinned blocks (pending upload) are skipped and evicted later
 
-This gives "refresh immediately, evict selectively" behavior:
+JetStream-specific behavior:
 
-- deleted/overwritten cached blocks are removed
-- unchanged cached blocks stay hot
-- newly referenced blocks are fetched on demand when read
+- Durable pull consumer with explicit ACK.
+- Message is ACKed only after sync+apply succeeds.
+- On sync/apply failure the client sends NAK with delay, so message is redelivered.
 
 ## Consistency Envelope
 
@@ -56,97 +71,39 @@ Observed propagation delay is approximately:
 
 Typical local setup yields near-immediate Explorer/Finder updates after flush.
 
-If NATS is unavailable:
+If NATS or JetStream is unavailable:
 
-- client keeps working from local metadata/cache
-- convergence falls back to TTL refresh and read-triggered sync
+- mount and I/O continue from local metadata/cache
+- convergence still happens via TTL refresh and read-triggered sync
+- with `auto`, listener/publisher can fall back to Core NATS
+- with strict `jetstream`, failed publishes are not replayed via Core fallback
 
 ## Recommended Setup
 
 ### Baseline
 
-- Use `--nats` on every client mounting the same volume.
-- `--nats` value takes precedence over `STUDIOFS_NATS_URL`.
-- If `--nats` is not provided, `studiofs mount` defaults to `nats://127.0.0.1:4222`.
+- Use the same `--nats` endpoint on every client mounting the same volume.
+- Set `STUDIOFS_NATS_DELIVERY=jetstream` on every client for durable invalidation.
+- `--nats` CLI value takes precedence over `STUDIOFS_NATS_URL`.
 - Keep clients and NATS in the same low-latency network segment when possible.
-- Use dedicated NATS subjects per volume (already encoded by volume name).
 
-### OS-specific setup (temporary + persistent)
+### Enable JetStream
 
-#### Windows (PowerShell)
-
-Variant 1 (one-shot command):
+PowerShell:
 
 ```powershell
+$env:STUDIOFS_NATS_DELIVERY = "jetstream"
 studiofs mount mydisk Z: --nats nats://127.0.0.1:4222
 ```
 
-Variant 2 (persistent PowerShell function in profile):
-
-```powershell
-# add to $PROFILE
-function Mount-MyDisk {
-  studiofs mount mydisk Z: --nats nats://127.0.0.1:4222
-}
-```
-
-Then open a new terminal and run:
-
-```powershell
-Mount-MyDisk
-```
-
-#### macOS (zsh)
-
-Variant 1 (one-shot command):
+Bash/zsh:
 
 ```bash
-studiofs mount mydisk /Volumes/mydisk --nats nats://127.0.0.1:4222
-```
-
-Variant 2 (persistent alias in `~/.zshrc`):
-
-```bash
-echo 'alias studiofs-mount-mydisk="studiofs mount mydisk /Volumes/mydisk --nats nats://127.0.0.1:4222"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Variant 3 (persistent function in `~/.zshrc`):
-
-```bash
-cat >> ~/.zshrc <<'EOF'
-studiofs_mount_mydisk() {
-  studiofs mount mydisk /Volumes/mydisk --nats nats://127.0.0.1:4222
-}
-EOF
-source ~/.zshrc
-```
-
-#### Linux (bash)
-
-Variant 1 (one-shot command):
-
-```bash
+export STUDIOFS_NATS_DELIVERY=jetstream
 studiofs mount mydisk /mnt/mydisk --nats nats://127.0.0.1:4222
 ```
 
-Variant 2 (persistent alias in `~/.bashrc`):
-
-```bash
-echo 'alias studiofs-mount-mydisk="studiofs mount mydisk /mnt/mydisk --nats nats://127.0.0.1:4222"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-Variant 3 (persistent function in `~/.bashrc`):
-
-```bash
-cat >> ~/.bashrc <<'EOF'
-studiofs_mount_mydisk() {
-  studiofs mount mydisk /mnt/mydisk --nats nats://127.0.0.1:4222
-}
-EOF
-source ~/.bashrc
-```
+NATS server must have JetStream enabled (for example `nats-server -js -p 4222`).
 
 ### Metadata Tuning Profiles
 
@@ -158,29 +115,30 @@ Tune metadata flush cadence to match desired freshness/cost tradeoff:
 | Balanced default | 20-60 | 10-30 | 32-128 | 1-4 MiB |
 | Write-heavy / lower metadata churn | 60-120 | 30-60 | 128-512 | 4-16 MiB |
 
-Example:
+### Invalidation Tuning (Advanced)
 
-```bash
-studiofs tune-metadata mydisk ^
-  --cache-ttl-secs 20 ^
-  --flush-interval-secs 8 ^
-  --flush-ops-threshold 16 ^
-  --flush-bytes-threshold 524288
-```
-
-### Operational Guidance
-
-- Use auth/TLS in NATS deployment according to your environment policy.
-- Monitor for repeated invalidation sync failures in logs.
-- Avoid sharing the same metadata bucket/prefix across unrelated test runs.
+| Variable | Default | Purpose |
+|---|---|---|
+| `STUDIOFS_INVALIDATION_SYNC_MAX_ATTEMPTS` | `8` | Max retries for `sync_metadata()` after receiving invalidation |
+| `STUDIOFS_INVALIDATION_SYNC_BASE_BACKOFF_MS` | `50` | Base backoff for sync retries |
+| `STUDIOFS_INVALIDATION_SYNC_MAX_BACKOFF_MS` | `1000` | Max backoff for sync retries |
+| `STUDIOFS_INVALIDATION_CONNECT_RETRY_BASE_MS` | `250` | Base backoff for NATS reconnect |
+| `STUDIOFS_INVALIDATION_CONNECT_RETRY_MAX_MS` | `10000` | Max backoff for NATS reconnect |
+| `STUDIOFS_INVALIDATION_JS_ACK_WAIT_SECS` | `30` | JetStream consumer `ack_wait` |
+| `STUDIOFS_INVALIDATION_JS_NAK_DELAY_MS` | `500` | Delay before JetStream redelivery on NAK |
 
 ## Troubleshooting
 
 ### "Changes are not visible immediately"
 
-- Verify every client uses the same `--nats` endpoint and that it is reachable.
-- Verify all clients mount the same volume name.
-- Verify writer actually flushed metadata (event is emitted after successful flush).
+- Verify all clients use the same `--nats` endpoint and mount the same volume.
+- Verify writer completed metadata flush (event is emitted only after successful flush).
+- In `jetstream` mode, verify server JetStream is enabled.
+
+### "Events may be missed on reconnect"
+
+- Use `STUDIOFS_NATS_DELIVERY=jetstream` instead of `core`.
+- Ensure no clients are still running in `core` mode for that volume.
 
 ### "Old block still present in cache"
 
@@ -190,4 +148,4 @@ studiofs tune-metadata mydisk ^
 ### "NATS is down"
 
 - Mount and I/O still work.
-- Freshness degrades to TTL/cold-read sync behavior.
+- Freshness degrades to TTL/cold-read sync behavior until bus connectivity recovers.

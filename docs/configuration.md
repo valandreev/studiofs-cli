@@ -147,6 +147,14 @@ studiofs destroy <name> --local   # local-only detach
 | `STUDIOFS_JANITOR_SKIP_NEWER_SECS` | `900` | Janitor grace window for new objects |
 | `STUDIOFS_JANITOR_MAX_DELETES` | `500` | Janitor delete cap per cycle |
 | `STUDIOFS_JANITOR_LEASE_TTL_SECS` | `2700` | Janitor leader lease TTL |
+| `STUDIOFS_NATS_DELIVERY` | `core` | Invalidation delivery mode: `core`, `auto`, `jetstream` |
+| `STUDIOFS_INVALIDATION_SYNC_MAX_ATTEMPTS` | `8` | Max metadata sync retries per invalidation event |
+| `STUDIOFS_INVALIDATION_SYNC_BASE_BACKOFF_MS` | `50` | Base retry backoff for invalidation sync |
+| `STUDIOFS_INVALIDATION_SYNC_MAX_BACKOFF_MS` | `1000` | Max retry backoff for invalidation sync |
+| `STUDIOFS_INVALIDATION_CONNECT_RETRY_BASE_MS` | `250` | Base reconnect backoff for invalidation bus |
+| `STUDIOFS_INVALIDATION_CONNECT_RETRY_MAX_MS` | `10000` | Max reconnect backoff for invalidation bus |
+| `STUDIOFS_INVALIDATION_JS_ACK_WAIT_SECS` | `30` | JetStream consumer `ack_wait` |
+| `STUDIOFS_INVALIDATION_JS_NAK_DELAY_MS` | `500` | JetStream NAK redelivery delay |
 
 ### Testing
 
@@ -243,6 +251,8 @@ For detailed runtime behavior and recommended tuning profiles, see [NATS Invalid
 Quick recommendations:
 
 - Pass the same `--nats` endpoint on every client for the same volume.
+- For reconnect/downtime resilience, set `STUDIOFS_NATS_DELIVERY=jetstream`.
+- Ensure NATS server starts with JetStream enabled (for example `nats-server -js -p 4222`).
 - Keep flush cadence aligned with freshness target:
   - interactive: lower `flush_interval_secs` and thresholds
   - write-heavy: higher thresholds to reduce metadata churn

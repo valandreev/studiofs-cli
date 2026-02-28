@@ -39,9 +39,7 @@ pub enum MetaEvent {
     RemoveFileBlocks { ino: u64 },
 
     /// Set multiple block references in one batch (used by drain_dirty_mem).
-    SetFileBlocksBatch {
-        blocks: Vec<(u64, u32, BlockRef)>,
-    },
+    SetFileBlocksBatch { blocks: Vec<(u64, u32, BlockRef)> },
 
     // ─── Target & Extended Attributes ────────────────────────────────────────
     /// Set a symlink target.

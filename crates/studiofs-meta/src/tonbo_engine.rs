@@ -1,14 +1,16 @@
 use crate::engine::{MetaEngine, MetaError, MetaResult};
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use crate::types::*;
+use async_nats::jetstream;
 use async_nats::Client as NatsClient;
 use opendal::options::WriteOptions;
 use opendal::services::S3;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +77,13 @@ struct RangeState {
     standby: Option<IdRange>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NatsDeliveryMode {
+    Core,
+    Auto,
+    JetStream,
+}
+
 /// Tonbo-style metadata engine:
 /// - local redb is the read/write cache
 /// - remote manifest in object storage is the shared metadata source
@@ -86,6 +95,8 @@ pub struct TonboMetaEngine {
     invalidation_sender_id: String,
     nats_subject_base: Option<String>,
     nats_client: Option<NatsClient>,
+    nats_stream_name: Option<String>,
+    nats_delivery_mode: NatsDeliveryMode,
     state: Mutex<FlushState>,
     flush_interval: Duration,
     cache_ttl: Duration,
@@ -117,11 +128,88 @@ const RANGE_CAS_MAX_RETRIES: u32 = 10;
 const REMOTE_IO_MAX_ATTEMPTS: usize = 3;
 const REMOTE_IO_RETRY_BASE_MS: u64 = 80;
 static TONBO_SENDER_SEQ: AtomicU64 = AtomicU64::new(1);
+const INVALIDATION_STREAM_PREFIX: &str = "STUDIOFS_INV_";
+const INVALIDATION_STREAM_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+const INVALIDATION_STREAM_MAX_MESSAGES: i64 = 2_000_000;
 
 impl TonboMetaEngine {
     fn new_invalidation_sender_id() -> String {
         let seq = TONBO_SENDER_SEQ.fetch_add(1, Ordering::Relaxed);
         format!("pid:{}:{}", std::process::id(), seq)
+    }
+
+    fn parse_nats_delivery_mode() -> NatsDeliveryMode {
+        match std::env::var("STUDIOFS_NATS_DELIVERY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("core") => NatsDeliveryMode::Core,
+            Some("auto") => NatsDeliveryMode::Auto,
+            Some("jetstream") => NatsDeliveryMode::JetStream,
+            _ => NatsDeliveryMode::Core,
+        }
+    }
+
+    fn sanitize_js_name(raw: &str, max_len: usize) -> String {
+        let mut out = String::with_capacity(raw.len().min(max_len));
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+            if out.len() >= max_len {
+                break;
+            }
+        }
+        let trimmed = out.trim_matches('_');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        "x".to_string()
+    }
+
+    fn invalidation_stream_name(volume_name: &str) -> String {
+        let base = Self::sanitize_js_name(volume_name, 52);
+        let mut hasher = DefaultHasher::new();
+        volume_name.hash(&mut hasher);
+        let suffix = format!("{:016x}", hasher.finish());
+        format!("{INVALIDATION_STREAM_PREFIX}{base}_{suffix}")
+    }
+
+    fn encode_invalidation_payload(&self, version_token: Option<&str>) -> Vec<u8> {
+        let version = version_token.unwrap_or("-");
+        format!("v1|{}|{}", self.invalidation_sender_id, version).into_bytes()
+    }
+
+    fn ensure_invalidation_stream(&self) -> MetaResult<()> {
+        let (Some(client), Some(subject_base), Some(stream_name)) = (
+            self.nats_client.as_ref(),
+            self.nats_subject_base.as_ref(),
+            self.nats_stream_name.as_ref(),
+        ) else {
+            return Ok(());
+        };
+
+        let subject_wildcard = format!("{}.>", subject_base);
+        let js = jetstream::new(client.clone());
+        let stream_name = stream_name.clone();
+        let fut = async move {
+            js.get_or_create_stream(jetstream::stream::Config {
+                name: stream_name,
+                subjects: vec![subject_wildcard],
+                max_age: Duration::from_secs(INVALIDATION_STREAM_MAX_AGE_SECS as u64),
+                max_messages: INVALIDATION_STREAM_MAX_MESSAGES,
+                ..Default::default()
+            })
+            .await
+        };
+        self.run_on_internal_rt(fut)
+            .map(|_| ())
+            .map_err(|e| MetaError::Storage(format!("failed to ensure NATS invalidation stream: {e}")))
     }
 
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
@@ -200,6 +288,7 @@ impl TonboMetaEngine {
             .enable_all()
             .build()
             .map_err(|e| MetaError::Storage(format!("failed to create tokio runtime: {e}")))?;
+        let nats_delivery_mode = Self::parse_nats_delivery_mode();
         let nats_url = std::env::var("STUDIOFS_NATS_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -221,18 +310,25 @@ impl TonboMetaEngine {
         } else {
             None
         };
+        let nats_enabled = nats_client.is_some();
 
         let engine = Arc::new(Self {
             local,
             remote,
             volume_name: volume_name.clone(),
             invalidation_sender_id: Self::new_invalidation_sender_id(),
-            nats_subject_base: if nats_client.is_some() {
+            nats_subject_base: if nats_enabled {
                 Some(format!("fs.invalidate.{}", volume_name))
             } else {
                 None
             },
             nats_client,
+            nats_stream_name: if nats_enabled && nats_delivery_mode != NatsDeliveryMode::Core {
+                Some(Self::invalidation_stream_name(&volume_name))
+            } else {
+                None
+            },
+            nats_delivery_mode,
             state: Mutex::new(FlushState {
                 pending_ops: 0,
                 pending_bytes: 0,
@@ -268,6 +364,19 @@ impl TonboMetaEngine {
         if let Ok(s) = engine.local.export_snapshot() {
             *engine.baseline_snapshot.lock() = s;
         }
+        if engine.nats_delivery_mode != NatsDeliveryMode::Core {
+            if let Err(err) = engine.ensure_invalidation_stream() {
+                match engine.nats_delivery_mode {
+                    NatsDeliveryMode::Auto => {
+                        warn!("JetStream invalidation stream unavailable, falling back to core NATS publish: {}", err);
+                    }
+                    NatsDeliveryMode::JetStream => {
+                        warn!("JetStream invalidation stream setup failed (STUDIOFS_NATS_DELIVERY=jetstream): {}", err);
+                    }
+                    NatsDeliveryMode::Core => {}
+                }
+            }
+        }
         engine.spawn_background_flush_worker();
 
         Ok(engine)
@@ -292,17 +401,82 @@ impl TonboMetaEngine {
         }
     }
 
-    fn publish_invalidation_all(&self) {
+    fn publish_invalidation_all(&self, version_token: Option<&str>) {
         let (Some(client), Some(subject_base)) = (&self.nats_client, &self.nats_subject_base)
         else {
             return;
         };
         let subject = format!("{}.all", subject_base);
-        let payload = self.invalidation_sender_id.clone().into_bytes();
+        let payload = self.encode_invalidation_payload(version_token);
         let client = client.clone();
-        let fut = async move { client.publish(subject, payload.into()).await };
-        if let Err(err) = self.run_on_internal_rt(fut) {
-            warn!("failed to publish invalidation event: {}", err);
+
+        let mut use_core_fallback = self.nats_delivery_mode == NatsDeliveryMode::Core;
+        if self.nats_delivery_mode != NatsDeliveryMode::Core {
+            match self.ensure_invalidation_stream() {
+                Ok(()) => {
+                    let subject_clone = subject.clone();
+                    let payload_clone = payload.clone();
+                    let js = jetstream::new(client.clone());
+                    let publish_result = self.run_on_internal_rt(async move {
+                        let ack = js
+                            .publish(subject_clone, payload_clone.into())
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        ack.await.map_err(|e| e.to_string())?;
+                        Ok::<(), String>(())
+                    });
+                    match publish_result {
+                        Ok(()) => {
+                            return;
+                        }
+                        Err(err) => match self.nats_delivery_mode {
+                            NatsDeliveryMode::JetStream => {
+                                warn!(
+                                    "failed to publish invalidation event via JetStream: {}",
+                                    err
+                                );
+                                return;
+                            }
+                            NatsDeliveryMode::Auto => {
+                                warn!(
+                                    "JetStream publish failed, falling back to core NATS publish: {}",
+                                    err
+                                );
+                                use_core_fallback = true;
+                            }
+                            NatsDeliveryMode::Core => {
+                                use_core_fallback = true;
+                            }
+                        },
+                    }
+                }
+                Err(err) => match self.nats_delivery_mode {
+                    NatsDeliveryMode::JetStream => {
+                        warn!(
+                            "JetStream invalidation stream unavailable; skipping publish: {}",
+                            err
+                        );
+                        return;
+                    }
+                    NatsDeliveryMode::Auto => {
+                        warn!(
+                            "JetStream stream unavailable, falling back to core NATS publish: {}",
+                            err
+                        );
+                        use_core_fallback = true;
+                    }
+                    NatsDeliveryMode::Core => {
+                        use_core_fallback = true;
+                    }
+                },
+            }
+        }
+
+        if use_core_fallback {
+            let fut = async move { client.publish(subject, payload.into()).await };
+            if let Err(err) = self.run_on_internal_rt(fut) {
+                warn!("failed to publish invalidation event: {}", err);
+            }
         }
     }
 
@@ -829,8 +1003,14 @@ impl TonboMetaEngine {
         remote: &RedbSnapshot,
     ) -> RedbSnapshot {
         let inodes = Self::merge_inodes_delta(&base.inodes, &local.inodes, &remote.inodes);
-        let mut dentries = Self::merge_dentries_delta(&base.dentries, &local.dentries, &remote.dentries);
-        Self::resolve_conflicting_rename_targets(&base.dentries, &local.dentries, &remote.dentries, &mut dentries);
+        let mut dentries =
+            Self::merge_dentries_delta(&base.dentries, &local.dentries, &remote.dentries);
+        Self::resolve_conflicting_rename_targets(
+            &base.dentries,
+            &local.dentries,
+            &remote.dentries,
+            &mut dentries,
+        );
 
         RedbSnapshot {
             settings: Self::merge_table_delta(&base.settings, &local.settings, &remote.settings),
@@ -1251,7 +1431,7 @@ impl TonboMetaEngine {
             state.last_flush = Instant::now();
             state.last_refresh = Instant::now();
             if new_etag.is_some() {
-                state.etag = new_etag;
+                state.etag = new_etag.clone();
             }
         }
         // Never overwrite local state with the flushed snapshot: local may have
@@ -1264,7 +1444,8 @@ impl TonboMetaEngine {
             cas_retries_in_cycle = retries,
             "tonbo metadata flush complete"
         );
-        self.publish_invalidation_all();
+        let version_token = self.state.lock().etag.clone();
+        self.publish_invalidation_all(version_token.as_deref());
         Ok(())
     }
 
@@ -1326,6 +1507,10 @@ impl MetaEngine for TonboMetaEngine {
 
     fn invalidation_sender_id(&self) -> Option<String> {
         Some(self.invalidation_sender_id.clone())
+    }
+
+    fn metadata_version_token(&self) -> Option<String> {
+        self.state.lock().etag.clone()
     }
 
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
@@ -1665,11 +1850,10 @@ impl MetaEngine for TonboMetaEngine {
 mod tests {
     use super::*;
     use crate::{FormatInfo, MetadataConfig, RemoteStoreConfig};
-    use aws_config::BehaviorVersion;
-    use aws_config::retry::RetryConfig;
     use aws_sdk_s3::Client as S3Client;
-    use aws_sdk_s3::config::{Credentials, Region};
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, retry::RetryConfig};
     use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+    use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use std::collections::HashMap;
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1949,11 +2133,15 @@ mod tests {
         );
         let b_ok = dentries_map.get(&key_b).is_some();
         let c_ok = dentries_map.get(&key_c).is_some();
-        assert!(b_ok ^ c_ok, "exactly one conflicting rename target must survive");
+        assert!(
+            b_ok ^ c_ok,
+            "exactly one conflicting rename target must survive"
+        );
     }
 
     async fn build_minio_client(endpoint: &str, access_key: &str, secret_key: &str) -> S3Client {
-        let shared = aws_config::defaults(BehaviorVersion::latest())
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
             .credentials_provider(Credentials::new(
                 access_key,
                 secret_key,
@@ -1963,9 +2151,7 @@ mod tests {
             ))
             .region(Region::new("us-east-1"))
             .retry_config(RetryConfig::standard().with_max_attempts(1))
-            .load()
-            .await;
-        let conf = aws_sdk_s3::config::Builder::from(&shared)
+            .http_client(SmithyHttpClientBuilder::new().build_http())
             .endpoint_url(endpoint)
             .force_path_style(true)
             .build();
@@ -3120,7 +3306,8 @@ mod tests {
                 }
 
                 // Writer performs a metadata mutation but does NOT call flush_now().
-                c1.create_file(ROOT_INO, b"eventual.txt", 0, 0, 0o644).unwrap();
+                c1.create_file(ROOT_INO, b"eventual.txt", 0, 0, 0o644)
+                    .unwrap();
 
                 // Reader should eventually observe the new entry after
                 // flush_interval + cache_ttl, without explicit flushes.

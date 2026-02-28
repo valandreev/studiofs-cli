@@ -1,4 +1,4 @@
-﻿//! Core VFS implementation — Block-based architecture.
+//! Core VFS implementation — Block-based architecture.
 //!
 //! Key design:
 //! - Files are split into fixed-size blocks (default 1MB)
@@ -22,21 +22,24 @@
 //! 4. Assemble response
 
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
+use async_nats::jetstream;
+use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+use async_nats::jetstream::message::AckKind;
 use async_nats::Client as NatsClient;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator, services::S3};
 use parking_lot::Mutex;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_data::object::{
-    create_object, format_object_key, parse_object_id_from_key,
-};
+use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key};
 use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
@@ -155,6 +158,24 @@ const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
+const DEFAULT_INVALIDATION_SYNC_MAX_ATTEMPTS: u32 = 8;
+const DEFAULT_INVALIDATION_SYNC_BASE_BACKOFF_MS: u64 = 50;
+const DEFAULT_INVALIDATION_SYNC_MAX_BACKOFF_MS: u64 = 1_000;
+const DEFAULT_INVALIDATION_CONNECT_RETRY_BASE_MS: u64 = 250;
+const DEFAULT_INVALIDATION_CONNECT_RETRY_MAX_MS: u64 = 10_000;
+const DEFAULT_INVALIDATION_JS_ACK_WAIT_SECS: u64 = 30;
+const DEFAULT_INVALIDATION_JS_NAK_DELAY_MS: u64 = 500;
+const INVALIDATION_STREAM_PREFIX: &str = "STUDIOFS_INV_";
+const INVALIDATION_STREAM_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+const INVALIDATION_STREAM_MAX_MESSAGES: i64 = 2_000_000;
+const INVALIDATION_CONSUMER_PREFIX: &str = "STUDIOFS_INV_C_";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvalidationDeliveryMode {
+    Core,
+    Auto,
+    JetStream,
+}
 
 #[derive(Clone)]
 struct DistributedFlock {
@@ -416,6 +437,9 @@ struct InvalidationBus {
     nats_url: String,
     subject_base: String,
     sender_id: String,
+    stream_name: String,
+    consumer_name: String,
+    delivery_mode: InvalidationDeliveryMode,
 }
 
 // =============================================================================
@@ -481,14 +505,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_limit: u64,
     ) -> VfsResult<Arc<Self>> {
-        Self::new_with_nats_url(
-            meta,
-            data_config,
-            cache_dir,
-            cache_size,
-            memory_limit,
-            None,
-        )
+        Self::new_with_nats_url(meta, data_config, cache_dir, cache_size, memory_limit, None)
     }
 
     /// Create a new VFS instance with optional explicit NATS URL override.
@@ -513,6 +530,7 @@ impl StudioVfs {
             format!("{}/", format_info.data_prefix)
         };
         let block_size = format_info.block_size;
+        let invalidation_delivery_mode = Self::invalidation_delivery_mode();
         let invalidation_sender_id = meta
             .invalidation_sender_id()
             .unwrap_or_else(|| format!("pid:{}", std::process::id()));
@@ -529,6 +547,9 @@ impl StudioVfs {
                 nats_url: url,
                 subject_base: format!("fs.invalidate.{}", format_info.name),
                 sender_id: invalidation_sender_id.clone(),
+                stream_name: Self::invalidation_stream_name(&format_info.name),
+                consumer_name: Self::invalidation_consumer_name(&format_info.name, cache_dir),
+                delivery_mode: invalidation_delivery_mode,
             });
         let janitor_interval = Duration::from_secs(
             std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS")
@@ -671,8 +692,8 @@ impl StudioVfs {
 
         // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
         let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
-        let (block_cache, upload_rx) = BlockCache::open(cache_config)
-            .map_err(|e| VfsError::Io(e))?;
+        let (block_cache, upload_rx) =
+            BlockCache::open(cache_config).map_err(|e| VfsError::Io(e))?;
         block_cache.spawn_background_tasks();
 
         // Init ReadAhead tracker + prefetch channel
@@ -860,6 +881,79 @@ impl StudioVfs {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    fn invalidation_delivery_mode() -> InvalidationDeliveryMode {
+        match std::env::var("STUDIOFS_NATS_DELIVERY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("core") => InvalidationDeliveryMode::Core,
+            Some("auto") => InvalidationDeliveryMode::Auto,
+            Some("jetstream") => InvalidationDeliveryMode::JetStream,
+            _ => InvalidationDeliveryMode::Core,
+        }
+    }
+
+    fn sanitize_js_name(raw: &str, max_len: usize) -> String {
+        let mut out = String::with_capacity(raw.len().min(max_len));
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+            if out.len() >= max_len {
+                break;
+            }
+        }
+        let trimmed = out.trim_matches('_');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        "x".to_string()
+    }
+
+    fn invalidation_stream_name(volume_name: &str) -> String {
+        let base = Self::sanitize_js_name(volume_name, 52);
+        let mut hasher = DefaultHasher::new();
+        volume_name.hash(&mut hasher);
+        let suffix = format!("{:016x}", hasher.finish());
+        format!("{INVALIDATION_STREAM_PREFIX}{base}_{suffix}")
+    }
+
+    fn invalidation_consumer_name(volume_name: &str, cache_dir: &str) -> String {
+        let host = std::env::var("COMPUTERNAME")
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "host".to_string());
+        let base = Self::sanitize_js_name(&host, 18);
+        let mut hasher = DefaultHasher::new();
+        volume_name.hash(&mut hasher);
+        cache_dir.hash(&mut hasher);
+        let suffix = format!("{:016x}", hasher.finish());
+        format!("{INVALIDATION_CONSUMER_PREFIX}{base}_{suffix}")
+    }
+
+    fn decode_invalidation_payload(payload: &[u8]) -> (String, Option<String>) {
+        let text = std::str::from_utf8(payload).unwrap_or_default();
+        if let Some(rest) = text.strip_prefix("v1|") {
+            let mut parts = rest.splitn(2, '|');
+            let sender_id = parts.next().unwrap_or_default().to_string();
+            let version = parts.next().and_then(|v| {
+                let v = v.trim();
+                if v.is_empty() || v == "-" {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            });
+            return (sender_id, version);
+        }
+        (text.to_string(), None)
     }
 
     fn encode_lease_record(owner_id: &str, lease_until_unix: i64, fencing_token: u64) -> Vec<u8> {
@@ -2086,9 +2180,7 @@ impl StudioVfs {
             .iter()
             .map(|(idx, _, _)| {
                 let block_idx = *idx;
-                async move {
-                    self.read_block_or_pending(ino, block_idx).await
-                }
+                async move { self.read_block_or_pending(ino, block_idx).await }
             })
             .collect();
 
@@ -2480,163 +2572,161 @@ impl StudioVfs {
         // waiting for the next timer tick / channel signal when the dirty
         // buffer has more than MAX_DRAIN_BATCH blocks queued.
         loop {
-        // ── Step 1: snapshot keys + filter deleted inodes ────────────────
-        let keys: Vec<(Ino, u32)> = {
-            let dirty = self.state.dirty_mem.lock();
-            dirty.keys().take(MAX_DRAIN_BATCH).cloned().collect()
-        };
-        if keys.is_empty() {
-            return;
-        }
-
-        let mut work: Vec<(Ino, u32, Bytes)> = Vec::with_capacity(keys.len());
-        for (ino, block_index) in keys {
-            if self.state.deleted_inodes.lock().contains(&ino) {
-                let removed = self.state.dirty_mem.lock().remove(&(ino, block_index));
-                if let Some(data) = removed {
-                    self.state
-                        .dirty_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(data.len()))
-                        })
-                        .ok();
-                    self.state.dirty_drained_notify.notify_waiters();
-                }
-                debug!(
-                    "slab flusher: skipping deleted inode {} block {}",
-                    ino, block_index
-                );
-                continue;
+            // ── Step 1: snapshot keys + filter deleted inodes ────────────────
+            let keys: Vec<(Ino, u32)> = {
+                let dirty = self.state.dirty_mem.lock();
+                dirty.keys().take(MAX_DRAIN_BATCH).cloned().collect()
+            };
+            if keys.is_empty() {
+                return;
             }
 
-            let data = {
-                let dirty = self.state.dirty_mem.lock();
-                match dirty.get(&(ino, block_index)) {
-                    Some(d) => d.clone(),
-                    None => continue,
+            let mut work: Vec<(Ino, u32, Bytes)> = Vec::with_capacity(keys.len());
+            for (ino, block_index) in keys {
+                if self.state.deleted_inodes.lock().contains(&ino) {
+                    let removed = self.state.dirty_mem.lock().remove(&(ino, block_index));
+                    if let Some(data) = removed {
+                        self.state
+                            .dirty_bytes
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(data.len()))
+                            })
+                            .ok();
+                        self.state.dirty_drained_notify.notify_waiters();
+                    }
+                    debug!(
+                        "slab flusher: skipping deleted inode {} block {}",
+                        ino, block_index
+                    );
+                    continue;
+                }
+
+                let data = {
+                    let dirty = self.state.dirty_mem.lock();
+                    match dirty.get(&(ino, block_index)) {
+                        Some(d) => d.clone(),
+                        None => continue,
+                    }
+                };
+                work.push((ino, block_index, data));
+            }
+
+            if work.is_empty() {
+                return;
+            }
+
+            // ── Step 2: allocate block IDs in one transaction ────────────────
+            let ids = match self.meta.next_block_ids(work.len() as u32) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    error!("slab flusher: next_block_ids failed: {}", e);
+                    return;
                 }
             };
-            work.push((ino, block_index, data));
-        }
 
-        if work.is_empty() {
-            return;
-        }
+            // ── Step 3: batch metadata — one redb commit ─────────────────────
+            let entries: Vec<BatchFlushEntry> = work
+                .iter()
+                .zip(ids.iter())
+                .map(|((ino, block_index, data), &object_id)| {
+                    let length = data.len() as u32;
+                    let is_partial = length < self.block_size;
+                    let flags = if is_partial {
+                        BlockFlags::COMPRESSED_LZ4 | BlockFlags::PARTIAL_BLOCK
+                    } else {
+                        BlockFlags::COMPRESSED_LZ4
+                    };
+                    BatchFlushEntry {
+                        ino: *ino,
+                        block_index: *block_index,
+                        object_id,
+                        length,
+                        flags,
+                    }
+                })
+                .collect();
 
-        // ── Step 2: allocate block IDs in one transaction ────────────────
-        let ids = match self.meta.next_block_ids(work.len() as u32) {
-            Ok(ids) => ids,
-            Err(e) => {
-                error!("slab flusher: next_block_ids failed: {}", e);
+            let results = match self.meta.flush_blocks_batch(&entries) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("slab flusher: flush_blocks_batch failed: {}", e);
+                    return;
+                }
+            };
+
+            // ── Step 4: stage L1 + submit uploads + free dirty_mem ───────────
+            let mut l2_work: Vec<(u64, Bytes)> = Vec::with_capacity(work.len());
+            let mut upload_ops: Vec<(u64, u64, u64)> = Vec::with_capacity(work.len());
+            let mut freed_bytes: usize = 0;
+
+            {
+                let mut dirty = self.state.dirty_mem.lock();
+                for (i, (ino, block_index, data)) in work.into_iter().enumerate() {
+                    let object_id = ids[i];
+
+                    // L1 insert (RAM, nanoseconds). Pinned so evictor won't discard.
+                    self.block_cache.stage_l1(object_id, data.clone());
+
+                    // Queue L2 write for Phase 2.
+                    l2_work.push((object_id, data.clone()));
+
+                    // Queue upload submission.
+                    let file_offset = block_index as u64 * self.block_size as u64;
+                    upload_ops.push((ino, file_offset, object_id));
+
+                    // Remove from dirty_mem only if we are still looking at the same
+                    // payload we drained. A concurrent write may have replaced this
+                    // key with newer bytes; in that case keep the new value for the
+                    // next drain cycle.
+                    let remove_key = dirty
+                        .get(&(ino, block_index))
+                        .map(|current| current.as_ref() == data.as_ref())
+                        .unwrap_or(false);
+                    if remove_key && let Some(removed) = dirty.remove(&(ino, block_index)) {
+                        freed_bytes += removed.len();
+                    }
+
+                    if let Some(ref old_block) = results[i].old_block {
+                        debug!(
+                            "marking old block {} for deletion (overwrite)",
+                            old_block.object_id
+                        );
+                    }
+                }
+            }
+
+            // Submit all upload journal entries.
+            self.block_cache.submit_uploads_batch(&upload_ops);
+
+            // Decrement dirty_bytes — write() backpressure is released HERE.
+            self.state
+                .dirty_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(freed_bytes))
+                })
+                .ok();
+
+            // Wake any write()/flush() callers blocked on backpressure.
+            self.state.dirty_drained_notify.notify_waiters();
+
+            let batch_len = l2_work.len();
+            debug!(
+                "slab flusher: drained {} blocks ({} bytes), dirty_bytes={}",
+                batch_len,
+                freed_bytes,
+                self.state.dirty_bytes.load(Ordering::Relaxed),
+            );
+
+            // ── Phase 2: background L2 writes (fire-and-forget, parallel) ───
+            let cache = self.block_cache.clone();
+            tokio::spawn(async move {
+                cache.commit_l2_batch(&l2_work).await;
+            });
+
+            // If we processed a full batch, there's likely more — loop immediately.
+            if batch_len < MAX_DRAIN_BATCH {
                 return;
             }
-        };
-
-        // ── Step 3: batch metadata — one redb commit ─────────────────────
-        let entries: Vec<BatchFlushEntry> = work
-            .iter()
-            .zip(ids.iter())
-            .map(|((ino, block_index, data), &object_id)| {
-                let length = data.len() as u32;
-                let is_partial = length < self.block_size;
-                let flags = if is_partial {
-                    BlockFlags::COMPRESSED_LZ4 | BlockFlags::PARTIAL_BLOCK
-                } else {
-                    BlockFlags::COMPRESSED_LZ4
-                };
-                BatchFlushEntry {
-                    ino: *ino,
-                    block_index: *block_index,
-                    object_id,
-                    length,
-                    flags,
-                }
-            })
-            .collect();
-
-        let results = match self.meta.flush_blocks_batch(&entries) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("slab flusher: flush_blocks_batch failed: {}", e);
-                return;
-            }
-        };
-
-        // ── Step 4: stage L1 + submit uploads + free dirty_mem ───────────
-        let mut l2_work: Vec<(u64, Bytes)> = Vec::with_capacity(work.len());
-        let mut upload_ops: Vec<(u64, u64, u64)> = Vec::with_capacity(work.len());
-        let mut freed_bytes: usize = 0;
-
-        {
-            let mut dirty = self.state.dirty_mem.lock();
-            for (i, (ino, block_index, data)) in work.into_iter().enumerate() {
-                let object_id = ids[i];
-
-                // L1 insert (RAM, nanoseconds). Pinned so evictor won't discard.
-                self.block_cache.stage_l1(object_id, data.clone());
-
-                // Queue L2 write for Phase 2.
-                l2_work.push((object_id, data.clone()));
-
-                // Queue upload submission.
-                let file_offset = block_index as u64 * self.block_size as u64;
-                upload_ops.push((ino, file_offset, object_id));
-
-                // Remove from dirty_mem only if we are still looking at the same
-                // payload we drained. A concurrent write may have replaced this
-                // key with newer bytes; in that case keep the new value for the
-                // next drain cycle.
-                let remove_key = dirty
-                    .get(&(ino, block_index))
-                    .map(|current| current.as_ref() == data.as_ref())
-                    .unwrap_or(false);
-                if remove_key
-                    && let Some(removed) = dirty.remove(&(ino, block_index))
-                {
-                    freed_bytes += removed.len();
-                }
-
-                if let Some(ref old_block) = results[i].old_block {
-                    debug!(
-                        "marking old block {} for deletion (overwrite)",
-                        old_block.object_id
-                    );
-                }
-            }
-        }
-
-        // Submit all upload journal entries.
-        self.block_cache.submit_uploads_batch(&upload_ops);
-
-        // Decrement dirty_bytes — write() backpressure is released HERE.
-        self.state
-            .dirty_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(freed_bytes))
-            })
-            .ok();
-
-        // Wake any write()/flush() callers blocked on backpressure.
-        self.state.dirty_drained_notify.notify_waiters();
-
-        let batch_len = l2_work.len();
-        debug!(
-            "slab flusher: drained {} blocks ({} bytes), dirty_bytes={}",
-            batch_len,
-            freed_bytes,
-            self.state.dirty_bytes.load(Ordering::Relaxed),
-        );
-
-        // ── Phase 2: background L2 writes (fire-and-forget, parallel) ───
-        let cache = self.block_cache.clone();
-        tokio::spawn(async move {
-            cache.commit_l2_batch(&l2_work).await;
-        });
-
-        // If we processed a full batch, there's likely more — loop immediately.
-        if batch_len < MAX_DRAIN_BATCH {
-            return;
-        }
         } // end loop
     }
 
@@ -2663,10 +2753,14 @@ impl StudioVfs {
                         info!(
                             object_id = retry_op.object_id,
                             ino = retry_op.ino,
-                            "upload failed for deleted inode, cancelling: {}", e
+                            "upload failed for deleted inode, cancelling: {}",
+                            e
                         );
                         vfs.block_cache.cancel_upload(&retry_op, true);
-                        vfs.state.pending_evictions.lock().remove(&retry_op.object_id);
+                        vfs.state
+                            .pending_evictions
+                            .lock()
+                            .remove(&retry_op.object_id);
                     } else {
                         warn!("upload processing error, will requeue: {}", e);
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2839,7 +2933,6 @@ impl StudioVfs {
                 continue;
             }
 
-
             let referenced = match self.meta.get_referenced_object_ids() {
                 Ok(v) => v,
                 Err(e) => {
@@ -3001,135 +3094,552 @@ impl StudioVfs {
         (evicted, skipped_pinned)
     }
 
-    async fn background_invalidation_listener(self: Arc<Self>, bus: InvalidationBus) {
-        let client: NatsClient = match async_nats::connect(&bus.nats_url).await {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(
-                    "invalidation bus connect failed ({}): {}",
-                    bus.nats_url, err
-                );
-                return;
-            }
-        };
+    fn invalidation_backoff_ms(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
+        let exp = attempt.saturating_sub(1).min(6);
+        base_ms.saturating_mul(1u64 << exp).min(max_ms)
+    }
 
-        let subject_pattern = format!("{}.>", bus.subject_base);
-        let mut sub = match client.subscribe(subject_pattern.clone()).await {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(
-                    "invalidation bus subscribe failed ({}): {}",
-                    subject_pattern, err
-                );
-                return;
-            }
-        };
+    fn is_jetstream_unavailable(error: &str) -> bool {
+        let e = error.to_ascii_lowercase();
+        e.contains("jetstream unavailable")
+            || e.contains("jetstream not enabled")
+            || e.contains("jetstream is not enabled")
+            || e.contains("no responders")
+            || e.contains("service unavailable")
+    }
 
-        info!(subject_pattern, "invalidation bus listener started");
-        while let Some(msg) = sub.next().await {
-            let source_id = std::str::from_utf8(&msg.payload)
-                .ok()
-                .unwrap_or_default()
-                .to_string();
-            if source_id == bus.sender_id {
-                continue;
-            }
+    async fn sync_and_apply_invalidation(
+        &self,
+        subject: &str,
+        source_id: &str,
+        expected_version: Option<&str>,
+        sync_max_attempts: u32,
+        sync_base_backoff_ms: u64,
+        sync_max_backoff_ms: u64,
+    ) -> bool {
+        let before_refs = self.collect_referenced_object_ids();
+        let before_version = self.meta.metadata_version_token();
+        let mut synced = false;
+        let mut after_refs: Option<HashSet<u64>> = None;
+        for attempt in 1..=sync_max_attempts {
+            match self.meta.sync_metadata() {
+                Ok(()) => {
+                    after_refs = self.collect_referenced_object_ids();
+                    let after_version = self.meta.metadata_version_token();
 
-            let before_refs = self.collect_referenced_object_ids();
-            let mut synced = false;
-            let mut after_refs: Option<HashSet<u64>> = None;
-            for attempt in 1..=8u32 {
-                match self.meta.sync_metadata() {
-                    Ok(()) => {
-                        after_refs = self.collect_referenced_object_ids();
-                        // Remote snapshot visibility can lag slightly after writer flush.
-                        // Retry a few times when object-id set is still unchanged so
-                        // append/overwrite/delete invalidations converge deterministically.
-                        if let (Some(before), Some(after)) =
-                            (before_refs.as_ref(), after_refs.as_ref())
-                            && before == after
-                            && attempt < 8
-                        {
-                            tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
-                            continue;
+                    let version_advanced = matches!(
+                        (before_version.as_ref(), after_version.as_ref()),
+                        (Some(before), Some(after)) if before != after
+                    );
+                    let refs_changed = matches!(
+                        (before_refs.as_ref(), after_refs.as_ref()),
+                        (Some(before), Some(after)) if before != after
+                    );
+                    let expected_version_observed = expected_version
+                        .and_then(|v| after_version.as_deref().map(|after| after == v))
+                        .unwrap_or(false);
+                    let can_observe_progress = (before_version.is_some() && after_version.is_some())
+                        || (before_refs.is_some() && after_refs.is_some())
+                        || (expected_version.is_some() && after_version.is_some());
+                    let progress_observed = if expected_version.is_some() {
+                        expected_version_observed || (after_version.is_none() && refs_changed)
+                    } else {
+                        version_advanced || refs_changed
+                    };
+
+                    if can_observe_progress && !progress_observed && attempt < sync_max_attempts {
+                        let backoff_ms = Self::invalidation_backoff_ms(
+                            attempt,
+                            sync_base_backoff_ms,
+                            sync_max_backoff_ms,
+                        );
+                        debug!(
+                            subject,
+                            source_id,
+                            attempt,
+                            expected_version = ?expected_version,
+                            backoff_ms,
+                            "invalidation sync observed no target metadata state yet, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+
+                    if can_observe_progress && !progress_observed && attempt == sync_max_attempts {
+                        warn!(
+                            subject,
+                            source_id,
+                            attempt,
+                            expected_version = ?expected_version,
+                            before_version = ?before_version,
+                            after_version = ?after_version,
+                            "invalidation sync reached retry limit before observing target metadata state"
+                        );
+                        if expected_version.is_some() {
+                            return false;
                         }
-                        synced = true;
+                    }
+
+                    synced = true;
+                    break;
+                }
+                Err(err) => {
+                    let backoff_ms = Self::invalidation_backoff_ms(
+                        attempt,
+                        sync_base_backoff_ms,
+                        sync_max_backoff_ms,
+                    );
+                    if attempt == sync_max_attempts {
+                        warn!(
+                            subject,
+                            source_id,
+                            error = %err,
+                            attempt,
+                            "invalidation sync failed"
+                        );
+                    } else {
+                        debug!(
+                            subject,
+                            source_id,
+                            error = %err,
+                            attempt,
+                            backoff_ms,
+                            "invalidation sync retry"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+        if !synced {
+            return false;
+        }
+        if after_refs.is_none() {
+            after_refs = self.collect_referenced_object_ids();
+        }
+
+        let target = subject.rsplit('.').next().unwrap_or("all");
+        if target == "all" {
+            self.invalidate_all_read_caches();
+            if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
+                let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
+                debug!(
+                    subject,
+                    source_id,
+                    evicted,
+                    skipped_pinned,
+                    "applied global invalidation with selective block cache eviction"
+                );
+            } else {
+                debug!(subject, source_id, "applied global invalidation");
+            }
+        } else if let Ok(ino) = target.parse::<u64>() {
+            self.invalidate_inode_read_caches(ino);
+            if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
+                let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
+                debug!(
+                    subject,
+                    source_id,
+                    ino,
+                    evicted,
+                    skipped_pinned,
+                    "applied inode invalidation with selective block cache eviction"
+                );
+            } else {
+                debug!(subject, source_id, ino, "applied inode invalidation");
+            }
+        } else {
+            self.invalidate_all_read_caches();
+            if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
+                let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
+                debug!(
+                    subject,
+                    source_id,
+                    evicted,
+                    skipped_pinned,
+                    "applied fallback global invalidation with selective block cache eviction"
+                );
+            } else {
+                debug!(subject, source_id, "applied fallback global invalidation");
+            }
+        }
+
+        true
+    }
+
+    async fn background_invalidation_listener_core(self: Arc<Self>, bus: InvalidationBus) {
+        let subject_pattern = format!("{}.>", bus.subject_base);
+        let sync_max_attempts = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_ATTEMPTS);
+        let sync_base_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_BASE_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_SYNC_BASE_BACKOFF_MS);
+        let sync_max_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_BACKOFF_MS);
+        let connect_retry_base_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_BASE_MS);
+        let connect_retry_max_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_MAX_MS);
+
+        let connect_backoff = |attempt: u32| -> u64 {
+            let exp = attempt.saturating_sub(1).min(6);
+            connect_retry_base_ms
+                .saturating_mul(1u64 << exp)
+                .min(connect_retry_max_ms)
+        };
+
+        let mut connect_attempt = 0u32;
+        loop {
+            let client: NatsClient = match async_nats::connect(&bus.nats_url).await {
+                Ok(c) => {
+                    connect_attempt = 0;
+                    c
+                }
+                Err(err) => {
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    let backoff_ms = connect_backoff(connect_attempt);
+                    warn!(
+                        url = %bus.nats_url,
+                        error = %err,
+                        attempt = connect_attempt,
+                        backoff_ms,
+                        "invalidation bus connect failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            };
+
+            let mut sub = match client.subscribe(subject_pattern.clone()).await {
+                Ok(s) => {
+                    connect_attempt = 0;
+                    info!(subject_pattern = %subject_pattern, "invalidation bus listener started");
+                    s
+                }
+                Err(err) => {
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    let backoff_ms = connect_backoff(connect_attempt);
+                    warn!(
+                        subject_pattern = %subject_pattern,
+                        error = %err,
+                        attempt = connect_attempt,
+                        backoff_ms,
+                        "invalidation bus subscribe failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            };
+
+            while let Some(msg) = sub.next().await {
+                let (source_id, _expected_version) =
+                    Self::decode_invalidation_payload(msg.payload.as_ref());
+                if source_id == bus.sender_id {
+                    continue;
+                }
+                let subject = msg.subject.to_string();
+                let _ = self
+                    .sync_and_apply_invalidation(
+                        &subject,
+                        &source_id,
+                        None,
+                        sync_max_attempts,
+                        sync_base_backoff_ms,
+                        sync_max_backoff_ms,
+                    )
+                    .await;
+            }
+
+            connect_attempt = connect_attempt.saturating_add(1);
+            let backoff_ms = connect_backoff(connect_attempt);
+            warn!(
+                subject_pattern = %subject_pattern,
+                attempt = connect_attempt,
+                backoff_ms,
+                "invalidation bus stream ended, reconnecting"
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    async fn background_invalidation_listener_jetstream(
+        self: Arc<Self>,
+        bus: InvalidationBus,
+        allow_core_fallback: bool,
+    ) {
+        let subject_pattern = format!("{}.>", bus.subject_base);
+        let subject_filter = format!("{}.all", bus.subject_base);
+        let sync_max_attempts = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_ATTEMPTS);
+        let sync_base_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_BASE_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_SYNC_BASE_BACKOFF_MS);
+        let sync_max_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_BACKOFF_MS);
+        let connect_retry_base_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_BASE_MS);
+        let connect_retry_max_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_MAX_MS);
+        let js_ack_wait_secs = std::env::var("STUDIOFS_INVALIDATION_JS_ACK_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_JS_ACK_WAIT_SECS);
+        let js_nak_delay_ms = std::env::var("STUDIOFS_INVALIDATION_JS_NAK_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_INVALIDATION_JS_NAK_DELAY_MS);
+
+        let mut connect_attempt = 0u32;
+        let mut js_setup_failures = 0u32;
+        loop {
+            let client = match async_nats::connect(&bus.nats_url).await {
+                Ok(client) => {
+                    connect_attempt = 0;
+                    client
+                }
+                Err(err) => {
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    let backoff_ms = Self::invalidation_backoff_ms(
+                        connect_attempt,
+                        connect_retry_base_ms,
+                        connect_retry_max_ms,
+                    );
+                    warn!(
+                        url = %bus.nats_url,
+                        error = %err,
+                        attempt = connect_attempt,
+                        backoff_ms,
+                        "JetStream invalidation connect failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            };
+
+            let js = jetstream::new(client.clone());
+            let stream = match js
+                .get_or_create_stream(jetstream::stream::Config {
+                    name: bus.stream_name.clone(),
+                    subjects: vec![subject_pattern.clone()],
+                    max_age: Duration::from_secs(INVALIDATION_STREAM_MAX_AGE_SECS as u64),
+                    max_messages: INVALIDATION_STREAM_MAX_MESSAGES,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let err_text = err.to_string();
+                    js_setup_failures = js_setup_failures.saturating_add(1);
+                    if allow_core_fallback
+                        && (Self::is_jetstream_unavailable(&err_text) || js_setup_failures >= 3)
+                    {
+                        warn!(
+                            error = %err,
+                            "JetStream unavailable, falling back to core invalidation listener"
+                        );
+                        self.background_invalidation_listener_core(bus).await;
+                        return;
+                    }
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    let backoff_ms = Self::invalidation_backoff_ms(
+                        connect_attempt,
+                        connect_retry_base_ms,
+                        connect_retry_max_ms,
+                    );
+                    warn!(
+                        stream = %bus.stream_name,
+                        error = %err,
+                        attempt = connect_attempt,
+                        backoff_ms,
+                        "JetStream stream setup failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            };
+
+            let consumer = match stream
+                .get_or_create_consumer(
+                    &bus.consumer_name,
+                    jetstream::consumer::pull::Config {
+                        durable_name: Some(bus.consumer_name.clone()),
+                        ack_policy: AckPolicy::Explicit,
+                        deliver_policy: DeliverPolicy::All,
+                        ack_wait: Duration::from_secs(js_ack_wait_secs),
+                        filter_subject: subject_filter.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(consumer) => consumer,
+                Err(err) => {
+                    let err_text = err.to_string();
+                    js_setup_failures = js_setup_failures.saturating_add(1);
+                    if allow_core_fallback
+                        && (Self::is_jetstream_unavailable(&err_text) || js_setup_failures >= 3)
+                    {
+                        warn!(
+                            error = %err,
+                            "JetStream consumer unavailable, falling back to core invalidation listener"
+                        );
+                        self.background_invalidation_listener_core(bus).await;
+                        return;
+                    }
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    let backoff_ms = Self::invalidation_backoff_ms(
+                        connect_attempt,
+                        connect_retry_base_ms,
+                        connect_retry_max_ms,
+                    );
+                    warn!(
+                        consumer = %bus.consumer_name,
+                        error = %err,
+                        attempt = connect_attempt,
+                        backoff_ms,
+                        "JetStream consumer setup failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            };
+
+            let mut messages = match consumer.messages().await {
+                Ok(messages) => {
+                    js_setup_failures = 0;
+                    messages
+                }
+                Err(err) => {
+                    js_setup_failures = js_setup_failures.saturating_add(1);
+                    if allow_core_fallback && js_setup_failures >= 3 {
+                        warn!(
+                            error = %err,
+                            "JetStream consumer stream setup repeatedly failed, falling back to core invalidation listener"
+                        );
+                        self.background_invalidation_listener_core(bus).await;
+                        return;
+                    }
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    let backoff_ms = Self::invalidation_backoff_ms(
+                        connect_attempt,
+                        connect_retry_base_ms,
+                        connect_retry_max_ms,
+                    );
+                    warn!(
+                        consumer = %bus.consumer_name,
+                        error = %err,
+                        attempt = connect_attempt,
+                        backoff_ms,
+                        "JetStream consumer stream setup failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            };
+
+            info!(
+                stream = %bus.stream_name,
+                consumer = %bus.consumer_name,
+                subject_filter = %subject_filter,
+                "JetStream invalidation listener started"
+            );
+
+            while let Some(next) = messages.next().await {
+                let msg = match next {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        warn!(error = %err, "JetStream invalidation stream error, reconnecting");
                         break;
                     }
-                    Err(err) => {
-                        if attempt == 8 {
-                            warn!(
-                                subject = %msg.subject,
-                                source_id,
-                                error = %err,
-                                attempt,
-                                "invalidation sync failed"
-                            );
-                        } else {
-                            debug!(
-                                subject = %msg.subject,
-                                source_id,
-                                error = %err,
-                                attempt,
-                                "invalidation sync retry"
-                            );
-                            tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
-                        }
-                    }
+                };
+
+                let subject = msg.subject.to_string();
+                let (source_id, expected_version) =
+                    Self::decode_invalidation_payload(msg.payload.as_ref());
+                if source_id == bus.sender_id {
+                    let _ = msg.ack().await;
+                    continue;
                 }
-            }
-            if !synced {
-                continue;
-            }
-            if after_refs.is_none() {
-                after_refs = self.collect_referenced_object_ids();
+
+                let applied = self
+                    .sync_and_apply_invalidation(
+                        &subject,
+                        &source_id,
+                        expected_version.as_deref(),
+                        sync_max_attempts,
+                        sync_base_backoff_ms,
+                        sync_max_backoff_ms,
+                    )
+                    .await;
+
+                let ack_result = if applied {
+                    msg.ack().await
+                } else {
+                    msg.ack_with(AckKind::Nak(Some(Duration::from_millis(js_nak_delay_ms))))
+                        .await
+                };
+                if let Err(err) = ack_result {
+                    warn!(subject, source_id, error = %err, "failed to ack invalidation message");
+                }
             }
 
-            let subject = msg.subject.to_string();
-            let target = subject.rsplit('.').next().unwrap_or("all");
-            if target == "all" {
-                self.invalidate_all_read_caches();
-                if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
-                    let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
-                    debug!(
-                        subject,
-                        source_id,
-                        evicted,
-                        skipped_pinned,
-                        "applied global invalidation with selective block cache eviction"
-                    );
-                } else {
-                    debug!(subject, source_id, "applied global invalidation");
-                }
-            } else if let Ok(ino) = target.parse::<u64>() {
-                self.invalidate_inode_read_caches(ino);
-                if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
-                    let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
-                    debug!(
-                        subject,
-                        source_id,
-                        ino,
-                        evicted,
-                        skipped_pinned,
-                        "applied inode invalidation with selective block cache eviction"
-                    );
-                } else {
-                    debug!(subject, source_id, ino, "applied inode invalidation");
-                }
-            } else {
-                self.invalidate_all_read_caches();
-                if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
-                    let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
-                    debug!(
-                        subject,
-                        source_id,
-                        evicted,
-                        skipped_pinned,
-                        "applied fallback global invalidation with selective block cache eviction"
-                    );
-                } else {
-                    debug!(subject, source_id, "applied fallback global invalidation");
-                }
+            connect_attempt = connect_attempt.saturating_add(1);
+            let backoff_ms = Self::invalidation_backoff_ms(
+                connect_attempt,
+                connect_retry_base_ms,
+                connect_retry_max_ms,
+            );
+            warn!(
+                stream = %bus.stream_name,
+                consumer = %bus.consumer_name,
+                attempt = connect_attempt,
+                backoff_ms,
+                "JetStream invalidation listener ended, reconnecting"
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    async fn background_invalidation_listener(self: Arc<Self>, bus: InvalidationBus) {
+        match bus.delivery_mode {
+            InvalidationDeliveryMode::Core => self.background_invalidation_listener_core(bus).await,
+            InvalidationDeliveryMode::Auto => {
+                self.background_invalidation_listener_jetstream(bus, true).await
+            }
+            InvalidationDeliveryMode::JetStream => {
+                self.background_invalidation_listener_jetstream(bus, false)
+                    .await
             }
         }
     }
@@ -3175,7 +3685,12 @@ impl StudioVfs {
         let mut reconciled = 0usize;
         for op in &pending_ops {
             let key = format_object_key(&self.data_prefix, op.object_id);
-            match tokio::time::timeout(Duration::from_secs(5), self.fetch_scheduler.data_store().exists(&key)).await {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.fetch_scheduler.data_store().exists(&key),
+            )
+            .await
+            {
                 Ok(Ok(true)) => {
                     self.block_cache.complete_upload(op);
                     reconciled += 1;
@@ -3252,10 +3767,7 @@ impl StudioVfs {
         // Phase 3: wait for uploads to drain, reconcile already-uploaded blocks.
         let pending = self.block_cache.pending_upload_count();
         if pending > 0 {
-            info!(
-                pending,
-                "VFS shutdown: waiting for uploads to drain"
-            );
+            info!(pending, "VFS shutdown: waiting for uploads to drain");
             let mut drained = self
                 .block_cache
                 .wait_for_uploads_idle(upload_drain_timeout)
@@ -3263,7 +3775,10 @@ impl StudioVfs {
             if !drained {
                 let reconciled = self.reconcile_remote_completed_pending().await;
                 if reconciled > 0 {
-                    info!(reconciled, "VFS shutdown: reconciled already-uploaded blocks");
+                    info!(
+                        reconciled,
+                        "VFS shutdown: reconciled already-uploaded blocks"
+                    );
                     drained = self
                         .block_cache
                         .wait_for_uploads_idle(Duration::from_millis(500))

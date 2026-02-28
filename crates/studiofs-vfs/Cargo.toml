@@ -26,4 +26,5 @@ tempfile.workspace = true
 bytes.workspace = true
 aws-config = "1"
 aws-sdk-s3 = "1"
+aws-smithy-http-client = "1"
 dotenvy.workspace = true

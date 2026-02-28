@@ -403,8 +403,7 @@ Without --bucket: a temporary bucket is created and deleted after the run.
 
 With --bucket: the specified bucket is used as-is. Temporary objects are removed
   after the run, but the bucket itself is never deleted. If the bucket is not
-  accessible the test is aborted immediately.")
-]
+  accessible the test is aborted immediately.")]
     #[command(after_help = "\
 EXAMPLES:
   MinIO (local, auto-create bucket):
@@ -584,7 +583,13 @@ fn main() -> anyhow::Result<()> {
             region,
             bucket,
         } => {
-            cli::test::run(&entrypoint, &access_key, &secret_key, &region, bucket.as_deref())?;
+            cli::test::run(
+                &entrypoint,
+                &access_key,
+                &secret_key,
+                &region,
+                bucket.as_deref(),
+            )?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;

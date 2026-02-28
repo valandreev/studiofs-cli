@@ -93,6 +93,15 @@ pub trait MetaEngine: Send + Sync {
         None
     }
 
+    /// Best-effort metadata version token for change detection.
+    ///
+    /// Remote-backed engines can expose a monotonic-ish token (for example,
+    /// an object ETag) so invalidation listeners can tell whether a sync
+    /// actually observed a newer remote snapshot.
+    fn metadata_version_token(&self) -> Option<String> {
+        None
+    }
+
     // ─── Format / Settings ───────────────────────────────────────────────
 
     /// Store format info (called during `studiofs init`).
@@ -195,10 +204,7 @@ pub trait MetaEngine: Send + Sync {
     /// Returns one [`BatchFlushResult`] per entry (same order).
     ///
     /// Default implementation calls individual methods sequentially.
-    fn flush_blocks_batch(
-        &self,
-        entries: &[BatchFlushEntry],
-    ) -> MetaResult<Vec<BatchFlushResult>> {
+    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)

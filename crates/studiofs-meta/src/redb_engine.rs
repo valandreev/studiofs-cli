@@ -1190,10 +1190,7 @@ impl MetaEngine for RedbMetaEngine {
     ///
     /// This replaces N individual transactions (each with its own fsync) with
     /// one transaction — reducing commit overhead by ~100-300×.
-    fn flush_blocks_batch(
-        &self,
-        entries: &[BatchFlushEntry],
-    ) -> MetaResult<Vec<BatchFlushResult>> {
+    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }

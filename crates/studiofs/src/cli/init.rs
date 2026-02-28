@@ -108,13 +108,15 @@ fn ensure_bucket_accessible(
 
     print!("  Creating {label} bucket '{bucket}'... ");
     std::io::stdout().flush().ok();
-    rt.block_on(bucket_create(endpoint, bucket, access_key, secret_key, region))
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "bucket '{bucket}' not accessible and could not be created: {e}\n\
+    rt.block_on(bucket_create(
+        endpoint, bucket, access_key, secret_key, region,
+    ))
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "bucket '{bucket}' not accessible and could not be created: {e}\n\
                  Tip: check credentials and ensure s3:CreateBucket permission is granted."
-            )
-        })?;
+        )
+    })?;
     println!("OK (created)");
     Ok(true)
 }
@@ -132,7 +134,9 @@ fn cleanup_delete_bucket(
     use super::test::bucket_delete_call;
     print!("    Deleting {label} bucket '{bucket}'... ");
     std::io::stdout().flush().ok();
-    match rt.block_on(bucket_delete_call(endpoint, bucket, access_key, secret_key, region)) {
+    match rt.block_on(bucket_delete_call(
+        endpoint, bucket, access_key, secret_key, region,
+    )) {
         Ok(()) => println!("OK"),
         Err(e) => println!("WARN — {e}"),
     }
@@ -161,38 +165,62 @@ pub fn run(
     block_size: Option<&str>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let eff_data_region = if data_region.is_empty() { "us-east-1" } else { data_region };
+    let eff_data_region = if data_region.is_empty() {
+        "us-east-1"
+    } else {
+        data_region
+    };
 
     // ── Resolve metadata credentials early ───────────────────────────────────
     // If --metadata-endpoint is provided, use a separate metadata store;
     // otherwise fall back to the data store credentials.
-    let (eff_meta_endpoint, eff_meta_bucket, eff_meta_access_key, eff_meta_secret_key, eff_meta_region) =
-        if let Some(ep) = metadata_endpoint {
-            let bk = metadata_bucket
-                .ok_or_else(|| anyhow::anyhow!("--metadata-bucket is required when --metadata-endpoint is provided"))?
-                .to_string();
-            let ak = metadata_access_key
-                .ok_or_else(|| anyhow::anyhow!("--metadata-access-key is required when --metadata-endpoint is provided"))?
-                .to_string();
-            let sk = metadata_secret_key
-                .ok_or_else(|| anyhow::anyhow!("--metadata-secret-key is required when --metadata-endpoint is provided"))?
-                .to_string();
-            let rg = metadata_region.unwrap_or("").to_string();
-            let rg = if rg.is_empty() { "us-east-1".to_string() } else { rg };
-            (ep.to_string(), bk, ak, sk, rg)
+    let (
+        eff_meta_endpoint,
+        eff_meta_bucket,
+        eff_meta_access_key,
+        eff_meta_secret_key,
+        eff_meta_region,
+    ) = if let Some(ep) = metadata_endpoint {
+        let bk = metadata_bucket
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--metadata-bucket is required when --metadata-endpoint is provided"
+                )
+            })?
+            .to_string();
+        let ak = metadata_access_key
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--metadata-access-key is required when --metadata-endpoint is provided"
+                )
+            })?
+            .to_string();
+        let sk = metadata_secret_key
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--metadata-secret-key is required when --metadata-endpoint is provided"
+                )
+            })?
+            .to_string();
+        let rg = metadata_region.unwrap_or("").to_string();
+        let rg = if rg.is_empty() {
+            "us-east-1".to_string()
         } else {
-            (
-                data_endpoint.to_string(),
-                data_bucket.to_string(),
-                data_access_key.to_string(),
-                data_secret_key.to_string(),
-                eff_data_region.to_string(),
-            )
+            rg
         };
+        (ep.to_string(), bk, ak, sk, rg)
+    } else {
+        (
+            data_endpoint.to_string(),
+            data_bucket.to_string(),
+            data_access_key.to_string(),
+            data_secret_key.to_string(),
+            eff_data_region.to_string(),
+        )
+    };
 
     // Are data and metadata using the exact same physical bucket / endpoint?
-    let meta_is_same_bucket =
-        eff_meta_endpoint == data_endpoint && eff_meta_bucket == data_bucket;
+    let meta_is_same_bucket = eff_meta_endpoint == data_endpoint && eff_meta_bucket == data_bucket;
 
     // ── 1. Ensure buckets are accessible (create if missing) ─────────────────
     println!("Checking storage backends...");
@@ -240,7 +268,10 @@ pub fn run(
         None // same physical bucket — reuse data result for verdict
     } else {
         println!();
-        println!("  [Metadata store: {} / {}]", eff_meta_endpoint, eff_meta_bucket);
+        println!(
+            "  [Metadata store: {} / {}]",
+            eff_meta_endpoint, eff_meta_bucket
+        );
         Some(super::test::run_compat_on_bucket(
             &eff_meta_endpoint,
             &eff_meta_bucket,
@@ -257,7 +288,10 @@ pub fn run(
     let meta_ok = if meta_is_same_bucket {
         data_compat.suitable_for_metadata()
     } else {
-        meta_compat.as_ref().map(|r| r.suitable_for_metadata()).unwrap_or(true)
+        meta_compat
+            .as_ref()
+            .map(|r| r.suitable_for_metadata())
+            .unwrap_or(true)
     };
 
     if !data_ok || !meta_ok {

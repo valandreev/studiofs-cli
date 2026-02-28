@@ -9,14 +9,14 @@
 //!                   bucket is never deleted.  If the bucket is not accessible the
 //!                   test aborts immediately.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use opendal::{
+    Operator,
     layers::{RetryLayer, TimeoutLayer},
     options::WriteOptions,
     services::S3,
-    Operator,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -93,7 +93,11 @@ pub fn run(
     let uid = Uuid::new_v4().to_string();
     let short = &uid[..8];
     let prefix = format!("studiofs-test-run-{short}");
-    let effective_region = if region.is_empty() { "us-east-1" } else { region };
+    let effective_region = if region.is_empty() {
+        "us-east-1"
+    } else {
+        region
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -109,7 +113,11 @@ pub fn run(
     println!("  Endpoint   : {entrypoint}");
     println!(
         "  Region     : {}",
-        if region.is_empty() { "us-east-1 (default)" } else { region }
+        if region.is_empty() {
+            "us-east-1 (default)"
+        } else {
+            region
+        }
     );
     if owns_bucket {
         println!("  Test bucket: {bucket}  (temporary — will be deleted after test)");
@@ -142,7 +150,13 @@ pub fn run(
         }
     } else {
         // Build a temporary operator just for the accessibility probe.
-        let probe_op = build_op(entrypoint, &bucket, access_key, secret_key, effective_region)?;
+        let probe_op = build_op(
+            entrypoint,
+            &bucket,
+            access_key,
+            secret_key,
+            effective_region,
+        )?;
         let probe_key = format!("{prefix}/__probe__");
 
         print!("  Verifying bucket '{bucket}' is accessible... ");
@@ -160,7 +174,13 @@ pub fn run(
     println!();
 
     // ── Build operator for tests ──────────────────────────────────────────────
-    let op = build_op(entrypoint, &bucket, access_key, secret_key, effective_region)?;
+    let op = build_op(
+        entrypoint,
+        &bucket,
+        access_key,
+        secret_key,
+        effective_region,
+    )?;
 
     // ── Run test suites ───────────────────────────────────────────────────────
     let mut cases: Vec<TestCase> = Vec::new();
@@ -348,9 +368,18 @@ async fn run_data_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
         let k = small_key.clone();
         let d = small_data.clone();
         let op2 = op.clone();
-        timed_test(out, Category::Data, "PUT 1 KB (small object)", None, async move {
-            op2.write(&k, d).await.map(|_| ()).map_err(|e| anyhow!("{e}"))
-        })
+        timed_test(
+            out,
+            Category::Data,
+            "PUT 1 KB (small object)",
+            None,
+            async move {
+                op2.write(&k, d)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| anyhow!("{e}"))
+            },
+        )
         .await;
     }
 
@@ -370,7 +399,9 @@ async fn run_data_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
                 if got_hash == expected {
                     Ok(())
                 } else {
-                    Err(anyhow!("hash mismatch: expected {expected}, got {got_hash}"))
+                    Err(anyhow!(
+                        "hash mismatch: expected {expected}, got {got_hash}"
+                    ))
                 }
             },
         )
@@ -381,18 +412,24 @@ async fn run_data_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
     {
         let k = small_key.clone();
         let op2 = op.clone();
-        timed_test(out, Category::Data, "HEAD (stat metadata)", None, async move {
-            let meta = op2.stat(&k).await.map_err(|e| anyhow!("{e}"))?;
-            if meta.content_length() == SMALL_SIZE as u64 {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "wrong content-length: expected {}, got {}",
-                    SMALL_SIZE,
-                    meta.content_length()
-                ))
-            }
-        })
+        timed_test(
+            out,
+            Category::Data,
+            "HEAD (stat metadata)",
+            None,
+            async move {
+                let meta = op2.stat(&k).await.map_err(|e| anyhow!("{e}"))?;
+                if meta.content_length() == SMALL_SIZE as u64 {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "wrong content-length: expected {}, got {}",
+                        SMALL_SIZE,
+                        meta.content_length()
+                    ))
+                }
+            },
+        )
         .await;
     }
 
@@ -432,7 +469,12 @@ async fn run_data_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
             Category::Data,
             "PUT 4 MB (full block write)",
             Some("throughput test — expected: ≥10 MB/s"),
-            async move { op2.write(&k, d).await.map(|_| ()).map_err(|e| anyhow!("{e}")) },
+            async move {
+                op2.write(&k, d)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| anyhow!("{e}"))
+            },
         )
         .await;
     }
@@ -468,8 +510,12 @@ async fn run_data_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
         let lk = large_key.clone();
         let op2 = op.clone();
         timed_test(out, Category::Data, "DELETE objects", None, async move {
-            op2.delete(&sk).await.map_err(|e| anyhow!("delete small: {e}"))?;
-            op2.delete(&lk).await.map_err(|e| anyhow!("delete large: {e}"))?;
+            op2.delete(&sk)
+                .await
+                .map_err(|e| anyhow!("delete small: {e}"))?;
+            op2.delete(&lk)
+                .await
+                .map_err(|e| anyhow!("delete large: {e}"))?;
             Ok(())
         })
         .await;
@@ -495,7 +541,10 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
             Some("basic write — manifest, counter, etc."),
             async move {
                 let payload = Bytes::from(b"{\"version\":1,\"seq\":0}\n".to_vec());
-                op2.write(&k, payload).await.map(|_| ()).map_err(|e| anyhow!("{e}"))
+                op2.write(&k, payload)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| anyhow!("{e}"))
             },
         )
         .await;
@@ -587,7 +636,9 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
                 let payload = Bytes::from(b"{\"version\":1,\"seq\":99}\n".to_vec());
                 match op2.write_options(&k, payload, opts).await {
                     Err(e) if is_condition_error(&e) => Ok(()), // correct rejection
-                    Err(e) => Err(anyhow!("unexpected error (expected 412 ConditionNotMatch): {e}")),
+                    Err(e) => Err(anyhow!(
+                        "unexpected error (expected 412 ConditionNotMatch): {e}"
+                    )),
                     Ok(_) => Err(anyhow!(
                         "backend ACCEPTED a write with an invalid ETag — \
                          conditional writes are NOT enforced. \
@@ -655,7 +706,10 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
 fn print_report(cases: &[TestCase]) {
     println!();
     println!("  ── Report ────────────────────────────────────────────────────────────────");
-    println!("  {:<14} {:<3} {:<45} {:>8}", "Category", "", "Test", "Duration");
+    println!(
+        "  {:<14} {:<3} {:<45} {:>8}",
+        "Category", "", "Test", "Duration"
+    );
     println!("  {}", "─".repeat(74));
 
     let mut prev_cat: Option<&Category> = None;
@@ -692,7 +746,10 @@ fn print_report(cases: &[TestCase]) {
         }
     }
 
-    let connectivity_ok = by_cat.get("connectivity").map(|(p, t)| p == t).unwrap_or(false);
+    let connectivity_ok = by_cat
+        .get("connectivity")
+        .map(|(p, t)| p == t)
+        .unwrap_or(false);
     let data_ok = by_cat.get("data").map(|(p, t)| p == t).unwrap_or(false);
     let meta_ok = by_cat.get("metadata").map(|(p, t)| p == t).unwrap_or(false);
 
@@ -722,13 +779,9 @@ fn print_report(cases: &[TestCase]) {
 
     let overall = connectivity_ok && data_ok && meta_ok;
     if overall {
-        println!(
-            "  OVERALL VERDICT: ✓  This backend is suitable for StudioFS."
-        );
+        println!("  OVERALL VERDICT: ✓  This backend is suitable for StudioFS.");
     } else {
-        println!(
-            "  OVERALL VERDICT: ✗  This backend is NOT fully compatible with StudioFS."
-        );
+        println!("  OVERALL VERDICT: ✗  This backend is NOT fully compatible with StudioFS.");
         if !meta_ok {
             println!();
             println!("  IMPORTANT: The metadata engine (TonboMetaEngine) relies on conditional");
@@ -890,15 +943,17 @@ fn fmt_datetime_now() -> (String, String) {
 fn build_signed_headers(
     method: &str,
     endpoint_url: &str,
-    path: &str,           // e.g. "/mybucket"
-    query: &str,          // empty for create/delete
+    path: &str,  // e.g. "/mybucket"
+    query: &str, // empty for create/delete
     body: &[u8],
     access_key: &str,
     secret_key: &str,
     region: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let url = reqwest::Url::parse(endpoint_url).context("invalid endpoint URL")?;
-    let host = url.host_str().ok_or_else(|| anyhow!("endpoint URL has no host"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("endpoint URL has no host"))?;
     let host_with_port = match url.port() {
         Some(p) => format!("{host}:{p}"),
         None => host.to_string(),
@@ -988,8 +1043,9 @@ pub(crate) async fn bucket_create(
         .into_bytes()
     };
 
-    let headers =
-        build_signed_headers("PUT", endpoint, &path, "", &body, access_key, secret_key, region)?;
+    let headers = build_signed_headers(
+        "PUT", endpoint, &path, "", &body, access_key, secret_key, region,
+    )?;
 
     let url = format!("{endpoint}{path}");
     let client = reqwest::Client::new();
@@ -1019,8 +1075,9 @@ async fn bucket_delete(
     region: &str,
 ) -> anyhow::Result<()> {
     let path = format!("/{bucket}");
-    let headers =
-        build_signed_headers("DELETE", endpoint, &path, "", b"", access_key, secret_key, region)?;
+    let headers = build_signed_headers(
+        "DELETE", endpoint, &path, "", b"", access_key, secret_key, region,
+    )?;
 
     let url = format!("{endpoint}{path}");
     let client = reqwest::Client::new();

@@ -23,3 +23,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 dotenvy.workspace = true
 aws-config = "1"
 aws-sdk-s3 = "1"
+aws-smithy-http-client = "1"

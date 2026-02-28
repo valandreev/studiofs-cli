@@ -49,9 +49,9 @@ fn make_store() -> DataStore {
 }
 
 async fn ensure_bucket() {
-    use aws_config::BehaviorVersion;
     use aws_sdk_s3::Client as S3Client;
-    use aws_sdk_s3::config::{Credentials, Region};
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
 
     let cfg = test_config();
@@ -70,7 +70,8 @@ async fn ensure_bucket() {
         return;
     }
 
-    let shared = aws_config::defaults(BehaviorVersion::latest())
+    let conf = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
         .credentials_provider(Credentials::new(
             &cfg.access_key,
             &cfg.secret_key,
@@ -79,9 +80,7 @@ async fn ensure_bucket() {
             "studiofs-test",
         ))
         .region(Region::new(cfg.region.clone()))
-        .load()
-        .await;
-    let conf = aws_sdk_s3::config::Builder::from(&shared)
+        .http_client(SmithyHttpClientBuilder::new().build_http())
         .endpoint_url(&cfg.endpoint)
         .force_path_style(true)
         .build();
