@@ -25,7 +25,7 @@ Holds all runtime state:
 | `memory_limit` | 2 GiB | L1 memory cache budget |
 | `block_size` | 1 MiB | Block size (from format info) |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
-| `readahead_width` | 128 | Max prefetch depth |
+| `readahead_width` | 512 | Max prefetch depth |
 | `max_dirty_bytes` | 8 GiB | Dirty memory limit before backpressure |
 
 ## Write Path
@@ -150,6 +150,11 @@ fetch_block(object_id)
   └─ On failure: retry up to 8 times with exponential backoff (50ms–2s by default)
 ```
 
+Prefetch reads use `fetch_block_prefetch()`:
+- shares the same singleflight map and cache population path
+- keeps reserved AIMD headroom for foreground reads
+- uses shorter retry policy (best-effort behavior)
+
 ### Fetch Metrics
 
 | Metric | Meaning |
@@ -177,14 +182,20 @@ Per-inode sequential read detection with adaptive prefetch depth.
 - Prefetch depth = `min(score, configured_width)`, with a minimum floor on sequential streams (default 16 blocks)
 
 Runtime tuning knobs:
-- `STUDIOFS_READAHEAD_WIDTH` (default `128`)
-- `STUDIOFS_READAHEAD_MIN_PREFETCH` (default `16`)
+- `STUDIOFS_READ_BUFFER_MB` (default `2048`) - high-level read buffer budget; drives fetch AIMD max window
+- `STUDIOFS_MAX_READAHEAD_MB` (default `512`) - high-level sequential readahead budget
+- `STUDIOFS_PREFETCH` (default `2`) - high-level prefetch pressure knob
+- `STUDIOFS_READAHEAD_WIDTH` (default derived from `STUDIOFS_MAX_READAHEAD_MB`, `512` blocks for 1 MiB block size)
+- `STUDIOFS_READAHEAD_MIN_PREFETCH` (default derived from width, usually `16`)
 - `STUDIOFS_READAHEAD_SEQ_STEP` (default `4`)
 - `STUDIOFS_READAHEAD_RANDOM_PENALTY` (default `2`)
-- `STUDIOFS_PREFETCH_CONCURRENCY` (default `128`)
-- `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `16`, keeps fetch headroom for direct reads)
-- `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `32`, caps prefetch scheduling burst per read call)
+- `STUDIOFS_PREFETCH_CONCURRENCY` (default derived from `STUDIOFS_PREFETCH`, usually `64`)
+- `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `max(32, prefetch_concurrency / 2)`, keeps fetch headroom for direct reads)
+- `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default derived from concurrency/width, usually `128`)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `1500`, temporarily pauses prefetch after transport send errors)
+- `STUDIOFS_FETCH_PREFETCH_RESERVE` (default equals foreground reserve; prefetch cannot consume these slots)
+- `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `2`, prefetch retries are intentionally short)
+- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `25`)
 
 On each `read()`:
 1. `record_read(ino, first_block, last_block)` returns blocks to prefetch
@@ -203,10 +214,10 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 | Field | Fetch Default | Upload Default |
 |-------|--------------|----------------|
-| `initial_window` | 16 | 16 |
+| `initial_window` | derived from read buffer (`~256` for 2048 MiB / 1 MiB blocks) | 16 |
 | `min_window` | 1 | 1 |
-| `max_window` | 512 | 512 |
-| `increase_step` | 2.0 | 2.0 |
+| `max_window` | derived from read buffer (`2048` for 2048 MiB / 1 MiB blocks) | 512 |
+| `increase_step` | derived (`4.0` when max window >= 1024) | 2.0 |
 | `decrease_factor` | 0.85 | 0.85 |
 | `decrease_cooldown` | 3s | 3s |
 

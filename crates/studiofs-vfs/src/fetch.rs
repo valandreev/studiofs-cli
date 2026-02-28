@@ -9,7 +9,7 @@
 //! 3. Applies its own retry with exponential backoff per fetch, independent of
 //!    OpenDAL's internal `RetryLayer`.
 
-use crate::aimd::{AimdConfig, AimdController};
+use crate::aimd::{AimdConfig, AimdController, AimdPermit};
 use bytes::Bytes;
 use dashmap::DashMap;
 use opendal::ErrorKind;
@@ -28,9 +28,11 @@ use tracing::{debug, error, info, warn};
 
 /// Defaults for retry/timeout tuning (all overrideable via env).
 const DEFAULT_MAX_FETCH_ATTEMPTS: u32 = 8;
+const DEFAULT_PREFETCH_MAX_FETCH_ATTEMPTS: u32 = 2;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_RETRY_BASE_MS: u64 = 50;
 const DEFAULT_RETRY_MAX_MS: u64 = 2_000;
+const DEFAULT_PREFETCH_ACQUIRE_WAIT_MS: u64 = 25;
 
 /// Capacity of the broadcast channel used for singleflight notifications.
 const BROADCAST_CAPACITY: usize = 2;
@@ -53,6 +55,9 @@ pub enum FetchError {
 
     #[error("cache write error: {0}")]
     CacheWrite(std::io::Error),
+
+    #[error("prefetch skipped: no foreground headroom")]
+    PrefetchSkipped,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +122,8 @@ pub struct FetchScheduler {
     cache: Arc<BlockCache>,
     /// Maximum attempts per fetch operation.
     max_fetch_attempts: u32,
+    /// Maximum attempts for best-effort prefetch fetches.
+    prefetch_max_fetch_attempts: u32,
     /// Per-request hard timeout.
     request_timeout: Duration,
     /// Base backoff delay between retries.
@@ -125,6 +132,10 @@ pub struct FetchScheduler {
     retry_max_delay: Duration,
     /// Last observed send-request network error timestamp (unix ms).
     last_send_error_ms: AtomicU64,
+    /// Keep this many AIMD slots free for foreground demand reads.
+    prefetch_reserve_slots: usize,
+    /// Max time prefetch waits to acquire an AIMD slot before skipping.
+    prefetch_acquire_wait: Duration,
     /// Metrics.
     pub metrics: FetchMetrics,
 }
@@ -140,6 +151,7 @@ impl FetchScheduler {
         data_store: Arc<DataStore>,
         cache: Arc<BlockCache>,
         aimd_config: AimdConfig,
+        default_prefetch_reserve_slots: usize,
     ) -> Self {
         fn env_u32(key: &str, default: u32) -> u32 {
             std::env::var(key)
@@ -157,6 +169,10 @@ impl FetchScheduler {
         }
 
         let max_fetch_attempts = env_u32("STUDIOFS_FETCH_MAX_ATTEMPTS", DEFAULT_MAX_FETCH_ATTEMPTS);
+        let prefetch_max_fetch_attempts = env_u32(
+            "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS",
+            DEFAULT_PREFETCH_MAX_FETCH_ATTEMPTS,
+        );
         let request_timeout_s = env_u64(
             "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
             DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -164,14 +180,25 @@ impl FetchScheduler {
         let retry_base_ms = env_u64("STUDIOFS_FETCH_RETRY_BASE_MS", DEFAULT_RETRY_BASE_MS);
         let retry_max_ms =
             env_u64("STUDIOFS_FETCH_RETRY_MAX_MS", DEFAULT_RETRY_MAX_MS).max(retry_base_ms);
+        let prefetch_reserve_slots = env_u64(
+            "STUDIOFS_FETCH_PREFETCH_RESERVE",
+            default_prefetch_reserve_slots as u64,
+        ) as usize;
+        let prefetch_acquire_wait_ms = env_u64(
+            "STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS",
+            DEFAULT_PREFETCH_ACQUIRE_WAIT_MS,
+        );
 
         info!(
             initial_window = aimd_config.initial_window,
             max_window = aimd_config.max_window,
             max_fetch_attempts,
+            prefetch_max_fetch_attempts,
             request_timeout_s,
             retry_base_ms,
             retry_max_ms,
+            prefetch_reserve_slots,
+            prefetch_acquire_wait_ms,
             "FetchScheduler created"
         );
         Self {
@@ -180,10 +207,13 @@ impl FetchScheduler {
             data_store,
             cache,
             max_fetch_attempts,
+            prefetch_max_fetch_attempts,
             request_timeout: Duration::from_secs(request_timeout_s),
             retry_base_delay: Duration::from_millis(retry_base_ms),
             retry_max_delay: Duration::from_millis(retry_max_ms),
             last_send_error_ms: AtomicU64::new(0),
+            prefetch_reserve_slots,
+            prefetch_acquire_wait: Duration::from_millis(prefetch_acquire_wait_ms),
             metrics: FetchMetrics::new(),
         }
     }
@@ -199,10 +229,37 @@ impl FetchScheduler {
     /// 4. Retry with exponential backoff on transient errors.
     /// 5. Cache population on success.
     pub async fn fetch_block(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
+        self.fetch_block_with_class(object_id, key, FetchClass::Foreground)
+            .await
+    }
+
+    /// Best-effort prefetch fetch.
+    ///
+    /// Uses the same singleflight map as foreground reads but never consumes
+    /// the last reserved foreground slots.
+    pub async fn fetch_block_prefetch(
+        &self,
+        object_id: u64,
+        key: &str,
+    ) -> Result<Bytes, FetchError> {
+        self.fetch_block_with_class(object_id, key, FetchClass::Prefetch)
+            .await
+    }
+
+    async fn fetch_block_with_class(
+        &self,
+        object_id: u64,
+        key: &str,
+        class: FetchClass,
+    ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
         if let Some(cached) = self.cache.get(object_id).await {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
+        }
+
+        if matches!(class, FetchClass::Prefetch) && !self.prefetch_admission_open() {
+            return Err(FetchError::PrefetchSkipped);
         }
 
         // ── Singleflight ───────────────────────────────────────────
@@ -272,7 +329,7 @@ impl FetchScheduler {
             active: std::cell::Cell::new(true),
         };
 
-        let result = self.do_fetch_with_retry(object_id, key).await;
+        let result = self.do_fetch_with_retry(object_id, key, class).await;
 
         // Notify waiters before cleanup removes the entry.
         let success = result.is_ok();
@@ -371,15 +428,38 @@ impl FetchScheduler {
     // ── Internal ────────────────────────────────────────────────────
 
     /// Perform the actual S3 GET with retries, AIMD permit, decode, cache.
-    async fn do_fetch_with_retry(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
+    async fn do_fetch_with_retry(
+        &self,
+        object_id: u64,
+        key: &str,
+        class: FetchClass,
+    ) -> Result<Bytes, FetchError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
+        let max_attempts = match class {
+            FetchClass::Foreground => self.max_fetch_attempts,
+            FetchClass::Prefetch => self.prefetch_max_fetch_attempts.max(1),
+        };
 
-        for attempt in 0..self.max_fetch_attempts {
+        for attempt in 0..max_attempts {
             // Acquire an AIMD permit — blocks until the concurrency window
             // allows another in-flight request.
             let wait_start = Instant::now();
-            let permit = self.aimd.acquire().await;
+            let permit = match class {
+                FetchClass::Foreground => self.aimd.acquire().await,
+                FetchClass::Prefetch => {
+                    let deadline = Instant::now() + self.prefetch_acquire_wait;
+                    loop {
+                        if let Some(permit) = self.try_acquire_prefetch_permit() {
+                            break permit;
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(FetchError::PrefetchSkipped);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            };
             let wait_ms = wait_start.elapsed().as_millis();
             if wait_ms > 100 {
                 debug!(
@@ -466,7 +546,7 @@ impl FetchScheduler {
 
                     self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
 
-                    if attempt + 1 < self.max_fetch_attempts {
+                    if attempt + 1 < max_attempts {
                         let retry_base = if is_send_error {
                             self.retry_base_delay.max(Duration::from_millis(200))
                         } else {
@@ -477,27 +557,52 @@ impl FetchScheduler {
                             .min(self.retry_max_delay);
                         let delay = jittered_delay(delay, object_id, attempt);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            attempt = attempt + 1,
-                            max = self.max_fetch_attempts,
-                            key,
-                            req_ms,
-                            delay_ms = delay.as_millis() as u64,
-                            is_server_overload,
-                            is_send_error,
-                            error = %e,
-                            "fetch failed, retrying"
-                        );
+                        if matches!(class, FetchClass::Prefetch) {
+                            debug!(
+                                attempt = attempt + 1,
+                                max = max_attempts,
+                                key,
+                                req_ms,
+                                delay_ms = delay.as_millis() as u64,
+                                is_server_overload,
+                                is_send_error,
+                                error = %e,
+                                "prefetch fetch failed, retrying"
+                            );
+                        } else {
+                            warn!(
+                                attempt = attempt + 1,
+                                max = max_attempts,
+                                key,
+                                req_ms,
+                                delay_ms = delay.as_millis() as u64,
+                                is_server_overload,
+                                is_send_error,
+                                error = %e,
+                                "fetch failed, retrying"
+                            );
+                        }
                         tokio::time::sleep(delay).await;
                     } else {
-                        error!(
-                            attempts = self.max_fetch_attempts,
-                            key,
-                            req_ms,
-                            total_ms = overall_start.elapsed().as_millis() as u64,
-                            error = %e,
-                            "fetch exhausted all retries"
-                        );
+                        if matches!(class, FetchClass::Prefetch) {
+                            debug!(
+                                attempts = max_attempts,
+                                key,
+                                req_ms,
+                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                error = %e,
+                                "prefetch exhausted retries"
+                            );
+                        } else {
+                            error!(
+                                attempts = max_attempts,
+                                key,
+                                req_ms,
+                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                error = %e,
+                                "fetch exhausted all retries"
+                            );
+                        }
                     }
 
                     last_err = Some(e);
@@ -514,28 +619,48 @@ impl FetchScheduler {
                         self.request_timeout.as_secs()
                     ));
 
-                    if attempt + 1 < self.max_fetch_attempts {
+                    if attempt + 1 < max_attempts {
                         let delay = self
                             .retry_base_delay
                             .saturating_mul(2u32.saturating_pow(attempt))
                             .min(self.retry_max_delay);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            attempt = attempt + 1,
-                            max = self.max_fetch_attempts,
-                            key,
-                            timeout_s = self.request_timeout.as_secs(),
-                            delay_ms = delay.as_millis() as u64,
-                            "fetch timed out, retrying (AIMD window unchanged)"
-                        );
+                        if matches!(class, FetchClass::Prefetch) {
+                            debug!(
+                                attempt = attempt + 1,
+                                max = max_attempts,
+                                key,
+                                timeout_s = self.request_timeout.as_secs(),
+                                delay_ms = delay.as_millis() as u64,
+                                "prefetch timed out, retrying"
+                            );
+                        } else {
+                            warn!(
+                                attempt = attempt + 1,
+                                max = max_attempts,
+                                key,
+                                timeout_s = self.request_timeout.as_secs(),
+                                delay_ms = delay.as_millis() as u64,
+                                "fetch timed out, retrying (AIMD window unchanged)"
+                            );
+                        }
                         tokio::time::sleep(delay).await;
                     } else {
-                        error!(
-                            attempts = self.max_fetch_attempts,
-                            key,
-                            total_ms = overall_start.elapsed().as_millis() as u64,
-                            "fetch timed out, all retries exhausted"
-                        );
+                        if matches!(class, FetchClass::Prefetch) {
+                            debug!(
+                                attempts = max_attempts,
+                                key,
+                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                "prefetch timed out, retries exhausted"
+                            );
+                        } else {
+                            error!(
+                                attempts = max_attempts,
+                                key,
+                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                "fetch timed out, all retries exhausted"
+                            );
+                        }
                     }
 
                     last_err = Some(timeout_err);
@@ -544,9 +669,25 @@ impl FetchScheduler {
         }
 
         Err(FetchError::Exhausted {
-            attempts: self.max_fetch_attempts,
+            attempts: max_attempts,
             source: last_err.expect("at least one error"),
         })
+    }
+
+    fn prefetch_admission_open(&self) -> bool {
+        let limit = self.aimd.effective_limit();
+        if limit == 0 {
+            return false;
+        }
+        let reserve = self.prefetch_reserve_slots.min(limit.saturating_sub(1));
+        self.aimd.in_flight().saturating_add(reserve) < limit
+    }
+
+    fn try_acquire_prefetch_permit(&self) -> Option<AimdPermit<'_>> {
+        if !self.prefetch_admission_open() {
+            return None;
+        }
+        self.aimd.try_acquire()
     }
 }
 
@@ -592,6 +733,12 @@ fn jittered_delay(base: Duration, object_id: u64, attempt: u32) -> Duration {
 enum Action {
     Fetch,
     Wait(broadcast::Receiver<BroadcastResult>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FetchClass {
+    Foreground,
+    Prefetch,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

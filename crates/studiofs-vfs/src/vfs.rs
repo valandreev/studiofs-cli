@@ -153,13 +153,21 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 128;
-const DEFAULT_READAHEAD_WIDTH: u32 = 128;
+// JuiceFS-like high-level read tuning defaults:
+// - buffer-size: 2048M
+// - max-readahead: 512M
+// - prefetch: 2
+const DEFAULT_READ_BUFFER_MB: u64 = 2_048;
+const DEFAULT_MAX_READAHEAD_MB: u64 = 512;
+const DEFAULT_PREFETCH_JOBS: usize = 2;
+// Block-level derived defaults (used as fallback if conversion is unavailable).
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 64;
+const DEFAULT_READAHEAD_WIDTH: u32 = 512;
 const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
-const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 16;
-const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 32;
+const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 32;
+const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 64;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 1500;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
@@ -585,21 +593,51 @@ impl StudioVfs {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
         );
+        let read_buffer_mb = std::env::var("STUDIOFS_READ_BUFFER_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_READ_BUFFER_MB);
+        let max_readahead_mb = std::env::var("STUDIOFS_MAX_READAHEAD_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_READAHEAD_MB);
+        let prefetch_jobs = std::env::var("STUDIOFS_PREFETCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_PREFETCH_JOBS);
+
+        let block_size_nonzero = block_size.max(1) as u128;
+        let mb_to_blocks = |mb: u64| -> u32 {
+            let bytes = (mb as u128) * 1024 * 1024;
+            let blocks = (bytes / block_size_nonzero).max(1).min(u32::MAX as u128);
+            blocks as u32
+        };
+        let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
+        let readahead_width_default = mb_to_blocks(max_readahead_mb).max(1);
+        let prefetch_concurrency_default = prefetch_jobs
+            .saturating_mul(32)
+            .clamp(DEFAULT_PREFETCH_CONCURRENCY / 4, 256);
+
         let prefetch_concurrency = std::env::var("STUDIOFS_PREFETCH_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PREFETCH_CONCURRENCY);
+            .unwrap_or(prefetch_concurrency_default.max(16));
         let readahead_width = std::env::var("STUDIOFS_READAHEAD_WIDTH")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READAHEAD_WIDTH);
+            .unwrap_or(readahead_width_default.max(32));
+        let min_readahead_prefetch_floor = DEFAULT_READAHEAD_MIN_PREFETCH.min(8);
+        let readahead_min_prefetch_default = ((readahead_width as usize / 32).clamp(8, 64)) as u32;
         let readahead_min_prefetch = std::env::var("STUDIOFS_READAHEAD_MIN_PREFETCH")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READAHEAD_MIN_PREFETCH);
+            .unwrap_or(readahead_min_prefetch_default.max(min_readahead_prefetch_floor));
         let readahead_seq_step = std::env::var("STUDIOFS_READAHEAD_SEQ_STEP")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
@@ -614,15 +652,24 @@ impl StudioVfs {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_DIR_PREFETCH_MAX_BATCH);
+        let prefetch_foreground_reserve_default =
+            (prefetch_concurrency / 2).clamp(16, (buffer_blocks_default as usize).max(16));
         let prefetch_foreground_reserve = std::env::var("STUDIOFS_PREFETCH_FOREGROUND_RESERVE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_PREFETCH_FOREGROUND_RESERVE);
+            .unwrap_or(
+                prefetch_foreground_reserve_default.max(DEFAULT_PREFETCH_FOREGROUND_RESERVE),
+            );
+        let prefetch_max_per_cycle_default = prefetch_concurrency
+            .saturating_mul(2)
+            .clamp(16, 256)
+            .min(readahead_width as usize);
+        let min_prefetch_cycle_floor = DEFAULT_PREFETCH_MAX_PER_CYCLE.min(16);
         let prefetch_max_per_cycle = std::env::var("STUDIOFS_PREFETCH_MAX_PER_CYCLE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PREFETCH_MAX_PER_CYCLE);
+            .unwrap_or(prefetch_max_per_cycle_default.max(min_prefetch_cycle_floor));
         let prefetch_pause_on_neterr = Duration::from_millis(
             std::env::var("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS")
                 .ok()
@@ -768,10 +815,17 @@ impl StudioVfs {
 
         // Build AIMD config for the fetch scheduler from env or defaults.
         let fetch_aimd_config = {
+            let fetch_max_window_default = (buffer_blocks_default as f64).clamp(64.0, 4096.0);
+            let fetch_initial_window_default = (fetch_max_window_default / 8.0).clamp(16.0, 256.0);
+            let fetch_increase_default = if fetch_max_window_default >= 1024.0 {
+                4.0
+            } else {
+                2.0
+            };
             let initial = std::env::var("STUDIOFS_FETCH_INITIAL_WINDOW")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(16.0);
+                .unwrap_or(fetch_initial_window_default);
             let min = std::env::var("STUDIOFS_FETCH_MIN_WINDOW")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
@@ -779,11 +833,11 @@ impl StudioVfs {
             let max = std::env::var("STUDIOFS_FETCH_MAX_WINDOW")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(512.0);
+                .unwrap_or(fetch_max_window_default);
             let increase = std::env::var("STUDIOFS_FETCH_INCREASE_STEP")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(2.0);
+                .unwrap_or(fetch_increase_default);
             let decrease = std::env::var("STUDIOFS_FETCH_DECREASE_FACTOR")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
@@ -807,6 +861,7 @@ impl StudioVfs {
             data_read,
             block_cache.clone(),
             fetch_aimd_config,
+            prefetch_foreground_reserve,
         ));
 
         // Build AIMD config for upload scheduling from env or defaults.
@@ -2380,16 +2435,26 @@ impl StudioVfs {
     /// Like `read_block()` but silently ignores errors and always marks the
     /// readahead inflight state as done when finished.
     async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
-        // Skip if block is already cached (L1 or L2) — avoid any S3 I/O.
-        if let Ok(Some(block_ref)) = self.meta.get_file_block(ino, block_index) {
-            if self.block_cache.contains(block_ref.object_id) {
+        let block_ref = match self.meta.get_file_block(ino, block_index) {
+            Ok(Some(block_ref)) => block_ref,
+            _ => {
                 self.readahead.finish_prefetch(ino, block_index);
                 return;
             }
+        };
+
+        // Skip if block is already cached (L1 or L2) — avoid any S3 I/O.
+        if self.block_cache.contains(block_ref.object_id) {
+            self.readahead.finish_prefetch(ino, block_index);
+            return;
         }
 
-        // Fetch from cache or S3 (read_block handles all cache levels)
-        let _ = self.read_block(ino, block_index).await;
+        // Best-effort prefetch: keep reserved AIMD headroom for foreground reads.
+        let key = format_object_key(&self.data_prefix, block_ref.object_id);
+        let _ = self
+            .fetch_scheduler
+            .fetch_block_prefetch(block_ref.object_id, &key)
+            .await;
         self.readahead.finish_prefetch(ino, block_index);
     }
 
