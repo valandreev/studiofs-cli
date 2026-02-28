@@ -24,8 +24,8 @@ Holds all runtime state:
 | `cache_size` | 50 GiB | L2 disk cache budget |
 | `memory_limit` | 2 GiB | L1 memory cache budget |
 | `block_size` | 1 MiB | Block size (from format info) |
-| `max_concurrent_uploads` | 8 | Upload parallelism |
-| `readahead_width` | 8 | Max prefetch depth |
+| `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
+| `readahead_width` | 128 | Max prefetch depth |
 | `max_dirty_bytes` | 8 GiB | Dirty memory limit before backpressure |
 
 ## Write Path
@@ -88,9 +88,8 @@ Consumes from upload queue channel:
 PendingUpload received
   │
   ├─ Read block from cache (L1 or L2)
-  ├─ Compress with LZ4, compute xxh64 checksum
-  ├─ Create object (header + compressed payload)
-  ├─ PUT to S3 via AIMD-controlled DataStore
+  ├─ Build object (header + raw payload), compute xxh64 checksum
+  ├─ PUT to S3 via UploadScheduler (AIMD + retry/timeout policy)
   ├─ cache.complete_upload(pending) — unpin LRU entry
   │
   └─ On failure: requeue with backoff
@@ -142,13 +141,13 @@ fetch_block(object_id)
   ├─ Register singleflight entry
   ├─ Acquire AIMD permit (may block if at capacity)
   │
-  ├─ S3 GET with 8s timeout
-  ├─ Decompress + verify checksum
+  ├─ S3 GET with configurable timeout (default 30s)
+  ├─ Decode object + verify checksum
   ├─ Populate L1 + L2 cache
   ├─ Resolve AIMD permit (success/failure)
   │
   ├─ Broadcast result to singleflight waiters
-  └─ On failure: retry up to 5 times with exponential backoff (50ms–2s)
+  └─ On failure: retry up to 8 times with exponential backoff (50ms–2s by default)
 ```
 
 ### Fetch Metrics
@@ -172,10 +171,20 @@ Per-inode sequential read detection with adaptive prefetch depth.
 
 ### Algorithm
 
-- **Score** per inode: 0–8, starts at 0
-- Sequential read: score +1
+- **Score** per inode: 0–255, starts at 0
+- Sequential read: score increases (default `+4` per sequential block span)
 - Random read: score -2
-- Prefetch depth = `min(score, configured_width)`
+- Prefetch depth = `min(score, configured_width)`, with a minimum floor on sequential streams (default 16 blocks)
+
+Runtime tuning knobs:
+- `STUDIOFS_READAHEAD_WIDTH` (default `128`)
+- `STUDIOFS_READAHEAD_MIN_PREFETCH` (default `16`)
+- `STUDIOFS_READAHEAD_SEQ_STEP` (default `4`)
+- `STUDIOFS_READAHEAD_RANDOM_PENALTY` (default `2`)
+- `STUDIOFS_PREFETCH_CONCURRENCY` (default `128`)
+- `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `16`, keeps fetch headroom for direct reads)
+- `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `32`, caps prefetch scheduling burst per read call)
+- `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `1500`, temporarily pauses prefetch after transport send errors)
 
 On each `read()`:
 1. `record_read(ino, first_block, last_block)` returns blocks to prefetch
@@ -194,16 +203,16 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 | Field | Fetch Default | Upload Default |
 |-------|--------------|----------------|
-| `initial_window` | 2 | 2 |
+| `initial_window` | 16 | 16 |
 | `min_window` | 1 | 1 |
-| `max_window` | 32 | 8 |
-| `increase_step` | 1.0 | 0.5 |
-| `decrease_factor` | 0.5 | 0.5 |
-| `decrease_cooldown` | 5s | 5s |
+| `max_window` | 512 | 512 |
+| `increase_step` | 2.0 | 2.0 |
+| `decrease_factor` | 0.85 | 0.85 |
+| `decrease_cooldown` | 3s | 3s |
 
 ### Behavior
 
-- **Additive increase:** on success, window += `increase_step / current_window`
+- **Additive increase:** on success, window += `increase_step`
 - **Multiplicative decrease:** on failure, window *= `decrease_factor` (subject to cooldown)
 - **RAII permits:** `acquire()` blocks until window allows; permit resolved with `success()` or `failure()`
 

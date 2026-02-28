@@ -173,7 +173,7 @@ The background flusher runs every 10ms and drains continuously (keeps processing
 | L2 read (batch) | ~3 GB/s | Parallel `spawn_blocking` |
 | L2 write (single) | ~1.5 GB/s | `spawn_blocking` + write + rename |
 | L2 write (batch) | ~3 GB/s | Parallel `spawn_blocking` |
-| S3 upload | Variable | AIMD-controlled, LZ4 compressed |
+| S3 upload | Variable | AIMD-controlled, raw payload in STFS object |
 
 ## Crash Recovery
 

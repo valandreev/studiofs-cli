@@ -501,9 +501,12 @@ async fn test_block_allocation() {
     assert_eq!(blocks[1].0, 1);
     assert_eq!(blocks[2].0, 2);
 
-    // Verify each block is compressed
+    // Verify each block is stored uncompressed in metadata flags
     for (_, block_ref) in &blocks {
-        assert!(block_ref.is_compressed(), "Block should be compressed");
+        assert!(
+            !block_ref.is_compressed(),
+            "Block should not be marked compressed"
+        );
     }
 
     // Read back and verify
@@ -1016,13 +1019,13 @@ fn test_crash_recovery_replays_pending_journal() {
 async fn test_block_ref_flags() {
     // Test BlockRef flags
     let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
-    assert!(full_block.is_compressed());
+    assert!(!full_block.is_compressed());
     assert!(!full_block.is_partial());
     assert_eq!(full_block.object_id, 123);
     assert_eq!(full_block.length, 4 * 1024 * 1024);
 
     let partial_block = BlockRef::new_partial(456, 1000);
-    assert!(partial_block.is_compressed());
+    assert!(!partial_block.is_compressed());
     assert!(partial_block.is_partial());
     assert_eq!(partial_block.object_id, 456);
     assert_eq!(partial_block.length, 1000);

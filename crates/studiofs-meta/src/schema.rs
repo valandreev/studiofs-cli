@@ -272,10 +272,10 @@ pub struct DirEntryValue {
 // =============================================================================
 
 bitflags::bitflags! {
-    /// Block flags indicating compression and other properties.
+    /// Block flags indicating block properties.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct BlockFlags: u8 {
-        /// Block is compressed with LZ4.
+        /// Legacy flag from earlier builds that used LZ4 compression.
         const COMPRESSED_LZ4 = 0x01;
         /// Block is partial (not a full block, typically the last block of a file).
         const PARTIAL_BLOCK = 0x02;
@@ -284,13 +284,13 @@ bitflags::bitflags! {
 
 impl Default for BlockFlags {
     fn default() -> Self {
-        Self::COMPRESSED_LZ4
+        Self::empty()
     }
 }
 
 /// Block reference - stored in FILE_BLOCKS table.
 ///
-/// Points to an immutable S3 object containing compressed data.
+/// Points to an immutable S3 object containing block payload data.
 /// Key: (inode, block_index) - each block has a single owner.
 ///
 /// Design decisions:
@@ -316,7 +316,7 @@ impl BlockRef {
             object_id,
             offset: 0,
             length,
-            flags: BlockFlags::COMPRESSED_LZ4,
+            flags: BlockFlags::empty(),
         }
     }
 
@@ -326,7 +326,7 @@ impl BlockRef {
             object_id,
             offset: 0,
             length,
-            flags: BlockFlags::COMPRESSED_LZ4 | BlockFlags::PARTIAL_BLOCK,
+            flags: BlockFlags::PARTIAL_BLOCK,
         }
     }
 
@@ -616,11 +616,11 @@ mod tests {
     fn test_block_ref_flags() {
         let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
         assert!(!full_block.is_partial());
-        assert!(full_block.is_compressed());
+        assert!(!full_block.is_compressed());
 
         let partial_block = BlockRef::new_partial(124, 1000);
         assert!(partial_block.is_partial());
-        assert!(partial_block.is_compressed());
+        assert!(!partial_block.is_compressed());
     }
 
     #[test]

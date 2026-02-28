@@ -22,10 +22,20 @@ Different connection pools optimized for different workloads:
 | Profile | Timeout | Concurrency | Retries | Use Case |
 |---------|---------|-------------|---------|----------|
 | `Default` | 60s | 128 | default | General operations |
-| `Read` | 5s | 16 | 0 | Cache-miss fetches |
-| `Write` | 20s | 16 | default | S3 uploads |
+| `Read` | 30s | 256 | 0 | Cache-miss fetches |
+| `Write` | 90s | 256 | 1 | S3 uploads |
 
 **Pool separation:** `clone_for_reads()` and `clone_for_writes()` create dedicated `DataStore` instances with appropriate profiles, ensuring fast reads are not blocked by slow uploads.
+
+You can override profile settings via env vars (all optional):
+- `STUDIOFS_S3_READ_META_TIMEOUT_SECS`
+- `STUDIOFS_S3_READ_IO_TIMEOUT_SECS`
+- `STUDIOFS_S3_READ_MAX_RETRIES`
+- `STUDIOFS_S3_READ_CONCURRENT_LIMIT`
+- `STUDIOFS_S3_WRITE_META_TIMEOUT_SECS`
+- `STUDIOFS_S3_WRITE_IO_TIMEOUT_SECS`
+- `STUDIOFS_S3_WRITE_MAX_RETRIES`
+- `STUDIOFS_S3_WRITE_CONCURRENT_LIMIT`
 
 ### Operations
 
@@ -56,7 +66,7 @@ Object keys use 2-level directory sharding based on the object ID hex representa
 
 ## Object Format (`object.rs`)
 
-Immutable, content-addressable objects with compression and integrity verification.
+Immutable, content-addressable objects with integrity verification.
 
 ### Binary Layout
 
@@ -68,15 +78,11 @@ Immutable, content-addressable objects with compression and integrity verificati
 │ version  │ 2 (u16 LE)                       │
 │ flags    │ ObjectFlags bitfield (u16 LE)    │
 │ orig_sz  │ original size (u32 LE)           │
-│ comp_sz  │ compressed size (u32 LE)         │
-│ checksum │ xxh64 of uncompressed data (u64) │
+│ comp_sz  │ payload size (u32 LE)            │
+│ checksum │ xxh64 of payload data (u64)      │
 │ reserved │ 6 bytes (zero)                   │
 ├──────────┴──────────────────────────────────┤
-│ Payload (LZ4 compressed)                    │
-│ ┌──────────────────────────────────┐        │
-│ │ original_size (u32 LE prefix)    │        │
-│ │ LZ4 compressed data             │        │
-│ └──────────────────────────────────┘        │
+│ Payload (raw bytes, uncompressed)           │
 └─────────────────────────────────────────────┘
 ```
 
@@ -84,14 +90,14 @@ Immutable, content-addressable objects with compression and integrity verificati
 
 | Flag | Value | Description |
 |------|-------|-------------|
-| `LZ4_COMPRESSED` | 0x01 | Payload is LZ4 compressed |
+| `LZ4_COMPRESSED` | 0x01 | Legacy compressed payload (unsupported in current build) |
 | `HAS_FOOTER` | 0x02 | Object has a footer (reserved) |
 | `ENCRYPTED` | 0x04 | Object is encrypted (reserved) |
 
 ### Operations
 
-- `create_object(data)` — compress with LZ4, compute xxh64, build header + payload
-- `read_object(bytes)` — validate magic/version, decompress, verify checksum
+- `create_object(data)` — store raw payload, compute xxh64, build header + payload
+- `read_object(bytes)` — validate magic/version, verify checksum, return payload
 
 ### Constants
 
@@ -100,7 +106,7 @@ Immutable, content-addressable objects with compression and integrity verificati
 | `MAGIC` | `b"STFS"` |
 | `VERSION` | 2 |
 | `MAX_OBJECT_SIZE` | 64 MiB |
-| `DEFAULT_BLOCK_SIZE` | 4 MiB |
+| `DEFAULT_BLOCK_SIZE` | 1 MiB |
 
 ## Block Management (`block.rs`)
 
@@ -122,24 +128,16 @@ Blocks are referenced in metadata via `BlockRef`:
 struct BlockRef {
     object_id: u64,    // sequential ID of the S3 object
     offset: u64,       // offset within object (0 for one-block-per-object)
-    length: u32,       // uncompressed data length
-    flags: BlockFlags, // COMPRESSED_LZ4 | PARTIAL_BLOCK
+    length: u32,       // payload data length
+    flags: BlockFlags, // PARTIAL_BLOCK (+ legacy COMPRESSED_LZ4)
 }
 ```
 
 | Flag | Value | Meaning |
 |------|-------|---------|
-| `COMPRESSED_LZ4` | 0x01 | Referenced object is LZ4 compressed |
+| `COMPRESSED_LZ4` | 0x01 | Legacy flag (unsupported for new writes) |
 | `PARTIAL_BLOCK` | 0x02 | Block is smaller than `block_size` (last block of a file) |
-
-## Compression
-
-StudioFS uses **LZ4** (via `lz4_flex`) for all data objects:
-
-- Fast compression/decompression (~4 GB/s throughput)
-- Prepends original size as `u32 LE` before compressed data (for pre-allocation during decompression)
-- Data is stored compressed in S3 but **decompressed in L1/L2 cache** for zero-copy reads
 
 ## Integrity
 
-All objects include an **xxh64** checksum of the uncompressed data in the header. On read, the checksum is verified after decompression.
+All objects include an **xxh64** checksum of payload data in the header. On read, the checksum is verified before returning bytes.

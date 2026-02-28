@@ -5,7 +5,7 @@
 //!
 //! Architecture Key Changes:
 //! - Fixed 32-byte header (was 22 bytes)
-//! - Added flags field for compression/encryption
+//! - Added flags field for future encryption/footer features
 //! - Version bumped to 2
 //! - Objects are immutable and content-addressable by sequential ID
 
@@ -42,8 +42,8 @@ pub enum ObjectError {
     UnsupportedVersion(u16),
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-    #[error("decompression failed: {0}")]
-    DecompressionFailed(String),
+    #[error("legacy compressed object is not supported in this build")]
+    LegacyCompressionUnsupported,
     #[error("checksum mismatch: expected {expected:016x}, got {computed:016x}")]
     ChecksumMismatch { expected: u64, computed: u64 },
     #[error("object too large: {0} bytes")]
@@ -60,8 +60,9 @@ bitflags::bitflags! {
     /// Flags indicating object properties.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ObjectFlags: u16 {
-        /// Object is compressed with LZ4.
-        const LZ4_COMPRESSED = 0x0001;
+        /// Legacy flag from older builds that used LZ4 compression.
+        /// This build rejects such objects.
+        const LEGACY_LZ4_COMPRESSED = 0x0001;
         /// Object has footer checksum (future use).
         const HAS_FOOTER = 0x0002;
         /// Object is encrypted (future use).
@@ -71,7 +72,7 @@ bitflags::bitflags! {
 
 impl Default for ObjectFlags {
     fn default() -> Self {
-        Self::LZ4_COMPRESSED
+        Self::empty()
     }
 }
 
@@ -112,7 +113,7 @@ pub struct ObjectHeader {
     pub flags: ObjectFlags,
     /// Original uncompressed size.
     pub original_size: u32,
-    /// Compressed size (excluding header).
+    /// Payload size (excluding header).
     pub compressed_size: u32,
     /// XXH64 checksum of ORIGINAL data.
     pub checksum: u64,
@@ -125,7 +126,7 @@ impl Default for ObjectHeader {
         Self {
             magic: *MAGIC,
             version: VERSION,
-            flags: ObjectFlags::LZ4_COMPRESSED,
+            flags: ObjectFlags::empty(),
             original_size: 0,
             compressed_size: 0,
             checksum: 0,
@@ -143,7 +144,7 @@ impl ObjectHeader {
         Self {
             magic: *MAGIC,
             version: VERSION,
-            flags: ObjectFlags::LZ4_COMPRESSED,
+            flags: ObjectFlags::empty(),
             original_size,
             compressed_size,
             checksum,
@@ -229,7 +230,7 @@ impl ObjectHeader {
 
     /// Check if object is compressed.
     pub fn is_compressed(&self) -> bool {
-        self.flags.contains(ObjectFlags::LZ4_COMPRESSED)
+        self.flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED)
     }
 
     /// Check if object has footer.
@@ -244,144 +245,52 @@ impl ObjectHeader {
 }
 
 // =============================================================================
-// Compression Functions
-// =============================================================================
-
-/// Compress data using LZ4 frame format.
-///
-/// Uses LZ4 frame format for better compatibility and streaming support.
-/// Returns compressed data with size header prepended.
-pub fn compress(data: &[u8]) -> Vec<u8> {
-    lz4_flex::compress_prepend_size(data)
-}
-
-/// Decompress LZ4 data with size header.
-///
-/// Expects data compressed with `compress()` (size-prepended format).
-pub fn decompress(compressed_data: &[u8]) -> Result<Vec<u8>, ObjectError> {
-    lz4_flex::decompress_size_prepended(compressed_data).map_err(|e| {
-        ObjectError::DecompressionFailed(format!(
-            "LZ4 decompression failed: {} (input size: {})",
-            e,
-            compressed_data.len()
-        ))
-    })
-}
-
-// =============================================================================
 // Object Creation and Reading
 // =============================================================================
 
-/// Create a full object (Header + Compressed Payload).
+/// Create a full object (Header + Payload).
 ///
 /// This is the primary function for creating S3 objects.
 /// The returned bytes are ready to be uploaded to S3.
 ///
 /// # Arguments
-/// * `data` - Uncompressed data to store
+/// * `data` - Raw block payload to store
 ///
 /// # Returns
-/// Complete object bytes (header + compressed payload)
+/// Complete object bytes (header + payload)
 pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
-    // Validate size
-    if data.len() > MAX_OBJECT_SIZE as usize {
-        return Err(ObjectError::ObjectTooLarge(data.len() as u64));
-    }
-
-    // Calculate checksum of original data
-    let checksum = xxh64(data, 0);
-
-    // Pre-allocate single buffer for Header + Size Prefix (4 bytes) + LZ4 payload
-    let max_compressed_size = lz4_flex::block::get_maximum_output_size(data.len());
-    let mut object = vec![0u8; ObjectHeader::SIZE + 4 + max_compressed_size];
-
-    // Compress payload leaving space for header and size prefix
-    let compressed_size =
-        match lz4_flex::block::compress_into(data, &mut object[ObjectHeader::SIZE + 4..]) {
-            Ok(size) => size,
-            Err(_) => {
-                return Err(ObjectError::DecompressionFailed(
-                    "LZ4 compression failed".to_string(),
-                ));
-            }
-        };
-
-    // Write the uncompressed size as the first 4 bytes of the payload (lz4_flex size-prepended format)
-    object[ObjectHeader::SIZE..ObjectHeader::SIZE + 4]
-        .copy_from_slice(&(data.len() as u32).to_le_bytes());
-
-    let total_compressed_payload_size = compressed_size + 4;
-
-    // Create header and write it to the start of the buffer
-    let header = ObjectHeader::new(
-        data.len() as u32,
-        total_compressed_payload_size as u32,
-        checksum,
-    );
-    object[..ObjectHeader::SIZE].copy_from_slice(&header.to_bytes());
-
-    // Truncate vector to exact size
-    object.truncate(ObjectHeader::SIZE + total_compressed_payload_size);
-
-    Ok(object)
+    create_object_with_flags(data, ObjectFlags::empty())
 }
 
 /// Create an object with custom flags.
 ///
-/// Use this for special cases like uncompressed objects.
+/// Compression flags are not supported in this build.
 pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u8>, ObjectError> {
     if data.len() > MAX_OBJECT_SIZE as usize {
         return Err(ObjectError::ObjectTooLarge(data.len() as u64));
     }
+    if flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED) {
+        return Err(ObjectError::LegacyCompressionUnsupported);
+    }
 
     let checksum = xxh64(data, 0);
-
-    if flags.contains(ObjectFlags::LZ4_COMPRESSED) {
-        let max_compressed_size = lz4_flex::block::get_maximum_output_size(data.len());
-        let mut object = vec![0u8; ObjectHeader::SIZE + 4 + max_compressed_size];
-
-        let compressed_size =
-            match lz4_flex::block::compress_into(data, &mut object[ObjectHeader::SIZE + 4..]) {
-                Ok(size) => size,
-                Err(_) => {
-                    return Err(ObjectError::DecompressionFailed(
-                        "LZ4 compression failed".to_string(),
-                    ));
-                }
-            };
-
-        object[ObjectHeader::SIZE..ObjectHeader::SIZE + 4]
-            .copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let total_payload_size = compressed_size + 4;
-
-        let header = ObjectHeader::with_flags(
-            data.len() as u32,
-            total_payload_size as u32,
-            checksum,
-            flags,
-        );
-        object[..ObjectHeader::SIZE].copy_from_slice(&header.to_bytes());
-        object.truncate(ObjectHeader::SIZE + total_payload_size);
-        Ok(object)
-    } else {
-        let size = data.len() as u32;
-        let header = ObjectHeader::with_flags(size, size, checksum, flags);
-        let mut object = Vec::with_capacity(ObjectHeader::SIZE + data.len());
-        object.extend_from_slice(&header.to_bytes());
-        object.extend_from_slice(data);
-        Ok(object)
-    }
+    let size = data.len() as u32;
+    let header = ObjectHeader::with_flags(size, size, checksum, flags);
+    let mut object = Vec::with_capacity(ObjectHeader::SIZE + data.len());
+    object.extend_from_slice(&header.to_bytes());
+    object.extend_from_slice(data);
+    Ok(object)
 }
 
-/// Read and decompress an object.
+/// Read and validate an object.
 ///
-/// Validates header, checksum, and decompresses payload.
+/// Validates header and checksum, then returns raw payload bytes.
 ///
 /// # Arguments
 /// * `data` - Complete object bytes (header + payload)
 ///
 /// # Returns
-/// Decompressed original data
+/// Original payload data
 pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     if data.len() < ObjectHeader::SIZE {
         return Err(
@@ -402,15 +311,13 @@ pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
         );
     }
 
-    // Decompress based on flags
-    let decompressed = if header.is_compressed() {
-        decompress(payload)?
-    } else {
-        payload.to_vec()
-    };
+    if header.is_compressed() {
+        return Err(ObjectError::LegacyCompressionUnsupported);
+    }
+    let raw = payload.to_vec();
 
     // Verify checksum
-    let computed_checksum = xxh64(&decompressed, 0);
+    let computed_checksum = xxh64(&raw, 0);
     if computed_checksum != header.checksum {
         return Err(ObjectError::ChecksumMismatch {
             expected: header.checksum,
@@ -418,10 +325,10 @@ pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
         });
     }
 
-    Ok(decompressed)
+    Ok(raw)
 }
 
-/// Read object header only (without decompressing payload).
+/// Read object header only (without loading payload bytes into a second buffer).
 ///
 /// Useful for quick metadata inspection.
 pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
@@ -624,9 +531,9 @@ mod tests {
         let original_data = b"Hello, StudioFS! This is a test of the object format.";
 
         let object = create_object(original_data).unwrap();
-        let decompressed = read_object(&object).unwrap();
+        let decoded = read_object(&object).unwrap();
 
-        assert_eq!(original_data.as_slice(), decompressed.as_slice());
+        assert_eq!(original_data.as_slice(), decoded.as_slice());
     }
 
     #[test]
@@ -635,9 +542,9 @@ mod tests {
         let original_data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
 
         let object = create_object(&original_data).unwrap();
-        let decompressed = read_object(&object).unwrap();
+        let decoded = read_object(&object).unwrap();
 
-        assert_eq!(original_data, decompressed);
+        assert_eq!(original_data, decoded);
     }
 
     #[test]
@@ -697,9 +604,9 @@ mod tests {
 
     #[test]
     fn test_object_flags() {
-        let flags = ObjectFlags::LZ4_COMPRESSED | ObjectFlags::HAS_FOOTER;
+        let flags = ObjectFlags::HAS_FOOTER;
 
-        assert!(flags.contains(ObjectFlags::LZ4_COMPRESSED));
+        assert!(!flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED));
         assert!(flags.contains(ObjectFlags::HAS_FOOTER));
         assert!(!flags.contains(ObjectFlags::ENCRYPTED));
     }
@@ -710,8 +617,29 @@ mod tests {
         let flags = ObjectFlags::empty();
 
         let object = create_object_with_flags(data, flags).unwrap();
-        let decompressed = read_object(&object).unwrap();
+        let decoded = read_object(&object).unwrap();
 
-        assert_eq!(data.as_slice(), decompressed.as_slice());
+        assert_eq!(data.as_slice(), decoded.as_slice());
+    }
+
+    #[test]
+    fn test_legacy_compressed_object_rejected() {
+        let data = b"legacy-compressed-data";
+        let checksum = xxh64(data, 0);
+        let header = ObjectHeader::with_flags(
+            data.len() as u32,
+            data.len() as u32,
+            checksum,
+            ObjectFlags::LEGACY_LZ4_COMPRESSED,
+        );
+        let mut object = Vec::with_capacity(ObjectHeader::SIZE + data.len());
+        object.extend_from_slice(&header.to_bytes());
+        object.extend_from_slice(data);
+
+        let result = read_object(&object);
+        assert!(matches!(
+            result,
+            Err(ObjectError::LegacyCompressionUnsupported)
+        ));
     }
 }

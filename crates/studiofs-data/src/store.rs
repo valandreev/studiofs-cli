@@ -36,13 +36,13 @@ pub enum IoProfile {
     /// Default: balanced for mixed read/write workloads.
     /// io_timeout=60s, concurrent_limit=128, retries=3.
     Default,
-    /// Optimised for reads: lower timeout so stale connections fail fast,
-    /// dedicated connection pool so uploads can never starve reads.
-    /// io_timeout=20s, concurrent_limit=16, retries=3.
+    /// Optimised for reads: dedicated connection pool so uploads can never
+    /// starve reads.
+    /// io_timeout=30s, concurrent_limit=256, retries=0.
     Read,
-    /// Optimised for writes (uploads, deletes): moderate timeout, small pool
-    /// to avoid overwhelming the backend (WAN-friendly).
-    /// io_timeout=30s, concurrent_limit=16, retries=3.
+    /// Optimised for writes (uploads, deletes): higher timeout budget for
+    /// high-latency object stores.
+    /// io_timeout=90s, concurrent_limit=256, retries=1.
     Write,
 }
 
@@ -90,19 +90,59 @@ impl DataStore {
             builder = builder.region("us-east-1");
         }
 
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        }
+
+        fn env_usize(key: &str, default: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        }
+
         // Per-profile tuning of timeouts, retries, and concurrency.
         //
-        // Read profile: short io_timeout for FAST failure so the VFS
-        // FetchScheduler can retry immediately on a fresh connection.
-        // NO OpenDAL retries — stacking retries multiplies the stall time
-        // (OpenDAL waits 5s, retries, waits 5s again = 10s before
-        // FetchScheduler even sees the error).  FetchScheduler handles
-        // all retry logic with AIMD back-pressure.
-        let (meta_timeout_s, io_timeout_s, max_retries, concurrent_limit) = match profile {
+        // Read profile: generous io_timeout for high-latency object stores.
+        // NO OpenDAL retries on reads — FetchScheduler owns retry logic and
+        // adaptive back-pressure, avoiding stacked retry delays across layers.
+        let (
+            default_meta_timeout_s,
+            default_io_timeout_s,
+            default_max_retries,
+            default_concurrent_limit,
+        ): (u64, u64, usize, usize) = match profile {
             IoProfile::Default => (10, 60, 3, 128),
-            IoProfile::Read => (3, 5, 0, 16),
-            IoProfile::Write => (10, 20, 3, 16),
+            IoProfile::Read => (3, 30, 0, 256),
+            IoProfile::Write => (10, 90, 1, 256),
         };
+
+        let profile_key = match profile {
+            IoProfile::Default => "DEFAULT",
+            IoProfile::Read => "READ",
+            IoProfile::Write => "WRITE",
+        };
+        let meta_timeout_s = env_u64(
+            &format!("STUDIOFS_S3_{}_META_TIMEOUT_SECS", profile_key),
+            default_meta_timeout_s,
+        );
+        let io_timeout_s = env_u64(
+            &format!("STUDIOFS_S3_{}_IO_TIMEOUT_SECS", profile_key),
+            default_io_timeout_s,
+        );
+        let max_retries = env_usize(
+            &format!("STUDIOFS_S3_{}_MAX_RETRIES", profile_key),
+            default_max_retries,
+        );
+        let concurrent_limit = env_usize(
+            &format!("STUDIOFS_S3_{}_CONCURRENT_LIMIT", profile_key),
+            default_concurrent_limit,
+        );
 
         let op = Operator::new(builder)?
             // TimeoutLayer MUST come before RetryLayer (see opendal docs).
@@ -126,7 +166,9 @@ impl DataStore {
 
         info!(
             profile = ?profile,
+            meta_timeout_s,
             io_timeout_s,
+            max_retries,
             concurrent_limit,
             "connected to S3: endpoint={}, bucket={}",
             config.endpoint, config.bucket,

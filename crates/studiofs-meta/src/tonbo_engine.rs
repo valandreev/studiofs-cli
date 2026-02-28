@@ -1,8 +1,8 @@
 use crate::engine::{MetaEngine, MetaError, MetaResult};
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use crate::types::*;
-use async_nats::jetstream;
 use async_nats::Client as NatsClient;
+use async_nats::jetstream;
 use opendal::options::WriteOptions;
 use opendal::services::S3;
 use parking_lot::Mutex;
@@ -207,9 +207,9 @@ impl TonboMetaEngine {
             })
             .await
         };
-        self.run_on_internal_rt(fut)
-            .map(|_| ())
-            .map_err(|e| MetaError::Storage(format!("failed to ensure NATS invalidation stream: {e}")))
+        self.run_on_internal_rt(fut).map(|_| ()).map_err(|e| {
+            MetaError::Storage(format!("failed to ensure NATS invalidation stream: {e}"))
+        })
     }
 
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
@@ -368,10 +368,16 @@ impl TonboMetaEngine {
             if let Err(err) = engine.ensure_invalidation_stream() {
                 match engine.nats_delivery_mode {
                     NatsDeliveryMode::Auto => {
-                        warn!("JetStream invalidation stream unavailable, falling back to core NATS publish: {}", err);
+                        warn!(
+                            "JetStream invalidation stream unavailable, falling back to core NATS publish: {}",
+                            err
+                        );
                     }
                     NatsDeliveryMode::JetStream => {
-                        warn!("JetStream invalidation stream setup failed (STUDIOFS_NATS_DELIVERY=jetstream): {}", err);
+                        warn!(
+                            "JetStream invalidation stream setup failed (STUDIOFS_NATS_DELIVERY=jetstream): {}",
+                            err
+                        );
                     }
                     NatsDeliveryMode::Core => {}
                 }

@@ -2641,7 +2641,7 @@ mod tests {
         let retrieved = engine.get_file_block(ino, 0).unwrap().unwrap();
         assert_eq!(retrieved.object_id, 1);
         assert_eq!(retrieved.length, 4 * 1024 * 1024);
-        assert!(retrieved.is_compressed());
+        assert!(!retrieved.is_compressed());
         assert!(!retrieved.is_partial());
 
         // Add another block

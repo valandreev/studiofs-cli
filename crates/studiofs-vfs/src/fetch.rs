@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::BlockCache;
 use studiofs_data::object::read_object;
 use studiofs_data::store::{DataError, DataStore};
@@ -26,23 +26,11 @@ use tracing::{debug, error, info, warn};
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maximum retries *within* the FetchScheduler (includes the initial attempt).
-/// With io_timeout=5s per attempt and 50ms base delay, worst case is
-/// 5 × (5s + ~0.1s) ≈ 25s total.  In practice the connection pool warms up
-/// after 1–2 failures, so typical cold-start stall is ~5–10s.
-const MAX_FETCH_ATTEMPTS: u32 = 5;
-
-/// Per-request hard timeout (independent of OpenDAL layers).
-/// Must be > io_timeout (5s) to let OpenDAL finish normally.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Base delay between retries.  Kept very short because the purpose of
-/// the retry is to get a fresh TCP connection, not to wait for the server
-/// to recover.
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
-
-/// Maximum per-attempt delay cap.
-const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+/// Defaults for retry/timeout tuning (all overrideable via env).
+const DEFAULT_MAX_FETCH_ATTEMPTS: u32 = 8;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_RETRY_BASE_MS: u64 = 50;
+const DEFAULT_RETRY_MAX_MS: u64 = 2_000;
 
 /// Capacity of the broadcast channel used for singleflight notifications.
 const BROADCAST_CAPACITY: usize = 2;
@@ -127,6 +115,16 @@ pub struct FetchScheduler {
     data_store: Arc<DataStore>,
     /// Unified block cache (L1 RAM + L2 NVMe).
     cache: Arc<BlockCache>,
+    /// Maximum attempts per fetch operation.
+    max_fetch_attempts: u32,
+    /// Per-request hard timeout.
+    request_timeout: Duration,
+    /// Base backoff delay between retries.
+    retry_base_delay: Duration,
+    /// Maximum per-attempt backoff delay.
+    retry_max_delay: Duration,
+    /// Last observed send-request network error timestamp (unix ms).
+    last_send_error_ms: AtomicU64,
     /// Metrics.
     pub metrics: FetchMetrics,
 }
@@ -143,9 +141,37 @@ impl FetchScheduler {
         cache: Arc<BlockCache>,
         aimd_config: AimdConfig,
     ) -> Self {
+        fn env_u32(key: &str, default: u32) -> u32 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        }
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        }
+
+        let max_fetch_attempts = env_u32("STUDIOFS_FETCH_MAX_ATTEMPTS", DEFAULT_MAX_FETCH_ATTEMPTS);
+        let request_timeout_s = env_u64(
+            "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
+            DEFAULT_REQUEST_TIMEOUT_SECS,
+        );
+        let retry_base_ms = env_u64("STUDIOFS_FETCH_RETRY_BASE_MS", DEFAULT_RETRY_BASE_MS);
+        let retry_max_ms =
+            env_u64("STUDIOFS_FETCH_RETRY_MAX_MS", DEFAULT_RETRY_MAX_MS).max(retry_base_ms);
+
         info!(
             initial_window = aimd_config.initial_window,
             max_window = aimd_config.max_window,
+            max_fetch_attempts,
+            request_timeout_s,
+            retry_base_ms,
+            retry_max_ms,
             "FetchScheduler created"
         );
         Self {
@@ -153,13 +179,18 @@ impl FetchScheduler {
             inflight: DashMap::new(),
             data_store,
             cache,
+            max_fetch_attempts,
+            request_timeout: Duration::from_secs(request_timeout_s),
+            retry_base_delay: Duration::from_millis(retry_base_ms),
+            retry_max_delay: Duration::from_millis(retry_max_ms),
+            last_send_error_ms: AtomicU64::new(0),
             metrics: FetchMetrics::new(),
         }
     }
 
     // ── Public API ──────────────────────────────────────────────────────
 
-    /// Fetch a block, returning decompressed data.
+    /// Fetch a block, returning validated raw payload data.
     ///
     /// This is the **single entry-point** for all remote reads.  It handles:
     /// 1. L1/L2 cache check (fast path).
@@ -328,14 +359,23 @@ impl FetchScheduler {
         &self.data_store
     }
 
+    /// True if a send-request network error happened recently.
+    pub fn recent_send_error(&self, within: Duration) -> bool {
+        let ts = self.last_send_error_ms.load(Ordering::Relaxed);
+        if ts == 0 {
+            return false;
+        }
+        now_millis().saturating_sub(ts) <= within.as_millis() as u64
+    }
+
     // ── Internal ────────────────────────────────────────────────────
 
-    /// Perform the actual S3 GET with retries, AIMD permit, decompress, cache.
+    /// Perform the actual S3 GET with retries, AIMD permit, decode, cache.
     async fn do_fetch_with_retry(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
 
-        for attempt in 0..MAX_FETCH_ATTEMPTS {
+        for attempt in 0..self.max_fetch_attempts {
             // Acquire an AIMD permit — blocks until the concurrency window
             // allows another in-flight request.
             let wait_start = Instant::now();
@@ -354,7 +394,7 @@ impl FetchScheduler {
             // blocking WinFSP/FUSE dispatch threads indefinitely.
             let req_start = Instant::now();
             let get_result =
-                tokio::time::timeout(REQUEST_TIMEOUT, self.data_store.get_by_key(key)).await;
+                tokio::time::timeout(self.request_timeout, self.data_store.get_by_key(key)).await;
             let req_ms = req_start.elapsed().as_millis();
 
             match get_result {
@@ -375,16 +415,16 @@ impl FetchScheduler {
                         "S3 GET ok"
                     );
 
-                    // Decompress.
-                    let decompressed = Bytes::from(read_object(&compressed)?);
+                    // Decode STFS object payload.
+                    let payload = Bytes::from(read_object(&compressed)?);
 
                     // Populate cache (L1 + L2).
                     self.cache
-                        .put(object_id, decompressed.clone())
+                        .put(object_id, payload.clone())
                         .await
                         .map_err(FetchError::CacheWrite)?;
 
-                    return Ok(decompressed);
+                    return Ok(payload);
                 }
                 Ok(Err(e)) => {
                     // NotFound — data consistency issue, NOT a server
@@ -403,9 +443,16 @@ impl FetchScheduler {
                     // window.  Persistent/timeout errors are connection-
                     // level issues — penalising them causes cascading
                     // window collapse that stalls the whole system.
+                    let is_send_error = is_send_request_error(&e);
+                    if is_send_error {
+                        self.last_send_error_ms
+                            .store(now_millis(), Ordering::Relaxed);
+                    }
+
                     let is_server_overload = match &e {
                         DataError::OpenDal(oe) => {
-                            oe.kind() == ErrorKind::RateLimited || oe.is_temporary()
+                            oe.kind() == ErrorKind::RateLimited
+                                || (oe.is_temporary() && !is_send_error)
                         }
                         _ => false,
                     };
@@ -419,25 +466,32 @@ impl FetchScheduler {
 
                     self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
 
-                    if attempt + 1 < MAX_FETCH_ATTEMPTS {
-                        let delay = RETRY_BASE_DELAY
+                    if attempt + 1 < self.max_fetch_attempts {
+                        let retry_base = if is_send_error {
+                            self.retry_base_delay.max(Duration::from_millis(200))
+                        } else {
+                            self.retry_base_delay
+                        };
+                        let delay = retry_base
                             .saturating_mul(2u32.saturating_pow(attempt))
-                            .min(RETRY_MAX_DELAY);
+                            .min(self.retry_max_delay);
+                        let delay = jittered_delay(delay, object_id, attempt);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             attempt = attempt + 1,
-                            max = MAX_FETCH_ATTEMPTS,
+                            max = self.max_fetch_attempts,
                             key,
                             req_ms,
                             delay_ms = delay.as_millis() as u64,
                             is_server_overload,
+                            is_send_error,
                             error = %e,
                             "fetch failed, retrying"
                         );
                         tokio::time::sleep(delay).await;
                     } else {
                         error!(
-                            attempts = MAX_FETCH_ATTEMPTS,
+                            attempts = self.max_fetch_attempts,
                             key,
                             req_ms,
                             total_ms = overall_start.elapsed().as_millis() as u64,
@@ -457,26 +511,27 @@ impl FetchScheduler {
 
                     let timeout_err = DataError::Storage(format!(
                         "request timeout after {}s",
-                        REQUEST_TIMEOUT.as_secs()
+                        self.request_timeout.as_secs()
                     ));
 
-                    if attempt + 1 < MAX_FETCH_ATTEMPTS {
-                        let delay = RETRY_BASE_DELAY
+                    if attempt + 1 < self.max_fetch_attempts {
+                        let delay = self
+                            .retry_base_delay
                             .saturating_mul(2u32.saturating_pow(attempt))
-                            .min(RETRY_MAX_DELAY);
+                            .min(self.retry_max_delay);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             attempt = attempt + 1,
-                            max = MAX_FETCH_ATTEMPTS,
+                            max = self.max_fetch_attempts,
                             key,
-                            timeout_s = REQUEST_TIMEOUT.as_secs(),
+                            timeout_s = self.request_timeout.as_secs(),
                             delay_ms = delay.as_millis() as u64,
                             "fetch timed out, retrying (AIMD window unchanged)"
                         );
                         tokio::time::sleep(delay).await;
                     } else {
                         error!(
-                            attempts = MAX_FETCH_ATTEMPTS,
+                            attempts = self.max_fetch_attempts,
                             key,
                             total_ms = overall_start.elapsed().as_millis() as u64,
                             "fetch timed out, all retries exhausted"
@@ -489,10 +544,45 @@ impl FetchScheduler {
         }
 
         Err(FetchError::Exhausted {
-            attempts: MAX_FETCH_ATTEMPTS,
+            attempts: self.max_fetch_attempts,
             source: last_err.expect("at least one error"),
         })
     }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn is_send_request_error(err: &DataError) -> bool {
+    match err {
+        DataError::OpenDal(oe) => {
+            oe.kind() == ErrorKind::Unexpected
+                && oe
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("send http request")
+        }
+        _ => false,
+    }
+}
+
+fn jittered_delay(base: Duration, object_id: u64, attempt: u32) -> Duration {
+    let base_ms = base.as_millis() as u64;
+    if base_ms == 0 {
+        return base;
+    }
+    let time = now_millis();
+    let mut seed = object_id ^ ((attempt as u64) << 32) ^ time;
+    seed ^= seed >> 12;
+    seed ^= seed << 25;
+    seed ^= seed >> 27;
+    let jitter_pct = 70 + (seed % 61); // [70..130]
+    let ms = base_ms.saturating_mul(jitter_pct).saturating_div(100);
+    Duration::from_millis(ms.max(1))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

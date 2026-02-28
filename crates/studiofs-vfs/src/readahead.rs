@@ -10,7 +10,8 @@
 //!
 //! - If the new first block follows the previous last block consecutively
 //!   the score increments (up to MAX_SCORE).
-//! - Otherwise the score decrements by 2.
+//! - If the reader is still inside the same block, the score is unchanged.
+//! - Any other jump decrements the score by 2.
 //!
 //! The number of blocks to prefetch equals the current score (capped at
 //! `width`).  So only truly sequential readers get aggressive prefetching while
@@ -27,7 +28,7 @@ use std::collections::HashSet;
 use studiofs_meta::types::Ino;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
-const MAX_SCORE: u8 = 8;
+const MAX_SCORE: u8 = 255;
 
 // =============================================================================
 // Internal state
@@ -52,6 +53,12 @@ pub struct ReadAheadTracker {
     inflight: DashMap<(Ino, u32), ()>,
     /// How many blocks ahead to fetch when fully ramped-up.
     pub width: u32,
+    /// Lower bound for prefetch depth once sequential access is detected.
+    min_prefetch_on_seq: u32,
+    /// Score increase per sequential span block.
+    sequential_step: u8,
+    /// Score penalty for random jumps.
+    random_penalty: u8,
 }
 
 impl ReadAheadTracker {
@@ -60,10 +67,27 @@ impl ReadAheadTracker {
     /// `width` — maximum number of blocks to prefetch ahead (e.g. 8 = 32 MB
     /// look-ahead with 4 MB blocks).
     pub fn new(width: u32) -> Self {
+        Self::new_with_tuning(width, 1, 1, 2)
+    }
+
+    /// Create a tracker with custom scoring and prefetch tuning.
+    pub fn new_with_tuning(
+        width: u32,
+        min_prefetch_on_seq: u32,
+        sequential_step: u8,
+        random_penalty: u8,
+    ) -> Self {
+        let width = width.max(1);
+        let min_prefetch_on_seq = min_prefetch_on_seq.max(1).min(width);
+        let sequential_step = sequential_step.max(1);
+        let random_penalty = random_penalty.max(1);
         Self {
             states: DashMap::new(),
             inflight: DashMap::new(),
             width,
+            min_prefetch_on_seq,
+            sequential_step,
+            random_penalty,
         }
     }
 
@@ -79,14 +103,25 @@ impl ReadAheadTracker {
 
         // Detect sequential continuation: the new read must start exactly at
         // the block immediately after where we left off.
-        // Re-reads (same block) and backward seeks both decrease the score.
+        //
+        // Important for WinFSP/FUSE small reads: many sequential workloads
+        // issue multiple requests within the same block before crossing the
+        // boundary. Re-reads of the same block should not suppress prefetch.
+        let is_same_block = state.last_block != u32::MAX && first_block == state.last_block;
         let is_sequential =
             state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
 
+        let span_blocks = last_block.saturating_sub(first_block).saturating_add(1);
+        let seq_gain = (self.sequential_step as u32)
+            .saturating_mul(span_blocks)
+            .min(MAX_SCORE as u32) as u8;
+
         if is_sequential {
-            state.score = (state.score + 1).min(MAX_SCORE);
+            state.score = state.score.saturating_add(seq_gain).min(MAX_SCORE);
+        } else if is_same_block {
+            // Keep score as-is.
         } else {
-            state.score = state.score.saturating_sub(2);
+            state.score = state.score.saturating_sub(self.random_penalty);
         }
 
         state.last_block = last_block;
@@ -98,7 +133,12 @@ impl ReadAheadTracker {
         }
 
         // Return up to `min(score, width)` blocks beyond last_block.
-        let prefetch_count = self.width.min(score as u32);
+        let mut prefetch_count = self.width.min(score as u32);
+        if (is_sequential || is_same_block) && score > 0 {
+            // For small sequential reads over high-latency links, keep a
+            // minimum look-ahead window to avoid throughput oscillation.
+            prefetch_count = prefetch_count.max(self.min_prefetch_on_seq.min(self.width));
+        }
         (1..=prefetch_count)
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
@@ -172,14 +212,14 @@ mod tests {
         let p = tracker.record_read(1, 2, 2);
         assert_eq!(p, vec![3, 4], "score=2 → 2 blocks ahead");
 
-        // Keep going until score is capped at MAX_SCORE=8
+        // Keep going until score is capped at MAX_SCORE.
         let mut last = 2u32;
         for _ in 0..10 {
             last += 1;
             let _ = tracker.record_read(1, last, last);
         }
         let blocks = tracker.record_read(1, last + 1, last + 1);
-        // Score capped at 8 = MAX_SCORE, width=8 → at most 8 blocks prefetched
+        // Prefetch is still capped by width=8.
         assert!(blocks.len() <= 8, "prefetch depth should not exceed width");
     }
 
@@ -252,6 +292,28 @@ mod tests {
     }
 
     #[test]
+    fn test_same_block_reads_do_not_decay_score() {
+        let tracker = ReadAheadTracker::new(8);
+
+        // Establish initial sequential signal (score=1).
+        let _ = tracker.record_read(1, 0, 0);
+        let _ = tracker.record_read(1, 1, 1);
+
+        // Multiple same-block reads should not decay prefetch score.
+        let p1 = tracker.record_read(1, 1, 1);
+        let p2 = tracker.record_read(1, 1, 1);
+
+        assert!(
+            !p1.is_empty(),
+            "same-block reread should keep prefetch active"
+        );
+        assert!(
+            !p2.is_empty(),
+            "same-block reread should keep prefetch active"
+        );
+    }
+
+    #[test]
     fn test_multi_block_read() {
         let tracker = ReadAheadTracker::new(8);
 
@@ -297,6 +359,23 @@ mod tests {
         // Inode 2 should start fresh
         let p = tracker.record_read(2, 0, 0);
         assert!(p.is_empty(), "separate inodes track state independently");
+    }
+
+    #[test]
+    fn test_aggressive_min_prefetch_window() {
+        let tracker = ReadAheadTracker::new_with_tuning(64, 16, 4, 2);
+
+        // Initial read establishes baseline (no prefetch yet).
+        let p0 = tracker.record_read(1, 0, 0);
+        assert!(p0.is_empty());
+
+        // First sequential boundary should immediately open a larger window.
+        let p1 = tracker.record_read(1, 1, 1);
+        assert!(
+            p1.len() >= 16,
+            "aggressive tuning should prefetch at least 16 blocks"
+        );
+        assert_eq!(p1[0], 2);
     }
 }
 
