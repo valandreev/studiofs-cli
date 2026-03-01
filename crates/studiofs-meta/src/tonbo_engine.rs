@@ -13,7 +13,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
 use tracing::{debug, warn};
@@ -120,6 +120,9 @@ pub struct TonboMetaEngine {
     block_ranges: Mutex<RangeState>,
     inode_alloc_lock: Mutex<()>,
     block_alloc_lock: Mutex<()>,
+    /// Set by `request_eager_flush()` — makes the background worker use a
+    /// short flush interval (~250 ms) instead of the full `flush_interval`.
+    eager_flush_pending: AtomicBool,
 }
 
 const INODE_RANGE_SIZE: u64 = 4_096;
@@ -357,6 +360,7 @@ impl TonboMetaEngine {
             block_ranges: Mutex::new(RangeState::default()),
             inode_alloc_lock: Mutex::new(()),
             block_alloc_lock: Mutex::new(()),
+            eager_flush_pending: AtomicBool::new(false),
         });
 
         // Best-effort initial pull so an empty local cache can hydrate from remote state.
@@ -505,14 +509,27 @@ impl TonboMetaEngine {
                         break;
                     };
 
+                    let is_eager = engine.eager_flush_pending.load(Ordering::Acquire);
                     let should_flush = {
                         let state = engine.state.lock();
-                        (state.pending_ops > 0 || state.pending_bytes > 0)
-                            && state.last_flush.elapsed() >= engine.flush_interval
+                        let has_pending = state.pending_ops > 0 || state.pending_bytes > 0;
+                        if !has_pending {
+                            false
+                        } else if is_eager {
+                            // Eager mode: flush after a short batching window so
+                            // rapid sequential mutations (e.g. multi-file delete)
+                            // are grouped into one remote round-trip + NATS event.
+                            state.last_flush.elapsed() >= Duration::from_millis(250)
+                        } else {
+                            state.last_flush.elapsed() >= engine.flush_interval
+                        }
                     };
                     if !should_flush {
                         continue;
                     }
+                    // Clear the eager flag *before* flushing so that new eager
+                    // requests arriving during the flush are not lost.
+                    engine.eager_flush_pending.store(false, Ordering::Release);
 
                     if let Err(err) = engine.flush_remote_snapshot(false) {
                         if TonboMetaEngine::is_temporary_remote_error(&err) {
@@ -1500,6 +1517,10 @@ impl Drop for TonboMetaEngine {
 impl MetaEngine for TonboMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
         self.flush_now()
+    }
+
+    fn request_eager_flush(&self) {
+        self.eager_flush_pending.store(true, Ordering::Release);
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {

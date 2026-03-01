@@ -93,6 +93,14 @@ pub trait MetaEngine: Send + Sync {
         None
     }
 
+    /// Request a near-immediate flush of pending metadata mutations.
+    ///
+    /// Called by the VFS after user-visible directory mutations (create,
+    /// unlink, rmdir, rename, …) so that changes reach remote/NATS within
+    /// a short batching window (~250 ms) instead of waiting for the full
+    /// `flush_interval` (default 60 s).  The default is a no-op.
+    fn request_eager_flush(&self) {}
+
     /// Best-effort metadata version token for change detection.
     ///
     /// Remote-backed engines can expose a monotonic-ish token (for example,

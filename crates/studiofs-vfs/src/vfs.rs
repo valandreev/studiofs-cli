@@ -1919,6 +1919,7 @@ impl StudioVfs {
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(&ino);
         self.state.dirty_attrs.lock().remove(&ino);
+        self.meta.request_eager_flush();
         Ok(attr)
     }
 
@@ -1935,6 +1936,7 @@ impl StudioVfs {
         let attr = self.meta.create_file(parent, name, uid, gid, mode)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
+        self.meta.request_eager_flush();
         Ok(attr)
     }
 
@@ -1951,6 +1953,7 @@ impl StudioVfs {
         let attr = self.meta.create_dir(parent, name, uid, gid, mode)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
+        self.meta.request_eager_flush();
         Ok(attr)
     }
 
@@ -1966,6 +1969,7 @@ impl StudioVfs {
         validate_name(name)?;
         let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
         self.state.attr_read_cache.lock().remove(&parent);
+        self.meta.request_eager_flush();
         Ok(attr)
     }
 
@@ -2106,6 +2110,7 @@ impl StudioVfs {
             self.state.attr_read_cache.lock().remove(&attr.ino);
         }
 
+        self.meta.request_eager_flush();
         Ok(())
     }
 
@@ -2114,6 +2119,7 @@ impl StudioVfs {
         self.meta.rmdir(parent, name)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
+        self.meta.request_eager_flush();
         Ok(())
     }
 
@@ -2173,6 +2179,7 @@ impl StudioVfs {
         if parent != new_parent {
             self.state.attr_read_cache.lock().remove(&new_parent);
         }
+        self.meta.request_eager_flush();
         Ok(())
     }
 
