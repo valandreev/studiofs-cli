@@ -1559,42 +1559,41 @@ impl StudioVfs {
 
     /// Truncate blocks beyond new size.
     fn truncate_blocks(&self, ino: Ino, new_size: u64, old_size: u64) -> VfsResult<()> {
-        let _block_size = self.block_size as u64;
-
-        // Calculate which blocks to remove
-        let new_last_block = if new_size == 0 {
-            0
-        } else {
-            block_index_from_offset(new_size - 1, self.block_size)
-        };
-
         let old_last_block = if old_size == 0 {
             0
         } else {
             block_index_from_offset(old_size - 1, self.block_size)
         };
 
-        // Remove blocks beyond new size
-        if new_last_block < old_last_block {
-            for block_idx in (new_last_block + 1)..=old_last_block {
-                // Remove the block and get its ID for GC
-                if let Some(object_id) = self.meta.remove_file_block(ino, block_idx)? {
-                    // Mark old block for deletion (S3 cleanup via background GC)
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    self.meta.add_pending_deletion(object_id, timestamp)?;
-                    debug!("marking block {} for deletion (truncate)", object_id);
+        // Calculate the first block index to remove.
+        // When new_size == 0, remove ALL blocks starting from index 0.
+        // Otherwise, keep blocks 0..=new_last_block and remove the rest.
+        let first_block_to_remove = if new_size == 0 {
+            0
+        } else {
+            block_index_from_offset(new_size - 1, self.block_size) + 1
+        };
 
-                    // Immediately evict this block from all cache tiers.
-                    self.evict_block_from_caches(ino, block_idx, object_id);
-                }
+        // Remove blocks beyond new size (or all blocks when new_size == 0).
+        for block_idx in first_block_to_remove..=old_last_block {
+            // Remove the block and get its ID for GC
+            if let Some(object_id) = self.meta.remove_file_block(ino, block_idx)? {
+                // Mark old block for deletion (S3 cleanup via background GC)
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.meta.add_pending_deletion(object_id, timestamp)?;
+                debug!("marking block {} for deletion (truncate)", object_id);
+
+                // Immediately evict this block from all cache tiers.
+                self.evict_block_from_caches(ino, block_idx, object_id);
             }
         }
 
         // Update last block length if partial
         if new_size > 0 {
+            let new_last_block = block_index_from_offset(new_size - 1, self.block_size);
             let last_block_offset = offset_within_block(new_size - 1, self.block_size);
             if let Some(mut block_ref) = self.meta.get_file_block(ino, new_last_block)? {
                 block_ref.length = last_block_offset + 1;

@@ -1388,6 +1388,7 @@ impl TonboMetaEngine {
         self.flushed_bytes_total
             .fetch_add(pending_bytes, Ordering::Relaxed);
 
+        let had_cached_etag = etag.is_some();
         let mut current_etag = etag;
         if current_etag.is_none() {
             match self.remote_stat(remote, &remote.manifest_path) {
@@ -1398,6 +1399,30 @@ impl TonboMetaEngine {
                 Err(err) => return Err(err),
             }
         }
+
+        // If we had no cached etag but the remote exists, our baseline may be
+        // stale.  Pre-merge with the remote manifest before the first write
+        // attempt so we don't blindly overwrite another client's changes.
+        if !had_cached_etag && current_etag.is_some() {
+            self.remote_round_trips.fetch_add(1, Ordering::Relaxed);
+            match self.remote_read_manifest(remote, &remote.manifest_path) {
+                Ok((remote_manifest, remote_etag)) => {
+                    snapshot_to_write = Self::merge_snapshot_with_local_delta(
+                        &baseline_snapshot,
+                        &local_snapshot,
+                        &remote_manifest.snapshot,
+                    );
+                    if let Some(re) = remote_etag {
+                        current_etag = Some(re);
+                    }
+                }
+                Err(err) if Self::is_not_found(&err) => {
+                    // Remote disappeared between stat and read — proceed with local.
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
         let mut retries: u32 = 0;
         loop {
             manifest.snapshot = snapshot_to_write.clone();

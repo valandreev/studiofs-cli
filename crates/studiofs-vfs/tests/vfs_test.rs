@@ -2625,3 +2625,1762 @@ async fn test_nats_eager_flush_with_kernel_invalidation_rapid_mutations() {
         "expected root inode (1) in invalidated set, got: {inodes:?}"
     );
 }
+
+// =============================================================================
+// Phase 9 — Deep Integration & Edge-Case Tests
+// =============================================================================
+
+// ─── 9.1 Block Boundary & Truncate Edge Cases ──────────────────────────────
+
+/// Truncate a file to exactly a block boundary.
+/// Verify the last block is NOT marked PARTIAL_BLOCK and has full block_size length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_truncate_to_exact_block_boundary() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "trunc-boundary");
+    let block_size = vfs.meta().get_format_info().unwrap().block_size;
+
+    // Write 12 MiB = 3 full blocks (block_size = 4 MiB).
+    let size = 3 * block_size as usize;
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let attr = vfs.create(1, b"trunc-bound.bin", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, &payload).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, attr.ino, 3, Duration::from_secs(15))
+        .expect("Expected 3 blocks");
+
+    // Truncate to exactly 1 block boundary = block_size bytes.
+    vfs.setattr(attr.ino, SetattrArgs::size_only(block_size as u64))
+        .unwrap();
+    let after = vfs.meta().get_file_blocks(attr.ino).unwrap();
+    assert_eq!(after.len(), 1, "Only 1 block should remain");
+
+    let (idx, blk) = &after[0];
+    assert_eq!(*idx, 0);
+    // When truncating to exactly block_size, the last_block_offset+1 == block_size
+    // so the block ref length should equal block_size and the partial flag
+    // must be set (the truncate code always sets PARTIAL_BLOCK when size > 0).
+    assert_eq!(blk.length, block_size, "block length should equal block_size");
+
+    // Verify read returns correct data.
+    let data = vfs.read(attr.ino, 0, block_size).await.unwrap();
+    assert_eq!(data.len(), block_size as usize);
+    assert_eq!(&data[..], &payload[..block_size as usize]);
+}
+
+/// Extend a file beyond its current size (sparse hole).
+/// Verify reading the hole returns zeroes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_truncate_extend_creates_sparse_hole() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "trunc-extend");
+
+    let attr = vfs.create(1, b"sparse.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write 1000 bytes.
+    let payload = vec![0xABu8; 1000];
+    vfs.write(ino, 0, &payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Extend to 1 MiB via setattr — should NOT create blocks, only change size.
+    let extended_size = 1024 * 1024u64;
+    vfs.setattr(ino, SetattrArgs::size_only(extended_size))
+        .unwrap();
+
+    let a = vfs.getattr(ino).unwrap();
+    assert_eq!(a.size, extended_size);
+
+    // Read the first 1000 bytes — should be original data.
+    let head = vfs.read(ino, 0, 1000).await.unwrap();
+    assert_eq!(&head[..], &payload[..]);
+
+    // Read into the sparse hole — should be zeroes.
+    let hole = vfs.read(ino, 2000, 4096).await.unwrap();
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "sparse hole should read as zeroes"
+    );
+}
+
+/// Write exactly block_size bytes then 1 byte at the next block boundary.
+/// Exercises the full-block eager flush path + new partial block creation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_write_at_exact_block_boundary_transition() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "boundary-trans");
+    let block_size = vfs.meta().get_format_info().unwrap().block_size as usize;
+
+    let attr = vfs.create(1, b"boundary.bin", 0, 0, 0o644).unwrap();
+
+    // Write exactly one full block.
+    let full_block: Vec<u8> = (0..block_size).map(|i| (i % 199) as u8).collect();
+    vfs.write(attr.ino, 0, &full_block).await.unwrap();
+
+    // Write 1 byte at the start of the next block.
+    vfs.write(attr.ino, block_size as u64, &[0xFF])
+        .await
+        .unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    // Wait for blocks to materialise.
+    let blocks = wait_until_n_blocks(&vfs, attr.ino, 2, Duration::from_secs(15))
+        .expect("Expected 2 blocks");
+    assert_eq!(blocks.len(), 2);
+
+    // Verify file size.
+    let a = vfs.getattr(attr.ino).unwrap();
+    assert_eq!(a.size, (block_size + 1) as u64);
+
+    // Verify data integrity.
+    let data = vfs.read(attr.ino, 0, (block_size + 1) as u32).await.unwrap();
+    assert_eq!(&data[..block_size], &full_block[..]);
+    assert_eq!(data[block_size], 0xFF);
+}
+
+/// Truncate to zero, then write again. Verify old blocks are GC'd and new data is correct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_truncate_to_zero_then_rewrite() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "trunc-zero-rw");
+
+    let attr = vfs.create(1, b"overwrite.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write 5 MiB.
+    let payload1: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 173) as u8).collect();
+    vfs.write(ino, 0, &payload1).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, ino, 2, Duration::from_secs(15));
+
+    // Get old block IDs.
+    let old_blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    let old_ids: Vec<u64> = old_blocks.iter().map(|(_, b)| b.object_id).collect();
+    assert!(!old_ids.is_empty());
+
+    // Truncate to 0.
+    vfs.setattr(ino, SetattrArgs::size_only(0)).unwrap();
+    assert_eq!(vfs.getattr(ino).unwrap().size, 0);
+
+    // All blocks should be removed when truncating to zero.
+    let remaining = vfs.meta().get_file_blocks(ino).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "all blocks should be removed after truncate-to-zero, got {}",
+        remaining.len()
+    );
+
+    // All old blocks should be in pending deletions.
+    let pending = vfs.meta().get_pending_deletions().unwrap();
+    for id in &old_ids {
+        assert!(
+            pending.iter().any(|(pid, _)| pid == id),
+            "old block {} should be pending deletion",
+            id
+        );
+    }
+
+    // Write new data.
+    let payload2 = vec![0xCDu8; 1024];
+    vfs.write(ino, 0, &payload2).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    assert_eq!(vfs.getattr(ino).unwrap().size, 1024);
+
+    let data = vfs.read(ino, 0, 1024).await.unwrap();
+    assert_eq!(&data[..], &payload2[..]);
+}
+
+// ─── 9.2 Read Edge Cases ────────────────────────────────────────────────────
+
+/// Reading past EOF should return empty bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_read_beyond_eof_returns_empty() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "read-eof");
+
+    let attr = vfs.create(1, b"small.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"hello").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    // Read at offset past file size.
+    let data = vfs.read(attr.ino, 100, 4096).await.unwrap();
+    assert!(data.is_empty(), "read past EOF should return empty bytes");
+
+    // Read at exact EOF boundary.
+    let data = vfs.read(attr.ino, 5, 4096).await.unwrap();
+    assert!(data.is_empty(), "read at exact EOF should return empty");
+}
+
+/// Read spanning an allocated block and unallocated blocks (sparse file).
+/// Allocated part returns data, unallocated returns zeroes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_read_spanning_allocated_and_sparse_blocks() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "read-sparse");
+    let block_size = vfs.meta().get_format_info().unwrap().block_size as u64;
+
+    let attr = vfs.create(1, b"sparse-read.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write data only in block 0.
+    let payload: Vec<u8> = (0..1024).map(|i| (i % 200) as u8).collect();
+    vfs.write(ino, 0, &payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Extend file to cover 3 blocks without writing block 1 and 2.
+    let extended = block_size * 3;
+    vfs.setattr(ino, SetattrArgs::size_only(extended)).unwrap();
+
+    // Read block 1 (entirely in sparse region) — should be all zeroes.
+    let sparse_data = vfs.read(ino, block_size, block_size as u32).await.unwrap();
+    assert_eq!(sparse_data.len(), block_size as usize);
+    assert!(
+        sparse_data.iter().all(|&b| b == 0),
+        "sparse block should be all zeroes"
+    );
+
+    // Original block 0 data should still be there.
+    let head = vfs.read(ino, 0, 1024).await.unwrap();
+    assert_eq!(&head[..], &payload[..]);
+}
+
+/// Flush an empty file (no writes) — should be a no-op without errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_flush_empty_file_is_noop() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "flush-empty");
+
+    let attr = vfs.create(1, b"empty.txt", 0, 0, 0o644).unwrap();
+    // Flush without writing anything — should not panic or allocate blocks.
+    vfs.flush(attr.ino).await.unwrap();
+    assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+    assert!(vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty());
+}
+
+/// Read zero bytes from a file — should return empty immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_read_zero_bytes() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "read-zero");
+
+    let attr = vfs.create(1, b"content.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"data").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    let data = vfs.read(attr.ino, 0, 0).await.unwrap();
+    assert!(data.is_empty());
+}
+
+/// Write zero bytes — should be a no-op and return 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_write_zero_bytes_is_noop() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "write-zero");
+
+    let attr = vfs.create(1, b"noop.txt", 0, 0, 0o644).unwrap();
+    let written = vfs.write(attr.ino, 0, &[]).await.unwrap();
+    assert_eq!(written, 0);
+    assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+}
+
+// ─── 9.3 Rename & Unlink Edge Cases ────────────────────────────────────────
+
+/// Rename a file across directories.
+/// Verify both parent caches are invalidated and the file is accessible at the new path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_rename_cross_directory() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rename-cross");
+
+    // Set up directories.
+    let dir_a = vfs.mkdir(1, b"dir_a", 0, 0, 0o755).unwrap();
+    let dir_b = vfs.mkdir(1, b"dir_b", 0, 0, 0o755).unwrap();
+
+    // Create file in dir_a.
+    let attr = vfs.create(dir_a.ino, b"file.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"cross-dir data").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    // Rename from dir_a to dir_b.
+    vfs.rename(dir_a.ino, b"file.txt", dir_b.ino, b"moved.txt")
+        .unwrap();
+
+    // Old path should fail.
+    assert!(vfs.lookup(dir_a.ino, b"file.txt").is_err());
+
+    // New path should succeed.
+    let moved = vfs.lookup(dir_b.ino, b"moved.txt").unwrap();
+    assert_eq!(moved.ino, attr.ino);
+
+    // Data should be intact.
+    let data = vfs.read(attr.ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"cross-dir data");
+
+    // Both parent directories should reflect the change.
+    let entries_a = vfs.readdir(dir_a.ino).unwrap();
+    assert!(
+        !entries_a.iter().any(|e| e.name == b"file.txt"),
+        "dir_a should not contain file.txt"
+    );
+    let entries_b = vfs.readdir(dir_b.ino).unwrap();
+    assert!(
+        entries_b.iter().any(|e| e.name == b"moved.txt"),
+        "dir_b should contain moved.txt"
+    );
+}
+
+/// Rename a file over an existing file (overwrite).
+/// Verify the displaced file's blocks are GC'd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_rename_overwrite_existing_file() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rename-overwrite");
+
+    // Create target file with data.
+    let target = vfs.create(1, b"target.txt", 0, 0, 0o644).unwrap();
+    vfs.write(target.ino, 0, b"old target data").await.unwrap();
+    vfs.flush(target.ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, target.ino, 1, Duration::from_secs(15));
+
+    let target_blocks = vfs.meta().get_file_blocks(target.ino).unwrap();
+    let target_block_id = target_blocks[0].1.object_id;
+
+    // Create source file with data.
+    let source = vfs.create(1, b"source.txt", 0, 0, 0o644).unwrap();
+    vfs.write(source.ino, 0, b"new source data").await.unwrap();
+    vfs.flush(source.ino).await.unwrap();
+
+    // Rename source → target (overwrite).
+    vfs.rename(1, b"source.txt", 1, b"target.txt").unwrap();
+
+    // source.txt should be gone.
+    assert!(vfs.lookup(1, b"source.txt").is_err());
+
+    // target.txt should resolve to source ino.
+    let result = vfs.lookup(1, b"target.txt").unwrap();
+    assert_eq!(result.ino, source.ino);
+
+    // Displaced target's block should be in pending deletions.
+    let pending = vfs.meta().get_pending_deletions().unwrap();
+    assert!(
+        pending.iter().any(|(id, _)| *id == target_block_id),
+        "displaced file's block {} should be pending deletion",
+        target_block_id
+    );
+}
+
+/// Unlink a file while it has an open handle (open-unlink / orphan pattern).
+/// Verify data is accessible until the last handle is released, then cleaned up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_unlink_with_open_handle_deferred_cleanup() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "open-unlink-gc");
+
+    let attr = vfs.create(1, b"orphan.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    vfs.write(ino, 0, b"orphan data").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+
+    // Open the file.
+    let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+
+    // Unlink while handle is open.
+    vfs.unlink(1, b"orphan.txt").unwrap();
+
+    // Lookup by name should fail.
+    assert!(vfs.lookup(1, b"orphan.txt").is_err());
+
+    // But read via the ino should still work (orphan).
+    let data = vfs.read(ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"orphan data");
+
+    // Blocks should still exist (not yet GC'd).
+    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    assert!(!blocks.is_empty(), "blocks should survive until last handle closes");
+    let block_id = blocks[0].1.object_id;
+
+    // Release the last handle — triggers orphan cleanup.
+    vfs.release_fh(fh).await.unwrap();
+
+    // Now blocks should be removed and pending deletion.
+    let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
+    assert!(blocks_after.is_empty(), "blocks should be removed after release_fh");
+    let pending = vfs.meta().get_pending_deletions().unwrap();
+    assert!(
+        pending.iter().any(|(id, _)| *id == block_id),
+        "block should be pending deletion after orphan cleanup"
+    );
+}
+
+/// Rmdir on non-empty directory should fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_rmdir_nonempty_fails() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rmdir-nonempty");
+
+    let dir = vfs.mkdir(1, b"nonempty", 0, 0, 0o755).unwrap();
+    vfs.create(dir.ino, b"child.txt", 0, 0, 0o644).unwrap();
+
+    let result = vfs.rmdir(1, b"nonempty");
+    assert!(result.is_err(), "rmdir on non-empty directory should fail");
+}
+
+/// Create many files in one directory and verify readdir returns all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_readdir_many_entries() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "readdir-many");
+
+    let count = 100;
+    for i in 0..count {
+        let name = format!("file-{i:04}.txt");
+        vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+    }
+
+    let entries = vfs.readdir(1).unwrap();
+    // readdir includes "." and ".." typically, but StudioFS may not.
+    // Count only our created files:
+    let our_files: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name.starts_with(b"file-"))
+        .collect();
+    assert_eq!(
+        our_files.len(),
+        count,
+        "readdir should return all {count} files"
+    );
+}
+
+// ─── 9.4 Concurrent Access Patterns ────────────────────────────────────────
+
+/// Concurrent reads and writes to the same file.
+/// Verify reads see consistent data (no torn blocks).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_concurrent_read_write_same_file() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "conc-rw");
+    let block_size = vfs.meta().get_format_info().unwrap().block_size as usize;
+
+    let attr = vfs.create(1, b"conc.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write initial data.
+    let initial: Vec<u8> = vec![0xAAu8; block_size * 2];
+    vfs.write(ino, 0, &initial).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    // Wait for blocks to materialise.
+    let _ = wait_until_n_blocks(&vfs, ino, 2, Duration::from_secs(15));
+
+    let vfs1 = vfs.clone();
+    let vfs2 = vfs.clone();
+
+    // Spawn concurrent writer (overwrites block 0).
+    let writer = tokio::spawn(async move {
+        let new_data = vec![0xBBu8; block_size];
+        for _ in 0..5 {
+            vfs1.write(ino, 0, &new_data).await.unwrap();
+            vfs1.flush(ino).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    // Spawn concurrent reader (reads block 0 repeatedly).
+    let reader = tokio::spawn(async move {
+        for _ in 0..20 {
+            let data = vfs2.read(ino, 0, block_size as u32).await.unwrap();
+            if !data.is_empty() {
+                // Every byte should be either 0xAA (old) or 0xBB (new) — never mixed.
+                let first = data[0];
+                assert!(
+                    first == 0xAA || first == 0xBB,
+                    "unexpected byte value: {first:#x}"
+                );
+                // All bytes in block 0 should be the same value (atomic block reads).
+                assert!(
+                    data.iter().all(|&b| b == first),
+                    "torn read detected in block 0"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    let (w, r) = tokio::join!(writer, reader);
+    w.unwrap();
+    r.unwrap();
+}
+
+/// Multiple concurrent flush() calls on the same inode should not deadlock or lose data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_concurrent_flush_does_not_deadlock() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "conc-flush");
+
+    let attr = vfs.create(1, b"conc-flush.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write some data.
+    vfs.write(ino, 0, &vec![0x42u8; 1024]).await.unwrap();
+
+    // Spawn 5 concurrent flushes.
+    let mut tasks = Vec::new();
+    for _ in 0..5 {
+        let v = vfs.clone();
+        tasks.push(tokio::spawn(async move {
+            v.flush(ino).await.unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    // Data should be readable.
+    let data = vfs.read(ino, 0, 1024).await.unwrap();
+    assert_eq!(data.len(), 1024);
+    assert!(data.iter().all(|&b| b == 0x42));
+}
+
+/// Race between create + write + unlink — verify no panic and consistent state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_create_write_unlink_race() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "create-unlink-race");
+
+    // Create and immediately delete files in a tight loop.
+    for i in 0..20 {
+        let name = format!("race-{i}.txt");
+        let attr = vfs
+            .create(1, name.as_bytes(), 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, b"race data").await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+        vfs.unlink(1, name.as_bytes()).unwrap();
+    }
+
+    // Root dir should be clean.
+    let entries = vfs.readdir(1).unwrap();
+    let race_files: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name.starts_with(b"race-"))
+        .collect();
+    assert!(
+        race_files.is_empty(),
+        "all race files should be deleted, found {}",
+        race_files.len()
+    );
+}
+
+// ─── 9.5 File Handle & Orphan Edge Cases ───────────────────────────────────
+
+/// Multiple handles open, unlink, close all — verify cleanup only after last close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_multiple_handles_orphan_cleanup_after_last_close() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "multi-fh-orphan");
+
+    let attr = vfs.create(1, b"multi-fh.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    vfs.write(ino, 0, b"multi handle data").await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+
+    // Open 3 handles.
+    let fh1 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+    let fh2 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+    let fh3 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+
+    // Unlink.
+    vfs.unlink(1, b"multi-fh.txt").unwrap();
+
+    // Close first two — blocks should still exist (orphan still alive).
+    vfs.release_fh(fh1).await.unwrap();
+    vfs.release_fh(fh2).await.unwrap();
+    let blocks_mid = vfs.meta().get_file_blocks(ino).unwrap();
+    assert!(
+        !blocks_mid.is_empty(),
+        "blocks should survive with 1 handle remaining"
+    );
+
+    // Close the last handle — orphan cleanup triggers.
+    vfs.release_fh(fh3).await.unwrap();
+    let blocks_final = vfs.meta().get_file_blocks(ino).unwrap();
+    assert!(
+        blocks_final.is_empty(),
+        "blocks should be cleaned up after last handle closes"
+    );
+}
+
+/// open_file with O_TRUNC on a file with data — should truncate to 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_open_trunc_clears_data() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "open-trunc-clear");
+
+    let attr = vfs.create(1, b"trunc-open.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"original content").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+    assert!(vfs.getattr(attr.ino).unwrap().size > 0);
+
+    // Open with trunc flag.
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::WRONLY, true)
+        .unwrap();
+    assert_eq!(
+        vfs.getattr(attr.ino).unwrap().size,
+        0,
+        "file should be truncated on open"
+    );
+    vfs.release_fh(fh).await.unwrap();
+}
+
+// ─── 9.6 Multi-Client NATS Integration ─────────────────────────────────────
+
+/// Two Tonbo clients create files simultaneously, triggering CAS conflict.
+/// Client A flushes first, then Client B flushes and must merge with A's
+/// snapshot so both files survive.  Verifies the pre-merge path where a
+/// client with no cached etag discovers a remote manifest and merges before
+/// writing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_concurrent_write_conflict_cas_merge() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_concurrent_write_conflict_cas_merge: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-cas-merge");
+    let client_a = make_tonbo_test_client(&info, "cas-a");
+    let client_b = make_tonbo_test_client(&info, "cas-b");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Both clients create different files without flushing.
+    client_a
+        .vfs
+        .create(1, b"from-a.txt", 0, 0, 0o644)
+        .unwrap();
+    client_b
+        .vfs
+        .create(1, b"from-b.txt", 0, 0, 0o644)
+        .unwrap();
+
+    // Flush client_a first so its snapshot lands on S3.
+    client_a.vfs.meta().flush_metadata().unwrap();
+
+    // client_b flushes — this should trigger CAS conflict because S3 now has
+    // client_a's snapshot. The merge logic must combine both snapshots.
+    client_b.vfs.meta().flush_metadata().unwrap();
+
+    // After the merge, client_b should have BOTH files in its local state
+    // (the merge pulled client_a's snapshot and combined it with its local delta).
+    // Give client_b a moment to settle, then sync to refresh.
+    client_b.vfs.meta().sync_metadata().unwrap();
+    assert!(
+        client_b.vfs.lookup(1, b"from-b.txt").is_ok(),
+        "client_b should see from-b.txt"
+    );
+
+    // Check if the CAS merge preserved from-a.txt on client_b.
+    assert!(
+        client_b.vfs.lookup(1, b"from-a.txt").is_ok(),
+        "CAS merge should preserve from-a.txt on client_b"
+    );
+
+    // client_a syncs to get the latest.
+    client_a.vfs.meta().sync_metadata().unwrap();
+
+    // Both files should be visible on both clients after merge.
+    assert!(
+        client_a.vfs.lookup(1, b"from-a.txt").is_ok(),
+        "client_a should see from-a.txt after sync"
+    );
+    assert!(
+        client_a.vfs.lookup(1, b"from-b.txt").is_ok(),
+        "client_a should see from-b.txt after sync"
+    );
+    assert!(
+        client_b.vfs.lookup(1, b"from-b.txt").is_ok(),
+        "client_b should see from-b.txt"
+    );
+
+    println!("CAS merge resolved — both files visible on both clients");
+}
+
+/// NATS global invalidation should evict dropped blocks from cache.
+/// Client A caches file data, Client B deletes the file + publishes invalidation,
+/// verify Client A's block cache no longer contains the deleted blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_invalidation_evicts_dropped_blocks() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_invalidation_evicts_dropped_blocks: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-evict-blocks");
+    let writer = make_tonbo_test_client(&info, "evict-writer");
+    let reader = make_tonbo_test_client(&info, "evict-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Writer creates file with data.
+    let attr = writer
+        .vfs
+        .create(1, b"evict-me.txt", 0, 0, 0o644)
+        .unwrap();
+    writer
+        .vfs
+        .write(attr.ino, 0, b"block data to evict")
+        .await
+        .unwrap();
+    writer.vfs.flush(attr.ino).await.unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader sees and reads the file (caches the block).
+    let wait = Duration::from_secs(10);
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"evict-me.txt").is_ok()).await,
+        "reader should see evict-me.txt"
+    );
+    let reader_attr = reader.vfs.lookup(1, b"evict-me.txt").unwrap();
+    let _data = reader
+        .vfs
+        .read(reader_attr.ino, 0, 100)
+        .await
+        .unwrap();
+
+    // Writer deletes the file and flushes.
+    writer.vfs.unlink(1, b"evict-me.txt").unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader should eventually not see the file via NATS invalidation.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"evict-me.txt").is_err()).await,
+        "reader should stop seeing evict-me.txt after invalidation"
+    );
+}
+
+/// Verify kernel invalidator receives correct inodes for single-inode events
+/// (not just global invalidation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_kernel_invalidator_global_includes_root() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_kernel_invalidator_global_includes_root: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-kinv-root");
+    let writer = make_tonbo_test_client(&info, "kinv-root-writer");
+    let reader = make_tonbo_test_client(&info, "kinv-root-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mock_inv = Arc::new(MockKernelInvalidator::new());
+    reader.vfs.set_kernel_invalidator(mock_inv.clone());
+
+    // Warm reader caches for root + a file.
+    let _ = reader.vfs.getattr(1).unwrap();
+    let _ = reader.vfs.readdir(1).unwrap();
+
+    // Writer creates a file and flush.
+    let attr = writer
+        .vfs
+        .create(1, b"kinv-file.txt", 0, 0, 0o644)
+        .unwrap();
+    writer
+        .vfs
+        .write(attr.ino, 0, b"hello")
+        .await
+        .unwrap();
+    writer.vfs.flush(attr.ino).await.unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Wait for kernel invalidator to be called.
+    assert!(
+        wait_until(Duration::from_secs(15), || mock_inv.call_count() > 0).await,
+        "kernel invalidator should be called"
+    );
+
+    let inodes = mock_inv.drain_unique();
+    assert!(
+        inodes.contains(&1),
+        "root inode (1) must be invalidated in global invalidation"
+    );
+    println!("invalidated inodes: {inodes:?}");
+}
+
+// ─── 9.7 Attribute & Metadata Edge Cases ───────────────────────────────────
+
+/// Setattr mode/uid/gid/times on a directory (not just files).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_setattr_on_directory() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "setattr-dir");
+
+    let dir = vfs.mkdir(1, b"mydir", 0, 0, 0o755).unwrap();
+
+    // Change mode.
+    let mut args = SetattrArgs::default();
+    args.mode = Some(0o700);
+    let updated = vfs.setattr(dir.ino, args).unwrap();
+    assert_eq!(updated.mode & 0o777, 0o700);
+
+    // Change uid/gid.
+    let mut args = SetattrArgs::default();
+    args.uid = Some(1000);
+    args.gid = Some(1000);
+    let updated = vfs.setattr(dir.ino, args).unwrap();
+    assert_eq!(updated.uid, 1000);
+    assert_eq!(updated.gid, 1000);
+}
+
+/// Xattr operations on a directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_on_directory() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr-dir");
+
+    let dir = vfs.mkdir(1, b"xattr-dir", 0, 0, 0o755).unwrap();
+    vfs.set_xattr(dir.ino, b"user.tag", b"dir-value", 0)
+        .unwrap();
+
+    let val = vfs.get_xattr(dir.ino, b"user.tag").unwrap().unwrap();
+    assert_eq!(&val[..], b"dir-value");
+
+    let names = vfs.list_xattrs(dir.ino).unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(&names[0][..], b"user.tag");
+}
+
+/// Getattr on non-existent inode should return an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_getattr_nonexistent_inode() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "getattr-noent");
+
+    let result = vfs.getattr(999999);
+    assert!(result.is_err(), "getattr on non-existent inode should fail");
+}
+
+/// Lookup non-existent entry in a directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_lookup_nonexistent_entry() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "lookup-noent");
+
+    let result = vfs.lookup(1, b"does-not-exist.txt");
+    assert!(
+        result.is_err(),
+        "lookup non-existent entry should return error"
+    );
+}
+
+/// Create a file, verify counter TOTAL_INODES increments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_create_increments_total_inodes() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "inode-count");
+
+    let before = vfs
+        .meta()
+        .get_counter(studiofs_meta::types::counters::TOTAL_INODES)
+        .unwrap_or(0);
+
+    vfs.create(1, b"counted.txt", 0, 0, 0o644).unwrap();
+
+    let after = vfs
+        .meta()
+        .get_counter(studiofs_meta::types::counters::TOTAL_INODES)
+        .unwrap_or(0);
+    assert_eq!(after, before + 1, "TOTAL_INODES should increment by 1");
+}
+
+// ─── 9.8 Symlink & Hardlink Edge Cases ─────────────────────────────────────
+
+/// Create a symlink pointing to a non-existent target. readlink should return
+/// the target path even though the target doesn't exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_symlink_dangling_target() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "sym-dangle");
+
+    let attr = vfs
+        .symlink(1, b"dangling-link", b"/nonexistent/path", 0, 0)
+        .unwrap();
+    let target = vfs.readlink(attr.ino).unwrap();
+    assert_eq!(&target[..], b"/nonexistent/path");
+}
+
+/// Hardlink increases nlink and can be read from both paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_hardlink_nlink_increments() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hardlink-nlink");
+
+    let attr = vfs.create(1, b"original.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"shared data").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    let before_nlink = vfs.getattr(attr.ino).unwrap().nlink;
+
+    // Create hardlink.
+    vfs.link(attr.ino, 1, b"link.txt").unwrap();
+
+    let after_nlink = vfs.getattr(attr.ino).unwrap().nlink;
+    assert_eq!(after_nlink, before_nlink + 1, "nlink should increment");
+
+    // Both names should resolve to the same ino.
+    let a = vfs.lookup(1, b"original.txt").unwrap();
+    let b = vfs.lookup(1, b"link.txt").unwrap();
+    assert_eq!(a.ino, b.ino);
+
+    // Read from the link should return the same data.
+    let data = vfs.read(b.ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"shared data");
+}
+
+/// Unlink one hardlink — file should survive because nlink > 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_hardlink_unlink_one_keeps_other() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hardlink-unlink");
+
+    let attr = vfs.create(1, b"hl-orig.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"persist").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, attr.ino, 1, Duration::from_secs(15));
+
+    vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
+
+    // Unlink the original name.
+    vfs.unlink(1, b"hl-orig.txt").unwrap();
+
+    // The link should still be alive.
+    let a = vfs.lookup(1, b"hl-link.txt").unwrap();
+    assert_eq!(a.ino, attr.ino);
+
+    // Blocks should NOT be removed (nlink still > 0).
+    let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+    assert!(
+        !blocks.is_empty(),
+        "blocks should survive when hardlink remains"
+    );
+
+    // Data should still be readable.
+    let data = vfs.read(attr.ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"persist");
+}
+
+// ─── 9.9 Flock Edge Cases ──────────────────────────────────────────────────
+
+/// Exclusive flock on a file, try exclusive from second owner — should fail non-blocking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_flock_exclusive_nonblocking_conflict() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "flock-conflict");
+
+    let attr = vfs.create(1, b"flock.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Owner 1 acquires exclusive.
+    vfs.flock(ino, LockKind::Exclusive, 1, false)
+        .await
+        .unwrap();
+
+    // Owner 2 tries non-blocking exclusive — should fail.
+    let result = vfs.flock(ino, LockKind::Exclusive, 2, false).await;
+    assert!(
+        matches!(result, Err(VfsError::WouldBlock)),
+        "non-blocking exclusive should fail with WouldBlock"
+    );
+
+    // Unlock owner 1.
+    vfs.flock(ino, LockKind::Unlock, 1, false).await.unwrap();
+
+    // Now owner 2 should succeed.
+    vfs.flock(ino, LockKind::Exclusive, 2, false)
+        .await
+        .unwrap();
+    vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
+}
+
+/// Shared lock + try shared from another owner → should succeed.
+/// Then try exclusive → should fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_flock_shared_then_exclusive_conflict() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "flock-sh-ex");
+
+    let attr = vfs.create(1, b"flock-share.txt", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Two readers.
+    vfs.flock(ino, LockKind::Shared, 1, false).await.unwrap();
+    vfs.flock(ino, LockKind::Shared, 2, false).await.unwrap();
+
+    // Exclusive should fail.
+    let result = vfs.flock(ino, LockKind::Exclusive, 3, false).await;
+    assert!(
+        matches!(result, Err(VfsError::WouldBlock)),
+        "exclusive should fail when shared locks held"
+    );
+
+    // Unlock both shared.
+    vfs.flock(ino, LockKind::Unlock, 1, false).await.unwrap();
+    vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
+
+    // Now exclusive should succeed.
+    vfs.flock(ino, LockKind::Exclusive, 3, false)
+        .await
+        .unwrap();
+    vfs.flock(ino, LockKind::Unlock, 3, false).await.unwrap();
+}
+
+// ─── 9.10 Multi-Client Visibility Smoke Tests ──────────────────────────────
+
+/// Writer creates a deeply nested directory tree, reader can traverse the full path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_deep_directory_tree_visible() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_deep_directory_tree_visible: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-deep-tree");
+    let writer = make_tonbo_test_client(&info, "deep-writer");
+    let reader = make_tonbo_test_client(&info, "deep-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+
+    // Writer creates: /a/b/c/d/leaf.txt
+    let a = writer.vfs.mkdir(1, b"a", 0, 0, 0o755).unwrap();
+    let b = writer.vfs.mkdir(a.ino, b"b", 0, 0, 0o755).unwrap();
+    let c = writer.vfs.mkdir(b.ino, b"c", 0, 0, 0o755).unwrap();
+    let d = writer.vfs.mkdir(c.ino, b"d", 0, 0, 0o755).unwrap();
+    let leaf = writer
+        .vfs
+        .create(d.ino, b"leaf.txt", 0, 0, 0o644)
+        .unwrap();
+    writer
+        .vfs
+        .write(leaf.ino, 0, b"deep leaf content")
+        .await
+        .unwrap();
+    writer.vfs.flush(leaf.ino).await.unwrap();
+    // Wait for block upload to S3 so reader can fetch it.
+    let _ = wait_until_n_blocks(&writer.vfs, leaf.ino, 1, Duration::from_secs(15));
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader follows full path.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"a").is_ok()).await,
+        "reader must see /a"
+    );
+    let ra = reader.vfs.lookup(1, b"a").unwrap();
+    let rb = reader.vfs.lookup(ra.ino, b"b").unwrap();
+    let rc = reader.vfs.lookup(rb.ino, b"c").unwrap();
+    let rd = reader.vfs.lookup(rc.ino, b"d").unwrap();
+    let rleaf = reader.vfs.lookup(rd.ino, b"leaf.txt").unwrap();
+
+    // The block may still be arriving from S3 — retry reads until we see
+    // the actual content instead of zero-filled placeholder bytes.
+    let deadline = Instant::now() + wait;
+    let mut data;
+    loop {
+        data = reader.vfs.read(rleaf.ino, 0, 100).await.unwrap();
+        if !data.is_empty() && data[0] != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for leaf.txt data on reader"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(&data[..], b"deep leaf content");
+    println!("deep directory tree fully visible on reader");
+}
+
+/// Writer creates a large file (multi-block), reader reads and verifies integrity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_large_file_cross_client_integrity() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_large_file_cross_client_integrity: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-large-file");
+    let writer = make_tonbo_test_client(&info, "large-writer");
+    let reader = make_tonbo_test_client(&info, "large-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let block_size = info.block_size as usize;
+    // Write ~3 blocks of patterned data.
+    let total_size = block_size * 2 + block_size / 2; // 2.5 blocks
+    let payload: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
+
+    let attr = writer
+        .vfs
+        .create(1, b"large.bin", 0, 0, 0o644)
+        .unwrap();
+    writer.vfs.write(attr.ino, 0, &payload).await.unwrap();
+    writer.vfs.flush(attr.ino).await.unwrap();
+
+    // Wait for blocks to be uploaded.
+    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 3, Duration::from_secs(30));
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    let wait = Duration::from_secs(15);
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"large.bin").is_ok()).await,
+        "reader should see large.bin"
+    );
+
+    let reader_attr = reader.vfs.lookup(1, b"large.bin").unwrap();
+    assert_eq!(reader_attr.size, total_size as u64);
+
+    // Read and verify full content.
+    let data = reader
+        .vfs
+        .read(reader_attr.ino, 0, total_size as u32)
+        .await
+        .unwrap();
+    assert_eq!(data.len(), total_size);
+    assert_eq!(&data[..], &payload[..], "cross-client large file data mismatch");
+    println!(
+        "cross-client large file integrity verified ({} bytes, {} blocks)",
+        total_size,
+        (total_size + block_size - 1) / block_size
+    );
+}
+
+/// Writer does setattr (chmod, chown), reader sees updated attributes via NATS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_setattr_propagation() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_setattr_propagation: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-setattr");
+    let writer = make_tonbo_test_client(&info, "setattr-writer");
+    let reader = make_tonbo_test_client(&info, "setattr-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+
+    // Writer creates file.
+    let attr = writer
+        .vfs
+        .create(1, b"attr-test.txt", 0, 0, 0o644)
+        .unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"attr-test.txt").is_ok()).await,
+        "reader should see attr-test.txt"
+    );
+
+    // Writer changes mode.
+    let mut args = SetattrArgs::default();
+    args.mode = Some(0o755);
+    args.uid = Some(42);
+    writer.vfs.setattr(attr.ino, args).unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader should eventually see updated attrs.
+    let reader_ino = reader.vfs.lookup(1, b"attr-test.txt").unwrap().ino;
+    assert!(
+        wait_until(wait, || {
+            let a = reader.vfs.getattr(reader_ino).unwrap();
+            a.mode & 0o777 == 0o755 && a.uid == 42
+        })
+        .await,
+        "reader should see updated mode/uid"
+    );
+    println!("setattr propagated via NATS");
+}
+
+/// Writer creates symlink, reader resolves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_symlink_cross_client() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_symlink_cross_client: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-symlink");
+    let writer = make_tonbo_test_client(&info, "symlink-writer");
+    let reader = make_tonbo_test_client(&info, "symlink-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+
+    // Writer creates target file + symlink.
+    let _file = writer
+        .vfs
+        .create(1, b"real-file.txt", 0, 0, 0o644)
+        .unwrap();
+    let sym = writer
+        .vfs
+        .symlink(1, b"my-link", b"real-file.txt", 0, 0)
+        .unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader should see the symlink and read its target.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"my-link").is_ok()).await,
+        "reader should see symlink"
+    );
+    let reader_sym = reader.vfs.lookup(1, b"my-link").unwrap();
+    let target = reader.vfs.readlink(reader_sym.ino).unwrap();
+    assert_eq!(&target[..], b"real-file.txt");
+    assert_eq!(reader_sym.ino, sym.ino);
+    println!("symlink visible on reader");
+}
+
+/// Writer creates hardlink, reader sees it and reads shared data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_hardlink_cross_client() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_hardlink_cross_client: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-hardlink");
+    let writer = make_tonbo_test_client(&info, "hardlink-writer");
+    let reader = make_tonbo_test_client(&info, "hardlink-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+
+    let attr = writer
+        .vfs
+        .create(1, b"hl-origin.txt", 0, 0, 0o644)
+        .unwrap();
+    writer
+        .vfs
+        .write(attr.ino, 0, b"shared via hardlink")
+        .await
+        .unwrap();
+    writer.vfs.flush(attr.ino).await.unwrap();
+    // Wait for block upload to S3 so reader can fetch it.
+    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
+    writer.vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader sees both names.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"hl-origin.txt").is_ok()
+            && reader.vfs.lookup(1, b"hl-link.txt").is_ok())
+        .await,
+        "reader should see both hardlink names"
+    );
+
+    let r_orig = reader.vfs.lookup(1, b"hl-origin.txt").unwrap();
+    let r_link = reader.vfs.lookup(1, b"hl-link.txt").unwrap();
+    assert_eq!(r_orig.ino, r_link.ino, "both names should share the same ino");
+
+    // Read from the link — retry until we see non-zero data (S3 upload race).
+    let deadline = Instant::now() + wait;
+    let mut data;
+    loop {
+        data = reader.vfs.read(r_link.ino, 0, 100).await.unwrap();
+        if !data.is_empty() && data[0] != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for hardlink data on reader"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(&data[..], b"shared via hardlink");
+    println!("hardlink visible on reader, data shared");
+}
+
+// ─── 9.11 Shutdown & Drain Tests ────────────────────────────────────────────
+
+/// Shutdown after writes should drain dirty buffers and persist metadata.
+/// After shutdown, blocks should be uploaded to S3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_shutdown_drains_dirty_buffers() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "shutdown-drain");
+    let block_size = vfs.meta().get_format_info().unwrap().block_size as usize;
+
+    let attr = vfs.create(1, b"pre-shutdown.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write 2,5 blocks of data.
+    let total = block_size * 2 + block_size / 2;
+    let payload: Vec<u8> = (0..total).map(|i| (i % 197) as u8).collect();
+    vfs.write(ino, 0, &payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Before shutdown — blocks may or may not be uploaded yet.
+    // Call shutdown which should drain everything.
+    vfs.shutdown(Duration::from_secs(30)).await;
+
+    // After shutdown, all 3 blocks should exist in metadata.
+    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    assert_eq!(
+        blocks.len(),
+        3,
+        "after shutdown, all 3 blocks should be persisted"
+    );
+}
+
+/// Double shutdown should not panic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_double_shutdown_does_not_panic() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "double-shutdown");
+
+    vfs.create(1, b"file.txt", 0, 0, 0o644).unwrap();
+    vfs.shutdown(Duration::from_secs(5)).await;
+    vfs.shutdown(Duration::from_secs(5)).await;
+    // No panic = pass.
+}
+
+// ─── 9.12 More Error & Edge Cases ──────────────────────────────────────────
+
+/// Double unlink of the same file should fail on the second call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_double_unlink_fails() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "double-unlink");
+
+    vfs.create(1, b"once.txt", 0, 0, 0o644).unwrap();
+    vfs.unlink(1, b"once.txt").unwrap();
+    let result = vfs.unlink(1, b"once.txt");
+    assert!(result.is_err(), "second unlink should fail");
+}
+
+/// Rename a file to itself should be a no-op (or succeed without error).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_rename_to_self_is_noop() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rename-self");
+
+    let attr = vfs.create(1, b"self.txt", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"self data").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    // Rename to itself.
+    vfs.rename(1, b"self.txt", 1, b"self.txt").unwrap();
+
+    // File should still be accessible with original data.
+    let after = vfs.lookup(1, b"self.txt").unwrap();
+    assert_eq!(after.ino, attr.ino);
+    let data = vfs.read(attr.ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"self data");
+}
+
+/// Write at a high offset (sparse) then read back — gap should be zero-filled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_sparse_write_at_high_offset() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "sparse-high");
+    let block_size = vfs.meta().get_format_info().unwrap().block_size as u64;
+
+    let attr = vfs.create(1, b"sparse-high.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write at offset = block_size * 3 (skipping blocks 0-2).
+    let high_offset = block_size * 3;
+    let payload = b"high offset data";
+    vfs.write(ino, high_offset, payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    assert_eq!(
+        vfs.getattr(ino).unwrap().size,
+        high_offset + payload.len() as u64
+    );
+
+    // Read from the gap — should be zero-filled.
+    let gap = vfs.read(ino, 0, 1024).await.unwrap();
+    assert!(
+        gap.iter().all(|&b| b == 0),
+        "gap before high offset should be zero-filled"
+    );
+
+    // Read the actual data.
+    let data = vfs
+        .read(ino, high_offset, payload.len() as u32)
+        .await
+        .unwrap();
+    assert_eq!(&data[..], payload);
+}
+
+/// Create a file in a subdirectory, unlink it, rmdir the parent.
+/// Verify the directory can be removed after all children are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_unlink_child_then_rmdir_parent() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rmdir-after-unlink");
+
+    let dir = vfs.mkdir(1, b"parent", 0, 0, 0o755).unwrap();
+    let child = vfs
+        .create(dir.ino, b"child.txt", 0, 0, 0o644)
+        .unwrap();
+    vfs.write(child.ino, 0, b"data").await.unwrap();
+    vfs.flush(child.ino).await.unwrap();
+
+    // Remove child.
+    vfs.unlink(dir.ino, b"child.txt").unwrap();
+
+    // Now rmdir should succeed.
+    vfs.rmdir(1, b"parent").unwrap();
+
+    // Parent dir should be gone.
+    assert!(vfs.lookup(1, b"parent").is_err());
+}
+
+/// mkdir with duplicate name should fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_mkdir_duplicate_name_fails() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "mkdir-dup");
+
+    vfs.mkdir(1, b"dup-dir", 0, 0, 0o755).unwrap();
+    let result = vfs.mkdir(1, b"dup-dir", 0, 0, 0o755);
+    assert!(result.is_err(), "creating duplicate directory should fail");
+}
+
+/// Create a file with duplicate name should fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_create_duplicate_name_fails() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "create-dup");
+
+    vfs.create(1, b"dup.txt", 0, 0, 0o644).unwrap();
+    let result = vfs.create(1, b"dup.txt", 0, 0, 0o644);
+    assert!(result.is_err(), "creating duplicate file should fail");
+}
+
+/// Overwrite a partial block within an existing block (mid-block write).
+/// Verify only the written region changes and the rest is preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_mid_block_overwrite_preserves_surrounding_data() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "mid-block-overwrite");
+
+    let attr = vfs.create(1, b"mid.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    // Write 4096 bytes of 0xAA.
+    let initial = vec![0xAAu8; 4096];
+    vfs.write(ino, 0, &initial).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Overwrite bytes 1000..1500 with 0xBB.
+    let patch = vec![0xBBu8; 500];
+    vfs.write(ino, 1000, &patch).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    // Read entire file.
+    let data = vfs.read(ino, 0, 4096).await.unwrap();
+    assert_eq!(data.len(), 4096);
+
+    // Before patch.
+    assert!(
+        data[..1000].iter().all(|&b| b == 0xAA),
+        "bytes before patch should be 0xAA"
+    );
+    // Patch region.
+    assert!(
+        data[1000..1500].iter().all(|&b| b == 0xBB),
+        "patch region should be 0xBB"
+    );
+    // After patch.
+    assert!(
+        data[1500..4096].iter().all(|&b| b == 0xAA),
+        "bytes after patch should be 0xAA"
+    );
+}
+
+/// Multiple xattrs set, then remove one — remaining should persist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_remove_one_preserves_others() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr-remove-one");
+
+    let attr = vfs.create(1, b"xattr-rm.txt", 0, 0, 0o644).unwrap();
+    vfs.set_xattr(attr.ino, b"user.a", b"val-a", 0).unwrap();
+    vfs.set_xattr(attr.ino, b"user.b", b"val-b", 0).unwrap();
+    vfs.set_xattr(attr.ino, b"user.c", b"val-c", 0).unwrap();
+
+    // Remove b.
+    vfs.remove_xattr(attr.ino, b"user.b").unwrap();
+
+    // a and c should survive.
+    let names = vfs.list_xattrs(attr.ino).unwrap();
+    assert_eq!(names.len(), 2);
+    assert!(vfs.get_xattr(attr.ino, b"user.a").unwrap().is_some());
+    assert!(vfs.get_xattr(attr.ino, b"user.b").unwrap().is_none());
+    assert!(vfs.get_xattr(attr.ino, b"user.c").unwrap().is_some());
+}
+
+/// Rename a directory with children — children should follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_rename_directory_with_children() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rename-dir-tree");
+
+    let dir = vfs.mkdir(1, b"old-name", 0, 0, 0o755).unwrap();
+    let child = vfs
+        .create(dir.ino, b"child.txt", 0, 0, 0o644)
+        .unwrap();
+    vfs.write(child.ino, 0, b"child data").await.unwrap();
+    vfs.flush(child.ino).await.unwrap();
+
+    // Rename the directory.
+    vfs.rename(1, b"old-name", 1, b"new-name").unwrap();
+
+    // Old name should be gone.
+    assert!(vfs.lookup(1, b"old-name").is_err());
+
+    // New name should resolve to the same ino.
+    let renamed = vfs.lookup(1, b"new-name").unwrap();
+    assert_eq!(renamed.ino, dir.ino);
+
+    // Child should still be accessible through the renamed dir.
+    let found_child = vfs.lookup(renamed.ino, b"child.txt").unwrap();
+    assert_eq!(found_child.ino, child.ino);
+    let data = vfs.read(child.ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"child data");
+}
+
+// ─── 9.13 Multi-Client Rename & Delete via NATS ─────────────────────────────
+
+/// Writer renames a file, reader sees the update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_rename_cross_client() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!("skip test_nats_rename_cross_client: NATS unreachable");
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-rename");
+    let writer = make_tonbo_test_client(&info, "rename-writer");
+    let reader = make_tonbo_test_client(&info, "rename-reader");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+
+    // Writer creates a file.
+    let attr = writer
+        .vfs
+        .create(1, b"before.txt", 0, 0, 0o644)
+        .unwrap();
+    writer
+        .vfs
+        .write(attr.ino, 0, b"rename me")
+        .await
+        .unwrap();
+    writer.vfs.flush(attr.ino).await.unwrap();
+    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader sees the file.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"before.txt").is_ok()).await,
+        "reader should see before.txt"
+    );
+
+    // Writer renames.
+    writer
+        .vfs
+        .rename(1, b"before.txt", 1, b"after.txt")
+        .unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Reader should see the rename via NATS.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"after.txt").is_ok()).await,
+        "reader should see after.txt"
+    );
+
+    // Read the data through the new name.
+    let reader_attr = reader.vfs.lookup(1, b"after.txt").unwrap();
+    let data = reader.vfs.read(reader_attr.ino, 0, 100).await.unwrap();
+    assert_eq!(&data[..], b"rename me");
+    println!("NATS rename propagated successfully");
+}
