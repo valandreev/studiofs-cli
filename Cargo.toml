@@ -52,7 +52,9 @@ thiserror = "2"
 anyhow = "1"
 
 # Platform - FUSE (Linux/macOS)
-fuser = { version = "0.16", features = ["libfuse"] }
+# Pure-Rust /dev/fuse transport (default); avoids linking libfuse3 and the
+# "library too old" warning that the C library emits on newer distros.
+fuser = "0.16"
 libc = "0.2"
 
 # Platform - WinFSP (Windows)

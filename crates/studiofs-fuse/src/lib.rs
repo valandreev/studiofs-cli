@@ -56,16 +56,26 @@ fn spawn_signal_watcher(mount_point: &str) {
             }
             #[cfg(target_os = "linux")]
             {
-                // Try fusermount3 first (FUSE 3), fall back to fusermount, then umount.
+                // Use lazy unmount (-z) so the command succeeds even when the
+                // FUSE daemon process itself is keeping the mount busy.  The
+                // mount point is detached from the filesystem hierarchy
+                // immediately, which severs the FUSE connection and lets
+                // fuser::mount2() return.  Actual cleanup happens once no
+                // process references the mount any more (i.e. right after we
+                // exit).
                 let _ = std::process::Command::new("fusermount3")
-                    .args(["-u", &mp])
+                    .args(["-uz", &mp])
                     .status()
                     .or_else(|_| {
                         std::process::Command::new("fusermount")
-                            .args(["-u", &mp])
+                            .args(["-uz", &mp])
                             .status()
                     })
-                    .or_else(|_| std::process::Command::new("umount").arg(&mp).status());
+                    .or_else(|_| {
+                        std::process::Command::new("umount")
+                            .args(["-l", &mp])
+                            .status()
+                    });
             }
         })
         .expect("failed to spawn signal-watcher thread");
