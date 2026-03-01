@@ -8,7 +8,7 @@ mod fs;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub use fs::StudioFuseFs;
+pub use fs::{FuseKernelInvalidator, StudioFuseFs};
 
 // ─── Signal Handling ─────────────────────────────────────────────────────────
 
@@ -91,10 +91,10 @@ pub fn mount_and_serve(
     volume_name: &str,
     foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Keep a reference for shutdown() after fuser::mount2() returns
+    // Keep a reference for shutdown() after the FUSE session ends
     // (vfs is moved into StudioFuseFs below).
     let vfs_ref = vfs.clone();
-    let fs = StudioFuseFs::new(vfs, rt.clone());
+    let fs = StudioFuseFs::new(vfs.clone(), rt.clone());
     let mut options = vec![
         fuser::MountOption::FSName(volume_name.into()),
         fuser::MountOption::AutoUnmount,
@@ -121,8 +121,21 @@ pub fn mount_and_serve(
     spawn_signal_watcher(mount_point);
 
     tracing::info!("mounting StudioFS at {mount_point}, press Ctrl+C to unmount");
-    fuser::mount2(fs, mount_point, &options)?;
-    // fuser::mount2 returns when the filesystem is unmounted.
+
+    // Use Session::new + run() instead of fuser::mount2 so we can obtain a
+    // Notifier.  The Notifier allows the VFS NATS invalidation listener to
+    // proactively clear the kernel FUSE dentry/attribute cache, making remote
+    // creates/deletes visible immediately without waiting for TTL expiry.
+    let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;
+    let notifier = session.notifier();
+
+    // Register the kernel cache invalidator with the VFS.
+    let invalidator = std::sync::Arc::new(FuseKernelInvalidator::new(notifier));
+    vfs.set_kernel_invalidator(invalidator);
+
+    session.run()?;
+
+    // Session::run returns when the filesystem is unmounted.
     // Drain uploads and persist cache checkpoint before process exit.
     tracing::info!("unmounted, draining uploads …");
     rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(30)));

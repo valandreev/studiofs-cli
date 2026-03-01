@@ -11,9 +11,9 @@ use fuser::{
 };
 use studiofs_meta::FileType;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
+use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};
 use tokio::runtime::Runtime;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -830,5 +830,33 @@ impl Filesystem for StudioFuseFs {
             }
         }
         reply.ok();
+    }
+}
+
+// ─── Kernel Cache Invalidator ────────────────────────────────────────────────
+
+/// Bridges `fuser::Notifier` to the VFS `KernelInvalidator` trait so that
+/// NATS-driven metadata refreshes can immediately clear the Linux kernel's
+/// FUSE dentry and attribute caches.
+pub struct FuseKernelInvalidator {
+    notifier: fuser::Notifier,
+}
+
+impl FuseKernelInvalidator {
+    pub fn new(notifier: fuser::Notifier) -> Self {
+        Self { notifier }
+    }
+}
+
+impl KernelInvalidator for FuseKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        // offset=0, len=-1 invalidates the entire inode (attributes + all
+        // cached page data / directory listing).
+        if let Err(e) = self.notifier.inval_inode(ino, 0, -1) {
+            // ENOENT is harmless (kernel already evicted the entry).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(ino, error = %e, "FUSE notify_inval_inode failed");
+            }
+        }
     }
 }

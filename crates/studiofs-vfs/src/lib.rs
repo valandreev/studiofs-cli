@@ -13,4 +13,4 @@ pub use fetch::FetchScheduler;
 pub use readahead::{DirAccessTracker, ReadAheadTracker};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
-pub use vfs::{LockKind, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError, VfsResult};
+pub use vfs::{LockKind, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError, VfsResult, KernelInvalidator};

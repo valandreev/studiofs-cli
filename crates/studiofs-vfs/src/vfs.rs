@@ -105,6 +105,21 @@ pub struct StatFs {
 pub type VfsResult<T> = Result<T, VfsError>;
 
 // =============================================================================
+// Kernel Cache Invalidation
+// =============================================================================
+
+/// Callback trait for notifying the platform filesystem driver (FUSE / WinFSP)
+/// to drop cached metadata so that userspace immediately sees remote changes.
+///
+/// Implemented by platform bridges and registered on the VFS via
+/// [`StudioVfs::set_kernel_invalidator`] after mount.
+pub trait KernelInvalidator: Send + Sync {
+    /// Invalidate cached attributes and directory listing for a single inode.
+    /// For directories this forces the kernel to re-issue `readdir`.
+    fn inval_inode(&self, ino: u64);
+}
+
+// =============================================================================
 // Filename Validation
 // =============================================================================
 
@@ -511,6 +526,8 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional NATS invalidation bus listener config.
     invalidation_bus: Option<InvalidationBus>,
+    /// Optional kernel cache invalidator (set by platform bridge after mount).
+    kernel_invalidator: std::sync::RwLock<Option<Arc<dyn KernelInvalidator>>>,
 }
 
 impl StudioVfs {
@@ -944,6 +961,7 @@ impl StudioVfs {
             fetch_scheduler: fetch_scheduler.clone(),
             distributed_flock,
             invalidation_bus,
+            kernel_invalidator: std::sync::RwLock::new(None),
         });
 
         // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
@@ -1381,6 +1399,13 @@ impl StudioVfs {
                 Err(err) => return Err(VfsError::Other(format!("lock write failed: {err}"))),
             }
         }
+    }
+
+    /// Register a kernel cache invalidator (called by the platform bridge
+    /// after mount so that NATS-driven metadata refreshes can immediately
+    /// invalidate the kernel dentry/attribute cache).
+    pub fn set_kernel_invalidator(&self, inv: Arc<dyn KernelInvalidator>) {
+        *self.kernel_invalidator.write().unwrap() = Some(inv);
     }
 
     /// Get metadata engine reference.
@@ -3236,10 +3261,43 @@ impl StudioVfs {
         self.state.attr_read_cache.lock().remove(&ino);
         // Block data doesn't need explicit invalidation — blocks are immutable.
         // The metadata engine will return updated block refs on next read.
+
+        // Notify the kernel filesystem driver to drop its dentry/attribute
+        // cache for this inode so that userspace immediately sees remote
+        // changes without needing `ls -l` or waiting for TTL expiry.
+        self.notify_kernel_inval_inode(ino);
     }
 
     fn invalidate_all_read_caches(&self) {
+        // Collect cached inode IDs before clearing so we can notify the kernel
+        // about each one — this is bounded by the number of recently-accessed
+        // inodes, not the total metadata size.
+        let cached_inos: Vec<Ino> = self.state.attr_read_cache.lock().keys().copied().collect();
         self.state.attr_read_cache.lock().clear();
+
+        // Notify the kernel filesystem driver to drop cached dentries/attrs
+        // for every recently-accessed inode so that userspace sees remote
+        // changes immediately.
+        if let Some(inv) = self.kernel_invalidator.read().unwrap().as_ref() {
+            // Always invalidate root — it is the most common directory listing.
+            inv.inval_inode(1);
+            for ino in &cached_inos {
+                if *ino != 1 {
+                    inv.inval_inode(*ino);
+                }
+            }
+            debug!(
+                count = cached_inos.len(),
+                "kernel cache invalidation sent for all cached inodes"
+            );
+        }
+    }
+
+    /// Notify the kernel filesystem driver to invalidate a single inode.
+    fn notify_kernel_inval_inode(&self, ino: Ino) {
+        if let Some(inv) = self.kernel_invalidator.read().unwrap().as_ref() {
+            inv.inval_inode(ino);
+        }
     }
 
     fn collect_referenced_object_ids(&self) -> Option<HashSet<u64>> {
