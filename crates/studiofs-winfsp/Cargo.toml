@@ -15,7 +15,7 @@ thiserror.workspace = true
 parking_lot.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-winfsp = { version = "0.12", features = ["windows-62"] }
+winfsp = { version = "0.12", features = ["windows-62", "notify"] }
 winfsp-sys = "0.12"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
 

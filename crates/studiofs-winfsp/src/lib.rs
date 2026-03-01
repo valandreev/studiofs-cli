@@ -6,7 +6,7 @@
 
 mod context;
 
-pub use context::StudioFsContext;
+pub use context::{StudioFsContext, WinfspKernelInvalidator};
 
 /// Start the WinFSP filesystem, mount, and block until unmounted.
 pub fn mount_and_serve(
@@ -16,7 +16,8 @@ pub fn mount_and_serve(
     _volume_label: &str,
     _foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use winfsp::host::{FileSystemHost, VolumeParams};
+    use studiofs_meta::Ino;
+    use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
@@ -42,10 +43,29 @@ pub fn mount_and_serve(
 
     // Keep a reference for shutdown() (vfs is moved into context).
     let vfs_ref = vfs.clone();
-    let context = StudioFsContext::new(vfs, rt.clone());
 
-    let mut host = FileSystemHost::new(volume_params, context)?;
+    // Shared invalidation queue: the `WinfspKernelInvalidator` pushes inode
+    // IDs from NATS events; the WinFSP timer drains and sends OS notifications.
+    let invalidation_queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Ino>::new()));
+
+    let context = StudioFsContext::new(vfs.clone(), rt.clone(), invalidation_queue.clone());
+
+    // Use `new_with_timer` so the WinFSP threadpool timer periodically calls
+    // our `NotifyingFileSystemContext` impl, which sends `FspFileSystemNotify`
+    // for NATS-driven metadata invalidations.  The const generic (250) is the
+    // timer interval in milliseconds — short enough for snappy Explorer
+    // refreshes, long enough to batch rapid sequences.
+    let mut host =
+        FileSystemHost::new_with_timer::<Vec<Ino>, 250>(
+            FileSystemParams::default_params(volume_params),
+            context,
+        )?;
     host.mount(mount_point)?;
+
+    // Register the kernel cache invalidator with the VFS so that NATS events
+    // can proactively enqueue inodes for WinFSP notification.
+    let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue));
+    vfs.set_kernel_invalidator(invalidator);
 
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
     host.start()?;

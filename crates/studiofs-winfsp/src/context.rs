@@ -4,9 +4,10 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
-use studiofs_vfs::{OpenFlags, StudioVfs};
+use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
@@ -17,6 +18,7 @@ use windows::Win32::Security::{
 use winfsp::U16CStr;
 use winfsp::filesystem::DirBuffer;
 use winfsp::filesystem::*;
+use winfsp::notify::{NotifyInfo, Notifier, NotifyingFileSystemContext};
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // Windows reparse point constants
@@ -373,15 +375,24 @@ pub struct StudioFsContext {
     rt: Arc<Runtime>,
     /// Cached binary security descriptor (Everyone = Full Access).
     default_sd: Vec<u8>,
+    /// Pending kernel cache invalidation queue (shared with
+    /// `WinfspKernelInvalidator` so NATS events can enqueue inodes
+    /// and the WinFSP timer can drain them).
+    invalidation_queue: Arc<Mutex<Vec<Ino>>>,
 }
 
 impl StudioFsContext {
-    pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
+    pub fn new(
+        vfs: Arc<StudioVfs>,
+        rt: Arc<Runtime>,
+        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    ) -> Self {
         let default_sd = create_default_security_descriptor();
         Self {
             vfs,
             rt,
             default_sd,
+            invalidation_queue,
         }
     }
 
@@ -928,5 +939,121 @@ impl FileSystemContext for StudioFsContext {
             .unwrap_or_else(|_| "StudioFS".to_string());
         out_volume_info.set_volume_label(&name);
         Ok(())
+    }
+}
+
+// ─── WinFSP Notify (Kernel Cache Invalidation) ──────────────────────────────
+
+/// Windows FILE_NOTIFY_CHANGE_* / FILE_ACTION_* constants.
+const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
+const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
+const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
+
+/// Resolve an inode number to a Windows-style path (`\dir\file`) by walking
+/// the parent chain.  Returns `None` if the inode or any ancestor no longer
+/// exists (e.g. already deleted).
+fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
+    if ino == ROOT_INO {
+        return Some("\\".to_string());
+    }
+
+    let mut components: Vec<String> = Vec::new();
+    let mut current = ino;
+
+    // Walk up the parent chain (bounded to 256 levels to avoid loops).
+    for _ in 0..256 {
+        let attr = vfs.meta().get_attr(current).ok()?;
+        let parent = attr.parent;
+
+        if parent == 0 || current == ROOT_INO {
+            break;
+        }
+
+        // Find our name in the parent's directory listing.
+        let entries = vfs.meta().readdir(parent).ok()?;
+        let name = entries
+            .iter()
+            .find(|e| e.ino == current)
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())?;
+
+        components.push(name);
+        current = parent;
+    }
+
+    components.reverse();
+    Some(format!("\\{}", components.join("\\")))
+}
+
+/// Bridges VFS kernel cache invalidation to WinFSP's
+/// `FspFileSystemNotify` mechanism.
+///
+/// NATS-driven metadata refreshes push inode numbers into a shared queue.
+/// The WinFSP timer drains the queue and sends Windows change notifications
+/// so that Explorer and other applications see remote changes promptly.
+pub struct WinfspKernelInvalidator {
+    queue: Arc<Mutex<Vec<Ino>>>,
+}
+
+impl WinfspKernelInvalidator {
+    pub fn new(queue: Arc<Mutex<Vec<Ino>>>) -> Self {
+        Self { queue }
+    }
+}
+
+impl KernelInvalidator for WinfspKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.queue.lock().push(ino);
+    }
+}
+
+impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
+    fn should_notify(&self) -> Option<Vec<Ino>> {
+        let mut queue = self.invalidation_queue.lock();
+        if queue.is_empty() {
+            return None;
+        }
+        // Drain and deduplicate.
+        let mut inodes: Vec<Ino> = std::mem::take(&mut *queue);
+        inodes.sort_unstable();
+        inodes.dedup();
+        Some(inodes)
+    }
+
+    fn notify(&self, inodes: Vec<Ino>, notifier: &Notifier) {
+        for ino in &inodes {
+            let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
+                trace!(ino, "skipping notify — inode no longer resolvable");
+                continue;
+            };
+
+            let is_dir = self
+                .vfs
+                .meta()
+                .get_attr(*ino)
+                .map(|a| a.kind == FileType::Directory)
+                .unwrap_or(false);
+
+            let filter = if is_dir {
+                FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
+            } else {
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_SIZE
+                    | FILE_NOTIFY_CHANGE_ATTRIBUTES
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE
+            };
+
+            let mut info = NotifyInfo::<512>::new();
+            info.filter = filter;
+            info.action = FILE_ACTION_MODIFIED;
+            if info.set_name(&path).is_err() {
+                warn!(ino, path, "notify path too long, skipping");
+                continue;
+            }
+            notifier.notify(&info);
+            debug!(ino, path, "WinFSP notify sent");
+        }
     }
 }

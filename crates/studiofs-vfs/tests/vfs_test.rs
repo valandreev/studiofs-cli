@@ -2146,3 +2146,482 @@ async fn test_statfs_after_write() {
     // blocks should show less free space (or equal if block size rounds down)
     assert!(st_after.bfree <= st_before.bfree);
 }
+
+// =============================================================================
+// Phase 8 — Eager Flush + Kernel Cache Invalidation Tests
+// =============================================================================
+
+/// Mock `KernelInvalidator` that records every invalidated inode for assertions.
+struct MockKernelInvalidator {
+    invocations: parking_lot::Mutex<Vec<u64>>,
+}
+
+impl MockKernelInvalidator {
+    fn new() -> Self {
+        Self {
+            invocations: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Return a sorted, deduplicated snapshot of all invalidated inodes.
+    fn drain_unique(&self) -> Vec<u64> {
+        let mut v = std::mem::take(&mut *self.invocations.lock());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Return total number of `inval_inode` calls (including duplicates).
+    fn call_count(&self) -> usize {
+        self.invocations.lock().len()
+    }
+}
+
+impl studiofs_vfs::KernelInvalidator for MockKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.invocations.lock().push(ino);
+    }
+}
+
+/// Verify that `request_eager_flush()` causes the TonboMetaEngine background
+/// flush to publish metadata to NATS within seconds (instead of waiting for
+/// the full 600 s `flush_interval`).  Reader observes writer's `create` quickly.
+///
+/// This exercises the end-to-end path:
+///   writer.create() → request_eager_flush() → 250 ms tick → flush_remote_snapshot()
+///   → NATS publish → reader invalidation listener → sync_metadata() → lookup OK
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_eager_flush_create_visible_quickly() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_eager_flush_create_visible_quickly: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    // Use a very long base flush_interval (600 s) — if the file becomes visible
+    // within 10 s, it must be due to eager flush, not the normal timer.
+    let info = make_tuned_tonbo_format_info("nats-eager-create");
+    let writer = make_tonbo_test_client(&info, "writer-eager-create");
+    let reader = make_tonbo_test_client(&info, "reader-eager-create");
+    // Let the NATS subscriptions settle.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let t0 = Instant::now();
+    // create() internally calls request_eager_flush().
+    let attr = writer
+        .vfs
+        .create(1, b"eager-file.txt", 0, 0, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    writer.vfs.write(ino, 0, b"eager").await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+
+    // Do NOT call writer.vfs.meta().flush_metadata() — the whole point is
+    // that eager flush triggers the background worker automatically.
+
+    // Reader should see the file within a few seconds (eager 250 ms batching
+    // window + 250 ms tick + NATS propagation + sync).
+    let visible = wait_until(Duration::from_secs(10), || {
+        reader.vfs.lookup(1, b"eager-file.txt").is_ok()
+    })
+    .await;
+    let elapsed = t0.elapsed();
+
+    assert!(
+        visible,
+        "reader did not observe writer's create within 10 s — eager flush may be broken"
+    );
+    println!(
+        "eager flush: file visible on reader after {:.2} s (expected < 10 s)",
+        elapsed.as_secs_f64()
+    );
+
+    // Sanity: data should be readable.
+    let reader_ino = reader.vfs.lookup(1, b"eager-file.txt").unwrap().ino;
+    let data = wait_until(Duration::from_secs(10), || {
+        reader.vfs.meta().get_attr(reader_ino).is_ok()
+    })
+    .await;
+    assert!(data, "reader could not resolve attr for eagerly created file");
+}
+
+/// Like above but for `unlink` — verify eager flush after delete propagates
+/// quickly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_eager_flush_unlink_visible_quickly() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_eager_flush_unlink_visible_quickly: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-eager-unlink");
+    let writer = make_tonbo_test_client(&info, "writer-eager-unlink");
+    let reader = make_tonbo_test_client(&info, "reader-eager-unlink");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // First: create the file and explicitly flush so both clients see it.
+    let attr = writer
+        .vfs
+        .create(1, b"eager-del.txt", 0, 0, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    writer.vfs.write(ino, 0, b"todelete").await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    let visible = wait_until(Duration::from_secs(10), || {
+        reader.vfs.lookup(1, b"eager-del.txt").is_ok()
+    })
+    .await;
+    assert!(visible, "reader did not observe initial file creation");
+
+    // Now unlink — this internally calls request_eager_flush().
+    let t0 = Instant::now();
+    writer.vfs.unlink(1, b"eager-del.txt").unwrap();
+
+    // Reader should see the deletion within a few seconds.
+    let deleted = wait_until(Duration::from_secs(10), || {
+        reader.vfs.lookup(1, b"eager-del.txt").is_err()
+    })
+    .await;
+    let elapsed = t0.elapsed();
+
+    assert!(
+        deleted,
+        "reader still sees deleted file after 10 s — eager flush for unlink may be broken"
+    );
+    println!(
+        "eager flush: unlink visible on reader after {:.2} s",
+        elapsed.as_secs_f64()
+    );
+}
+
+/// Verify that `mkdir` + `rmdir` + `rename` also trigger eager flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_eager_flush_dir_ops() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_eager_flush_dir_ops: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-eager-dirops");
+    let writer = make_tonbo_test_client(&info, "writer-eager-dirops");
+    let reader = make_tonbo_test_client(&info, "reader-eager-dirops");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(10);
+
+    // 1. mkdir — eager flush
+    writer.vfs.mkdir(1, b"subdir", 0, 0, 0o755).unwrap();
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_ok()).await,
+        "reader did not see mkdir within 10 s"
+    );
+
+    // 2. create file in subdir via rename from root
+    let subdir_ino = writer.vfs.lookup(1, b"subdir").unwrap().ino;
+    let _attr = writer
+        .vfs
+        .create(subdir_ino, b"before.txt", 0, 0, 0o644)
+        .unwrap();
+    // Wait for the remote reader to see the subdir inode first
+    let reader_subdir_ino = wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_ok()).await;
+    assert!(reader_subdir_ino, "reader did not see subdir");
+    // Now flush the create
+    writer.vfs.meta().flush_metadata().unwrap();
+    let r_sdir = reader.vfs.lookup(1, b"subdir").unwrap().ino;
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(r_sdir, b"before.txt").is_ok()).await,
+        "reader did not see file in subdir"
+    );
+
+    // 3. rename — eager flush
+    writer
+        .vfs
+        .rename(subdir_ino, b"before.txt", subdir_ino, b"after.txt")
+        .unwrap();
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(r_sdir, b"after.txt").is_ok()).await,
+        "reader did not see rename within 10 s"
+    );
+
+    // 4. rmdir (need to remove files first)
+    writer.vfs.unlink(subdir_ino, b"after.txt").unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(r_sdir, b"after.txt").is_err()).await,
+        "reader still sees deleted file"
+    );
+    writer.vfs.rmdir(1, b"subdir").unwrap();
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_err()).await,
+        "reader did not see rmdir within 10 s"
+    );
+}
+
+/// Verify that the `KernelInvalidator` receives `inval_inode` calls when NATS
+/// invalidation events arrive on the reader.
+///
+/// This confirms the plumbing works — the same trait is implemented by
+/// `FuseKernelInvalidator` (Linux) and `WinfspKernelInvalidator` (Windows).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_kernel_invalidator_receives_inode_events() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_kernel_invalidator_receives_inode_events: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-invalidator");
+    let writer = make_tonbo_test_client(&info, "writer-invalidator");
+    let reader = make_tonbo_test_client(&info, "reader-invalidator");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+
+    // Register a mock kernel invalidator on the reader.
+    let mock_inv = Arc::new(MockKernelInvalidator::new());
+    reader.vfs.set_kernel_invalidator(mock_inv.clone());
+
+    // Pre-warm reader's attr cache for root (ino 1) so that the invalidation
+    // actually has something to clear.
+    let _ = reader.vfs.getattr(1).unwrap();
+
+    // Writer creates a file — triggers eager flush → NATS → reader invalidation.
+    let attr = writer
+        .vfs
+        .create(1, b"notify-test.txt", 0, 0, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    writer.vfs.write(ino, 0, b"data").await.unwrap();
+    writer.vfs.flush(ino).await.unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    // Wait for the reader to process the NATS invalidation event.
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"notify-test.txt").is_ok()).await,
+        "reader did not observe file creation via NATS"
+    );
+
+    // The mock invalidator should have been called.  The global "all"
+    // invalidation always invalidates root (ino 1) plus any other cached inodes.
+    let invoked = wait_until(Duration::from_secs(5), || mock_inv.call_count() > 0).await;
+    assert!(
+        invoked,
+        "KernelInvalidator::inval_inode was never called on the reader"
+    );
+
+    let invalidated = mock_inv.drain_unique();
+    println!(
+        "kernel invalidator received inval_inode calls for inodes: {:?}",
+        invalidated
+    );
+    // Root inode should always be in the list (invalidate_all_read_caches
+    // explicitly invalidates ino 1).
+    assert!(
+        invalidated.contains(&1),
+        "expected root inode (1) to be invalidated, got: {:?}",
+        invalidated
+    );
+
+    // Now test a second round: create another file, verify invalidator fires again.
+    let prev_count = mock_inv.call_count();
+    let attr2 = writer
+        .vfs
+        .create(1, b"notify-test-2.txt", 0, 0, 0o644)
+        .unwrap();
+    writer.vfs.flush(attr2.ino).await.unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    assert!(
+        wait_until(wait, || reader.vfs.lookup(1, b"notify-test-2.txt").is_ok()).await,
+        "reader did not observe second file creation"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || mock_inv.call_count() > prev_count).await,
+        "KernelInvalidator was not called again for the second event"
+    );
+    println!(
+        "kernel invalidator total calls after two events: {}",
+        mock_inv.call_count()
+    );
+}
+
+/// Verify that eager-flush batching and kernel-cache invalidation work
+/// together end-to-end.
+///
+/// **Batching semantics:** `request_eager_flush()` uses a 250 ms collection
+/// window so that rapid sequential mutations (e.g. multi-file create/delete)
+/// are grouped into one remote flush + one NATS event.  The reader may see
+/// the S3 data *before* the NATS event arrives (via `read_with_refresh`
+/// cache-miss → direct `pull_remote_snapshot`).  When this happens the NATS
+/// handler's `sync_and_apply_invalidation` observes no version advancement
+/// and enters a multi-attempt retry loop.  Because the handler is sequential,
+/// back-to-back events can queue up and exceed tight timeouts.
+///
+/// This test therefore keeps the number of NATS events minimal:
+///   1. Rapid creates → eager-flush visibility check (no explicit flush).
+///   2. One explicit `flush_metadata()` to produce a deterministic NATS event
+///      that the handler can resolve in a single attempt, triggering
+///      `invalidate_all_read_caches()` and the `KernelInvalidator` mock.
+///
+/// More complex mutation sequences (rename, unlink, dir-ops) are covered
+/// by the dedicated eager-flush tests above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_nats_eager_flush_with_kernel_invalidation_rapid_mutations() {
+    load_test_env();
+    ensure_bucket().await;
+
+    let nats_url =
+        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if !ensure_nats(&nats_url).await {
+        eprintln!(
+            "skip test_nats_eager_flush_with_kernel_invalidation_rapid_mutations: NATS unreachable at {}",
+            nats_url
+        );
+        return;
+    }
+
+    let _env_lock = nats_test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
+
+    let info = make_tuned_tonbo_format_info("nats-eager-rapid");
+    let writer = make_tonbo_test_client(&info, "writer-eager-rapid");
+    let reader = make_tonbo_test_client(&info, "reader-eager-rapid");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wait = Duration::from_secs(15);
+    let mock_inv = Arc::new(MockKernelInvalidator::new());
+    reader.vfs.set_kernel_invalidator(mock_inv.clone());
+
+    // Warm reader caches so there is at least inode 1 in the attr cache.
+    let _ = reader.vfs.getattr(1).unwrap();
+    let _ = reader.vfs.readdir(1).unwrap();
+
+    // ── Phase 1: Eager-flush visibility ────────────────────────────────────
+    // Create 3 files in quick succession.  `request_eager_flush()` fires for
+    // each mutation; the background flush thread batches them and pushes to S3
+    // after the 250 ms collection window.  We verify the reader can see all
+    // three files WITHOUT an explicit `flush_metadata()`.
+    let t0 = Instant::now();
+    for i in 0..3 {
+        let name = format!("rapid-{i}.txt");
+        let attr = writer
+            .vfs
+            .create(1, name.as_bytes(), 0, 0, 0o644)
+            .unwrap();
+        writer
+            .vfs
+            .write(attr.ino, 0, format!("content-{i}").as_bytes())
+            .await
+            .unwrap();
+        writer.vfs.flush(attr.ino).await.unwrap();
+    }
+
+    // Do NOT call flush_metadata — rely on eager flush for visibility.
+
+    for i in 0..3 {
+        let name = format!("rapid-{i}.txt");
+        assert!(
+            wait_until(wait, || reader.vfs.lookup(1, name.as_bytes()).is_ok()).await,
+            "reader did not see {name} within {wait:?}"
+        );
+    }
+    let batch_elapsed = t0.elapsed();
+    println!(
+        "rapid 3-file create visible on reader after {:.2} s",
+        batch_elapsed.as_secs_f64()
+    );
+
+    // ── Phase 2: Kernel invalidator via explicit flush ─────────────────────
+    // The reader's `wait_until` polling above may have pulled the writer's
+    // snapshot directly from S3 (cache-miss path), racing ahead of the NATS
+    // invalidation event.  Every queued NATS event then enters a ~4 s retry
+    // loop because the handler sees no version advancement.
+    //
+    // To verify kernel invalidation deterministically we:
+    //  1. Wait a short while so the handler can drain any earlier events.
+    //  2. Create one more mutation + explicit `flush_metadata()` to produce a
+    //     NATS event with a guaranteed new etag.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    writer
+        .vfs
+        .create(1, b"kernel-inv-trigger.txt", 0, 0, 0o644)
+        .unwrap();
+    writer.vfs.meta().flush_metadata().unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(15), || mock_inv.call_count() > 0).await,
+        "KernelInvalidator was not called after explicit flush trigger"
+    );
+
+    let calls = mock_inv.call_count();
+    let inodes = mock_inv.drain_unique();
+    println!(
+        "test complete — kernel invalidator called {calls} time(s), inodes: {inodes:?}"
+    );
+    // Root (ino 1) must always be present because invalidate_all_read_caches()
+    // unconditionally sends it.
+    assert!(
+        inodes.contains(&1),
+        "expected root inode (1) in invalidated set, got: {inodes:?}"
+    );
+}
