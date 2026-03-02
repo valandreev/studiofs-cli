@@ -10,6 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use fs::{FuseKernelInvalidator, StudioFuseFs};
 
+fn shutdown_upload_drain_timeout() -> std::time::Duration {
+    let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    std::time::Duration::from_secs(secs)
+}
+
 // ─── Signal Handling ─────────────────────────────────────────────────────────
 
 /// Flag set by the SIGINT/SIGTERM handler.
@@ -138,7 +146,7 @@ pub fn mount_and_serve(
     // Session::run returns when the filesystem is unmounted.
     // Drain uploads and persist cache checkpoint before process exit.
     tracing::info!("unmounted, draining uploads …");
-    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(30)));
+    rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
     // Use process::exit to avoid blocking on tokio Runtime drop, which would
     // wait for all background tasks (janitor, GC etc.) to complete — causing
     // an indefinite hang after unmount on Linux/WSL.

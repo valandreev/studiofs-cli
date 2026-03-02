@@ -27,8 +27,8 @@ pub const VERSION: u16 = 2;
 /// Maximum object size (for safety check, e.g., 64MB).
 pub const MAX_OBJECT_SIZE: u32 = 64 * 1024 * 1024;
 
-/// Default block size: 4 MiB.
-pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
+/// Default block size: 8 MiB.
+pub const DEFAULT_BLOCK_SIZE: u32 = 8 * 1024 * 1024;
 
 // =============================================================================
 // Error Types

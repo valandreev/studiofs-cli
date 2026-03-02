@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use studiofs_meta::DEFAULT_BLOCK_SIZE;
 
-/// Split a data buffer into 1 MiB blocks.
+/// Split a data buffer into blocks of `DEFAULT_BLOCK_SIZE`.
 ///
 /// Returns a list of (block_index, block_data) pairs.
 pub fn split_into_blocks(data: &[u8], start_offset: u32) -> Vec<(u32, Bytes)> {
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn test_split_aligned() {
-        let bs = DEFAULT_BLOCK_SIZE as usize; // 1 MiB
+        let bs = DEFAULT_BLOCK_SIZE as usize;
         let data = vec![0u8; 2 * bs]; // 2 blocks
         let blocks = split_into_blocks(&data, 0);
         assert_eq!(blocks.len(), 2);
@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn test_split_unaligned() {
-        let bs = DEFAULT_BLOCK_SIZE as usize; // 1 MiB
+        let bs = DEFAULT_BLOCK_SIZE as usize;
         let data = vec![0u8; bs + 512 * 1024]; // 1 full + 0.5 MiB partial
         let blocks = split_into_blocks(&data, 0);
         assert_eq!(blocks.len(), 2);
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn test_split_with_offset() {
-        let bs = DEFAULT_BLOCK_SIZE as usize; // 1 MiB
+        let bs = DEFAULT_BLOCK_SIZE as usize;
         let data = vec![0u8; bs / 2]; // 0.5 MiB
         let blocks = split_into_blocks(&data, (3 * bs) as u32); // starting at block 3
         // offset 3 MiB is in block 3, with the full block available

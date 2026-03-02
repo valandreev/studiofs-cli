@@ -113,6 +113,14 @@ ENV TUNING:
   STUDIOFS_JANITOR_SKIP_NEWER_SECS  Grace window for orphan deletion (default: 900).
   STUDIOFS_JANITOR_MAX_DELETES      Max janitor deletes per cycle (default: 500).
   STUDIOFS_JANITOR_LEASE_TTL_SECS   Janitor lease TTL in metadata store (default: 2700).
+  STUDIOFS_UPLOAD_DELAY_MS          Delay uploads for overwrite/delete coalescing (default: 2000).
+  STUDIOFS_UPLOAD_REQUEUE_BASE_MS   Base backoff for exhausted upload requeue (default: 5000).
+  STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
+  STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
+  STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
+  STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY  Upload slot cost when reads active (default: 4).
+  STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 250).
+  STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS  Wait uploads on unmount (default: 0, resume next mount).
 
   Enable debug logging:
     studiofs --log-level debug mount myvolume Z:
@@ -155,10 +163,10 @@ EXAMPLES:
       --metadata-bucket meta-bucket --metadata-access-key minioadmin \\
       --metadata-secret-key minioadmin
 
-  Custom block size (8 MiB instead of default 4 MiB):
+  Custom block size (16 MiB instead of default 8 MiB):
     studiofs init custom --endpoint http://127.0.0.1:9000 \\
       --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
-      --block-size 8MB
+      --block-size 16MB
 
   Multi-client tuning (aggressive convergence):
     studiofs init teamdisk --endpoint http://127.0.0.1:9000 \\
@@ -226,7 +234,7 @@ EXAMPLES:
         #[arg(long, default_value_t = 1024 * 1024)]
         metadata_flush_bytes_threshold: u64,
 
-        /// Block size in bytes (e.g. 4MB, 8MB, 16MB). Defaults to 4MB if not specified.
+        /// Block size in bytes (e.g. 4MB, 8MB, 16MB). Defaults to 8MB if not specified.
         /// Larger blocks reduce metadata overhead but increase memory usage per operation.
         #[arg(long)]
         block_size: Option<String>,

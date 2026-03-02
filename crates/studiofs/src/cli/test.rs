@@ -32,7 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// 1 KB — typical metadata object (manifest counter, inode counter).
 const SMALL_SIZE: usize = 1 * 1024;
-/// 4 MB — one full data block (default block size).
+/// 4 MB — large data object probe for throughput checks.
 const LARGE_SIZE: usize = 4 * 1024 * 1024;
 
 // ── Result model ─────────────────────────────────────────────────────────────

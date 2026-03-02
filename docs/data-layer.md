@@ -106,7 +106,7 @@ Immutable, content-addressable objects with integrity verification.
 | `MAGIC` | `b"STFS"` |
 | `VERSION` | 2 |
 | `MAX_OBJECT_SIZE` | 64 MiB |
-| `DEFAULT_BLOCK_SIZE` | 1 MiB |
+| `DEFAULT_BLOCK_SIZE` | 8 MiB |
 
 ## Block Management (`block.rs`)
 

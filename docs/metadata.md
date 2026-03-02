@@ -107,7 +107,7 @@ To avoid contending on remote counters for every `next_inode()` / `next_block_id
 
 | Constant | Value |
 |----------|-------|
-| `DEFAULT_BLOCK_SIZE` | 1 MiB (1,048,576) |
+| `DEFAULT_BLOCK_SIZE` | 8 MiB (8,388,608) |
 | `ROOT_INO` | 1 |
 
 ### Core Types

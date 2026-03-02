@@ -38,11 +38,11 @@ pub enum IoProfile {
     Default,
     /// Optimised for reads: dedicated connection pool so uploads can never
     /// starve reads.
-    /// io_timeout=30s, concurrent_limit=256, retries=0.
+    /// io_timeout=30s, concurrent_limit=512, retries=0.
     Read,
     /// Optimised for writes (uploads, deletes): higher timeout budget for
     /// high-latency object stores.
-    /// io_timeout=90s, concurrent_limit=256, retries=1.
+    /// io_timeout=90s, concurrent_limit=256, retries=0.
     Write,
 }
 
@@ -118,8 +118,10 @@ impl DataStore {
             default_concurrent_limit,
         ): (u64, u64, usize, usize) = match profile {
             IoProfile::Default => (10, 60, 3, 128),
-            IoProfile::Read => (3, 30, 0, 256),
-            IoProfile::Write => (10, 90, 1, 256),
+            IoProfile::Read => (3, 30, 0, 512),
+            // UploadScheduler owns retry policy for writes; keep OpenDAL retries
+            // off by default to avoid stacked retry storms.
+            IoProfile::Write => (10, 90, 0, 256),
         };
 
         let profile_key = match profile {
@@ -144,15 +146,19 @@ impl DataStore {
             default_concurrent_limit,
         );
 
-        let op = Operator::new(builder)?
+        let base = Operator::new(builder)?
             // TimeoutLayer MUST come before RetryLayer (see opendal docs).
             .layer(
                 TimeoutLayer::new()
                     .with_timeout(Duration::from_secs(meta_timeout_s))
                     .with_io_timeout(Duration::from_secs(io_timeout_s)),
-            )
-            // RetryLayer: exponential backoff with jitter for transient errors.
-            .layer(
+            );
+
+        let op = if max_retries > 0 {
+            // Attach RetryLayer only when explicitly enabled. With max_retries=0 we
+            // leave retries entirely to upper schedulers (fetch/upload), avoiding
+            // stacked retry storms and duplicate warning noise.
+            base.layer(
                 RetryLayer::new()
                     .with_max_times(max_retries)
                     .with_min_delay(Duration::from_millis(200))
@@ -162,7 +168,11 @@ impl DataStore {
             // Each profile gets its own connection pool — reads never compete
             // with uploads for HTTP connections.
             .layer(ConcurrentLimitLayer::new(concurrent_limit))
-            .finish();
+            .finish()
+        } else {
+            base.layer(ConcurrentLimitLayer::new(concurrent_limit))
+                .finish()
+        };
 
         info!(
             profile = ?profile,

@@ -1225,11 +1225,33 @@ impl TonboMetaEngine {
         }
     }
 
+    // Hot-path reader for strict local semantics:
+    // 1) try local snapshot immediately (no remote round-trip);
+    // 2) on cache miss, return immediately (no on-demand remote pull).
+    //
+    // Remote reconciliation is handled by background sync/invalidation paths.
+    fn read_local_first<T, F>(&self, mut op: F) -> MetaResult<T>
+    where
+        F: FnMut() -> MetaResult<T>,
+    {
+        match op() {
+            Ok(v) => {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(v)
+            }
+            Err(err) if Self::is_cache_miss(&err) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn on_mutation(&self, approx_delta_bytes: u64) -> MetaResult<()> {
         if self.remote.is_none() {
             return Ok(());
         }
-        let should_flush = {
+        let should_eager_flush = {
             let mut state = self.state.lock();
             state.pending_ops = state.pending_ops.saturating_add(1);
             state.pending_bytes = state.pending_bytes.saturating_add(approx_delta_bytes);
@@ -1237,18 +1259,10 @@ impl TonboMetaEngine {
                 || state.pending_bytes >= self.flush_bytes_threshold
                 || state.last_flush.elapsed() >= self.flush_interval
         };
-        if should_flush {
-            if let Err(err) = self.flush_remote_snapshot(false) {
-                if Self::is_temporary_remote_error(&err) {
-                    // Keep pending counters as-is and retry on next mutation/flush cycle.
-                    warn!(
-                        "tonbo deferred metadata flush due to temporary remote error: {}",
-                        err
-                    );
-                } else {
-                    return Err(err);
-                }
-            }
+        if should_eager_flush {
+            // Never block caller paths (write/flush/fsync/readdir/etc.) on
+            // remote metadata sync. Background worker performs the actual flush.
+            self.eager_flush_pending.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1623,7 +1637,7 @@ impl MetaEngine for TonboMetaEngine {
     }
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
-        self.read_with_refresh(|| self.local.get_attr(ino))
+        self.read_local_first(|| self.local.get_attr(ino))
     }
 
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
@@ -1643,11 +1657,11 @@ impl MetaEngine for TonboMetaEngine {
     }
 
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        self.read_with_refresh(|| self.local.lookup(parent, name))
+        self.read_local_first(|| self.local.lookup(parent, name))
     }
 
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
-        self.read_with_refresh(|| self.local.readdir(parent))
+        self.read_local_first(|| self.local.readdir(parent))
     }
 
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
@@ -1667,7 +1681,7 @@ impl MetaEngine for TonboMetaEngine {
     }
 
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        self.read_with_refresh(|| self.local.get_file_block(ino, block_index))
+        self.read_local_first(|| self.local.get_file_block(ino, block_index))
     }
 
     fn set_file_block(
@@ -1684,7 +1698,7 @@ impl MetaEngine for TonboMetaEngine {
     }
 
     fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        self.read_with_refresh(|| self.local.get_file_blocks(ino))
+        self.read_local_first(|| self.local.get_file_blocks(ino))
     }
 
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {

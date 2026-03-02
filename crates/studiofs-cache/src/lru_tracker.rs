@@ -8,7 +8,7 @@
 //! mutations for hot blocks.
 
 use parking_lot::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // =============================================================================
 // Constants
@@ -167,6 +167,30 @@ pub struct LruTracker {
 }
 
 impl LruTracker {
+    /// Largest whole-second duration that can be safely subtracted from `now`.
+    fn max_subtractable_secs(now: Instant) -> u64 {
+        let mut lo = 0u64;
+        let mut hi = 1u64;
+
+        while hi < u64::MAX / 2 && now.checked_sub(Duration::from_secs(hi)).is_some() {
+            lo = hi;
+            hi = hi.saturating_mul(2);
+        }
+        if now.checked_sub(Duration::from_secs(hi)).is_some() {
+            return hi;
+        }
+
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if now.checked_sub(Duration::from_secs(mid)).is_some() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Create a new empty tracker.
     pub fn new() -> Self {
         let mut shards = Vec::with_capacity(SHARD_COUNT);
@@ -262,7 +286,9 @@ impl LruTracker {
         for (shard_idx, shard) in self.shards.iter().enumerate() {
             let s = shard.lock();
             for entry in &s.entries {
-                if entry.pinned || entry.location != BlockLocation::MemoryAndDisk {
+                // Pinned blocks must stay on disk for upload safety, but they
+                // can still be demoted from L1 RAM once they are in L2.
+                if entry.location != BlockLocation::MemoryAndDisk {
                     continue;
                 }
                 if oldest.is_none() || entry.last_access < oldest.as_ref().unwrap().2 {
@@ -339,13 +365,25 @@ impl LruTracker {
     ///
     /// `entries` must be sorted oldest-first.
     pub fn load_checkpoint(&self, entries: Vec<CheckpointEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+
         let now = Instant::now();
+        let max_back_secs = Self::max_subtractable_secs(now);
+        let denom = (entries.len() - 1) as u128;
+
         for (i, ce) in entries.iter().enumerate() {
             let shard_idx = (ce.object_id as usize) % SHARD_COUNT;
-            // Synthesise access times: oldest entry = now - len, newest = now.
-            // This preserves relative ordering from the checkpoint.
-            let offset_secs = (entries.len() - i) as u64;
-            let access = now - std::time::Duration::from_secs(offset_secs);
+            // Synthesize access times in the safe subtractable range:
+            // oldest is furthest in the past, newest is closest to `now`.
+            let offset_secs = if denom == 0 || max_back_secs == 0 {
+                0
+            } else {
+                let oldest_rank = (entries.len() - 1 - i) as u128;
+                ((oldest_rank * max_back_secs as u128) / denom) as u64
+            };
+            let access = now.checked_sub(Duration::from_secs(offset_secs)).unwrap_or(now);
             self.shards[shard_idx].lock().insert(LruEntry {
                 object_id: ce.object_id,
                 size: ce.size,
@@ -472,6 +510,21 @@ mod tests {
         assert!(lru2.contains(1));
         assert!(lru2.contains(2));
         assert!(lru2.contains(3));
+    }
+
+    #[test]
+    fn load_checkpoint_many_entries_does_not_panic() {
+        let lru = LruTracker::new();
+        let entries: Vec<CheckpointEntry> = (0..250_000u64)
+            .map(|id| CheckpointEntry {
+                object_id: id,
+                size: 1,
+                location: BlockLocation::DiskOnly,
+                pinned: false,
+            })
+            .collect();
+        lru.load_checkpoint(entries);
+        assert_eq!(lru.len(), 250_000);
     }
 
     #[test]

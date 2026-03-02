@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // =============================================================================
 // Journal format constants
@@ -51,6 +51,10 @@ pub struct PendingUpload {
     pub object_id: u64,
     /// Path to the journal file tracking this op.
     pub journal_path: PathBuf,
+    /// Enqueue timestamp in unix milliseconds (from journal).
+    pub created_unix_ms: u64,
+    /// In-memory retry attempt counter for cooldown requeue logic.
+    pub retry_count: u32,
 }
 
 // =============================================================================
@@ -101,7 +105,10 @@ impl UploadQueue {
     pub fn submit(&self, ino: Ino, offset: u64, object_id: u64) {
         // Write journal file.
         let journal_path = self.journal_path(object_id);
-        if let Err(e) = self.write_journal(ino, offset, object_id, &journal_path) {
+        let created_unix_nanos = now_unix_nanos_i64();
+        if let Err(e) =
+            self.write_journal(ino, offset, object_id, created_unix_nanos, &journal_path)
+        {
             error!(object_id, error = %e, "failed to write upload journal");
             // Continue anyway — the upload itself is more critical than the journal.
         }
@@ -113,6 +120,8 @@ impl UploadQueue {
             offset,
             object_id,
             journal_path,
+            created_unix_ms: unix_nanos_to_ms(created_unix_nanos),
+            retry_count: 0,
         };
 
         if self.sender.send(op).is_err() {
@@ -206,7 +215,15 @@ impl UploadQueue {
                 match self.parse_journal(&path) {
                     Ok(op) => ops.push(op),
                     Err(e) => {
-                        warn!(path = %path.display(), error = %e, "corrupt upload journal");
+                        if e.kind() == io::ErrorKind::PermissionDenied {
+                            debug!(
+                                path = %path.display(),
+                                error = %e,
+                                "upload journal temporarily unavailable, skipping"
+                            );
+                        } else {
+                            warn!(path = %path.display(), error = %e, "corrupt upload journal");
+                        }
                     }
                 }
             }
@@ -245,6 +262,7 @@ impl UploadQueue {
         ino: Ino,
         offset: u64,
         object_id: u64,
+        created_unix_nanos: i64,
         final_path: &Path,
     ) -> io::Result<()> {
         let tmp = final_path.with_extension("tmp");
@@ -256,10 +274,7 @@ impl UploadQueue {
         buf.extend_from_slice(&offset.to_le_bytes());
         buf.extend_from_slice(&ino.to_le_bytes());
         buf.push(0u8); // status = pending
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
+        let ts = created_unix_nanos;
         buf.extend_from_slice(&ts.to_le_bytes());
         buf.push(0u8); // padding
 
@@ -294,12 +309,15 @@ impl UploadQueue {
         let object_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let offset = u64::from_le_bytes(data[16..24].try_into().unwrap());
         let ino = u64::from_le_bytes(data[24..32].try_into().unwrap());
+        let ts_nanos = i64::from_le_bytes(data[33..41].try_into().unwrap());
 
         Ok(PendingUpload {
             ino,
             offset,
             object_id,
             journal_path: path.to_path_buf(),
+            created_unix_ms: unix_nanos_to_ms(ts_nanos),
+            retry_count: 0,
         })
     }
 
@@ -353,6 +371,21 @@ impl UploadQueue {
         if corrupted > 0 {
             warn!(corrupted, "removed corrupted upload journals");
         }
+    }
+}
+
+fn now_unix_nanos_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn unix_nanos_to_ms(ts_nanos: i64) -> u64 {
+    if ts_nanos <= 0 {
+        0
+    } else {
+        (ts_nanos as u64) / 1_000_000
     }
 }
 

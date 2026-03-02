@@ -8,6 +8,14 @@ mod context;
 
 pub use context::{StudioFsContext, WinfspKernelInvalidator};
 
+fn shutdown_upload_drain_timeout() -> std::time::Duration {
+    let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Start the WinFSP filesystem, mount, and block until unmounted.
 pub fn mount_and_serve(
     vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
@@ -82,8 +90,9 @@ pub fn mount_and_serve(
     // Stop WinFSP first so no new callbacks race with the shutdown drain.
     host.stop();
     host.unmount();
-    // Drain uploads and persist cache checkpoint after WinFSP callbacks are quiesced.
-    rt.block_on(vfs_ref.shutdown(std::time::Duration::from_secs(30)));
+    // By default do not block process exit on remote uploads; pending journal
+    // entries are resumed on next mount.
+    rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
 
     Ok(())
 }

@@ -166,6 +166,22 @@ impl ReadAheadTracker {
         self.inflight.remove(&(ino, block));
     }
 
+    /// Return whether a queued prefetch block is still relevant to the current
+    /// read head for this inode.
+    ///
+    /// After a large seek jump, many queued prefetch tasks for the old region
+    /// can still be in flight. Dropping those stale tasks improves seek
+    /// responsiveness for interactive video playback.
+    pub fn is_prefetch_relevant(&self, ino: Ino, block: u32) -> bool {
+        let Some(state) = self.states.get(&ino) else {
+            return true;
+        };
+        let head = state.last_block;
+        let tail_slack = self.width.max(1);
+        let min_valid = head.saturating_sub(tail_slack);
+        block >= min_valid
+    }
+
     /// Remove all state for an inode (e.g. on file close or delete).
     pub fn evict(&self, ino: Ino) {
         self.states.remove(&ino);

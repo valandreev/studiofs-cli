@@ -111,6 +111,7 @@ impl AimdController {
     /// Create a new controller from the given configuration.
     pub fn new(cfg: AimdConfig) -> Self {
         let initial = cfg.initial_window.clamp(cfg.min_window, cfg.max_window);
+        let now = Instant::now();
         Self {
             state: Mutex::new(AimdState {
                 window: initial,
@@ -119,7 +120,9 @@ impl AimdController {
                 max_window: cfg.max_window,
                 increase_step: cfg.increase_step,
                 decrease_factor: cfg.decrease_factor,
-                last_decrease: Instant::now() - cfg.decrease_cooldown, // allow immediate first decrease
+                // Large cooldown values (e.g. bad env/config) can underflow here.
+                // Fall back to `now` instead of panicking during startup.
+                last_decrease: now.checked_sub(cfg.decrease_cooldown).unwrap_or(now),
                 decrease_cooldown: cfg.decrease_cooldown,
             }),
             notify: Notify::new(),
@@ -305,6 +308,16 @@ mod tests {
             decrease_factor: 0.5,
             decrease_cooldown: Duration::from_millis(0), // instant for tests
         }
+    }
+
+    #[test]
+    fn new_with_huge_cooldown_does_not_panic() {
+        let cfg = AimdConfig {
+            decrease_cooldown: Duration::MAX,
+            ..test_config()
+        };
+        let c = AimdController::new(cfg);
+        assert_eq!(c.effective_limit(), 2);
     }
 
     #[tokio::test]

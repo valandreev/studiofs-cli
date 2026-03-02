@@ -28,11 +28,11 @@ use tracing::{debug, error, info, warn};
 
 /// Defaults for retry/timeout tuning (all overrideable via env).
 const DEFAULT_MAX_FETCH_ATTEMPTS: u32 = 8;
-const DEFAULT_PREFETCH_MAX_FETCH_ATTEMPTS: u32 = 2;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_PREFETCH_MAX_FETCH_ATTEMPTS: u32 = 4;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 45;
 const DEFAULT_RETRY_BASE_MS: u64 = 50;
 const DEFAULT_RETRY_MAX_MS: u64 = 2_000;
-const DEFAULT_PREFETCH_ACQUIRE_WAIT_MS: u64 = 25;
+const DEFAULT_PREFETCH_ACQUIRE_WAIT_MS: u64 = 75;
 
 /// Capacity of the broadcast channel used for singleflight notifications.
 const BROADCAST_CAPACITY: usize = 2;

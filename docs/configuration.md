@@ -27,7 +27,7 @@ studiofs init <name> \
   [--metadata-flush-interval-secs <u64>] \
   [--metadata-flush-ops-threshold <u32>] \
   [--metadata-flush-bytes-threshold <u64>] \
-  [--block-size <e.g. 4MB>]
+  [--block-size <e.g. 8MB>]
 ```
 
 | Option | Required | Default | Description |
@@ -48,7 +48,7 @@ studiofs init <name> \
 | `--metadata-flush-interval-secs` | No | 60 | Batch flush interval |
 | `--metadata-flush-ops-threshold` | No | 100 | Flush after N operations |
 | `--metadata-flush-bytes-threshold` | No | 1 MiB | Flush after N bytes |
-| `--block-size` | No | 1 MiB | Block size |
+| `--block-size` | No | 8 MiB | Block size |
 
 ### `discover` — Attach to Existing Volume
 

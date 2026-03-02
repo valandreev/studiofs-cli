@@ -13,18 +13,30 @@ use tracing::{debug, error, info, warn};
 
 /// Lock-free counters for upload observability.
 pub struct UploadMetrics {
+    pub attempts: AtomicU64,
     pub uploads_ok: AtomicU64,
     pub uploads_err: AtomicU64,
     pub retries: AtomicU64,
+    pub exhausted: AtomicU64,
+    pub timeout_err: AtomicU64,
+    pub temporary_err: AtomicU64,
+    pub status_5xx_err: AtomicU64,
+    pub network_err: AtomicU64,
     pub bytes_uploaded: AtomicU64,
 }
 
 impl UploadMetrics {
     fn new() -> Self {
         Self {
+            attempts: AtomicU64::new(0),
             uploads_ok: AtomicU64::new(0),
             uploads_err: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            exhausted: AtomicU64::new(0),
+            timeout_err: AtomicU64::new(0),
+            temporary_err: AtomicU64::new(0),
+            status_5xx_err: AtomicU64::new(0),
+            network_err: AtomicU64::new(0),
             bytes_uploaded: AtomicU64::new(0),
         }
     }
@@ -34,10 +46,16 @@ impl std::fmt::Display for UploadMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ok={} err={} retries={} bytes={}",
+            "attempts={} ok={} err={} retries={} exhausted={} timeout={} temporary={} http_5xx={} network={} bytes={}",
+            self.attempts.load(Ordering::Relaxed),
             self.uploads_ok.load(Ordering::Relaxed),
             self.uploads_err.load(Ordering::Relaxed),
             self.retries.load(Ordering::Relaxed),
+            self.exhausted.load(Ordering::Relaxed),
+            self.timeout_err.load(Ordering::Relaxed),
+            self.temporary_err.load(Ordering::Relaxed),
+            self.status_5xx_err.load(Ordering::Relaxed),
+            self.network_err.load(Ordering::Relaxed),
             self.bytes_uploaded.load(Ordering::Relaxed),
         )
     }
@@ -110,6 +128,7 @@ impl UploadScheduler {
         let overall_start = Instant::now();
 
         for attempt in 0..self.max_attempts {
+            self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
             let permit = self.aimd.acquire().await;
             let req_start = Instant::now();
             let put_result = tokio::time::timeout(
@@ -138,6 +157,7 @@ impl UploadScheduler {
                 }
                 Ok(Err(e)) => {
                     self.metrics.uploads_err.fetch_add(1, Ordering::Relaxed);
+                    classify_data_error(&self.metrics, &e);
                     let retryable = is_retryable(&e);
 
                     if retryable {
@@ -189,6 +209,7 @@ impl UploadScheduler {
                 Err(_) => {
                     permit.failure();
                     self.metrics.uploads_err.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.timeout_err.fetch_add(1, Ordering::Relaxed);
 
                     let timeout_err = DataError::Storage(format!(
                         "request timeout after {}s",
@@ -224,6 +245,7 @@ impl UploadScheduler {
             }
         }
 
+        self.metrics.exhausted.fetch_add(1, Ordering::Relaxed);
         Err(UploadError::Exhausted {
             attempts: self.max_attempts,
             source: last_err.expect("at least one error"),
@@ -237,6 +259,19 @@ impl UploadScheduler {
     pub fn in_flight(&self) -> usize {
         self.aimd.in_flight()
     }
+
+    /// Log a periodic summary line for upload pipeline health.
+    pub fn log_stats(&self, pending: usize, pending_age_p95_ms: u64, pending_age_max_ms: u64) {
+        info!(
+            window = format!("{:.1}", self.aimd.window()),
+            inflight = self.aimd.in_flight(),
+            pending,
+            pending_age_p95_ms,
+            pending_age_max_ms,
+            "upload: {}",
+            self.metrics,
+        );
+    }
 }
 
 fn is_retryable(err: &DataError) -> bool {
@@ -247,5 +282,32 @@ fn is_retryable(err: &DataError) -> bool {
                 || oe.is_temporary()
         }
         DataError::Storage(_) => true,
+    }
+}
+
+fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
+    if let DataError::OpenDal(oe) = err {
+        if oe.is_temporary() {
+            metrics.temporary_err.fetch_add(1, Ordering::Relaxed);
+        }
+        let kind = oe.kind();
+        if kind == ErrorKind::Unexpected {
+            let msg = oe.to_string();
+            if msg.contains("status: 5")
+                || msg.contains(" 500")
+                || msg.contains(" 502")
+                || msg.contains(" 503")
+                || msg.contains(" 504")
+            {
+                metrics.status_5xx_err.fetch_add(1, Ordering::Relaxed);
+            }
+            if msg.contains("send http request")
+                || msg.contains("error sending request")
+                || msg.contains("connection")
+                || msg.contains("timed out")
+            {
+                metrics.network_err.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }

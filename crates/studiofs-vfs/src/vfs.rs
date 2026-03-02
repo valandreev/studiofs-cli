@@ -1,7 +1,7 @@
 //! Core VFS implementation — Block-based architecture.
 //!
 //! Key design:
-//! - Files are split into fixed-size blocks (default 1MB)
+//! - Files are split into fixed-size blocks (default 8MB)
 //! - Each block has a sequential ID (not content hash)
 //! - Blocks are immutable - never modified, only created/deleted
 //! - No deduplication = no reference counting overhead
@@ -168,23 +168,26 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
-// JuiceFS-like high-level read tuning defaults:
+// JuiceFS-like high-level read tuning default:
 // - buffer-size: 2048M
-// - max-readahead: 512M
-// - prefetch: 2
 const DEFAULT_READ_BUFFER_MB: u64 = 2_048;
-const DEFAULT_MAX_READAHEAD_MB: u64 = 512;
-const DEFAULT_PREFETCH_JOBS: usize = 2;
 // Block-level derived defaults (used as fallback if conversion is unavailable).
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 64;
-const DEFAULT_READAHEAD_WIDTH: u32 = 512;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 128;
+const DEFAULT_READAHEAD_WIDTH: u32 = 128;
 const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
 const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 32;
-const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 64;
-const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 1500;
+const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 96;
+const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
+const DEFAULT_UPLOAD_DELAY_MS: u64 = 2000;
+const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 5000;
+const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
+const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 10;
+const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
+const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
+const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
@@ -239,13 +242,13 @@ pub struct VfsConfig {
     pub cache_size: u64,
     /// L1 RAM cache budget in bytes.
     pub memory_limit: u64,
-    /// Block size in bytes (default 1MB).
+    /// Block size in bytes (default 8MB).
     pub block_size: u32,
     /// Maximum concurrent uploads.
     pub max_concurrent_uploads: usize,
     /// Number of blocks to prefetch ahead when a sequential access pattern is
-    /// detected.  0 disables read-ahead entirely.  Default: 128 (= 128 MB with
-    /// 1 MB blocks).
+    /// detected.  0 disables read-ahead entirely.  Default: 128 (= 1024 MB with
+    /// 8 MB blocks).
     pub readahead_width: u32,
     /// Maximum bytes to hold in the dirty-write memory buffer before applying
     /// backpressure.  This buffer stores blocks that `flush()` has accepted
@@ -446,6 +449,16 @@ struct VfsState {
     /// pending upload completes (or is cancelled).  Populated by
     /// `evict_inode_from_caches()` when it encounters a pinned block.
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    /// Number of upload operations requeued after process failures.
+    upload_requeues: AtomicU64,
+    /// Upload operations canceled because inode was deleted/missing.
+    upload_canceled_deleted: AtomicU64,
+    /// Upload operations canceled because the block was superseded by a newer one.
+    upload_canceled_stale: AtomicU64,
+    /// Number of foreground reads currently in progress.
+    foreground_reads_inflight: AtomicUsize,
+    /// Last time a foreground read was observed (unix millis).
+    last_foreground_read_ms: AtomicU64,
     /// Flag set at shutdown to stop the background slab flusher so it cannot
     /// race with the shutdown drain.
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
@@ -493,6 +506,16 @@ pub struct StudioVfs {
     // --- Upload Control ---
     /// Adaptive upload scheduler (AIMD + retries).
     upload_scheduler: Arc<crate::upload::UploadScheduler>,
+    upload_delay: Duration,
+    upload_requeue_base: Duration,
+    upload_requeue_max: Duration,
+    upload_stats_interval: Duration,
+    /// Shared local-I/O budget for upload path reads from cache.
+    upload_cache_io_slots: Arc<Semaphore>,
+    /// Extra cost per upload op when foreground reads are active.
+    upload_cache_io_user_penalty: u32,
+    /// Grace window after the last foreground read to keep user priority.
+    upload_user_idle_grace: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
     /// Directory-level prefetch tracker.
@@ -615,17 +638,6 @@ impl StudioVfs {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_READ_BUFFER_MB);
-        let max_readahead_mb = std::env::var("STUDIOFS_MAX_READAHEAD_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_MAX_READAHEAD_MB);
-        let prefetch_jobs = std::env::var("STUDIOFS_PREFETCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PREFETCH_JOBS);
-
         let block_size_nonzero = block_size.max(1) as u128;
         let mb_to_blocks = |mb: u64| -> u32 {
             let bytes = (mb as u128) * 1024 * 1024;
@@ -633,10 +645,7 @@ impl StudioVfs {
             blocks as u32
         };
         let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
-        let readahead_width_default = mb_to_blocks(max_readahead_mb).max(1);
-        let prefetch_concurrency_default = prefetch_jobs
-            .saturating_mul(32)
-            .clamp(DEFAULT_PREFETCH_CONCURRENCY / 4, 256);
+        let prefetch_concurrency_default = DEFAULT_PREFETCH_CONCURRENCY;
 
         let prefetch_concurrency = std::env::var("STUDIOFS_PREFETCH_CONCURRENCY")
             .ok()
@@ -647,14 +656,13 @@ impl StudioVfs {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(readahead_width_default.max(32));
-        let min_readahead_prefetch_floor = DEFAULT_READAHEAD_MIN_PREFETCH.min(8);
-        let readahead_min_prefetch_default = ((readahead_width as usize / 32).clamp(8, 64)) as u32;
+            .unwrap_or(DEFAULT_READAHEAD_WIDTH);
+        let min_readahead_prefetch_floor = DEFAULT_READAHEAD_MIN_PREFETCH.min(16);
         let readahead_min_prefetch = std::env::var("STUDIOFS_READAHEAD_MIN_PREFETCH")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(readahead_min_prefetch_default.max(min_readahead_prefetch_floor));
+            .unwrap_or(DEFAULT_READAHEAD_MIN_PREFETCH.max(min_readahead_prefetch_floor));
         let readahead_seq_step = std::env::var("STUDIOFS_READAHEAD_SEQ_STEP")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
@@ -677,11 +685,8 @@ impl StudioVfs {
             .unwrap_or(
                 prefetch_foreground_reserve_default.max(DEFAULT_PREFETCH_FOREGROUND_RESERVE),
             );
-        let prefetch_max_per_cycle_default = prefetch_concurrency
-            .saturating_mul(2)
-            .clamp(16, 256)
-            .min(readahead_width as usize);
-        let min_prefetch_cycle_floor = DEFAULT_PREFETCH_MAX_PER_CYCLE.min(16);
+        let prefetch_max_per_cycle_default = DEFAULT_PREFETCH_MAX_PER_CYCLE;
+        let min_prefetch_cycle_floor = DEFAULT_PREFETCH_MAX_PER_CYCLE.min(32);
         let prefetch_max_per_cycle = std::env::var("STUDIOFS_PREFETCH_MAX_PER_CYCLE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -921,6 +926,61 @@ impl StudioVfs {
             data_write.clone(),
             upload_aimd_config,
         ));
+        let upload_delay = Duration::from_millis(
+            std::env::var("STUDIOFS_UPLOAD_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_UPLOAD_DELAY_MS),
+        );
+        let upload_requeue_base = Duration::from_millis(
+            std::env::var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_UPLOAD_REQUEUE_BASE_MS),
+        );
+        let upload_requeue_max = Duration::from_millis(
+            std::env::var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v >= upload_requeue_base.as_millis() as u64)
+                .unwrap_or(DEFAULT_UPLOAD_REQUEUE_MAX_MS.max(upload_requeue_base.as_millis() as u64)),
+        );
+        let upload_stats_interval = Duration::from_secs(
+            std::env::var("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_UPLOAD_STATS_INTERVAL_SECS),
+        );
+        let upload_cache_io_slots = std::env::var("STUDIOFS_UPLOAD_CACHE_IO_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_SLOTS);
+        let upload_cache_io_user_penalty = std::env::var("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY)
+            .min(upload_cache_io_slots as u32);
+        let upload_user_idle_grace = Duration::from_millis(
+            std::env::var("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_UPLOAD_USER_IDLE_GRACE_MS),
+        );
+        info!(
+            writeback = true,
+            upload_delay_ms = upload_delay.as_millis() as u64,
+            requeue_base_ms = upload_requeue_base.as_millis() as u64,
+            requeue_max_ms = upload_requeue_max.as_millis() as u64,
+            upload_stats_interval_secs = upload_stats_interval.as_secs(),
+            upload_cache_io_slots,
+            upload_cache_io_user_penalty,
+            upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
+            "upload pipeline v2 enabled"
+        );
 
         let vfs = Arc::new(Self {
             meta,
@@ -937,11 +997,23 @@ impl StudioVfs {
                 dirty_drained_notify: tokio::sync::Notify::new(),
                 deleted_inodes: Mutex::new(std::collections::HashSet::new()),
                 pending_evictions: Mutex::new(std::collections::HashSet::new()),
+                upload_requeues: AtomicU64::new(0),
+                upload_canceled_deleted: AtomicU64::new(0),
+                upload_canceled_stale: AtomicU64::new(0),
+                foreground_reads_inflight: AtomicUsize::new(0),
+                last_foreground_read_ms: AtomicU64::new(0),
                 slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
                 file_locks: Mutex::new(std::collections::HashMap::new()),
                 lock_notify: tokio::sync::Notify::new(),
             }),
             upload_scheduler,
+            upload_delay,
+            upload_requeue_base,
+            upload_requeue_max,
+            upload_stats_interval,
+            upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
+            upload_cache_io_user_penalty,
+            upload_user_idle_grace,
             readahead: readahead.clone(),
             dir_prefetch,
             prefetch_tx,
@@ -983,6 +1055,12 @@ impl StudioVfs {
         let vfs_clone = vfs.clone();
         tokio::spawn(async move {
             vfs_clone.background_uploader(upload_rx).await;
+        });
+
+        // Spawn upload stats logger.
+        let vfs_clone = vfs.clone();
+        tokio::spawn(async move {
+            vfs_clone.background_upload_stats().await;
         });
 
         // Warm up the HTTP GET connection pool SYNCHRONOUSLY.
@@ -1037,6 +1115,77 @@ impl StudioVfs {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    fn now_unix_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn pending_age_stats_ms(&self) -> (u64, u64) {
+        let now_ms = Self::now_unix_millis();
+        let mut ages: Vec<u64> = self
+            .block_cache
+            .snapshot_pending_uploads()
+            .into_iter()
+            .map(|op| now_ms.saturating_sub(op.created_unix_ms))
+            .collect();
+        if ages.is_empty() {
+            return (0, 0);
+        }
+        ages.sort_unstable();
+        let p95_idx = ((ages.len() - 1) * 95) / 100;
+        let p95 = ages[p95_idx];
+        let max = *ages.last().unwrap_or(&0);
+        (p95, max)
+    }
+
+    fn upload_requeue_delay(&self, op: &PendingUpload) -> Duration {
+        let exp = op.retry_count.min(8);
+        let base = self
+            .upload_requeue_base
+            .saturating_mul(2u32.saturating_pow(exp));
+        let capped = base.min(self.upload_requeue_max);
+        let jitter_max = (capped.as_millis() as u64 / 5).max(1);
+        let jitter_seed = op.object_id ^ Self::now_unix_millis();
+        let jitter_ms = jitter_seed % jitter_max;
+        capped.saturating_add(Duration::from_millis(jitter_ms))
+    }
+
+    #[inline]
+    fn mark_foreground_read(&self) {
+        self.state
+            .foreground_reads_inflight
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .last_foreground_read_ms
+            .store(Self::now_unix_millis(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn unmark_foreground_read(&self) {
+        self.state
+            .foreground_reads_inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
+            .ok();
+        self.state
+            .last_foreground_read_ms
+            .store(Self::now_unix_millis(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn foreground_read_active(&self) -> bool {
+        if self.state.foreground_reads_inflight.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        let last = self.state.last_foreground_read_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        Self::now_unix_millis().saturating_sub(last)
+            <= self.upload_user_idle_grace.as_millis() as u64
     }
 
     fn invalidation_delivery_mode() -> InvalidationDeliveryMode {
@@ -1679,7 +1828,7 @@ impl StudioVfs {
 
         if remaining == 0 && self.handle_table.take_orphan(ino) {
             // Last handle closed on an unlinked file — final cleanup
-            info!("orphan cleanup: ino={} (last fd closed)", ino);
+            debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
             self.state.deleted_inodes.lock().insert(ino);
 
@@ -2034,7 +2183,7 @@ impl StudioVfs {
 
             // Mark as orphan — release_fh will do the real cleanup
             self.handle_table.mark_orphan(ino);
-            info!(
+            debug!(
                 "unlink ino={}: {} open handles, deferred cleanup (orphan)",
                 ino, open_handles
             );
@@ -2297,6 +2446,14 @@ impl StudioVfs {
     /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
     /// Returns the number of bytes written.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
+        self.mark_foreground_read();
+        struct ForegroundReadGuard<'a>(&'a StudioVfs);
+        impl Drop for ForegroundReadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unmark_foreground_read();
+            }
+        }
+        let _guard = ForegroundReadGuard(self);
         let attr = self.getattr(ino)?;
 
         // Clamp read to file size
@@ -2466,6 +2623,11 @@ impl StudioVfs {
     /// Like `read_block()` but silently ignores errors and always marks the
     /// readahead inflight state as done when finished.
     async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
+        if !self.readahead.is_prefetch_relevant(ino, block_index) {
+            self.readahead.finish_prefetch(ino, block_index);
+            return;
+        }
+
         let block_ref = match self.meta.get_file_block(ino, block_index) {
             Ok(Some(block_ref)) => block_ref,
             _ => {
@@ -2977,8 +3139,19 @@ impl StudioVfs {
                             .lock()
                             .remove(&retry_op.object_id);
                     } else {
-                        warn!("upload processing error, will requeue: {}", e);
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let mut retry_op = retry_op;
+                        retry_op.retry_count = retry_op.retry_count.saturating_add(1);
+                        let delay = vfs.upload_requeue_delay(&retry_op);
+                        vfs.state.upload_requeues.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            object_id = retry_op.object_id,
+                            ino = retry_op.ino,
+                            retry_count = retry_op.retry_count,
+                            delay_ms = delay.as_millis() as u64,
+                            "upload processing error, will requeue: {}",
+                            e
+                        );
+                        tokio::time::sleep(delay).await;
                         if !vfs.block_cache.requeue_upload(retry_op) {
                             error!("failed to requeue upload op after error");
                         }
@@ -2997,6 +3170,14 @@ impl StudioVfs {
     /// If the owning inode has been deleted, the upload is cancelled immediately
     /// (no S3 write) and the block is evicted from cache.
     async fn process_upload(&self, op: PendingUpload) -> VfsResult<()> {
+        if self.upload_delay > Duration::from_millis(0) {
+            let age_ms = Self::now_unix_millis().saturating_sub(op.created_unix_ms);
+            let delay_ms = self.upload_delay.as_millis() as u64;
+            if age_ms < delay_ms {
+                tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)).await;
+            }
+        }
+
         // ── Fast-path: inode deleted → cancel upload, skip S3 write ──────
         let inode_deleted = self.state.deleted_inodes.lock().contains(&op.ino);
         // Also check metadata: after a remount, `deleted_inodes` is empty but
@@ -3004,6 +3185,9 @@ impl StudioVfs {
         // longer exists in the metadata store, the upload is stale.
         let inode_gone = inode_deleted || self.meta.get_attr(op.ino).is_err();
         if inode_gone {
+            self.state
+                .upload_canceled_deleted
+                .fetch_add(1, Ordering::Relaxed);
             debug!(
                 object_id = op.object_id,
                 ino = op.ino,
@@ -3014,7 +3198,42 @@ impl StudioVfs {
             return Ok(());
         }
 
+        // Coalescing: if this file block has already been replaced in metadata
+        // with a newer object_id, skip uploading this stale one.
+        let block_index = block_index_from_offset(op.offset, self.block_size);
+        if let Ok(Some(current)) = self.meta.get_file_block(op.ino, block_index)
+            && current.object_id != op.object_id
+        {
+            self.state
+                .upload_canceled_stale
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                object_id = op.object_id,
+                current_object_id = current.object_id,
+                ino = op.ino,
+                block_index,
+                "upload cancelled: stale block superseded by newer object"
+            );
+            self.block_cache.cancel_upload(&op, true);
+            self.state.pending_evictions.lock().remove(&op.object_id);
+            return Ok(());
+        }
+
         let t0 = Instant::now();
+        // Upload QoS: when user reads are active, each upload consumes multiple
+        // local I/O slots, effectively shrinking upload pressure and preserving
+        // read latency/throughput for foreground operations.
+        let upload_io_cost = if self.foreground_read_active() {
+            self.upload_cache_io_user_penalty.max(1)
+        } else {
+            1
+        };
+        let _upload_io_permit = self
+            .upload_cache_io_slots
+            .clone()
+            .acquire_many_owned(upload_io_cost)
+            .await
+            .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
         // Read raw block payload from cache, then package for S3.
         let raw_payload = match self.block_cache.get(op.object_id).await {
             Some(data) => data,
@@ -3034,6 +3253,7 @@ impl StudioVfs {
             }
         };
         let object_bytes = Bytes::from(create_object(&raw_payload)?);
+        drop(_upload_io_permit);
 
         let key = format_object_key(&self.data_prefix, op.object_id);
         self.upload_scheduler
@@ -3059,6 +3279,23 @@ impl StudioVfs {
             "background upload complete"
         );
         Ok(())
+    }
+
+    async fn background_upload_stats(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(self.upload_stats_interval).await;
+            let pending = self.block_cache.pending_upload_count();
+            let (p95_ms, max_ms) = self.pending_age_stats_ms();
+            info!(
+                requeues = self.state.upload_requeues.load(Ordering::Relaxed),
+                canceled_deleted = self.state.upload_canceled_deleted.load(Ordering::Relaxed),
+                canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
+                foreground_reads_inflight = self.state.foreground_reads_inflight.load(Ordering::Relaxed),
+                upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
+                "upload pipeline counters"
+            );
+            self.upload_scheduler.log_stats(pending, p95_ms, max_ms);
+        }
     }
 
     /// Background task for garbage collection.
@@ -4015,6 +4252,12 @@ impl StudioVfs {
         // Phase 3: wait for uploads to drain, reconcile already-uploaded blocks.
         let pending = self.block_cache.pending_upload_count();
         if pending > 0 {
+            if upload_drain_timeout.is_zero() {
+                info!(
+                    pending,
+                    "VFS shutdown: skipping upload drain (resume from journal on next start)"
+                );
+            } else {
             info!(pending, "VFS shutdown: waiting for uploads to drain");
             let mut drained = self
                 .block_cache
@@ -4044,6 +4287,7 @@ impl StudioVfs {
                     timeout_ms = upload_drain_timeout.as_millis() as u64,
                     "VFS shutdown: upload queue did not fully drain before timeout"
                 );
+            }
             }
         }
 

@@ -3,7 +3,7 @@
 //! Core types for the virtual filesystem metadata.
 //!
 //! Architecture Key Changes:
-//! - Files are split into fixed-size blocks (default 4MB)
+//! - Files are split into fixed-size blocks (default 8MB)
 //! - Each block has a sequential ID (not content hash)
 //! - Blocks are immutable - never modified, only created/deleted
 //! - No deduplication = no reference counting overhead
@@ -16,8 +16,8 @@ use std::time::SystemTime;
 // Constants
 // =============================================================================
 
-/// Default block size: 1 MiB (configurable at volume init).
-pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024;
+/// Default block size: 8 MiB (configurable at volume init).
+pub const DEFAULT_BLOCK_SIZE: u32 = 8 * 1024 * 1024;
 
 /// Root inode number.
 pub const ROOT_INO: Ino = 1;
@@ -373,7 +373,7 @@ pub struct FormatInfo {
     /// Manifest version token (used as ETag/If-Match in remote metadata backends).
     #[serde(default)]
     pub version: String,
-    /// Block size in bytes (configurable at init, default 4MB).
+    /// Block size in bytes (configurable at init, default 8MB).
     pub block_size: u32,
     /// Chunk size - deprecated, kept for compatibility.
     #[serde(default)]
