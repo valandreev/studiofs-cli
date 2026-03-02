@@ -1577,6 +1577,15 @@ impl StudioVfs {
         self.block_size
     }
 
+    /// Wait until all pending S3 uploads complete or `timeout` elapses.
+    ///
+    /// Returns `true` if the upload queue drained within the timeout.
+    /// Useful in tests to ensure block data is available on S3 before
+    /// cross-client reads.
+    pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
+        self.block_cache.wait_for_uploads_idle(timeout).await
+    }
+
     /// Get filesystem statistics.
     ///
     /// Returns real inode count and used space from redb counters.

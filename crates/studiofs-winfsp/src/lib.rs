@@ -17,12 +17,16 @@ fn shutdown_upload_drain_timeout() -> std::time::Duration {
 }
 
 /// Start the WinFSP filesystem, mount, and block until unmounted.
+///
+/// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
+/// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(
     vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
     rt: std::sync::Arc<tokio::runtime::Runtime>,
     mount_point: &str,
     _volume_label: &str,
     _foreground: bool,
+    shutdown_event_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
@@ -78,8 +82,58 @@ pub fn mount_and_serve(
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
     host.start()?;
 
-    // Block until Ctrl+C
+    // Block until Ctrl+C or external shutdown event
     let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    // If an event name is provided, create a named event and watch for it in
+    // a background thread.  When the event is signalled (`studiofs umount`),
+    // the watcher sends on `tx` which wakes `rx.recv()` below — identical to
+    // the Ctrl+C path.
+    if let Some(event_name) = shutdown_event_name {
+        let tx_event = tx.clone();
+        let wide: Vec<u16> = event_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+        unsafe extern "system" {
+            fn CreateEventW(
+                lpEventAttributes: *mut core::ffi::c_void,
+                bManualReset: i32,
+                bInitialState: i32,
+                lpName: *const u16,
+            ) -> *mut core::ffi::c_void;
+            fn WaitForSingleObject(
+                hHandle: *mut core::ffi::c_void,
+                dwMilliseconds: u32,
+            ) -> u32;
+            fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
+        }
+
+        let event = unsafe {
+            CreateEventW(
+                std::ptr::null_mut(),
+                1,  // bManualReset = TRUE
+                0,  // bInitialState = FALSE
+                wide.as_ptr(),
+            )
+        };
+        if !event.is_null() {
+            // SAFETY: `event` is a valid handle; the thread takes ownership and
+            // closes it after WaitForSingleObject returns.  We round-trip through
+            // usize so the captured value is `Send`.
+            let handle = event as usize;
+            std::thread::Builder::new()
+                .name("shutdown-event-watcher".into())
+                .spawn(move || unsafe {
+                    let h = handle as *mut core::ffi::c_void;
+                    WaitForSingleObject(h, 0xFFFF_FFFF); // INFINITE
+                    let _ = tx_event.send(());
+                    CloseHandle(h);
+                })
+                .ok();
+        } else {
+            tracing::warn!("failed to create shutdown named event");
+        }
+    }
+
     *SHUTDOWN_TX.lock().unwrap() = Some(tx);
     unsafe {
         SetConsoleCtrlHandler(Some(ctrl_handler), 1);

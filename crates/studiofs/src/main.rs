@@ -93,8 +93,15 @@ EXAMPLES:
   Mount on Windows (drive letter):
     studiofs mount myvolume Z:
 
+  Mount in background (daemon mode):
+    studiofs mount myvolume Z: -d
+
   Mount on Linux/macOS (directory):
     studiofs mount myvolume /mnt/studio --memory-limit 4GB
+
+  Unmount:
+    studiofs umount Z:
+    studiofs umount /mnt/studio
 
   Check volume status:
     studiofs status myvolume
@@ -134,7 +141,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize a new filesystem volume
     #[command(long_about = "\
@@ -330,6 +337,23 @@ SIZE FORMATS:
         /// Run in foreground (keep terminal attached)
         #[arg(long)]
         foreground: bool,
+
+        /// Detach and run mount in the background (daemon mode).
+        /// Logs are written to ~/.studiofs/logs/.
+        /// Use `studiofs umount <mount_point>` to stop.
+        #[arg(short = 'd', long)]
+        detach: bool,
+    },
+
+    /// Unmount a previously mounted filesystem volume
+    #[command(after_help = "\
+EXAMPLES:
+  studiofs umount Z:
+  studiofs umount /mnt/studio
+")]
+    Umount {
+        /// Mount point to unmount (e.g. Z: on Windows, /mnt/studio on Linux/macOS)
+        mount_point: String,
     },
 
     /// Show volume status and statistics
@@ -531,6 +555,7 @@ fn main() -> anyhow::Result<()> {
             memory_limit,
             nats,
             foreground,
+            detach,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::mount::run(
@@ -542,7 +567,11 @@ fn main() -> anyhow::Result<()> {
                 &memory_limit,
                 &nats,
                 foreground,
+                detach,
             )?;
+        }
+        Commands::Umount { mount_point } => {
+            cli::umount::run(&mount_point)?;
         }
         Commands::Discover {
             name,
@@ -625,4 +654,132 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("studiofs").chain(args.iter().copied()))
+    }
+
+    // ── mount --detach / -d ──────────────────────────────────────────────────
+
+    #[test]
+    fn mount_short_detach_flag() {
+        let cli = parse(&["mount", "vol", "Z:", "-d"]).unwrap();
+        match cli.command {
+            Commands::Mount { detach, foreground, name, mount_point, .. } => {
+                assert!(detach);
+                assert!(!foreground);
+                assert_eq!(name, "vol");
+                assert_eq!(mount_point, "Z:");
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_long_detach_flag() {
+        let cli = parse(&["mount", "vol", "/mnt/x", "--detach"]).unwrap();
+        match cli.command {
+            Commands::Mount { detach, .. } => assert!(detach),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_no_detach_by_default() {
+        let cli = parse(&["mount", "vol", "Z:"]).unwrap();
+        match cli.command {
+            Commands::Mount { detach, foreground, .. } => {
+                assert!(!detach);
+                assert!(!foreground);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_foreground_and_detach_together() {
+        // Both flags can be parsed (the implementation handles conflicts at runtime).
+        let cli = parse(&["mount", "vol", "Z:", "--foreground", "-d"]).unwrap();
+        match cli.command {
+            Commands::Mount { detach, foreground, .. } => {
+                assert!(detach);
+                assert!(foreground);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_with_options_and_detach() {
+        let cli = parse(&[
+            "mount", "vol", "Z:",
+            "--memory-limit", "4GB",
+            "--cache-size", "200GB",
+            "-d",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Mount {
+                detach,
+                memory_limit,
+                cache_size,
+                ..
+            } => {
+                assert!(detach);
+                assert_eq!(memory_limit, "4GB");
+                assert_eq!(cache_size, "200GB");
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    // ── umount ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn umount_parses_mount_point() {
+        let cli = parse(&["umount", "Z:"]).unwrap();
+        match cli.command {
+            Commands::Umount { mount_point } => {
+                assert_eq!(mount_point, "Z:");
+            }
+            other => panic!("expected Umount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn umount_unix_path() {
+        let cli = parse(&["umount", "/mnt/studio"]).unwrap();
+        match cli.command {
+            Commands::Umount { mount_point } => {
+                assert_eq!(mount_point, "/mnt/studio");
+            }
+            other => panic!("expected Umount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn umount_requires_mount_point() {
+        let result = parse(&["umount"]);
+        assert!(result.is_err());
+    }
+
+    // ── global flag propagation ──────────────────────────────────────────────
+
+    #[test]
+    fn log_level_propagates_to_mount() {
+        let cli = parse(&["--log-level", "debug", "mount", "vol", "Z:"]).unwrap();
+        assert_eq!(cli.log_level, "debug");
+    }
+
+    #[test]
+    fn log_level_propagates_to_umount() {
+        let cli = parse(&["--log-level", "trace", "umount", "Z:"]).unwrap();
+        assert_eq!(cli.log_level, "trace");
+    }
 }

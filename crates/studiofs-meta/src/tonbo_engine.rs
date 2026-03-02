@@ -483,7 +483,16 @@ impl TonboMetaEngine {
         }
 
         if use_core_fallback {
-            let fut = async move { client.publish(subject, payload.into()).await };
+            // Flush after publish to ensure the message is actually written to
+            // TCP.  The internal `current_thread` runtime only drives spawned
+            // tasks during `block_on`, so without an explicit flush the NATS
+            // client's background writer task may never send the buffered
+            // publish bytes.
+            let fut = async move {
+                client.publish(subject, payload.into()).await?;
+                client.flush().await?;
+                Ok::<(), async_nats::Error>(())
+            };
             if let Err(err) = self.run_on_internal_rt(fut) {
                 warn!("failed to publish invalidation event: {}", err);
             }
@@ -1291,7 +1300,27 @@ impl TonboMetaEngine {
                 };
                 let manifest: TonboManifest = serde_json::from_slice(&bytes)
                     .map_err(|e| MetaError::Serialization(e.to_string()))?;
-                self.local.import_snapshot(&manifest.snapshot)?;
+
+                // If there are pending local mutations that haven't been
+                // flushed yet, a blind import would destroy them.  Use the
+                // same 3-way merge that flush_remote_snapshot employs so
+                // local changes survive until the next flush cycle.
+                let has_pending = {
+                    let st = self.state.lock();
+                    st.pending_ops > 0 || st.pending_bytes > 0
+                };
+                if has_pending {
+                    let local_snapshot = self.local.export_snapshot()?;
+                    let baseline = self.baseline_snapshot.lock().clone();
+                    let merged = Self::merge_snapshot_with_local_delta(
+                        &baseline,
+                        &local_snapshot,
+                        &manifest.snapshot,
+                    );
+                    self.local.import_snapshot(&merged)?;
+                } else {
+                    self.local.import_snapshot(&manifest.snapshot)?;
+                }
                 *self.baseline_snapshot.lock() = manifest.snapshot.clone();
 
                 let mut state = self.state.lock();
@@ -1318,7 +1347,24 @@ impl TonboMetaEngine {
                             };
                             let manifest: TonboManifest = serde_json::from_slice(&bytes)
                                 .map_err(|e| MetaError::Serialization(e.to_string()))?;
-                            self.local.import_snapshot(&manifest.snapshot)?;
+
+                            // Preserve unflushed local mutations (same as primary path).
+                            let has_pending = {
+                                let st = self.state.lock();
+                                st.pending_ops > 0 || st.pending_bytes > 0
+                            };
+                            if has_pending {
+                                let local_snapshot = self.local.export_snapshot()?;
+                                let baseline = self.baseline_snapshot.lock().clone();
+                                let merged = Self::merge_snapshot_with_local_delta(
+                                    &baseline,
+                                    &local_snapshot,
+                                    &manifest.snapshot,
+                                );
+                                self.local.import_snapshot(&merged)?;
+                            } else {
+                                self.local.import_snapshot(&manifest.snapshot)?;
+                            }
                             *self.baseline_snapshot.lock() = manifest.snapshot.clone();
                             let mut state = self.state.lock();
                             state.last_refresh = Instant::now();
@@ -1384,6 +1430,21 @@ impl TonboMetaEngine {
         }
 
         let _guard = self.sync_lock.lock();
+
+        // Re-check state after acquiring sync_lock: another thread (e.g. the
+        // NATS invalidation listener) may have already flushed while we were
+        // waiting for the lock, resetting pending counters and updating the
+        // etag.  Proceeding with the stale captured state would compute
+        // incorrect merge deltas (a remote entry absent from local looks like
+        // a local deletion).
+        {
+            let state = self.state.lock();
+            if state.pending_ops == 0 && state.pending_bytes == 0 {
+                if !force || state.etag.is_some() {
+                    return Ok(());
+                }
+            }
+        }
 
         let local_snapshot = self.local.export_snapshot()?;
         let baseline_snapshot = self.baseline_snapshot.lock().clone();
@@ -3380,6 +3441,9 @@ mod tests {
                 let mut observed = false;
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
                 while std::time::Instant::now() < deadline {
+                    // sync_metadata pulls from remote so c2's local snapshot
+                    // picks up whatever the background flush worker wrote.
+                    let _ = c2.sync_metadata();
                     match c2.lookup(ROOT_INO, b"eventual.txt") {
                         Ok(_) => {
                             observed = true;

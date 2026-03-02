@@ -1193,6 +1193,7 @@ async fn test_nats_delete_updates_metadata_and_clears_cached_block() {
         !writer_blocks.is_empty(),
         "writer metadata missing initial block before publish"
     );
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     let visible = wait_until(wait, || reader.vfs.lookup(1, b"nats-delete.bin").is_ok()).await;
@@ -1291,6 +1292,7 @@ async fn test_nats_overwrite_evicts_only_changed_block_cache() {
     assert_eq!(writer_refs_v1.len(), 2);
     let writer_old_id0 = writer_refs_v1[0].1.object_id;
     let writer_old_id1 = writer_refs_v1[1].1.object_id;
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     assert!(
@@ -1343,6 +1345,7 @@ async fn test_nats_overwrite_evicts_only_changed_block_cache() {
         writer_overwrite_ready,
         "writer metadata did not materialize overwrite before publish"
     );
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     let refs_updated = wait_until(wait, || {
@@ -1420,6 +1423,7 @@ async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
     assert_eq!(writer_refs_v1.len(), 2);
     let writer_id0 = writer_refs_v1[0].1.object_id;
     let writer_id1 = writer_refs_v1[1].1.object_id;
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     assert!(
@@ -1473,6 +1477,7 @@ async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
         writer_append_ready,
         "writer metadata did not materialize append before publish"
     );
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     let append_visible = wait_until(wait, || {
@@ -3768,6 +3773,7 @@ async fn test_nats_deep_directory_tree_visible() {
     writer.vfs.flush(leaf.ino).await.unwrap();
     // Wait for block upload to S3 so reader can fetch it.
     let _ = wait_until_n_blocks(&writer.vfs, leaf.ino, 1, Duration::from_secs(15));
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     // Reader follows full path.
@@ -3838,6 +3844,10 @@ async fn test_nats_large_file_cross_client_integrity() {
 
     // Wait for blocks to be uploaded.
     let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 3, Duration::from_secs(30));
+    assert!(
+        writer.vfs.wait_for_uploads_idle(Duration::from_secs(30)).await,
+        "uploads should complete within timeout"
+    );
     writer.vfs.meta().flush_metadata().unwrap();
 
     let wait = Duration::from_secs(15);
@@ -4009,6 +4019,7 @@ async fn test_nats_hardlink_cross_client() {
     writer.vfs.flush(attr.ino).await.unwrap();
     // Wait for block upload to S3 so reader can fetch it.
     let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
     writer.vfs.meta().flush_metadata().unwrap();
 
@@ -4357,6 +4368,7 @@ async fn test_nats_rename_cross_client() {
         .unwrap();
     writer.vfs.flush(attr.ino).await.unwrap();
     let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
+    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
     writer.vfs.meta().flush_metadata().unwrap();
 
     // Reader sees the file.
