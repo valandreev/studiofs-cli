@@ -1,4 +1,4 @@
-# studiofs-lobby — Design Document (v3)
+# studiofs-lobby — Design Document (v4 — WAN-first)
 
 ## Предыстория: почему отказ от Tonbo
 
@@ -16,11 +16,26 @@
 
 ---
 
-## 1. Философия: PostgreSQL как lobby
+## 1. Философия: PostgreSQL + WAN-first
 
-Вместо написания custom lobby — используем **PostgreSQL**.
+используем **PostgreSQL**.
 
-**Почему PostgreSQL, а не custom Rust-сервис:**
+### Ключевое допущение: WAN-only
+
+> **Все клиенты работают через WAN.** RTT до сервера PG: **40—300 мс** (типичные значения для студий в разных регионах). Архитектура оптимизирована исключительно под WAN — LAN-оптимизации не рассматриваются.
+
+Это означает:
+- Каждый PG round-trip стоит дорого → **минимизация количества round-trips** (batch mutations, range ID alloc, pipeline queries)
+- Локальный redb на клиенте — **обязателен**, не опция. Все reads из redb (sub-µs), PG только для writes/sync
+- Write-back batching агрессивный: до 100 мутаций или 2с, что раньше (а не 50/1с как в LAN-сценарии)
+- ID allocation большими блоками: 8192 inodes + 131072 blocks (часы/дни offline работы)
+- LISTEN/NOTIFY + periodic poll (каждые 30с) для sync — при WAN latency NOTIFY delivery может задерживаться
+
+### Гонки — допустимы (модель LucidLink)
+
+> Конкурентные изменения одного файла/директории — **race condition допустима** (Last-Writer-Wins). Это сознательное решение, аналогичное LucidLink. Для критических файлов есть advisory locks.
+
+**Почему PostgreSQL:**
 - ACID транзакции из коробки (inode + dentry + counter — атомарно)
 - `LISTEN/NOTIFY` + trigger = push-нотификации без NATS
 - Advisory locks = файловые блокировки с автоматическим release при disconnect
@@ -28,7 +43,7 @@
 - Знакомый стек → доверие пользователей
 - `docker-compose up` и готово
 
-**Что убираем:** custom lobby binary, gRPC протокол, NATS (PG NOTIFY заменяет для метаданных).
+**Что убираем:** NATS (PG NOTIFY заменяет для метаданных).
 
 **Что остаётся:**
 - Локальный `redb` на клиенте как L1 кэш (sub-microsecond reads для VFS hot path)
@@ -61,10 +76,12 @@ Client C ──tokio-postgres──▸     │         ├── event_log
 - **Sync path**: `LISTEN` на PG канале → при NOTIFY запрос event_log → apply дельта в локальный redb
 - **Catch-up**: при reconnect → `SELECT * FROM event_log WHERE volume_id=$1 AND seq_id > $2`
 
-### Зачем оставить redb локально
+### Зачем оставить redb локально (критично для WAN)
 
-- VFS hot path (`lookup` на каждый компонент пути) требует sub-millisecond. PG по сети = 1-5мс/query
+- VFS hot path (`lookup` на каждый компонент пути) требует sub-millisecond. **PG по WAN = 40-300мс/query** — неприемлемо для hot path
+- Глубокий путь `/a/b/c/d/e/file.exr` = 6 lookup'ов. При WAN 100мс = 600мс задержки без redb. С redb = <1мс
 - Offline режим: redb работает без сети, мутации копятся в локальной очереди
+- Write-back: приложение не ждёт WAN round-trip — запись в redb мгновенна, sync в PG фоном
 - Уже работает: 3050 строк `redb_engine.rs` без изменений
 
 ---
@@ -75,9 +92,11 @@ Client C ──tokio-postgres──▸     │         ├── event_log
 
 ```yaml
 # docker-compose.yml
+# Target: 2× ARM CPU (Ampere Altra) + 8 GB RAM
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine    # PostgreSQL 18.3
+    platform: linux/arm64
     restart: unless-stopped
     environment:
       POSTGRES_DB: studiofs
@@ -87,18 +106,238 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+        reservations:
+          cpus: "1.0"
+          memory: 4G
     command: >
       postgres
-        -c shared_buffers=256MB
-        -c work_mem=16MB
-        -c max_connections=100
+        -c shared_buffers=2GB
+        -c effective_cache_size=6GB
+        -c work_mem=32MB
+        -c maintenance_work_mem=256MB
+        -c max_connections=200
         -c synchronous_commit=on
+        -c wal_buffers=64MB
+        -c checkpoint_completion_target=0.9
+        -c checkpoint_timeout=10min
+        -c max_wal_size=1GB
+        -c min_wal_size=256MB
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c max_worker_processes=2
+        -c max_parallel_workers_per_gather=1
+        -c max_parallel_workers=2
+        -c max_parallel_maintenance_workers=1
+        -c huge_pages=try
+        -c tcp_keepalives_idle=60
+        -c tcp_keepalives_interval=10
+        -c tcp_keepalives_count=6
+        -c idle_in_transaction_session_timeout=120000
+        -c statement_timeout=30000
+        -c jit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studiofs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   pgdata:
 ```
 
+**Настройки оптимизированы под 2 ARM CPU + 8 GB RAM (Ampere):**
+
+| Параметр | Значение | Обоснование |
+|----------|----------|-------------|
+| `shared_buffers` | 2 GB | 25% RAM — стандартная рекомендация |
+| `effective_cache_size` | 6 GB | 75% RAM — подсказка планировщику |
+| `work_mem` | 32 MB | Достаточно для сортировок event_log; 200 connections × 32MB = 6.4GB max (редко все одновременно) |
+| `max_connections` | 200 | До 50 клиентов × 4 conn/pool |
+| `max_worker_processes` | 2 | = количество CPU |
+| `max_parallel_workers` | 2 | = количество CPU |
+| `random_page_cost` | 1.1 | Предполагаем SSD/NVMe |
+| `effective_io_concurrency` | 200 | SSD/NVMe |
+| `tcp_keepalives_idle` | 60с | Быстрое обнаружение отвалившихся WAN-клиентов |
+| `tcp_keepalives_interval` | 10с | Агрессивный keepalive для WAN |
+| `tcp_keepalives_count` | 6 | Dead connection detected ≈ 60+60=120с worst case |
+| `jit` | off | JIT overhead не окупается на простых metadata queries |
+| `statement_timeout` | 30с | Защита от зависших WAN-клиентов |
+| `idle_in_transaction_session_timeout` | 120с | Автоматический rollback забытых транзакций |
+
 Запуск: `docker compose up -d`
+
+### Локальный PostgreSQL для тестов (без Docker)
+
+Для быстрых локальных тестов удобнее запустить PG напрямую, без контейнера.
+
+#### macOS (Homebrew)
+
+```bash
+# Установка (один раз)
+brew install postgresql@18
+
+# Инициализация кластера (один раз)
+initdb -D /tmp/studiofs-pg --auth=trust --username=studiofs --encoding=UTF8
+
+# Запуск (параметры максимально лёгкие для разработки)
+postgres -D /tmp/studiofs-pg \
+  -p 5432 \
+  -c shared_buffers=128MB \
+  -c work_mem=8MB \
+  -c max_connections=50 \
+  -c synchronous_commit=off \
+  -c fsync=off \
+  -c full_page_writes=off \
+  -c log_min_messages=warning \
+  -c log_destination=stderr \
+  -c logging_collector=off
+
+# или фоном:
+pg_ctl -D /tmp/studiofs-pg -l /tmp/studiofs-pg.log \
+  -o "-p 5432 -c shared_buffers=128MB -c work_mem=8MB -c max_connections=50 -c synchronous_commit=off -c fsync=off -c full_page_writes=off" \
+  start
+```
+
+> **Внимание:** `fsync=off` и `full_page_writes=off` — только для тестов. При крэше данные могут быть повреждены. Никогда не использовать в production.
+
+#### Создание базы и пользователя
+
+```bash
+createdb -h localhost -p 5432 -U studiofs studiofs
+# PG запущен с --auth=trust, пароль не нужен
+```
+
+#### Подключение для проверки
+
+```bash
+psql -h localhost -p 5432 -U studiofs -d studiofs -c '\dt'
+```
+
+#### Остановка
+
+```bash
+# Graceful shutdown (ждёт завершения транзакций)
+pg_ctl -D /tmp/studiofs-pg stop -m fast
+
+# Или если запущен на переднем плане: Ctrl+C
+```
+
+#### Сброс до чистого состояния
+
+```bash
+# Полная очистка — удалить весь кластер и пересоздать
+pg_ctl -D /tmp/studiofs-pg stop -m immediate 2>/dev/null; \
+rm -rf /tmp/studiofs-pg /tmp/studiofs-pg.log && \
+initdb -D /tmp/studiofs-pg --auth=trust --username=studiofs --encoding=UTF8 && \
+pg_ctl -D /tmp/studiofs-pg -l /tmp/studiofs-pg.log \
+  -o "-p 5432 -c fsync=off -c full_page_writes=off -c synchronous_commit=off" start && \
+sleep 1 && createdb -h localhost -p 5432 -U studiofs studiofs
+```
+
+#### Только сброс данных studiofs (без пересоздания кластера)
+
+```bash
+# Дропнуть и пересоздать базу — быстрее чем reinit кластера
+dropdb -h localhost -p 5432 -U studiofs studiofs && \
+createdb -h localhost -p 5432 -U studiofs studiofs
+# studiofs init пересоздаст все таблицы автоматически
+```
+
+#### Linux (системный PostgreSQL 18)
+
+```bash
+# Ubuntu/Debian
+sudo apt install postgresql-18
+
+# Запуск от текущего пользователя (для тестов)
+initdb -D /tmp/studiofs-pg --auth=trust --username=$USER --encoding=UTF8
+postgres -D /tmp/studiofs-pg -p 5432 -c fsync=off -c synchronous_commit=off &
+
+createdb -h localhost -p 5432 studiofs
+```
+
+#### Windows (PowerShell)
+
+Установка через [EDB installer](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads) или winget:
+
+```powershell
+# Установка PostgreSQL 18 (один раз)
+winget install PostgreSQL.PostgreSQL.18
+
+# После установки pg_ctl/initdb находятся в:
+# C:\Program Files\PostgreSQL\18\bin\
+# Добавить в PATH (один раз):
+$env:PATH += ";C:\Program Files\PostgreSQL\18\bin"
+# Или прописать в системных переменных окружения постоянно.
+```
+
+**Инициализация кластера (один раз):**
+
+```powershell
+initdb -D C:\Temp\studiofs-pg --auth=trust --username=studiofs --encoding=UTF8
+```
+
+**Запуск:**
+
+```powershell
+# Фоном через pg_ctl (рекомендуется для тестов)
+pg_ctl -D C:\Temp\studiofs-pg -l C:\Temp\studiofs-pg.log `
+  -o "-p 5432 -c fsync=off -c full_page_writes=off -c synchronous_commit=off -c log_min_messages=warning" `
+  start
+
+# Проверить статус
+pg_ctl -D C:\Temp\studiofs-pg status
+```
+
+> **Внимание:** `fsync=off` — только для тестов. Никогда не для production.
+
+**Создание базы:**
+
+```powershell
+createdb -h localhost -p 5432 -U studiofs studiofs
+
+# Проверка подключения
+psql -h localhost -p 5432 -U studiofs -d studiofs -c "\dt"
+```
+
+**Остановка:**
+
+```powershell
+pg_ctl -D C:\Temp\studiofs-pg stop -m fast
+```
+
+**Полный сброс до чистого состояния:**
+
+```powershell
+# Остановить, удалить кластер, пересоздать
+pg_ctl -D C:\Temp\studiofs-pg stop -m immediate 2>$null
+Remove-Item -Recurse -Force C:\Temp\studiofs-pg, C:\Temp\studiofs-pg.log -ErrorAction SilentlyContinue
+
+initdb -D C:\Temp\studiofs-pg --auth=trust --username=studiofs --encoding=UTF8
+
+pg_ctl -D C:\Temp\studiofs-pg -l C:\Temp\studiofs-pg.log `
+  -o "-p 5432 -c fsync=off -c full_page_writes=off -c synchronous_commit=off" `
+  start
+
+Start-Sleep -Seconds 1
+createdb -h localhost -p 5432 -U studiofs studiofs
+```
+
+**Только сброс данных studiofs (без пересоздания кластера):**
+
+```powershell
+dropdb -h localhost -p 5432 -U studiofs studiofs
+createdb -h localhost -p 5432 -U studiofs studiofs
+# studiofs init пересоздаст все таблицы автоматически
+```
+
+**Альтернатива — WSL2:**  
+Если на машине есть WSL2, удобнее использовать Linux-инструкцию выше внутри WSL и подключаться с Windows по `localhost:5432` — WSL2 пробрасывает порты автоматически.
 
 ### SQL Schema (автоматически создаётся при `studiofs init`)
 
@@ -240,7 +479,7 @@ CREATE TRIGGER trg_event_log_notify
 
 ### Ключевые SQL-операции
 
-**Atomic file create** (полная транзакция в одном SQL round-trip):
+**Atomic file create** (полная транзакция в одном SQL round-trip — критично для WAN):
 ```sql
 BEGIN;
   -- Allocate inode
@@ -264,7 +503,7 @@ BEGIN;
 COMMIT;
 ```
 
-**Range-based ID allocation** (один round-trip):
+**Range-based ID allocation** (один round-trip, $size=8192 для inodes, 131072 для blocks):
 ```sql
 UPDATE counters SET value = value + $size
   WHERE vol = $1 AND name = 'next_inode'
@@ -282,7 +521,7 @@ SELECT pg_advisory_unlock($lock_key);
 -- Auto-release: happens when PG connection drops (client crash/disconnect)
 ```
 
-**Catch-up после reconnect:**
+**Catch-up после reconnect** (один round-trip, WAN-friendly):
 ```sql
 SELECT seq_id, client_id, client_timestamp, event_type, event_payload
   FROM event_log
@@ -312,14 +551,17 @@ PostgreSQL сам сериализует транзакции. Не нужен �
 - Timestamp ordering добавляет сложность (clock skew, rollback winners)
 - `client_timestamp` сохраняем в event_log для аудита, но **не** для conflict resolution
 
-### Конфликтные сценарии
+### Конфликтные сценарии (LucidLink-style: race OK)
+
+> **Принцип:** гонки между клиентами — **допустимы**. Поведение аналогично LucidLink: кто последний записал — тот и прав (LWW). Explicit locking — только для критических workflow.
 
 | Сценарий | PG behaviour | Клиент проигравшего |
 |----------|-------------|-------------------|
 | create same filename | UNIQUE violation | rollback dentry + inode из redb |
 | rename к одной цели | UNIQUE violation или кто первый | rollback rename |
 | delete + create в одной dir | Serialized: порядок определяет PG | может получить ENOENT |
-| overwrite same file (LWW) | Оба UPDATE проходят, последний коммит остаётся | норма: LWW |
+| overwrite same file (LWW) | Оба UPDATE проходят, последний коммит остаётся | **норма: LWW — ожидаемое поведение** |
+| concurrent write same blocks | Оба upload в S3, PG file_blocks LWW | последний коммит определяет содержимое |
 | lock + modify | advisory lock блокирует второго | ждёт release или таймаут |
 
 ### Операции без конфликтов
@@ -330,11 +572,11 @@ PostgreSQL сам сериализует транзакции. Не нужен �
 
 Для критических файлов (проекты Nuke, DaVinci Resolve):
 
-1. Клиент: `SELECT pg_try_advisory_lock(vol * 1000000 + ino)` (~1-5мс LAN)
+1. Клиент: `SELECT pg_try_advisory_lock(vol * 1000000 + ino)` (~40-300мс WAN round-trip)
 2. Если `true` → лок получен. PG session держит его автоматически
 3. Другой клиент: `pg_try_advisory_lock` → `false` → `ELOCKED`
 4. При закрытии файла: `pg_advisory_unlock(...)` или автоматически при disconnect
-5. **Нет TTL/heartbeat проблем:** PG сам обнаруживает disconnected sessions за ~15-30с (tcp_keepalives)
+5. **Нет TTL/heartbeat проблем:** PG сам обнаруживает disconnected sessions за ~60-120с (tcp_keepalives_idle=60, count=6, interval=10)
 
 Для таблицы `file_locks` — backup для случаев когда нужна информация "кто держит лок":
 ```sql
@@ -353,11 +595,12 @@ INSERT INTO file_locks (vol, ino, client_id, expires_at)
 1. Приложение вызывает `create_file()` → VFS → `PgMetaEngine`
 2. `PgMetaEngine` пишет в **локальный redb** мгновенно (приложение не ждёт)
 3. Мутация добавляется в `pending_queue` (in-memory + persisted в redb event_log)
-4. Фоновый воркер:
-   - Батчит мутации (до 50 штук или 1с, что раньше)
-   - Отправляет в PG одной транзакцией: `BEGIN; ... COMMIT;`
+4. Фоновый воркер (WAN-optimized batching):
+   - Батчит мутации: до **100 штук** или **2с**, что раньше (увеличено для амортизации WAN latency)
+   - Отправляет в PG одной транзакцией: `BEGIN; ... COMMIT;` (1 round-trip на весь batch)
    - При success: чистит pending_queue
    - При conflict (UNIQUE violation и т.п.): rollback несовместимых мутаций из redb
+   - **Pipelining:** несколько независимых мутаций отправляются как pipelined statements (tokio-postgres pipeline), не дожидаясь ответа на каждый
 5. NOTIFY стреляет на других клиентах → те обновляют свой redb
 
 ### LISTEN/NOTIFY sync (заменяет NATS)
@@ -448,7 +691,7 @@ studiofs mount my-disk /mnt/studio
 2. Подключается к PG (`tokio-postgres` connection pool)
 3. Делает catch-up: `SELECT ... FROM event_log WHERE vol=$vol_id AND seq_id > $last_seq`
 4. Запускает LISTEN на `studiofs_vol_{vol_id}`
-5. Аллоцирует ID диапазон: `UPDATE counters SET value = value + 4096 ... RETURNING ...`
+5. Аллоцирует ID диапазон: `UPDATE counters SET value = value + 8192 ... RETURNING ...` (большой блок для WAN)
 6. Монтирует VFS (FUSE/WinFSP)
 
 ---
@@ -479,8 +722,8 @@ studiofs mount my-disk /mnt/studio
 - **Read**: из локального redb (мгновенно)
 - **Write**: в локальный redb + pending_queue → фоновый воркер → PG transaction
 - **Sync**: `LISTEN studiofs_vol_N` → poll event_log → apply delta в redb
-- **ID alloc**: `UPDATE counters ... RETURNING` (batch 4096/65536)
-- **Lock**: `pg_try_advisory_lock(vol * 1_000_000 + ino)`
+- **ID alloc**: `UPDATE counters ... RETURNING` (batch 8192/131072 — увеличено для WAN)
+- **Lock**: `pg_try_advisory_lock(vol * 1_000_000 + ino)` (~40-300мс WAN)
 - **Catch-up**: `SELECT FROM event_log WHERE seq > last_known`
 - **Offline**: redb работает, мутации копятся, sync при reconnect
 
@@ -519,7 +762,7 @@ postgres-types = "0.2"
 
 | Case | Решение |
 |------|--------|
-| **Lock + offline** | PG session advisory lock auto-released on disconnect (~15-30с) |
+| **Lock + offline** | PG session advisory lock auto-released on disconnect (~60-120с, tcp_keepalives) |
 | **Lock expiry during upload** | file_locks.expires_at + client auto-renew |
 | **rmdir with locked file** | unlink(locked) → ELOCKED. Остальные файлы удаляются. rmdir → ENOTEMPTY |
 
@@ -536,7 +779,7 @@ postgres-types = "0.2"
 | Case | Решение |
 |------|--------|
 | **Accumulated offline mutations** | Pending queue в redb. На reconnect: batch → PG. Conflicts → per-op rollback |
-| **ID exhaustion offline** | 4096 inodes + 65536 blocks = часы работы. При исчерпании: FS read-only until reconnect |
+| **ID exhaustion offline** | 8192 inodes + 131072 blocks = дни offline работы. При исчерпании: FS read-only until reconnect |
 | **Split brain (оба offline)** | PG serializes на reconnect. Один из create same-name проигрывает |
 | **Event log trimmed** | If `last_known_seq < min(event_log.seq)` → full rebuild from PG tables |
 
@@ -570,9 +813,9 @@ postgres-types = "0.2"
 
 ### Фаза 2: Write-back + Performance
 
-9. Write-back batching (pending queue → PG tx)
+9. Write-back batching (pending queue → PG tx, 100 ops / 2s WAN-optimized)
 10. Advisory locks integration (flock → pg_try_advisory_lock)
-11. ID range allocation (batch 4096/65536)
+11. ID range allocation (batch 8192/131072 — WAN-sized)
 12. Event log compaction (janitor)
 
 ### Фаза 3: Stress + Production readiness
