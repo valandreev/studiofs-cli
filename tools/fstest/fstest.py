@@ -98,6 +98,13 @@ def wait_for_path(path: Path, timeout: float = VISIBILITY_TIMEOUT) -> Optional[f
     start = now_ms()
     deadline = start + timeout * 1000
     while now_ms() < deadline:
+        # Force directory refresh (especially needed for macOS + FUSE/SMB)
+        try:
+            if path.parent.exists():
+                list(path.parent.iterdir())
+        except OSError:
+            pass
+            
         if path.exists():
             return now_ms() - start
         time.sleep(VISIBILITY_POLL_INTERVAL)

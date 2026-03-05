@@ -5,3 +5,4 @@ Cargo.lock
 docs/logs/*.*
 *.exe
 .env
+/tools/fstest/results/*
