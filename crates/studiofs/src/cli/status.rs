@@ -41,6 +41,10 @@ pub fn run(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
         println!("  Meta bucket:   {}", remote.bucket);
         println!("  Meta prefix:   {}", remote.prefix);
     }
+    if let Some(pg) = &format_info.metadata.postgres {
+        println!("  Postgres URL:  {}", pg.url);
+        println!("  Postgres vol:  {}", pg.volume_id);
+    }
     println!("  Meta cache TTL: {}s", format_info.metadata.cache_ttl_secs);
     println!(
         "  Meta flush interval: {}s",

@@ -21,7 +21,9 @@ repository = "https://github.com/user/studiofs"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
-async-nats = "0.39"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+postgres-types = "0.2"
 
 # Storage
 opendal = { version = "0.55", features = ["services-s3"] }

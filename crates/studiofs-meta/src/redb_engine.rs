@@ -539,6 +539,34 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
+
+    /// Read decoded events from local event log in [start_seq, end_seq).
+    pub fn read_events_range(
+        &self,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> MetaResult<Vec<crate::events::MetaEvent>> {
+        if end_seq <= start_seq {
+            return Ok(Vec::new());
+        }
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .range(start_seq..end_seq)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let ev: crate::events::MetaEvent = decode(bytes.value())?;
+            out.push(ev);
+        }
+        Ok(out)
+    }
 }
 
 impl MetaEngine for RedbMetaEngine {

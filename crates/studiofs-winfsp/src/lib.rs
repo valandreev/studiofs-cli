@@ -57,24 +57,23 @@ pub fn mount_and_serve(
     let vfs_ref = vfs.clone();
 
     // Shared invalidation queue: the `WinfspKernelInvalidator` pushes inode
-    // IDs from NATS events; the WinFSP timer drains and sends OS notifications.
+    // IDs from metadata refresh events; the WinFSP timer drains and sends OS notifications.
     let invalidation_queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Ino>::new()));
 
     let context = StudioFsContext::new(vfs.clone(), rt.clone(), invalidation_queue.clone());
 
     // Use `new_with_timer` so the WinFSP threadpool timer periodically calls
     // our `NotifyingFileSystemContext` impl, which sends `FspFileSystemNotify`
-    // for NATS-driven metadata invalidations.  The const generic (250) is the
+    // for metadata-driven invalidations. The const generic (250) is the
     // timer interval in milliseconds — short enough for snappy Explorer
     // refreshes, long enough to batch rapid sequences.
-    let mut host =
-        FileSystemHost::new_with_timer::<Vec<Ino>, 250>(
-            FileSystemParams::default_params(volume_params),
-            context,
-        )?;
+    let mut host = FileSystemHost::new_with_timer::<Vec<Ino>, 250>(
+        FileSystemParams::default_params(volume_params),
+        context,
+    )?;
     host.mount(mount_point)?;
 
-    // Register the kernel cache invalidator with the VFS so that NATS events
+    // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
     let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue));
     vfs.set_kernel_invalidator(invalidator);
@@ -91,7 +90,10 @@ pub fn mount_and_serve(
     // the Ctrl+C path.
     if let Some(event_name) = shutdown_event_name {
         let tx_event = tx.clone();
-        let wide: Vec<u16> = event_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = event_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         unsafe extern "system" {
             fn CreateEventW(
@@ -100,18 +102,15 @@ pub fn mount_and_serve(
                 bInitialState: i32,
                 lpName: *const u16,
             ) -> *mut core::ffi::c_void;
-            fn WaitForSingleObject(
-                hHandle: *mut core::ffi::c_void,
-                dwMilliseconds: u32,
-            ) -> u32;
+            fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
             fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
         }
 
         let event = unsafe {
             CreateEventW(
                 std::ptr::null_mut(),
-                1,  // bManualReset = TRUE
-                0,  // bInitialState = FALSE
+                1, // bManualReset = TRUE
+                0, // bInitialState = FALSE
                 wide.as_ptr(),
             )
         };

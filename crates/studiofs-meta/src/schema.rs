@@ -386,7 +386,7 @@ pub struct FormatInfo {
 pub enum MetadataBackend {
     #[default]
     RedbLocal,
-    Tonbo,
+    Postgres,
 }
 
 /// Connection details for remote metadata object store.
@@ -421,6 +421,8 @@ pub struct MetadataConfig {
     pub backend: MetadataBackend,
     #[serde(default)]
     pub remote: Option<RemoteStoreConfig>,
+    #[serde(default)]
+    pub postgres: Option<PostgresConfig>,
     #[serde(default = "default_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
     #[serde(default = "default_flush_interval_secs")]
@@ -436,12 +438,22 @@ impl Default for MetadataConfig {
         Self {
             backend: MetadataBackend::RedbLocal,
             remote: None,
+            postgres: None,
             cache_ttl_secs: default_cache_ttl_secs(),
             flush_interval_secs: default_flush_interval_secs(),
             flush_ops_threshold: default_flush_ops_threshold(),
             flush_bytes_threshold: default_flush_bytes_threshold(),
         }
     }
+}
+
+/// Connection details for PostgreSQL metadata backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresConfig {
+    /// PostgreSQL connection string (e.g. postgres://user:pass@host:5432/db).
+    pub url: String,
+    /// Logical volume id in shared PG schema.
+    pub volume_id: i64,
 }
 
 fn default_metadata_prefix() -> String {

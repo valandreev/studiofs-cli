@@ -15,11 +15,7 @@ pub fn sanitize_mount_point(mp: &str) -> String {
         .replace(['\\', '/', ':'], "_")
         .trim_matches('_')
         .to_lowercase();
-    if s.is_empty() {
-        "root".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { "root".to_string() } else { s }
 }
 
 /// `~/.studiofs/mounts/`
@@ -66,10 +62,7 @@ pub fn read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
     let pid = v["pid"]
         .as_u64()
         .ok_or_else(|| anyhow!("corrupt PID file"))? as u32;
-    let mp = v["mount_point"]
-        .as_str()
-        .unwrap_or(mount_point)
-        .to_string();
+    let mp = v["mount_point"].as_str().unwrap_or(mount_point).to_string();
     let vol = v["volume"].as_str().unwrap_or("unknown").to_string();
     Ok((pid, mp, vol))
 }
@@ -122,7 +115,12 @@ pub fn is_process_running(pid: u32) -> bool {
 
 /// Write a PID file into the given directory.
 #[cfg(test)]
-pub fn write_pid_file_in(dir: &std::path::Path, mount_point: &str, volume: &str, pid: u32) -> Result<()> {
+pub fn write_pid_file_in(
+    dir: &std::path::Path,
+    mount_point: &str,
+    volume: &str,
+    pid: u32,
+) -> Result<()> {
     let sanitized = sanitize_mount_point(mount_point);
     let path = dir.join(format!("{sanitized}.json"));
     let info = serde_json::json!({
@@ -145,10 +143,7 @@ pub fn read_pid_file_in(dir: &std::path::Path, mount_point: &str) -> Result<(u32
     let pid = v["pid"]
         .as_u64()
         .ok_or_else(|| anyhow!("corrupt PID file"))? as u32;
-    let mp = v["mount_point"]
-        .as_str()
-        .unwrap_or(mount_point)
-        .to_string();
+    let mp = v["mount_point"].as_str().unwrap_or(mount_point).to_string();
     let vol = v["volume"].as_str().unwrap_or("unknown").to_string();
     Ok((pid, mp, vol))
 }
@@ -187,7 +182,10 @@ mod tests {
 
     #[test]
     fn sanitize_unix_nested_path() {
-        assert_eq!(sanitize_mount_point("/home/user/mount/data"), "home_user_mount_data");
+        assert_eq!(
+            sanitize_mount_point("/home/user/mount/data"),
+            "home_user_mount_data"
+        );
     }
 
     #[test]

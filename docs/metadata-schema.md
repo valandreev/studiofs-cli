@@ -1,15 +1,21 @@
 # Metadata Schema
 
-StudioFS metadata schema has a single source of truth:
+Source of truth:
 - `crates/studiofs-meta/src/schema.rs`
 
-Compatibility note:
-- `crates/studiofs-meta/src/types.rs` now re-exports from `schema.rs` and must not define divergent structs.
+Compatibility:
+- `crates/studiofs-meta/src/types.rs` re-exports from `schema.rs`.
 
-Manifest/version note:
-- `FormatInfo.version` is reserved for remote metadata manifest versioning (ETag/If-Match semantics).
-- Metadata runtime defaults:
-  - `cache_ttl_secs = 20`
-  - `flush_interval_secs = 60`
-  - `flush_ops_threshold = 100`
-  - `flush_bytes_threshold = 1 MiB`
+Current backend model:
+- `MetadataBackend::RedbLocal`
+- `MetadataBackend::Postgres`
+
+Key runtime defaults:
+- `cache_ttl_secs = 20`
+- `flush_interval_secs = 60`
+- `flush_ops_threshold = 100`
+- `flush_bytes_threshold = 1 MiB`
+
+PostgreSQL config fields:
+- `metadata.postgres.url`
+- `metadata.postgres.volume_id`

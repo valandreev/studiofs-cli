@@ -836,7 +836,7 @@ impl Filesystem for StudioFuseFs {
 // ─── Kernel Cache Invalidator ────────────────────────────────────────────────
 
 /// Bridges `fuser::Notifier` to the VFS `KernelInvalidator` trait so that
-/// NATS-driven metadata refreshes can immediately clear the Linux kernel's
+/// Metadata refreshes can immediately clear the Linux kernel's
 /// FUSE dentry and attribute caches.
 pub struct FuseKernelInvalidator {
     notifier: fuser::Notifier,

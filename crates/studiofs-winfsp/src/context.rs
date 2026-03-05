@@ -18,7 +18,7 @@ use windows::Win32::Security::{
 use winfsp::U16CStr;
 use winfsp::filesystem::DirBuffer;
 use winfsp::filesystem::*;
-use winfsp::notify::{NotifyInfo, Notifier, NotifyingFileSystemContext};
+use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
 // Windows reparse point constants
@@ -376,7 +376,7 @@ pub struct StudioFsContext {
     /// Cached binary security descriptor (Everyone = Full Access).
     default_sd: Vec<u8>,
     /// Pending kernel cache invalidation queue (shared with
-    /// `WinfspKernelInvalidator` so NATS events can enqueue inodes
+    /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
 }
@@ -990,7 +990,7 @@ fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
 /// Bridges VFS kernel cache invalidation to WinFSP's
 /// `FspFileSystemNotify` mechanism.
 ///
-/// NATS-driven metadata refreshes push inode numbers into a shared queue.
+/// Metadata refreshes push inode numbers into a shared queue.
 /// The WinFSP timer drains the queue and sends Windows change notifications
 /// so that Explorer and other applications see remote changes promptly.
 pub struct WinfspKernelInvalidator {

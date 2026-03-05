@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import stat
+import subprocess
 import sys
 import time
 import traceback
@@ -43,6 +44,7 @@ BARRIER_TIMEOUT = 120  # seconds to wait for peers at barrier
 VISIBILITY_POLL_INTERVAL = 0.05  # 50ms between polls
 VISIBILITY_TIMEOUT = 30  # max seconds to wait for file to appear
 DATA_BLOCK = b"STUDIOFS_TEST_" * 1000  # ~14KB test payload
+SYNC_HOOK_TIMEOUT = 120  # seconds
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -228,6 +230,10 @@ class TestCtx:
     fs_name: str
     barrier: Barrier
     work_dir: Path  # per-run temporary work directory under mount
+    consistency_model: str = "direct"
+    sync_cmd_template: Optional[str] = None
+    sync_settle_secs: float = 0.5
+    probe_rounds: int = 30
 
     @property
     def is_a(self) -> bool:
@@ -236,6 +242,60 @@ class TestCtx:
     @property
     def is_b(self) -> bool:
         return self.role == "B"
+
+
+def run_sync_hook(ctx: TestCtx, phase: str) -> dict[str, Any]:
+    """
+    Execute optional external sync command.
+    Template placeholders:
+      {role} {phase} {mount} {work_dir} {fs_name}
+    """
+    if not ctx.sync_cmd_template:
+        time.sleep(ctx.sync_settle_secs)
+        return {"executed": False, "reason": "no sync command configured"}
+
+    cmd = ctx.sync_cmd_template.format(
+        role=ctx.role,
+        phase=phase,
+        mount=str(ctx.mount),
+        work_dir=str(ctx.work_dir),
+        fs_name=ctx.fs_name,
+    )
+    started = now_ms()
+    proc = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=SYNC_HOOK_TIMEOUT,
+    )
+    elapsed = now_ms() - started
+    return {
+        "executed": True,
+        "phase": phase,
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "duration_ms": round(elapsed, 1),
+        "stdout": proc.stdout[-1000:],
+        "stderr": proc.stderr[-1000:],
+        "ok": proc.returncode == 0,
+    }
+
+
+def percentile(values: list[float], p: float) -> Optional[float]:
+    """Return percentile value for p in [0, 100]."""
+    if not values:
+        return None
+    if p <= 0:
+        return min(values)
+    if p >= 100:
+        return max(values)
+    ordered = sorted(values)
+    idx = (len(ordered) - 1) * (p / 100.0)
+    lo = int(idx)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = idx - lo
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1116,6 +1176,261 @@ def test_rapid_create_delete(ctx: TestCtx) -> TestResult:
     )
 
 
+def test_conflict_contract_probe(ctx: TestCtx) -> TestResult:
+    """
+    Single probe test that extracts conflict/convergence metrics:
+    - visibility delay (A->B and B->A)
+    - overwrite winner distribution
+    - rename winner distribution
+    - delete-while-open behavior
+    """
+    rounds = max(1, int(ctx.probe_rounds))
+    vis_a_to_b: list[float] = []
+    vis_b_to_a: list[float] = []
+    overwrite_winners = {"A": 0, "B": 0, "other": 0}
+    rename_winners = {"A": 0, "B": 0, "none_or_both": 0}
+    delete_attempts = 0
+    delete_success = 0
+    holder_read_after_delete_ok = 0
+
+    base = ctx.work_dir / "probe"
+    base.mkdir(parents=True, exist_ok=True)
+
+    for i in range(rounds):
+        # 1) Visibility round-trip, alternating writer.
+        vis_dir = base / "visibility"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        writer = "A" if i % 2 == 0 else "B"
+        vis_file = vis_dir / f"v_{i:03d}_{writer}.txt"
+        vis_payload = f"vis_round={i};writer={writer};ts={wall_ms()}".encode()
+
+        ctx.barrier.wait(f"probe_vis_ready_{i}")
+        if ctx.role == writer:
+            vis_file.write_bytes(vis_payload)
+        else:
+            d = wait_for_path(vis_file, timeout=VISIBILITY_TIMEOUT)
+            if d is not None:
+                if writer == "A" and ctx.is_b:
+                    vis_a_to_b.append(d)
+                elif writer == "B" and ctx.is_a:
+                    vis_b_to_a.append(d)
+        ctx.barrier.wait(f"probe_vis_done_{i}")
+
+        # 2) Concurrent overwrite winner.
+        ow_dir = base / "overwrite"
+        ow_dir.mkdir(parents=True, exist_ok=True)
+        ow_file = ow_dir / f"shared_{i:03d}.txt"
+        if ctx.is_a:
+            ow_file.write_bytes(b"seed")
+        ctx.barrier.wait(f"probe_ow_seed_{i}")
+
+        my_ow_payload = f"ow_round={i};writer={ctx.role};ts={wall_ms()}".encode()
+        ow_file.write_bytes(my_ow_payload)
+        ctx.barrier.wait(f"probe_ow_write_{i}")
+        time.sleep(0.2)
+        final_ow = ow_file.read_bytes() if ow_file.exists() else b""
+        winner = "other"
+        if b"writer=A" in final_ow:
+            winner = "A"
+        elif b"writer=B" in final_ow:
+            winner = "B"
+        overwrite_winners[winner] += 1
+        ctx.barrier.wait(f"probe_ow_done_{i}")
+
+        # 3) Concurrent rename winner.
+        rn_dir = base / "rename"
+        rn_dir.mkdir(parents=True, exist_ok=True)
+        src = rn_dir / f"src_{i:03d}.txt"
+        dst_a = rn_dir / f"dst_a_{i:03d}.txt"
+        dst_b = rn_dir / f"dst_b_{i:03d}.txt"
+        if ctx.is_a:
+            src.write_bytes(f"rename_round={i}".encode())
+            safe_remove(dst_a)
+            safe_remove(dst_b)
+        ctx.barrier.wait(f"probe_rn_seed_{i}")
+        try:
+            src.rename(dst_a if ctx.is_a else dst_b)
+        except OSError:
+            pass
+        ctx.barrier.wait(f"probe_rn_renamed_{i}")
+        a_exists = dst_a.exists()
+        b_exists = dst_b.exists()
+        if a_exists and not b_exists:
+            rename_winners["A"] += 1
+        elif b_exists and not a_exists:
+            rename_winners["B"] += 1
+        else:
+            rename_winners["none_or_both"] += 1
+        ctx.barrier.wait(f"probe_rn_done_{i}")
+
+        # 4) Delete while open.
+        dr_dir = base / "delete_open"
+        dr_dir.mkdir(parents=True, exist_ok=True)
+        dr_file = dr_dir / f"f_{i:03d}.bin"
+        if ctx.is_a:
+            dr_file.write_bytes(b"X" * 4096)
+        ctx.barrier.wait(f"probe_del_seed_{i}")
+
+        if ctx.is_a:
+            ok = 0
+            try:
+                with open(dr_file, "rb") as f:
+                    _ = f.read(64)
+                    ctx.barrier.wait(f"probe_del_hold_{i}")
+                    ctx.barrier.wait(f"probe_del_try_done_{i}")
+                    try:
+                        f.seek(0)
+                        ok = 1 if len(f.read(64)) == 64 else 0
+                    except OSError:
+                        ok = 0
+            except OSError:
+                ok = 0
+            holder_read_after_delete_ok += ok
+        else:
+            ctx.barrier.wait(f"probe_del_hold_{i}")
+            delete_attempts += 1
+            try:
+                dr_file.unlink()
+                delete_success += 1
+            except OSError:
+                pass
+            ctx.barrier.wait(f"probe_del_try_done_{i}")
+        ctx.barrier.wait(f"probe_del_done_{i}")
+
+    def vis_stats(vals: list[float]) -> dict[str, Any]:
+        if not vals:
+            return {"n": 0, "p50_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None}
+        return {
+            "n": len(vals),
+            "p50_ms": round(percentile(vals, 50) or 0, 2),
+            "p95_ms": round(percentile(vals, 95) or 0, 2),
+            "p99_ms": round(percentile(vals, 99) or 0, 2),
+            "max_ms": round(max(vals), 2),
+        }
+
+    details = {
+        "rounds": rounds,
+        "visibility": {
+            "a_to_b": vis_stats(vis_a_to_b),
+            "b_to_a": vis_stats(vis_b_to_a),
+        },
+        "overwrite_winners": overwrite_winners,
+        "rename_winners": rename_winners,
+        "delete_while_open": {
+            "deleter_attempts": delete_attempts,
+            "deleter_success": delete_success,
+            "holder_read_after_delete_ok": holder_read_after_delete_ok,
+        },
+    }
+    return TestResult(
+        "conflict_contract_probe",
+        True,
+        notes=f"rounds={rounds}",
+        details=details,
+    )
+
+
+def test_eventual_visibility_ordered_sync(ctx: TestCtx) -> TestResult:
+    """
+    Eventual model:
+      A writes local change -> A sync -> B sync -> B must observe change.
+    """
+    d = ctx.work_dir / "eventual_visibility"
+    d.mkdir(parents=True, exist_ok=True)
+    target = d / "from_a.txt"
+    payload = f"eventual_{wall_ms()}".encode()
+    details: dict[str, Any] = {}
+
+    ctx.barrier.wait("ev_vis_ready")
+    if ctx.is_a:
+        target.write_bytes(payload)
+    ctx.barrier.wait("ev_vis_written")
+
+    immediate_visible = target.exists() if ctx.is_b else None
+    if ctx.is_b:
+        details["visible_before_sync"] = immediate_visible
+
+    if ctx.is_a:
+        details["a_flush"] = run_sync_hook(ctx, "flush_a_visibility")
+    ctx.barrier.wait("ev_vis_after_a_flush")
+
+    if ctx.is_b:
+        details["b_pull"] = run_sync_hook(ctx, "pull_b_visibility")
+    ctx.barrier.wait("ev_vis_after_b_pull")
+
+    delay = wait_for_path(target, timeout=VISIBILITY_TIMEOUT)
+    final_bytes = target.read_bytes() if target.exists() else None
+    content_ok = final_bytes == payload
+    passed = delay is not None and content_ok
+
+    details["visible_after_sync"] = target.exists()
+    details["content_ok"] = content_ok
+    details["final_preview"] = (
+        final_bytes[:120].decode(errors="replace") if final_bytes is not None else None
+    )
+    return TestResult(
+        "eventual_visibility_ordered_sync",
+        passed,
+        visibility_delay_ms=delay,
+        notes=(
+            f"before_sync={immediate_visible}, after_sync={details['visible_after_sync']}, "
+            f"content_ok={content_ok}"
+        ),
+        details=details,
+    )
+
+
+def test_eventual_same_file_ordered_flush(ctx: TestCtx) -> TestResult:
+    """
+    Eventual model:
+      A and B mutate same file locally.
+      Flush order is A then B; after both pulls final content should be B's.
+    """
+    d = ctx.work_dir / "eventual_conflict"
+    d.mkdir(parents=True, exist_ok=True)
+    target = d / "shared.txt"
+    my_payload = f"payload_{ctx.role}_{wall_ms()}".encode()
+    details: dict[str, Any] = {}
+
+    ctx.barrier.wait("ev_conflict_ready")
+    target.write_bytes(my_payload)
+    ctx.barrier.wait("ev_conflict_local_written")
+
+    if ctx.is_a:
+        details["a_flush"] = run_sync_hook(ctx, "flush_a_conflict")
+    ctx.barrier.wait("ev_conflict_after_a_flush")
+
+    details["pull_after_a"] = run_sync_hook(ctx, "pull_after_a_conflict")
+    ctx.barrier.wait("ev_conflict_after_pull_a")
+    after_a = target.read_bytes() if target.exists() else None
+    details["after_a_preview"] = (
+        after_a[:120].decode(errors="replace") if after_a is not None else None
+    )
+
+    if ctx.is_b:
+        details["b_flush"] = run_sync_hook(ctx, "flush_b_conflict")
+    ctx.barrier.wait("ev_conflict_after_b_flush")
+
+    details["pull_after_b"] = run_sync_hook(ctx, "pull_after_b_conflict")
+    ctx.barrier.wait("ev_conflict_after_pull_b")
+    final = target.read_bytes() if target.exists() else None
+    expected_final = None
+    if ctx.is_b:
+        (d / "expected_final_by_b.txt").write_bytes(my_payload)
+    ctx.barrier.wait("ev_conflict_expected_ready")
+    expected_final = (d / "expected_final_by_b.txt").read_bytes()
+    final_matches_b = final == expected_final
+    details["final_preview"] = final[:120].decode(errors="replace") if final else None
+    details["expected_preview"] = expected_final[:120].decode(errors="replace")
+
+    return TestResult(
+        "eventual_same_file_ordered_flush",
+        final_matches_b,
+        notes=f"final_matches_b={final_matches_b}",
+        details=details,
+    )
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TEST RUNNER
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1144,6 +1459,10 @@ MULTI_CLIENT_TESTS = [
     test_rapid_create_delete,
 ]
 
+PROBE_TESTS = [
+    test_conflict_contract_probe,
+]
+
 
 def run_test(func, ctx: TestCtx) -> TestResult:
     """Run a single test with error handling."""
@@ -1161,6 +1480,61 @@ def run_test(func, ctx: TestCtx) -> TestResult:
         )
 
 
+def build_contract_summary(work_dir: Path) -> Optional[dict[str, Any]]:
+    """Merge A/B probe reports into one contract summary."""
+    reports = []
+    for p in sorted(work_dir.glob("results_*.json")):
+        reports.append(json.loads(p.read_text()))
+    if len(reports) < 2:
+        return None
+
+    by_role = {r.get("role"): r for r in reports}
+    a = by_role.get("A")
+    b = by_role.get("B")
+    if not a or not b:
+        return None
+
+    def details(report: dict[str, Any]) -> dict[str, Any]:
+        return report.get("tests", {}).get("conflict_contract_probe", {}).get("details", {})
+
+    da = details(a)
+    db = details(b)
+    vis_a_to_b = da.get("visibility", {}).get("a_to_b", {})
+    vis_b_to_a = da.get("visibility", {}).get("b_to_a", {})
+
+    def merge_counts(x: dict[str, int], y: dict[str, int]) -> dict[str, int]:
+        keys = set(x.keys()) | set(y.keys())
+        return {k: int(x.get(k, 0)) + int(y.get(k, 0)) for k in sorted(keys)}
+
+    summary = {
+        "run_id": a.get("run_id"),
+        "filesystem": a.get("filesystem"),
+        "mode": "probe",
+        "rounds": da.get("rounds"),
+        "visibility": {
+            "a_to_b": vis_a_to_b,
+            "b_to_a": vis_b_to_a,
+        },
+        "overwrite_winners_total": merge_counts(
+            da.get("overwrite_winners", {}), db.get("overwrite_winners", {})
+        ),
+        "rename_winners_total": merge_counts(
+            da.get("rename_winners", {}), db.get("rename_winners", {})
+        ),
+        "delete_while_open": {
+            "deleter_attempts_total": int(da.get("delete_while_open", {}).get("deleter_attempts", 0))
+            + int(db.get("delete_while_open", {}).get("deleter_attempts", 0)),
+            "deleter_success_total": int(da.get("delete_while_open", {}).get("deleter_success", 0))
+            + int(db.get("delete_while_open", {}).get("deleter_success", 0)),
+            "holder_read_after_delete_ok_total": int(
+                da.get("delete_while_open", {}).get("holder_read_after_delete_ok", 0)
+            )
+            + int(db.get("delete_while_open", {}).get("holder_read_after_delete_ok", 0)),
+        },
+    }
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="studiofs-fstest: Multi-client filesystem behavior test suite"
@@ -1172,12 +1546,8 @@ def main():
                         help="Total number of peer clients (default: 2)")
     parser.add_argument("--fs-name", default="unknown",
                         help="Filesystem name for report (e.g. LucidLink, StudioFS, SMB)")
-    parser.add_argument("--skip-single", action="store_true",
-                        help="Skip single-client tests")
-    parser.add_argument("--skip-multi", action="store_true",
-                        help="Skip multi-client tests")
-    parser.add_argument("--test", action="append", default=[],
-                        help="Run only specific test(s) by name (can repeat)")
+    parser.add_argument("--rounds", type=int, default=30,
+                        help="Probe rounds per metric scenario (default: 30)")
 
     args = parser.parse_args()
     mount = Path(args.mount)
@@ -1202,6 +1572,8 @@ def main():
         fs_name=args.fs_name,
         barrier=barrier,
         work_dir=work_dir,
+        consistency_model="probe",
+        probe_rounds=max(1, args.rounds),
     )
 
     print(f"═══ studiofs-fstest ═══")
@@ -1209,6 +1581,8 @@ def main():
     print(f"  role:    {args.role}")
     print(f"  peers:   {args.peers}")
     print(f"  fs:      {args.fs_name}")
+    print(f"  mode:    probe")
+    print(f"  rounds:  {ctx.probe_rounds}")
     print(f"  run_id:  {run_id}")
     print(f"  platform: {platform.system()} {platform.release()}")
     print()
@@ -1241,36 +1615,15 @@ def main():
 
     results: list[TestResult] = []
 
-    # ─── Single-client tests (A only, B waits) ───
-    if not args.skip_single:
-        if ctx.is_a:
-            print("── Single-client tests (A runs, others wait) ──")
-            for test_fn in SINGLE_CLIENT_TESTS:
-                if args.test and test_fn.__name__ not in args.test:
-                    continue
-                name = test_fn.__name__
-                print(f"  {name}...", end=" ", flush=True)
-                result = run_test(test_fn, ctx)
-                results.append(result)
-                status = "PASS" if result.passed else "FAIL"
-                print(f"{status} ({result.notes})" if result.notes else status)
-            print()
-
-        barrier.wait("single_done")
-
-    # ─── Multi-client tests ───
-    if not args.skip_multi:
-        print("── Multi-client tests ──")
-        for test_fn in MULTI_CLIENT_TESTS:
-            if args.test and test_fn.__name__ not in args.test:
-                continue
-            name = test_fn.__name__
-            print(f"  {name}...", end=" ", flush=True)
-            result = run_test(test_fn, ctx)
-            results.append(result)
-            status = "PASS" if result.passed else "FAIL"
-            print(f"{status} ({result.notes})" if result.notes else status)
-        print()
+    print("── Probe tests ──")
+    for test_fn in PROBE_TESTS:
+        name = test_fn.__name__
+        print(f"  {name}...", end=" ", flush=True)
+        result = run_test(test_fn, ctx)
+        results.append(result)
+        status = "PASS" if result.passed else "FAIL"
+        print(f"{status} ({result.notes})" if result.notes else status)
+    print()
 
     # ─── Summary ───
     passed = sum(1 for r in results if r.passed)
@@ -1284,6 +1637,7 @@ def main():
         "peers": args.peers,
         "platform": platform.system(),
         "platform_release": platform.release(),
+        "consistency_model": "probe",
         "run_id": run_id,
         "timestamp": time.time(),
         "summary": {"passed": passed, "failed": failed, "total": len(results)},
@@ -1306,6 +1660,11 @@ def main():
             role = peer_report["role"]
             s = peer_report["summary"]
             print(f"  {role}: {s['passed']}/{s['total']} passed ({peer_report['platform']})")
+        summary = build_contract_summary(work_dir)
+        if summary is not None:
+            summary_file = work_dir / "contract_summary.json"
+            summary_file.write_text(json.dumps(summary, indent=2, default=str))
+            print(f"  contract: {summary_file}")
 
     sys.exit(0 if failed == 0 else 1)
 

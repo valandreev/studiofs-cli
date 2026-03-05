@@ -14,7 +14,10 @@ serde_json.workspace = true
 parking_lot.workspace = true
 opendal.workspace = true
 tokio.workspace = true
-async-nats.workspace = true
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+postgres-types.workspace = true
+futures.workspace = true
 bitflags = { version = "2.4", features = ["serde"] }
 
 [dev-dependencies]
@@ -24,3 +27,4 @@ aws-config = "1"
 aws-sdk-s3 = "1"
 aws-smithy-http-client = "1"
 dotenvy.workspace = true
+uuid.workspace = true

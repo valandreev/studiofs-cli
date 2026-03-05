@@ -106,14 +106,8 @@ EXAMPLES:
   Check volume status:
     studiofs status myvolume
 
-  Update metadata tuning for an existing volume:
-    studiofs tune-metadata myvolume --cache-ttl-secs 5 --flush-interval-secs 15
-
   Run janitor in dry-run mode:
     studiofs janitor myvolume --dry-run
-
-  Enable cross-client cache invalidation bus (NATS):
-    studiofs mount myvolume Z: --nats nats://127.0.0.1:4222
 
 ENV TUNING:
   STUDIOFS_JANITOR_INTERVAL_SECS    Auto-janitor cycle interval (default: 1800).
@@ -209,6 +203,10 @@ EXAMPLES:
         #[arg(long)]
         metadata_endpoint: Option<String>,
 
+        /// PostgreSQL DSN for metadata backend (switches metadata backend to Postgres)
+        #[arg(long)]
+        postgres: Option<String>,
+
         /// Metadata bucket (required when --metadata-endpoint is provided)
         #[arg(long)]
         metadata_bucket: Option<String>,
@@ -247,41 +245,14 @@ EXAMPLES:
         block_size: Option<String>,
     },
 
-    /// Discover and attach local cache to an existing Tonbo metadata volume
-    #[command(long_about = "\
-Attach to an existing disk by reading metadata manifest from:
-  <disk-name>/metadata/manifest.json
-
-Discovery requires only metadata endpoint/bucket/credentials + disk name.
-Data endpoint/bucket/prefix are loaded from remote metadata.")]
-    #[command(after_help = "\
-EXAMPLES:
-  studiofs discover mydisk --endpoint http://127.0.0.1:9000 \\
-    --bucket meta-bucket --access-key minioadmin --secret-key minioadmin
-")]
+    /// Discover an existing PostgreSQL-backed volume and create local metadata for this client
     Discover {
-        /// Disk name to discover
+        /// Volume name to discover
         name: String,
 
-        /// Metadata endpoint URL
+        /// PostgreSQL DSN (e.g. postgres://user:pass@host:5432/db)
         #[arg(long)]
-        endpoint: String,
-
-        /// Metadata bucket
-        #[arg(long)]
-        bucket: String,
-
-        /// Metadata access key
-        #[arg(long)]
-        access_key: String,
-
-        /// Metadata secret key
-        #[arg(long)]
-        secret_key: String,
-
-        /// Metadata region
-        #[arg(long, default_value = "")]
-        region: String,
+        postgres: String,
     },
 
     /// Mount a filesystem volume as a local drive
@@ -301,9 +272,6 @@ EXAMPLES:
   High-performance mount (4 GB memory cache, 500 GB disk cache):
     studiofs mount myvolume Z: --memory-limit 4GB --cache-size 500GB \\
       --cache-dir D:\\cache\\studiofs
-
-  Mount with explicit NATS server:
-    studiofs mount myvolume Z: --nats nats://10.0.0.5:4222
 
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
@@ -329,10 +297,6 @@ SIZE FORMATS:
         /// Maximum in-memory cache size (e.g. 1GB, 512MB, 4GB)
         #[arg(long, default_value = "1GB")]
         memory_limit: String,
-
-        /// NATS URL for cross-client invalidation (CLI value overrides env; default is local NATS)
-        #[arg(long, default_value = "nats://127.0.0.1:4222")]
-        nats: String,
 
         /// Run in foreground (keep terminal attached)
         #[arg(long)]
@@ -364,33 +328,6 @@ EXAMPLES:
     Status {
         /// Volume name
         name: String,
-    },
-
-    /// Update metadata cache/flush tuning for an existing volume
-    #[command(after_help = "\
-EXAMPLES:
-  studiofs tune-metadata myvolume --cache-ttl-secs 5
-  studiofs tune-metadata myvolume --flush-interval-secs 15 --flush-ops-threshold 20
-")]
-    TuneMetadata {
-        /// Volume name
-        name: String,
-
-        /// Metadata cache TTL in seconds (minimum 1)
-        #[arg(long)]
-        cache_ttl_secs: Option<u64>,
-
-        /// Metadata flush interval in seconds (minimum 1)
-        #[arg(long)]
-        flush_interval_secs: Option<u64>,
-
-        /// Metadata flush ops threshold (minimum 1)
-        #[arg(long)]
-        flush_ops_threshold: Option<u32>,
-
-        /// Metadata flush bytes threshold (minimum 1)
-        #[arg(long)]
-        flush_bytes_threshold: Option<u64>,
     },
 
     /// Scan data objects and remove orphaned ones (Phase 6 prototype)
@@ -516,6 +453,7 @@ fn main() -> anyhow::Result<()> {
             secret_key,
             region,
             metadata_endpoint,
+            postgres,
             metadata_bucket,
             metadata_access_key,
             metadata_secret_key,
@@ -534,6 +472,7 @@ fn main() -> anyhow::Result<()> {
                 &access_key,
                 &secret_key,
                 &region,
+                postgres.as_deref(),
                 metadata_endpoint.as_deref(),
                 metadata_bucket.as_deref(),
                 metadata_access_key.as_deref(),
@@ -547,13 +486,16 @@ fn main() -> anyhow::Result<()> {
                 block_size.as_deref(),
             )?;
         }
+        Commands::Discover { name, postgres } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::discovery::run(&name, &postgres, &meta_dir)?;
+        }
         Commands::Mount {
             name,
             mount_point,
             cache_dir,
             cache_size,
             memory_limit,
-            nats,
             foreground,
             detach,
         } => {
@@ -565,7 +507,6 @@ fn main() -> anyhow::Result<()> {
                 cache_dir.as_deref(),
                 &cache_size,
                 &memory_limit,
-                &nats,
                 foreground,
                 detach,
             )?;
@@ -573,45 +514,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Umount { mount_point } => {
             cli::umount::run(&mount_point)?;
         }
-        Commands::Discover {
-            name,
-            endpoint,
-            bucket,
-            access_key,
-            secret_key,
-            region,
-        } => {
-            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::discovery::run(
-                &name,
-                &endpoint,
-                &bucket,
-                &access_key,
-                &secret_key,
-                &region,
-                &meta_dir,
-            )?;
-        }
         Commands::Status { name } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::status::run(&name, &meta_dir)?;
-        }
-        Commands::TuneMetadata {
-            name,
-            cache_ttl_secs,
-            flush_interval_secs,
-            flush_ops_threshold,
-            flush_bytes_threshold,
-        } => {
-            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::tune_metadata::run(
-                &name,
-                &meta_dir,
-                cache_ttl_secs,
-                flush_interval_secs,
-                flush_ops_threshold,
-                flush_bytes_threshold,
-            )?;
         }
         Commands::Test {
             entrypoint,
@@ -671,7 +576,13 @@ mod tests {
     fn mount_short_detach_flag() {
         let cli = parse(&["mount", "vol", "Z:", "-d"]).unwrap();
         match cli.command {
-            Commands::Mount { detach, foreground, name, mount_point, .. } => {
+            Commands::Mount {
+                detach,
+                foreground,
+                name,
+                mount_point,
+                ..
+            } => {
                 assert!(detach);
                 assert!(!foreground);
                 assert_eq!(name, "vol");
@@ -694,7 +605,9 @@ mod tests {
     fn mount_no_detach_by_default() {
         let cli = parse(&["mount", "vol", "Z:"]).unwrap();
         match cli.command {
-            Commands::Mount { detach, foreground, .. } => {
+            Commands::Mount {
+                detach, foreground, ..
+            } => {
                 assert!(!detach);
                 assert!(!foreground);
             }
@@ -707,7 +620,9 @@ mod tests {
         // Both flags can be parsed (the implementation handles conflicts at runtime).
         let cli = parse(&["mount", "vol", "Z:", "--foreground", "-d"]).unwrap();
         match cli.command {
-            Commands::Mount { detach, foreground, .. } => {
+            Commands::Mount {
+                detach, foreground, ..
+            } => {
                 assert!(detach);
                 assert!(foreground);
             }
@@ -718,9 +633,13 @@ mod tests {
     #[test]
     fn mount_with_options_and_detach() {
         let cli = parse(&[
-            "mount", "vol", "Z:",
-            "--memory-limit", "4GB",
-            "--cache-size", "200GB",
+            "mount",
+            "vol",
+            "Z:",
+            "--memory-limit",
+            "4GB",
+            "--cache-size",
+            "200GB",
             "-d",
         ])
         .unwrap();

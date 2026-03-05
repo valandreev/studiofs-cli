@@ -1,119 +1,120 @@
-//! `studiofs discover` — attach local metadata cache to an existing Tonbo volume.
+//! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
-use std::io::Write;
 use std::path::Path;
+use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine};
 
-use studiofs_data::{DataStore, DataStoreConfig};
-use studiofs_meta::{
-    DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine,
-    RemoteStoreConfig, TonboMetaEngine,
-};
+fn extract_format_info_from_snapshot(snapshot_bytes: &[u8]) -> anyhow::Result<FormatInfo> {
+    let value: serde_json::Value = serde_json::from_slice(snapshot_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid metadata snapshot json: {e}"))?;
+    let settings = value
+        .get("settings")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("snapshot.settings missing"))?;
 
-fn verify_store(label: &str, cfg: &DataStoreConfig) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let ds = DataStore::new(cfg)?;
-        ds.check()
-            .await
-            .map_err(|e| anyhow::anyhow!("{} check failed: {}", label, e))
-    })
+    for item in settings {
+        let pair = item
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("snapshot.settings item is not tuple"))?;
+        if pair.len() != 2 {
+            continue;
+        }
+        let key = pair[0].as_str().unwrap_or_default();
+        if key != "format" {
+            continue;
+        }
+        let arr = pair[1]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("snapshot format payload is not byte array"))?;
+        let mut bytes = Vec::with_capacity(arr.len());
+        for n in arr {
+            let b = n
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("snapshot format payload contains non-byte"))?;
+            bytes.push(
+                u8::try_from(b).map_err(|_| anyhow::anyhow!("snapshot format byte out of range"))?,
+            );
+        }
+        let info: FormatInfo = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("invalid embedded FormatInfo json: {e}"))?;
+        return Ok(info);
+    }
+
+    Err(anyhow::anyhow!(
+        "FormatInfo not found in metadata snapshot settings"
+    ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    name: &str,
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-    meta_dir: &Path,
-) -> anyhow::Result<()> {
-    println!("🔍 Verifying metadata store access...");
-    let metadata_cfg = DataStoreConfig {
-        endpoint: endpoint.to_string(),
-        bucket: bucket.to_string(),
-        access_key: access_key.to_string(),
-        secret_key: secret_key.to_string(),
-        region: region.to_string(),
-        volume_name: name.to_string(),
-    };
-    verify_store("metadata", &metadata_cfg)?;
-    println!("✅ Metadata store is accessible.");
+pub fn run(name: &str, postgres_dsn: &str, meta_dir: &Path) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
 
-    if meta_dir.exists() {
-        println!("! Metadata directory already exists: {:?}", meta_dir);
-        print!("  Do you want to REPLACE local metadata cache? [y/N]: ");
-        std::io::stdout().flush()?;
+    let (volume_id, snapshot): (i64, Vec<u8>) = rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(postgres_dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input == "y" || input == "yes" {
-            std::fs::remove_dir_all(meta_dir)?;
-        } else {
-            return Err(anyhow::anyhow!("Discovery cancelled."));
-        }
-    }
+        let row = client
+            .query_opt(
+                r#"
+                SELECT v.vol, ms.snapshot
+                FROM volumes v
+                JOIN metadata_state ms ON ms.vol = v.vol
+                WHERE v.name = $1
+                ORDER BY v.vol DESC
+                LIMIT 1
+                "#,
+                &[&name],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("discover query failed: {e}"))?;
+        conn_task.abort();
+
+        let row = row.ok_or_else(|| {
+            anyhow::anyhow!(
+                "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
+            )
+        })?;
+        Ok::<(i64, Vec<u8>), anyhow::Error>((row.get(0), row.get(1)))
+    })?;
+
+    let mut format_info = extract_format_info_from_snapshot(&snapshot)?;
+    let pg = format_info
+        .metadata
+        .postgres
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("discovered format is not postgres-backed"))?;
+    pg.url = postgres_dsn.to_string();
+    pg.volume_id = volume_id;
 
     std::fs::create_dir_all(meta_dir)?;
     let db_path = meta_dir.join(format!("{name}.db"));
-
-    let redb = RedbMetaEngine::open(&db_path)?;
-    let metadata_prefix = format!("{name}/metadata/");
-    let data_prefix = format!("{name}/objects/");
-    // Bootstrap minimal info so Tonbo engine can locate manifest by disk name.
-    redb.set_format_info(&FormatInfo {
-        name: name.to_string(),
-        uuid: String::new(),
-        endpoint: endpoint.to_string(),
-        bucket: bucket.to_string(),
-        access_key: access_key.to_string(),
-        secret_key: secret_key.to_string(),
-        region: region.to_string(),
-        data_prefix,
-        metadata: MetadataConfig {
-            backend: MetadataBackend::Tonbo,
-            remote: Some(RemoteStoreConfig {
-                endpoint: endpoint.to_string(),
-                bucket: bucket.to_string(),
-                access_key: access_key.to_string(),
-                secret_key: secret_key.to_string(),
-                region: region.to_string(),
-                prefix: metadata_prefix.to_string(),
-            }),
-            ..MetadataConfig::default()
-        },
-        version: String::new(),
-        block_size: DEFAULT_BLOCK_SIZE,
-        chunk_size: 0,
-    })?;
-    // Root is only needed when remote manifest is not yet present.
-    redb.init_root(0, 0)?;
-    drop(redb);
-
-    let tonbo = TonboMetaEngine::open(&db_path)?;
-    let info = tonbo.get_format_info().map_err(|e| {
-        anyhow::anyhow!("failed to load remote metadata for disk '{}': {}", name, e)
-    })?;
-    if info.uuid.is_empty() {
-        return Err(anyhow::anyhow!(
-            "remote metadata manifest for disk '{}' not found under prefix '{}'",
-            name,
-            metadata_prefix
-        ));
+    if db_path.exists() {
+        anyhow::bail!(
+            "local metadata already exists at {} (remove it first or use another name)",
+            db_path.display()
+        );
     }
+
+    let engine = RedbMetaEngine::open(&db_path)?;
+    engine.set_format_info(&format_info)?;
+    let (uid, gid) = {
+        #[cfg(unix)]
+        unsafe {
+            (libc::getuid(), libc::getgid())
+        }
+        #[cfg(windows)]
+        {
+            (0, 0)
+        }
+    };
+    engine.init_root(uid, gid)?;
 
     println!("✓ Volume '{}' discovered", name);
-    println!("  UUID:      {}", info.uuid);
-    println!("  Data:      {} / {}", info.endpoint, info.bucket);
-    if let Some(remote) = &info.metadata.remote {
-        println!("  Metadata:  {} / {}", remote.endpoint, remote.bucket);
-        println!("  Prefix:    {}", remote.prefix);
-    }
-    println!("  Local DB:  {:?}", db_path);
-    println!();
+    println!("  Local metadata: {}", db_path.display());
+    println!("  Postgres volume_id: {}", volume_id);
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);
-
     Ok(())
 }
+

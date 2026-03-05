@@ -260,11 +260,6 @@ impl CompatResult {
         self.connectivity_ok && self.data_ok
     }
 
-    /// The bucket can serve as the **metadata** store (CAS / conditional writes).
-    pub fn suitable_for_metadata(&self) -> bool {
-        self.connectivity_ok && self.meta_ok
-    }
-
     /// One-line summaries of every failed test, suitable for error output.
     pub fn failure_summary(&self) -> Vec<String> {
         self.cases
@@ -570,8 +565,7 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
                         Ok(())
                     }
                     Some(_) | None => Err(anyhow!(
-                        "ETag not returned — backend does not support ETags. \
-                         The metadata engine (TonboMetaEngine) requires ETag support."
+                        "ETag not returned — backend does not support ETags."
                     )),
                 }
             },
@@ -591,7 +585,7 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
             out,
             Category::Metadata,
             "conditional PUT If-Match: <correct-etag> (CAS update)",
-            Some("core of TonboMetaEngine manifest flush"),
+            Some("conditional metadata update safety check"),
             async move {
                 let etag = {
                     let g = etag_in.lock().await;
@@ -771,7 +765,7 @@ fn print_report(cases: &[TestCase]) {
         "  Metadata (CAS)     : {}",
         verdict_str(
             meta_ok,
-            "suitable for metadata (TonboMetaEngine)",
+            "suitable for metadata",
             "NOT suitable for metadata — conditional writes broken or unsupported"
         )
     );
@@ -784,8 +778,8 @@ fn print_report(cases: &[TestCase]) {
         println!("  OVERALL VERDICT: ✗  This backend is NOT fully compatible with StudioFS.");
         if !meta_ok {
             println!();
-            println!("  IMPORTANT: The metadata engine (TonboMetaEngine) relies on conditional");
-            println!("  writes (If-Match / If-None-Match) for safe concurrent access. If your");
+            println!("  IMPORTANT: Metadata writes rely on conditional");
+            println!("  updates (If-Match / If-None-Match) for safe concurrent access. If your");
             println!("  backend does not support them, consider using a separate metadata");
             println!("  backend that does (e.g. MinIO ≥ RELEASE.2024-*, RustFS, AWS S3).");
         }

@@ -131,7 +131,7 @@ pub fn mount_and_serve(
     tracing::info!("mounting StudioFS at {mount_point}, press Ctrl+C to unmount");
 
     // Use Session::new + run() instead of fuser::mount2 so we can obtain a
-    // Notifier.  The Notifier allows the VFS NATS invalidation listener to
+    // Notifier. The notifier allows VFS metadata refresh paths to
     // proactively clear the kernel FUSE dentry/attribute cache, making remote
     // creates/deletes visible immediately without waiting for TTL expiry.
     let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;

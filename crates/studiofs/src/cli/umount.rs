@@ -12,11 +12,17 @@ pub fn run(mount_point: &str) -> Result<()> {
     if !super::utils::is_process_running(pid) {
         // Stale PID file — just clean up
         let _ = super::utils::remove_pid_file(mount_point);
-        println!("Mount for '{}' (PID {}) is no longer running. Cleaned up stale state.", mp, pid);
+        println!(
+            "Mount for '{}' (PID {}) is no longer running. Cleaned up stale state.",
+            mp, pid
+        );
         return Ok(());
     }
 
-    println!("Unmounting volume '{}' from '{}' (PID: {}) …", volume, mp, pid);
+    println!(
+        "Unmounting volume '{}' from '{}' (PID: {}) …",
+        volume, mp, pid
+    );
 
     #[cfg(windows)]
     unmount_windows(mount_point, pid)?;
@@ -59,7 +65,10 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
 
     // 1. Signal the named event for graceful shutdown
     let event_name = super::utils::shutdown_event_name(mount_point);
-    let wide: Vec<u16> = event_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = event_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
     if event.is_null() {
@@ -72,8 +81,7 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
     }
 
     // 2. Wait for the process to exit (up to 15 s)
-    let process =
-        unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+    let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
     if !process.is_null() {
         let wait_result = unsafe { WaitForSingleObject(process, 15_000) };
         if wait_result == WAIT_TIMEOUT {
@@ -147,7 +155,10 @@ mod tests {
 
         // Should succeed (prints "no longer running" and cleans up).
         let result = run(mp);
-        assert!(result.is_ok(), "umount of stale PID should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "umount of stale PID should succeed: {result:?}"
+        );
 
         // PID file should be gone.
         assert!(

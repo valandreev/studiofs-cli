@@ -13,7 +13,6 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -24,10 +23,7 @@ use studiofs_data::object::{create_object, format_object_key, read_object};
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
-use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine, RemoteStoreConfig,
-    TonboMetaEngine, types::BlockRef,
-};
+use studiofs_meta::{FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine, types::BlockRef};
 use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 
 // =============================================================================
@@ -63,15 +59,6 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig {
-            backend: MetadataBackend::Tonbo,
-            remote: Some(RemoteStoreConfig {
-                endpoint,
-                bucket,
-                access_key,
-                secret_key,
-                region: "us-east-1".into(),
-                prefix: format!("{volume_name}/metadata/"),
-            }),
             ..MetadataConfig::default()
         },
         version: String::new(),
@@ -244,121 +231,6 @@ fn wait_until_n_blocks(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-fn nats_test_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-struct EnvVarRestore {
-    key: &'static str,
-    old: Option<String>,
-}
-
-impl EnvVarRestore {
-    fn set(key: &'static str, value: &str) -> Self {
-        let old = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, old }
-    }
-}
-
-impl Drop for EnvVarRestore {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(v) = &self.old {
-                std::env::set_var(self.key, v);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
-async fn ensure_nats(url: &str) -> bool {
-    match tokio::time::timeout(Duration::from_secs(2), async_nats::connect(url)).await {
-        Ok(Ok(client)) => {
-            drop(client);
-            true
-        }
-        _ => false,
-    }
-}
-
-async fn wait_until<F>(timeout: Duration, mut cond: F) -> bool
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn block_cache_path(cache_dir: &Path, object_id: u64) -> PathBuf {
-    let shard = (object_id >> 56) as u8;
-    cache_dir
-        .join("blocks")
-        .join(format!("{:02x}", shard))
-        .join(format!("{:016x}.block", object_id))
-}
-
-struct TonboTestClient {
-    _tmp: tempfile::TempDir,
-    cache_dir: PathBuf,
-    vfs: Arc<StudioVfs>,
-}
-
-fn make_tonbo_test_client(format_info: &FormatInfo, label: &str) -> TonboTestClient {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join(format!("meta-{label}.redb"));
-
-    let seed = RedbMetaEngine::open(&db_path).expect("failed to open seed RedbMetaEngine");
-    seed.init_root(0, 0)
-        .expect("failed to initialize root inode");
-    seed.set_format_info(format_info)
-        .expect("failed to set tonbo format info");
-    drop(seed);
-
-    let meta = TonboMetaEngine::open(&db_path).expect("failed to open TonboMetaEngine");
-    let data_config = DataStoreConfig::from(format_info);
-    let cache_dir = tmp.path().join(format!("cache-{label}"));
-    let vfs = StudioVfs::new(
-        meta,
-        &data_config,
-        cache_dir.to_str().unwrap(),
-        512 * 1024 * 1024,
-        256 * 1024 * 1024,
-    )
-    .expect("failed to create tonbo StudioVfs");
-
-    TonboTestClient {
-        _tmp: tmp,
-        cache_dir,
-        vfs,
-    }
-}
-
-fn make_tuned_tonbo_format_info(volume_suffix: &str) -> FormatInfo {
-    let mut info = make_format_info(volume_suffix);
-    info.block_size = 64 * 1024;
-    info.metadata.backend = MetadataBackend::Tonbo;
-    info.metadata.cache_ttl_secs = 300;
-    info.metadata.flush_interval_secs = 600;
-    // Keep auto-flush effectively disabled in these NATS tests so each scenario
-    // publishes one explicit, complete metadata snapshot at controlled points.
-    info.metadata.flush_ops_threshold = 1_000_000;
-    info.metadata.flush_bytes_threshold = 1_000_000_000;
-    info
 }
 
 // =============================================================================
@@ -1149,372 +1021,8 @@ async fn test_attr_cache_ttl() {
 }
 
 // =============================================================================
-// NATS Invalidation Tests
+// metadata sync Invalidation Tests
 // =============================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn test_nats_delete_updates_metadata_and_clears_cached_block() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_delete_updates_metadata_and_clears_cached_block: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-delete");
-    let writer = make_tonbo_test_client(&info, "writer-delete");
-    let reader = make_tonbo_test_client(&info, "reader-delete");
-    let wait = Duration::from_secs(15);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let attr = writer
-        .vfs
-        .create(1, b"nats-delete.bin", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    let payload = vec![0xA5; info.block_size as usize];
-    writer.vfs.write(ino, 0, &payload).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let writer_blocks = wait_until_n_blocks(&writer.vfs, ino, 1, Duration::from_secs(15))
-        .expect("writer metadata did not materialize initial block");
-    assert!(
-        !writer_blocks.is_empty(),
-        "writer metadata missing initial block before publish"
-    );
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let visible = wait_until(wait, || reader.vfs.lookup(1, b"nats-delete.bin").is_ok()).await;
-    assert!(visible, "reader did not observe file creation");
-
-    let reader_ino = reader.vfs.lookup(1, b"nats-delete.bin").unwrap().ino;
-    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 1, Duration::from_secs(15))
-        .expect("reader metadata missing initial block after create invalidation");
-    assert!(
-        !reader_blocks.is_empty(),
-        "reader did not materialize initial block"
-    );
-    let got = reader
-        .vfs
-        .read(reader_ino, 0, payload.len() as u32)
-        .await
-        .unwrap();
-    assert_eq!(got, payload);
-
-    let block_id = reader.vfs.meta().get_file_blocks(reader_ino).unwrap()[0]
-        .1
-        .object_id;
-    let cached_path = block_cache_path(&reader.cache_dir, block_id);
-    assert!(
-        wait_until(wait, || cached_path.exists()).await,
-        "expected reader L2 cache to contain the block before delete"
-    );
-
-    let _ = reader.vfs.getattr(reader_ino).unwrap(); // prime attr_read_cache
-
-    writer.vfs.unlink(1, b"nats-delete.bin").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || {
-            reader.vfs.lookup(1, b"nats-delete.bin").is_err()
-        })
-        .await,
-        "reader still resolves deleted entry"
-    );
-
-    assert!(
-        wait_until(wait, || reader.vfs.getattr(reader_ino).is_err()).await,
-        "reader attr cache was not invalidated after delete"
-    );
-
-    assert!(
-        wait_until(wait, || !cached_path.exists()).await,
-        "cached deleted block was not evicted"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn test_nats_overwrite_evicts_only_changed_block_cache() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_overwrite_evicts_only_changed_block_cache: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-overwrite");
-    let writer = make_tonbo_test_client(&info, "writer-overwrite");
-    let reader = make_tonbo_test_client(&info, "reader-overwrite");
-    let wait = Duration::from_secs(15);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let bs = info.block_size as usize;
-    let block0_v1 = vec![0x11; bs];
-    let block1_static = vec![0x22; bs];
-    let mut initial = block0_v1.clone();
-    initial.extend_from_slice(&block1_static);
-
-    let attr = writer
-        .vfs
-        .create(1, b"nats-overwrite.bin", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, &initial).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let mut writer_refs_v1 = wait_until_n_blocks(&writer.vfs, ino, 2, Duration::from_secs(15))
-        .expect("writer metadata did not materialize initial two blocks");
-    writer_refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(writer_refs_v1.len(), 2);
-    let writer_old_id0 = writer_refs_v1[0].1.object_id;
-    let writer_old_id1 = writer_refs_v1[1].1.object_id;
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || {
-            reader.vfs.lookup(1, b"nats-overwrite.bin").is_ok()
-        })
-        .await,
-        "reader did not observe file creation"
-    );
-
-    let reader_ino = reader.vfs.lookup(1, b"nats-overwrite.bin").unwrap().ino;
-    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
-        .expect("reader metadata missing initial blocks after create invalidation");
-    assert_eq!(reader_blocks.len(), 2);
-    let got_v1 = reader
-        .vfs
-        .read(reader_ino, 0, (2 * bs) as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_v1, initial);
-
-    let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
-    refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(refs_v1.len(), 2);
-    let old_id0 = refs_v1[0].1.object_id;
-    let old_id1 = refs_v1[1].1.object_id;
-
-    let old_path0 = block_cache_path(&reader.cache_dir, old_id0);
-    let old_path1 = block_cache_path(&reader.cache_dir, old_id1);
-    assert!(
-        wait_until(wait, || old_path0.exists() && old_path1.exists()).await,
-        "reader cache did not materialize both initial blocks"
-    );
-
-    let block0_v2 = vec![0x33; bs];
-    writer.vfs.write(ino, 0, &block0_v2).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let writer_overwrite_ready = wait_until(wait, || {
-        let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 2
-            && refs[0].1.object_id != writer_old_id0
-            && refs[1].1.object_id == writer_old_id1
-    })
-    .await;
-    assert!(
-        writer_overwrite_ready,
-        "writer metadata did not materialize overwrite before publish"
-    );
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let refs_updated = wait_until(wait, || {
-        let mut refs = match reader.vfs.meta().get_file_blocks(reader_ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 2 && refs[0].1.object_id != old_id0 && refs[1].1.object_id == old_id1
-    })
-    .await;
-    assert!(
-        refs_updated,
-        "reader metadata did not reflect selective overwrite"
-    );
-
-    assert!(
-        wait_until(wait, || !old_path0.exists() && old_path1.exists()).await,
-        "changed block cache should be evicted while unchanged block should remain"
-    );
-
-    let mut expected = block0_v2.clone();
-    expected.extend_from_slice(&block1_static);
-    let got_v2 = reader
-        .vfs
-        .read(reader_ino, 0, (2 * bs) as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_v2, expected);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-append");
-    let writer = make_tonbo_test_client(&info, "writer-append");
-    let reader = make_tonbo_test_client(&info, "reader-append");
-    let wait = Duration::from_secs(15);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let bs = info.block_size as usize;
-    let block0 = vec![0x41; bs];
-    let block1 = vec![0x42; bs];
-    let mut initial = block0.clone();
-    initial.extend_from_slice(&block1);
-
-    let attr = writer
-        .vfs
-        .create(1, b"nats-append.bin", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, &initial).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let mut writer_refs_v1 = wait_until_n_blocks(&writer.vfs, ino, 2, Duration::from_secs(15))
-        .expect("writer metadata did not materialize initial two blocks");
-    writer_refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(writer_refs_v1.len(), 2);
-    let writer_id0 = writer_refs_v1[0].1.object_id;
-    let writer_id1 = writer_refs_v1[1].1.object_id;
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || {
-            reader.vfs.lookup(1, b"nats-append.bin").is_ok()
-        })
-        .await,
-        "reader did not observe file creation"
-    );
-
-    let reader_ino = reader.vfs.lookup(1, b"nats-append.bin").unwrap().ino;
-    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
-        .expect("reader metadata missing initial blocks after create invalidation");
-    assert_eq!(reader_blocks.len(), 2);
-    let got_v1 = reader
-        .vfs
-        .read(reader_ino, 0, (2 * bs) as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_v1, initial);
-
-    let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
-    refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(refs_v1.len(), 2);
-    let id0 = refs_v1[0].1.object_id;
-    let id1 = refs_v1[1].1.object_id;
-    let path0 = block_cache_path(&reader.cache_dir, id0);
-    let path1 = block_cache_path(&reader.cache_dir, id1);
-    assert!(
-        wait_until(wait, || path0.exists() && path1.exists()).await,
-        "reader cache did not materialize initial blocks"
-    );
-
-    let block2 = vec![0x43; bs];
-    writer
-        .vfs
-        .write(ino, (2 * bs) as u64, &block2)
-        .await
-        .unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let writer_append_ready = wait_until(wait, || {
-        let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 3 && refs[0].1.object_id == writer_id0 && refs[1].1.object_id == writer_id1
-    })
-    .await;
-    assert!(
-        writer_append_ready,
-        "writer metadata did not materialize append before publish"
-    );
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let append_visible = wait_until(wait, || {
-        let mut refs = match reader.vfs.meta().get_file_blocks(reader_ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 3 && refs[0].1.object_id == id0 && refs[1].1.object_id == id1
-    })
-    .await;
-    assert!(
-        append_visible,
-        "reader metadata did not reflect appended block"
-    );
-
-    assert!(
-        path0.exists() && path1.exists(),
-        "unchanged cached blocks should be preserved after append"
-    );
-
-    let got_new = reader
-        .vfs
-        .read(reader_ino, (2 * bs) as u64, bs as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_new, block2);
-
-    let mut refs_after = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
-    refs_after.sort_by_key(|(idx, _)| *idx);
-    let id2 = refs_after[2].1.object_id;
-    let path2 = block_cache_path(&reader.cache_dir, id2);
-    assert!(
-        wait_until(wait, || path2.exists()).await,
-        "new appended block should be fetched and cached on read"
-    );
-}
 
 // =============================================================================
 // Handle Tracking Tests
@@ -2157,480 +1665,42 @@ async fn test_statfs_after_write() {
 // =============================================================================
 
 /// Mock `KernelInvalidator` that records every invalidated inode for assertions.
-struct MockKernelInvalidator {
-    invocations: parking_lot::Mutex<Vec<u64>>,
-}
 
-impl MockKernelInvalidator {
-    fn new() -> Self {
-        Self {
-            invocations: parking_lot::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Return a sorted, deduplicated snapshot of all invalidated inodes.
-    fn drain_unique(&self) -> Vec<u64> {
-        let mut v = std::mem::take(&mut *self.invocations.lock());
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
-
-    /// Return total number of `inval_inode` calls (including duplicates).
-    fn call_count(&self) -> usize {
-        self.invocations.lock().len()
-    }
-}
-
-impl studiofs_vfs::KernelInvalidator for MockKernelInvalidator {
-    fn inval_inode(&self, ino: u64) {
-        self.invocations.lock().push(ino);
-    }
-}
-
-/// Verify that `request_eager_flush()` causes the TonboMetaEngine background
-/// flush to publish metadata to NATS within seconds (instead of waiting for
+/// Verify that `request_eager_flush()` causes the metadata engine background
+/// flush to publish metadata to metadata sync within seconds (instead of waiting for
 /// the full 600 s `flush_interval`).  Reader observes writer's `create` quickly.
 ///
 /// This exercises the end-to-end path:
 ///   writer.create() → request_eager_flush() → 250 ms tick → flush_remote_snapshot()
-///   → NATS publish → reader invalidation listener → sync_metadata() → lookup OK
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_create_visible_quickly() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_create_visible_quickly: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    // Use a very long base flush_interval (600 s) — if the file becomes visible
-    // within 10 s, it must be due to eager flush, not the normal timer.
-    let info = make_tuned_tonbo_format_info("nats-eager-create");
-    let writer = make_tonbo_test_client(&info, "writer-eager-create");
-    let reader = make_tonbo_test_client(&info, "reader-eager-create");
-    // Let the NATS subscriptions settle.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let t0 = Instant::now();
-    // create() internally calls request_eager_flush().
-    let attr = writer
-        .vfs
-        .create(1, b"eager-file.txt", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, b"eager").await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-
-    // Do NOT call writer.vfs.meta().flush_metadata() — the whole point is
-    // that eager flush triggers the background worker automatically.
-
-    // Reader should see the file within a few seconds (eager 250 ms batching
-    // window + 250 ms tick + NATS propagation + sync).
-    let visible = wait_until(Duration::from_secs(10), || {
-        reader.vfs.lookup(1, b"eager-file.txt").is_ok()
-    })
-    .await;
-    let elapsed = t0.elapsed();
-
-    assert!(
-        visible,
-        "reader did not observe writer's create within 10 s — eager flush may be broken"
-    );
-    println!(
-        "eager flush: file visible on reader after {:.2} s (expected < 10 s)",
-        elapsed.as_secs_f64()
-    );
-
-    // Sanity: data should be readable.
-    let reader_ino = reader.vfs.lookup(1, b"eager-file.txt").unwrap().ino;
-    let data = wait_until(Duration::from_secs(10), || {
-        reader.vfs.meta().get_attr(reader_ino).is_ok()
-    })
-    .await;
-    assert!(data, "reader could not resolve attr for eagerly created file");
-}
-
+///   → metadata sync publish → reader invalidation listener → sync_metadata() → lookup OK
 /// Like above but for `unlink` — verify eager flush after delete propagates
 /// quickly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_unlink_visible_quickly() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_unlink_visible_quickly: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-eager-unlink");
-    let writer = make_tonbo_test_client(&info, "writer-eager-unlink");
-    let reader = make_tonbo_test_client(&info, "reader-eager-unlink");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // First: create the file and explicitly flush so both clients see it.
-    let attr = writer
-        .vfs
-        .create(1, b"eager-del.txt", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, b"todelete").await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let visible = wait_until(Duration::from_secs(10), || {
-        reader.vfs.lookup(1, b"eager-del.txt").is_ok()
-    })
-    .await;
-    assert!(visible, "reader did not observe initial file creation");
-
-    // Now unlink — this internally calls request_eager_flush().
-    let t0 = Instant::now();
-    writer.vfs.unlink(1, b"eager-del.txt").unwrap();
-
-    // Reader should see the deletion within a few seconds.
-    let deleted = wait_until(Duration::from_secs(10), || {
-        reader.vfs.lookup(1, b"eager-del.txt").is_err()
-    })
-    .await;
-    let elapsed = t0.elapsed();
-
-    assert!(
-        deleted,
-        "reader still sees deleted file after 10 s — eager flush for unlink may be broken"
-    );
-    println!(
-        "eager flush: unlink visible on reader after {:.2} s",
-        elapsed.as_secs_f64()
-    );
-}
-
 /// Verify that `mkdir` + `rmdir` + `rename` also trigger eager flush.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_dir_ops() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_dir_ops: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-eager-dirops");
-    let writer = make_tonbo_test_client(&info, "writer-eager-dirops");
-    let reader = make_tonbo_test_client(&info, "reader-eager-dirops");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(10);
-
-    // 1. mkdir — eager flush
-    writer.vfs.mkdir(1, b"subdir", 0, 0, 0o755).unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_ok()).await,
-        "reader did not see mkdir within 10 s"
-    );
-
-    // 2. create file in subdir via rename from root
-    let subdir_ino = writer.vfs.lookup(1, b"subdir").unwrap().ino;
-    let _attr = writer
-        .vfs
-        .create(subdir_ino, b"before.txt", 0, 0, 0o644)
-        .unwrap();
-    // Wait for the remote reader to see the subdir inode first
-    let reader_subdir_ino = wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_ok()).await;
-    assert!(reader_subdir_ino, "reader did not see subdir");
-    // Now flush the create
-    writer.vfs.meta().flush_metadata().unwrap();
-    let r_sdir = reader.vfs.lookup(1, b"subdir").unwrap().ino;
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(r_sdir, b"before.txt").is_ok()).await,
-        "reader did not see file in subdir"
-    );
-
-    // 3. rename — eager flush
-    writer
-        .vfs
-        .rename(subdir_ino, b"before.txt", subdir_ino, b"after.txt")
-        .unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(r_sdir, b"after.txt").is_ok()).await,
-        "reader did not see rename within 10 s"
-    );
-
-    // 4. rmdir (need to remove files first)
-    writer.vfs.unlink(subdir_ino, b"after.txt").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(r_sdir, b"after.txt").is_err()).await,
-        "reader still sees deleted file"
-    );
-    writer.vfs.rmdir(1, b"subdir").unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_err()).await,
-        "reader did not see rmdir within 10 s"
-    );
-}
-
-/// Verify that the `KernelInvalidator` receives `inval_inode` calls when NATS
+/// Verify that the `KernelInvalidator` receives `inval_inode` calls when metadata sync
 /// invalidation events arrive on the reader.
 ///
 /// This confirms the plumbing works — the same trait is implemented by
 /// `FuseKernelInvalidator` (Linux) and `WinfspKernelInvalidator` (Windows).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_kernel_invalidator_receives_inode_events() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_kernel_invalidator_receives_inode_events: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-invalidator");
-    let writer = make_tonbo_test_client(&info, "writer-invalidator");
-    let reader = make_tonbo_test_client(&info, "reader-invalidator");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Register a mock kernel invalidator on the reader.
-    let mock_inv = Arc::new(MockKernelInvalidator::new());
-    reader.vfs.set_kernel_invalidator(mock_inv.clone());
-
-    // Pre-warm reader's attr cache for root (ino 1) so that the invalidation
-    // actually has something to clear.
-    let _ = reader.vfs.getattr(1).unwrap();
-
-    // Writer creates a file — triggers eager flush → NATS → reader invalidation.
-    let attr = writer
-        .vfs
-        .create(1, b"notify-test.txt", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, b"data").await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Wait for the reader to process the NATS invalidation event.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"notify-test.txt").is_ok()).await,
-        "reader did not observe file creation via NATS"
-    );
-
-    // The mock invalidator should have been called.  The global "all"
-    // invalidation always invalidates root (ino 1) plus any other cached inodes.
-    let invoked = wait_until(Duration::from_secs(5), || mock_inv.call_count() > 0).await;
-    assert!(
-        invoked,
-        "KernelInvalidator::inval_inode was never called on the reader"
-    );
-
-    let invalidated = mock_inv.drain_unique();
-    println!(
-        "kernel invalidator received inval_inode calls for inodes: {:?}",
-        invalidated
-    );
-    // Root inode should always be in the list (invalidate_all_read_caches
-    // explicitly invalidates ino 1).
-    assert!(
-        invalidated.contains(&1),
-        "expected root inode (1) to be invalidated, got: {:?}",
-        invalidated
-    );
-
-    // Now test a second round: create another file, verify invalidator fires again.
-    let prev_count = mock_inv.call_count();
-    let attr2 = writer
-        .vfs
-        .create(1, b"notify-test-2.txt", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.flush(attr2.ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"notify-test-2.txt").is_ok()).await,
-        "reader did not observe second file creation"
-    );
-    assert!(
-        wait_until(Duration::from_secs(5), || mock_inv.call_count() > prev_count).await,
-        "KernelInvalidator was not called again for the second event"
-    );
-    println!(
-        "kernel invalidator total calls after two events: {}",
-        mock_inv.call_count()
-    );
-}
-
 /// Verify that eager-flush batching and kernel-cache invalidation work
 /// together end-to-end.
 ///
 /// **Batching semantics:** `request_eager_flush()` uses a 250 ms collection
 /// window so that rapid sequential mutations (e.g. multi-file create/delete)
-/// are grouped into one remote flush + one NATS event.  The reader may see
-/// the S3 data *before* the NATS event arrives (via `read_with_refresh`
-/// cache-miss → direct `pull_remote_snapshot`).  When this happens the NATS
+/// are grouped into one remote flush + one metadata sync event.  The reader may see
+/// the S3 data *before* the metadata sync event arrives (via `read_with_refresh`
+/// cache-miss → direct `pull_remote_snapshot`).  When this happens the metadata sync
 /// handler's `sync_and_apply_invalidation` observes no version advancement
 /// and enters a multi-attempt retry loop.  Because the handler is sequential,
 /// back-to-back events can queue up and exceed tight timeouts.
 ///
-/// This test therefore keeps the number of NATS events minimal:
+/// This test therefore keeps the number of metadata sync events minimal:
 ///   1. Rapid creates → eager-flush visibility check (no explicit flush).
-///   2. One explicit `flush_metadata()` to produce a deterministic NATS event
+///   2. One explicit `flush_metadata()` to produce a deterministic metadata sync event
 ///      that the handler can resolve in a single attempt, triggering
 ///      `invalidate_all_read_caches()` and the `KernelInvalidator` mock.
 ///
 /// More complex mutation sequences (rename, unlink, dir-ops) are covered
 /// by the dedicated eager-flush tests above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_with_kernel_invalidation_rapid_mutations() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_with_kernel_invalidation_rapid_mutations: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-eager-rapid");
-    let writer = make_tonbo_test_client(&info, "writer-eager-rapid");
-    let reader = make_tonbo_test_client(&info, "reader-eager-rapid");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-    let mock_inv = Arc::new(MockKernelInvalidator::new());
-    reader.vfs.set_kernel_invalidator(mock_inv.clone());
-
-    // Warm reader caches so there is at least inode 1 in the attr cache.
-    let _ = reader.vfs.getattr(1).unwrap();
-    let _ = reader.vfs.readdir(1).unwrap();
-
-    // ── Phase 1: Eager-flush visibility ────────────────────────────────────
-    // Create 3 files in quick succession.  `request_eager_flush()` fires for
-    // each mutation; the background flush thread batches them and pushes to S3
-    // after the 250 ms collection window.  We verify the reader can see all
-    // three files WITHOUT an explicit `flush_metadata()`.
-    let t0 = Instant::now();
-    for i in 0..3 {
-        let name = format!("rapid-{i}.txt");
-        let attr = writer
-            .vfs
-            .create(1, name.as_bytes(), 0, 0, 0o644)
-            .unwrap();
-        writer
-            .vfs
-            .write(attr.ino, 0, format!("content-{i}").as_bytes())
-            .await
-            .unwrap();
-        writer.vfs.flush(attr.ino).await.unwrap();
-    }
-
-    // Do NOT call flush_metadata — rely on eager flush for visibility.
-
-    for i in 0..3 {
-        let name = format!("rapid-{i}.txt");
-        assert!(
-            wait_until(wait, || reader.vfs.lookup(1, name.as_bytes()).is_ok()).await,
-            "reader did not see {name} within {wait:?}"
-        );
-    }
-    let batch_elapsed = t0.elapsed();
-    println!(
-        "rapid 3-file create visible on reader after {:.2} s",
-        batch_elapsed.as_secs_f64()
-    );
-
-    // ── Phase 2: Kernel invalidator via explicit flush ─────────────────────
-    // The reader's `wait_until` polling above may have pulled the writer's
-    // snapshot directly from S3 (cache-miss path), racing ahead of the NATS
-    // invalidation event.  Every queued NATS event then enters a ~4 s retry
-    // loop because the handler sees no version advancement.
-    //
-    // To verify kernel invalidation deterministically we:
-    //  1. Wait a short while so the handler can drain any earlier events.
-    //  2. Create one more mutation + explicit `flush_metadata()` to produce a
-    //     NATS event with a guaranteed new etag.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    writer
-        .vfs
-        .create(1, b"kernel-inv-trigger.txt", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(Duration::from_secs(15), || mock_inv.call_count() > 0).await,
-        "KernelInvalidator was not called after explicit flush trigger"
-    );
-
-    let calls = mock_inv.call_count();
-    let inodes = mock_inv.drain_unique();
-    println!(
-        "test complete — kernel invalidator called {calls} time(s), inodes: {inodes:?}"
-    );
-    // Root (ino 1) must always be present because invalidate_all_read_caches()
-    // unconditionally sends it.
-    assert!(
-        inodes.contains(&1),
-        "expected root inode (1) in invalidated set, got: {inodes:?}"
-    );
-}
-
 // =============================================================================
 // Phase 9 — Deep Integration & Edge-Case Tests
 // =============================================================================
@@ -2653,8 +1723,8 @@ async fn test_truncate_to_exact_block_boundary() {
     let attr = vfs.create(1, b"trunc-bound.bin", 0, 0, 0o644).unwrap();
     vfs.write(attr.ino, 0, &payload).await.unwrap();
     vfs.flush(attr.ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, attr.ino, 3, Duration::from_secs(15))
-        .expect("Expected 3 blocks");
+    let _ =
+        wait_until_n_blocks(&vfs, attr.ino, 3, Duration::from_secs(15)).expect("Expected 3 blocks");
 
     // Truncate to exactly 1 block boundary = block_size bytes.
     vfs.setattr(attr.ino, SetattrArgs::size_only(block_size as u64))
@@ -2667,7 +1737,10 @@ async fn test_truncate_to_exact_block_boundary() {
     // When truncating to exactly block_size, the last_block_offset+1 == block_size
     // so the block ref length should equal block_size and the partial flag
     // must be set (the truncate code always sets PARTIAL_BLOCK when size > 0).
-    assert_eq!(blk.length, block_size, "block length should equal block_size");
+    assert_eq!(
+        blk.length, block_size,
+        "block length should equal block_size"
+    );
 
     // Verify read returns correct data.
     let data = vfs.read(attr.ino, 0, block_size).await.unwrap();
@@ -2735,8 +1808,8 @@ async fn test_write_at_exact_block_boundary_transition() {
     vfs.flush(attr.ino).await.unwrap();
 
     // Wait for blocks to materialise.
-    let blocks = wait_until_n_blocks(&vfs, attr.ino, 2, Duration::from_secs(15))
-        .expect("Expected 2 blocks");
+    let blocks =
+        wait_until_n_blocks(&vfs, attr.ino, 2, Duration::from_secs(15)).expect("Expected 2 blocks");
     assert_eq!(blocks.len(), 2);
 
     // Verify file size.
@@ -2744,7 +1817,10 @@ async fn test_write_at_exact_block_boundary_transition() {
     assert_eq!(a.size, (block_size + 1) as u64);
 
     // Verify data integrity.
-    let data = vfs.read(attr.ino, 0, (block_size + 1) as u32).await.unwrap();
+    let data = vfs
+        .read(attr.ino, 0, (block_size + 1) as u32)
+        .await
+        .unwrap();
     assert_eq!(&data[..block_size], &full_block[..]);
     assert_eq!(data[block_size], 0xFF);
 }
@@ -3026,7 +2102,10 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
 
     // Blocks should still exist (not yet GC'd).
     let blocks = vfs.meta().get_file_blocks(ino).unwrap();
-    assert!(!blocks.is_empty(), "blocks should survive until last handle closes");
+    assert!(
+        !blocks.is_empty(),
+        "blocks should survive until last handle closes"
+    );
     let block_id = blocks[0].1.object_id;
 
     // Release the last handle — triggers orphan cleanup.
@@ -3034,7 +2113,10 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
 
     // Now blocks should be removed and pending deletion.
     let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
-    assert!(blocks_after.is_empty(), "blocks should be removed after release_fh");
+    assert!(
+        blocks_after.is_empty(),
+        "blocks should be removed after release_fh"
+    );
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
         pending.iter().any(|(id, _)| *id == block_id),
@@ -3189,9 +2271,7 @@ async fn test_create_write_unlink_race() {
     // Create and immediately delete files in a tight loop.
     for i in 0..20 {
         let name = format!("race-{i}.txt");
-        let attr = vfs
-            .create(1, name.as_bytes(), 0, 0, 0o644)
-            .unwrap();
+        let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, b"race data").await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
         vfs.unlink(1, name.as_bytes()).unwrap();
@@ -3266,9 +2346,7 @@ async fn test_open_trunc_clears_data() {
     assert!(vfs.getattr(attr.ino).unwrap().size > 0);
 
     // Open with trunc flag.
-    let fh = vfs
-        .open_file(attr.ino, OpenFlags::WRONLY, true)
-        .unwrap();
+    let fh = vfs.open_file(attr.ino, OpenFlags::WRONLY, true).unwrap();
     assert_eq!(
         vfs.getattr(attr.ino).unwrap().size,
         0,
@@ -3277,210 +2355,18 @@ async fn test_open_trunc_clears_data() {
     vfs.release_fh(fh).await.unwrap();
 }
 
-// ─── 9.6 Multi-Client NATS Integration ─────────────────────────────────────
+// ─── 9.6 Multi-Client metadata sync Integration ─────────────────────────────────────
 
-/// Two Tonbo clients create files simultaneously, triggering CAS conflict.
+/// Two metadata clients create files simultaneously, triggering CAS conflict.
 /// Client A flushes first, then Client B flushes and must merge with A's
 /// snapshot so both files survive.  Verifies the pre-merge path where a
 /// client with no cached etag discovers a remote manifest and merges before
 /// writing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_concurrent_write_conflict_cas_merge() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_concurrent_write_conflict_cas_merge: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-cas-merge");
-    let client_a = make_tonbo_test_client(&info, "cas-a");
-    let client_b = make_tonbo_test_client(&info, "cas-b");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Both clients create different files without flushing.
-    client_a
-        .vfs
-        .create(1, b"from-a.txt", 0, 0, 0o644)
-        .unwrap();
-    client_b
-        .vfs
-        .create(1, b"from-b.txt", 0, 0, 0o644)
-        .unwrap();
-
-    // Flush client_a first so its snapshot lands on S3.
-    client_a.vfs.meta().flush_metadata().unwrap();
-
-    // client_b flushes — this should trigger CAS conflict because S3 now has
-    // client_a's snapshot. The merge logic must combine both snapshots.
-    client_b.vfs.meta().flush_metadata().unwrap();
-
-    // After the merge, client_b should have BOTH files in its local state
-    // (the merge pulled client_a's snapshot and combined it with its local delta).
-    // Give client_b a moment to settle, then sync to refresh.
-    client_b.vfs.meta().sync_metadata().unwrap();
-    assert!(
-        client_b.vfs.lookup(1, b"from-b.txt").is_ok(),
-        "client_b should see from-b.txt"
-    );
-
-    // Check if the CAS merge preserved from-a.txt on client_b.
-    assert!(
-        client_b.vfs.lookup(1, b"from-a.txt").is_ok(),
-        "CAS merge should preserve from-a.txt on client_b"
-    );
-
-    // client_a syncs to get the latest.
-    client_a.vfs.meta().sync_metadata().unwrap();
-
-    // Both files should be visible on both clients after merge.
-    assert!(
-        client_a.vfs.lookup(1, b"from-a.txt").is_ok(),
-        "client_a should see from-a.txt after sync"
-    );
-    assert!(
-        client_a.vfs.lookup(1, b"from-b.txt").is_ok(),
-        "client_a should see from-b.txt after sync"
-    );
-    assert!(
-        client_b.vfs.lookup(1, b"from-b.txt").is_ok(),
-        "client_b should see from-b.txt"
-    );
-
-    println!("CAS merge resolved — both files visible on both clients");
-}
-
-/// NATS global invalidation should evict dropped blocks from cache.
+/// metadata sync global invalidation should evict dropped blocks from cache.
 /// Client A caches file data, Client B deletes the file + publishes invalidation,
 /// verify Client A's block cache no longer contains the deleted blocks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_invalidation_evicts_dropped_blocks() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_invalidation_evicts_dropped_blocks: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-evict-blocks");
-    let writer = make_tonbo_test_client(&info, "evict-writer");
-    let reader = make_tonbo_test_client(&info, "evict-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Writer creates file with data.
-    let attr = writer
-        .vfs
-        .create(1, b"evict-me.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"block data to evict")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader sees and reads the file (caches the block).
-    let wait = Duration::from_secs(10);
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"evict-me.txt").is_ok()).await,
-        "reader should see evict-me.txt"
-    );
-    let reader_attr = reader.vfs.lookup(1, b"evict-me.txt").unwrap();
-    let _data = reader
-        .vfs
-        .read(reader_attr.ino, 0, 100)
-        .await
-        .unwrap();
-
-    // Writer deletes the file and flushes.
-    writer.vfs.unlink(1, b"evict-me.txt").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should eventually not see the file via NATS invalidation.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"evict-me.txt").is_err()).await,
-        "reader should stop seeing evict-me.txt after invalidation"
-    );
-}
-
 /// Verify kernel invalidator receives correct inodes for single-inode events
 /// (not just global invalidation).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_kernel_invalidator_global_includes_root() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_kernel_invalidator_global_includes_root: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-kinv-root");
-    let writer = make_tonbo_test_client(&info, "kinv-root-writer");
-    let reader = make_tonbo_test_client(&info, "kinv-root-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let mock_inv = Arc::new(MockKernelInvalidator::new());
-    reader.vfs.set_kernel_invalidator(mock_inv.clone());
-
-    // Warm reader caches for root + a file.
-    let _ = reader.vfs.getattr(1).unwrap();
-    let _ = reader.vfs.readdir(1).unwrap();
-
-    // Writer creates a file and flush.
-    let attr = writer
-        .vfs
-        .create(1, b"kinv-file.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"hello")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Wait for kernel invalidator to be called.
-    assert!(
-        wait_until(Duration::from_secs(15), || mock_inv.call_count() > 0).await,
-        "kernel invalidator should be called"
-    );
-
-    let inodes = mock_inv.drain_unique();
-    assert!(
-        inodes.contains(&1),
-        "root inode (1) must be invalidated in global invalidation"
-    );
-    println!("invalidated inodes: {inodes:?}");
-}
-
 // ─── 9.7 Attribute & Metadata Edge Cases ───────────────────────────────────
 
 /// Setattr mode/uid/gid/times on a directory (not just files).
@@ -3673,9 +2559,7 @@ async fn test_flock_exclusive_nonblocking_conflict() {
     let ino = attr.ino;
 
     // Owner 1 acquires exclusive.
-    vfs.flock(ino, LockKind::Exclusive, 1, false)
-        .await
-        .unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 1, false).await.unwrap();
 
     // Owner 2 tries non-blocking exclusive — should fail.
     let result = vfs.flock(ino, LockKind::Exclusive, 2, false).await;
@@ -3688,9 +2572,7 @@ async fn test_flock_exclusive_nonblocking_conflict() {
     vfs.flock(ino, LockKind::Unlock, 1, false).await.unwrap();
 
     // Now owner 2 should succeed.
-    vfs.flock(ino, LockKind::Exclusive, 2, false)
-        .await
-        .unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 2, false).await.unwrap();
     vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
 }
 
@@ -3722,337 +2604,17 @@ async fn test_flock_shared_then_exclusive_conflict() {
     vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
 
     // Now exclusive should succeed.
-    vfs.flock(ino, LockKind::Exclusive, 3, false)
-        .await
-        .unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 3, false).await.unwrap();
     vfs.flock(ino, LockKind::Unlock, 3, false).await.unwrap();
 }
 
 // ─── 9.10 Multi-Client Visibility Smoke Tests ──────────────────────────────
 
 /// Writer creates a deeply nested directory tree, reader can traverse the full path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_deep_directory_tree_visible() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_deep_directory_tree_visible: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-deep-tree");
-    let writer = make_tonbo_test_client(&info, "deep-writer");
-    let reader = make_tonbo_test_client(&info, "deep-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates: /a/b/c/d/leaf.txt
-    let a = writer.vfs.mkdir(1, b"a", 0, 0, 0o755).unwrap();
-    let b = writer.vfs.mkdir(a.ino, b"b", 0, 0, 0o755).unwrap();
-    let c = writer.vfs.mkdir(b.ino, b"c", 0, 0, 0o755).unwrap();
-    let d = writer.vfs.mkdir(c.ino, b"d", 0, 0, 0o755).unwrap();
-    let leaf = writer
-        .vfs
-        .create(d.ino, b"leaf.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(leaf.ino, 0, b"deep leaf content")
-        .await
-        .unwrap();
-    writer.vfs.flush(leaf.ino).await.unwrap();
-    // Wait for block upload to S3 so reader can fetch it.
-    let _ = wait_until_n_blocks(&writer.vfs, leaf.ino, 1, Duration::from_secs(15));
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader follows full path.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"a").is_ok()).await,
-        "reader must see /a"
-    );
-    let ra = reader.vfs.lookup(1, b"a").unwrap();
-    let rb = reader.vfs.lookup(ra.ino, b"b").unwrap();
-    let rc = reader.vfs.lookup(rb.ino, b"c").unwrap();
-    let rd = reader.vfs.lookup(rc.ino, b"d").unwrap();
-    let rleaf = reader.vfs.lookup(rd.ino, b"leaf.txt").unwrap();
-
-    // The block may still be arriving from S3 — retry reads until we see
-    // the actual content instead of zero-filled placeholder bytes.
-    let deadline = Instant::now() + wait;
-    let mut data;
-    loop {
-        data = reader.vfs.read(rleaf.ino, 0, 100).await.unwrap();
-        if !data.is_empty() && data[0] != 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for leaf.txt data on reader"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert_eq!(&data[..], b"deep leaf content");
-    println!("deep directory tree fully visible on reader");
-}
-
 /// Writer creates a large file (multi-block), reader reads and verifies integrity.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_large_file_cross_client_integrity() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_large_file_cross_client_integrity: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-large-file");
-    let writer = make_tonbo_test_client(&info, "large-writer");
-    let reader = make_tonbo_test_client(&info, "large-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let block_size = info.block_size as usize;
-    // Write ~3 blocks of patterned data.
-    let total_size = block_size * 2 + block_size / 2; // 2.5 blocks
-    let payload: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
-
-    let attr = writer
-        .vfs
-        .create(1, b"large.bin", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.write(attr.ino, 0, &payload).await.unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-
-    // Wait for blocks to be uploaded.
-    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 3, Duration::from_secs(30));
-    assert!(
-        writer.vfs.wait_for_uploads_idle(Duration::from_secs(30)).await,
-        "uploads should complete within timeout"
-    );
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let wait = Duration::from_secs(15);
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"large.bin").is_ok()).await,
-        "reader should see large.bin"
-    );
-
-    let reader_attr = reader.vfs.lookup(1, b"large.bin").unwrap();
-    assert_eq!(reader_attr.size, total_size as u64);
-
-    // Read and verify full content.
-    let data = reader
-        .vfs
-        .read(reader_attr.ino, 0, total_size as u32)
-        .await
-        .unwrap();
-    assert_eq!(data.len(), total_size);
-    assert_eq!(&data[..], &payload[..], "cross-client large file data mismatch");
-    println!(
-        "cross-client large file integrity verified ({} bytes, {} blocks)",
-        total_size,
-        (total_size + block_size - 1) / block_size
-    );
-}
-
-/// Writer does setattr (chmod, chown), reader sees updated attributes via NATS.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_setattr_propagation() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_setattr_propagation: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-setattr");
-    let writer = make_tonbo_test_client(&info, "setattr-writer");
-    let reader = make_tonbo_test_client(&info, "setattr-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates file.
-    let attr = writer
-        .vfs
-        .create(1, b"attr-test.txt", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"attr-test.txt").is_ok()).await,
-        "reader should see attr-test.txt"
-    );
-
-    // Writer changes mode.
-    let mut args = SetattrArgs::default();
-    args.mode = Some(0o755);
-    args.uid = Some(42);
-    writer.vfs.setattr(attr.ino, args).unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should eventually see updated attrs.
-    let reader_ino = reader.vfs.lookup(1, b"attr-test.txt").unwrap().ino;
-    assert!(
-        wait_until(wait, || {
-            let a = reader.vfs.getattr(reader_ino).unwrap();
-            a.mode & 0o777 == 0o755 && a.uid == 42
-        })
-        .await,
-        "reader should see updated mode/uid"
-    );
-    println!("setattr propagated via NATS");
-}
-
+/// Writer does setattr (chmod, chown), reader sees updated attributes via metadata sync.
 /// Writer creates symlink, reader resolves it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_symlink_cross_client() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_symlink_cross_client: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-symlink");
-    let writer = make_tonbo_test_client(&info, "symlink-writer");
-    let reader = make_tonbo_test_client(&info, "symlink-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates target file + symlink.
-    let _file = writer
-        .vfs
-        .create(1, b"real-file.txt", 0, 0, 0o644)
-        .unwrap();
-    let sym = writer
-        .vfs
-        .symlink(1, b"my-link", b"real-file.txt", 0, 0)
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should see the symlink and read its target.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"my-link").is_ok()).await,
-        "reader should see symlink"
-    );
-    let reader_sym = reader.vfs.lookup(1, b"my-link").unwrap();
-    let target = reader.vfs.readlink(reader_sym.ino).unwrap();
-    assert_eq!(&target[..], b"real-file.txt");
-    assert_eq!(reader_sym.ino, sym.ino);
-    println!("symlink visible on reader");
-}
-
 /// Writer creates hardlink, reader sees it and reads shared data.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_hardlink_cross_client() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_hardlink_cross_client: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-hardlink");
-    let writer = make_tonbo_test_client(&info, "hardlink-writer");
-    let reader = make_tonbo_test_client(&info, "hardlink-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    let attr = writer
-        .vfs
-        .create(1, b"hl-origin.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"shared via hardlink")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    // Wait for block upload to S3 so reader can fetch it.
-    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader sees both names.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"hl-origin.txt").is_ok()
-            && reader.vfs.lookup(1, b"hl-link.txt").is_ok())
-        .await,
-        "reader should see both hardlink names"
-    );
-
-    let r_orig = reader.vfs.lookup(1, b"hl-origin.txt").unwrap();
-    let r_link = reader.vfs.lookup(1, b"hl-link.txt").unwrap();
-    assert_eq!(r_orig.ino, r_link.ino, "both names should share the same ino");
-
-    // Read from the link — retry until we see non-zero data (S3 upload race).
-    let deadline = Instant::now() + wait;
-    let mut data;
-    loop {
-        data = reader.vfs.read(r_link.ino, 0, 100).await.unwrap();
-        if !data.is_empty() && data[0] != 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for hardlink data on reader"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert_eq!(&data[..], b"shared via hardlink");
-    println!("hardlink visible on reader, data shared");
-}
-
 // ─── 9.11 Shutdown & Drain Tests ────────────────────────────────────────────
 
 /// Shutdown after writes should drain dirty buffers and persist metadata.
@@ -4187,9 +2749,7 @@ async fn test_unlink_child_then_rmdir_parent() {
     let vfs = make_vfs(&tmp, "rmdir-after-unlink");
 
     let dir = vfs.mkdir(1, b"parent", 0, 0, 0o755).unwrap();
-    let child = vfs
-        .create(dir.ino, b"child.txt", 0, 0, 0o644)
-        .unwrap();
+    let child = vfs.create(dir.ino, b"child.txt", 0, 0, 0o644).unwrap();
     vfs.write(child.ino, 0, b"data").await.unwrap();
     vfs.flush(child.ino).await.unwrap();
 
@@ -4305,9 +2865,7 @@ async fn test_rename_directory_with_children() {
     let vfs = make_vfs(&tmp, "rename-dir-tree");
 
     let dir = vfs.mkdir(1, b"old-name", 0, 0, 0o755).unwrap();
-    let child = vfs
-        .create(dir.ino, b"child.txt", 0, 0, 0o644)
-        .unwrap();
+    let child = vfs.create(dir.ino, b"child.txt", 0, 0, 0o644).unwrap();
     vfs.write(child.ino, 0, b"child data").await.unwrap();
     vfs.flush(child.ino).await.unwrap();
 
@@ -4326,73 +2884,4 @@ async fn test_rename_directory_with_children() {
     assert_eq!(found_child.ino, child.ino);
     let data = vfs.read(child.ino, 0, 100).await.unwrap();
     assert_eq!(&data[..], b"child data");
-}
-
-// ─── 9.13 Multi-Client Rename & Delete via NATS ─────────────────────────────
-
-/// Writer renames a file, reader sees the update.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_rename_cross_client() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_rename_cross_client: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-rename");
-    let writer = make_tonbo_test_client(&info, "rename-writer");
-    let reader = make_tonbo_test_client(&info, "rename-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates a file.
-    let attr = writer
-        .vfs
-        .create(1, b"before.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"rename me")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader sees the file.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"before.txt").is_ok()).await,
-        "reader should see before.txt"
-    );
-
-    // Writer renames.
-    writer
-        .vfs
-        .rename(1, b"before.txt", 1, b"after.txt")
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should see the rename via NATS.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"after.txt").is_ok()).await,
-        "reader should see after.txt"
-    );
-
-    // Read the data through the new name.
-    let reader_attr = reader.vfs.lookup(1, b"after.txt").unwrap();
-    let data = reader.vfs.read(reader_attr.ino, 0, 100).await.unwrap();
-    assert_eq!(&data[..], b"rename me");
-    println!("NATS rename propagated successfully");
 }

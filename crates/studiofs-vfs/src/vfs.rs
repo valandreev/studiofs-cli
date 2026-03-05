@@ -22,18 +22,11 @@
 //! 4. Assemble response
 
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
-use async_nats::Client as NatsClient;
-use async_nats::jetstream;
-use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
-use async_nats::jetstream::message::AckKind;
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
 use opendal::options::WriteOptions;
-use opendal::{EntryMode, ErrorKind, Operator, services::S3};
+use opendal::{EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -191,25 +184,6 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const DEFAULT_INVALIDATION_SYNC_MAX_ATTEMPTS: u32 = 8;
-const DEFAULT_INVALIDATION_SYNC_BASE_BACKOFF_MS: u64 = 50;
-const DEFAULT_INVALIDATION_SYNC_MAX_BACKOFF_MS: u64 = 1_000;
-const DEFAULT_INVALIDATION_CONNECT_RETRY_BASE_MS: u64 = 250;
-const DEFAULT_INVALIDATION_CONNECT_RETRY_MAX_MS: u64 = 10_000;
-const DEFAULT_INVALIDATION_JS_ACK_WAIT_SECS: u64 = 30;
-const DEFAULT_INVALIDATION_JS_NAK_DELAY_MS: u64 = 500;
-const INVALIDATION_STREAM_PREFIX: &str = "STUDIOFS_INV_";
-const INVALIDATION_STREAM_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
-const INVALIDATION_STREAM_MAX_MESSAGES: i64 = 2_000_000;
-const INVALIDATION_CONSUMER_PREFIX: &str = "STUDIOFS_INV_C_";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InvalidationDeliveryMode {
-    Core,
-    Auto,
-    JetStream,
-}
-
 #[derive(Clone)]
 struct DistributedFlock {
     op: Operator,
@@ -475,16 +449,6 @@ struct JanitorLease {
     owner_id: String,
 }
 
-#[derive(Clone)]
-struct InvalidationBus {
-    nats_url: String,
-    subject_base: String,
-    sender_id: String,
-    stream_name: String,
-    consumer_name: String,
-    delivery_mode: InvalidationDeliveryMode,
-}
-
 // =============================================================================
 // StudioVfs Implementation
 // =============================================================================
@@ -547,8 +511,6 @@ pub struct StudioVfs {
     fetch_scheduler: Arc<crate::fetch::FetchScheduler>,
     /// Optional serverless distributed lock manager for bimodal consistency.
     distributed_flock: Option<DistributedFlock>,
-    /// Optional NATS invalidation bus listener config.
-    invalidation_bus: Option<InvalidationBus>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: std::sync::RwLock<Option<Arc<dyn KernelInvalidator>>>,
 }
@@ -562,552 +524,432 @@ impl StudioVfs {
         cache_size: u64,
         memory_limit: u64,
     ) -> VfsResult<Arc<Self>> {
-        Self::new_with_nats_url(meta, data_config, cache_dir, cache_size, memory_limit, None)
-    }
-
-    /// Create a new VFS instance with optional explicit NATS URL override.
-    ///
-    /// If `nats_url_override` is `Some`, that value is used and `STUDIOFS_NATS_URL`
-    /// is ignored. If it is `None`, `STUDIOFS_NATS_URL` is used when present.
-    pub fn new_with_nats_url(
-        meta: Arc<dyn MetaEngine>,
-        data_config: &DataStoreConfig,
-        cache_dir: &str,
-        cache_size: u64,
-        memory_limit: u64,
-        nats_url_override: Option<&str>,
-    ) -> VfsResult<Arc<Self>> {
-        // Get volume info
-        let format_info = meta.get_format_info()?;
-        let data_prefix = if format_info.data_prefix.trim().is_empty() {
-            format!("{}/objects/", format_info.name)
-        } else if format_info.data_prefix.ends_with('/') {
-            format_info.data_prefix.clone()
-        } else {
-            format!("{}/", format_info.data_prefix)
-        };
-        let block_size = format_info.block_size;
-        let invalidation_delivery_mode = Self::invalidation_delivery_mode();
-        let invalidation_sender_id = meta
-            .invalidation_sender_id()
-            .unwrap_or_else(|| format!("pid:{}", std::process::id()));
-        let invalidation_bus = nats_url_override
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                std::env::var("STUDIOFS_NATS_URL")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-            })
-            .map(|url| InvalidationBus {
-                nats_url: url,
-                subject_base: format!("fs.invalidate.{}", format_info.name),
-                sender_id: invalidation_sender_id.clone(),
-                stream_name: Self::invalidation_stream_name(&format_info.name),
-                consumer_name: Self::invalidation_consumer_name(&format_info.name, cache_dir),
-                delivery_mode: invalidation_delivery_mode,
-            });
-        let janitor_interval = Duration::from_secs(
-            std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_JANITOR_INTERVAL.as_secs()),
-        );
-        let janitor_skip_newer_than = Duration::from_secs(
-            std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs()),
-        );
-        let janitor_max_deletes_per_run = std::env::var("STUDIOFS_JANITOR_MAX_DELETES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_JANITOR_MAX_DELETES_PER_RUN);
-        let janitor_lease_ttl = Duration::from_secs(
-            std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
-        );
-        let read_buffer_mb = std::env::var("STUDIOFS_READ_BUFFER_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READ_BUFFER_MB);
-        let block_size_nonzero = block_size.max(1) as u128;
-        let mb_to_blocks = |mb: u64| -> u32 {
-            let bytes = (mb as u128) * 1024 * 1024;
-            let blocks = (bytes / block_size_nonzero).max(1).min(u32::MAX as u128);
-            blocks as u32
-        };
-        let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
-        let prefetch_concurrency_default = DEFAULT_PREFETCH_CONCURRENCY;
-
-        let prefetch_concurrency = std::env::var("STUDIOFS_PREFETCH_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(prefetch_concurrency_default.max(16));
-        let readahead_width = std::env::var("STUDIOFS_READAHEAD_WIDTH")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READAHEAD_WIDTH);
-        let min_readahead_prefetch_floor = DEFAULT_READAHEAD_MIN_PREFETCH.min(16);
-        let readahead_min_prefetch = std::env::var("STUDIOFS_READAHEAD_MIN_PREFETCH")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READAHEAD_MIN_PREFETCH.max(min_readahead_prefetch_floor));
-        let readahead_seq_step = std::env::var("STUDIOFS_READAHEAD_SEQ_STEP")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READAHEAD_SEQ_STEP);
-        let readahead_random_penalty = std::env::var("STUDIOFS_READAHEAD_RANDOM_PENALTY")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READAHEAD_RANDOM_PENALTY);
-        let dir_prefetch_max_batch = std::env::var("STUDIOFS_DIR_PREFETCH_MAX_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_DIR_PREFETCH_MAX_BATCH);
-        let prefetch_foreground_reserve_default =
-            (prefetch_concurrency / 2).clamp(16, (buffer_blocks_default as usize).max(16));
-        let prefetch_foreground_reserve = std::env::var("STUDIOFS_PREFETCH_FOREGROUND_RESERVE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(
-                prefetch_foreground_reserve_default.max(DEFAULT_PREFETCH_FOREGROUND_RESERVE),
-            );
-        let prefetch_max_per_cycle_default = DEFAULT_PREFETCH_MAX_PER_CYCLE;
-        let min_prefetch_cycle_floor = DEFAULT_PREFETCH_MAX_PER_CYCLE.min(32);
-        let prefetch_max_per_cycle = std::env::var("STUDIOFS_PREFETCH_MAX_PER_CYCLE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(prefetch_max_per_cycle_default.max(min_prefetch_cycle_floor));
-        let prefetch_pause_on_neterr = Duration::from_millis(
-            std::env::var("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS),
-        );
-        let lock_lease_ttl = Duration::from_secs(
-            std::env::var("STUDIOFS_LOCK_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_LOCK_LEASE_TTL.as_secs()),
-        );
-        let lock_retry_base_ms = std::env::var("STUDIOFS_LOCK_RETRY_BASE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_LOCK_RETRY_BASE_MS);
-        let lock_retry_max_ms = std::env::var("STUDIOFS_LOCK_RETRY_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v >= lock_retry_base_ms)
-            .unwrap_or(DEFAULT_LOCK_RETRY_MAX_MS.max(lock_retry_base_ms));
-
-        let janitor_lease = if format_info.metadata.backend == MetadataBackend::Tonbo {
-            if let Some(remote) = &format_info.metadata.remote {
-                let mut builder = S3::default()
-                    .endpoint(&remote.endpoint)
-                    .bucket(&remote.bucket)
-                    .access_key_id(&remote.access_key)
-                    .secret_access_key(&remote.secret_key)
-                    .disable_config_load()
-                    .disable_ec2_metadata();
-                if !remote.region.is_empty() {
-                    builder = builder.region(&remote.region);
-                } else {
-                    builder = builder.region("us-east-1");
-                }
-                let op = Operator::new(builder)
-                    .map_err(|e| {
-                        VfsError::Other(format!("failed to init janitor lease operator: {e}"))
-                    })?
-                    .finish();
-                let mut prefix = if remote.prefix.trim().is_empty() {
-                    format!("{}/metadata/", format_info.name)
-                } else {
-                    remote.prefix.clone()
-                };
-                if !prefix.ends_with('/') {
-                    prefix.push('/');
-                }
-                let now_nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                Some(JanitorLease {
-                    op,
-                    lock_path: format!("{}janitor.lock", prefix),
-                    owner_id: format!("{}:{}:{}", format_info.name, std::process::id(), now_nanos),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let distributed_flock = if format_info.metadata.backend == MetadataBackend::Tonbo {
-            if let Some(remote) = &format_info.metadata.remote {
-                let mut builder = S3::default()
-                    .endpoint(&remote.endpoint)
-                    .bucket(&remote.bucket)
-                    .access_key_id(&remote.access_key)
-                    .secret_access_key(&remote.secret_key)
-                    .disable_config_load()
-                    .disable_ec2_metadata();
-                if !remote.region.is_empty() {
-                    builder = builder.region(&remote.region);
-                } else {
-                    builder = builder.region("us-east-1");
-                }
-                let op = Operator::new(builder)
-                    .map_err(|e| VfsError::Other(format!("failed to init lock operator: {e}")))?
-                    .finish();
-                let mut prefix = if remote.prefix.trim().is_empty() {
-                    format!("{}/metadata/", format_info.name)
-                } else {
-                    remote.prefix.clone()
-                };
-                if !prefix.ends_with('/') {
-                    prefix.push('/');
-                }
-                let now_nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                Some(DistributedFlock {
-                    op,
-                    prefix: format!("{prefix}locks/"),
-                    client_id: format!("{}:{}:{}", format_info.name, std::process::id(), now_nanos),
-                    lease_ttl: lock_lease_ttl,
-                    retry_base_ms: lock_retry_base_ms,
-                    retry_max_ms: lock_retry_max_ms,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
-        let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
-        let (block_cache, upload_rx) =
-            BlockCache::open(cache_config).map_err(|e| VfsError::Io(e))?;
-        block_cache.spawn_background_tasks();
-
-        // Init ReadAhead tracker + prefetch channel
-        let readahead = Arc::new(ReadAheadTracker::new_with_tuning(
-            readahead_width,
-            readahead_min_prefetch,
-            readahead_seq_step,
-            readahead_random_penalty,
-        ));
-        let dir_prefetch = Arc::new(DirAccessTracker::new(2));
-        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
-
-        // Dirty-write memory buffer + background flusher channel.
-        let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        // Create a read-optimised DataStore with dedicated connection pool and
-        // tighter timeouts so that background uploads can never starve reads.
-        let data_read = Arc::new(
-            DataStore::with_profile(data_config, IoProfile::Read)
-                .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
-        );
-
-        // Create a write-optimised DataStore for uploads/deletes.
-        let data_write = Arc::new(
-            DataStore::with_profile(data_config, IoProfile::Write)
-                .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?,
-        );
-
-        // Build AIMD config for the fetch scheduler from env or defaults.
-        let fetch_aimd_config = {
-            let fetch_max_window_default = (buffer_blocks_default as f64).clamp(64.0, 4096.0);
-            let fetch_initial_window_default = (fetch_max_window_default / 8.0).clamp(16.0, 256.0);
-            let fetch_increase_default = if fetch_max_window_default >= 1024.0 {
-                4.0
-            } else {
-                2.0
-            };
-            let initial = std::env::var("STUDIOFS_FETCH_INITIAL_WINDOW")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(fetch_initial_window_default);
-            let min = std::env::var("STUDIOFS_FETCH_MIN_WINDOW")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(1.0);
-            let max = std::env::var("STUDIOFS_FETCH_MAX_WINDOW")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(fetch_max_window_default);
-            let increase = std::env::var("STUDIOFS_FETCH_INCREASE_STEP")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(fetch_increase_default);
-            let decrease = std::env::var("STUDIOFS_FETCH_DECREASE_FACTOR")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.85);
-            let cooldown_secs = std::env::var("STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(3);
-            crate::aimd::AimdConfig {
-                initial_window: initial,
-                min_window: min,
-                max_window: max,
-                increase_step: increase,
-                decrease_factor: decrease,
-                decrease_cooldown: Duration::from_secs(cooldown_secs),
-            }
-        };
-
-        let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
-            data_read,
-            block_cache.clone(),
-            fetch_aimd_config,
-            prefetch_foreground_reserve,
-        ));
-
-        // Build AIMD config for upload scheduling from env or defaults.
-        let upload_aimd_config = {
-            let initial = std::env::var("STUDIOFS_UPLOAD_INITIAL_WINDOW")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(16.0);
-            let min = std::env::var("STUDIOFS_UPLOAD_MIN_WINDOW")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(1.0);
-            let max = std::env::var("STUDIOFS_UPLOAD_MAX_WINDOW")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(512.0);
-            let increase = std::env::var("STUDIOFS_UPLOAD_INCREASE_STEP")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(2.0);
-            let decrease = std::env::var("STUDIOFS_UPLOAD_DECREASE_FACTOR")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.85);
-            let cooldown_secs = std::env::var("STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(3);
-            crate::aimd::AimdConfig {
-                initial_window: initial,
-                min_window: min,
-                max_window: max,
-                increase_step: increase,
-                decrease_factor: decrease,
-                decrease_cooldown: Duration::from_secs(cooldown_secs),
-            }
-        };
-        let upload_scheduler = Arc::new(crate::upload::UploadScheduler::new(
-            data_write.clone(),
-            upload_aimd_config,
-        ));
-        let upload_delay = Duration::from_millis(
-            std::env::var("STUDIOFS_UPLOAD_DELAY_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_UPLOAD_DELAY_MS),
-        );
-        let upload_requeue_base = Duration::from_millis(
-            std::env::var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_UPLOAD_REQUEUE_BASE_MS),
-        );
-        let upload_requeue_max = Duration::from_millis(
-            std::env::var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v >= upload_requeue_base.as_millis() as u64)
-                .unwrap_or(DEFAULT_UPLOAD_REQUEUE_MAX_MS.max(upload_requeue_base.as_millis() as u64)),
-        );
-        let upload_stats_interval = Duration::from_secs(
-            std::env::var("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_UPLOAD_STATS_INTERVAL_SECS),
-        );
-        let upload_cache_io_slots = std::env::var("STUDIOFS_UPLOAD_CACHE_IO_SLOTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_SLOTS);
-        let upload_cache_io_user_penalty = std::env::var("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY)
-            .min(upload_cache_io_slots as u32);
-        let upload_user_idle_grace = Duration::from_millis(
-            std::env::var("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_UPLOAD_USER_IDLE_GRACE_MS),
-        );
-        info!(
-            writeback = true,
-            upload_delay_ms = upload_delay.as_millis() as u64,
-            requeue_base_ms = upload_requeue_base.as_millis() as u64,
-            requeue_max_ms = upload_requeue_max.as_millis() as u64,
-            upload_stats_interval_secs = upload_stats_interval.as_secs(),
-            upload_cache_io_slots,
-            upload_cache_io_user_penalty,
-            upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
-            "upload pipeline v2 enabled"
-        );
-
-        let vfs = Arc::new(Self {
-            meta,
-            data_write,
-            block_cache,
-            block_size,
-            data_prefix,
-            state: Arc::new(VfsState {
-                pending_blocks: Mutex::new(std::collections::HashMap::new()),
-                dirty_attrs: Mutex::new(std::collections::HashMap::new()),
-                attr_read_cache: Mutex::new(std::collections::HashMap::new()),
-                dirty_mem: Mutex::new(std::collections::HashMap::new()),
-                dirty_bytes: AtomicUsize::new(0),
-                dirty_drained_notify: tokio::sync::Notify::new(),
-                deleted_inodes: Mutex::new(std::collections::HashSet::new()),
-                pending_evictions: Mutex::new(std::collections::HashSet::new()),
-                upload_requeues: AtomicU64::new(0),
-                upload_canceled_deleted: AtomicU64::new(0),
-                upload_canceled_stale: AtomicU64::new(0),
-                foreground_reads_inflight: AtomicUsize::new(0),
-                last_foreground_read_ms: AtomicU64::new(0),
-                slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
-                file_locks: Mutex::new(std::collections::HashMap::new()),
-                lock_notify: tokio::sync::Notify::new(),
-            }),
-            upload_scheduler,
-            upload_delay,
-            upload_requeue_base,
-            upload_requeue_max,
-            upload_stats_interval,
-            upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
-            upload_cache_io_user_penalty,
-            upload_user_idle_grace,
-            readahead: readahead.clone(),
-            dir_prefetch,
-            prefetch_tx,
-            dirty_flush_tx,
-            max_dirty_bytes: 8 * 1024 * 1024 * 1024,
-            handle_table: HandleTable::new(),
-            janitor_lease,
-            janitor_interval,
-            janitor_skip_newer_than,
-            janitor_max_deletes_per_run,
-            janitor_lease_ttl,
-            prefetch_concurrency,
-            dir_prefetch_max_batch,
-            prefetch_foreground_reserve,
-            prefetch_max_per_cycle,
-            prefetch_pause_on_neterr,
-            fetch_scheduler: fetch_scheduler.clone(),
-            distributed_flock,
-            invalidation_bus,
-            kernel_invalidator: std::sync::RwLock::new(None),
-        });
-
-        // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
-        let vfs_for_prefetch = vfs.clone();
-        let prefetch_limit = vfs.prefetch_concurrency.max(1);
-        tokio::spawn(async move {
-            let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
-            while let Some((ino, block_idx)) = prefetch_rx.recv().await {
-                let permit = prefetch_sem.clone().acquire_owned().await.unwrap();
-                let v = vfs_for_prefetch.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = v.read_block_for_prefetch(ino, block_idx).await;
-                });
-            }
-        });
-
-        // Spawn Upload Worker
-        let vfs_clone = vfs.clone();
-        tokio::spawn(async move {
-            vfs_clone.background_uploader(upload_rx).await;
-        });
-
-        // Spawn upload stats logger.
-        let vfs_clone = vfs.clone();
-        tokio::spawn(async move {
-            vfs_clone.background_upload_stats().await;
-        });
-
-        // Warm up the HTTP GET connection pool SYNCHRONOUSLY.
-        // The warmup fires real GET requests (which 404) to force TCP
-        // connections to be established.  Without this, the first burst
-        // of reads hits a cold pool and gets io_timeouts (~5s each),
-        // causing a visible stall.  3 seconds is generous for LAN.
         {
-            let fs = fetch_scheduler.clone();
-            let timeout = Duration::from_secs(3);
-            let handle = tokio::runtime::Handle::current();
-            let _ = std::thread::spawn(move || {
-                handle.block_on(async {
-                    let _ = fs.warmup(timeout).await;
-                })
-            })
-            .join();
-        }
+            // Get volume info
+            let format_info = meta.get_format_info()?;
+            let data_prefix = if format_info.data_prefix.trim().is_empty() {
+                format!("{}/objects/", format_info.name)
+            } else if format_info.data_prefix.ends_with('/') {
+                format_info.data_prefix.clone()
+            } else {
+                format!("{}/", format_info.data_prefix)
+            };
+            let block_size = format_info.block_size;
+            let janitor_interval = Duration::from_secs(
+                std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_JANITOR_INTERVAL.as_secs()),
+            );
+            let janitor_skip_newer_than = Duration::from_secs(
+                std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs()),
+            );
+            let janitor_max_deletes_per_run = std::env::var("STUDIOFS_JANITOR_MAX_DELETES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_JANITOR_MAX_DELETES_PER_RUN);
+            let janitor_lease_ttl = Duration::from_secs(
+                std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
+            );
+            let read_buffer_mb = std::env::var("STUDIOFS_READ_BUFFER_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READ_BUFFER_MB);
+            let block_size_nonzero = block_size.max(1) as u128;
+            let mb_to_blocks = |mb: u64| -> u32 {
+                let bytes = (mb as u128) * 1024 * 1024;
+                let blocks = (bytes / block_size_nonzero).max(1).min(u32::MAX as u128);
+                blocks as u32
+            };
+            let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
+            let prefetch_concurrency_default = DEFAULT_PREFETCH_CONCURRENCY;
 
-        // Spawn GC Worker
-        let vfs_clone = vfs.clone();
-        tokio::spawn(async move {
-            vfs_clone.background_gc().await;
-        });
+            let prefetch_concurrency = std::env::var("STUDIOFS_PREFETCH_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(prefetch_concurrency_default.max(16));
+            let readahead_width = std::env::var("STUDIOFS_READAHEAD_WIDTH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READAHEAD_WIDTH);
+            let min_readahead_prefetch_floor = DEFAULT_READAHEAD_MIN_PREFETCH.min(16);
+            let readahead_min_prefetch = std::env::var("STUDIOFS_READAHEAD_MIN_PREFETCH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READAHEAD_MIN_PREFETCH.max(min_readahead_prefetch_floor));
+            let readahead_seq_step = std::env::var("STUDIOFS_READAHEAD_SEQ_STEP")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READAHEAD_SEQ_STEP);
+            let readahead_random_penalty = std::env::var("STUDIOFS_READAHEAD_RANDOM_PENALTY")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READAHEAD_RANDOM_PENALTY);
+            let dir_prefetch_max_batch = std::env::var("STUDIOFS_DIR_PREFETCH_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_DIR_PREFETCH_MAX_BATCH);
+            let prefetch_foreground_reserve_default =
+                (prefetch_concurrency / 2).clamp(16, (buffer_blocks_default as usize).max(16));
+            let prefetch_foreground_reserve = std::env::var("STUDIOFS_PREFETCH_FOREGROUND_RESERVE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(
+                    prefetch_foreground_reserve_default.max(DEFAULT_PREFETCH_FOREGROUND_RESERVE),
+                );
+            let prefetch_max_per_cycle_default = DEFAULT_PREFETCH_MAX_PER_CYCLE;
+            let min_prefetch_cycle_floor = DEFAULT_PREFETCH_MAX_PER_CYCLE.min(32);
+            let prefetch_max_per_cycle = std::env::var("STUDIOFS_PREFETCH_MAX_PER_CYCLE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(prefetch_max_per_cycle_default.max(min_prefetch_cycle_floor));
+            let prefetch_pause_on_neterr = Duration::from_millis(
+                std::env::var("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS),
+            );
+            let _lock_lease_ttl = Duration::from_secs(
+                std::env::var("STUDIOFS_LOCK_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_LOCK_LEASE_TTL.as_secs()),
+            );
+            let lock_retry_base_ms = std::env::var("STUDIOFS_LOCK_RETRY_BASE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_LOCK_RETRY_BASE_MS);
+            let _lock_retry_max_ms = std::env::var("STUDIOFS_LOCK_RETRY_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v >= lock_retry_base_ms)
+                .unwrap_or(DEFAULT_LOCK_RETRY_MAX_MS.max(lock_retry_base_ms));
 
-        // Spawn Janitor Worker (automatic orphan scan/cleanup)
-        let vfs_clone = vfs.clone();
-        tokio::spawn(async move {
-            vfs_clone.background_janitor().await;
-        });
+            let janitor_lease = None;
+            let distributed_flock = None;
 
-        // Spawn Invalidation Bus Listener (optional)
-        if let Some(bus) = vfs.invalidation_bus.clone() {
+            // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
+            let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
+            let (block_cache, upload_rx) =
+                BlockCache::open(cache_config).map_err(|e| VfsError::Io(e))?;
+            block_cache.spawn_background_tasks();
+
+            // Init ReadAhead tracker + prefetch channel
+            let readahead = Arc::new(ReadAheadTracker::new_with_tuning(
+                readahead_width,
+                readahead_min_prefetch,
+                readahead_seq_step,
+                readahead_random_penalty,
+            ));
+            let dir_prefetch = Arc::new(DirAccessTracker::new(2));
+            let (prefetch_tx, mut prefetch_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
+
+            // Dirty-write memory buffer + background flusher channel.
+            let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+            // Create a read-optimised DataStore with dedicated connection pool and
+            // tighter timeouts so that background uploads can never starve reads.
+            let data_read = Arc::new(
+                DataStore::with_profile(data_config, IoProfile::Read).map_err(|e| {
+                    VfsError::Other(format!("failed to create read data store: {e}"))
+                })?,
+            );
+
+            // Create a write-optimised DataStore for uploads/deletes.
+            let data_write = Arc::new(
+                DataStore::with_profile(data_config, IoProfile::Write).map_err(|e| {
+                    VfsError::Other(format!("failed to create write data store: {e}"))
+                })?,
+            );
+
+            // Build AIMD config for the fetch scheduler from env or defaults.
+            let fetch_aimd_config = {
+                let fetch_max_window_default = (buffer_blocks_default as f64).clamp(64.0, 4096.0);
+                let fetch_initial_window_default =
+                    (fetch_max_window_default / 8.0).clamp(16.0, 256.0);
+                let fetch_increase_default = if fetch_max_window_default >= 1024.0 {
+                    4.0
+                } else {
+                    2.0
+                };
+                let initial = std::env::var("STUDIOFS_FETCH_INITIAL_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(fetch_initial_window_default);
+                let min = std::env::var("STUDIOFS_FETCH_MIN_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(1.0);
+                let max = std::env::var("STUDIOFS_FETCH_MAX_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(fetch_max_window_default);
+                let increase = std::env::var("STUDIOFS_FETCH_INCREASE_STEP")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(fetch_increase_default);
+                let decrease = std::env::var("STUDIOFS_FETCH_DECREASE_FACTOR")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.85);
+                let cooldown_secs = std::env::var("STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(3);
+                crate::aimd::AimdConfig {
+                    initial_window: initial,
+                    min_window: min,
+                    max_window: max,
+                    increase_step: increase,
+                    decrease_factor: decrease,
+                    decrease_cooldown: Duration::from_secs(cooldown_secs),
+                }
+            };
+
+            let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
+                data_read,
+                block_cache.clone(),
+                fetch_aimd_config,
+                prefetch_foreground_reserve,
+            ));
+
+            // Build AIMD config for upload scheduling from env or defaults.
+            let upload_aimd_config = {
+                let initial = std::env::var("STUDIOFS_UPLOAD_INITIAL_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(16.0);
+                let min = std::env::var("STUDIOFS_UPLOAD_MIN_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(1.0);
+                let max = std::env::var("STUDIOFS_UPLOAD_MAX_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(512.0);
+                let increase = std::env::var("STUDIOFS_UPLOAD_INCREASE_STEP")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(2.0);
+                let decrease = std::env::var("STUDIOFS_UPLOAD_DECREASE_FACTOR")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.85);
+                let cooldown_secs = std::env::var("STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(3);
+                crate::aimd::AimdConfig {
+                    initial_window: initial,
+                    min_window: min,
+                    max_window: max,
+                    increase_step: increase,
+                    decrease_factor: decrease,
+                    decrease_cooldown: Duration::from_secs(cooldown_secs),
+                }
+            };
+            let upload_scheduler = Arc::new(crate::upload::UploadScheduler::new(
+                data_write.clone(),
+                upload_aimd_config,
+            ));
+            let upload_delay = Duration::from_millis(
+                std::env::var("STUDIOFS_UPLOAD_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_UPLOAD_DELAY_MS),
+            );
+            let upload_requeue_base = Duration::from_millis(
+                std::env::var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_UPLOAD_REQUEUE_BASE_MS),
+            );
+            let upload_requeue_max = Duration::from_millis(
+                std::env::var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v >= upload_requeue_base.as_millis() as u64)
+                    .unwrap_or(
+                        DEFAULT_UPLOAD_REQUEUE_MAX_MS.max(upload_requeue_base.as_millis() as u64),
+                    ),
+            );
+            let upload_stats_interval = Duration::from_secs(
+                std::env::var("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_UPLOAD_STATS_INTERVAL_SECS),
+            );
+            let upload_cache_io_slots = std::env::var("STUDIOFS_UPLOAD_CACHE_IO_SLOTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_SLOTS);
+            let upload_cache_io_user_penalty =
+                std::env::var("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY)
+                    .min(upload_cache_io_slots as u32);
+            let upload_user_idle_grace = Duration::from_millis(
+                std::env::var("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_UPLOAD_USER_IDLE_GRACE_MS),
+            );
+            info!(
+                writeback = true,
+                upload_delay_ms = upload_delay.as_millis() as u64,
+                requeue_base_ms = upload_requeue_base.as_millis() as u64,
+                requeue_max_ms = upload_requeue_max.as_millis() as u64,
+                upload_stats_interval_secs = upload_stats_interval.as_secs(),
+                upload_cache_io_slots,
+                upload_cache_io_user_penalty,
+                upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
+                "upload pipeline v2 enabled"
+            );
+
+            let vfs = Arc::new(Self {
+                meta,
+                data_write,
+                block_cache,
+                block_size,
+                data_prefix,
+                state: Arc::new(VfsState {
+                    pending_blocks: Mutex::new(std::collections::HashMap::new()),
+                    dirty_attrs: Mutex::new(std::collections::HashMap::new()),
+                    attr_read_cache: Mutex::new(std::collections::HashMap::new()),
+                    dirty_mem: Mutex::new(std::collections::HashMap::new()),
+                    dirty_bytes: AtomicUsize::new(0),
+                    dirty_drained_notify: tokio::sync::Notify::new(),
+                    deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+                    pending_evictions: Mutex::new(std::collections::HashSet::new()),
+                    upload_requeues: AtomicU64::new(0),
+                    upload_canceled_deleted: AtomicU64::new(0),
+                    upload_canceled_stale: AtomicU64::new(0),
+                    foreground_reads_inflight: AtomicUsize::new(0),
+                    last_foreground_read_ms: AtomicU64::new(0),
+                    slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
+                    file_locks: Mutex::new(std::collections::HashMap::new()),
+                    lock_notify: tokio::sync::Notify::new(),
+                }),
+                upload_scheduler,
+                upload_delay,
+                upload_requeue_base,
+                upload_requeue_max,
+                upload_stats_interval,
+                upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
+                upload_cache_io_user_penalty,
+                upload_user_idle_grace,
+                readahead: readahead.clone(),
+                dir_prefetch,
+                prefetch_tx,
+                dirty_flush_tx,
+                max_dirty_bytes: 8 * 1024 * 1024 * 1024,
+                handle_table: HandleTable::new(),
+                janitor_lease,
+                janitor_interval,
+                janitor_skip_newer_than,
+                janitor_max_deletes_per_run,
+                janitor_lease_ttl,
+                prefetch_concurrency,
+                dir_prefetch_max_batch,
+                prefetch_foreground_reserve,
+                prefetch_max_per_cycle,
+                prefetch_pause_on_neterr,
+                fetch_scheduler: fetch_scheduler.clone(),
+                distributed_flock,
+                kernel_invalidator: std::sync::RwLock::new(None),
+            });
+
+            // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
+            let vfs_for_prefetch = vfs.clone();
+            let prefetch_limit = vfs.prefetch_concurrency.max(1);
+            tokio::spawn(async move {
+                let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
+                while let Some((ino, block_idx)) = prefetch_rx.recv().await {
+                    let permit = prefetch_sem.clone().acquire_owned().await.unwrap();
+                    let v = vfs_for_prefetch.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _ = v.read_block_for_prefetch(ino, block_idx).await;
+                    });
+                }
+            });
+
+            // Spawn Upload Worker
             let vfs_clone = vfs.clone();
             tokio::spawn(async move {
-                vfs_clone.background_invalidation_listener(bus).await;
+                vfs_clone.background_uploader(upload_rx).await;
             });
+
+            // Spawn upload stats logger.
+            let vfs_clone = vfs.clone();
+            tokio::spawn(async move {
+                vfs_clone.background_upload_stats().await;
+            });
+
+            // Warm up the HTTP GET connection pool SYNCHRONOUSLY.
+            // The warmup fires real GET requests (which 404) to force TCP
+            // connections to be established.  Without this, the first burst
+            // of reads hits a cold pool and gets io_timeouts (~5s each),
+            // causing a visible stall.  3 seconds is generous for LAN.
+            {
+                let fs = fetch_scheduler.clone();
+                let timeout = Duration::from_secs(3);
+                let handle = tokio::runtime::Handle::current();
+                let _ = std::thread::spawn(move || {
+                    handle.block_on(async {
+                        let _ = fs.warmup(timeout).await;
+                    })
+                })
+                .join();
+            }
+
+            // Spawn GC Worker
+            let vfs_clone = vfs.clone();
+            tokio::spawn(async move {
+                vfs_clone.background_gc().await;
+            });
+
+            // Spawn Janitor Worker (automatic orphan scan/cleanup)
+            let vfs_clone = vfs.clone();
+            tokio::spawn(async move {
+                vfs_clone.background_janitor().await;
+            });
+
+            // Spawn Background Slab Flusher
+            // Drains dirty_mem → slab → upload queue asynchronously after flush() returns.
+            let vfs_clone = vfs.clone();
+            tokio::spawn(async move {
+                vfs_clone.background_slab_flusher(dirty_flush_rx).await;
+            });
+
+            Ok(vfs)
         }
-
-        // Spawn Background Slab Flusher
-        // Drains dirty_mem → slab → upload queue asynchronously after flush() returns.
-        let vfs_clone = vfs.clone();
-        tokio::spawn(async move {
-            vfs_clone.background_slab_flusher(dirty_flush_rx).await;
-        });
-
-        Ok(vfs)
     }
 
     fn now_unix_secs() -> i64 {
@@ -1168,7 +1010,9 @@ impl StudioVfs {
     fn unmark_foreground_read(&self) {
         self.state
             .foreground_reads_inflight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
             .ok();
         self.state
             .last_foreground_read_ms
@@ -1186,79 +1030,6 @@ impl StudioVfs {
         }
         Self::now_unix_millis().saturating_sub(last)
             <= self.upload_user_idle_grace.as_millis() as u64
-    }
-
-    fn invalidation_delivery_mode() -> InvalidationDeliveryMode {
-        match std::env::var("STUDIOFS_NATS_DELIVERY")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("core") => InvalidationDeliveryMode::Core,
-            Some("auto") => InvalidationDeliveryMode::Auto,
-            Some("jetstream") => InvalidationDeliveryMode::JetStream,
-            _ => InvalidationDeliveryMode::Core,
-        }
-    }
-
-    fn sanitize_js_name(raw: &str, max_len: usize) -> String {
-        let mut out = String::with_capacity(raw.len().min(max_len));
-        for ch in raw.chars() {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                out.push(ch);
-            } else {
-                out.push('_');
-            }
-            if out.len() >= max_len {
-                break;
-            }
-        }
-        let trimmed = out.trim_matches('_');
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-        "x".to_string()
-    }
-
-    fn invalidation_stream_name(volume_name: &str) -> String {
-        let base = Self::sanitize_js_name(volume_name, 52);
-        let mut hasher = DefaultHasher::new();
-        volume_name.hash(&mut hasher);
-        let suffix = format!("{:016x}", hasher.finish());
-        format!("{INVALIDATION_STREAM_PREFIX}{base}_{suffix}")
-    }
-
-    fn invalidation_consumer_name(volume_name: &str, cache_dir: &str) -> String {
-        let host = std::env::var("COMPUTERNAME")
-            .ok()
-            .or_else(|| std::env::var("HOSTNAME").ok())
-            .unwrap_or_else(|| "host".to_string());
-        let base = Self::sanitize_js_name(&host, 18);
-        let mut hasher = DefaultHasher::new();
-        volume_name.hash(&mut hasher);
-        cache_dir.hash(&mut hasher);
-        let suffix = format!("{:016x}", hasher.finish());
-        format!("{INVALIDATION_CONSUMER_PREFIX}{base}_{suffix}")
-    }
-
-    fn decode_invalidation_payload(payload: &[u8]) -> (String, Option<String>) {
-        let text = std::str::from_utf8(payload).unwrap_or_default();
-        if let Some(rest) = text.strip_prefix("v1|") {
-            let mut parts = rest.splitn(2, '|');
-            let sender_id = parts.next().unwrap_or_default().to_string();
-            let version = parts.next().and_then(|v| {
-                let v = v.trim();
-                if v.is_empty() || v == "-" {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            });
-            return (sender_id, version);
-        }
-        (text.to_string(), None)
     }
 
     fn encode_lease_record(owner_id: &str, lease_until_unix: i64, fencing_token: u64) -> Vec<u8> {
@@ -1551,8 +1322,7 @@ impl StudioVfs {
     }
 
     /// Register a kernel cache invalidator (called by the platform bridge
-    /// after mount so that NATS-driven metadata refreshes can immediately
-    /// invalidate the kernel dentry/attribute cache).
+    /// after mount so metadata refreshes can invalidate kernel dentry/attribute cache).
     pub fn set_kernel_invalidator(&self, inv: Arc<dyn KernelInvalidator>) {
         *self.kernel_invalidator.write().unwrap() = Some(inv);
     }
@@ -3299,7 +3069,8 @@ impl StudioVfs {
                 requeues = self.state.upload_requeues.load(Ordering::Relaxed),
                 canceled_deleted = self.state.upload_canceled_deleted.load(Ordering::Relaxed),
                 canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
-                foreground_reads_inflight = self.state.foreground_reads_inflight.load(Ordering::Relaxed),
+                foreground_reads_inflight =
+                    self.state.foreground_reads_inflight.load(Ordering::Relaxed),
                 upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
                 "upload pipeline counters"
             );
@@ -3509,635 +3280,6 @@ impl StudioVfs {
         }
     }
 
-    fn invalidate_inode_read_caches(&self, ino: Ino) {
-        self.state.attr_read_cache.lock().remove(&ino);
-        // Block data doesn't need explicit invalidation — blocks are immutable.
-        // The metadata engine will return updated block refs on next read.
-
-        // Notify the kernel filesystem driver to drop its dentry/attribute
-        // cache for this inode so that userspace immediately sees remote
-        // changes without needing `ls -l` or waiting for TTL expiry.
-        self.notify_kernel_inval_inode(ino);
-    }
-
-    fn invalidate_all_read_caches(&self) {
-        // Collect cached inode IDs before clearing so we can notify the kernel
-        // about each one — this is bounded by the number of recently-accessed
-        // inodes, not the total metadata size.
-        let cached_inos: Vec<Ino> = self.state.attr_read_cache.lock().keys().copied().collect();
-        self.state.attr_read_cache.lock().clear();
-
-        // Notify the kernel filesystem driver to drop cached dentries/attrs
-        // for every recently-accessed inode so that userspace sees remote
-        // changes immediately.
-        if let Some(inv) = self.kernel_invalidator.read().unwrap().as_ref() {
-            // Always invalidate root — it is the most common directory listing.
-            inv.inval_inode(1);
-            for ino in &cached_inos {
-                if *ino != 1 {
-                    inv.inval_inode(*ino);
-                }
-            }
-            debug!(
-                count = cached_inos.len(),
-                "kernel cache invalidation sent for all cached inodes"
-            );
-        }
-    }
-
-    /// Notify the kernel filesystem driver to invalidate a single inode.
-    fn notify_kernel_inval_inode(&self, ino: Ino) {
-        if let Some(inv) = self.kernel_invalidator.read().unwrap().as_ref() {
-            inv.inval_inode(ino);
-        }
-    }
-
-    fn collect_referenced_object_ids(&self) -> Option<HashSet<u64>> {
-        match self.meta.get_referenced_object_ids() {
-            Ok(ids) => Some(ids),
-            Err(err) => {
-                debug!(error = %err, "invalidation: unable to read referenced object ids");
-                None
-            }
-        }
-    }
-
-    fn evict_dropped_cached_blocks(
-        &self,
-        before: &HashSet<u64>,
-        after: &HashSet<u64>,
-    ) -> (usize, usize) {
-        let mut evicted = 0usize;
-        let mut skipped_pinned = 0usize;
-        for object_id in before {
-            if after.contains(object_id) {
-                continue;
-            }
-            if self.block_cache.is_pinned(*object_id) {
-                skipped_pinned = skipped_pinned.saturating_add(1);
-                continue;
-            }
-            if !self.block_cache.contains(*object_id) {
-                continue;
-            }
-            self.block_cache.remove_sync(*object_id);
-            evicted = evicted.saturating_add(1);
-        }
-        (evicted, skipped_pinned)
-    }
-
-    fn invalidation_backoff_ms(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
-        let exp = attempt.saturating_sub(1).min(6);
-        base_ms.saturating_mul(1u64 << exp).min(max_ms)
-    }
-
-    fn is_jetstream_unavailable(error: &str) -> bool {
-        let e = error.to_ascii_lowercase();
-        e.contains("jetstream unavailable")
-            || e.contains("jetstream not enabled")
-            || e.contains("jetstream is not enabled")
-            || e.contains("no responders")
-            || e.contains("service unavailable")
-    }
-
-    async fn sync_and_apply_invalidation(
-        &self,
-        subject: &str,
-        source_id: &str,
-        expected_version: Option<&str>,
-        sync_max_attempts: u32,
-        sync_base_backoff_ms: u64,
-        sync_max_backoff_ms: u64,
-    ) -> bool {
-        let before_refs = self.collect_referenced_object_ids();
-        let before_version = self.meta.metadata_version_token();
-        let mut synced = false;
-        let mut after_refs: Option<HashSet<u64>> = None;
-        for attempt in 1..=sync_max_attempts {
-            match self.meta.sync_metadata() {
-                Ok(()) => {
-                    after_refs = self.collect_referenced_object_ids();
-                    let after_version = self.meta.metadata_version_token();
-
-                    let version_advanced = matches!(
-                        (before_version.as_ref(), after_version.as_ref()),
-                        (Some(before), Some(after)) if before != after
-                    );
-                    let refs_changed = matches!(
-                        (before_refs.as_ref(), after_refs.as_ref()),
-                        (Some(before), Some(after)) if before != after
-                    );
-                    let expected_version_observed = expected_version
-                        .and_then(|v| after_version.as_deref().map(|after| after == v))
-                        .unwrap_or(false);
-                    let can_observe_progress = (before_version.is_some()
-                        && after_version.is_some())
-                        || (before_refs.is_some() && after_refs.is_some())
-                        || (expected_version.is_some() && after_version.is_some());
-                    let progress_observed = if expected_version.is_some() {
-                        expected_version_observed || (after_version.is_none() && refs_changed)
-                    } else {
-                        version_advanced || refs_changed
-                    };
-
-                    if can_observe_progress && !progress_observed && attempt < sync_max_attempts {
-                        let backoff_ms = Self::invalidation_backoff_ms(
-                            attempt,
-                            sync_base_backoff_ms,
-                            sync_max_backoff_ms,
-                        );
-                        debug!(
-                            subject,
-                            source_id,
-                            attempt,
-                            expected_version = ?expected_version,
-                            backoff_ms,
-                            "invalidation sync observed no target metadata state yet, retrying"
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        continue;
-                    }
-
-                    if can_observe_progress && !progress_observed && attempt == sync_max_attempts {
-                        warn!(
-                            subject,
-                            source_id,
-                            attempt,
-                            expected_version = ?expected_version,
-                            before_version = ?before_version,
-                            after_version = ?after_version,
-                            "invalidation sync reached retry limit before observing target metadata state"
-                        );
-                        if expected_version.is_some() {
-                            return false;
-                        }
-                    }
-
-                    synced = true;
-                    break;
-                }
-                Err(err) => {
-                    let backoff_ms = Self::invalidation_backoff_ms(
-                        attempt,
-                        sync_base_backoff_ms,
-                        sync_max_backoff_ms,
-                    );
-                    if attempt == sync_max_attempts {
-                        warn!(
-                            subject,
-                            source_id,
-                            error = %err,
-                            attempt,
-                            "invalidation sync failed"
-                        );
-                    } else {
-                        debug!(
-                            subject,
-                            source_id,
-                            error = %err,
-                            attempt,
-                            backoff_ms,
-                            "invalidation sync retry"
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    }
-                }
-            }
-        }
-        if !synced {
-            return false;
-        }
-        if after_refs.is_none() {
-            after_refs = self.collect_referenced_object_ids();
-        }
-
-        let target = subject.rsplit('.').next().unwrap_or("all");
-        if target == "all" {
-            self.invalidate_all_read_caches();
-            if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
-                let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
-                debug!(
-                    subject,
-                    source_id,
-                    evicted,
-                    skipped_pinned,
-                    "applied global invalidation with selective block cache eviction"
-                );
-            } else {
-                debug!(subject, source_id, "applied global invalidation");
-            }
-        } else if let Ok(ino) = target.parse::<u64>() {
-            self.invalidate_inode_read_caches(ino);
-            if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
-                let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
-                debug!(
-                    subject,
-                    source_id,
-                    ino,
-                    evicted,
-                    skipped_pinned,
-                    "applied inode invalidation with selective block cache eviction"
-                );
-            } else {
-                debug!(subject, source_id, ino, "applied inode invalidation");
-            }
-        } else {
-            self.invalidate_all_read_caches();
-            if let (Some(before), Some(after)) = (before_refs.as_ref(), after_refs.as_ref()) {
-                let (evicted, skipped_pinned) = self.evict_dropped_cached_blocks(before, after);
-                debug!(
-                    subject,
-                    source_id,
-                    evicted,
-                    skipped_pinned,
-                    "applied fallback global invalidation with selective block cache eviction"
-                );
-            } else {
-                debug!(subject, source_id, "applied fallback global invalidation");
-            }
-        }
-
-        true
-    }
-
-    async fn background_invalidation_listener_core(self: Arc<Self>, bus: InvalidationBus) {
-        let subject_pattern = format!("{}.>", bus.subject_base);
-        let sync_max_attempts = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_ATTEMPTS);
-        let sync_base_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_BASE_BACKOFF_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_SYNC_BASE_BACKOFF_MS);
-        let sync_max_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_BACKOFF_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_BACKOFF_MS);
-        let connect_retry_base_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_BASE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_BASE_MS);
-        let connect_retry_max_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_MAX_MS);
-
-        let connect_backoff = |attempt: u32| -> u64 {
-            let exp = attempt.saturating_sub(1).min(6);
-            connect_retry_base_ms
-                .saturating_mul(1u64 << exp)
-                .min(connect_retry_max_ms)
-        };
-
-        let mut connect_attempt = 0u32;
-        loop {
-            let client: NatsClient = match async_nats::connect(&bus.nats_url).await {
-                Ok(c) => {
-                    connect_attempt = 0;
-                    c
-                }
-                Err(err) => {
-                    connect_attempt = connect_attempt.saturating_add(1);
-                    let backoff_ms = connect_backoff(connect_attempt);
-                    warn!(
-                        url = %bus.nats_url,
-                        error = %err,
-                        attempt = connect_attempt,
-                        backoff_ms,
-                        "invalidation bus connect failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-            };
-
-            let mut sub = match client.subscribe(subject_pattern.clone()).await {
-                Ok(s) => {
-                    connect_attempt = 0;
-                    info!(subject_pattern = %subject_pattern, "invalidation bus listener started");
-                    s
-                }
-                Err(err) => {
-                    connect_attempt = connect_attempt.saturating_add(1);
-                    let backoff_ms = connect_backoff(connect_attempt);
-                    warn!(
-                        subject_pattern = %subject_pattern,
-                        error = %err,
-                        attempt = connect_attempt,
-                        backoff_ms,
-                        "invalidation bus subscribe failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-            };
-
-            while let Some(msg) = sub.next().await {
-                let (source_id, _expected_version) =
-                    Self::decode_invalidation_payload(msg.payload.as_ref());
-                if source_id == bus.sender_id {
-                    continue;
-                }
-                let subject = msg.subject.to_string();
-                let _ = self
-                    .sync_and_apply_invalidation(
-                        &subject,
-                        &source_id,
-                        None,
-                        sync_max_attempts,
-                        sync_base_backoff_ms,
-                        sync_max_backoff_ms,
-                    )
-                    .await;
-            }
-
-            connect_attempt = connect_attempt.saturating_add(1);
-            let backoff_ms = connect_backoff(connect_attempt);
-            warn!(
-                subject_pattern = %subject_pattern,
-                attempt = connect_attempt,
-                backoff_ms,
-                "invalidation bus stream ended, reconnecting"
-            );
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        }
-    }
-
-    async fn background_invalidation_listener_jetstream(
-        self: Arc<Self>,
-        bus: InvalidationBus,
-        allow_core_fallback: bool,
-    ) {
-        let subject_pattern = format!("{}.>", bus.subject_base);
-        let subject_filter = format!("{}.all", bus.subject_base);
-        let sync_max_attempts = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_ATTEMPTS);
-        let sync_base_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_BASE_BACKOFF_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_SYNC_BASE_BACKOFF_MS);
-        let sync_max_backoff_ms = std::env::var("STUDIOFS_INVALIDATION_SYNC_MAX_BACKOFF_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_SYNC_MAX_BACKOFF_MS);
-        let connect_retry_base_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_BASE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_BASE_MS);
-        let connect_retry_max_ms = std::env::var("STUDIOFS_INVALIDATION_CONNECT_RETRY_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_CONNECT_RETRY_MAX_MS);
-        let js_ack_wait_secs = std::env::var("STUDIOFS_INVALIDATION_JS_ACK_WAIT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_JS_ACK_WAIT_SECS);
-        let js_nak_delay_ms = std::env::var("STUDIOFS_INVALIDATION_JS_NAK_DELAY_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_INVALIDATION_JS_NAK_DELAY_MS);
-
-        let mut connect_attempt = 0u32;
-        let mut js_setup_failures = 0u32;
-        loop {
-            let client = match async_nats::connect(&bus.nats_url).await {
-                Ok(client) => {
-                    connect_attempt = 0;
-                    client
-                }
-                Err(err) => {
-                    connect_attempt = connect_attempt.saturating_add(1);
-                    let backoff_ms = Self::invalidation_backoff_ms(
-                        connect_attempt,
-                        connect_retry_base_ms,
-                        connect_retry_max_ms,
-                    );
-                    warn!(
-                        url = %bus.nats_url,
-                        error = %err,
-                        attempt = connect_attempt,
-                        backoff_ms,
-                        "JetStream invalidation connect failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-            };
-
-            let js = jetstream::new(client.clone());
-            let stream = match js
-                .get_or_create_stream(jetstream::stream::Config {
-                    name: bus.stream_name.clone(),
-                    subjects: vec![subject_pattern.clone()],
-                    max_age: Duration::from_secs(INVALIDATION_STREAM_MAX_AGE_SECS as u64),
-                    max_messages: INVALIDATION_STREAM_MAX_MESSAGES,
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(stream) => stream,
-                Err(err) => {
-                    let err_text = err.to_string();
-                    js_setup_failures = js_setup_failures.saturating_add(1);
-                    if allow_core_fallback
-                        && (Self::is_jetstream_unavailable(&err_text) || js_setup_failures >= 3)
-                    {
-                        warn!(
-                            error = %err,
-                            "JetStream unavailable, falling back to core invalidation listener"
-                        );
-                        self.background_invalidation_listener_core(bus).await;
-                        return;
-                    }
-                    connect_attempt = connect_attempt.saturating_add(1);
-                    let backoff_ms = Self::invalidation_backoff_ms(
-                        connect_attempt,
-                        connect_retry_base_ms,
-                        connect_retry_max_ms,
-                    );
-                    warn!(
-                        stream = %bus.stream_name,
-                        error = %err,
-                        attempt = connect_attempt,
-                        backoff_ms,
-                        "JetStream stream setup failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-            };
-
-            let consumer = match stream
-                .get_or_create_consumer(
-                    &bus.consumer_name,
-                    jetstream::consumer::pull::Config {
-                        durable_name: Some(bus.consumer_name.clone()),
-                        ack_policy: AckPolicy::Explicit,
-                        deliver_policy: DeliverPolicy::All,
-                        ack_wait: Duration::from_secs(js_ack_wait_secs),
-                        filter_subject: subject_filter.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(consumer) => consumer,
-                Err(err) => {
-                    let err_text = err.to_string();
-                    js_setup_failures = js_setup_failures.saturating_add(1);
-                    if allow_core_fallback
-                        && (Self::is_jetstream_unavailable(&err_text) || js_setup_failures >= 3)
-                    {
-                        warn!(
-                            error = %err,
-                            "JetStream consumer unavailable, falling back to core invalidation listener"
-                        );
-                        self.background_invalidation_listener_core(bus).await;
-                        return;
-                    }
-                    connect_attempt = connect_attempt.saturating_add(1);
-                    let backoff_ms = Self::invalidation_backoff_ms(
-                        connect_attempt,
-                        connect_retry_base_ms,
-                        connect_retry_max_ms,
-                    );
-                    warn!(
-                        consumer = %bus.consumer_name,
-                        error = %err,
-                        attempt = connect_attempt,
-                        backoff_ms,
-                        "JetStream consumer setup failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-            };
-
-            let mut messages = match consumer.messages().await {
-                Ok(messages) => {
-                    js_setup_failures = 0;
-                    messages
-                }
-                Err(err) => {
-                    js_setup_failures = js_setup_failures.saturating_add(1);
-                    if allow_core_fallback && js_setup_failures >= 3 {
-                        warn!(
-                            error = %err,
-                            "JetStream consumer stream setup repeatedly failed, falling back to core invalidation listener"
-                        );
-                        self.background_invalidation_listener_core(bus).await;
-                        return;
-                    }
-                    connect_attempt = connect_attempt.saturating_add(1);
-                    let backoff_ms = Self::invalidation_backoff_ms(
-                        connect_attempt,
-                        connect_retry_base_ms,
-                        connect_retry_max_ms,
-                    );
-                    warn!(
-                        consumer = %bus.consumer_name,
-                        error = %err,
-                        attempt = connect_attempt,
-                        backoff_ms,
-                        "JetStream consumer stream setup failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-            };
-
-            info!(
-                stream = %bus.stream_name,
-                consumer = %bus.consumer_name,
-                subject_filter = %subject_filter,
-                "JetStream invalidation listener started"
-            );
-
-            while let Some(next) = messages.next().await {
-                let msg = match next {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        warn!(error = %err, "JetStream invalidation stream error, reconnecting");
-                        break;
-                    }
-                };
-
-                let subject = msg.subject.to_string();
-                let (source_id, expected_version) =
-                    Self::decode_invalidation_payload(msg.payload.as_ref());
-                if source_id == bus.sender_id {
-                    let _ = msg.ack().await;
-                    continue;
-                }
-
-                let applied = self
-                    .sync_and_apply_invalidation(
-                        &subject,
-                        &source_id,
-                        expected_version.as_deref(),
-                        sync_max_attempts,
-                        sync_base_backoff_ms,
-                        sync_max_backoff_ms,
-                    )
-                    .await;
-
-                let ack_result = if applied {
-                    msg.ack().await
-                } else {
-                    msg.ack_with(AckKind::Nak(Some(Duration::from_millis(js_nak_delay_ms))))
-                        .await
-                };
-                if let Err(err) = ack_result {
-                    warn!(subject, source_id, error = %err, "failed to ack invalidation message");
-                }
-            }
-
-            connect_attempt = connect_attempt.saturating_add(1);
-            let backoff_ms = Self::invalidation_backoff_ms(
-                connect_attempt,
-                connect_retry_base_ms,
-                connect_retry_max_ms,
-            );
-            warn!(
-                stream = %bus.stream_name,
-                consumer = %bus.consumer_name,
-                attempt = connect_attempt,
-                backoff_ms,
-                "JetStream invalidation listener ended, reconnecting"
-            );
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        }
-    }
-
-    async fn background_invalidation_listener(self: Arc<Self>, bus: InvalidationBus) {
-        match bus.delivery_mode {
-            InvalidationDeliveryMode::Core => self.background_invalidation_listener_core(bus).await,
-            InvalidationDeliveryMode::Auto => {
-                self.background_invalidation_listener_jetstream(bus, true)
-                    .await
-            }
-            InvalidationDeliveryMode::JetStream => {
-                self.background_invalidation_listener_jetstream(bus, false)
-                    .await
-            }
-        }
-    }
-
     /// Persist the cache checkpoint to disk.
     ///
     /// Called at shutdown so the LRU state survives across remounts.
@@ -4267,36 +3409,36 @@ impl StudioVfs {
                     "VFS shutdown: skipping upload drain (resume from journal on next start)"
                 );
             } else {
-            info!(pending, "VFS shutdown: waiting for uploads to drain");
-            let mut drained = self
-                .block_cache
-                .wait_for_uploads_idle(upload_drain_timeout)
-                .await;
-            if !drained {
-                let reconciled = self.reconcile_remote_completed_pending().await;
-                if reconciled > 0 {
-                    info!(
-                        reconciled,
-                        "VFS shutdown: reconciled already-uploaded blocks"
-                    );
-                    drained = self
-                        .block_cache
-                        .wait_for_uploads_idle(Duration::from_millis(500))
-                        .await;
+                info!(pending, "VFS shutdown: waiting for uploads to drain");
+                let mut drained = self
+                    .block_cache
+                    .wait_for_uploads_idle(upload_drain_timeout)
+                    .await;
+                if !drained {
+                    let reconciled = self.reconcile_remote_completed_pending().await;
+                    if reconciled > 0 {
+                        info!(
+                            reconciled,
+                            "VFS shutdown: reconciled already-uploaded blocks"
+                        );
+                        drained = self
+                            .block_cache
+                            .wait_for_uploads_idle(Duration::from_millis(500))
+                            .await;
+                    }
                 }
-            }
-            if !drained {
-                let pending_ops = self.block_cache.snapshot_pending_uploads();
-                let sample_object_ids: Vec<u64> =
-                    pending_ops.iter().take(8).map(|op| op.object_id).collect();
-                warn!(
-                    pending = self.block_cache.pending_upload_count(),
-                    pending_journal_files = pending_ops.len(),
-                    pending_object_ids_sample = ?sample_object_ids,
-                    timeout_ms = upload_drain_timeout.as_millis() as u64,
-                    "VFS shutdown: upload queue did not fully drain before timeout"
-                );
-            }
+                if !drained {
+                    let pending_ops = self.block_cache.snapshot_pending_uploads();
+                    let sample_object_ids: Vec<u64> =
+                        pending_ops.iter().take(8).map(|op| op.object_id).collect();
+                    warn!(
+                        pending = self.block_cache.pending_upload_count(),
+                        pending_journal_files = pending_ops.len(),
+                        pending_object_ids_sample = ?sample_object_ids,
+                        timeout_ms = upload_drain_timeout.as_millis() as u64,
+                        "VFS shutdown: upload queue did not fully drain before timeout"
+                    );
+                }
             }
         }
 
