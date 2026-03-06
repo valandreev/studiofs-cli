@@ -179,7 +179,9 @@ class Barrier:
         tag = f"barrier_{self.barrier_count}_{label}" if label else f"barrier_{self.barrier_count}"
         my_file = self.coord_dir / f"{tag}_{self.role}"
 
-        # Signal readiness
+        # Signal readiness.
+        # Do not use wall-clock freshness checks across machines: clock skew can
+        # cause asymmetric barrier failures.
         my_file.write_text(f"{wall_ms()}")
 
         # Wait for all peers
@@ -234,6 +236,7 @@ class TestCtx:
     sync_cmd_template: Optional[str] = None
     sync_settle_secs: float = 0.5
     probe_rounds: int = 30
+    show_progress: bool = True
 
     @property
     def is_a(self) -> bool:
@@ -242,6 +245,32 @@ class TestCtx:
     @property
     def is_b(self) -> bool:
         return self.role == "B"
+
+
+def format_duration(seconds: float) -> str:
+    """Format duration as M:SS."""
+    seconds = max(0.0, float(seconds))
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m}:{s:02d}"
+
+
+def print_progress(prefix: str, done: int, total: int, started_at: float):
+    """Render a one-line textual progress bar."""
+    total = max(1, total)
+    done = max(0, min(done, total))
+    ratio = done / total
+    width = 24
+    filled = int(ratio * width)
+    bar = "#" * filled + "-" * (width - filled)
+    elapsed = max(0.0, time.monotonic() - started_at)
+    rate = done / elapsed if elapsed > 0 else 0.0
+    eta = (total - done) / rate if rate > 0 else 0.0
+    sys.stdout.write(
+        f"\r  {prefix} [{bar}] {done}/{total} ({ratio * 100:5.1f}%) "
+        f"elapsed {format_duration(elapsed)} eta {format_duration(eta)}"
+    )
+    sys.stdout.flush()
 
 
 def run_sync_hook(ctx: TestCtx, phase: str) -> dict[str, Any]:
@@ -1195,6 +1224,9 @@ def test_conflict_contract_probe(ctx: TestCtx) -> TestResult:
 
     base = ctx.work_dir / "probe"
     base.mkdir(parents=True, exist_ok=True)
+    progress_started_at = time.monotonic()
+    if ctx.show_progress:
+        print_progress("probe rounds", 0, rounds, progress_started_at)
 
     for i in range(rounds):
         # 1) Visibility round-trip, alternating writer.
@@ -1296,6 +1328,11 @@ def test_conflict_contract_probe(ctx: TestCtx) -> TestResult:
                 pass
             ctx.barrier.wait(f"probe_del_try_done_{i}")
         ctx.barrier.wait(f"probe_del_done_{i}")
+        if ctx.show_progress:
+            print_progress("probe rounds", i + 1, rounds, progress_started_at)
+
+    if ctx.show_progress:
+        print()
 
     def vis_stats(vals: list[float]) -> dict[str, Any]:
         if not vals:
@@ -1480,15 +1517,12 @@ def run_test(func, ctx: TestCtx) -> TestResult:
         )
 
 
-def build_contract_summary(work_dir: Path) -> Optional[dict[str, Any]]:
+def build_contract_summary_from_reports(reports: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Merge A/B probe reports into one contract summary."""
-    reports = []
-    for p in sorted(work_dir.glob("results_*.json")):
-        reports.append(json.loads(p.read_text()))
     if len(reports) < 2:
         return None
 
-    by_role = {r.get("role"): r for r in reports}
+    by_role = {r.get("role"): r for r in reports if isinstance(r, dict)}
     a = by_role.get("A")
     b = by_role.get("B")
     if not a or not b:
@@ -1535,11 +1569,72 @@ def build_contract_summary(work_dir: Path) -> Optional[dict[str, Any]]:
     return summary
 
 
+def build_contract_summary(work_dir: Path) -> Optional[dict[str, Any]]:
+    """Merge A/B probe reports into one contract summary from run directory."""
+    reports: list[dict[str, Any]] = []
+    for p in sorted(work_dir.glob("results_*.json")):
+        try:
+            reports.append(json.loads(p.read_text()))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return build_contract_summary_from_reports(reports)
+
+
+def wait_for_nonempty_text(path: Path, timeout: float = 10.0) -> str:
+    """
+    Wait until file exists and contains non-empty text.
+    Returns empty string on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            content = path.read_text().strip()
+        except OSError:
+            content = ""
+        if content:
+            return content
+        time.sleep(0.05)
+    return ""
+
+
+def read_json_with_retry(path: Path, timeout: float = 30.0) -> dict[str, Any]:
+    """
+    Read JSON file with retries to handle transient empty/partial visibility on
+    network filesystems. Raises TimeoutError on failure.
+    """
+    deadline = time.monotonic() + timeout
+    last_error: Optional[Exception] = None
+    while time.monotonic() < deadline:
+        try:
+            raw = path.read_text()
+            if not raw.strip():
+                raise ValueError("empty file")
+            return json.loads(raw)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            time.sleep(0.1)
+    raise TimeoutError(f"Timed out reading valid JSON from {path}: {last_error}")
+
+
+def prune_stale_coord_files(coord_dir: Path, older_than_secs: float = 3600.0):
+    """Remove old coordination artifacts from previous runs."""
+    now = time.time()
+    patterns = ["barrier_*", "peer_*", "run_id_current"]
+    for pattern in patterns:
+        for p in coord_dir.glob(pattern):
+            try:
+                age = now - p.stat().st_mtime
+            except OSError:
+                continue
+            if age > older_than_secs:
+                safe_remove(p)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="studiofs-fstest: Multi-client filesystem behavior test suite"
     )
-    parser.add_argument("mount", help="Path to shared filesystem mount point")
+    parser.add_argument("mount", nargs="?", help="Path to shared filesystem mount point")
     parser.add_argument("--role", required=True, choices=list("ABCDEF"),
                         help="This client's role identifier (A, B, C, ...)")
     parser.add_argument("--peers", type=int, default=2,
@@ -1548,21 +1643,61 @@ def main():
                         help="Filesystem name for report (e.g. LucidLink, StudioFS, SMB)")
     parser.add_argument("--rounds", type=int, default=30,
                         help="Probe rounds per metric scenario (default: 30)")
+    parser.add_argument("--run-id", default=None,
+                        help="Explicit shared run id for all peers (recommended for multi-PC runs)")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable per-round probe progress bar")
+    parser.add_argument("--combine-results", nargs="+",
+                        help="Offline merge mode: paths to results_*.json from different machines")
+    parser.add_argument("--output", default=None,
+                        help="Output path for --combine-results (default: contract_summary.json next to first input)")
 
     args = parser.parse_args()
+
+    if args.combine_results:
+        reports: list[dict[str, Any]] = []
+        bad_inputs: list[str] = []
+        for p_raw in args.combine_results:
+            p = Path(p_raw)
+            try:
+                reports.append(json.loads(p.read_text()))
+            except (OSError, json.JSONDecodeError):
+                bad_inputs.append(str(p))
+        if bad_inputs:
+            print(f"ERROR: Failed to read/parse inputs: {bad_inputs}", file=sys.stderr)
+            sys.exit(2)
+        summary = build_contract_summary_from_reports(reports)
+        if summary is None:
+            print("ERROR: Need at least one valid A report and one valid B report", file=sys.stderr)
+            sys.exit(2)
+        default_out = Path(args.combine_results[0]).resolve().parent / "contract_summary.json"
+        out_path = Path(args.output) if args.output else default_out
+        out_path.write_text(json.dumps(summary, indent=2, default=str))
+        print(f"Combined contract saved to: {out_path}")
+        sys.exit(0)
+
+    if not args.mount:
+        print("ERROR: mount is required unless --combine-results is used", file=sys.stderr)
+        sys.exit(2)
     mount = Path(args.mount)
 
     if not mount.is_dir():
         print(f"ERROR: Mount point does not exist: {mount}", file=sys.stderr)
         sys.exit(1)
 
-    # Setup coordination and work directories
-    coord_dir = mount / COORD_DIR
-    coord_dir.mkdir(exist_ok=True)
-
-    run_id = f"run_{int(time.time())}"
+    run_id = args.run_id.strip() if args.run_id else f"run_{int(time.time())}"
     work_dir = mount / COORD_DIR / run_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Use run-scoped coordination dir when run_id is explicitly shared.
+    # This avoids barrier collisions across separate runs.
+    if args.run_id:
+        coord_dir = work_dir / "coord"
+    else:
+        coord_dir = mount / COORD_DIR
+    coord_dir.mkdir(parents=True, exist_ok=True)
+    # Prevent stale coordination files from previous runs from affecting
+    # startup barriers.
+    prune_stale_coord_files(coord_dir, older_than_secs=3600.0)
 
     barrier = Barrier(coord_dir, args.role, args.peers)
     ctx = TestCtx(
@@ -1574,6 +1709,7 @@ def main():
         work_dir=work_dir,
         consistency_model="probe",
         probe_rounds=max(1, args.rounds),
+        show_progress=not args.no_progress,
     )
 
     print(f"═══ studiofs-fstest ═══")
@@ -1599,19 +1735,22 @@ def main():
     barrier.wait("startup")
     print(f"All {args.peers} peers connected!\n")
 
-    # Agree on run_id (use A's)
-    run_id_file = coord_dir / f"run_id_current"
-    if ctx.is_a:
-        run_id_file.write_text(run_id)
-    barrier.wait("run_id_agreed")
-    actual_run_id = run_id_file.read_text().strip()
-    if actual_run_id != run_id:
-        # Use A's run_id
-        work_dir = mount / COORD_DIR / actual_run_id
-        work_dir.mkdir(parents=True, exist_ok=True)
-        ctx.work_dir = work_dir
-        run_id = actual_run_id
-        print(f"  Using run_id from A: {run_id}\n")
+    # Agree on run_id (use A's) only in implicit run-id mode.
+    if not args.run_id:
+        run_id_file = coord_dir / f"run_id_current"
+        if ctx.is_a:
+            run_id_file.write_text(run_id)
+        barrier.wait("run_id_agreed")
+        actual_run_id = wait_for_nonempty_text(run_id_file, timeout=10.0)
+        if not actual_run_id:
+            raise RuntimeError("Failed to read non-empty run_id_current from coordination directory")
+        if actual_run_id != run_id:
+            # Use A's run_id
+            work_dir = mount / COORD_DIR / actual_run_id
+            work_dir.mkdir(parents=True, exist_ok=True)
+            ctx.work_dir = work_dir
+            run_id = actual_run_id
+            print(f"  Using run_id from A: {run_id}\n")
 
     results: list[TestResult] = []
 
@@ -1656,7 +1795,11 @@ def main():
         time.sleep(1)
         print("\n── Combined Report ──")
         for r in sorted(work_dir.glob("results_*.json")):
-            peer_report = json.loads(r.read_text())
+            try:
+                peer_report = read_json_with_retry(r, timeout=30.0)
+            except TimeoutError as e:
+                print(f"  skip {r.name}: {e}")
+                continue
             role = peer_report["role"]
             s = peer_report["summary"]
             print(f"  {role}: {s['passed']}/{s['total']} passed ({peer_report['platform']})")

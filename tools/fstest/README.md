@@ -6,13 +6,18 @@ One purpose: extract conflict/convergence metrics from a shared mount using 2 ma
 
 ```bash
 # Machine A
-python fstest.py <mount_path_A> --role A --peers 2 --fs-name LucidLink --rounds 30
+python fstest.py <mount_path_A> --role A --peers 2 --fs-name LucidLink --rounds 30 --run-id ll-smoke-001
 
 # Machine B
-python fstest.py <mount_path_B> --role B --peers 2 --fs-name LucidLink --rounds 30
+python fstest.py <mount_path_B> --role B --peers 2 --fs-name LucidLink --rounds 30 --run-id ll-smoke-001
 ```
 
 Run both commands at the same time.
+
+Optional flags:
+
+- `--no-progress` to disable per-round progress bar output.
+- `--run-id <id>` to force both peers into one run namespace (recommended on multi-PC runs).
 
 ## What metrics it extracts
 
@@ -35,3 +40,14 @@ Combined contract (written by role `A`):
 - `<mount>/.fstest/<run_id>/contract_summary.json`
 
 Use `contract_summary.json` as the reference contract for StudioFS behavior matching.
+
+## Offline merge (when A/B reports were produced separately)
+
+If cross-machine auto-merge did not happen, combine reports manually:
+
+```bash
+python fstest.py --role A --combine-results \
+  E:/dev/studiofs-cli/tools/fstest/results-new/results_A.json \
+  E:/dev/studiofs-cli/tools/fstest/results-new/results_B.json \
+  --output E:/dev/studiofs-cli/tools/fstest/results-new/contract_summary.json
+```
