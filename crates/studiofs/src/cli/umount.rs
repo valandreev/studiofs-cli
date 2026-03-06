@@ -5,13 +5,22 @@ use anyhow::Result;
 #[cfg(unix)]
 use anyhow::anyhow;
 
-pub fn run(mount_point: &str) -> Result<()> {
-    let (pid, mp, volume) = super::utils::read_pid_file(mount_point)?;
+type ReadPidFn = fn(&str) -> Result<(u32, String, String)>;
+type RemovePidFn = fn(&str) -> Result<()>;
+type IsRunningFn = fn(u32) -> bool;
+
+fn run_with(
+    mount_point: &str,
+    read_pid_file: ReadPidFn,
+    remove_pid_file: RemovePidFn,
+    is_process_running: IsRunningFn,
+) -> Result<()> {
+    let (pid, mp, volume) = read_pid_file(mount_point)?;
 
     // Check the process is actually alive
-    if !super::utils::is_process_running(pid) {
+    if !is_process_running(pid) {
         // Stale PID file — just clean up
-        let _ = super::utils::remove_pid_file(mount_point);
+        let _ = remove_pid_file(mount_point);
         println!(
             "Mount for '{}' (PID {}) is no longer running. Cleaned up stale state.",
             mp, pid
@@ -31,10 +40,19 @@ pub fn run(mount_point: &str) -> Result<()> {
     unmount_unix(pid)?;
 
     // Clean up PID file
-    let _ = super::utils::remove_pid_file(mount_point);
+    let _ = remove_pid_file(mount_point);
 
     println!("✓ Successfully unmounted '{}'", mount_point);
     Ok(())
+}
+
+pub fn run(mount_point: &str) -> Result<()> {
+    run_with(
+        mount_point,
+        super::utils::read_pid_file,
+        super::utils::remove_pid_file,
+        super::utils::is_process_running,
+    )
 }
 
 // ─── Windows ─────────────────────────────────────────────────────────────────
@@ -132,6 +150,39 @@ fn unmount_unix(pid: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct TestPidState {
+        value: Option<(u32, String, String)>,
+        removed: bool,
+    }
+
+    static TEST_PID_STATE: OnceLock<Mutex<TestPidState>> = OnceLock::new();
+
+    fn pid_state() -> &'static Mutex<TestPidState> {
+        TEST_PID_STATE.get_or_init(|| Mutex::new(TestPidState::default()))
+    }
+
+    fn test_read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
+        let state = pid_state().lock().unwrap();
+        state
+            .value
+            .clone()
+            .ok_or_else(|| anyhow!("No mount found for '{mount_point}'. Is it mounted?"))
+    }
+
+    fn test_remove_pid_file(_mount_point: &str) -> Result<()> {
+        let mut state = pid_state().lock().unwrap();
+        state.value = None;
+        state.removed = true;
+        Ok(())
+    }
+
+    fn test_process_not_running(_pid: u32) -> bool {
+        false
+    }
 
     /// `umount` on a mount point with no PID file should return an error.
     #[test]
@@ -149,21 +200,27 @@ mod tests {
     /// If a PID file exists but the process is dead, `umount` should clean it up.
     #[test]
     fn umount_stale_pid_file_cleanup() {
-        // Write a PID file for a PID that is almost certainly dead.
         let mp = "__test_stale_umount__";
-        let _ = super::super::utils::write_pid_file(mp, "fakevol", 0xFFFF_FFFE);
+        {
+            let mut state = pid_state().lock().unwrap();
+            state.value = Some((0xFFFF_FFFE, mp.to_string(), "fakevol".to_string()));
+            state.removed = false;
+        }
 
         // Should succeed (prints "no longer running" and cleans up).
-        let result = run(mp);
+        let result = run_with(
+            mp,
+            test_read_pid_file,
+            test_remove_pid_file,
+            test_process_not_running,
+        );
         assert!(
             result.is_ok(),
             "umount of stale PID should succeed: {result:?}"
         );
 
-        // PID file should be gone.
-        assert!(
-            super::super::utils::read_pid_file(mp).is_err(),
-            "PID file should have been removed"
-        );
+        let state = pid_state().lock().unwrap();
+        assert!(state.removed, "PID file should have been removed");
+        assert!(state.value.is_none(), "PID state should be cleared");
     }
 }

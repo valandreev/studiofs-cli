@@ -152,13 +152,13 @@ Checkpoint format: magic `STFSCM` (6 bytes), version `u16`, then entries of 18 b
 The VFS `drain_dirty_mem()` function drives blocks through the cache:
 
 ```
-dirty_mem pool (up to 8 GiB)
+dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   │
-  ├─ Take batch of up to 256 blocks
+  ├─ Take batch of up to 1024 blocks
   ├─ stage_l1() for each block          ← immediate L1 insert
-  ├─ Batch metadata commit (redb txn)   ← single transaction
+  ├─ Batch metadata commit (local staged refs only)
   ├─ commit_l2_batch() in parallel      ← parallel NVMe writes
-  └─ submit_upload() for each           ← journal + S3 queue
+  └─ submit_upload(..., content_epoch)  ← journal + S3 queue
 ```
 
 The background flusher runs every 10ms and drains continuously (keeps processing while data exists).
@@ -183,4 +183,5 @@ On startup:
 2. Scan L2 directory to rebuild actual block inventory
 3. Reconcile: remove LRU entries for missing L2 files, add L2 entries not in checkpoint
 4. Scan upload journal (`upload/*.pending`) and re-queue pending uploads
-5. Resume normal operation
+5. Recovered upload ops keep their persisted `content_epoch`
+6. Resume normal operation

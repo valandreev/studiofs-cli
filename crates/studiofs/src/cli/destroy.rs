@@ -73,6 +73,27 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
         })?;
         println!("✓ S3 data deleted.");
 
+        if let Some(pg) = &format_info.metadata.postgres {
+            println!("Deleting PostgreSQL metadata...");
+            rt.block_on(async {
+                let (client, connection) = tokio_postgres::connect(&pg.url, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+
+                client
+                    .execute("DELETE FROM volumes WHERE vol = $1", &[&pg.volume_id])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to delete postgres metadata: {e}"))?;
+
+                conn_task.abort();
+                Ok::<(), anyhow::Error>(())
+            })?;
+            println!("✓ PostgreSQL metadata deleted.");
+        }
+
         if let Some(remote) = &format_info.metadata.remote {
             let mut builder = opendal::services::S3::default()
                 .endpoint(&remote.endpoint)

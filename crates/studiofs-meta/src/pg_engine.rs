@@ -12,10 +12,10 @@ static NEXT_PG_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 /// PostgreSQL-backed metadata engine.
 ///
 /// Current implementation strategy:
-/// - Redb remains the local serving store (hot reads)
-/// - every mutating op is applied to redb first, then write-through to PG
-/// - PG stores the authoritative serialized snapshot per volume
-/// - background catch-up thread periodically pulls newer PG snapshot versions
+/// - local `redb` remains the foreground serving store
+/// - PostgreSQL `event_log` is the runtime delta stream
+/// - PostgreSQL `metadata_state` stores bootstrap/checkpoint snapshots
+/// - foreign batches are pulled in `batch_version` order
 pub struct PgMetaEngine {
     local: Arc<RedbMetaEngine>,
     postgres_url: String,
@@ -25,9 +25,11 @@ pub struct PgMetaEngine {
     op_lock: Mutex<()>,
     poll_interval: Duration,
     flush_interval: Duration,
+    flush_idle_grace: Duration,
     flush_ops_threshold: u32,
     pending_ops: std::sync::atomic::AtomicU32,
     pending_started_at: Mutex<Option<Instant>>,
+    last_mutation_at: Mutex<Option<Instant>>,
     force_flush: std::sync::atomic::AtomicBool,
     pending_event_start: Mutex<Option<u64>>,
     pending_event_end: AtomicU64,
@@ -80,6 +82,13 @@ impl PgMetaEngine {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(2);
+        let flush_idle_grace = Duration::from_millis(
+            std::env::var("STUDIOFS_PG_FLUSH_IDLE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(2_000),
+        );
         let flush_interval = Duration::from_secs(info.metadata.flush_interval_secs.max(1));
         let flush_ops_threshold = info.metadata.flush_ops_threshold.max(1);
 
@@ -93,15 +102,19 @@ impl PgMetaEngine {
             op_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(poll_secs),
             flush_interval,
+            flush_idle_grace,
             flush_ops_threshold,
             pending_ops: std::sync::atomic::AtomicU32::new(0),
             pending_started_at: Mutex::new(None),
+            last_mutation_at: Mutex::new(None),
             force_flush: std::sync::atomic::AtomicBool::new(false),
             pending_event_start: Mutex::new(None),
             pending_event_end: AtomicU64::new(0),
         });
 
-        // Initial catch-up from PG and start periodic background catch-up.
+        // Bootstrap from the last checkpoint if present, then catch up from
+        // append-only event deltas.
+        let _ = engine.pull_snapshot_locked();
         let _ = engine.sync_metadata();
         let _ = engine.prime_local_id_ranges(client_slot);
         Self::start_background_poll(Arc::downgrade(&engine), engine.poll_interval);
@@ -147,11 +160,6 @@ impl PgMetaEngine {
         rt.block_on(fut)
     }
 
-    fn encode_snapshot(snapshot: &RedbSnapshot) -> MetaResult<Vec<u8>> {
-        serde_json::to_vec(snapshot)
-            .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))
-    }
-
     fn decode_snapshot(bytes: &[u8]) -> MetaResult<RedbSnapshot> {
         serde_json::from_slice(bytes)
             .map_err(|e| MetaError::Serialization(format!("snapshot decode failed: {e}")))
@@ -162,141 +170,74 @@ impl PgMetaEngine {
             .map_err(|e| MetaError::Serialization(format!("postcard encode failed: {e}")))
     }
 
-    fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8 + name.len());
-        key.extend_from_slice(&parent.to_le_bytes());
-        key.extend_from_slice(name);
-        key
-    }
-
-    fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
-        let mut buf = [0u8; 12];
-        buf[..8].copy_from_slice(&ino.to_le_bytes());
-        buf[8..12].copy_from_slice(&block_index.to_le_bytes());
-        buf
-    }
-
-    fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8 + name.len());
-        key.extend_from_slice(&ino.to_le_bytes());
-        key.extend_from_slice(name);
-        key
-    }
-
-    fn merge_snapshot_with_events(
-        mut remote: RedbSnapshot,
-        local: &RedbSnapshot,
-        events: &[MetaEvent],
-    ) -> MetaResult<RedbSnapshot> {
-        let mut inodes: std::collections::HashMap<u64, Vec<u8>> = remote.inodes.drain(..).collect();
-        let mut dentries: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            remote.dentries.drain(..).collect();
-        let mut file_blocks: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            remote.file_blocks.drain(..).collect();
-        let mut pending_deletions: std::collections::HashMap<u64, i64> =
-            remote.pending_deletions.drain(..).collect();
-        let mut symlinks: std::collections::HashMap<u64, Vec<u8>> =
-            remote.symlinks.drain(..).collect();
-        let mut xattrs: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            remote.xattrs.drain(..).collect();
-
-        for ev in events {
-            match ev {
-                MetaEvent::SetAttr { attr } => {
-                    inodes.insert(attr.ino, Self::encode_postcard(attr)?);
+    fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                MetaEvent::SetFileBlock { .. } | MetaEvent::SetFileBlocksBatch { .. } => {}
+                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                    let mut remote_attr = attr.clone();
+                    remote_attr.size = remote_attr.committed_size;
+                    out.push(MetaEvent::SetAttr { attr: remote_attr });
                 }
-                MetaEvent::RemoveAttr { ino } => {
-                    inodes.remove(ino);
-                    symlinks.remove(ino);
-                    let ino_prefix = ino.to_le_bytes();
-                    xattrs.retain(|k, _| !k.starts_with(&ino_prefix));
-                }
-                MetaEvent::AddEntry {
-                    parent,
-                    name,
-                    entry,
-                } => {
-                    dentries.insert(
-                        Self::encode_dentry_key(*parent, name),
-                        Self::encode_postcard(entry)?,
-                    );
-                }
-                MetaEvent::RemoveEntry { parent, name } => {
-                    dentries.remove(&Self::encode_dentry_key(*parent, name));
-                }
-                MetaEvent::SetFileBlock {
-                    ino,
-                    block_index,
-                    block,
-                } => {
-                    file_blocks.insert(
-                        Self::encode_file_block_key(*ino, *block_index).to_vec(),
-                        Self::encode_postcard(block)?,
-                    );
-                }
-                MetaEvent::RemoveFileBlock { ino, block_index } => {
-                    file_blocks.remove(&Self::encode_file_block_key(*ino, *block_index).to_vec());
-                }
-                MetaEvent::RemoveFileBlocks { ino } => {
-                    let prefix = ino.to_le_bytes();
-                    file_blocks.retain(|k, _| !k.starts_with(&prefix));
-                }
-                MetaEvent::SetFileBlocksBatch { blocks } => {
-                    for (ino, block_index, block) in blocks {
-                        file_blocks.insert(
-                            Self::encode_file_block_key(*ino, *block_index).to_vec(),
-                            Self::encode_postcard(block)?,
-                        );
-                    }
-                }
-                MetaEvent::SetSymlinkTarget { ino, target } => {
-                    symlinks.insert(*ino, target.clone());
-                }
-                MetaEvent::SetXattr {
-                    ino,
-                    name,
-                    value,
-                    flags: _,
-                } => {
-                    xattrs.insert(Self::encode_xattr_key(*ino, name), value.clone());
-                }
-                MetaEvent::RemoveXattr { ino, name } => {
-                    xattrs.remove(&Self::encode_xattr_key(*ino, name));
-                }
-                MetaEvent::AddPendingDeletion {
-                    object_id,
-                    timestamp,
-                } => {
-                    pending_deletions.insert(*object_id, *timestamp);
-                }
-                MetaEvent::RemovePendingDeletion { object_id } => {
-                    pending_deletions.remove(object_id);
-                }
+                _ => out.push(event.clone()),
             }
         }
+        out
+    }
 
-        let mut counters: std::collections::HashMap<String, u64> =
-            remote.counters.drain(..).collect();
-        for (k, v) in &local.counters {
-            let e = counters.entry(k.clone()).or_insert(*v);
-            *e = (*e).max(*v);
+    fn event_conflicts_with_overlay(
+        &self,
+        event: &MetaEvent,
+        overlay_inodes: &HashSet<Ino>,
+    ) -> MetaResult<bool> {
+        let conflict = match event {
+            MetaEvent::SetAttr { attr } => overlay_inodes.contains(&attr.ino),
+            MetaEvent::RemoveAttr { ino }
+            | MetaEvent::SetFileBlock { ino, .. }
+            | MetaEvent::RemoveFileBlock { ino, .. }
+            | MetaEvent::RemoveFileBlocks { ino }
+            | MetaEvent::CommitFileBlock { ino, .. }
+            | MetaEvent::SetSymlinkTarget { ino, .. }
+            | MetaEvent::SetXattr { ino, .. }
+            | MetaEvent::RemoveXattr { ino, .. } => overlay_inodes.contains(ino),
+            MetaEvent::SetFileBlocksBatch { blocks } => blocks
+                .iter()
+                .any(|(ino, _, _)| overlay_inodes.contains(ino)),
+            MetaEvent::AddEntry { entry, .. } | MetaEvent::RenameEntry { entry, .. } => {
+                overlay_inodes.contains(&entry.ino)
+            }
+            MetaEvent::RemoveEntry { parent, name } => match self.local.lookup(*parent, name) {
+                Ok(entry) => overlay_inodes.contains(&entry.ino),
+                Err(MetaError::EntryNotFound { .. }) => false,
+                Err(e) => return Err(e),
+            },
+            MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => false,
+        };
+        Ok(conflict)
+    }
+
+    fn batch_conflicts_with_overlay(
+        &self,
+        events: &[MetaEvent],
+        overlay_inodes: &HashSet<Ino>,
+    ) -> MetaResult<bool> {
+        if overlay_inodes.is_empty() {
+            return Ok(false);
         }
-
-        remote.settings = local.settings.clone();
-        remote.counters = counters.into_iter().collect();
-        remote.inodes = inodes.into_iter().collect();
-        remote.dentries = dentries.into_iter().collect();
-        remote.file_blocks = file_blocks.into_iter().collect();
-        remote.pending_deletions = pending_deletions.into_iter().collect();
-        remote.symlinks = symlinks.into_iter().collect();
-        remote.xattrs = xattrs.into_iter().collect();
-        remote.event_log = local.event_log.clone();
-        Ok(remote)
+        for event in events {
+            if self.event_conflicts_with_overlay(event, overlay_inodes)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn pull_snapshot_locked(&self) -> MetaResult<bool> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
+        let local_version = self.local_version.load(Ordering::SeqCst);
 
         let row = self.run_async(async move {
             let (client, connection) =
@@ -308,16 +249,38 @@ impl PgMetaEngine {
                 let _ = connection.await;
             });
 
-            let row = client
+            let version_row = client
                 .query_opt(
+                    "SELECT version FROM metadata_state WHERE vol=$1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres snapshot version select failed: {e}"))
+                })?;
+
+            let Some(version_row) = version_row else {
+                conn_task.abort();
+                return Ok(None);
+            };
+            let version: i64 = version_row.get(0);
+            if version <= local_version {
+                conn_task.abort();
+                return Ok(None);
+            }
+
+            let row = client
+                .query_one(
                     "SELECT version, snapshot FROM metadata_state WHERE vol=$1",
                     &[&volume_id],
                 )
                 .await
-                .map_err(|e| MetaError::Storage(format!("postgres snapshot select failed: {e}")))?;
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres snapshot payload select failed: {e}"))
+                })?;
 
             conn_task.abort();
-            Ok(row)
+            Ok(Some(row))
         })?;
 
         let Some(row) = row else {
@@ -327,26 +290,23 @@ impl PgMetaEngine {
         let version: i64 = row.get(0);
         let bytes: Vec<u8> = row.get(1);
 
-        if version <= self.local_version.load(Ordering::SeqCst) {
-            return Ok(false);
-        }
-
         let snapshot = Self::decode_snapshot(&bytes)?;
         self.local.import_snapshot(&snapshot)?;
-        self.local_version.store(version, Ordering::SeqCst);
+        let _ = version;
         Ok(true)
     }
 
-    fn push_local_snapshot_with_lock(
-        &self,
-        events: &[MetaEvent],
-    ) -> MetaResult<(i64, RedbSnapshot)> {
+    fn push_event_log_batch_locked(&self, events: &[MetaEvent]) -> MetaResult<i64> {
+        let remote_events = Self::project_remote_events(events);
+        if remote_events.is_empty() {
+            return Ok(self.local_version.load(Ordering::SeqCst));
+        }
+
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
         let now_ms = Self::now_millis();
-        let local_snapshot = self.local.export_snapshot()?;
-        let events_vec = events.to_vec();
+        let events_vec = remote_events;
 
         self.run_async(async move {
             let (mut client, connection) =
@@ -358,73 +318,207 @@ impl PgMetaEngine {
                 let _ = connection.await;
             });
 
-            client
-                .execute("SELECT pg_advisory_lock($1)", &[&volume_id])
-                .await
-                .map_err(|e| MetaError::Storage(format!("postgres advisory lock failed: {e}")))?;
-
             let tx = client
                 .transaction()
                 .await
                 .map_err(|e| MetaError::Storage(format!("postgres begin tx failed: {e}")))?;
 
-            let current = tx
-                .query_opt(
-                    "SELECT snapshot FROM metadata_state WHERE vol=$1 FOR UPDATE",
+            let batch_version: i64 = tx
+                .query_one(
+                    r#"
+                    UPDATE metadata_state
+                    SET version = version + 1,
+                        updated_at = now()
+                    WHERE vol = $1
+                    RETURNING version
+                    "#,
                     &[&volume_id],
                 )
                 .await
-                .map_err(|e| MetaError::Storage(format!("postgres snapshot read failed: {e}")))?;
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres metadata_state bump failed: {e}"))
+                })?
+                .get(0);
 
-            let merged_snapshot = if let Some(row) = current {
-                let remote_bytes: Vec<u8> = row.get(0);
-                let remote = Self::decode_snapshot(&remote_bytes)?;
-                Self::merge_snapshot_with_events(remote, &local_snapshot, &events_vec)?
-            } else {
-                local_snapshot.clone()
-            };
-            let payload = Self::encode_snapshot(&merged_snapshot)?;
+            let mut last_seq = 0_i64;
+            for event in &events_vec {
+                let payload = Self::encode_postcard(event)?;
+                let row = tx
+                    .query_one(
+                        r#"
+                        INSERT INTO event_log (
+                            vol,
+                            batch_version,
+                            event_type,
+                            event_payload,
+                            client_id,
+                            client_timestamp
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        RETURNING seq_id
+                        "#,
+                        &[
+                            &volume_id,
+                            &batch_version,
+                            &event.kind(),
+                            &payload,
+                            &client_id,
+                            &now_ms,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!("postgres event_log insert failed: {e}"))
+                    })?;
+                last_seq = row.get(0);
+            }
 
-            let row = tx
-                .query_one(
-                    r#"
-                    INSERT INTO metadata_state (vol, version, snapshot)
-                    VALUES ($1, 1, $2)
-                    ON CONFLICT (vol) DO UPDATE
-                    SET version = metadata_state.version + 1,
-                        snapshot = EXCLUDED.snapshot,
-                        updated_at = now()
-                    RETURNING version
-                    "#,
-                    &[&volume_id, &payload],
-                )
-                .await
-                .map_err(|e| MetaError::Storage(format!("postgres snapshot upsert failed: {e}")))?;
-            let version: i64 = row.get(0);
-
-            let _ = tx
-                .execute(
-                    "INSERT INTO event_log (vol, event_type, event_payload, client_id, client_timestamp) VALUES ($1, 'snapshot', '{}'::jsonb, $2, $3)",
-                    &[&volume_id, &client_id, &now_ms],
-                )
-                .await;
-            let channel = format!("studiofs_vol_{volume_id}");
-            let _ = tx
-                .execute("SELECT pg_notify($1, $2)", &[&channel, &version.to_string()])
-                .await;
+            if last_seq > 0 {
+                let channel = format!("studiofs_vol_{volume_id}");
+                let _ = tx
+                    .execute(
+                        "SELECT pg_notify($1, $2)",
+                        &[&channel, &batch_version.to_string()],
+                    )
+                    .await;
+            }
 
             tx.commit()
                 .await
                 .map_err(|e| MetaError::Storage(format!("postgres commit failed: {e}")))?;
             conn_task.abort();
-            Ok((version, merged_snapshot))
+            Ok(batch_version)
         })
+    }
+
+    fn write_checkpoint_locked(&self) -> MetaResult<()> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let snapshot = self.local.export_remote_snapshot()?;
+        let payload = serde_json::to_vec(&snapshot)
+            .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
+        let version = self.local_version.load(Ordering::SeqCst);
+
+        self.run_async(async move {
+            let (client, connection) =
+                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            client
+                .execute(
+                    r#"
+                    INSERT INTO metadata_state (vol, version, snapshot)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (vol) DO UPDATE
+                    SET version = EXCLUDED.version,
+                        snapshot = EXCLUDED.snapshot,
+                        updated_at = now()
+                    "#,
+                    &[&volume_id, &version, &payload],
+                )
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres checkpoint upsert failed: {e}"))
+                })?;
+
+            conn_task.abort();
+            Ok(())
+        })
+    }
+
+    fn pull_foreign_events_locked(&self) -> MetaResult<bool> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let client_id = self.client_id.clone();
+        let last_seq = self.local_version.load(Ordering::SeqCst);
+
+        let rows = self.run_async(async move {
+            let (client, connection) =
+                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
+
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let rows = client
+                .query(
+                    r#"
+                    SELECT batch_version, seq_id, event_payload, client_id
+                    FROM event_log
+                    WHERE vol=$1 AND batch_version > $2
+                    ORDER BY batch_version ASC, seq_id ASC
+                    "#,
+                    &[&volume_id, &last_seq],
+                )
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres event_log select failed: {e}"))
+                })?;
+            conn_task.abort();
+            Ok::<_, MetaError>(rows)
+        })?;
+
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        let overlay_inodes = self.local.local_overlay_inodes()?;
+        let mut applied_any = false;
+        let mut max_version = last_seq;
+        let mut idx = 0;
+        while idx < rows.len() {
+            let batch_version: i64 = rows[idx].get(0);
+            let batch_source: Option<String> = rows[idx].get(3);
+            let mut batch_events = Vec::new();
+
+            while idx < rows.len() {
+                let row_batch_version: i64 = rows[idx].get(0);
+                if row_batch_version != batch_version {
+                    break;
+                }
+                let payload: Vec<u8> = rows[idx].get(2);
+                let source_client: Option<String> = rows[idx].get(3);
+                if source_client.as_deref() != Some(client_id.as_str()) {
+                    let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
+                        MetaError::Serialization(format!("postgres event decode failed: {e}"))
+                    })?;
+                    batch_events.push(event);
+                }
+                idx += 1;
+            }
+
+            if batch_source.as_deref() == Some(client_id.as_str()) {
+                max_version = batch_version;
+                continue;
+            }
+
+            if self.batch_conflicts_with_overlay(&batch_events, &overlay_inodes)? {
+                break;
+            }
+
+            if !batch_events.is_empty() {
+                self.local.apply_replica_events(&batch_events)?;
+                applied_any = true;
+            }
+            max_version = batch_version;
+        }
+        self.local_version.store(max_version, Ordering::SeqCst);
+        Ok(applied_any)
     }
 
     fn reset_pending_locked(&self) {
         self.pending_ops.store(0, Ordering::SeqCst);
         if let Ok(mut started) = self.pending_started_at.lock() {
             *started = None;
+        }
+        if let Ok(mut last) = self.last_mutation_at.lock() {
+            *last = None;
         }
         self.force_flush.store(false, Ordering::SeqCst);
         if let Ok(mut seq_start) = self.pending_event_start.lock() {
@@ -434,10 +528,14 @@ impl PgMetaEngine {
     }
 
     fn mark_pending_locked(&self) {
+        let now = Instant::now();
         if self.pending_ops.fetch_add(1, Ordering::SeqCst) == 0
             && let Ok(mut started) = self.pending_started_at.lock()
         {
-            *started = Some(Instant::now());
+            *started = Some(now);
+        }
+        if let Ok(mut last) = self.last_mutation_at.lock() {
+            *last = Some(now);
         }
     }
 
@@ -445,6 +543,11 @@ impl PgMetaEngine {
         let pending = self.pending_ops.load(Ordering::SeqCst);
         if pending == 0 {
             return false;
+        }
+        if let Ok(last) = self.last_mutation_at.lock()
+            && let Some(t0) = *last
+        {
+            return t0.elapsed() >= self.flush_idle_grace;
         }
         if let Ok(started) = self.pending_started_at.lock()
             && let Some(t0) = *started
@@ -466,13 +569,11 @@ impl PgMetaEngine {
             Vec::new()
         };
         if self.pending_ops.load(Ordering::SeqCst) > 0 && events.is_empty() {
-            return Err(MetaError::Storage(
-                "pending_ops>0 but no pending events captured".to_string(),
-            ));
+            self.reset_pending_locked();
+            return Ok(());
         }
-        let (version, merged_snapshot) = self.push_local_snapshot_with_lock(&events)?;
-        self.local.import_snapshot(&merged_snapshot)?;
-        self.local_version.store(version, Ordering::SeqCst);
+        let version = self.push_event_log_batch_locked(&events)?;
+        let _ = version;
         self.reset_pending_locked();
         Ok(())
     }
@@ -518,8 +619,19 @@ impl PgMetaEngine {
 
 impl MetaEngine for PgMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
+        let _guard = self
+            .op_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg op lock poisoned".to_string()))?;
         self.force_flush.store(true, Ordering::SeqCst);
+        self.flush_pending_locked()?;
+        let _ = self.pull_foreign_events_locked()?;
+        self.write_checkpoint_locked()?;
         Ok(())
+    }
+
+    fn request_eager_flush(&self) {
+        self.force_flush.store(true, Ordering::SeqCst);
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
@@ -534,8 +646,7 @@ impl MetaEngine for PgMetaEngine {
         if self.pending_ops.load(Ordering::SeqCst) > 0 {
             return Ok(());
         }
-        // Pull-only sync. Push is handled by background worker.
-        let _ = self.pull_snapshot_locked()?;
+        let _ = self.pull_foreign_events_locked()?;
         Ok(())
     }
 
@@ -638,6 +749,21 @@ impl MetaEngine for PgMetaEngine {
 
     fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
         self.mutate(|local| local.flush_blocks_batch(entries))
+    }
+
+    fn commit_uploaded_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool> {
+        let result = self
+            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
+        if matches!(result, Ok(true)) {
+            self.force_flush.store(true, Ordering::SeqCst);
+        }
+        result
     }
 
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
@@ -747,6 +873,7 @@ impl MetaEngine for PgMetaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pg_dsn::ensure_studiofs_database;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -760,9 +887,12 @@ mod tests {
 
     fn pg_dsn() -> Option<String> {
         let _ = dotenvy::dotenv();
-        std::env::var("STUDIOFS_TEST_PG_DSN")
+        let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
             .ok()
-            .filter(|v| !v.trim().is_empty())
+            .filter(|v| !v.trim().is_empty())?;
+        run_async(async { ensure_studiofs_database(&raw).await })
+            .ok()
+            .map(|v| v.metadata_dsn)
     }
 
     fn run_async<T, F>(fut: F) -> MetaResult<T>
@@ -792,6 +922,66 @@ mod tests {
             let _ = engine.sync_metadata();
             engine.lookup(parent, name).is_ok()
         })
+    }
+
+    struct PgTestVolume {
+        dsn: String,
+        name: String,
+        uuid: String,
+        volume_id: i64,
+    }
+
+    impl PgTestVolume {
+        fn new(dsn: &str, prefix: &str) -> Self {
+            let name = format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            );
+            let uuid = Uuid::new_v4().to_string();
+            let volume_id =
+                setup_pg_volume(dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
+            Self {
+                dsn: dsn.to_string(),
+                name,
+                uuid,
+                volume_id,
+            }
+        }
+
+        fn format_info(&self) -> FormatInfo {
+            format_info(&self.name, &self.uuid, &self.dsn, self.volume_id)
+        }
+    }
+
+    impl Drop for PgTestVolume {
+        fn drop(&mut self) {
+            let _ = run_async(async {
+                let (client, connection) =
+                    tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
+                        })?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+                    .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!("postgres cleanup failed: {}", pg_err(e)))
+                    })?;
+                conn_task.abort();
+                Ok::<(), MetaError>(())
+            });
+        }
+    }
+
+    fn seed_local(path: &std::path::Path, info: &FormatInfo) {
+        let seed = RedbMetaEngine::open(path).expect("seed open");
+        seed.set_format_info(info).expect("set format");
+        seed.init_root(0, 0).expect("init root");
     }
 
     fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
@@ -827,18 +1017,26 @@ mod tests {
                 CREATE TABLE IF NOT EXISTS event_log (
                     vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
                     seq_id BIGSERIAL PRIMARY KEY,
+                    batch_version BIGINT NOT NULL,
                     event_type TEXT NOT NULL,
-                    event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    event_payload BYTEA NOT NULL,
                     client_id TEXT,
                     client_timestamp BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
                 CREATE TABLE IF NOT EXISTS metadata_state (
-                    vol BIGINT PRIMARY KEY,
+                    vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
                     version BIGINT NOT NULL,
                     snapshot BYTEA NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                ALTER TABLE event_log
+                    ADD COLUMN IF NOT EXISTS batch_version BIGINT;
+                UPDATE event_log
+                    SET batch_version = 0
+                    WHERE batch_version IS NULL;
+                ALTER TABLE event_log
+                    ALTER COLUMN batch_version SET NOT NULL;
                 "#,
             )
             .await
@@ -862,12 +1060,31 @@ mod tests {
                 .map_err(|e| {
                     MetaError::Storage(format!("postgres volume upsert failed: {}", pg_err(e)))
                 })?;
+            let volume_id: i64 = row.get(0);
+
+            let empty_snapshot = serde_json::to_vec(&RedbSnapshot::default())
+                .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
+            tx.execute(
+                r#"
+                INSERT INTO metadata_state (vol, version, snapshot)
+                VALUES ($1, 0, $2)
+                ON CONFLICT (vol) DO NOTHING
+                "#,
+                &[&volume_id, &empty_snapshot],
+            )
+            .await
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres metadata_state seed failed: {}",
+                    pg_err(e)
+                ))
+            })?;
 
             tx.commit().await.map_err(|e| {
                 MetaError::Storage(format!("postgres commit failed: {}", pg_err(e)))
             })?;
             conn_task.abort();
-            Ok(row.get(0))
+            Ok(volume_id)
         })
     }
 
@@ -900,22 +1117,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_write_through_persists_snapshot() {
+    fn test_pg_flush_advances_checkpoint_version() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
 
         let dir = tempdir().expect("tempdir");
         let db = dir.path().join("meta.redb");
-        let name = format!("pg-test-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-
-        let seed = RedbMetaEngine::open(&db).expect("seed open");
-        seed.set_format_info(&format_info(&name, &uuid, &dsn, volume_id))
-            .expect("set format");
-        seed.init_root(0, 0).expect("init root");
-        drop(seed);
+        let volume = PgTestVolume::new(&dsn, "pg-test");
+        seed_local(&db, &volume.format_info());
 
         let pg = PgMetaEngine::open(&db).expect("open pg");
         pg.create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
@@ -932,7 +1142,7 @@ mod tests {
                 let row = client
                     .query_opt(
                         "SELECT version FROM metadata_state WHERE vol=$1",
-                        &[&volume_id],
+                        &[&volume.volume_id],
                     )
                     .await
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -955,21 +1165,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-sync-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-sync");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -987,6 +1186,154 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_remote_client_reads_committed_blocks_without_local_staged_mirror() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-committed-block-read");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
+            .expect("create file");
+        let mut attr = a.get_attr(file.ino).expect("get attr");
+        attr.size = 4096;
+        a.set_attr(&attr).expect("set size");
+        let block = BlockRef::new_partial(77, 4096);
+        a.set_file_block(file.ino, 0, &block)
+            .expect("set staged block");
+        a.commit_uploaded_block(file.ino, 0, 0, &block)
+            .expect("commit uploaded block");
+        a.flush_metadata().expect("flush a");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote.bin",
+            Duration::from_secs(10)
+        ));
+        let remote = b.lookup(ROOT_INO, b"remote.bin").expect("lookup remote");
+        let remote_block = b
+            .get_file_block(remote.ino, 0)
+            .expect("get remote block")
+            .expect("remote committed block");
+        assert_eq!(remote_block.object_id, 77);
+
+        let remote_blocks = b.get_file_blocks(remote.ino).expect("get remote blocks");
+        assert_eq!(remote_blocks.len(), 1);
+        assert_eq!(remote_blocks[0].0, 0);
+        assert_eq!(remote_blocks[0].1.object_id, 77);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_overlay_allows_unrelated_remote_batches_to_apply() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-overlay-prefix");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let draft = a
+            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+            .expect("create draft");
+        let mut draft_attr = a.get_attr(draft.ino).expect("get draft attr");
+        draft_attr.size = 4096;
+        a.set_attr(&draft_attr).expect("set draft size");
+        a.set_file_block(draft.ino, 0, &BlockRef::new_partial(501, 4096))
+            .expect("set draft staged block");
+        a.flush_metadata().expect("flush draft namespace");
+
+        b.create_file(ROOT_INO, b"foreign.txt", 0, 0, 0o644)
+            .expect("create foreign");
+        b.flush_metadata().expect("flush foreign");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.lookup(ROOT_INO, b"foreign.txt").is_ok()
+        }));
+
+        let draft_after = a.get_attr(draft.ino).expect("get local draft");
+        assert_eq!(draft_after.size, 4096);
+        assert_eq!(draft_after.committed_size, 0);
+        let local_block = a
+            .get_file_block(draft.ino, 0)
+            .expect("get staged draft block")
+            .expect("staged draft block exists");
+        assert_eq!(local_block.object_id, 501);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_checkpoint_excludes_uncommitted_local_blocks() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-checkpoint-projection");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let file = a
+            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+            .expect("create draft");
+
+        let mut attr = a.get_attr(file.ino).expect("get attr");
+        attr.size = 4096;
+        attr.mtime = InodeAttr::now_nanos();
+        attr.ctime = attr.mtime;
+        a.set_attr(&attr).expect("set staged size");
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(42, 4096))
+            .expect("set staged block");
+        a.flush_metadata().expect("flush a");
+
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+        let b_file = b.lookup(ROOT_INO, b"draft.bin").expect("lookup draft");
+        let b_attr = b.get_attr(b_file.ino).expect("get b attr");
+        assert_eq!(b_attr.size, 0, "remote-visible size must stay committed");
+        assert_eq!(b_attr.committed_size, 0);
+        assert!(
+            b.get_file_block(b_file.ino, 0)
+                .expect("get remote block")
+                .is_none(),
+            "checkpoint must not leak local-only staged file blocks"
+        );
+        assert!(
+            b.get_file_blocks(b_file.ino)
+                .expect("get remote blocks")
+                .is_empty(),
+            "checkpoint must not leak local-only staged file blocks"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_two_clients_different_dirs_no_loss() {
         let Some(dsn) = pg_dsn() else {
             return;
@@ -996,20 +1343,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-dirs-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-dirs");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1089,20 +1426,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-samedir-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-samedir");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1163,20 +1490,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-concurrent-create-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-concurrent-create");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1236,20 +1553,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-concurrent-rename-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-concurrent-rename");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1314,20 +1621,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-delete-recreate-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-delete-recreate");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1364,15 +1661,8 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let db = dir.path().join("meta.redb");
-        let name = format!("pg-rapid-cd-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-
-        let seed = RedbMetaEngine::open(&db).expect("seed");
-        seed.set_format_info(&format_info(&name, &uuid, &dsn, volume_id))
-            .expect("set format");
-        seed.init_root(0, 0).expect("init root");
-        drop(seed);
+        let volume = PgTestVolume::new(&dsn, "pg-rapid-cd");
+        seed_local(&db, &volume.format_info());
 
         let pg = PgMetaEngine::open(&db).expect("open pg");
         for i in 0..200 {
@@ -1400,20 +1690,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-hardlink-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-hardlink");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1452,20 +1732,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-symlink-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-symlink");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1495,15 +1765,8 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let db = dir.path().join("meta.redb");
-        let name = format!("pg-basic-crud-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed = RedbMetaEngine::open(&db).expect("seed");
-        seed.set_format_info(&info).expect("set format");
-        seed.init_root(0, 0).expect("init root");
-        drop(seed);
+        let volume = PgTestVolume::new(&dsn, "pg-basic-crud");
+        seed_local(&db, &volume.format_info());
 
         let pg = PgMetaEngine::open(&db).expect("open pg");
         let file = pg
@@ -1535,15 +1798,8 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let db = dir.path().join("meta.redb");
-        let name = format!("pg-deep-path-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed = RedbMetaEngine::open(&db).expect("seed");
-        seed.set_format_info(&info).expect("set format");
-        seed.init_root(0, 0).expect("init root");
-        drop(seed);
+        let volume = PgTestVolume::new(&dsn, "pg-deep-path");
+        seed_local(&db, &volume.format_info());
 
         let pg = PgMetaEngine::open(&db).expect("open pg");
         let mut parent = ROOT_INO;
@@ -1567,15 +1823,8 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let db = dir.path().join("meta.redb");
-        let name = format!("pg-large-dir-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed = RedbMetaEngine::open(&db).expect("seed");
-        seed.set_format_info(&info).expect("set format");
-        seed.init_root(0, 0).expect("init root");
-        drop(seed);
+        let volume = PgTestVolume::new(&dsn, "pg-large-dir");
+        seed_local(&db, &volume.format_info());
 
         let pg = PgMetaEngine::open(&db).expect("open pg");
         for i in 0..1000 {
@@ -1596,15 +1845,8 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let db = dir.path().join("meta.redb");
-        let name = format!("pg-special-names-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed = RedbMetaEngine::open(&db).expect("seed");
-        seed.set_format_info(&info).expect("set format");
-        seed.init_root(0, 0).expect("init root");
-        drop(seed);
+        let volume = PgTestVolume::new(&dsn, "pg-special-names");
+        seed_local(&db, &volume.format_info());
 
         let pg = PgMetaEngine::open(&db).expect("open pg");
         let names = vec![
@@ -1637,20 +1879,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-readdir-race-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-readdir-race");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -1689,20 +1921,10 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let name = format!("pg-vis-timing-{}", std::process::id());
-        let uuid = Uuid::new_v4().to_string();
-        let volume_id = setup_pg_volume(&dsn, &name, &uuid, DEFAULT_BLOCK_SIZE).expect("setup pg");
-        let info = format_info(&name, &uuid, &dsn, volume_id);
-
-        let seed_a = RedbMetaEngine::open(&db_a).expect("seed a");
-        seed_a.set_format_info(&info).expect("set format a");
-        seed_a.init_root(0, 0).expect("init root a");
-        drop(seed_a);
-
-        let seed_b = RedbMetaEngine::open(&db_b).expect("seed b");
-        seed_b.set_format_info(&info).expect("set format b");
-        seed_b.init_root(0, 0).expect("init root b");
-        drop(seed_b);
+        let volume = PgTestVolume::new(&dsn, "pg-vis-timing");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");

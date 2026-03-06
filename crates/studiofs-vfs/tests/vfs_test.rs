@@ -23,7 +23,10 @@ use studiofs_data::object::{create_object, format_object_key, read_object};
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
-use studiofs_meta::{FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine, types::BlockRef};
+use studiofs_meta::{
+    FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
+    types::{BlockFlags, BlockRef},
+};
 use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 
 // =============================================================================
@@ -181,6 +184,22 @@ async fn wait_until_absent(ds: &DataStore, path: &str, timeout: Duration) -> boo
             Ok(false) => return true,
             Ok(true) => {}
             Err(_) => return true,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate() {
+            return true;
         }
         if Instant::now() >= deadline {
             return false;
@@ -544,6 +563,8 @@ async fn test_pending_deletions_gc() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "gc");
+    let info = vfs.meta().get_format_info().unwrap();
+    let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
 
     let attr = vfs.create(1, b"gc_test.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -557,8 +578,17 @@ async fn test_pending_deletions_gc() {
         .expect("Should have 1 block after initial write");
     assert_eq!(blocks_before.len(), 1);
     let old_block_id = blocks_before[0].1.object_id;
+    let old_key = format_object_key(&info.data_prefix, old_block_id);
 
-    // Overwrite with new data (should mark old block for deletion)
+    // Under the committed/overlay model, the old block becomes GC-eligible
+    // only after it has actually been uploaded.
+    assert!(
+        wait_until_exists(&ds, &old_key, Duration::from_secs(20)).await,
+        "initial object should be uploaded before overwrite GC check"
+    );
+
+    // Overwrite with new data. The displaced old block should be marked for
+    // deletion once the replacement upload commits.
     vfs.write(ino, 0, b"new data here!!").await.unwrap();
     vfs.flush(ino).await.unwrap();
 
@@ -579,11 +609,13 @@ async fn test_pending_deletions_gc() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Verify old block is in pending deletions
-    let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
-        pending.iter().any(|(id, _)| *id == old_block_id),
-        "Old block should be in pending deletions"
+        wait_until(Duration::from_secs(20), || {
+            let pending = vfs.meta().get_pending_deletions().unwrap();
+            pending.iter().any(|(id, _)| *id == old_block_id)
+        })
+        .await,
+        "old committed block should eventually enter pending deletions"
     );
 
     // Verify new block is different
@@ -875,11 +907,11 @@ fn test_crash_recovery_replays_pending_journal() {
     let pending_after = std::fs::read_dir(&pending_dir)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pending"))
         .count();
     assert_eq!(
         pending_after, 0,
-        "pending journals must be cleaned up after recovery"
+        "pending upload journals must be cleaned up after recovery"
     );
 }
 
@@ -1661,46 +1693,19 @@ async fn test_statfs_after_write() {
 }
 
 // =============================================================================
-// Phase 8 — Eager Flush + Kernel Cache Invalidation Tests
+// Phase 8 — Notes On PG Sync Coverage
 // =============================================================================
 
-/// Mock `KernelInvalidator` that records every invalidated inode for assertions.
-
-/// Verify that `request_eager_flush()` causes the metadata engine background
-/// flush to publish metadata to metadata sync within seconds (instead of waiting for
-/// the full 600 s `flush_interval`).  Reader observes writer's `create` quickly.
+/// PG convergence and remote-visible metadata semantics are primarily covered in
+/// `studiofs-meta::pg_engine` ignored tests now:
+/// - checkpoint bootstrap
+/// - delta pull by batch version
+/// - committed-vs-staged block visibility
+/// - overlay conflict handling
 ///
-/// This exercises the end-to-end path:
-///   writer.create() → request_eager_flush() → 250 ms tick → flush_remote_snapshot()
-///   → metadata sync publish → reader invalidation listener → sync_metadata() → lookup OK
-/// Like above but for `unlink` — verify eager flush after delete propagates
-/// quickly.
-/// Verify that `mkdir` + `rmdir` + `rename` also trigger eager flush.
-/// Verify that the `KernelInvalidator` receives `inval_inode` calls when metadata sync
-/// invalidation events arrive on the reader.
-///
-/// This confirms the plumbing works — the same trait is implemented by
-/// `FuseKernelInvalidator` (Linux) and `WinfspKernelInvalidator` (Windows).
-/// Verify that eager-flush batching and kernel-cache invalidation work
-/// together end-to-end.
-///
-/// **Batching semantics:** `request_eager_flush()` uses a 250 ms collection
-/// window so that rapid sequential mutations (e.g. multi-file create/delete)
-/// are grouped into one remote flush + one metadata sync event.  The reader may see
-/// the S3 data *before* the metadata sync event arrives (via `read_with_refresh`
-/// cache-miss → direct `pull_remote_snapshot`).  When this happens the metadata sync
-/// handler's `sync_and_apply_invalidation` observes no version advancement
-/// and enters a multi-attempt retry loop.  Because the handler is sequential,
-/// back-to-back events can queue up and exceed tight timeouts.
-///
-/// This test therefore keeps the number of metadata sync events minimal:
-///   1. Rapid creates → eager-flush visibility check (no explicit flush).
-///   2. One explicit `flush_metadata()` to produce a deterministic metadata sync event
-///      that the handler can resolve in a single attempt, triggering
-///      `invalidate_all_read_caches()` and the `KernelInvalidator` mock.
-///
-/// More complex mutation sequences (rename, unlink, dir-ops) are covered
-/// by the dedicated eager-flush tests above.
+/// The VFS ignored suite below focuses on end-to-end data path correctness:
+/// reads, writes, truncation, crash recovery, upload completion, and cache
+/// behavior on top of the local metadata serving model.
 // =============================================================================
 // Phase 9 — Deep Integration & Edge-Case Tests
 // =============================================================================
@@ -1734,12 +1739,15 @@ async fn test_truncate_to_exact_block_boundary() {
 
     let (idx, blk) = &after[0];
     assert_eq!(*idx, 0);
-    // When truncating to exactly block_size, the last_block_offset+1 == block_size
-    // so the block ref length should equal block_size and the partial flag
-    // must be set (the truncate code always sets PARTIAL_BLOCK when size > 0).
+    // Exact boundary truncate keeps a full block and must not leave it marked
+    // as partial.
     assert_eq!(
         blk.length, block_size,
         "block length should equal block_size"
+    );
+    assert!(
+        !blk.flags.contains(BlockFlags::PARTIAL_BLOCK),
+        "exact block-boundary truncate must clear PARTIAL_BLOCK"
     );
 
     // Verify read returns correct data.
@@ -1783,6 +1791,37 @@ async fn test_truncate_extend_creates_sparse_hole() {
         hole.iter().all(|&b| b == 0),
         "sparse hole should read as zeroes"
     );
+}
+
+/// Shrink inside a block, then extend by writing later in the same block.
+/// Bytes between the truncated EOF and the new write offset must be zeroed,
+/// not preserved from the old tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "trunc-shrink-extend");
+
+    let attr = vfs.create(1, b"tail-zero.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    vfs.write(ino, 0, &payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+
+    vfs.setattr(ino, SetattrArgs::size_only(1024)).unwrap();
+    vfs.write(ino, 2048, &[0xEE]).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    let data = vfs.read(ino, 0, 2049).await.unwrap();
+    assert_eq!(&data[..1024], &payload[..1024]);
+    assert!(
+        data[1024..2048].iter().all(|&b| b == 0),
+        "gap after truncate must be zero-filled"
+    );
+    assert_eq!(data[2048], 0xEE);
 }
 
 /// Write exactly block_size bytes then 1 byte at the next block boundary.
@@ -2357,16 +2396,8 @@ async fn test_open_trunc_clears_data() {
 
 // ─── 9.6 Multi-Client metadata sync Integration ─────────────────────────────────────
 
-/// Two metadata clients create files simultaneously, triggering CAS conflict.
-/// Client A flushes first, then Client B flushes and must merge with A's
-/// snapshot so both files survive.  Verifies the pre-merge path where a
-/// client with no cached etag discovers a remote manifest and merges before
-/// writing.
-/// metadata sync global invalidation should evict dropped blocks from cache.
-/// Client A caches file data, Client B deletes the file + publishes invalidation,
-/// verify Client A's block cache no longer contains the deleted blocks.
-/// Verify kernel invalidator receives correct inodes for single-inode events
-/// (not just global invalidation).
+/// Multi-client metadata convergence coverage now lives in `studiofs-meta`
+/// PostgreSQL tests. VFS integration below stays focused on local FS semantics.
 // ─── 9.7 Attribute & Metadata Edge Cases ───────────────────────────────────
 
 /// Setattr mode/uid/gid/times on a directory (not just files).

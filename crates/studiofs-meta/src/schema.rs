@@ -68,6 +68,9 @@ pub struct InodeAttr {
     pub gid: u32,
     /// File size in bytes.
     pub size: u64,
+    /// Size visible to remote clients after committed block uploads.
+    #[serde(default)]
+    pub committed_size: u64,
     /// Number of hard links.
     pub nlink: u32,
     /// Modification time (nanoseconds since Unix epoch).
@@ -87,6 +90,9 @@ pub struct InodeAttr {
     /// Stored as raw Win32 FILE_ATTRIBUTE_* bitmask. 0 = not set (derive from kind).
     #[serde(default)]
     pub win_attrs: u32,
+    /// Monotonic content generation used to discard stale async completions.
+    #[serde(default)]
+    pub content_epoch: u64,
 }
 
 impl InodeAttr {
@@ -108,6 +114,7 @@ impl InodeAttr {
             uid,
             gid,
             size: 4096,
+            committed_size: 4096,
             nlink: 2, // '.' and '..'
             mtime: now,
             ctime: now,
@@ -115,6 +122,7 @@ impl InodeAttr {
             parent,
             crtime: now,
             win_attrs: 0x10, // FILE_ATTRIBUTE_DIRECTORY
+            content_epoch: 0,
         }
     }
 
@@ -128,6 +136,7 @@ impl InodeAttr {
             uid,
             gid,
             size: 0,
+            committed_size: 0,
             nlink: 1,
             mtime: now,
             ctime: now,
@@ -135,6 +144,7 @@ impl InodeAttr {
             parent,
             crtime: now,
             win_attrs: 0x20, // FILE_ATTRIBUTE_ARCHIVE
+            content_epoch: 0,
         }
     }
 
@@ -165,6 +175,7 @@ impl InodeAttr {
             uid,
             gid,
             size: target_len as u64,
+            committed_size: target_len as u64,
             nlink: 1,
             mtime: now,
             ctime: now,
@@ -172,6 +183,7 @@ impl InodeAttr {
             parent,
             crtime: now,
             win_attrs: 0x0400, // FILE_ATTRIBUTE_REPARSE_POINT
+            content_epoch: 0,
         }
     }
 
@@ -297,7 +309,7 @@ impl Default for BlockFlags {
 /// - Sequential object_id (not content hash) - simpler and faster
 /// - No reference counting - block belongs to exactly one file position
 /// - Immutable objects - never modified, only created/deleted
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRef {
     /// Sequential block ID (unique across the volume).
     pub object_id: u64,
@@ -450,7 +462,8 @@ impl Default for MetadataConfig {
 /// Connection details for PostgreSQL metadata backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
-    /// PostgreSQL connection string (e.g. postgres://user:pass@host:5432/db).
+    /// PostgreSQL server DSN (e.g. postgres://user:pass@host:5432).
+    /// StudioFS rewrites it to database `studiofs`.
     pub url: String,
     /// Logical volume id in shared PG schema.
     pub volume_id: i64,

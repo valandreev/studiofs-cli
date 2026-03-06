@@ -11,7 +11,7 @@ use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
     DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PostgresConfig,
-    RedbMetaEngine,
+    RedbMetaEngine, ensure_studiofs_database,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -164,6 +164,38 @@ fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow:
     })
 }
 
+fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> anyhow::Result<bool> {
+    rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        let has_volumes_table = client
+            .query_one("SELECT to_regclass('public.volumes') IS NOT NULL", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("postgres schema probe failed: {e}"))?;
+        let has_volumes_table: bool = has_volumes_table.get(0);
+        if !has_volumes_table {
+            conn_task.abort();
+            return Ok(false);
+        }
+
+        let row = client
+            .query_opt("SELECT vol FROM volumes WHERE name = $1 LIMIT 1", &[&name])
+            .await
+            .map_err(|e| anyhow::anyhow!("postgres volume lookup failed: {e}"))?;
+
+        conn_task.abort();
+        Ok(row.is_some())
+    })
+}
+
 fn init_postgres_schema_and_volume(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
@@ -209,8 +241,9 @@ fn init_postgres_schema_and_volume(
             CREATE TABLE IF NOT EXISTS event_log (
                 vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
                 seq_id BIGSERIAL PRIMARY KEY,
+                batch_version BIGINT NOT NULL,
                 event_type TEXT NOT NULL,
-                event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                event_payload BYTEA NOT NULL,
                 client_id TEXT,
                 client_timestamp BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -223,8 +256,18 @@ fn init_postgres_schema_and_volume(
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
 
+            ALTER TABLE event_log
+                ADD COLUMN IF NOT EXISTS batch_version BIGINT;
+            UPDATE event_log
+                SET batch_version = 0
+                WHERE batch_version IS NULL;
+            ALTER TABLE event_log
+                ALTER COLUMN batch_version SET NOT NULL;
+
             CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq
                 ON event_log(vol, seq_id);
+            CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
+                ON event_log(vol, batch_version, seq_id);
             "#,
         )
         .await?;
@@ -321,11 +364,15 @@ pub fn run(
     block_size: Option<&str>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let postgres_dsn = postgres_dsn.ok_or_else(|| {
+    let meta_dsn = postgres_dsn.ok_or_else(|| {
         anyhow::anyhow!(
-            "PostgreSQL metadata backend is required. Pass --postgres postgres://user:pass@host:5432/db"
+            "PostgreSQL metadata backend is required. Pass --meta postgres://user:pass@host:5432"
         )
     })?;
+    let postgres_dsn = rt
+        .block_on(async { ensure_studiofs_database(meta_dsn).await })
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .metadata_dsn;
     let eff_data_region = if data_region.is_empty() {
         "us-east-1"
     } else {
@@ -360,9 +407,15 @@ pub fn run(
     println!();
 
     println!("Checking PostgreSQL backend...");
-    check_postgres_accessible(&rt, postgres_dsn)?;
+    check_postgres_accessible(&rt, &postgres_dsn)?;
     println!("✓ PostgreSQL connectivity check passed.");
     println!();
+
+    if volume_name_exists(&rt, &postgres_dsn, name)? {
+        return Err(anyhow::anyhow!(
+            "Volume '{name}' already exists in PostgreSQL metadata. Run `studiofs destroy {name}` first, then retry `studiofs init {name}`."
+        ));
+    }
 
     // ── 2. Compatibility pre-flight check ─────────────────────────────────────
     println!("Running compatibility pre-flight check...");
@@ -405,7 +458,7 @@ pub fn run(
         let failures: Vec<String> = data_compat.failure_summary();
         let detail = failures.join("\n  ");
         return Err(anyhow::anyhow!(
-            "Storage compatibility check failed — this backend is not suitable for StudioFS:\n  {detail}\n\nRun `studiofs test` for detailed diagnostics."
+            "Storage compatibility check failed — this backend is not suitable for StudioFS:\n  {detail}"
         ));
     }
 
@@ -448,7 +501,7 @@ pub fn run(
 
     let data_prefix = format!("{name}/objects/");
     let postgres_volume_id =
-        init_postgres_schema_and_volume(&rt, postgres_dsn, name, &volume_uuid, actual_block_size)?;
+        init_postgres_schema_and_volume(&rt, &postgres_dsn, name, &volume_uuid, actual_block_size)?;
 
     // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
@@ -483,7 +536,7 @@ pub fn run(
     engine.init_root(uid, gid)?;
     let snapshot = engine.export_snapshot()?;
     let snapshot_json = serde_json::to_vec(&snapshot)?;
-    seed_postgres_metadata_state(&rt, postgres_dsn, postgres_volume_id, &snapshot_json)?;
+    seed_postgres_metadata_state(&rt, &postgres_dsn, postgres_volume_id, &snapshot_json)?;
     drop(engine);
 
     // ── 7. Report success ─────────────────────────────────────────────────────

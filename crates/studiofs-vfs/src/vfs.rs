@@ -27,6 +27,7 @@ use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -227,7 +228,7 @@ pub struct VfsConfig {
     /// Maximum bytes to hold in the dirty-write memory buffer before applying
     /// backpressure.  This buffer stores blocks that `flush()` has accepted
     /// but the background flusher has not yet written to disk.
-    /// Default: 8 GiB.  Larger buffer absorbs write bursts better and lets
+    /// Default: 12 GiB.  Larger buffer absorbs write bursts better and lets
     /// the parallel background flusher saturate NVMe.
     pub max_dirty_bytes: usize,
 }
@@ -242,9 +243,32 @@ impl Default for VfsConfig {
             block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
             max_concurrent_uploads: 4,
             readahead_width: DEFAULT_READAHEAD_WIDTH,
-            max_dirty_bytes: 8 * 1024 * 1024 * 1024,
+            max_dirty_bytes: 12 * 1024 * 1024 * 1024,
         }
     }
+}
+
+fn parse_size_bytes_env(raw: &str) -> Option<usize> {
+    let s = raw.trim().to_ascii_uppercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
+        (v, 1024u128 * 1024 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("GB") {
+        (v, 1024u128 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("MB") {
+        (v, 1024u128 * 1024)
+    } else if let Some(v) = s.strip_suffix("KB") {
+        (v, 1024u128)
+    } else if let Some(v) = s.strip_suffix('B') {
+        (v, 1u128)
+    } else {
+        (s.as_str(), 1u128)
+    };
+    let num = num_part.trim().parse::<u128>().ok()?;
+    let bytes = num.checked_mul(multiplier)?;
+    usize::try_from(bytes).ok()
 }
 
 // =============================================================================
@@ -393,6 +417,12 @@ struct PendingBlock {
     dirty: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SpillEntry {
+    path: PathBuf,
+    len: usize,
+}
+
 // =============================================================================
 // Internal State (for Clone support)
 // =============================================================================
@@ -409,12 +439,21 @@ struct VfsState {
     /// disk by the background flusher.  Reads must consult this buffer
     /// BEFORE falling through to the block cache or S3.
     dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
+    /// Dirty blocks spilled to local NVMe when the RAM dirty buffer is full.
+    dirty_spill: Mutex<std::collections::HashMap<(Ino, u32), SpillEntry>>,
     /// Approximate total bytes currently held in `dirty_mem` (for backpressure).
     dirty_bytes: AtomicUsize,
+    /// Approximate total bytes currently held in `dirty_spill`.
+    dirty_spill_bytes: AtomicUsize,
     /// Notification fired by the background flusher each time it drains blocks
     /// from `dirty_mem`, used for low-latency backpressure wakeup in `write()`
     /// and `flush()` instead of polling with `sleep(5ms)`.
     dirty_drained_notify: tokio::sync::Notify,
+    /// Serialize dirty buffer drainers so a foreground writer can assist the
+    /// background flusher without duplicating metadata work for the same keys.
+    dirty_drain_lock: tokio::sync::Mutex<()>,
+    /// Sequence used to generate unique spill file names.
+    spill_seq: AtomicU64,
     /// Inodes that have been unlinked.  The background flusher checks this
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
@@ -493,6 +532,11 @@ pub struct StudioVfs {
     /// Maximum total bytes allowed in the dirty-write memory buffer before
     /// `flush()` / `write()` apply backpressure.
     max_dirty_bytes: usize,
+    /// Maximum total bytes allowed in local NVMe spill before foreground
+    /// writes block waiting for the pipeline to catch up.
+    max_spill_bytes: usize,
+    /// Local directory for temporary dirty spill blocks.
+    spill_dir: PathBuf,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Optional distributed lease for janitor leader election.
@@ -645,6 +689,26 @@ impl StudioVfs {
 
             let janitor_lease = None;
             let distributed_flock = None;
+            let max_dirty_bytes = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
+                .ok()
+                .and_then(|v| parse_size_bytes_env(&v))
+                .filter(|v| *v > 0)
+                .unwrap_or(12 * 1024 * 1024 * 1024);
+            let max_spill_bytes = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
+                .ok()
+                .and_then(|v| parse_size_bytes_env(&v))
+                .filter(|v| *v > 0)
+                .unwrap_or(64 * 1024 * 1024 * 1024usize);
+            let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
+            std::fs::create_dir_all(&spill_dir).map_err(VfsError::Io)?;
+            if let Ok(entries) = std::fs::read_dir(&spill_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
@@ -829,6 +893,8 @@ impl StudioVfs {
                 upload_cache_io_slots,
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
+                max_dirty_bytes,
+                max_spill_bytes,
                 "upload pipeline v2 enabled"
             );
 
@@ -843,8 +909,12 @@ impl StudioVfs {
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
+                    dirty_spill: Mutex::new(std::collections::HashMap::new()),
                     dirty_bytes: AtomicUsize::new(0),
+                    dirty_spill_bytes: AtomicUsize::new(0),
                     dirty_drained_notify: tokio::sync::Notify::new(),
+                    dirty_drain_lock: tokio::sync::Mutex::new(()),
+                    spill_seq: AtomicU64::new(1),
                     deleted_inodes: Mutex::new(std::collections::HashSet::new()),
                     pending_evictions: Mutex::new(std::collections::HashSet::new()),
                     upload_requeues: AtomicU64::new(0),
@@ -868,7 +938,9 @@ impl StudioVfs {
                 dir_prefetch,
                 prefetch_tx,
                 dirty_flush_tx,
-                max_dirty_bytes: 8 * 1024 * 1024 * 1024,
+                max_dirty_bytes,
+                max_spill_bytes,
+                spill_dir,
                 handle_table: HandleTable::new(),
                 janitor_lease,
                 janitor_interval,
@@ -994,6 +1066,232 @@ impl StudioVfs {
         let jitter_seed = op.object_id ^ Self::now_unix_millis();
         let jitter_ms = jitter_seed % jitter_max;
         capped.saturating_add(Duration::from_millis(jitter_ms))
+    }
+
+    fn spill_path_for(&self, ino: Ino, block_index: u32) -> PathBuf {
+        let seq = self.state.spill_seq.fetch_add(1, Ordering::Relaxed);
+        self.spill_dir.join(format!(
+            "{:016x}_{:08x}_{:016x}.spill",
+            ino, block_index, seq
+        ))
+    }
+
+    fn remove_spill_entry(&self, key: (Ino, u32)) -> Option<SpillEntry> {
+        let removed = self.state.dirty_spill.lock().remove(&key);
+        if let Some(ref entry) = removed {
+            self.state
+                .dirty_spill_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(entry.len))
+                })
+                .ok();
+            let _ = std::fs::remove_file(&entry.path);
+            self.state.dirty_drained_notify.notify_waiters();
+        }
+        removed
+    }
+
+    fn load_spill_block(&self, key: (Ino, u32)) -> VfsResult<Option<Bytes>> {
+        let entry = self.state.dirty_spill.lock().get(&key).cloned();
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        Ok(Some(Bytes::from(std::fs::read(&entry.path)?)))
+    }
+
+    fn spill_block(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
+        let path = self.spill_path_for(key.0, key.1);
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, &path)?;
+
+        if let Some(old) = self.state.dirty_spill.lock().insert(
+            key,
+            SpillEntry {
+                path: path.clone(),
+                len: data.len(),
+            },
+        ) {
+            self.state
+                .dirty_spill_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(old.len))
+                })
+                .ok();
+            let _ = std::fs::remove_file(old.path);
+        }
+        self.state
+            .dirty_spill_bytes
+            .fetch_add(data.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn current_content_epoch(&self, ino: Ino) -> VfsResult<u64> {
+        if let Some(attr) = self.state.dirty_attrs.lock().get(&ino) {
+            return Ok(attr.content_epoch);
+        }
+        Ok(self.meta.get_attr(ino)?.content_epoch)
+    }
+
+    fn logical_block_len(&self, file_size: u64, block_index: u32) -> usize {
+        let block_start = block_index as u64 * self.block_size as u64;
+        if block_start >= file_size {
+            return 0;
+        }
+        file_size
+            .saturating_sub(block_start)
+            .min(self.block_size as u64) as usize
+    }
+
+    fn clear_pending_block(&self, ino: Ino, block_index: u32) {
+        let _ = self.state.pending_blocks.lock().remove(&(ino, block_index));
+    }
+
+    fn trim_local_block_staging(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        new_len: usize,
+    ) -> VfsResult<bool> {
+        let mut changed = false;
+
+        {
+            let mut pending = self.state.pending_blocks.lock();
+            if let Some(block) = pending.get_mut(&(ino, block_index))
+                && block.data.len() > new_len
+            {
+                block.data.truncate(new_len);
+                block.dirty = true;
+                changed = true;
+            }
+        }
+
+        {
+            let mut dirty = self.state.dirty_mem.lock();
+            if let Some(current) = dirty.get(&(ino, block_index)).cloned()
+                && current.len() > new_len
+            {
+                self.state
+                    .dirty_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(current.len()))
+                    })
+                    .ok();
+                if new_len == 0 {
+                    let _ = dirty.remove(&(ino, block_index));
+                } else {
+                    dirty.insert((ino, block_index), current.slice(0..new_len));
+                    self.state.dirty_bytes.fetch_add(new_len, Ordering::Relaxed);
+                }
+                self.state.dirty_drained_notify.notify_waiters();
+                changed = true;
+            }
+        }
+
+        if let Some(current) = self.load_spill_block((ino, block_index))?
+            && current.len() > new_len
+        {
+            let _ = self.remove_spill_entry((ino, block_index));
+            if new_len > 0 {
+                self.spill_block((ino, block_index), current.slice(0..new_len))?;
+            }
+            changed = true;
+        }
+
+        Ok(changed)
+    }
+
+    fn load_local_block_bytes_sync(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        object_id: u64,
+    ) -> VfsResult<Option<Bytes>> {
+        if let Some(pending_block) = self.state.pending_blocks.lock().get(&(ino, block_index)) {
+            return Ok(Some(pending_block.data.clone().freeze()));
+        }
+        if let Some(data) = self.state.dirty_mem.lock().get(&(ino, block_index)) {
+            return Ok(Some(data.clone()));
+        }
+        if let Some(data) = self.load_spill_block((ino, block_index))? {
+            return Ok(Some(data));
+        }
+        Ok(self.block_cache.get_sync(object_id))
+    }
+
+    fn install_truncated_pending_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        data: Bytes,
+        new_len: usize,
+    ) {
+        self.clear_pending_block(ino, block_index);
+        let mut pending = self.state.pending_blocks.lock();
+        pending.insert(
+            (ino, block_index),
+            PendingBlock {
+                data: BytesMut::from(&data[..new_len]),
+                dirty: true,
+            },
+        );
+    }
+
+    async fn enqueue_dirty_blocks(&self, ino: Ino, blocks: Vec<(u32, Bytes)>) -> VfsResult<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let total: usize = blocks.iter().map(|(_, d)| d.len()).sum();
+
+        loop {
+            let dirty_bytes = self.state.dirty_bytes.load(Ordering::Relaxed);
+            if dirty_bytes.saturating_add(total) <= self.max_dirty_bytes {
+                {
+                    let mut dirty = self.state.dirty_mem.lock();
+                    for (block_index, data) in &blocks {
+                        if let Some(old) = dirty.insert((ino, *block_index), data.clone()) {
+                            self.state
+                                .dirty_bytes
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                    Some(v.saturating_sub(old.len()))
+                                })
+                                .ok();
+                        }
+                        let _ = self.remove_spill_entry((ino, *block_index));
+                    }
+                }
+                self.state.dirty_bytes.fetch_add(total, Ordering::Relaxed);
+                let _ = self.dirty_flush_tx.send(());
+                return Ok(());
+            }
+
+            let spill_bytes = self.state.dirty_spill_bytes.load(Ordering::Relaxed);
+            if spill_bytes.saturating_add(total) <= self.max_spill_bytes {
+                for (block_index, data) in blocks {
+                    {
+                        let mut dirty = self.state.dirty_mem.lock();
+                        if let Some(old) = dirty.remove(&(ino, block_index)) {
+                            self.state
+                                .dirty_bytes
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                    Some(v.saturating_sub(old.len()))
+                                })
+                                .ok();
+                        }
+                    }
+                    self.spill_block((ino, block_index), data)?;
+                }
+                self.state.dirty_drained_notify.notify_waiters();
+                let _ = self.dirty_flush_tx.send(());
+                return Ok(());
+            }
+
+            if let Ok(_guard) = self.state.dirty_drain_lock.try_lock() {
+                self.drain_dirty_mem_inner().await;
+            } else {
+                self.state.dirty_drained_notify.notified().await;
+            }
+        }
     }
 
     #[inline]
@@ -1427,7 +1725,9 @@ impl StudioVfs {
         {
             if new_size < attr.size {
                 // Truncate - may need to remove blocks
+                attr.content_epoch = attr.content_epoch.saturating_add(1);
                 self.truncate_blocks(ino, new_size, attr.size)?;
+                attr.committed_size = attr.committed_size.min(new_size);
             }
             attr.size = new_size;
             changed = true;
@@ -1504,6 +1804,7 @@ impl StudioVfs {
 
         // Remove blocks beyond new size (or all blocks when new_size == 0).
         for block_idx in first_block_to_remove..=old_last_block {
+            self.clear_pending_block(ino, block_idx);
             // Remove the block and get its ID for GC
             if let Some(object_id) = self.meta.remove_file_block(ino, block_idx)? {
                 // Mark old block for deletion (S3 cleanup via background GC)
@@ -1516,6 +1817,18 @@ impl StudioVfs {
 
                 // Immediately evict this block from all cache tiers.
                 self.evict_block_from_caches(ino, block_idx, object_id);
+            } else {
+                let _ = self.remove_spill_entry((ino, block_idx));
+                let mut dirty = self.state.dirty_mem.lock();
+                if let Some(data) = dirty.remove(&(ino, block_idx)) {
+                    self.state
+                        .dirty_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(data.len()))
+                        })
+                        .ok();
+                    self.state.dirty_drained_notify.notify_waiters();
+                }
             }
         }
 
@@ -1523,9 +1836,22 @@ impl StudioVfs {
         if new_size > 0 {
             let new_last_block = block_index_from_offset(new_size - 1, self.block_size);
             let last_block_offset = offset_within_block(new_size - 1, self.block_size);
+            let new_last_len = last_block_offset as usize + 1;
+            let trimmed_local = self.trim_local_block_staging(ino, new_last_block, new_last_len)?;
             if let Some(mut block_ref) = self.meta.get_file_block(ino, new_last_block)? {
+                if !trimmed_local
+                    && let Some(bytes) =
+                        self.load_local_block_bytes_sync(ino, new_last_block, block_ref.object_id)?
+                    && bytes.len() > new_last_len
+                {
+                    self.install_truncated_pending_block(ino, new_last_block, bytes, new_last_len);
+                }
                 block_ref.length = last_block_offset + 1;
-                block_ref.flags |= BlockFlags::PARTIAL_BLOCK;
+                if block_ref.length < self.block_size {
+                    block_ref.flags |= BlockFlags::PARTIAL_BLOCK;
+                } else {
+                    block_ref.flags.remove(BlockFlags::PARTIAL_BLOCK);
+                }
                 self.meta.set_file_block(ino, new_last_block, &block_ref)?;
             }
         }
@@ -2142,6 +2468,19 @@ impl StudioVfs {
                 );
             }
         }
+        {
+            let spill_keys: Vec<(Ino, u32)> = self
+                .state
+                .dirty_spill
+                .lock()
+                .keys()
+                .filter(|(i, _)| *i == ino)
+                .cloned()
+                .collect();
+            for key in spill_keys {
+                let _ = self.remove_spill_entry(key);
+            }
+        }
 
         // L1 + L2 — unified block cache: remove each object.
         // Blocks with a pending upload are pinned — schedule deferred eviction
@@ -2175,6 +2514,8 @@ impl StudioVfs {
     /// Called by `truncate_blocks()` for each block that is removed by a
     /// truncation.
     fn evict_block_from_caches(&self, ino: Ino, block_index: u32, object_id: u64) {
+        self.clear_pending_block(ino, block_index);
+
         // L1.5 — dirty memory buffer.
         {
             let mut dirty = self.state.dirty_mem.lock();
@@ -2188,6 +2529,7 @@ impl StudioVfs {
                 self.state.dirty_drained_notify.notify_waiters();
             }
         }
+        let _ = self.remove_spill_entry((ino, block_index));
 
         // L1 + L2 — unified block cache (defer if pinned for pending upload).
         if self.block_cache.is_pinned(object_id) {
@@ -2393,6 +2735,10 @@ impl StudioVfs {
             }
         }
 
+        if let Some(data) = self.load_spill_block((ino, block_index))? {
+            return Ok(data);
+        }
+
         // 3. Slab cache / S3
         self.read_block(ino, block_index).await
     }
@@ -2471,6 +2817,7 @@ impl StudioVfs {
             return Ok(0);
         }
 
+        let current_size = self.getattr(ino)?.size;
         let mut written = 0u64;
         let mut remaining = data.len();
         let mut current_offset = offset;
@@ -2494,6 +2841,12 @@ impl StudioVfs {
                 let existing_data = match self.read_block_if_exists(ino, block_index).await {
                     Ok(Some(d)) => d,
                     _ => Bytes::new(),
+                };
+                let logical_len = self.logical_block_len(current_size, block_index);
+                let existing_data = if existing_data.len() > logical_len {
+                    existing_data.slice(0..logical_len)
+                } else {
+                    existing_data
                 };
                 let mut pending = self.state.pending_blocks.lock();
                 // Double-check: another write call might have inserted while we loaded
@@ -2549,28 +2902,7 @@ impl StudioVfs {
         // Eagerly move full blocks into the dirty memory buffer so write() returns
         // immediately without waiting for object packaging or slab I/O.
         // The background slab flusher will process them asynchronously.
-        if !full_blocks.is_empty() {
-            let total: usize = full_blocks.iter().map(|(_, d)| d.len()).sum();
-            // Backpressure: wait until the flusher drains enough dirty bytes.
-            // Uses Notify for instant wakeup instead of polling with sleep().
-            while self
-                .state
-                .dirty_bytes
-                .load(Ordering::Relaxed)
-                .saturating_add(total)
-                > self.max_dirty_bytes
-            {
-                self.state.dirty_drained_notify.notified().await;
-            }
-            {
-                let mut dirty = self.state.dirty_mem.lock();
-                for (block_index, data) in full_blocks {
-                    dirty.insert((ino, block_index), data);
-                }
-            }
-            self.state.dirty_bytes.fetch_add(total, Ordering::Relaxed);
-            let _ = self.dirty_flush_tx.send(());
-        }
+        self.enqueue_dirty_blocks(ino, full_blocks).await?;
 
         Ok(written as u32)
     }
@@ -2584,6 +2916,10 @@ impl StudioVfs {
             if let Some(data) = dirty.get(&(ino, block_index)) {
                 return Ok(Some(data.clone()));
             }
+        }
+
+        if let Some(data) = self.load_spill_block((ino, block_index))? {
+            return Ok(Some(data));
         }
 
         // Get block reference from metadata
@@ -2632,27 +2968,7 @@ impl StudioVfs {
             blocks
         };
 
-        if !blocks_to_buffer.is_empty() {
-            let total: usize = blocks_to_buffer.iter().map(|(_, d)| d.len()).sum();
-            // Backpressure: wait until the flusher drains enough dirty bytes.
-            while self
-                .state
-                .dirty_bytes
-                .load(Ordering::Relaxed)
-                .saturating_add(total)
-                > self.max_dirty_bytes
-            {
-                self.state.dirty_drained_notify.notified().await;
-            }
-            {
-                let mut dirty = self.state.dirty_mem.lock();
-                for (block_index, data) in blocks_to_buffer {
-                    dirty.insert((ino, block_index), data);
-                }
-            }
-            self.state.dirty_bytes.fetch_add(total, Ordering::Relaxed);
-            let _ = self.dirty_flush_tx.send(());
-        }
+        self.enqueue_dirty_blocks(ino, blocks_to_buffer).await?;
 
         // Keep flush non-blocking for interactive UX: move data to dirty buffer
         // and commit attrs; background flusher materializes block refs asynchronously.
@@ -2697,10 +3013,15 @@ impl StudioVfs {
         info!("background slab flusher stopped");
     }
 
+    async fn drain_dirty_mem(&self) {
+        let _guard = self.state.dirty_drain_lock.lock().await;
+        self.drain_dirty_mem_inner().await;
+    }
+
     /// Two-phase batched drain of `dirty_mem`.
     ///
-    /// **Phase 1 (fast — sub-millisecond for 256 blocks):**
-    /// 1. Take up to 256 blocks from `dirty_mem`.
+    /// **Phase 1 (fast — sub-millisecond for a normal drain batch):**
+    /// 1. Take up to `STUDIOFS_MAX_DRAIN_BATCH` blocks from accepted local staging.
     /// 2. Allocate block IDs in one transaction (`next_block_ids`).
     /// 3. Write all block refs + counters + pending deletions in one
     ///    transaction (`flush_blocks_batch`) — 1 fsync instead of ~300.
@@ -2713,8 +3034,12 @@ impl StudioVfs {
     /// Write all blocks to L2 NVMe **in parallel** via `commit_l2_batch`.
     /// Does NOT affect `dirty_bytes` or backpressure.  Blocks are pinned in
     /// LRU and safe in L1 RAM until both L2 and S3 upload complete.
-    async fn drain_dirty_mem(&self) {
-        const MAX_DRAIN_BATCH: usize = 256;
+    async fn drain_dirty_mem_inner(&self) {
+        let max_drain_batch = std::env::var("STUDIOFS_MAX_DRAIN_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1024);
 
         // Keep draining in a loop as long as there is work — this avoids
         // waiting for the next timer tick / channel signal when the dirty
@@ -2723,7 +3048,14 @@ impl StudioVfs {
             // ── Step 1: snapshot keys + filter deleted inodes ────────────────
             let keys: Vec<(Ino, u32)> = {
                 let dirty = self.state.dirty_mem.lock();
-                dirty.keys().take(MAX_DRAIN_BATCH).cloned().collect()
+                let mut keys: Vec<(Ino, u32)> =
+                    dirty.keys().take(max_drain_batch).cloned().collect();
+                if keys.len() < max_drain_batch {
+                    let spill = self.state.dirty_spill.lock();
+                    let remaining = max_drain_batch - keys.len();
+                    keys.extend(spill.keys().take(remaining).cloned());
+                }
+                keys
             };
             if keys.is_empty() {
                 return;
@@ -2742,6 +3074,7 @@ impl StudioVfs {
                             .ok();
                         self.state.dirty_drained_notify.notify_waiters();
                     }
+                    let _ = self.remove_spill_entry((ino, block_index));
                     debug!(
                         "slab flusher: skipping deleted inode {} block {}",
                         ino, block_index
@@ -2753,7 +3086,19 @@ impl StudioVfs {
                     let dirty = self.state.dirty_mem.lock();
                     match dirty.get(&(ino, block_index)) {
                         Some(d) => d.clone(),
-                        None => continue,
+                        None => match self.load_spill_block((ino, block_index)) {
+                            Ok(Some(d)) => d,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                error!(
+                                    ino,
+                                    block_index,
+                                    error = %e,
+                                    "slab flusher: failed to load spill block"
+                                );
+                                return;
+                            }
+                        },
                     }
                 };
                 work.push((ino, block_index, data));
@@ -2804,7 +3149,8 @@ impl StudioVfs {
 
             // ── Step 4: stage L1 + submit uploads + free dirty_mem ───────────
             let mut l2_work: Vec<(u64, Bytes)> = Vec::with_capacity(work.len());
-            let mut upload_ops: Vec<(u64, u64, u64)> = Vec::with_capacity(work.len());
+            let mut upload_ops: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(work.len());
+            let mut epoch_cache = std::collections::HashMap::<Ino, u64>::new();
             let mut freed_bytes: usize = 0;
 
             {
@@ -2820,7 +3166,20 @@ impl StudioVfs {
 
                     // Queue upload submission.
                     let file_offset = block_index as u64 * self.block_size as u64;
-                    upload_ops.push((ino, file_offset, object_id));
+                    let content_epoch = if let Some(epoch) = epoch_cache.get(&ino) {
+                        *epoch
+                    } else {
+                        let epoch = match self.current_content_epoch(ino) {
+                            Ok(epoch) => epoch,
+                            Err(e) => {
+                                error!(ino, error = %e, "slab flusher: read content_epoch failed");
+                                return;
+                            }
+                        };
+                        epoch_cache.insert(ino, epoch);
+                        epoch
+                    };
+                    upload_ops.push((ino, file_offset, object_id, content_epoch));
 
                     // Remove from dirty_mem only if we are still looking at the same
                     // payload we drained. A concurrent write may have replaced this
@@ -2832,6 +3191,18 @@ impl StudioVfs {
                         .unwrap_or(false);
                     if remove_key && let Some(removed) = dirty.remove(&(ino, block_index)) {
                         freed_bytes += removed.len();
+                    }
+                    let spill_match = self
+                        .state
+                        .dirty_spill
+                        .lock()
+                        .get(&(ino, block_index))
+                        .cloned();
+                    if let Some(entry) = spill_match
+                        && let Ok(current) = std::fs::read(&entry.path)
+                        && current.as_slice() == data.as_ref()
+                    {
+                        let _ = self.remove_spill_entry((ino, block_index));
                     }
 
                     if let Some(ref old_block) = results[i].old_block {
@@ -2872,7 +3243,7 @@ impl StudioVfs {
             });
 
             // If we processed a full batch, there's likely more — loop immediately.
-            if batch_len < MAX_DRAIN_BATCH {
+            if batch_len < max_drain_batch {
                 return;
             }
         } // end loop
@@ -2962,7 +3333,8 @@ impl StudioVfs {
         // Also check metadata: after a remount, `deleted_inodes` is empty but
         // the inode may have been deleted in a prior session.  If the inode no
         // longer exists in the metadata store, the upload is stale.
-        let inode_gone = inode_deleted || self.meta.get_attr(op.ino).is_err();
+        let attr = self.meta.get_attr(op.ino).ok();
+        let inode_gone = inode_deleted || attr.is_none();
         if inode_gone {
             self.state
                 .upload_canceled_deleted
@@ -2980,6 +3352,24 @@ impl StudioVfs {
         // Coalescing: if this file block has already been replaced in metadata
         // with a newer object_id, skip uploading this stale one.
         let block_index = block_index_from_offset(op.offset, self.block_size);
+        if let Some(attr) = attr.as_ref()
+            && attr.content_epoch != op.content_epoch
+        {
+            self.state
+                .upload_canceled_stale
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                object_id = op.object_id,
+                ino = op.ino,
+                block_index,
+                queued_epoch = op.content_epoch,
+                current_epoch = attr.content_epoch,
+                "upload cancelled: stale content epoch"
+            );
+            self.block_cache.cancel_upload(&op, true);
+            self.state.pending_evictions.lock().remove(&op.object_id);
+            return Ok(());
+        }
         if let Ok(Some(current)) = self.meta.get_file_block(op.ino, block_index)
             && current.object_id != op.object_id
         {
@@ -3040,6 +3430,54 @@ impl StudioVfs {
             .await
             .map_err(|e| VfsError::Other(e.to_string()))?;
 
+        let current = self
+            .meta
+            .get_file_block(op.ino, block_index)
+            .map_err(VfsError::Meta)?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        match current {
+            Some(ref block_ref)
+                if block_ref.object_id == op.object_id
+                    && self
+                        .meta
+                        .get_attr(op.ino)
+                        .map(|attr| attr.content_epoch == op.content_epoch)
+                        .unwrap_or(false) =>
+            {
+                let committed = self
+                    .meta
+                    .commit_uploaded_block(op.ino, block_index, op.content_epoch, block_ref)
+                    .map_err(VfsError::Meta)?;
+                if !committed {
+                    self.meta
+                        .add_pending_deletion(op.object_id, timestamp)
+                        .map_err(VfsError::Meta)?;
+                    debug!(
+                        object_id = op.object_id,
+                        ino = op.ino,
+                        block_index,
+                        queued_epoch = op.content_epoch,
+                        "upload completion rejected by metadata precondition"
+                    );
+                }
+            }
+            _ => {
+                self.meta
+                    .add_pending_deletion(op.object_id, timestamp)
+                    .map_err(VfsError::Meta)?;
+                debug!(
+                    object_id = op.object_id,
+                    ino = op.ino,
+                    block_index,
+                    "upload completed for stale block, marked for deletion"
+                );
+            }
+        }
+
         self.block_cache.complete_upload(&op);
 
         // Post-upload cleanup: if the block was marked for deferred eviction
@@ -3050,6 +3488,10 @@ impl StudioVfs {
                 object_id = op.object_id,
                 "post-upload eviction: block removed (inode deleted)"
             );
+        } else if let Ok(Some(current)) = self.meta.get_file_block(op.ino, block_index)
+            && current.object_id != op.object_id
+        {
+            self.block_cache.remove_sync(op.object_id);
         }
 
         debug!(
@@ -3389,7 +3831,10 @@ impl StudioVfs {
         );
         loop {
             let before = self.state.dirty_bytes.load(Ordering::Relaxed);
-            if before == 0 && self.state.dirty_mem.lock().is_empty() {
+            if before == 0
+                && self.state.dirty_mem.lock().is_empty()
+                && self.state.dirty_spill.lock().is_empty()
+            {
                 break;
             }
             self.drain_dirty_mem().await;

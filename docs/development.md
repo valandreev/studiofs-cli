@@ -67,13 +67,13 @@ cargo test -p studiofs-data --test integration_test -- --ignored --nocapture
 
 1. Client A:
 ```bash
-studiofs init <name> ... --postgres <dsn>
+studiofs init <name> ... --meta <postgres-server-dsn>
 studiofs mount <name> <mount-point>
 ```
 
 2. Client B/C/...:
 ```bash
-studiofs discover <name> --postgres <dsn>
+studiofs discover <name> --meta <postgres-server-dsn>
 studiofs mount <name> <mount-point>
 ```
 

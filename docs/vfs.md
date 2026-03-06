@@ -26,7 +26,7 @@ Holds all runtime state:
 | `block_size` | 8 MiB | Block size (from format info) |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Max prefetch depth |
-| `max_dirty_bytes` | 8 GiB | Dirty memory limit before backpressure |
+| `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
 
 ## Write Path
 
@@ -36,14 +36,9 @@ Holds all runtime state:
 data arrives
   │
   ├─ Split into block-aligned chunks
-  ├─ Allocate block IDs (batch: next_block_ids)
-  ├─ Store in pending_blocks (per-inode HashMap)
-  ├─ Increment dirty_bytes counter
-  │
-  ├─ If dirty_bytes > max_dirty_bytes:
-  │    └─ Await dirty_drained_notify (backpressure)
-  │
-  └─ Update inode size if extending file
+  ├─ Store/merge in `pending_blocks`
+  ├─ Update local inode size
+  └─ Full blocks can be moved immediately into dirty staging
 ```
 
 ### 2. `flush(ino)` / `close(ino)`
@@ -51,7 +46,9 @@ data arrives
 ```
 pending_blocks for this inode
   │
-  ├─ Move all blocks to dirty_mem global pool
+  ├─ Move blocks into accepted local staging:
+  │    ├─ dirty_mem (RAM)
+  │    └─ ingress_spill (NVMe overflow)
   └─ Notify background flusher
 ```
 
@@ -60,24 +57,25 @@ pending_blocks for this inode
 Runs every 10ms, processes continuously while data exists:
 
 ```
-dirty_mem pool
+dirty_mem + ingress_spill
   │
-  ├─ Take batch of up to 256 blocks
+  ├─ Take batch of up to 1024 blocks
   │
-  ├─ Phase 1: L1 stage + metadata
-  │    ├─ cache.stage_l1(id, data) for each block
-  │    └─ meta.flush_blocks_batch() — single redb transaction
+  ├─ Phase 1: local metadata + L1 stage
+  │    ├─ allocate object ids
+  │    ├─ cache.stage_l1(id, data)
+  │    └─ meta.flush_blocks_batch()   ← local staged refs only
   │
   ├─ Phase 2: L2 commit (parallel)
   │    └─ cache.commit_l2_batch(blocks) — parallel NVMe writes
   │
   ├─ Phase 3: Upload enqueue
-  │    └─ cache.submit_upload(ino, offset, id) for each
+  │    └─ cache.submit_upload(..., content_epoch) for each
   │
   ├─ Decrement dirty_bytes
   ├─ Notify dirty_drained_notify (wake backpressured writers)
   │
-  └─ If batch was full (256), loop immediately
+  └─ If batch was full, loop immediately
 ```
 
 ### 4. Upload Worker
@@ -88,25 +86,32 @@ Consumes from upload queue channel:
 PendingUpload received
   │
   ├─ Read block from cache (L1 or L2)
+  ├─ Reject stale op if inode/content_epoch no longer match
   ├─ Build object (header + raw payload), compute xxh64 checksum
   ├─ PUT to S3 via UploadScheduler (AIMD + retry/timeout policy)
+  ├─ Commit remote-visible block only after upload success
   ├─ cache.complete_upload(pending) — unpin LRU entry
   │
   └─ On failure: requeue with backoff
 ```
+
+Remote-visible regular-file size advances through `committed_size`, not through
+the local foreground `size`.
 
 ## Read Path
 
 ### `read(ino, offset, size)`
 
 ```
-                         ┌─ pending_blocks (uncommitted)
-  lookup BlockRef   ──── ├─ dirty_mem (staged)
-  from metadata          └─ meta.get_file_block()
+  local metadata view ──┬─ staged `file_blocks`
+                        └─ fallback `committed_file_blocks`
          │
          ▼
-  resolve block data ─── ┌─ L1 memory cache
-  (first match wins)     ├─ L2 disk cache
+  resolve block data ─── ┌─ pending_blocks
+  (first match wins)     ├─ dirty_mem
+                         ├─ ingress_spill
+                         ├─ L1 memory cache
+                         ├─ L2 disk cache
                          └─ FetchScheduler → S3
          │
          ▼
@@ -229,11 +234,11 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 ## Backpressure
 
-When `dirty_bytes` exceeds `max_dirty_bytes` (8 GiB):
+When accepted local staging exceeds configured budget:
 
-1. `write()` and `flush()` await `dirty_drained_notify`
-2. Background flusher processes blocks and calls `notify_waiters()`
-3. Writers unblock with near-zero latency (no polling)
+1. StudioFS prefers spilling to NVMe ingress (`ingress_spill`)
+2. only after RAM + spill budget are exhausted do `write()` / `flush()` wait
+3. background flusher drains staged blocks and wakes waiters
 
 This prevents unbounded memory growth during sustained writes.
 

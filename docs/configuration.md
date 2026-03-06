@@ -18,7 +18,7 @@ studiofs init <name> \
   --bucket <s3-bucket> \
   --access-key <s3-access-key> \
   --secret-key <s3-secret-key> \
-  --postgres <postgres-dsn> \
+  --meta <postgres-server-dsn> \
   [--region <region>] \
   [--metadata-cache-ttl-secs <u64>] \
   [--metadata-flush-interval-secs <u64>] \
@@ -30,19 +30,21 @@ studiofs init <name> \
 Important:
 - `--metadata-*` endpoint/bucket/keys options are legacy and rejected.
 - PostgreSQL metadata backend is required.
+- StudioFS always uses database `studiofs` and will create it during `init` when permissions allow.
 
 ### `discover`
 
 Attaches another client to an existing PG-backed volume.
 
 ```bash
-studiofs discover <name> --postgres <postgres-dsn>
+studiofs discover <name> --meta <postgres-server-dsn>
 ```
 
 What it does:
-- reads volume snapshot from PostgreSQL metadata tables,
+- reads the latest remote-visible checkpoint from PostgreSQL,
 - creates local `redb` metadata DB for this client,
-- stores discovered `FormatInfo` locally.
+- stores discovered `FormatInfo` locally,
+- then normal runtime sync continues through PostgreSQL delta batches.
 
 ### `mount`
 
@@ -76,12 +78,6 @@ studiofs status <name>
 studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>]
 ```
 
-### `test`
-
-```bash
-studiofs test --entrypoint <s3-endpoint> --access-key <key> --secret-key <secret> [--region <region>] [--bucket <bucket>]
-```
-
 ### `destroy`
 
 ```bash
@@ -93,13 +89,13 @@ studiofs destroy <name> --local
 
 Client A:
 ```bash
-studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key minioadmin --secret-key minioadmin --postgres "host=100.123.245.11 port=5432 user=studiofs password=studiofs dbname=studiofs sslmode=disable"
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key minioadmin --secret-key minioadmin --meta "host=100.123.245.11 port=5432 user=studiofs password=studiofs sslmode=disable"
 studiofs mount projectfs Z:
 ```
 
 Client B:
 ```bash
-studiofs discover projectfs --postgres "host=100.123.245.11 port=5432 user=studiofs password=studiofs dbname=studiofs sslmode=disable"
+studiofs discover projectfs --meta "host=100.123.245.11 port=5432 user=studiofs password=studiofs sslmode=disable"
 studiofs mount projectfs Y:
 ```
 
@@ -113,7 +109,11 @@ studiofs mount projectfs Y:
 | `STUDIOFS_JANITOR_SKIP_NEWER_SECS` | `900` | Janitor grace window |
 | `STUDIOFS_JANITOR_MAX_DELETES` | `500` | Janitor delete cap |
 | `STUDIOFS_JANITOR_LEASE_TTL_SECS` | `2700` | Janitor lease TTL |
-| `STUDIOFS_PG_SYNC_POLL_SECS` | `2` | Background PG sync/flush loop period |
+| `STUDIOFS_PG_SYNC_POLL_SECS` | `2` | Background PG delta sync / flush loop period |
+| `STUDIOFS_PG_FLUSH_IDLE_MS` | `2000` | Idle grace before PG flush of accumulated local metadata events |
+| `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
+| `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
+| `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
 
 ### Testing
 
@@ -123,4 +123,4 @@ studiofs mount projectfs Y:
 | `STUDIOFS_MINIO_ACCESS_KEY` | `minioadmin` | Test access key |
 | `STUDIOFS_MINIO_SECRET_KEY` | `minioadmin` | Test secret key |
 | `STUDIOFS_MINIO_BUCKET` | `studiofs-test` | Test bucket |
-| `STUDIOFS_TEST_PG_DSN` | none | PG DSN for ignored PG tests |
+| `STUDIOFS_TEST_PG_DSN` | none | PostgreSQL server DSN for ignored PG tests; StudioFS uses DB `studiofs` |

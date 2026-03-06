@@ -1,58 +1,87 @@
 # Metadata Engine
 
-`studiofs-meta` provides synchronous metadata operations through `MetaEngine`.
+`studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
 
 ## Engines
 
 ### `RedbMetaEngine`
 
-Local embedded metadata store.
-- ACID transactions in local DB.
-- Source for foreground reads/writes in client path.
-- Contains inode/dentry/file_blocks/counters/xattrs/symlinks/event_log tables.
+Local embedded serving store.
+- ACID local transactions
+- foreground source of truth for the mounted client
+- stores inode attrs, dentries, staged blocks, committed blocks, xattrs, symlinks, counters, local event log
 
 ### `PgMetaEngine`
 
-Distributed metadata engine for multi-client mode.
+Distributed wrapper around `RedbMetaEngine`.
 
 Current behavior:
-- Foreground operations (`create`, `rename`, `unlink`, etc.): local `redb` only.
-- Every mutation appends to local event log.
-- Background worker batches pending mutations and flushes merged snapshot to PostgreSQL.
-- `sync_metadata()` is pull-only from PostgreSQL snapshot.
-- Eventual consistency across clients is achieved by ordered PostgreSQL transactions.
+- foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
+- local mutations append to the local metadata event log
+- background flush projects remote-visible deltas into PostgreSQL `event_log`
+- background pull applies only newer foreign delta batches
+- `metadata_state` is used as a bootstrap/checkpoint store, not the primary runtime sync channel
 
 ## Sync Model
 
-### Flush (background)
+### Local vs Remote-Visible State
 
-1. Read pending local events range from local event log.
-2. Open PostgreSQL transaction.
-3. Lock/read current remote snapshot.
-4. Merge pending local events over remote snapshot.
-5. Upsert merged snapshot into `metadata_state` with version increment.
-6. Update local `redb` with committed merged snapshot.
+For regular files StudioFS keeps two views:
+- local view:
+  - `size`
+  - staged `file_blocks`
+- remote-visible view:
+  - `committed_size`
+  - `committed_file_blocks`
 
-### Pull (`sync_metadata`)
+This is required so a client can finish local writes immediately while remote
+clients only see blocks that have actually finished uploading.
 
-- If no local pending mutations: pull newer snapshot from `metadata_state`.
-- If local pending exists: skip pull to avoid overwriting unflushed local changes.
+### Flush to PostgreSQL
 
-## PostgreSQL Tables (used)
+1. Read the pending local event range from the local event log.
+2. Project events into a remote-visible stream.
+3. Start a PostgreSQL transaction.
+4. Bump `metadata_state.version` and use that value as the batch cursor.
+5. Append projected events into `event_log`.
+6. Periodically refresh the remote-visible checkpoint in `metadata_state`.
+
+Events that stay local-only are not published as remote-visible deltas:
+- staged `SetFileBlock` / `SetFileBlocksBatch`
+- pending deletion churn
+- local regular-file `size` ahead of `committed_size`
+
+### Pull from PostgreSQL
+
+1. Load only rows with `batch_version > local_version`.
+2. Skip self batches (`client_id == self`).
+3. Apply foreign batches in order.
+4. Stop at the first batch that conflicts with local overlay inodes.
+
+This avoids replaying a client's own changes and avoids clobbering local staged
+writes with foreign state.
+
+## PostgreSQL Tables
 
 - `volumes`
-- `counters`
 - `event_log`
 - `metadata_state`
 
+`event_log` is the runtime delta stream. `metadata_state` stores:
+- the monotonic `version`
+- the latest remote-visible checkpoint snapshot
+
 ## Consistency
 
-- Local operations are immediate and synchronous (low latency).
-- Cross-client visibility is eventual.
-- Serialization/conflict resolution is handled by PostgreSQL transaction order.
+- local operations are synchronous and immediate for the current client
+- cross-client visibility is eventual
+- namespace visibility may arrive before all file blocks are committed
+- remote-visible file size advances only with committed blocks
+- stale async completions are rejected using `content_epoch` plus block identity checks
 
-## MetadataConfig (important fields)
+## MetadataConfig
 
+Important fields:
 - `backend = Postgres`
 - `postgres.url`
 - `postgres.volume_id`

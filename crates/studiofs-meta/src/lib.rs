@@ -5,6 +5,7 @@
 
 pub mod engine;
 pub mod events;
+pub mod pg_dsn;
 pub mod pg_engine;
 pub mod redb_engine;
 pub mod schema;
@@ -15,6 +16,9 @@ use std::sync::Arc;
 
 pub use engine::{BatchFlushEntry, BatchFlushResult, MetaEngine, MetaError, MetaResult};
 pub use events::MetaEvent;
+pub use pg_dsn::{
+    STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
+};
 pub use pg_engine::PgMetaEngine;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;

@@ -761,11 +761,17 @@ impl FileSystemContext for StudioFsContext {
             let ino = context.ino;
             let fh = context.fh;
             if fh != 0 {
-                if let Err(e) = self.spawn_wait(async move { vfs.flush_fh(fh).await }) {
-                    error!(ino, "cleanup flush_fh failed: {:?}", e);
-                }
-            } else if let Err(e) = self.spawn_wait(async move { vfs.flush(ino).await }) {
-                error!(ino, "cleanup flush failed: {:?}", e);
+                self.rt.spawn(async move {
+                    if let Err(e) = vfs.flush_fh(fh).await {
+                        error!(ino, "cleanup flush_fh failed: {:?}", e);
+                    }
+                });
+            } else {
+                self.rt.spawn(async move {
+                    if let Err(e) = vfs.flush(ino).await {
+                        error!(ino, "cleanup flush failed: {:?}", e);
+                    }
+                });
             }
         }
     }

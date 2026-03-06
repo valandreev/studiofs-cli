@@ -347,9 +347,10 @@ impl BlockCache {
     // =========================================================================
 
     /// Submit a block for async S3 upload.  Pins it in the LRU.
-    pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId) {
+    pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
         self.lru.pin(object_id);
-        self.upload_queue.submit(ino, offset, object_id);
+        self.upload_queue
+            .submit(ino, offset, object_id, content_epoch);
     }
 
     /// Submit multiple blocks for async S3 upload in a batch.
@@ -357,10 +358,11 @@ impl BlockCache {
     /// Each block is pinned in the LRU and a journal entry is written.
     /// More efficient than calling `submit_upload` in a loop because it
     /// avoids re-acquiring the LRU shard lock repeatedly.
-    pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId)]) {
-        for &(ino, offset, object_id) in ops {
+    pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
+        for &(ino, offset, object_id, content_epoch) in ops {
             self.lru.pin(object_id);
-            self.upload_queue.submit(ino, offset, object_id);
+            self.upload_queue
+                .submit(ino, offset, object_id, content_epoch);
         }
     }
 
@@ -399,6 +401,10 @@ impl BlockCache {
     /// Snapshot pending uploads from disk (for reconciliation).
     pub fn snapshot_pending_uploads(&self) -> Vec<PendingUpload> {
         self.upload_queue.snapshot_pending()
+    }
+
+    pub async fn flush_upload_journal(&self) {
+        self.upload_queue.flush_journal().await;
     }
 
     // =========================================================================
@@ -448,6 +454,7 @@ impl BlockCache {
     /// Graceful shutdown: persist LRU checkpoint.
     pub async fn shutdown(&self) {
         self.shutdown_notify.notify_waiters();
+        self.upload_queue.flush_journal().await;
 
         // Persist final checkpoint.
         let checkpoint_path = self.config.cache_dir.join("cache.meta");
@@ -778,7 +785,7 @@ mod tests {
 
         let data = Bytes::from_static(b"upload me");
         cache.put(100, data).await.unwrap();
-        cache.submit_upload(1, 0, 100);
+        cache.submit_upload(1, 0, 100, 0);
 
         let op = rx.recv().await.unwrap();
         assert_eq!(op.object_id, 100);

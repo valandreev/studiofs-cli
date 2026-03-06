@@ -1,7 +1,7 @@
 //! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
 use std::path::Path;
-use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine};
+use studiofs_meta::{FormatInfo, MetaEngine, RedbMetaEngine, ensure_studiofs_database};
 
 fn extract_format_info_from_snapshot(snapshot_bytes: &[u8]) -> anyhow::Result<FormatInfo> {
     let value: serde_json::Value = serde_json::from_slice(snapshot_bytes)
@@ -31,7 +31,8 @@ fn extract_format_info_from_snapshot(snapshot_bytes: &[u8]) -> anyhow::Result<Fo
                 .as_u64()
                 .ok_or_else(|| anyhow::anyhow!("snapshot format payload contains non-byte"))?;
             bytes.push(
-                u8::try_from(b).map_err(|_| anyhow::anyhow!("snapshot format byte out of range"))?,
+                u8::try_from(b)
+                    .map_err(|_| anyhow::anyhow!("snapshot format byte out of range"))?,
             );
         }
         let info: FormatInfo = serde_json::from_slice(&bytes)
@@ -44,11 +45,15 @@ fn extract_format_info_from_snapshot(snapshot_bytes: &[u8]) -> anyhow::Result<Fo
     ))
 }
 
-pub fn run(name: &str, postgres_dsn: &str, meta_dir: &Path) -> anyhow::Result<()> {
+pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let postgres_dsn = rt
+        .block_on(async { ensure_studiofs_database(meta_dsn).await })
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .metadata_dsn;
 
     let (volume_id, snapshot): (i64, Vec<u8>) = rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(postgres_dsn, tokio_postgres::NoTls)
+        let (client, connection) = tokio_postgres::connect(&postgres_dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
         let conn_task = tokio::spawn(async move {
@@ -85,7 +90,7 @@ pub fn run(name: &str, postgres_dsn: &str, meta_dir: &Path) -> anyhow::Result<()
         .postgres
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("discovered format is not postgres-backed"))?;
-    pg.url = postgres_dsn.to_string();
+    pg.url = postgres_dsn;
     pg.volume_id = volume_id;
 
     std::fs::create_dir_all(meta_dir)?;
@@ -117,4 +122,3 @@ pub fn run(name: &str, postgres_dsn: &str, meta_dir: &Path) -> anyhow::Result<()
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);
     Ok(())
 }
-

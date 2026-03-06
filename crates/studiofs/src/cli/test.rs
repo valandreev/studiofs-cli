@@ -1,13 +1,5 @@
 //! `studiofs test` — validate S3-compatible storage for StudioFS compatibility.
-//!
-//! Runs two suites:
-//!  • Data suite   — PUT/GET/HEAD/range-GET/DELETE at block sizes used by the VFS.
-//!  • Metadata suite — conditional PUT (if_match / if_not_exists), ETag round-trip.
-//!
-//! Without --bucket: a random bucket is created and deleted after the run.
-//! With --bucket:    the named bucket is used; temp objects are removed but the
-//!                   bucket is never deleted.  If the bucket is not accessible the
-//!                   test aborts immediately.
+//! Internal S3 compatibility probes used by `studiofs init`.
 
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
@@ -21,7 +13,6 @@ use opendal::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    io::Write as _,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -78,160 +69,6 @@ struct TestCase {
     name: String,
     status: Status,
     duration: Duration,
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    entrypoint: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-    existing_bucket: Option<&str>,
-) -> anyhow::Result<()> {
-    let uid = Uuid::new_v4().to_string();
-    let short = &uid[..8];
-    let prefix = format!("studiofs-test-run-{short}");
-    let effective_region = if region.is_empty() {
-        "us-east-1"
-    } else {
-        region
-    };
-
-    let rt = tokio::runtime::Runtime::new()?;
-
-    // ── Determine bucket and whether we own it ────────────────────────────────
-    let (bucket, owns_bucket) = match existing_bucket {
-        Some(name) => (name.to_string(), false),
-        None => (format!("studiofs-test-{short}"), true),
-    };
-
-    // ── Header ────────────────────────────────────────────────────────────────
-    println!("StudioFS Storage Compatibility Test");
-    println!("=====================================");
-    println!("  Endpoint   : {entrypoint}");
-    println!(
-        "  Region     : {}",
-        if region.is_empty() {
-            "us-east-1 (default)"
-        } else {
-            region
-        }
-    );
-    if owns_bucket {
-        println!("  Test bucket: {bucket}  (temporary — will be deleted after test)");
-    } else {
-        println!("  Test bucket: {bucket}  (existing — will NOT be deleted)");
-    }
-    println!();
-
-    // ── Create bucket (auto mode) or verify access (existing mode) ─────────────
-    if owns_bucket {
-        print!("  Creating bucket '{bucket}'... ");
-        std::io::stdout().flush().ok();
-        match rt.block_on(bucket_create(
-            entrypoint,
-            &bucket,
-            access_key,
-            secret_key,
-            effective_region,
-        )) {
-            Ok(()) => println!("OK"),
-            Err(e) => {
-                println!("FAIL\n");
-                eprintln!("  Error: {e}");
-                eprintln!();
-                eprintln!("  Cannot create bucket — aborting.");
-                eprintln!("  Tip: ensure credentials have s3:CreateBucket permissions,");
-                eprintln!("  or use --bucket to supply an existing bucket.");
-                return Ok(());
-            }
-        }
-    } else {
-        // Build a temporary operator just for the accessibility probe.
-        let probe_op = build_op(
-            entrypoint,
-            &bucket,
-            access_key,
-            secret_key,
-            effective_region,
-        )?;
-        let probe_key = format!("{prefix}/__probe__");
-
-        print!("  Verifying bucket '{bucket}' is accessible... ");
-        std::io::stdout().flush().ok();
-
-        if rt.block_on(is_bucket_reachable(&probe_op, &probe_key)) {
-            println!("OK");
-        } else {
-            println!("FAIL\n");
-            eprintln!("  Bucket '{bucket}' is not accessible — aborting test.");
-            eprintln!("  Tip: check the bucket name, endpoint, and credentials.");
-            return Ok(());
-        }
-    }
-    println!();
-
-    // ── Build operator for tests ──────────────────────────────────────────────
-    let op = build_op(
-        entrypoint,
-        &bucket,
-        access_key,
-        secret_key,
-        effective_region,
-    )?;
-
-    // ── Run test suites ───────────────────────────────────────────────────────
-    let mut cases: Vec<TestCase> = Vec::new();
-    println!("  Running tests...");
-    println!();
-    rt.block_on(run_connectivity(&op, &prefix, &mut cases));
-    rt.block_on(run_data_tests(&op, &prefix, &mut cases));
-    rt.block_on(run_metadata_tests(&op, &prefix, &mut cases));
-
-    // ── Cleanup ───────────────────────────────────────────────────────────────
-    println!();
-    println!("  Cleanup:");
-    print!("    Removing test objects under prefix '{prefix}/'... ");
-    std::io::stdout().flush().ok();
-    match rt.block_on(remove_prefix(&op, &prefix)) {
-        Ok(n) => println!("OK ({n} objects)"),
-        Err(e) => println!("WARN — {e}"),
-    }
-
-    if owns_bucket {
-        print!("    Deleting bucket '{bucket}'... ");
-        std::io::stdout().flush().ok();
-        match rt.block_on(bucket_delete(
-            entrypoint,
-            &bucket,
-            access_key,
-            secret_key,
-            effective_region,
-        )) {
-            Ok(()) => println!("OK"),
-            Err(e) => println!("WARN — {e}"),
-        }
-    } else {
-        println!("    Bucket '{bucket}' kept (--bucket mode).");
-    }
-
-    // ── Print report ──────────────────────────────────────────────────────────
-    print_report(&cases);
-
-    Ok(())
-}
-
-/// Returns `true` if the bucket is reachable.
-///
-/// A 404 (key not found) is considered reachable — the request reached the bucket.
-/// Any other error (auth failure, network error, no such bucket) → `false`.
-async fn is_bucket_reachable(op: &Operator, probe_key: &str) -> bool {
-    match op.stat(probe_key).await {
-        Ok(_) => true,
-        Err(e) => is_not_found(&e),
-    }
 }
 
 // ── Programmatic compatibility check API (used by `studiofs init`) ───────────

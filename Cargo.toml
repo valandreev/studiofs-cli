@@ -69,6 +69,7 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 home = "0.5"
 dotenvy = "0.15"
+url = "2"
 
 # Internal crates
 studiofs-meta = { path = "crates/studiofs-meta" }

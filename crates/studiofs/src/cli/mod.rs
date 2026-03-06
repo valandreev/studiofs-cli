@@ -1,7 +1,7 @@
 //! CLI command modules.
 
-pub mod discovery;
 pub mod destroy;
+pub mod discovery;
 pub mod init;
 pub mod janitor;
 pub mod mount;

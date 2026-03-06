@@ -74,8 +74,9 @@ fn init_winfsp_dll_path() {
 #[command(about = "Mount S3-compatible storage as a local filesystem")]
 #[command(long_about = "\
 StudioFS — a high-performance, cross-platform virtual filesystem backed by \
-S3-compatible cloud storage. It combines the scalability of object storage with \
-multi-tier caching (memory + disk) for near-local access speeds.
+S3-compatible cloud storage for file data and PostgreSQL for shared metadata. \
+It combines the scalability of object storage with multi-tier caching (memory + \
+disk) and a distributed metadata backend for multi-client mounts.
 
 Supported platforms:
   • Windows  (via WinFSP)
@@ -86,9 +87,14 @@ Supported S3 backends:
   AWS S3, MinIO, Google Cloud Storage, Wasabi, Backblaze B2, and any S3-compatible service.")]
 #[command(after_help = "\
 EXAMPLES:
-  Initialize a new volume with MinIO:
+  Initialize a new volume with MinIO + PostgreSQL:
     studiofs init myvolume --endpoint http://127.0.0.1:9000 \\
-      --bucket mybucket --access-key minioadmin --secret-key minioadmin
+      --bucket mybucket --access-key minioadmin --secret-key minioadmin \\
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432
+
+  Discover the same volume on another machine/client:
+    studiofs discover myvolume \\
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
   Mount on Windows (drive letter):
     studiofs mount myvolume Z:
@@ -139,51 +145,54 @@ struct Cli {
 enum Commands {
     /// Initialize a new filesystem volume
     #[command(long_about = "\
-Initialize a new filesystem volume by creating a local metadata database and \
-storing connection details for data + metadata stores.
+Initialize a new filesystem volume by validating S3 object storage, creating \
+shared PostgreSQL metadata state, and bootstrapping the local metadata cache \
+for the current client.
 
 Path layout is fixed by disk name:
-  • Data objects:     <disk-name>/objects/...
-  • Metadata manifest <disk-name>/metadata/manifest.json
+  • Data objects: <disk-name>/objects/...
 
-The target S3 bucket must already exist — this command does not create it.")]
+`--meta` is required and must point at the PostgreSQL server. StudioFS always \
+stores metadata in database `studiofs`; it will create that database during \
+`init` when the server allows it. S3-backed metadata manifests and Tonbo/NATS \
+metadata flows are no longer supported.
+
+The target S3 bucket is created automatically if it does not exist and the \
+provided credentials allow it.")]
     #[command(after_help = "\
 EXAMPLES:
-  AWS S3:
+  AWS S3 + PostgreSQL:
     studiofs init prod --endpoint https://s3.amazonaws.com \\
-      --bucket my-bucket --access-key AKIA... --secret-key wJal... --region us-east-1
+      --bucket my-bucket --access-key AKIA... --secret-key wJal... \\
+      --region us-east-1 --meta postgres://user:pass@db:5432
 
-  MinIO (local):
+  MinIO (local) + PostgreSQL:
     studiofs init dev --endpoint http://127.0.0.1:9000 \\
-      --bucket test-bucket --access-key minioadmin --secret-key minioadmin
-
-  Separate metadata backend/bucket:
-    studiofs init prod --endpoint https://s3.us-east-1.amazonaws.com \\
-      --bucket data-bucket --access-key DATA_KEY --secret-key DATA_SECRET \\
-      --metadata-endpoint http://127.0.0.1:9000 \\
-      --metadata-bucket meta-bucket --metadata-access-key minioadmin \\
-      --metadata-secret-key minioadmin
+      --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
   Custom block size (16 MiB instead of default 8 MiB):
     studiofs init custom --endpoint http://127.0.0.1:9000 \\
       --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432 \\
       --block-size 16MB
 
   Multi-client tuning (aggressive convergence):
     studiofs init teamdisk --endpoint http://127.0.0.1:9000 \\
       --bucket data-bucket --access-key minioadmin --secret-key minioadmin \\
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432 \\
       --metadata-cache-ttl-secs 5 --metadata-flush-interval-secs 15 \\
       --metadata-flush-ops-threshold 20 --metadata-flush-bytes-threshold 262144
 ")]
     Init {
-        /// Disk name (used in object paths like <name>/objects and <name>/metadata)
+        /// Disk name (used in object paths like <name>/objects)
         name: String,
 
         /// S3 endpoint URL (e.g. https://s3.amazonaws.com, http://127.0.0.1:9000)
         #[arg(long)]
         endpoint: String,
 
-        /// S3 bucket name (must already exist)
+        /// S3 bucket name for file data (created if missing when permissions allow)
         #[arg(long)]
         bucket: String,
 
@@ -199,28 +208,28 @@ EXAMPLES:
         #[arg(long, default_value = "")]
         region: String,
 
-        /// Metadata endpoint URL (separate store; if omitted, re-uses the data endpoint/bucket)
-        #[arg(long)]
+        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        #[arg(long, hide = true)]
         metadata_endpoint: Option<String>,
 
-        /// PostgreSQL DSN for metadata backend (switches metadata backend to Postgres)
-        #[arg(long)]
-        postgres: Option<String>,
+        /// PostgreSQL server DSN; StudioFS uses database `studiofs`
+        #[arg(long = "meta", required = true)]
+        meta: Option<String>,
 
-        /// Metadata bucket (required when --metadata-endpoint is provided)
-        #[arg(long)]
+        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        #[arg(long, hide = true)]
         metadata_bucket: Option<String>,
 
-        /// Metadata access key (required when --metadata-endpoint is provided)
-        #[arg(long)]
+        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        #[arg(long, hide = true)]
         metadata_access_key: Option<String>,
 
-        /// Metadata secret key (required when --metadata-endpoint is provided)
-        #[arg(long)]
+        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        #[arg(long, hide = true)]
         metadata_secret_key: Option<String>,
 
-        /// Metadata region (optional, defaults to empty)
-        #[arg(long)]
+        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        #[arg(long, hide = true)]
         metadata_region: Option<String>,
 
         /// Metadata cache TTL in seconds (read-through refresh window).
@@ -246,19 +255,35 @@ EXAMPLES:
     },
 
     /// Discover an existing PostgreSQL-backed volume and create local metadata for this client
+    #[command(long_about = "\
+Download the latest PostgreSQL checkpoint for an existing shared volume and \
+create the local metadata cache for this client.
+
+Use this on additional machines or user profiles after the volume was created \
+with `studiofs init`. Runtime convergence after discovery continues through \
+PostgreSQL delta batches.")]
+    #[command(after_help = "\
+EXAMPLES:
+  Discover a volume from PostgreSQL:
+    studiofs discover myvolume \\
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432
+")]
     Discover {
         /// Volume name to discover
         name: String,
 
-        /// PostgreSQL DSN (e.g. postgres://user:pass@host:5432/db)
-        #[arg(long)]
-        postgres: String,
+        /// PostgreSQL server DSN; StudioFS uses database `studiofs`
+        #[arg(long = "meta")]
+        meta: String,
     },
 
     /// Mount a filesystem volume as a local drive
     #[command(long_about = "\
 Mount a previously initialized volume. On Windows, the mount point is a drive \
 letter (e.g. Z:). On Linux/macOS, it is an existing directory path.
+
+The local client uses its cached metadata database while synchronizing shared \
+state through PostgreSQL.
 
 The process blocks while the filesystem is mounted. Press Ctrl+C to unmount.")]
     #[command(after_help = "\
@@ -320,7 +345,7 @@ EXAMPLES:
         mount_point: String,
     },
 
-    /// Show volume status and statistics
+    /// Show volume status, PostgreSQL metadata binding, and local counters
     #[command(after_help = "\
 EXAMPLES:
   studiofs status myvolume
@@ -361,62 +386,12 @@ EXAMPLES:
         #[arg(long, default_value_t = 500)]
         max_deletes: u64,
     },
-    /// Test S3-compatible storage for StudioFS compatibility
-    #[command(long_about = "\
-Tests whether an S3-compatible backend is suitable for StudioFS by running:
-  • Data suite   — PUT/GET/HEAD/range-GET/DELETE at block sizes (1 KB, 4 MB)
-  • Metadata suite — conditional PUT (If-Match, If-None-Match) and ETag round-trip
-
-Without --bucket: a temporary bucket is created and deleted after the run.
-  Credentials must include s3:CreateBucket + s3:DeleteBucket.
-
-With --bucket: the specified bucket is used as-is. Temporary objects are removed
-  after the run, but the bucket itself is never deleted. If the bucket is not
-  accessible the test is aborted immediately.")]
-    #[command(after_help = "\
-EXAMPLES:
-  MinIO (local, auto-create bucket):
-    studiofs test --entrypoint http://127.0.0.1:9000 \\
-      --access-key minioadmin --secret-key minioadmin
-
-  Use an existing bucket (bucket is not deleted after test):
-    studiofs test --entrypoint http://127.0.0.1:9000 \\
-      --access-key minioadmin --secret-key minioadmin --bucket my-bucket
-
-  AWS S3:
-    studiofs test --entrypoint https://s3.us-east-1.amazonaws.com \\
-      --access-key AKIA... --secret-key wJal... --region us-east-1
-
-  Wasabi:
-    studiofs test --entrypoint https://s3.wasabisys.com \\
-      --access-key KEY --secret-key SECRET --region us-east-1
-")]
-    Test {
-        /// S3 endpoint URL (e.g. https://s3.amazonaws.com, http://127.0.0.1:9000)
-        #[arg(long)]
-        entrypoint: String,
-
-        /// S3 access key ID
-        #[arg(long)]
-        access_key: String,
-
-        /// S3 secret access key
-        #[arg(long)]
-        secret_key: String,
-
-        /// S3 region (defaults to us-east-1)
-        #[arg(long, default_value = "us-east-1")]
-        region: String,
-
-        /// Use an existing bucket for the test. Temp objects are cleaned up but the
-        /// bucket itself is never deleted. If not set, a random bucket is created and
-        /// removed after the run.
-        #[arg(long)]
-        bucket: Option<String>,
-    },
     /// Permanently destroy a volume
     #[command(long_about = "\
-Permanently destroy a volume, deleting all data from S3 and removing local metadata.
+Permanently destroy a volume, deleting all data objects from S3, removing the \
+shared PostgreSQL metadata for that volume, and deleting local metadata/cache \
+for this client.
+
 WARNING: This action is irreversible.")]
     Destroy {
         /// Volume name to destroy
@@ -453,7 +428,7 @@ fn main() -> anyhow::Result<()> {
             secret_key,
             region,
             metadata_endpoint,
-            postgres,
+            meta,
             metadata_bucket,
             metadata_access_key,
             metadata_secret_key,
@@ -472,7 +447,7 @@ fn main() -> anyhow::Result<()> {
                 &access_key,
                 &secret_key,
                 &region,
-                postgres.as_deref(),
+                meta.as_deref(),
                 metadata_endpoint.as_deref(),
                 metadata_bucket.as_deref(),
                 metadata_access_key.as_deref(),
@@ -486,9 +461,9 @@ fn main() -> anyhow::Result<()> {
                 block_size.as_deref(),
             )?;
         }
-        Commands::Discover { name, postgres } => {
+        Commands::Discover { name, meta } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::discovery::run(&name, &postgres, &meta_dir)?;
+            cli::discovery::run(&name, &meta, &meta_dir)?;
         }
         Commands::Mount {
             name,
@@ -517,21 +492,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Status { name } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::status::run(&name, &meta_dir)?;
-        }
-        Commands::Test {
-            entrypoint,
-            access_key,
-            secret_key,
-            region,
-            bucket,
-        } => {
-            cli::test::run(
-                &entrypoint,
-                &access_key,
-                &secret_key,
-                &region,
-                bucket.as_deref(),
-            )?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
