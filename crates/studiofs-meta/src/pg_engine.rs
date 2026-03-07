@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 static NEXT_PG_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// PostgreSQL-backed metadata engine.
@@ -15,6 +16,8 @@ static NEXT_PG_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 /// - local `redb` remains the foreground serving store
 /// - PostgreSQL `event_log` is the runtime delta stream
 /// - PostgreSQL `metadata_state` stores bootstrap/checkpoint snapshots
+/// - foreign namespace/attr state is applied into local `base_*`
+/// - local serving remains `overlay over base`
 /// - foreign batches are pulled in `batch_version` order
 pub struct PgMetaEngine {
     local: Arc<RedbMetaEngine>,
@@ -33,6 +36,15 @@ pub struct PgMetaEngine {
     force_flush: std::sync::atomic::AtomicBool,
     pending_event_start: Mutex<Option<u64>>,
     pending_event_end: AtomicU64,
+}
+
+struct OverlayConflictSets {
+    block_inodes: HashSet<Ino>,
+    attr_inodes: HashSet<Ino>,
+    dentry_keys: HashSet<Vec<u8>>,
+    symlink_inodes: HashSet<Ino>,
+    xattr_inodes: HashSet<Ino>,
+    xattr_keys: HashSet<Vec<u8>>,
 }
 
 impl PgMetaEngine {
@@ -187,51 +199,224 @@ impl PgMetaEngine {
         out
     }
 
-    fn event_conflicts_with_overlay(
+    fn aux_event_conflicts_with_overlay(
         &self,
         event: &MetaEvent,
-        overlay_inodes: &HashSet<Ino>,
+        overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         let conflict = match event {
-            MetaEvent::SetAttr { attr } => overlay_inodes.contains(&attr.ino),
-            MetaEvent::RemoveAttr { ino }
-            | MetaEvent::SetFileBlock { ino, .. }
-            | MetaEvent::RemoveFileBlock { ino, .. }
+            MetaEvent::RemoveAttr { ino } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+                    || overlay.xattr_inodes.contains(ino)
+            }
+            MetaEvent::SetFileBlock { .. } => false,
+            MetaEvent::RemoveFileBlock { ino, .. }
             | MetaEvent::RemoveFileBlocks { ino }
-            | MetaEvent::CommitFileBlock { ino, .. }
-            | MetaEvent::SetSymlinkTarget { ino, .. }
-            | MetaEvent::SetXattr { ino, .. }
-            | MetaEvent::RemoveXattr { ino, .. } => overlay_inodes.contains(ino),
+            | MetaEvent::CommitFileBlock { ino, .. } => overlay.block_inodes.contains(ino),
+            MetaEvent::SetSymlinkTarget { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+            }
+            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.xattr_keys.contains(&Self::xattr_key(*ino, name))
+            }
             MetaEvent::SetFileBlocksBatch { blocks } => blocks
                 .iter()
-                .any(|(ino, _, _)| overlay_inodes.contains(ino)),
-            MetaEvent::AddEntry { entry, .. } | MetaEvent::RenameEntry { entry, .. } => {
-                overlay_inodes.contains(&entry.ino)
-            }
-            MetaEvent::RemoveEntry { parent, name } => match self.local.lookup(*parent, name) {
-                Ok(entry) => overlay_inodes.contains(&entry.ino),
-                Err(MetaError::EntryNotFound { .. }) => false,
-                Err(e) => return Err(e),
-            },
-            MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => false,
+                .any(|(ino, _, _)| overlay.block_inodes.contains(ino)),
+            MetaEvent::SetAttr { .. }
+            | MetaEvent::AddEntry { .. }
+            | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RenameEntry { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. } => false,
         };
         Ok(conflict)
     }
 
-    fn batch_conflicts_with_overlay(
-        &self,
-        events: &[MetaEvent],
-        overlay_inodes: &HashSet<Ino>,
-    ) -> MetaResult<bool> {
-        if overlay_inodes.is_empty() {
-            return Ok(false);
+    fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
+        match event {
+            MetaEvent::RemoveAttr { .. }
+            | MetaEvent::RemoveFileBlock { .. }
+            | MetaEvent::RemoveFileBlocks { .. }
+            | MetaEvent::CommitFileBlock { .. }
+            | MetaEvent::SetSymlinkTarget { .. }
+            | MetaEvent::SetXattr { .. }
+            | MetaEvent::RemoveXattr { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. } => true,
+            MetaEvent::SetAttr { .. }
+            | MetaEvent::SetFileBlock { .. }
+            | MetaEvent::SetFileBlocksBatch { .. }
+            | MetaEvent::AddEntry { .. }
+            | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RenameEntry { .. } => false,
         }
-        for event in events {
-            if self.event_conflicts_with_overlay(event, overlay_inodes)? {
-                return Ok(true);
+    }
+
+    fn xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(8 + name.len());
+        key.extend_from_slice(&ino.to_le_bytes());
+        key.extend_from_slice(name);
+        key
+    }
+
+    fn dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(8 + name.len());
+        key.extend_from_slice(&parent.to_le_bytes());
+        key.extend_from_slice(name);
+        key
+    }
+
+    fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
+        Ok(OverlayConflictSets {
+            block_inodes: self.local.local_overlay_inodes()?,
+            attr_inodes: self.local.local_overlay_attr_inodes()?,
+            dentry_keys: self.local.local_overlay_dentries()?,
+            symlink_inodes: self.local.local_overlay_symlink_inodes()?,
+            xattr_inodes: self.local.local_overlay_xattr_inodes()?,
+            xattr_keys: self.local.local_overlay_xattr_keys()?,
+        })
+    }
+
+    fn serving_event_conflicts_with_overlay(
+        event: &MetaEvent,
+        overlay: &OverlayConflictSets,
+    ) -> bool {
+        match event {
+            MetaEvent::SetAttr { attr } => {
+                overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
+            }
+            MetaEvent::RemoveAttr { ino } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+                    || overlay.xattr_inodes.contains(ino)
+            }
+            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+                overlay
+                    .dentry_keys
+                    .contains(&Self::dentry_key(*parent, name))
+            }
+            MetaEvent::RenameEntry { .. } => false,
+            MetaEvent::SetSymlinkTarget { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+            }
+            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.xattr_keys.contains(&Self::xattr_key(*ino, name))
+            }
+            MetaEvent::SetFileBlock { .. }
+            | MetaEvent::RemoveFileBlock { .. }
+            | MetaEvent::RemoveFileBlocks { .. }
+            | MetaEvent::SetFileBlocksBatch { .. }
+            | MetaEvent::CommitFileBlock { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. } => false,
+        }
+    }
+
+    fn decode_foreign_batch(
+        rows: &[tokio_postgres::Row],
+        start_idx: usize,
+        client_id: &str,
+    ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
+        let batch_version: i64 = rows[start_idx].get(0);
+        let batch_client: Option<String> = rows[start_idx].get(3);
+        let is_self_batch = batch_client.as_deref() == Some(client_id);
+        let mut idx = start_idx;
+        let mut batch_events = Vec::new();
+
+        while idx < rows.len() {
+            let row_batch_version: i64 = rows[idx].get(0);
+            let row_client: Option<String> = rows[idx].get(3);
+            if row_batch_version != batch_version || row_client != batch_client {
+                break;
+            }
+            let payload: Vec<u8> = rows[idx].get(2);
+            let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
+                MetaError::Serialization(format!("postgres event decode failed: {e}"))
+            })?;
+            batch_events.push(event);
+            idx += 1;
+        }
+
+        Ok((batch_version, idx, batch_events, is_self_batch))
+    }
+
+    fn apply_foreign_batch(
+        &self,
+        batch_events: &[MetaEvent],
+        overlay: &OverlayConflictSets,
+    ) -> MetaResult<bool> {
+        self.local.apply_replica_events_to_base(batch_events)?;
+        let serving_events: Vec<MetaEvent> = batch_events
+            .iter()
+            .filter(|event| !Self::serving_event_conflicts_with_overlay(event, overlay))
+            .cloned()
+            .collect();
+        self.local.apply_replica_serving_state(&serving_events)?;
+        let mut aux_events = Vec::new();
+        for event in batch_events {
+            if !Self::event_has_aux_apply_effect(event) {
+                continue;
+            }
+            if !self.aux_event_conflicts_with_overlay(event, overlay)? {
+                aux_events.push(event.clone());
             }
         }
-        Ok(false)
+
+        if aux_events.is_empty() {
+            return Ok(false);
+        }
+
+        self.local.apply_replica_aux_state(&aux_events)?;
+        Ok(true)
+    }
+
+    fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
+        if batch_events.is_empty() {
+            return Ok(false);
+        }
+
+        self.local.apply_replica_events_to_base(batch_events)?;
+        for event in batch_events {
+            if let MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            {
+                self.local.reconcile_serving_rename_from_base(
+                    *parent,
+                    name,
+                    *new_parent,
+                    new_name,
+                    entry,
+                )?;
+            }
+        }
+        let aux_events: Vec<MetaEvent> = batch_events
+            .iter()
+            .filter(|event| Self::event_has_aux_apply_effect(event))
+            .cloned()
+            .collect();
+        if aux_events.is_empty() {
+            return Ok(false);
+        }
+
+        self.local.apply_replica_aux_state(&aux_events)?;
+        Ok(true)
     }
 
     fn pull_snapshot_locked(&self) -> MetaResult<bool> {
@@ -468,43 +653,19 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
-        let overlay_inodes = self.local.local_overlay_inodes()?;
+        let overlay = self.local_overlay_conflicts()?;
         let mut applied_any = false;
         let mut max_version = last_seq;
         let mut idx = 0;
         while idx < rows.len() {
-            let batch_version: i64 = rows[idx].get(0);
-            let batch_source: Option<String> = rows[idx].get(3);
-            let mut batch_events = Vec::new();
+            let (batch_version, next_idx, batch_events, is_self_batch) =
+                Self::decode_foreign_batch(&rows, idx, client_id.as_str())?;
+            idx = next_idx;
 
-            while idx < rows.len() {
-                let row_batch_version: i64 = rows[idx].get(0);
-                if row_batch_version != batch_version {
-                    break;
-                }
-                let payload: Vec<u8> = rows[idx].get(2);
-                let source_client: Option<String> = rows[idx].get(3);
-                if source_client.as_deref() != Some(client_id.as_str()) {
-                    let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
-                        MetaError::Serialization(format!("postgres event decode failed: {e}"))
-                    })?;
-                    batch_events.push(event);
-                }
-                idx += 1;
-            }
-
-            if batch_source.as_deref() == Some(client_id.as_str()) {
-                max_version = batch_version;
-                continue;
-            }
-
-            if self.batch_conflicts_with_overlay(&batch_events, &overlay_inodes)? {
-                break;
-            }
-
-            if !batch_events.is_empty() {
-                self.local.apply_replica_events(&batch_events)?;
-                applied_any = true;
+            if is_self_batch {
+                applied_any |= self.apply_visible_self_batch(&batch_events)?;
+            } else {
+                applied_any |= self.apply_foreign_batch(&batch_events, &overlay)?;
             }
             max_version = batch_version;
         }
@@ -636,7 +797,7 @@ impl MetaEngine for PgMetaEngine {
 
     fn sync_metadata(&self) -> MetaResult<()> {
         if self.pending_ops.load(Ordering::SeqCst) > 0 {
-            return Ok(());
+            return self.flush_metadata();
         }
         let _guard = self
             .op_lock
@@ -644,7 +805,7 @@ impl MetaEngine for PgMetaEngine {
             .map_err(|_| MetaError::Storage("pg op lock poisoned".to_string()))?;
         // Never overwrite local unflushed mutations with remote state.
         if self.pending_ops.load(Ordering::SeqCst) > 0 {
-            return Ok(());
+            return self.flush_metadata();
         }
         let _ = self.pull_foreign_events_locked()?;
         Ok(())
@@ -984,6 +1145,34 @@ mod tests {
         seed.init_root(0, 0).expect("init root");
     }
 
+    fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("meta.redb");
+        let local = Arc::new(RedbMetaEngine::open(&path).expect("open local redb"));
+        local.init_root(0, 0).expect("init root");
+
+        let engine = PgMetaEngine {
+            local,
+            postgres_url: "postgres://127.0.0.1:1/studiofs".to_string(),
+            volume_id: 1,
+            client_id: "unit-test".to_string(),
+            local_version: AtomicI64::new(0),
+            op_lock: Mutex::new(()),
+            poll_interval: Duration::from_secs(60),
+            flush_interval: Duration::from_secs(60),
+            flush_idle_grace: Duration::from_secs(60),
+            flush_ops_threshold: 8,
+            pending_ops: std::sync::atomic::AtomicU32::new(0),
+            pending_started_at: Mutex::new(None),
+            last_mutation_at: Mutex::new(None),
+            force_flush: std::sync::atomic::AtomicBool::new(false),
+            pending_event_start: Mutex::new(None),
+            pending_event_end: AtomicU64::new(0),
+        };
+
+        (dir, engine)
+    }
+
     fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
         run_async(async move {
             let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
@@ -1113,6 +1302,84 @@ mod tests {
             block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: 0,
         }
+    }
+
+    #[test]
+    fn test_local_overlay_conflicts_reserve_pending_xattr_and_symlink() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .local
+            .create_file(ROOT_INO, b"file.txt", 0, 0, 0o644)
+            .expect("create file");
+        let sym = pg
+            .local
+            .create_symlink(ROOT_INO, b"link.txt", b"target-a", 0, 0)
+            .expect("create symlink");
+
+        let baseline = pg
+            .local
+            .get_counter("nextEventSeq")
+            .expect("read baseline seq");
+        {
+            let mut start = pg.pending_event_start.lock().expect("pending_event_start");
+            *start = None;
+        }
+        pg.pending_event_end.store(0, Ordering::SeqCst);
+
+        pg.set_xattr(file.ino, b"user.color", b"red", 0)
+            .expect("set local xattr");
+        pg.set_symlink_target(sym.ino, b"target-b")
+            .expect("set local symlink");
+
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(
+            !overlay.block_inodes.contains(&file.ino),
+            "xattr reservation should not masquerade as block overlay"
+        );
+        assert!(overlay.symlink_inodes.contains(&sym.ino));
+        assert!(overlay.xattr_inodes.contains(&file.ino));
+        assert!(
+            overlay
+                .xattr_keys
+                .contains(&PgMetaEngine::xattr_key(file.ino, b"user.color"))
+        );
+        assert!(
+            !overlay
+                .xattr_keys
+                .contains(&PgMetaEngine::xattr_key(file.ino, b"user.other"))
+        );
+        assert!(
+            pg.aux_event_conflicts_with_overlay(
+                &MetaEvent::SetXattr {
+                    ino: file.ino,
+                    name: b"user.color".to_vec(),
+                    value: b"blue".to_vec(),
+                    flags: 0,
+                },
+                &overlay,
+            )
+            .expect("xattr conflict")
+        );
+        assert!(
+            pg.aux_event_conflicts_with_overlay(
+                &MetaEvent::SetSymlinkTarget {
+                    ino: sym.ino,
+                    target: b"target-c".to_vec(),
+                },
+                &overlay,
+            )
+            .expect("symlink conflict")
+        );
+
+        let start = pg
+            .pending_event_start
+            .lock()
+            .expect("pending_event_start")
+            .expect("pending start set");
+        let end = pg.pending_event_end.load(Ordering::SeqCst);
+        assert_eq!(start, baseline);
+        assert!(end > start);
     }
 
     #[test]
@@ -1285,6 +1552,175 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_committed_block_applies_despite_local_attr_overlay() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-committed-block-vs-attr-overlay");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote.bin",
+            Duration::from_secs(10)
+        ));
+
+        let b_file = b.lookup(ROOT_INO, b"remote.bin").expect("lookup on b");
+        let mut local_attr = b.get_attr(b_file.ino).expect("get local attr");
+        local_attr.size = 8192;
+        b.set_attr(&local_attr).expect("set local attr overlay");
+
+        let mut remote_attr = a.get_attr(file.ino).expect("get attr on a");
+        remote_attr.size = 4096;
+        a.set_attr(&remote_attr).expect("set remote size");
+        let block = BlockRef::new_partial(88, 4096);
+        a.set_file_block(file.ino, 0, &block)
+            .expect("set staged remote block");
+        assert!(
+            a.commit_uploaded_block(file.ino, 0, 0, &block)
+                .expect("commit remote block")
+        );
+        a.flush_metadata().expect("flush remote block");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            b.get_file_block(b_file.ino, 0)
+                .map(|block| block.map(|value| value.object_id == 88).unwrap_or(false))
+                .unwrap_or(false)
+        }));
+
+        let committed = b
+            .get_file_block(b_file.ino, 0)
+            .expect("get committed block on b")
+            .expect("committed block visible on b");
+        assert_eq!(committed.object_id, 88);
+
+        let attr_after = b.get_attr(b_file.ino).expect("get local attr after sync");
+        assert_eq!(
+            attr_after.size, 8192,
+            "local attr overlay should still mask remote size"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("meta.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-conflict-gap");
+        let info = volume.format_info();
+        seed_local(&db, &info);
+
+        let pg = PgMetaEngine::open(&db).expect("open pg");
+        let draft = pg
+            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+            .expect("create draft");
+        let mut draft_attr = pg.get_attr(draft.ino).expect("get draft attr");
+        draft_attr.size = 4096;
+        pg.set_attr(&draft_attr).expect("set staged size");
+        pg.set_file_block(draft.ino, 0, &BlockRef::new_partial(601, 4096))
+            .expect("set draft block");
+
+        let mut conflicted_attr = draft_attr.clone();
+        conflicted_attr.size = 8192;
+
+        let remote_ino = 1_234_567_890u64;
+        let remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 0, 0, 0o644);
+
+        let conflict_event = MetaEvent::SetAttr {
+            attr: conflicted_attr,
+        };
+        let add_event = MetaEvent::SetAttr {
+            attr: remote_attr.clone(),
+        };
+        let dentry_event = MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"unrelated.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: remote_ino,
+                kind: FileType::RegularFile,
+            },
+        };
+
+        let conflict_payload = postcard::to_stdvec(&conflict_event).expect("encode conflict event");
+        let add_payload = postcard::to_stdvec(&add_event).expect("encode add attr event");
+        let dentry_payload =
+            postcard::to_stdvec(&dentry_event).expect("encode unrelated dentry event");
+
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            client
+                .execute(
+                    "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                    VALUES ($1, 1, $2, $3, 'manual-foreign')",
+                    &[&volume.volume_id, &conflict_event.kind(), &conflict_payload],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(format!("insert conflict event failed: {e}")))?;
+
+            client
+                .execute(
+                    "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                    VALUES ($1, 2, $2, $3, 'manual-foreign')",
+                    &[&volume.volume_id, &add_event.kind(), &add_payload],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(format!("insert remote attr event failed: {e}")))?;
+            client
+                .execute(
+                    "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                    VALUES ($1, 2, $2, $3, 'manual-foreign')",
+                    &[&volume.volume_id, &dentry_event.kind(), &dentry_payload],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(format!("insert remote dentry event failed: {e}")))?;
+            conn_task.abort();
+            Ok(())
+        })
+        .expect("write synthetic remote batches");
+
+        pg.sync_metadata().expect("sync remote batches");
+        let remote = pg
+            .lookup(ROOT_INO, b"unrelated.txt")
+            .expect("lookup unrelated file");
+        assert_eq!(remote.ino, remote_ino);
+
+        let local = pg
+            .get_attr(draft.ino)
+            .expect("lookup local draft attr after sync");
+        assert_eq!(
+            local.size, 4096,
+            "conflicting foreign batch should not clobber local overlay"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_checkpoint_excludes_uncommitted_local_blocks() {
         let Some(dsn) = pg_dsn() else {
             return;
@@ -1330,6 +1766,189 @@ mod tests {
                 .is_empty(),
             "checkpoint must not leak local-only staged file blocks"
         );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_remote_unlink_removes_file_from_namespace_immediately() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-remote-unlink");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        a.create_file(ROOT_INO, b"remote-delete.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote-delete.txt",
+            Duration::from_secs(10)
+        ));
+
+        a.unlink(ROOT_INO, b"remote-delete.txt")
+            .expect("unlink on a");
+        a.flush_metadata().expect("flush unlink");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            b.lookup(ROOT_INO, b"remote-delete.txt").is_err()
+        }));
+        assert!(b.lookup(ROOT_INO, b"remote-delete.txt").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_remote_rename_overwrite_converges_to_source_inode() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-rename-overwrite");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let src = a
+            .create_file(ROOT_INO, b"src.txt", 0, 0, 0o644)
+            .expect("create src");
+        let dst = a
+            .create_file(ROOT_INO, b"dst.txt", 0, 0, 0o644)
+            .expect("create dst");
+        a.flush_metadata().expect("flush seed files");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"src.txt",
+            Duration::from_secs(10)
+        ));
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"dst.txt",
+            Duration::from_secs(10)
+        ));
+
+        a.rename(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt")
+            .expect("rename overwrite on a");
+        a.flush_metadata().expect("flush rename overwrite");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            b.lookup(ROOT_INO, b"src.txt").is_err()
+                && b.lookup(ROOT_INO, b"dst.txt")
+                    .map(|entry| entry.ino == src.ino)
+                    .unwrap_or(false)
+        }));
+
+        let on_b = b.lookup(ROOT_INO, b"dst.txt").expect("lookup dst on b");
+        assert_eq!(on_b.ino, src.ino);
+        assert_ne!(on_b.ino, dst.ino);
+        assert!(b.lookup(ROOT_INO, b"src.txt").is_err());
+        assert!(
+            b.get_attr(dst.ino).is_err(),
+            "overwritten inode should be removed"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_peer_can_rename_foreign_visible_base_entry() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-peer-rename-base");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
+            .expect("create on a");
+        a.flush_metadata().expect("flush create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote.txt",
+            Duration::from_secs(10)
+        ));
+
+        b.rename(ROOT_INO, b"remote.txt", ROOT_INO, b"renamed-by-b.txt")
+            .expect("rename on b");
+        b.flush_metadata().expect("flush rename on b");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.lookup(ROOT_INO, b"remote.txt").is_err()
+                && a.lookup(ROOT_INO, b"renamed-by-b.txt")
+                    .map(|entry| entry.ino == file.ino)
+                    .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_peer_can_unlink_foreign_visible_base_entry() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-peer-unlink-base");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        a.create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
+            .expect("create on a");
+        a.flush_metadata().expect("flush create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote.txt",
+            Duration::from_secs(10)
+        ));
+
+        b.unlink(ROOT_INO, b"remote.txt").expect("unlink on b");
+        b.flush_metadata().expect("flush unlink on b");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.lookup(ROOT_INO, b"remote.txt").is_err()
+        }));
     }
 
     #[test]
@@ -1754,6 +2373,114 @@ mod tests {
         assert_eq!(link.ino, sym.ino);
         let target = b.get_symlink_target(link.ino).expect("readlink");
         assert_eq!(target, b"target/path.txt");
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_peer_can_update_foreign_visible_symlink_target() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-peer-symlink-update");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let sym = a
+            .create_symlink(ROOT_INO, b"shared-link", b"target/a", 0, 0)
+            .expect("create symlink on a");
+        a.flush_metadata().expect("flush create on a");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"shared-link",
+            Duration::from_secs(10)
+        ));
+        assert_eq!(b.get_symlink_target(sym.ino).unwrap(), b"target/a");
+
+        b.set_symlink_target(sym.ino, b"target/b")
+            .expect("update symlink on b");
+        b.flush_metadata().expect("flush update on b");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.get_symlink_target(sym.ino)
+                .map(|target| target == b"target/b")
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_local_xattr_overlay_masks_foreign_update_until_flush() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-xattr-overlay-precedence");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"shared.txt", 0, 0, 0o644)
+            .expect("create file on a");
+        a.set_xattr(file.ino, b"user.color", b"red", 0)
+            .expect("set red xattr on a");
+        a.flush_metadata().expect("flush red on a");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"shared.txt",
+            Duration::from_secs(10)
+        ));
+        assert_eq!(
+            b.get_xattr(file.ino, b"user.color").unwrap(),
+            Some(b"red".to_vec())
+        );
+
+        b.set_xattr(file.ino, b"user.color", b"blue", 0)
+            .expect("set blue xattr on b");
+
+        a.set_xattr(file.ino, b"user.color", b"green", 0)
+            .expect("set green xattr on a");
+        a.flush_metadata().expect("flush green on a");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            b.get_xattr(file.ino, b"user.color")
+                .map(|value| value == Some(b"blue".to_vec()))
+                .unwrap_or(false)
+        }));
+        assert_eq!(
+            b.get_xattr(file.ino, b"user.color").unwrap(),
+            Some(b"blue".to_vec()),
+            "local xattr overlay should mask foreign base update"
+        );
+
+        b.flush_metadata().expect("flush blue on b");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.get_xattr(file.ino, b"user.color")
+                .map(|value| value == Some(b"blue".to_vec()))
+                .unwrap_or(false)
+        }));
     }
 
     #[test]

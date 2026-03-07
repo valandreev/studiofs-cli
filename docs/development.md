@@ -56,6 +56,14 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
+On Windows/PowerShell, clear proxy env before infra tests when MinIO/PG are
+directly reachable in LAN/VPN:
+
+```powershell
+Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY -ErrorAction SilentlyContinue
+$env:NO_PROXY='localhost,127.0.0.1,::1'
+```
+
 Targeted:
 ```bash
 cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1

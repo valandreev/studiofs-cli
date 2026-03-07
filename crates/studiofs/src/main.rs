@@ -124,6 +124,14 @@ ENV TUNING:
   STUDIOFS_UPLOAD_REQUEUE_BASE_MS   Base backoff for exhausted upload requeue (default: 5000).
   STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
   STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
+  STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background slab flusher wake interval (default: 10).
+  STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
+  STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
+  STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).
+  STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES  Wake checkpointing after this much uncheckpointed append churn (default: 64MiB).
+  STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS  Wake checkpointing after this many uncheckpointed ingress mutations (default: 128).
+  STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG  Wake checkpointing when active head is this many segments ahead of the last checkpoint (default: 2).
+  STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS  Wake checkpointing when live ingress refs span this many segments (default: 4).
   STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
   STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY  Upload slot cost when reads active (default: 4).
   STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 250).
@@ -349,10 +357,15 @@ EXAMPLES:
     #[command(after_help = "\
 EXAMPLES:
   studiofs status myvolume
+  studiofs status myvolume --cache-dir D:\\cache\\studiofs
 ")]
     Status {
         /// Volume name
         name: String,
+
+        /// Override local cache base directory (defaults to <meta-dir>/cache)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
 
     /// Scan data objects and remove orphaned ones (Phase 6 prototype)
@@ -489,9 +502,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Umount { mount_point } => {
             cli::umount::run(&mount_point)?;
         }
-        Commands::Status { name } => {
+        Commands::Status { name, cache_dir } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::status::run(&name, &meta_dir)?;
+            cli::status::run(&name, &meta_dir, cache_dir.as_deref())?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -646,6 +659,18 @@ mod tests {
     fn umount_requires_mount_point() {
         let result = parse(&["umount"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn status_parses_cache_dir() {
+        let cli = parse(&["status", "vol", "--cache-dir", "D:\\cache\\studiofs"]).unwrap();
+        match cli.command {
+            Commands::Status { name, cache_dir } => {
+                assert_eq!(name, "vol");
+                assert_eq!(cache_dir.unwrap(), PathBuf::from("D:\\cache\\studiofs"));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     // ── global flag propagation ──────────────────────────────────────────────

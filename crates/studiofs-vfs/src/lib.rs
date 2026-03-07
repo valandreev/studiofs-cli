@@ -15,5 +15,5 @@ pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use vfs::{
     KernelInvalidator, LockKind, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError,
-    VfsResult,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsResult,
 };

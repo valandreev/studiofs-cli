@@ -27,7 +27,7 @@ use studiofs_meta::{
     FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
     types::{BlockFlags, BlockRef},
 };
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
+use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane};
 
 // =============================================================================
 // Test Helpers
@@ -913,6 +913,847 @@ fn test_crash_recovery_replays_pending_journal() {
         pending_after, 0,
         "pending upload journals must be cleaned up after recovery"
     );
+}
+
+#[test]
+#[ignore]
+fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+
+    let volume_suffix = format!("spill-crash-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x11u8; 512 * 1024];
+    let replacement_payload = vec![0x22u8; baseline_payload.len()];
+    let mut ino = 0u64;
+    let mut baseline_object_id = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("expected committed block refs for baseline payload");
+            baseline_object_id = blocks[0].1.object_id;
+
+            let ds = DataStore::new(&data_config).unwrap();
+            let key = format_object_key(&format_info.data_prefix, baseline_object_id);
+            assert!(
+                wait_until_exists(&ds, &key, Duration::from_secs(15)).await,
+                "baseline object should be uploaded before overwrite crash test"
+            );
+
+            vfs.shutdown(Duration::from_secs(15)).await;
+        });
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_fetch_attempts = EnvRestore {
+        key: "STUDIOFS_FETCH_MAX_ATTEMPTS",
+        old: std::env::var("STUDIOFS_FETCH_MAX_ATTEMPTS").ok(),
+    };
+    let _restore_fetch_timeout = EnvRestore {
+        key: "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
+        old: std::env::var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS").ok(),
+    };
+    let _restore_upload_attempts = EnvRestore {
+        key: "STUDIOFS_UPLOAD_MAX_ATTEMPTS",
+        old: std::env::var("STUDIOFS_UPLOAD_MAX_ATTEMPTS").ok(),
+    };
+    let _restore_upload_timeout = EnvRestore {
+        key: "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
+        old: std::env::var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        // Keep this regression deterministic and fast when it accidentally
+        // falls back to remote fetch/upload paths.
+        std::env::set_var("STUDIOFS_FETCH_MAX_ATTEMPTS", "1");
+        std::env::set_var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS", "2");
+        std::env::set_var("STUDIOFS_UPLOAD_MAX_ATTEMPTS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "2");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let before = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(
+                before.len(),
+                1,
+                "baseline file should have one committed block"
+            );
+            assert_eq!(
+                before[0].1.object_id, baseline_object_id,
+                "baseline committed block must remain visible before overwrite"
+            );
+
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let after = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(
+                after[0].1.object_id, baseline_object_id,
+                "spill-backed overwrite must not advance metadata before simulated crash"
+            );
+            assert!(
+                segment_file_count(&spill_dir) > 0,
+                "flush should leave at least one ingress segment on disk before crash"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    assert!(
+        segment_file_count(&spill_dir) > 0,
+        "simulated crash should leave ingress segments for restart recovery"
+    );
+    let blocks_after_crash = meta.get_file_blocks(ino).unwrap();
+    assert_eq!(
+        blocks_after_crash[0].1.object_id, baseline_object_id,
+        "metadata should still point at baseline block after crash"
+    );
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let blocks = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(
+                blocks[0].1.object_id, baseline_object_id,
+                "restart should not require metadata flush before serving recovered spill"
+            );
+
+            let data = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(
+                data.as_ref(),
+                replacement_payload.as_slice(),
+                "read-after-restart should serve bytes from recovered spill overlay"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn test_ingress_prefers_spill_before_backpressure() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-preferred-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let attr = vfs.create(1, b"spill-first.bin", 0, 0, 0o644).unwrap();
+        let payload = vec![0x33u8; 512 * 1024];
+
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill,
+            "with RAM budget exhausted by config and spill budget available, acceptance should prefer spill"
+        );
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.spill_records > 0,
+            "flush should materialize at least one accepted spill record"
+        );
+        assert!(
+            stats.spill_bytes >= payload.len(),
+            "spill bytes should include the flushed payload"
+        );
+        assert!(
+            stats.forced_spill_blocks > 0,
+            "forced spill counter should advance when RAM budget is too small"
+        );
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "foreground should not accumulate backpressure wait while spill still has headroom"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(1).lane,
+            VfsIngressLane::Spill,
+            "small follow-up payloads should still prefer spill before entering backpressure"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_flush = EnvRestore {
+        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
+        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
+    };
+    let _restore_assist = EnvRestore {
+        key: "STUDIOFS_FOREGROUND_DRAIN_ASSIST",
+        old: std::env::var("STUDIOFS_FOREGROUND_DRAIN_ASSIST").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
+        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
+        std::env::set_var("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-backpressure-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let attr = vfs
+            .create(1, b"spill-backpressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x44u8; 512 * 1024];
+
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill,
+            "before spill is populated, the next payload should still fit into spill"
+        );
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.spill_bytes >= payload.len(),
+            "first payload should consume the configured spill budget"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Backpressure,
+            "once spill is full and RAM is over budget, the next payload should report backpressure"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-wait-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let payload = vec![0x55u8; 512 * 1024];
+
+        let first = vfs.create(1, b"spill-full.bin", 0, 0, 0o644).unwrap();
+        vfs.write(first.ino, 0, &payload).await.unwrap();
+        vfs.flush(first.ino).await.unwrap();
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Backpressure,
+            "after the first spill-backed flush, the same payload should hit backpressure"
+        );
+
+        let blocked_vfs = vfs.clone();
+        let blocked = tokio::spawn(async move {
+            let second = blocked_vfs.create(1, b"blocked.bin", 0, 0, 0o644).unwrap();
+            blocked_vfs.write(second.ino, 0, &payload).await.unwrap();
+            blocked_vfs.flush(second.ino).await.unwrap();
+        });
+        blocked.await.unwrap();
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.write_backpressure_wait_ms >= 100,
+            "foreground backpressure wait time should accumulate until the normal background drain tick releases space"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_flush = EnvRestore {
+        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
+        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "4MB");
+        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "5000");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-multi-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let writer_count = 4usize;
+        let payload = vec![0x66u8; 256 * 1024];
+
+        let mut tasks = Vec::new();
+        for idx in 0..writer_count {
+            let writer_vfs = vfs.clone();
+            let payload = payload.clone();
+            tasks.push(tokio::spawn(async move {
+                let name = format!("spill-writer-{idx}.bin");
+                let attr = writer_vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+                writer_vfs.flush(attr.ino).await.unwrap();
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.spill_records >= writer_count,
+            "concurrent writers should leave accepted spill-backed state while drain is blocked"
+        );
+        assert!(
+            stats.forced_spill_blocks >= writer_count as u64,
+            "each writer should contribute to forced spill accounting under RAM pressure"
+        );
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "foreground writers should not block while spill still has available capacity"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill,
+            "after concurrent accepted writes, spill should still be preferred until its budget is exhausted"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_multi_writer_spill_recovers_after_crash() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_flush = EnvRestore {
+        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
+        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "5000");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+    let volume_suffix = format!("spill-multi-crash-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let writer_count = 3usize;
+    let mut files: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(4)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let mut tasks = Vec::new();
+            for idx in 0..writer_count {
+                let writer_vfs = vfs.clone();
+                tasks.push(tokio::spawn(async move {
+                    let payload = vec![(0x70 + idx) as u8; 256 * 1024];
+                    let name = format!("spill-crash-{idx}.bin");
+                    let attr = writer_vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                    writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+                    writer_vfs.flush(attr.ino).await.unwrap();
+                    (attr.ino, payload)
+                }));
+            }
+
+            for task in tasks {
+                files.push(task.await.unwrap());
+            }
+
+            let stats = vfs.ingress_stats();
+            assert!(
+                stats.spill_records >= writer_count,
+                "concurrent writers should leave multiple accepted spill records before crash"
+            );
+            assert!(
+                segment_file_count(&spill_dir) > 0,
+                "segment directory should contain accepted records before crash"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    assert!(
+        segment_file_count(&spill_dir) > 0,
+        "simulated crash should leave ingress segments for accepted writers"
+    );
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let stats = vfs.ingress_stats();
+            assert!(
+                stats.spill_records >= writer_count,
+                "restart should recover all accepted spill-backed files into local staged state"
+            );
+
+            for (ino, payload) in &files {
+                let data = vfs.read(*ino, 0, payload.len() as u32).await.unwrap();
+                assert_eq!(
+                    data.as_ref(),
+                    payload.as_slice(),
+                    "read-after-restart should return recovered spill-backed bytes for every file"
+                );
+            }
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+#[ignore]
+fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+
+    let volume_suffix = format!("segment-crash-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x77u8; 512 * 1024];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            tokio::time::timeout(Duration::from_secs(15), vfs.write(ino, 0, &payload))
+                .await
+                .expect("write timed out in crash-recovery regression")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(15), vfs.flush(ino))
+                .await
+                .expect("flush timed out in crash-recovery regression")
+                .unwrap();
+        });
+        rt.shutdown_background();
+    }
+
+    for entry in std::fs::read_dir(&spill_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "spill") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let data =
+                tokio::time::timeout(Duration::from_secs(20), vfs.read(ino, 0, payload.len() as u32))
+                    .await
+                    .expect("read timed out in crash-recovery regression")
+                    .unwrap();
+            assert_eq!(
+                data.as_ref(),
+                payload.as_slice(),
+                "segment replay should recover accepted staged data even if legacy spill files are gone"
+            );
+        });
+        rt.shutdown_background();
+    }
 }
 
 // =============================================================================

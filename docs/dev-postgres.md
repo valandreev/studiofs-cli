@@ -9,6 +9,8 @@ Implemented:
 - foreground metadata reads/writes stay local in `redb`.
 - runtime cross-client sync uses delta batches in `event_log`.
 - `metadata_state` stores bootstrap/checkpoint snapshots, not the primary runtime stream.
+- foreign namespace, attrs, symlink targets, and xattrs land in local `base_*`.
+- foreground serving uses merged `overlay over base`.
 - remote-visible regular-file size is driven by `committed_size`.
 - stale upload completions are filtered by `content_epoch`.
 
@@ -21,8 +23,9 @@ server allows it.
 2. Local event log records pending metadata events.
 3. Background flush projects only remote-visible events into PostgreSQL `event_log`.
 4. Upload completion promotes blocks into `committed_file_blocks` and advances `committed_size`.
-5. Clients periodically pull only newer foreign batches.
-6. `metadata_state` is refreshed as a checkpoint for bootstrap and `discover`.
+5. Clients periodically pull only newer foreign batches and update local `base_*`.
+6. Foreign auxiliary events (`symlink`, `xattr`, committed blocks, GC state) apply event-by-event unless a local overlay for the same object is present.
+7. `metadata_state` is refreshed as a checkpoint for bootstrap and `discover`.
 
 ## PostgreSQL Objects Used
 
@@ -34,9 +37,11 @@ server allows it.
 
 - `event_log` is append-only.
 - batch ordering uses `batch_version`.
-- clients do not replay their own PG events back into local state.
+- self-published PG batches are consumed for base/remote-visible reconciliation only and do not overwrite local overlay state.
 - staged file blocks are never published as remote-visible deltas.
 - checkpoints must not leak local-only staged blocks.
+- local overlay wins for serving until it is flushed or cleared.
+- local symlink/xattr overlay and tombstones mask foreign base state until local convergence publishes them.
 
 ## Rationale
 

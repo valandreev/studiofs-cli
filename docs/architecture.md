@@ -29,24 +29,27 @@ studiofs (CLI)
 `PgMetaEngine` currently works like this:
 - bootstrap: load the latest remote-visible checkpoint from `metadata_state`
 - steady-state sync: exchange only ordered delta events through `event_log`
-- local client view: serve from local `redb`
+- local client view: serve merged `overlay over base` from local `redb`
 - foreign visibility: eventual, driven by background `flush_metadata()` / `sync_metadata()`
 
 Important invariants:
 - local `size` may be ahead of remote-visible `committed_size`
 - local staged `file_blocks` may be ahead of remote-visible `committed_file_blocks`
 - block data becomes remote-visible only after successful S3 upload completion
-- clients ignore their own echoed PostgreSQL events and pull only foreign deltas
+- local echoed PostgreSQL batches are applied only to remote-visible/base state reconciliation and do not clobber local overlay
+- foreign namespace/attr/symlink/xattr apply lands in local `base_*`
+- local mutations remain in overlay tables (`inodes`, `dentries`, `symlinks`, `xattrs`)
+- local tombstones hide remote-visible base state for dentries, symlinks, and xattrs
 
 ## High-Level Mutation Flow
 
 1. App calls a VFS mutation.
 2. StudioFS updates local metadata in `redb`.
-3. File payload enters local write staging (`pending_blocks`, `dirty_mem`, `ingress_spill`, cache).
+3. File payload enters local write staging (`pending_blocks`, `dirty_mem`, ingress live index backed by `ingress_spill/segments/`, cache).
 4. Background upload writes the object to S3.
 5. Upload completion promotes the block to remote-visible committed state.
 6. Metadata background flush projects remote-visible deltas to PostgreSQL `event_log`.
-7. Other clients pull only newer foreign batches and apply them to local `redb`.
+7. Other clients pull only newer foreign batches and apply remote-visible namespace/attrs/symlinks/xattrs to local `base_*`.
 8. `metadata_state` stores periodic checkpoints for bootstrap and `discover`.
 
 ## Write Path
@@ -61,21 +64,25 @@ Important invariants:
 This lets the local client see writes immediately while remote clients see a
 growing committed view.
 
+Ingress follow-up:
+- concrete first-slice scope is frozen in
+  [`nvme-ingress-first-slice.md`](./nvme-ingress-first-slice.md)
+
 ## Read Path
 
 Reads prefer local state in this order:
 1. `pending_blocks`
 2. `dirty_mem`
-3. `ingress_spill`
+3. ingress live index (`ingress_spill/segments/`)
 4. cache (L1/L2)
 5. S3 fetch
 
 Metadata lookups are served from local `redb`, where local staged blocks
-override committed blocks.
+override committed blocks, and local overlay attrs/dentries/symlinks/xattrs override the remote-visible base view.
 
 ## Concurrency Model
 
 - Tokio for async upload/fetch/background work
 - local locks for VFS/cache hot structures
 - PostgreSQL transaction order via `batch_version` for cross-client metadata ordering
-- inode-scoped overlay conflict handling for foreign batch application
+- overlay-scoped conflict handling for foreign batch auxiliary application (`inode attrs`, staged blocks, symlink targets, xattr keys)

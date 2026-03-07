@@ -114,6 +114,23 @@ studiofs mount projectfs Y:
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
 | `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
+| `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
+| `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |
+| `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Periodic ingress checkpoint cadence |
+| `STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES` | `64MB` | Immediate checkpoint trigger on uncheckpointed ingress bytes |
+| `STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS` | `128` | Immediate checkpoint trigger on ingress record mutations |
+| `STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG` | `2` | Checkpoint trigger when active segment runs too far ahead |
+| `STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS` | `4` | Checkpoint trigger when live ingress index spans too many segments |
+| `STUDIOFS_FETCH_MAX_ATTEMPTS` | `8` | Foreground fetch max retry attempts |
+| `STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS` | `45` | Per-attempt S3 GET timeout |
+| `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base backoff |
+| `STUDIOFS_FETCH_RETRY_MAX_MS` | `2000` | Fetch retry max backoff |
+| `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` | `4` | Prefetch fetch retry attempts |
+| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `75` | Max wait for prefetch AIMD permit before skipping |
+| `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Upload retry attempts |
+| `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-attempt upload timeout |
+| `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base backoff |
+| `STUDIOFS_UPLOAD_RETRY_MAX_MS` | `5000` | Upload retry max backoff |
 
 ### Testing
 

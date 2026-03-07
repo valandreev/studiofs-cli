@@ -6,6 +6,9 @@ Source of truth:
 Compatibility:
 - `crates/studiofs-meta/src/types.rs` re-exports from `schema.rs`
 
+Design reference:
+- [`base-overlay-design.md`](./base-overlay-design.md)
+
 ## Backend Modes
 
 - `MetadataBackend::RedbLocal`

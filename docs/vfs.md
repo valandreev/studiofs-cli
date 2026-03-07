@@ -9,9 +9,9 @@ Holds all runtime state:
 | Field | Type | Purpose |
 |-------|------|---------|
 | `meta` | `Arc<dyn MetaEngine>` | Metadata operations |
-| `data` | `DataStore` | S3 read/write (dedicated pools) |
-| `cache` | `Arc<BlockCache>` | L1 + L2 block cache |
-| `fetch` | `Arc<FetchScheduler>` | Adaptive S3 fetcher |
+| `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
+| `block_cache` | `Arc<BlockCache>` | L1 + L2 block cache |
+| `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Open files, dirty buffers, backpressure |
 
@@ -146,7 +146,7 @@ fetch_block(object_id)
   ├─ Register singleflight entry
   ├─ Acquire AIMD permit (may block if at capacity)
   │
-  ├─ S3 GET with configurable timeout (default 30s)
+  ├─ S3 GET with configurable timeout (default 45s)
   ├─ Decode object + verify checksum
   ├─ Populate L1 + L2 cache
   ├─ Resolve AIMD permit (success/failure)
@@ -174,6 +174,7 @@ Prefetch reads use `fetch_block_prefetch()`:
 ### Connection Warmup
 
 On startup, `warmup(timeout)` primes the HTTP connection pool by issuing 4 parallel lightweight S3 requests.
+Warmup runs in a background task and does not block `StudioVfs::new`.
 
 ## ReadAhead (`readahead.rs`)
 
@@ -199,8 +200,8 @@ Runtime tuning knobs:
 - `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `96`)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `250`, temporarily pauses prefetch after transport send errors)
 - `STUDIOFS_FETCH_PREFETCH_RESERVE` (default equals foreground reserve; prefetch cannot consume these slots)
-- `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `2`, prefetch retries are intentionally short)
-- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `25`)
+- `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
+- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
 On each `read()`:
 1. `record_read(ino, first_block, last_block)` returns blocks to prefetch
