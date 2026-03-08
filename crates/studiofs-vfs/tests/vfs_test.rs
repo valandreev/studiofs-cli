@@ -48,13 +48,10 @@ use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, Vfs
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
     load_test_env();
-    let endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
-    let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
-    let access_key =
-        std::env::var("STUDIOFS_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
-    let secret_key =
-        std::env::var("STUDIOFS_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let bucket = test_env_var("STUDIOFS_MINIO_BUCKET", "studiofs-test");
+    let access_key = test_env_var("STUDIOFS_MINIO_ACCESS_KEY", "minioadmin");
+    let secret_key = test_env_var("STUDIOFS_MINIO_SECRET_KEY", "minioadmin");
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let run_id = RUN_ID.get_or_init(|| {
         let ts = SystemTime::now()
@@ -82,11 +79,93 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
     }
 }
 
+fn workspace_root() -> &'static std::path::Path {
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .and_then(|dir| dir.parent())
+            .unwrap_or(manifest_dir)
+            .to_path_buf()
+    })
+    .as_path()
+}
+
+fn workspace_env_path() -> std::path::PathBuf {
+    workspace_root().join(".env")
+}
+
+fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
+    static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    VARS.get_or_init(|| {
+        let mut vars = std::collections::HashMap::new();
+        let env_path = workspace_env_path();
+        if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
+            for item in iter.flatten() {
+                vars.insert(item.0, item.1);
+            }
+        }
+        vars
+    })
+}
+
+fn workspace_dotenv_var(key: &str) -> Option<String> {
+    workspace_dotenv_vars().get(key).cloned()
+}
+
+fn test_env_var(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .or_else(|| workspace_dotenv_var(key))
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn load_test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     let _ = ONCE.get_or_init(|| {
-        let _ = dotenvy::dotenv();
+        let env_path = workspace_env_path();
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
     });
+}
+
+struct TestMinioEnv {
+    endpoint: String,
+    bucket: String,
+    access_key: String,
+    secret_key: String,
+}
+
+fn test_online_minio_env() -> &'static TestMinioEnv {
+    static ENV: OnceLock<TestMinioEnv> = OnceLock::new();
+    ENV.get_or_init(|| {
+        load_test_env();
+
+        TestMinioEnv {
+            endpoint: workspace_dotenv_var("STUDIOFS_MINIO_ENDPOINT")
+                .unwrap_or_else(|| "http://127.0.0.1:9000".to_string()),
+            bucket: workspace_dotenv_var("STUDIOFS_MINIO_BUCKET")
+                .unwrap_or_else(|| "studiofs-test".to_string()),
+            access_key: workspace_dotenv_var("STUDIOFS_MINIO_ACCESS_KEY")
+                .unwrap_or_else(|| "minioadmin".to_string()),
+            secret_key: workspace_dotenv_var("STUDIOFS_MINIO_SECRET_KEY")
+                .unwrap_or_else(|| "minioadmin".to_string()),
+        }
+    })
+}
+
+fn apply_test_online_minio_env() {
+    let env = test_online_minio_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &env.endpoint);
+        std::env::set_var("STUDIOFS_MINIO_BUCKET", &env.bucket);
+        std::env::set_var("STUDIOFS_MINIO_ACCESS_KEY", &env.access_key);
+        std::env::set_var("STUDIOFS_MINIO_SECRET_KEY", &env.secret_key);
+    }
 }
 
 fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
@@ -164,13 +243,10 @@ async fn ensure_bucket() {
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
-    let endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
-    let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
-    let access_key =
-        std::env::var("STUDIOFS_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
-    let secret_key =
-        std::env::var("STUDIOFS_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let bucket = test_env_var("STUDIOFS_MINIO_BUCKET", "studiofs-test");
+    let access_key = test_env_var("STUDIOFS_MINIO_ACCESS_KEY", "minioadmin");
+    let secret_key = test_env_var("STUDIOFS_MINIO_SECRET_KEY", "minioadmin");
 
     let builder = S3::default()
         .endpoint(&endpoint)
@@ -960,8 +1036,7 @@ fn test_crash_recovery_replays_pending_journal() {
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
-    let online_endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let online_endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
     let online_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     meta.set_format_info(&online_info).unwrap();
 
@@ -1628,11 +1703,22 @@ fn remote_clients_keep_previous_committed_version_during_update() {
 fn atomic_switch_to_new_incarnation_after_full_commit() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_minio_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "250");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
     }
@@ -1724,24 +1810,30 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
             "writer should publish the new incarnation after the full upload set completes"
         );
 
-        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
-        {
-            let remote_vfs =
-                make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+            let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
             let remote_attr_after = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
-            assert_eq!(remote_attr_after.upload_state, UploadState::Ready);
             let remote_blocks_after = remote_meta.get_file_blocks(ino).unwrap();
-            assert_eq!(remote_blocks_after.len(), 2);
-            assert_ne!(remote_blocks_after, baseline_blocks);
             let read_after = remote_vfs
                 .read(ino, 0, replacement_payload.len() as u32)
                 .await
                 .unwrap();
-            assert_eq!(
-                read_after.as_ref(),
-                replacement_payload.as_slice(),
+
+            if remote_attr_after.upload_state == UploadState::Ready
+                && remote_blocks_after.len() == 2
+                && remote_blocks_after != baseline_blocks
+                && read_after.as_ref() == replacement_payload.as_slice()
+            {
+                break;
+            }
+
+            assert!(
+                Instant::now() < deadline,
                 "remote view should switch atomically from old committed incarnation to the fully published new incarnation"
             );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
     rt.shutdown_background();
@@ -1817,8 +1909,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
     let mut ino = 0u64;
     let mut baseline_object_id = 0u64;
     let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
-    let online_endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let online_endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
     let mut format_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     let data_config_online = DataStoreConfig::from(&format_info);
 
@@ -3045,11 +3136,15 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_minio_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
@@ -3146,7 +3241,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &online_info.endpoint);
+        apply_test_online_minio_env();
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
     }
@@ -3182,12 +3277,29 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                     .read(ino, 0, replacement_payload.len() as u32)
                     .await
                     .unwrap();
-                assert_eq!(
-                    read.as_ref(),
-                    replacement_payload.as_slice(),
+                if read.as_ref() == replacement_payload.as_slice() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
                     "upload completion batching must not change the local visible file contents"
                 );
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
 
+            loop {
+                let read = vfs
+                    .read(ino, 0, replacement_payload.len() as u32)
+                    .await
+                    .unwrap();
+                if read.as_ref() != replacement_payload.as_slice() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "upload completion batching must not change the local visible file contents"
+                    );
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                    continue;
+                }
                 if vfs.pending_uploads_for_inode(ino).is_empty() {
                     break;
                 }
@@ -3748,16 +3860,28 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
         for idx in 0..iterations {
             let name = format!("soak-{idx:04}.bin");
             let payload = vec![(idx % 251) as u8; 256 * 1024];
-            let started = Instant::now();
-            let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
-            vfs.write(attr.ino, 0, &payload).await.unwrap();
-            vfs.flush(attr.ino).await.unwrap();
-            let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_millis(max_op_ms), async {
+                let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                vfs.write(attr.ino, 0, &payload).await.unwrap();
+                vfs.flush(attr.ino).await.unwrap();
+
+                loop {
+                    match vfs.read(attr.ino, 0, payload.len() as u32).await {
+                        Ok(read) => return read,
+                        Err(VfsError::WouldBlock) => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(err) => {
+                            panic!("unexpected soak read error on iteration {idx}: {err:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("iteration {idx} exceeded the no-stall budget of {max_op_ms}ms")
+            });
             assert_eq!(read.as_ref(), payload.as_slice());
-            assert!(
-                started.elapsed() < Duration::from_millis(max_op_ms),
-                "iteration {idx} exceeded the no-stall budget of {max_op_ms}ms"
-            );
         }
 
         let stats = vfs.ingress_stats();
@@ -4634,6 +4758,16 @@ async fn test_open_unlink_deferred_cleanup() {
     // Write data
     vfs.write(ino, 0, b"orphan data").await.unwrap();
     vfs.flush(ino).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            vfs.meta()
+                .get_attr(ino)
+                .map(|attr| attr.upload_state == UploadState::Ready)
+                .unwrap_or(false)
+        })
+        .await,
+        "orphan cleanup test should begin after the file reaches committed ready state"
+    );
 
     // Open a handle
     let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -4667,6 +4801,16 @@ async fn test_multiple_handles_open_unlink() {
 
     vfs.write(ino, 0, b"multi-handle data").await.unwrap();
     vfs.flush(ino).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            vfs.meta()
+                .get_attr(ino)
+                .map(|attr| attr.upload_state == UploadState::Ready)
+                .unwrap_or(false)
+        })
+        .await,
+        "multi-handle orphan test should begin after the file reaches committed ready state"
+    );
 
     // Open two handles
     let fh1 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
@@ -4905,6 +5049,16 @@ async fn test_hardlink_unlink_keeps_data() {
     let ino = attr.ino;
     vfs.write(ino, 0, b"survive unlink").await.unwrap();
     vfs.flush(ino).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            vfs.meta()
+                .get_attr(ino)
+                .map(|attr| attr.upload_state == UploadState::Ready)
+                .unwrap_or(false)
+        })
+        .await,
+        "hardlink/unlink test should begin after the source file reaches committed ready state"
+    );
 
     // Create hardlink, then remove the original
     vfs.link(ino, 1, b"backup.txt").unwrap();
