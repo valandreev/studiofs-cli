@@ -2380,6 +2380,447 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 }
 
 #[test]
+fn update_manifest_reuses_untouched_committed_extents() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-manifest-reuse-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x31u8; block_size * 3];
+    let patch = vec![0xABu8; block_size];
+    let mut ino = 0u64;
+    let mut baseline_blocks = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, seeded_blocks) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"manifest-reuse.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+            baseline_blocks = seeded_blocks;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config_offline,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        vfs.write(ino, block_size as u64, &patch).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.live_extent_records_for_inode(ino).len() == 1
+            })
+            .await,
+            "single-block update should materialize exactly one live pending extent"
+        );
+
+        let visible_blocks = meta.get_file_blocks(ino).unwrap();
+        assert_eq!(visible_blocks.len(), 3);
+        assert_eq!(visible_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
+        assert_ne!(visible_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
+        assert_eq!(visible_blocks[2].1.object_id, baseline_blocks[2].1.object_id);
+
+        let read = vfs
+            .read(ino, block_size as u64, block_size as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.as_ref(),
+            patch.as_slice(),
+            "pending update manifest must expose the touched extent while preserving untouched committed refs"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn restart_replays_only_live_pending_extents() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-restart-live-only-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let first = vec![0x41u8; block_size];
+    let second = vec![0x52u8; block_size];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let attr = vfs.create(1, b"restart-live-only.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+
+            vfs.write(ino, 0, &first).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            vfs.write(ino, 0, &second).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+            assert_eq!(read.as_ref(), second.as_slice());
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            second.as_slice(),
+            "restart must replay the live pending extent before any remote activity"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(ino).len() == 1
+                    && vfs.live_extent_records_for_inode(ino).len() == 1
+            })
+            .await,
+            "replay should materialize only the last live pending extent for the block"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn offline_s3_does_not_break_local_read_after_write() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-offline-local-read-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let mut payload = vec![0x61u8; block_size * 2];
+    payload[block_size..].fill(0x7Cu8);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"offline-local-read.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+            })
+            .await,
+            "offline S3 scenario needs local materialization and queued uploads"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "local read must succeed even while every upload is failing and requeuing"
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let read_again = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read_again.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn upload_completion_batching_does_not_change_visibility_contract() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-upload-batching-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_online = DataStoreConfig::from(&online_info);
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x10u8; block_size * 2];
+    let mut replacement_payload = vec![0x90u8; block_size * 2];
+    replacement_payload[block_size..].fill(0xA5u8);
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"upload-batching.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 2
+                })
+                .await,
+                "offline phase should leave the whole replacement pending"
+            );
+
+            let read = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+            assert_eq!(read.as_ref(), replacement_payload.as_slice());
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &online_info.endpoint);
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+    meta.set_format_info(&online_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_online,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(ino).is_empty()
+                })
+                .await,
+                "restart should recover the pending upload batch"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let read = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+                assert_eq!(
+                    read.as_ref(),
+                    replacement_payload.as_slice(),
+                    "upload completion batching must not change the local visible file contents"
+                );
+
+                if vfs.pending_uploads_for_inode(ino).is_empty() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "pending uploads did not drain under sequential completion");
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+
+            let final_read = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+            assert_eq!(final_read.as_ref(), replacement_payload.as_slice());
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
 fn test_ingress_prefers_spill_before_backpressure() {
     struct EnvRestore {
         key: &'static str,
