@@ -25,17 +25,32 @@ pub struct PgMetaEngine {
     volume_id: i64,
     client_id: String,
     local_version: AtomicI64,
-    op_lock: Mutex<()>,
+    replication_lock: Mutex<()>,
     poll_interval: Duration,
     flush_interval: Duration,
     flush_idle_grace: Duration,
     flush_ops_threshold: u32,
-    pending_ops: std::sync::atomic::AtomicU32,
-    pending_started_at: Mutex<Option<Instant>>,
-    last_mutation_at: Mutex<Option<Instant>>,
-    force_flush: std::sync::atomic::AtomicBool,
-    pending_event_start: Mutex<Option<u64>>,
-    pending_event_end: AtomicU64,
+    pending_state: Mutex<PendingReplicationState>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PendingReplicationState {
+    ops: u32,
+    started_at: Option<Instant>,
+    last_mutation_at: Option<Instant>,
+    force_flush: bool,
+    event_start: Option<u64>,
+    event_end: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ClaimedPendingBatch {
+    ops: u32,
+    started_at: Option<Instant>,
+    last_mutation_at: Option<Instant>,
+    force_flush: bool,
+    event_start: u64,
+    event_end: u64,
 }
 
 struct OverlayConflictSets {
@@ -111,17 +126,12 @@ impl PgMetaEngine {
             volume_id: pg.volume_id,
             client_id: format!("pid:{}:{client_slot}", std::process::id()),
             local_version: AtomicI64::new(0),
-            op_lock: Mutex::new(()),
+            replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(poll_secs),
             flush_interval,
             flush_idle_grace,
             flush_ops_threshold,
-            pending_ops: std::sync::atomic::AtomicU32::new(0),
-            pending_started_at: Mutex::new(None),
-            last_mutation_at: Mutex::new(None),
-            force_flush: std::sync::atomic::AtomicBool::new(false),
-            pending_event_start: Mutex::new(None),
-            pending_event_end: AtomicU64::new(0),
+            pending_state: Mutex::new(PendingReplicationState::default()),
         });
 
         // Bootstrap from the last checkpoint if present, then catch up from
@@ -186,7 +196,11 @@ impl PgMetaEngine {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             match event {
-                MetaEvent::SetFileBlock { .. } | MetaEvent::SetFileBlocksBatch { .. } => {}
+                MetaEvent::SetFileBlock { .. }
+                | MetaEvent::RemoveFileBlock { .. }
+                | MetaEvent::RemoveFileBlocks { .. }
+                | MetaEvent::SetFileBlocksBatch { .. }
+                | MetaEvent::CommitFileBlock { .. } => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
                 MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                     let mut remote_attr = attr.clone();
@@ -676,107 +690,144 @@ impl PgMetaEngine {
         Ok(applied_any)
     }
 
-    fn reset_pending_locked(&self) {
-        self.pending_ops.store(0, Ordering::SeqCst);
-        if let Ok(mut started) = self.pending_started_at.lock() {
-            *started = None;
-        }
-        if let Ok(mut last) = self.last_mutation_at.lock() {
-            *last = None;
-        }
-        self.force_flush.store(false, Ordering::SeqCst);
-        if let Ok(mut seq_start) = self.pending_event_start.lock() {
-            *seq_start = None;
-        }
-        self.pending_event_end.store(0, Ordering::SeqCst);
+    fn clear_pending_state(state: &mut PendingReplicationState) {
+        *state = PendingReplicationState::default();
     }
 
-    fn mark_pending_locked(&self) {
+    fn mark_pending_after_mutation(&self, before_seq: u64, after_seq: u64) {
         let now = Instant::now();
-        if self.pending_ops.fetch_add(1, Ordering::SeqCst) == 0
-            && let Ok(mut started) = self.pending_started_at.lock()
-        {
-            *started = Some(now);
-        }
-        if let Ok(mut last) = self.last_mutation_at.lock() {
-            *last = Some(now);
+        if let Ok(mut state) = self.pending_state.lock() {
+            if state.ops == 0 {
+                state.started_at = Some(now);
+            }
+            state.ops = state.ops.saturating_add(1);
+            state.last_mutation_at = Some(now);
+            if after_seq > before_seq {
+                if state.event_start.is_none() {
+                    state.event_start = Some(before_seq);
+                }
+                state.event_end = state.event_end.max(after_seq);
+            }
+            if state.ops >= self.flush_ops_threshold {
+                state.force_flush = true;
+            }
         }
     }
 
-    fn should_flush_due_interval_locked(&self) -> bool {
-        let pending = self.pending_ops.load(Ordering::SeqCst);
-        if pending == 0 {
+    fn request_pending_flush(&self) {
+        if let Ok(mut state) = self.pending_state.lock() {
+            state.force_flush = true;
+        }
+    }
+
+    fn should_flush_due_interval(
+        state: &PendingReplicationState,
+        idle_grace: Duration,
+        interval: Duration,
+    ) -> bool {
+        if state.ops == 0 {
             return false;
         }
-        if let Ok(last) = self.last_mutation_at.lock()
-            && let Some(t0) = *last
-        {
-            return t0.elapsed() >= self.flush_idle_grace;
+        if let Some(t0) = state.last_mutation_at {
+            return t0.elapsed() >= idle_grace;
         }
-        if let Ok(started) = self.pending_started_at.lock()
-            && let Some(t0) = *started
-        {
-            return t0.elapsed() >= self.flush_interval;
+        if let Some(t0) = state.started_at {
+            return t0.elapsed() >= interval;
         }
         true
     }
 
-    fn flush_pending_locked(&self) -> MetaResult<()> {
-        if self.pending_ops.load(Ordering::SeqCst) == 0 {
-            return Ok(());
+    fn claim_pending_batch(&self, force: bool) -> Option<ClaimedPendingBatch> {
+        let mut state = self.pending_state.lock().ok()?;
+        if state.ops == 0 {
+            return None;
         }
-        let start = self.pending_event_start.lock().ok().and_then(|g| *g);
-        let end = self.pending_event_end.load(Ordering::SeqCst);
-        let events = if let Some(s) = start {
-            self.local.read_events_range(s, end)?
-        } else {
-            Vec::new()
+        let should_flush = force
+            || state.force_flush
+            || Self::should_flush_due_interval(&state, self.flush_idle_grace, self.flush_interval);
+        if !should_flush {
+            return None;
+        }
+        let event_start = state.event_start?;
+        let batch = ClaimedPendingBatch {
+            ops: state.ops,
+            started_at: state.started_at,
+            last_mutation_at: state.last_mutation_at,
+            force_flush: state.force_flush,
+            event_start,
+            event_end: state.event_end,
         };
-        if self.pending_ops.load(Ordering::SeqCst) > 0 && events.is_empty() {
-            self.reset_pending_locked();
+        Self::clear_pending_state(&mut state);
+        Some(batch)
+    }
+
+    fn restore_pending_batch(&self, batch: ClaimedPendingBatch) {
+        if let Ok(mut state) = self.pending_state.lock() {
+            state.ops = state.ops.saturating_add(batch.ops);
+            state.force_flush |= batch.force_flush;
+            state.event_start = Some(
+                state
+                    .event_start
+                    .map(|current| current.min(batch.event_start))
+                    .unwrap_or(batch.event_start),
+            );
+            state.event_end = state.event_end.max(batch.event_end);
+            state.started_at = match (state.started_at, batch.started_at) {
+                (Some(current), Some(claimed)) => Some(current.min(claimed)),
+                (Some(current), None) => Some(current),
+                (None, Some(claimed)) => Some(claimed),
+                (None, None) => None,
+            };
+            state.last_mutation_at = match (state.last_mutation_at, batch.last_mutation_at) {
+                (Some(current), Some(claimed)) => Some(current.max(claimed)),
+                (Some(current), None) => Some(current),
+                (None, Some(claimed)) => Some(claimed),
+                (None, None) => None,
+            };
+        }
+    }
+
+    fn flush_pending_claimed_batch(&self, batch: ClaimedPendingBatch) -> MetaResult<()> {
+        let events = self
+            .local
+            .read_events_range(batch.event_start, batch.event_end)?;
+        if events.is_empty() {
             return Ok(());
         }
-        let version = self.push_event_log_batch_locked(&events)?;
-        let _ = version;
-        self.reset_pending_locked();
+        let _version = self.push_event_log_batch_locked(&events)?;
+        Ok(())
+    }
+
+    fn flush_pending_claimed_batch_with_restore(
+        &self,
+        batch: ClaimedPendingBatch,
+    ) -> MetaResult<()> {
+        if let Err(err) = self.flush_pending_claimed_batch(batch) {
+            self.restore_pending_batch(batch);
+            return Err(err);
+        }
         Ok(())
     }
 
     fn flush_due_pending(&self) -> MetaResult<()> {
+        let Some(batch) = self.claim_pending_batch(false) else {
+            return Ok(());
+        };
         let _guard = self
-            .op_lock
+            .replication_lock
             .lock()
-            .map_err(|_| MetaError::Storage("pg op lock poisoned".to_string()))?;
-        if self.force_flush.load(Ordering::SeqCst) || self.should_flush_due_interval_locked() {
-            self.flush_pending_locked()?;
-        }
-        Ok(())
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        self.flush_pending_claimed_batch_with_restore(batch)
     }
 
     fn mutate<T, F>(&self, f: F) -> MetaResult<T>
     where
         F: FnOnce(&RedbMetaEngine) -> MetaResult<T>,
     {
-        let _guard = self
-            .op_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg op lock poisoned".to_string()))?;
         let before_seq = self.local.get_counter("nextEventSeq")?;
         let result = f(&self.local)?;
         let after_seq = self.local.get_counter("nextEventSeq")?;
-        if after_seq > before_seq {
-            if let Ok(mut seq_start) = self.pending_event_start.lock()
-                && seq_start.is_none()
-            {
-                *seq_start = Some(before_seq);
-            }
-            self.pending_event_end.store(after_seq, Ordering::SeqCst);
-        }
-        self.mark_pending_locked();
-
-        if self.pending_ops.load(Ordering::SeqCst) >= self.flush_ops_threshold {
-            self.force_flush.store(true, Ordering::SeqCst);
-        }
+        self.mark_pending_after_mutation(before_seq, after_seq);
         Ok(result)
     }
 }
@@ -784,32 +835,26 @@ impl PgMetaEngine {
 impl MetaEngine for PgMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
         let _guard = self
-            .op_lock
+            .replication_lock
             .lock()
-            .map_err(|_| MetaError::Storage("pg op lock poisoned".to_string()))?;
-        self.force_flush.store(true, Ordering::SeqCst);
-        self.flush_pending_locked()?;
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        if let Some(batch) = self.claim_pending_batch(true) {
+            self.flush_pending_claimed_batch_with_restore(batch)?;
+        }
         let _ = self.pull_foreign_events_locked()?;
         self.write_checkpoint_locked()?;
         Ok(())
     }
 
     fn request_eager_flush(&self) {
-        self.force_flush.store(true, Ordering::SeqCst);
+        self.request_pending_flush();
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        if self.pending_ops.load(Ordering::SeqCst) > 0 {
-            return self.flush_metadata();
-        }
         let _guard = self
-            .op_lock
+            .replication_lock
             .lock()
-            .map_err(|_| MetaError::Storage("pg op lock poisoned".to_string()))?;
-        // Never overwrite local unflushed mutations with remote state.
-        if self.pending_ops.load(Ordering::SeqCst) > 0 {
-            return self.flush_metadata();
-        }
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
         let _ = self.pull_foreign_events_locked()?;
         Ok(())
     }
@@ -925,7 +970,7 @@ impl MetaEngine for PgMetaEngine {
         let result = self
             .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
         if matches!(result, Ok(true)) {
-            self.force_flush.store(true, Ordering::SeqCst);
+            self.request_pending_flush();
         }
         result
     }
@@ -933,7 +978,7 @@ impl MetaEngine for PgMetaEngine {
     fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
         let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
         if matches!(result, Ok(true)) {
-            self.force_flush.store(true, Ordering::SeqCst);
+            self.request_pending_flush();
         }
         result
     }
@@ -1156,6 +1201,15 @@ mod tests {
         seed.init_root(0, 0).expect("init root");
     }
 
+    fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
+        let mut attr = engine.get_attr(ino).expect("get file attr");
+        attr.size = size;
+        attr.content_epoch = content_epoch;
+        attr.mtime = InodeAttr::now_nanos();
+        attr.ctime = attr.mtime;
+        engine.set_attr(&attr).expect("set file attr");
+    }
+
     fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("meta.redb");
@@ -1168,17 +1222,12 @@ mod tests {
             volume_id: 1,
             client_id: "unit-test".to_string(),
             local_version: AtomicI64::new(0),
-            op_lock: Mutex::new(()),
+            replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(60),
             flush_interval: Duration::from_secs(60),
             flush_idle_grace: Duration::from_secs(60),
             flush_ops_threshold: 8,
-            pending_ops: std::sync::atomic::AtomicU32::new(0),
-            pending_started_at: Mutex::new(None),
-            last_mutation_at: Mutex::new(None),
-            force_flush: std::sync::atomic::AtomicBool::new(false),
-            pending_event_start: Mutex::new(None),
-            pending_event_end: AtomicU64::new(0),
+            pending_state: Mutex::new(PendingReplicationState::default()),
         };
 
         (dir, engine)
@@ -1333,10 +1382,9 @@ mod tests {
             .get_counter("nextEventSeq")
             .expect("read baseline seq");
         {
-            let mut start = pg.pending_event_start.lock().expect("pending_event_start");
-            *start = None;
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            *state = PendingReplicationState::default();
         }
-        pg.pending_event_end.store(0, Ordering::SeqCst);
 
         pg.set_xattr(file.ino, b"user.color", b"red", 0)
             .expect("set local xattr");
@@ -1383,12 +1431,9 @@ mod tests {
             .expect("symlink conflict")
         );
 
-        let start = pg
-            .pending_event_start
-            .lock()
-            .expect("pending_event_start")
-            .expect("pending start set");
-        let end = pg.pending_event_end.load(Ordering::SeqCst);
+        let state = pg.pending_state.lock().expect("pending_state");
+        let start = state.event_start.expect("pending start set");
+        let end = state.event_end;
         assert_eq!(start, baseline);
         assert!(end > start);
     }
@@ -1484,14 +1529,14 @@ mod tests {
         let file = a
             .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
             .expect("create file");
-        let mut attr = a.get_attr(file.ino).expect("get attr");
-        attr.size = 4096;
-        a.set_attr(&attr).expect("set size");
+        set_file_state(&a, file.ino, 4096, 1);
         let block = BlockRef::new_partial(77, 4096);
         a.set_file_block(file.ino, 0, &block)
             .expect("set staged block");
-        a.commit_uploaded_block(file.ino, 0, 0, &block)
-            .expect("commit uploaded block");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish committed manifest")
+        );
         a.flush_metadata().expect("flush a");
 
         assert!(wait_visible(
@@ -1511,6 +1556,274 @@ mod tests {
         assert_eq!(remote_blocks.len(), 1);
         assert_eq!(remote_blocks[0].0, 0);
         assert_eq!(remote_blocks[0].1.object_id, 77);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_remote_uploading_marker_replication() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-remote-uploading-marker");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&a, file.ino, 4096, 1);
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(501, 4096))
+            .expect("set staged block");
+        a.flush_metadata().expect("flush uploading marker");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"uploading.bin",
+            Duration::from_secs(10)
+        ));
+
+        let remote = b.lookup(ROOT_INO, b"uploading.bin").expect("lookup remote");
+        let remote_attr = b.get_attr(remote.ino).expect("get remote attr");
+        assert_eq!(remote_attr.upload_state, UploadState::Uploading);
+        assert_eq!(remote_attr.size, 0);
+        assert_eq!(remote_attr.committed_size, 0);
+        assert!(
+            b.get_file_block(remote.ino, 0)
+                .expect("get remote block")
+                .is_none(),
+            "staged file blocks must not replicate through PG before publish"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_remote_update_keeps_old_committed_version_until_switch() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-old-committed-until-switch");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"committed.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&a, file.ino, 4096, 1);
+        let baseline = BlockRef::new_partial(701, 4096);
+        a.set_file_block(file.ino, 0, &baseline)
+            .expect("set baseline block");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish baseline manifest")
+        );
+        a.flush_metadata().expect("flush baseline");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"committed.bin",
+            Duration::from_secs(10)
+        ));
+        let remote = b.lookup(ROOT_INO, b"committed.bin").expect("lookup remote");
+        assert_eq!(
+            b.get_file_block(remote.ino, 0)
+                .expect("get baseline remote block")
+                .expect("baseline remote block")
+                .object_id,
+            701
+        );
+
+        set_file_state(&a, file.ino, 4096, 2);
+        let replacement = BlockRef::new_partial(702, 4096);
+        a.set_file_block(file.ino, 0, &replacement)
+            .expect("set replacement block");
+        a.flush_metadata().expect("flush updating marker");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            b.get_attr(remote.ino)
+                .map(|attr| attr.upload_state == UploadState::Updating)
+                .unwrap_or(false)
+        }));
+
+        let remote_attr = b
+            .get_attr(remote.ino)
+            .expect("get remote attr after update");
+        assert_eq!(remote_attr.upload_state, UploadState::Updating);
+        let remote_block = b
+            .get_file_block(remote.ino, 0)
+            .expect("get remote block after update")
+            .expect("remote block after update");
+        assert_eq!(
+            remote_block.object_id, 701,
+            "remote peer must keep serving the previous committed version until publish"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_publish_switch_is_atomic_across_peers() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-atomic-publish-switch");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"atomic.bin", 0, 0, 0o644)
+            .expect("create file");
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
+        set_file_state(&a, file.ino, block_size + 4096, 1);
+        let baseline0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
+        let baseline1 = BlockRef::new_partial(802, 4096);
+        a.set_file_block(file.ino, 0, &baseline0)
+            .expect("set baseline block 0");
+        a.set_file_block(file.ino, 1, &baseline1)
+            .expect("set baseline block 1");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish baseline manifest")
+        );
+        a.flush_metadata().expect("flush baseline manifest");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"atomic.bin",
+            Duration::from_secs(10)
+        ));
+        let remote = b.lookup(ROOT_INO, b"atomic.bin").expect("lookup remote");
+
+        set_file_state(&a, file.ino, block_size + 4096, 2);
+        let replacement0 = BlockRef::new_full(901, DEFAULT_BLOCK_SIZE);
+        let replacement1 = BlockRef::new_partial(902, 4096);
+        a.set_file_block(file.ino, 0, &replacement0)
+            .expect("set replacement block 0");
+        a.set_file_block(file.ino, 1, &replacement1)
+            .expect("set replacement block 1");
+        a.flush_metadata().expect("flush updating state");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            let blocks = b.get_file_blocks(remote.ino).unwrap_or_default();
+            blocks.len() == 2
+                && blocks[0].1.object_id == 801
+                && blocks[1].1.object_id == 802
+                && b.get_attr(remote.ino)
+                    .map(|attr| attr.upload_state == UploadState::Updating)
+                    .unwrap_or(false)
+        }));
+
+        assert!(
+            a.publish_file_manifest(file.ino, 2)
+                .expect("publish replacement manifest")
+        );
+        a.flush_metadata().expect("flush replacement manifest");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            let blocks = b.get_file_blocks(remote.ino).unwrap_or_default();
+            blocks.len() == 2
+                && blocks[0].1.object_id == 901
+                && blocks[1].1.object_id == 902
+                && b.get_attr(remote.ino)
+                    .map(|attr| attr.upload_state == UploadState::Ready)
+                    .unwrap_or(false)
+        }));
+
+        let remote_blocks = b.get_file_blocks(remote.ino).expect("get remote blocks");
+        assert_eq!(remote_blocks.len(), 2);
+        assert_eq!(remote_blocks[0].1.object_id, 901);
+        assert_eq!(remote_blocks[1].1.object_id, 902);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_foreign_events_do_not_block_local_accepted_reads() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let dir_c = tempdir().expect("tempdir c");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let db_c = dir_c.path().join("meta-c.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-foreign-does-not-flush-local");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+        seed_local(&db_c, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+        let c = PgMetaEngine::open(&db_c).expect("open c");
+
+        let draft = b
+            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+            .expect("create local draft");
+        set_file_state(&b, draft.ino, 4096, 1);
+        b.set_file_block(draft.ino, 0, &BlockRef::new_partial(1001, 4096))
+            .expect("set local draft block");
+
+        a.create_file(ROOT_INO, b"foreign.txt", 0, 0, 0o644)
+            .expect("create foreign file");
+        a.flush_metadata().expect("flush foreign file");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            b.lookup(ROOT_INO, b"foreign.txt").is_ok()
+        }));
+
+        let local_attr = b.get_attr(draft.ino).expect("get local draft attr");
+        assert_eq!(local_attr.size, 4096);
+        assert_eq!(local_attr.committed_size, 0);
+        assert_eq!(local_attr.upload_state, UploadState::Uploading);
+        let local_block = b
+            .get_file_block(draft.ino, 0)
+            .expect("get local draft block")
+            .expect("local draft block");
+        assert_eq!(local_block.object_id, 1001);
+
+        let _ = c.sync_metadata();
+        assert!(
+            c.lookup(ROOT_INO, b"draft.bin").is_err(),
+            "syncing foreign events on b must not flush its local accepted draft into PG"
+        );
+        assert!(
+            c.lookup(ROOT_INO, b"foreign.txt").is_ok(),
+            "foreign namespace convergence should still work while b has local-only accepted state"
+        );
     }
 
     #[test]
@@ -1596,15 +1909,13 @@ mod tests {
         local_attr.size = 8192;
         b.set_attr(&local_attr).expect("set local attr overlay");
 
-        let mut remote_attr = a.get_attr(file.ino).expect("get attr on a");
-        remote_attr.size = 4096;
-        a.set_attr(&remote_attr).expect("set remote size");
+        set_file_state(&a, file.ino, 4096, 1);
         let block = BlockRef::new_partial(88, 4096);
         a.set_file_block(file.ino, 0, &block)
             .expect("set staged remote block");
         assert!(
-            a.commit_uploaded_block(file.ino, 0, 0, &block)
-                .expect("commit remote block")
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish remote block manifest")
         );
         a.flush_metadata().expect("flush remote block");
 
