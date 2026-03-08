@@ -114,12 +114,11 @@ pub fn run(
     // Write PID file so `studiofs umount` can find us
     let _ = super::utils::write_pid_file(mount_point, name, std::process::id());
 
-    // Named event for external graceful shutdown (used by `studiofs umount` on Windows)
-    let event_name = super::utils::shutdown_event_name(mount_point);
-
     // Start platform-specific FUSE mount
     #[cfg(windows)]
     {
+        // Named event for external graceful shutdown (used by `studiofs umount`).
+        let event_name = super::utils::shutdown_event_name(mount_point);
         info!("starting WinFSP mount at {mount_point}");
         studiofs_winfsp::mount_and_serve(
             vfs,

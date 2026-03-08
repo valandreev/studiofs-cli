@@ -77,6 +77,7 @@ pub fn remove_pid_file(mount_point: &str) -> Result<()> {
 }
 
 /// Named-event identifier used on Windows for graceful external shutdown.
+#[cfg(any(windows, test))]
 pub fn shutdown_event_name(mount_point: &str) -> String {
     let sanitized = sanitize_mount_point(mount_point);
     format!("Local\\StudioFS_{sanitized}")
