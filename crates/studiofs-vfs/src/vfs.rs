@@ -170,6 +170,14 @@ pub struct VfsIngressPressure {
     pub lane: VfsIngressLane,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct VfsUploadStats {
+    pub pending_uploads: usize,
+    pub upload_requeues: u64,
+    pub canceled_deleted: u64,
+    pub canceled_stale: u64,
+}
+
 pub type VfsResult<T> = Result<T, VfsError>;
 
 // =============================================================================
@@ -500,6 +508,12 @@ struct PendingBlock {
     data: BytesMut,
     /// Has this block been modified?
     dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ExtentRecordId {
+    object_id: u64,
+    content_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1015,6 +1029,8 @@ struct VfsState {
     pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
     /// Explicit per-inode pending/committed incarnation model for local serving.
     inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
+    /// Live extent identity per inode/block used to invalidate superseded uploads.
+    live_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
     /// Dirty attributes cache (from writes not yet synced to redb).
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
@@ -1611,6 +1627,7 @@ impl StudioVfs {
                 state: Arc::new(VfsState {
                     pending_blocks: Mutex::new(std::collections::HashMap::new()),
                     inode_incarnations: Mutex::new(std::collections::HashMap::new()),
+                    live_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
@@ -2242,6 +2259,66 @@ impl StudioVfs {
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
         let attr = self.getattr_async(ino).await?;
         Ok(self.refresh_inode_incarnation_state_from_attr(ino, &attr))
+    }
+
+    fn record_live_extent(&self, ino: Ino, block_index: u32, object_id: u64, content_epoch: u64) {
+        self.state.live_extent_records.lock().insert(
+            (ino, block_index),
+            ExtentRecordId {
+                object_id,
+                content_epoch,
+            },
+        );
+    }
+
+    fn remove_live_extent(&self, ino: Ino, block_index: u32) {
+        self.state
+            .live_extent_records
+            .lock()
+            .remove(&(ino, block_index));
+    }
+
+    fn remove_live_extents_for_inode(&self, ino: Ino) {
+        self.state
+            .live_extent_records
+            .lock()
+            .retain(|(candidate, _), _| *candidate != ino);
+    }
+
+    pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
+        let mut out: Vec<_> = self
+            .state
+            .live_extent_records
+            .lock()
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == ino)
+            .map(|((_, block_index), extent)| {
+                (*block_index, extent.object_id, extent.content_epoch)
+            })
+            .collect();
+        out.sort_by_key(|(block_index, _, _)| *block_index);
+        out
+    }
+
+    pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
+        let mut out: Vec<_> = self
+            .block_cache
+            .snapshot_pending_uploads()
+            .into_iter()
+            .filter(|op| op.ino == ino)
+            .map(|op| (op.offset, op.object_id, op.content_epoch))
+            .collect();
+        out.sort_by_key(|(offset, _, _)| *offset);
+        out
+    }
+
+    pub fn upload_stats(&self) -> VfsUploadStats {
+        VfsUploadStats {
+            pending_uploads: self.block_cache.pending_upload_count(),
+            upload_requeues: self.state.upload_requeues.load(Ordering::Relaxed),
+            canceled_deleted: self.state.upload_canceled_deleted.load(Ordering::Relaxed),
+            canceled_stale: self.state.upload_canceled_stale.load(Ordering::Relaxed),
+        }
     }
 
     fn logical_block_len(&self, file_size: u64, block_index: u32) -> usize {
@@ -3126,6 +3203,7 @@ impl StudioVfs {
         // Remove blocks beyond new size (or all blocks when new_size == 0).
         for block_idx in first_block_to_remove..=old_last_block {
             self.clear_pending_block(ino, block_idx);
+            self.remove_live_extent(ino, block_idx);
             // Remove the block and get its ID for GC
             if let Some(object_id) = self.meta.remove_file_block(ino, block_idx)? {
                 // Mark old block for deletion (S3 cleanup via background GC)
@@ -3808,6 +3886,8 @@ impl StudioVfs {
     /// Called by `unlink()` so that deleted file data is no longer occupying
     /// disk / RAM space without waiting for the next background GC run.
     fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
+        self.remove_live_extents_for_inode(ino);
+
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
         {
             let mut dirty = self.state.dirty_mem.lock();
@@ -3878,6 +3958,7 @@ impl StudioVfs {
     /// truncation.
     fn evict_block_from_caches(&self, ino: Ino, block_index: u32, object_id: u64) {
         self.clear_pending_block(ino, block_index);
+        self.remove_live_extent(ino, block_index);
 
         // L1.5 — dirty memory buffer.
         {
@@ -4618,6 +4699,7 @@ impl StudioVfs {
                 // Queue upload submission.
                 let file_offset = (*block_index as u64) * self.block_size as u64;
                 upload_ops.push((*ino, file_offset, object_id, *content_epoch));
+                self.record_live_extent(*ino, *block_index, object_id, *content_epoch);
 
                 // Remove from dirty_mem only if we are still looking at the same
                 // payload we drained. A concurrent write may have replaced this
@@ -4837,6 +4919,34 @@ impl StudioVfs {
         // Coalescing: if this file block has already been replaced in metadata
         // with a newer object_id, skip uploading this stale one.
         let block_index = block_index_from_offset(op.offset, self.block_size);
+        let expected_extent = ExtentRecordId {
+            object_id: op.object_id,
+            content_epoch: op.content_epoch,
+        };
+        if let Some(current_extent) = self
+            .state
+            .live_extent_records
+            .lock()
+            .get(&(op.ino, block_index))
+            .copied()
+            && current_extent != expected_extent
+        {
+            self.state
+                .upload_canceled_stale
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                object_id = op.object_id,
+                ino = op.ino,
+                block_index,
+                queued_epoch = op.content_epoch,
+                current_object_id = current_extent.object_id,
+                current_epoch = current_extent.content_epoch,
+                "upload cancelled: stale extent record superseded"
+            );
+            self.block_cache.cancel_upload(&op, true);
+            self.state.pending_evictions.lock().remove(&op.object_id);
+            return Ok(());
+        }
         if let Some(attr) = attr.as_ref()
             && attr.content_epoch != op.content_epoch
         {
