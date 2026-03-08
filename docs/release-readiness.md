@@ -1,6 +1,6 @@
 # Release Readiness
 
-Current status as of 2026-03-07: candidate is ready for external test pass.
+Current status as of 2026-03-08: candidate is ready for external test pass.
 
 ## Gate Checklist
 
@@ -28,8 +28,16 @@ Current status as of 2026-03-07: candidate is ready for external test pass.
   - `sync_metadata()` follows flush-then-pull semantics.
 - Operational safety:
   - upload/fetch adaptive schedulers active with bounded retry/timeout policies.
+  - stage-scoped QoS credits are active for accept, materialize, upload, commit, and fetch.
+  - upload dispatch is fair across inodes; one large file no longer monopolizes the uploader.
   - startup warmup is non-blocking (no `StudioVfs::new` deadlock on current-thread runtime).
   - infra test guidance includes proxy cleanup for MinIO/PG runs.
+- PR-10 non-stall and recovery coverage:
+  - `slow_s3_does_not_stall_local_reads_and_writes` passes.
+  - `backpressure_only_on_local_budget_exhaustion` passes.
+  - `single_large_file_upload_does_not_starve_small_foreground_io` passes.
+  - `recovery_after_offline_s3_preserves_local_accepted_view` passes.
+  - `twenty_four_hour_soak_no_global_fs_stall` exists as an ignored manual soak/fault-injection gate.
 - Documentation:
   - architecture, metadata, VFS, configuration, tests, and dev docs updated to match current behavior.
 
@@ -43,6 +51,12 @@ $env:NO_PROXY='localhost,127.0.0.1,::1'
 cargo build --release
 cargo test --workspace --all-targets -- --nocapture
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
+$env:CARGO_TARGET_DIR='target-pr10'
+cargo test -p studiofs-vfs --test vfs_test slow_s3_does_not_stall_local_reads_and_writes -- --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test backpressure_only_on_local_budget_exhaustion -- --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test single_large_file_upload_does_not_starve_small_foreground_io -- --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test recovery_after_offline_s3_preserves_local_accepted_view -- --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test twenty_four_hour_soak_no_global_fs_stall -- --ignored --nocapture --test-threads=1
 ```
 
 ## Known Operational Notes

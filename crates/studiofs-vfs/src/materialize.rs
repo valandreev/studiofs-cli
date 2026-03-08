@@ -50,6 +50,13 @@ impl Materializer {
 
     pub(super) async fn drain(vfs: &StudioVfs) {
         let _guard = vfs.state.dirty_drain_lock.lock().await;
+        let _qos = match vfs.qos.acquire_materialize().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                error!("materializer: qos acquire failed: {}", e);
+                return;
+            }
+        };
         Self::drain_inner(vfs).await;
     }
 
@@ -86,11 +93,27 @@ impl Materializer {
     ) -> Option<(Vec<MaterializedExtent>, Vec<BatchFlushResult>)> {
         let keys: Vec<(Ino, u32)> = {
             let dirty = vfs.state.dirty_mem.lock();
-            let mut keys: Vec<(Ino, u32)> = dirty.keys().take(max_drain_batch).cloned().collect();
-            if keys.len() < max_drain_batch {
+            let mut fair = FairInodeScheduler::default();
+            let mut seen = std::collections::HashSet::new();
+            for key in dirty.keys() {
+                if seen.insert(*key) {
+                    fair.push(key.0, *key);
+                }
+            }
+            if fair.len() < max_drain_batch {
                 let spill = vfs.state.ingress_live.lock();
-                let remaining = max_drain_batch - keys.len();
-                keys.extend(spill.keys().take(remaining).cloned());
+                for key in spill.keys() {
+                    if seen.insert(*key) {
+                        fair.push(key.0, *key);
+                    }
+                }
+            }
+            let mut keys = Vec::with_capacity(max_drain_batch);
+            while keys.len() < max_drain_batch {
+                let Some(key) = fair.pop() else {
+                    break;
+                };
+                keys.push(key);
             }
             keys
         };

@@ -29,6 +29,7 @@ mod materialize;
 use crate::incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
+use crate::qos::{FairInodeScheduler, QosController};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{run_blocking, run_meta};
@@ -1162,6 +1163,7 @@ pub struct StudioVfs {
     ingress_checkpoint_max_live_segments: u64,
     /// Shared local-I/O budget for upload path reads from cache.
     upload_cache_io_slots: Arc<Semaphore>,
+    qos: Arc<QosController>,
     /// Extra cost per upload op when foreground reads are active.
     upload_cache_io_user_penalty: u32,
     /// Grace window after the last foreground read to keep user priority.
@@ -1465,11 +1467,13 @@ impl StudioVfs {
                 }
             };
 
+            let qos = Arc::new(QosController::from_env());
             let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
                 data_read,
                 block_cache.clone(),
                 fetch_aimd_config,
                 prefetch_foreground_reserve,
+                qos.clone(),
             ));
 
             // Build AIMD config for upload scheduling from env or defaults.
@@ -1699,6 +1703,7 @@ impl StudioVfs {
                 ingress_checkpoint_max_segment_lag,
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
+                qos,
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace,
                 readahead: readahead.clone(),
@@ -2489,6 +2494,7 @@ impl StudioVfs {
         if blocks.is_empty() {
             return Ok(());
         }
+        let _accept_qos = self.qos.try_acquire_accept();
         let total: usize = blocks.iter().map(|(_, d)| d.len()).sum();
         let block_count = blocks.len() as u64;
 
@@ -4553,7 +4559,7 @@ impl StudioVfs {
     // =========================================================================
 
     /// Woken by `dirty_flush_tx` signals and a periodic timer.
-    /// Drains the dirty memory buffer → L1 + metadata (batch) → L2 (background).
+    /// Drains accepted ingress records into cache, metadata, and upload intents.
     async fn background_slab_flusher(
         self: Arc<Self>,
         rx: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -4562,26 +4568,6 @@ impl StudioVfs {
     }
 
     async fn drain_dirty_mem(&self) {
-        self.drain_dirty_mem_inner().await;
-    }
-
-    /// Two-phase batched drain of `dirty_mem`.
-    ///
-    /// **Phase 1 (fast — sub-millisecond for a normal drain batch):**
-    /// 1. Take up to `STUDIOFS_MAX_DRAIN_BATCH` blocks from accepted local staging.
-    /// 2. Allocate block IDs in one transaction (`next_block_ids`).
-    /// 3. Write all block refs + counters + pending deletions in one
-    ///    transaction (`flush_blocks_batch`) — 1 fsync instead of ~300.
-    /// 4. Insert each block into L1 RAM (`stage_l1`) — nanoseconds per block.
-    /// 5. Submit all upload journal entries.
-    /// 6. Remove blocks from `dirty_mem`, decrement `dirty_bytes` → write()
-    ///    is immediately unblocked.
-    ///
-    /// **Phase 2 (background spawn — fire-and-forget):**
-    /// Write all blocks to L2 NVMe **in parallel** via `commit_l2_batch`.
-    /// Does NOT affect `dirty_bytes` or backpressure.  Blocks are pinned in
-    /// LRU and safe in L1 RAM until both L2 and S3 upload complete.
-    async fn drain_dirty_mem_inner(&self) {
         materialize::Materializer::drain(self).await;
     }
 
@@ -4592,7 +4578,7 @@ impl StudioVfs {
     /// Background task to process pending uploads.
     async fn background_uploader(
         self: Arc<Self>,
-        rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
     ) {
         info!("background uploader started");
         let worker_count = std::env::var("STUDIOFS_UPLOAD_WORKER_COUNT")
@@ -4607,14 +4593,16 @@ impl StudioVfs {
                     .unwrap_or(4)
             });
 
-        let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+        let dispatch_capacity = worker_count.max(1) * 2;
+        let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<PendingUpload>(dispatch_capacity);
+        let worker_rx = std::sync::Arc::new(tokio::sync::Mutex::new(worker_rx));
         info!(
             upload_worker_count = worker_count,
-            "upload worker pool started"
+            dispatch_capacity, "upload worker pool started"
         );
 
         for _ in 0..worker_count {
-            let rx = rx.clone();
+            let rx = worker_rx.clone();
             let vfs = self.clone();
             tokio::spawn(async move {
                 loop {
@@ -4658,6 +4646,34 @@ impl StudioVfs {
                     }
                 }
             });
+        }
+
+        let mut fair = FairInodeScheduler::default();
+        let mut inbound_closed = false;
+        loop {
+            if inbound_closed && fair.is_empty() {
+                break;
+            }
+
+            tokio::select! {
+                biased;
+                permit = worker_tx.reserve(), if !fair.is_empty() => {
+                    match permit {
+                        Ok(permit) => {
+                            if let Some(op) = fair.pop() {
+                                permit.send(op);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                inbound = rx.recv(), if !inbound_closed => {
+                    match inbound {
+                        Some(op) => fair.push(op.ino, op),
+                        None => inbound_closed = true,
+                    }
+                }
+            }
         }
     }
 
@@ -4775,6 +4791,11 @@ impl StudioVfs {
         }
 
         let t0 = Instant::now();
+        let _upload_qos = self
+            .qos
+            .acquire_upload()
+            .await
+            .map_err(|e| VfsError::Other(format!("upload qos permit failed: {e}")))?;
         // Upload QoS: when user reads are active, each upload consumes multiple
         // local I/O slots, effectively shrinking upload pressure and preserving
         // read latency/throughput for foreground operations.
@@ -4923,6 +4944,11 @@ impl StudioVfs {
                 checkpoint_live_segments = ingress.checkpoint_live_segments,
                 write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
                 upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
+                qos_accept_available = self.qos.accept_available(),
+                qos_materialize_available = self.qos.materialize_available(),
+                qos_upload_available = self.qos.upload_available(),
+                qos_commit_available = self.qos.commit_available(),
+                qos_fetch_available = self.qos.fetch_available(),
                 "upload pipeline counters"
             );
             self.upload_scheduler.log_stats(pending, p95_ms, max_ms);
@@ -5289,8 +5315,8 @@ impl StudioVfs {
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         let t0 = Instant::now();
 
-        // Phase 0: stop the background slab flusher so it cannot race with
-        // our own drain_dirty_mem().
+        // Phase 0: stop the background materializer so shutdown can finish the
+        // remaining accepted ingress without a concurrent drainer racing it.
         self.state
             .slab_flusher_stopped
             .store(true, Ordering::Release);
@@ -5309,9 +5335,8 @@ impl StudioVfs {
         );
         self.flush_pending_blocks_for_shutdown().await;
 
-        // Phase 2: drain dirty_mem → cache + upload queue.
-        // Loop until all dirty blocks are flushed (drain_dirty_mem processes
-        // up to 64 blocks per call).
+        // Phase 2: drain remaining accepted ingress into cache + upload queue.
+        // Loop until the materializer consumes every live accepted record.
         let dirty_after_flush = self.state.dirty_bytes.load(Ordering::Relaxed);
         info!(
             dirty_bytes = dirty_after_flush,

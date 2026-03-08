@@ -8,6 +8,11 @@ impl CommitCoordinator {
         op: &PendingUpload,
         block_index: u32,
     ) -> VfsResult<()> {
+        let _commit_qos = vfs
+            .qos
+            .acquire_commit()
+            .await
+            .map_err(|e| VfsError::Other(format!("commit qos permit failed: {e}")))?;
         vfs.record_uploaded_extent(op.ino, block_index, op.object_id, op.content_epoch);
 
         let pending_same_epoch =
