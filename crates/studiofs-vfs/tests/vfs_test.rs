@@ -29,6 +29,18 @@ use studiofs_meta::{
 };
 use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane};
 
+// PR-01 Gate-Named Scenarios (reserved)
+//
+// - writer_reads_full_file_before_any_remote_commit
+// - writer_recovers_local_file_after_restart_before_upload_complete
+// - remote_clients_see_uploading_marker_without_precise_progress
+// - remote_open_on_uploading_new_file_returns_transient_unavailable
+// - remote_clients_keep_previous_committed_version_during_update
+// - large_file_unlink_cancels_pending_uploads
+// - large_file_partial_overwrite_reuploads_only_touched_extents
+// - stale_upload_completion_is_ignored_after_extent_invalidate
+// - large_file_rename_does_not_restart_or_duplicate_uploads
+
 // =============================================================================
 // Test Helpers
 // =============================================================================

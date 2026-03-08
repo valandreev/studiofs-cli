@@ -188,6 +188,13 @@ The migration should be incremental:
 The important point is to preserve the already-hardened contract while changing
 the storage representation underneath it.
 
+Contract-aligned requirements for this phase:
+
+- accepted writes must remain locally readable after `flush()`/`close()` even when uploads lag.
+- upload progress is not exposed as remote partial reads; remote reads follow the
+  committed incarnation.
+- overwrite and unlink must produce explicit supersession records by range.
+
 Current implementation cut:
 
 - append-only segment records now exist under `ingress_spill/segments/`
@@ -233,6 +240,10 @@ current local ingress index shape, but that index now points at segment payload
 for newly accepted entries while the segment format and invalidation semantics
 stabilize. `state.json` is currently a recovery hint rather than the sole
 source of truth; segment replay and checkpoints still win if the hint is stale.
+
+The ingress segment semantics must remain consistent with:
+[`file-visibility-and-incarnation-model.md`](./refactor/file-visibility-and-incarnation-model.md),
+especially around extent creation/invalidation and pending-incarnation acceptance.
 
 ## Non-Goals For This Phase
 

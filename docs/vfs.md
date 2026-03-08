@@ -2,6 +2,14 @@
 
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
+This behavior is frozen by
+[`file-visibility-and-incarnation-model.md`](./refactor/file-visibility-and-incarnation-model.md):
+
+- `flush()`/`close()` and local WAL accept guarantee immediate read-after-write for
+  the same mounted client.
+- remote readers see only coarse `upload_state` (`uploading`, `updating`, `ready`).
+- remote visibility is file-version atomic via incarnation publish.
+
 ## Core Struct: `StudioVfs`
 
 Holds all runtime state:
@@ -37,7 +45,7 @@ data arrives
   │
   ├─ Split into block-aligned chunks
   ├─ Store/merge in `pending_blocks`
-  ├─ Update local inode size
+  ├─ Update local inode size and pending incarnation overlay
   └─ Full blocks can be moved immediately into dirty staging
 ```
 
@@ -46,13 +54,12 @@ data arrives
 ```
 pending_blocks for this inode
   │
-  ├─ Move blocks into accepted local staging:
-  │    ├─ dirty_mem (RAM)
-  │    └─ ingress_spill (NVMe overflow)
-  └─ Notify background flusher
+  ├─ Append accepted records to ingress segments (durable local accept)
+  ├─ Update live ingress index / pending incarnation state
+  └─ Notify background pipeline
 ```
 
-### 3. Background Flusher (`drain_dirty_mem`)
+### 3. Background Materializer (`drain_dirty_mem` lineage)
 
 Runs every 10ms, processes continuously while data exists:
 
@@ -61,15 +68,15 @@ dirty_mem + ingress_spill
   │
   ├─ Take batch of up to 1024 blocks
   │
-  ├─ Phase 1: local metadata + L1 stage
+  ├─ Phase 1: pending manifest state update + L1 stage
   │    ├─ allocate object ids
   │    ├─ cache.stage_l1(id, data)
-  │    └─ meta.flush_blocks_batch()   ← local staged refs only
+  │    └─ meta.flush_blocks_batch()   ← local pending refs only
   │
   ├─ Phase 2: L2 commit (parallel)
   │    └─ cache.commit_l2_batch(blocks) — parallel NVMe writes
   │
-  ├─ Phase 3: Upload enqueue
+  ├─ Phase 3: Upload enqueue for accepted incarnation extents
   │    └─ cache.submit_upload(..., content_epoch) for each
   │
   ├─ Decrement dirty_bytes
@@ -86,29 +93,31 @@ Consumes from upload queue channel:
 PendingUpload received
   │
   ├─ Read block from cache (L1 or L2)
-  ├─ Reject stale op if inode/content_epoch no longer match
+  ├─ Reject stale op if inode/incarnation no longer match
   ├─ Build object (header + raw payload), compute xxh64 checksum
   ├─ PUT to S3 via UploadScheduler (AIMD + retry/timeout policy)
-  ├─ Commit remote-visible block only after upload success
+  ├─ Mark extent record as uploaded only after upload success
   ├─ cache.complete_upload(pending) — unpin LRU entry
   │
   └─ On failure: requeue with backoff
 ```
 
-Remote-visible regular-file size advances through `committed_size`, not through
-the local foreground `size`.
+Remote-visible regular-file size advances only when a full incarnation is committed
+through `committed_size`, not through the local foreground `size`.
 
 ## Read Path
 
 ### `read(ino, offset, size)`
 
 ```
-  local metadata view ──┬─ staged `file_blocks`
+local metadata view ──┬─ pending incarnation extents
                         └─ fallback `committed_file_blocks`
          │
          ▼
   resolve block data ─── ┌─ pending_blocks
   (first match wins)     ├─ dirty_mem
+                         ├─ open handle dirty state
+                         ├─ pending incarnation extents
                          ├─ ingress_spill
                          ├─ L1 memory cache
                          ├─ L2 disk cache

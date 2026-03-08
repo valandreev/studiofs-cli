@@ -9,8 +9,16 @@ Core principles:
 - Foreground filesystem operations read and write local `redb` only.
 - PostgreSQL is the shared replication bus and checkpoint store, not the hot read path.
 - File payloads live in immutable S3 objects.
-- Runtime file visibility is split into local state and remote-visible committed state.
+- Runtime file visibility is split into local accepted state and remote-visible
+  committed state.
 - RAM + NVMe cache tiers hide most object-store latency.
+
+This document is constrained by the contract in
+[`file-visibility-and-incarnation-model.md`](./refactor/file-visibility-and-incarnation-model.md):
+
+- `flush()` and `close()` must make accepted data readable locally without waiting for S3/upload/metadata.
+- Remote readers observe only coarse states: `uploading`, `updating`, `ready`.
+- Remote visibility switches atomically by file incarnation, not block-by-block.
 
 ## Workspace Graph
 
@@ -32,10 +40,10 @@ studiofs (CLI)
 - local client view: serve merged `overlay over base` from local `redb`
 - foreign visibility: eventual, driven by background `flush_metadata()` / `sync_metadata()`
 
-Important invariants:
+Core invariants:
 - local `size` may be ahead of remote-visible `committed_size`
-- local staged `file_blocks` may be ahead of remote-visible `committed_file_blocks`
-- block data becomes remote-visible only after successful S3 upload completion
+- local pending incarnation data may be ahead of remote-visible committed manifest
+- remote-visible manifest switches only after full pending incarnation publish
 - local echoed PostgreSQL batches are applied only to remote-visible/base state reconciliation and do not clobber local overlay
 - foreign namespace/attr/symlink/xattr apply lands in local `base_*`
 - local mutations remain in overlay tables (`inodes`, `dentries`, `symlinks`, `xattrs`)
@@ -46,23 +54,24 @@ Important invariants:
 1. App calls a VFS mutation.
 2. StudioFS updates local metadata in `redb`.
 3. File payload enters local write staging (`pending_blocks`, `dirty_mem`, ingress live index backed by `ingress_spill/segments/`, cache).
-4. Background upload writes the object to S3.
-5. Upload completion promotes the block to remote-visible committed state.
-6. Metadata background flush projects remote-visible deltas to PostgreSQL `event_log`.
-7. Other clients pull only newer foreign batches and apply remote-visible namespace/attrs/symlinks/xattrs to local `base_*`.
-8. `metadata_state` stores periodic checkpoints for bootstrap and `discover`.
+4. `flush(ino)`/`close(ino)` appends accepted records to ingress and makes local accepted view durable.
+5. Background workers materialize and upload accepted records.
+6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
+7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
+8. Other clients pull only newer foreign batches and apply remote-visible namespace/attrs/symlinks/xattrs to local `base_*`.
+9. `metadata_state` stores periodic checkpoints for bootstrap and `discover`.
 
 ## Write Path
 
 1. Split incoming data into blocks.
 2. Stage bytes locally in memory and, if needed, NVMe spill.
-3. Publish staged block refs only to local metadata.
-4. Queue upload journal entries with `content_epoch`.
-5. After S3 upload success, commit the block into `committed_file_blocks`.
-6. Advance `committed_size` only as blocks become committed.
+3. Track staged data in pending incarnation state.
+4. On `flush()` / `close()`, append records to ingress as accepted local data.
+5. Background materialization builds and updates pending manifests as needed.
+6. On publish, update remote committed incarnation and `committed_size`.
 
-This lets the local client see writes immediately while remote clients see a
-growing committed view.
+This lets the local client read accepted data immediately, while remote clients
+still observe committed incarnations as they become published.
 
 Ingress follow-up:
 - concrete first-slice scope is frozen in

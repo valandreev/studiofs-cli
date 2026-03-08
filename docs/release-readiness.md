@@ -4,6 +4,13 @@ Current status as of 2026-03-07: candidate is ready for external test pass.
 
 ## Gate Checklist
 
+- PR-01 (Freeze Contract):
+  - `docs/refactor/file-visibility-and-incarnation-model.md` is the canonical
+    visibility contract.
+  - `docs/architecture.md`, `docs/append-only-ingress-segments.md`, `docs/vfs.md`
+    all align with the same local/remote semantics and terminology.
+  - `vfs_test.rs` contains reserved gate test names for new contract edges.
+
 - Build:
   - `cargo build --release` passes.
   - no known workspace warnings in the latest validated run.
