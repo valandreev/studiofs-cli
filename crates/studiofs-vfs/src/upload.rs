@@ -262,6 +262,9 @@ impl UploadScheduler {
 
     /// Log a periodic summary line for upload pipeline health.
     pub fn log_stats(&self, pending: usize, pending_age_p95_ms: u64, pending_age_max_ms: u64) {
+        if upload_log_is_idle(pending, self.aimd.in_flight()) {
+            return;
+        }
         info!(
             window = format!("{:.1}", self.aimd.window()),
             inflight = self.aimd.in_flight(),
@@ -272,6 +275,10 @@ impl UploadScheduler {
             self.metrics,
         );
     }
+}
+
+pub(crate) fn upload_log_is_idle(pending: usize, inflight: usize) -> bool {
+    pending == 0 && inflight == 0
 }
 
 fn is_retryable(err: &DataError) -> bool {
@@ -309,5 +316,17 @@ fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
                 metrics.network_err.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_log_is_idle;
+
+    #[test]
+    fn idle_upload_info_log_is_compact() {
+        assert!(upload_log_is_idle(0, 0));
+        assert!(!upload_log_is_idle(1, 0));
+        assert!(!upload_log_is_idle(0, 1));
     }
 }

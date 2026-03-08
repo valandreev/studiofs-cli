@@ -398,7 +398,7 @@ impl BlockCache {
         self.upload_queue.wait_for_idle(timeout).await
     }
 
-    /// Snapshot pending uploads from disk (for reconciliation).
+    /// Snapshot pending uploads from the live in-memory index.
     pub fn snapshot_pending_uploads(&self) -> Vec<PendingUpload> {
         self.upload_queue.snapshot_pending()
     }

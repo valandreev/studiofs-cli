@@ -1974,6 +1974,16 @@ impl StudioVfs {
         (count, oldest_age_ms)
     }
 
+    fn upload_pipeline_is_idle(&self, pending_uploads: usize, ingress: &VfsIngressStats) -> bool {
+        crate::upload::upload_log_is_idle(pending_uploads, self.upload_scheduler.in_flight())
+            && ingress.dirty_mem_blocks == 0
+            && ingress.dirty_mem_bytes == 0
+            && ingress.spill_records == 0
+            && ingress.spill_bytes == 0
+            && ingress.checkpoint_pending_bytes == 0
+            && ingress.checkpoint_pending_mutations == 0
+    }
+
     fn ingress_checkpoint_due(&self, timer_fired: bool) -> bool {
         let pending_bytes = self
             .state
@@ -5164,40 +5174,44 @@ impl StudioVfs {
             let pending = self.block_cache.pending_upload_count();
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
-            info!(
-                requeues = self.state.upload_requeues.load(Ordering::Relaxed),
-                canceled_deleted = self.state.upload_canceled_deleted.load(Ordering::Relaxed),
-                canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
-                foreground_reads_inflight =
-                    self.state.foreground_reads_inflight.load(Ordering::Relaxed),
-                dirty_mem_blocks = ingress.dirty_mem_blocks,
-                dirty_mem_bytes = ingress.dirty_mem_bytes,
-                spill_records = ingress.spill_records,
-                spill_bytes = ingress.spill_bytes,
-                oldest_spill_age_ms = ingress.oldest_spill_age_ms,
-                forced_spill_blocks = ingress.forced_spill_blocks,
-                drained_mem_blocks = ingress.drained_mem_blocks,
-                drained_mem_bytes = ingress.drained_mem_bytes,
-                drained_spill_blocks = ingress.drained_spill_blocks,
-                drained_spill_bytes = ingress.drained_spill_bytes,
-                checkpoint_persists = ingress.checkpoint_persists,
-                checkpoint_failures = ingress.checkpoint_failures,
-                last_checkpoint_age_ms = ingress.last_checkpoint_age_ms,
-                last_checkpoint_segment_id = ingress.last_checkpoint_segment_id,
-                last_checkpoint_offset = ingress.last_checkpoint_offset,
-                checkpoint_pending_bytes = ingress.checkpoint_pending_bytes,
-                checkpoint_pending_mutations = ingress.checkpoint_pending_mutations,
-                checkpoint_active_segment_lag = ingress.checkpoint_active_segment_lag,
-                checkpoint_live_segments = ingress.checkpoint_live_segments,
-                write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
-                upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
-                qos_accept_available = self.qos.accept_available(),
-                qos_materialize_available = self.qos.materialize_available(),
-                qos_upload_available = self.qos.upload_available(),
-                qos_commit_available = self.qos.commit_available(),
-                qos_fetch_available = self.qos.fetch_available(),
-                "upload pipeline counters"
-            );
+            if self.upload_pipeline_is_idle(pending, &ingress) {
+                info!(pending_uploads = pending, "upload pipeline");
+            } else {
+                info!(
+                    requeues = self.state.upload_requeues.load(Ordering::Relaxed),
+                    canceled_deleted = self.state.upload_canceled_deleted.load(Ordering::Relaxed),
+                    canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
+                    foreground_reads_inflight =
+                        self.state.foreground_reads_inflight.load(Ordering::Relaxed),
+                    dirty_mem_blocks = ingress.dirty_mem_blocks,
+                    dirty_mem_bytes = ingress.dirty_mem_bytes,
+                    spill_records = ingress.spill_records,
+                    spill_bytes = ingress.spill_bytes,
+                    oldest_spill_age_ms = ingress.oldest_spill_age_ms,
+                    forced_spill_blocks = ingress.forced_spill_blocks,
+                    drained_mem_blocks = ingress.drained_mem_blocks,
+                    drained_mem_bytes = ingress.drained_mem_bytes,
+                    drained_spill_blocks = ingress.drained_spill_blocks,
+                    drained_spill_bytes = ingress.drained_spill_bytes,
+                    checkpoint_persists = ingress.checkpoint_persists,
+                    checkpoint_failures = ingress.checkpoint_failures,
+                    last_checkpoint_age_ms = ingress.last_checkpoint_age_ms,
+                    last_checkpoint_segment_id = ingress.last_checkpoint_segment_id,
+                    last_checkpoint_offset = ingress.last_checkpoint_offset,
+                    checkpoint_pending_bytes = ingress.checkpoint_pending_bytes,
+                    checkpoint_pending_mutations = ingress.checkpoint_pending_mutations,
+                    checkpoint_active_segment_lag = ingress.checkpoint_active_segment_lag,
+                    checkpoint_live_segments = ingress.checkpoint_live_segments,
+                    write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
+                    upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
+                    qos_accept_available = self.qos.accept_available(),
+                    qos_materialize_available = self.qos.materialize_available(),
+                    qos_upload_available = self.qos.upload_available(),
+                    qos_commit_available = self.qos.commit_available(),
+                    qos_fetch_available = self.qos.fetch_available(),
+                    "upload pipeline counters"
+                );
+            }
             self.upload_scheduler.log_stats(pending, p95_ms, max_ms);
         }
     }

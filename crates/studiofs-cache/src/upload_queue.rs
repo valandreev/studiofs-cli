@@ -13,6 +13,8 @@
 //! a channel of [`PendingUpload`] items that the VFS upload worker consumes.
 //! This keeps cache-layer responsibilities separate from network I/O.
 
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -71,6 +73,7 @@ pub struct UploadQueue {
     sender: mpsc::UnboundedSender<PendingUpload>,
     journal_tx: mpsc::UnboundedSender<JournalOp>,
     pending_count: AtomicUsize,
+    pending_index: Mutex<HashMap<u64, PendingUpload>>,
     idle_notify: Arc<Notify>,
 }
 
@@ -111,6 +114,7 @@ impl UploadQueue {
             sender: tx,
             journal_tx,
             pending_count: AtomicUsize::new(0),
+            pending_index: Mutex::new(HashMap::new()),
             idle_notify,
         });
 
@@ -151,8 +155,10 @@ impl UploadQueue {
             retry_count: 0,
         };
 
+        self.record_pending(op.clone());
         if self.sender.send(op).is_err() {
             error!("upload channel closed — cannot queue upload");
+            self.remove_pending(object_id);
             self.mark_done();
         }
     }
@@ -162,6 +168,7 @@ impl UploadQueue {
     /// Removes the journal file.  The caller is responsible for unpinning the
     /// block in the LRU tracker.
     pub fn complete(&self, op: &PendingUpload) {
+        self.remove_pending(op.object_id);
         if !op.journal_path.as_os_str().is_empty() {
             let _ = self.journal_tx.send(JournalOp::Complete {
                 path: op.journal_path.clone(),
@@ -179,6 +186,7 @@ impl UploadQueue {
     /// pending count.  The caller is responsible for unpinning + removing the
     /// block from cache.
     pub fn cancel(&self, op: &PendingUpload) {
+        self.remove_pending(op.object_id);
         if !op.journal_path.as_os_str().is_empty() {
             let _ = self.journal_tx.send(JournalOp::Complete {
                 path: op.journal_path.clone(),
@@ -231,39 +239,10 @@ impl UploadQueue {
         self.pending_count.load(Ordering::Relaxed)
     }
 
-    /// Snapshot all currently pending upload ops from disk.
+    /// Snapshot all currently pending upload ops from the live in-memory index.
     pub fn snapshot_pending(&self) -> Vec<PendingUpload> {
-        let mut ops = Vec::new();
-        let read_dir = match fs::read_dir(&self.upload_dir) {
-            Ok(rd) => rd,
-            Err(e) => {
-                warn!(error = %e, "failed to read upload dir for snapshot");
-                return ops;
-            }
-        };
-        for entry in read_dir {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "pending") {
-                match self.parse_journal(&path) {
-                    Ok(op) => ops.push(op),
-                    Err(e) => {
-                        if e.kind() == io::ErrorKind::PermissionDenied {
-                            debug!(
-                                path = %path.display(),
-                                error = %e,
-                                "upload journal temporarily unavailable, skipping"
-                            );
-                        } else {
-                            warn!(path = %path.display(), error = %e, "corrupt upload journal");
-                        }
-                    }
-                }
-            }
-        }
+        let mut ops: Vec<_> = self.pending_index.lock().values().cloned().collect();
+        ops.sort_by_key(|op| (op.created_unix_ms, op.object_id));
         ops
     }
 
@@ -291,6 +270,14 @@ impl UploadQueue {
 
     fn journal_path(&self, object_id: u64) -> PathBuf {
         self.upload_dir.join(format!("{:016x}.pending", object_id))
+    }
+
+    fn record_pending(&self, op: PendingUpload) {
+        self.pending_index.lock().insert(op.object_id, op);
+    }
+
+    fn remove_pending(&self, object_id: u64) {
+        self.pending_index.lock().remove(&object_id);
     }
 
     fn parse_journal(&self, path: &Path) -> io::Result<PendingUpload> {
@@ -346,6 +333,26 @@ impl UploadQueue {
         })
     }
 
+    fn load_pending_entry(&self, path: &Path) -> io::Result<Option<PendingUpload>> {
+        match self.parse_journal(path) {
+            Ok(op) => Ok(Some(op)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "upload journal disappeared during scan, skipping"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn scan_and_queue(&self) {
         let read_dir = match fs::read_dir(&self.upload_dir) {
             Ok(rd) => rd,
@@ -372,15 +379,17 @@ impl UploadQueue {
             }
 
             if path.is_file() && path.extension().is_some_and(|ext| ext == "pending") {
-                match self.parse_journal(&path) {
-                    Ok(op) => {
+                match self.load_pending_entry(&path) {
+                    Ok(Some(op)) => {
                         self.pending_count.fetch_add(1, Ordering::Relaxed);
-                        if self.sender.send(op).is_ok() {
+                        if self.sender.send(op.clone()).is_ok() {
+                            self.record_pending(op);
                             count += 1;
                         } else {
                             self.pending_count.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => {
                         warn!(path = %path.display(), error = %e, "corrupt upload journal, removing");
                         corrupted += 1;
@@ -487,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery() {
+    async fn startup_rebuilds_pending_upload_index_from_journal() {
         let dir = tempfile::tempdir().unwrap();
 
         // Simulate a prior session that left journal files.
@@ -509,6 +518,7 @@ mod tests {
         let mut ids: Vec<u64> = vec![op1.object_id, op2.object_id];
         ids.sort();
         assert_eq!(ids, vec![10, 20]);
+        assert_eq!(queue.snapshot_pending().len(), 2);
     }
 
     #[tokio::test]
@@ -522,6 +532,40 @@ mod tests {
 
         let snap = queue.snapshot_pending();
         assert_eq!(snap.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn snapshot_pending_uses_live_index_without_directory_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, _rx) = UploadQueue::new(dir.path());
+
+        queue.submit(1, 0, 777, 3);
+        queue.flush_journal().await;
+
+        let upload_dir = dir.path().join("upload");
+        let hidden_dir = dir.path().join("upload-hidden");
+        std::fs::rename(&upload_dir, &hidden_dir).unwrap();
+
+        let snap = queue.snapshot_pending();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].object_id, 777);
+    }
+
+    #[tokio::test]
+    async fn pending_upload_snapshot_ignores_concurrent_completion_enoent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, _rx) = UploadQueue::new(dir.path());
+
+        queue.submit(1, 0, 888, 9);
+        queue.flush_journal().await;
+
+        let path = queue.journal_path(888);
+        std::fs::remove_file(&path).unwrap();
+
+        let recovered = queue
+            .load_pending_entry(&path)
+            .expect("missing journal should be treated as benign");
+        assert!(recovered.is_none());
     }
 
     #[tokio::test]

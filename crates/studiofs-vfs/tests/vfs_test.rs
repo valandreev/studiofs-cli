@@ -6688,6 +6688,64 @@ async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_upload_helpers_use_live_index_without_directory_scan() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr13-live-upload-index-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let payload = vec![0x22u8; format_info.block_size as usize * 2];
+    let attr = vfs.create(1, b"live-index.bin", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, &payload).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            vfs.pending_uploads_for_inode(attr.ino).len() == 2
+        })
+        .await,
+        "offline upload scenario should surface pending uploads before the upload dir is hidden"
+    );
+
+    let upload_dir = cache_dir.join("upload");
+    let hidden_dir = cache_dir.join("upload-hidden");
+    std::fs::rename(&upload_dir, &hidden_dir).unwrap();
+
+    let pending = vfs.pending_uploads_for_inode(attr.ino);
+    assert_eq!(
+        pending.len(),
+        2,
+        "pending upload helpers must use the live in-memory index instead of scanning upload/"
+    );
+    assert_eq!(
+        vfs.upload_stats().pending_uploads,
+        2,
+        "pending upload count should stay available even if upload/ is temporarily unavailable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_shutdown_drains_dirty_buffers() {
     ensure_bucket().await;
