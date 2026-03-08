@@ -50,6 +50,16 @@ impl FileType {
     }
 }
 
+/// Coarse remote upload lifecycle exposed by metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
+pub enum UploadState {
+    Uploading = 1,
+    Updating = 2,
+    #[default]
+    Ready = 3,
+}
+
 /// Inode attributes - stored in ATTRIBUTES table.
 ///
 /// Key design: timestamps stored as nanoseconds since Unix epoch,
@@ -93,6 +103,12 @@ pub struct InodeAttr {
     /// Monotonic content generation used to discard stale async completions.
     #[serde(default)]
     pub content_epoch: u64,
+    /// Last committed content generation visible to remote clients.
+    #[serde(default)]
+    pub committed_content_epoch: u64,
+    /// Coarse remote upload lifecycle for the current inode view.
+    #[serde(default)]
+    pub upload_state: UploadState,
 }
 
 impl InodeAttr {
@@ -123,6 +139,8 @@ impl InodeAttr {
             crtime: now,
             win_attrs: 0x10, // FILE_ATTRIBUTE_DIRECTORY
             content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: UploadState::Ready,
         }
     }
 
@@ -145,6 +163,8 @@ impl InodeAttr {
             crtime: now,
             win_attrs: 0x20, // FILE_ATTRIBUTE_ARCHIVE
             content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: UploadState::Ready,
         }
     }
 
@@ -184,6 +204,8 @@ impl InodeAttr {
             crtime: now,
             win_attrs: 0x0400, // FILE_ATTRIBUTE_REPARSE_POINT
             content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: UploadState::Ready,
         }
     }
 

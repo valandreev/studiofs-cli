@@ -979,6 +979,98 @@ impl RedbMetaEngine {
         Ok(size)
     }
 
+    fn committed_manifest_in_txn(
+        committed: &redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let mut out = Vec::new();
+        for row in committed
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_ino, block_index) = decode_file_block_key(key.value());
+            if decoded_ino != ino {
+                break;
+            }
+            out.push((block_index, decode(value.value())?));
+        }
+        Ok(out)
+    }
+
+    fn current_manifest_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let blocks = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let committed = txn
+            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let mut merged = std::collections::BTreeMap::new();
+        for row in blocks
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_ino, block_index) = decode_file_block_key(key.value());
+            if decoded_ino != ino {
+                break;
+            }
+            merged.insert(block_index, decode(value.value())?);
+        }
+        for row in committed
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_ino, block_index) = decode_file_block_key(key.value());
+            if decoded_ino != ino {
+                break;
+            }
+            merged.entry(block_index).or_insert(decode(value.value())?);
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    fn transition_upload_state_for_local_mutation(
+        attr: &mut InodeAttr,
+        has_committed_manifest: bool,
+    ) {
+        if attr.kind != FileType::RegularFile {
+            attr.upload_state = UploadState::Ready;
+            return;
+        }
+        if attr.content_epoch == attr.committed_content_epoch && attr.size == attr.committed_size {
+            attr.upload_state = UploadState::Ready;
+        } else if has_committed_manifest
+            || attr.committed_size > 0
+            || attr.committed_content_epoch > 0
+        {
+            attr.upload_state = UploadState::Updating;
+        } else {
+            attr.upload_state = UploadState::Uploading;
+        }
+    }
+
+    fn manifest_matches_committed_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        let current = Self::current_manifest_in_txn(txn, ino)?;
+        let committed = txn
+            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(current == Self::committed_manifest_in_txn(&committed, ino)?)
+    }
+
     /// Export full redb state as a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self
@@ -1888,6 +1980,19 @@ impl RedbMetaEngine {
                         .insert(key.as_slice(), data.as_slice())
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
+                crate::events::MetaEvent::PublishFileManifest { ino, blocks } => {
+                    let mut committed = txn
+                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
+                    for (block_index, block) in blocks {
+                        let key = encode_file_block_key(*ino, *block_index);
+                        let data = encode(block)?;
+                        committed
+                            .insert(key.as_slice(), data.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
                     let mut table = txn
                         .open_table(BASE_SYMLINKS_TABLE)
@@ -2116,6 +2221,7 @@ impl RedbMetaEngine {
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::SetFileBlocksBatch { .. }
                 | crate::events::MetaEvent::CommitFileBlock { .. }
+                | crate::events::MetaEvent::PublishFileManifest { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
             }
@@ -2235,6 +2341,7 @@ impl RedbMetaEngine {
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::SetFileBlocksBatch { .. }
                 | crate::events::MetaEvent::CommitFileBlock { .. }
+                | crate::events::MetaEvent::PublishFileManifest { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
             }
@@ -2481,11 +2588,25 @@ impl MetaEngine for RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
-            Self::set_inode_overlay_in_txn(&txn, attr)?;
+            let mut normalized = attr.clone();
+            if normalized.kind == FileType::RegularFile {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let has_committed_manifest =
+                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                Self::transition_upload_state_for_local_mutation(
+                    &mut normalized,
+                    has_committed_manifest,
+                );
+            }
+            Self::set_inode_overlay_in_txn(&txn, &normalized)?;
 
             Self::append_event_in_txn(
                 &txn,
-                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                &crate::events::MetaEvent::SetAttr {
+                    attr: normalized.clone(),
+                },
             )?;
         }
         txn.commit()
@@ -2735,6 +2856,27 @@ impl MetaEngine for RedbMetaEngine {
                 .insert(key.as_slice(), data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(attr_bytes) = attr_bytes {
+                let mut attr: InodeAttr = decode(&attr_bytes)?;
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let has_committed_manifest =
+                    !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                Self::transition_upload_state_for_local_mutation(&mut attr, has_committed_manifest);
+                let encoded = encode(&attr)?;
+                inodes
+                    .insert(ino, encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::SetFileBlock {
@@ -2885,14 +3027,17 @@ impl MetaEngine for RedbMetaEngine {
                     .map(|g| g.value().to_vec());
                 if let Some(attr_bytes) = attr_bytes {
                     let mut attr: InodeAttr = decode(&attr_bytes)?;
-                    if attr.committed_size != new_committed_size {
-                        attr.committed_size = new_committed_size;
-                        let data = encode(&attr)?;
-                        inodes
-                            .insert(ino, data.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        updated_attr = Some(attr);
-                    }
+                    attr.committed_size = new_committed_size;
+                    let has_committed_manifest = new_committed_size > 0;
+                    Self::transition_upload_state_for_local_mutation(
+                        &mut attr,
+                        has_committed_manifest,
+                    );
+                    let data = encode(&attr)?;
+                    inodes
+                        .insert(ino, data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    updated_attr = Some(attr);
                 }
 
                 Self::append_event_in_txn(
@@ -2991,6 +3136,7 @@ impl MetaEngine for RedbMetaEngine {
             let mut counters_table = txn
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut touched_inodes = std::collections::BTreeSet::new();
 
             for e in entries {
                 let key = encode_file_block_key(e.ino, e.block_index);
@@ -3025,6 +3171,35 @@ impl MetaEngine for RedbMetaEngine {
 
                 used_space_delta += e.length as i64;
                 results.push(BatchFlushResult { old_block });
+                touched_inodes.insert(e.ino);
+            }
+
+            if !touched_inodes.is_empty() {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for ino in touched_inodes {
+                    let attr_bytes = inodes
+                        .get(ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|g| g.value().to_vec());
+                    if let Some(attr_bytes) = attr_bytes {
+                        let mut attr: InodeAttr = decode(&attr_bytes)?;
+                        let has_committed_manifest =
+                            !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                        Self::transition_upload_state_for_local_mutation(
+                            &mut attr,
+                            has_committed_manifest,
+                        );
+                        let encoded = encode(&attr)?;
+                        inodes
+                            .insert(ino, encoded.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
             }
 
             // Apply net USED_SPACE delta in one counter update.
@@ -3151,8 +3326,20 @@ impl MetaEngine for RedbMetaEngine {
             let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
             drop(committed);
 
-            let committed_changed = attr.committed_size != new_committed_size;
+            let previous_committed_size = attr.committed_size;
+            let previous_committed_epoch = attr.committed_content_epoch;
+            let previous_upload_state = attr.upload_state;
+            let manifest_matches_committed = Self::manifest_matches_committed_in_txn(&txn, ino)?;
             attr.committed_size = new_committed_size;
+            if manifest_matches_committed {
+                attr.committed_content_epoch = attr.content_epoch;
+                attr.upload_state = UploadState::Ready;
+            } else {
+                Self::transition_upload_state_for_local_mutation(&mut attr, new_committed_size > 0);
+            }
+            let committed_changed = previous_committed_size != attr.committed_size
+                || previous_committed_epoch != attr.committed_content_epoch
+                || previous_upload_state != attr.upload_state;
             let attr_data = encode(&attr)?;
             inodes
                 .insert(ino, attr_data.as_slice())
@@ -3195,6 +3382,96 @@ impl MetaEngine for RedbMetaEngine {
                     },
                 )?;
             }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let published_blocks;
+        {
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = match inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(false),
+            };
+            let mut attr: InodeAttr = decode(&attr_bytes)?;
+            if attr.content_epoch != expected_epoch {
+                return Ok(false);
+            }
+
+            published_blocks = Self::current_manifest_in_txn(&txn, ino)?;
+
+            let mut committed = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let old_committed = Self::remove_all_committed_blocks_in_txn(&mut committed, ino)?;
+            let mut surviving = std::collections::HashSet::new();
+            for (block_index, block) in &published_blocks {
+                let key = encode_file_block_key(ino, *block_index);
+                let data = encode(block)?;
+                committed
+                    .insert(key.as_slice(), data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                surviving.insert(block.object_id);
+            }
+            drop(committed);
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for object_id in old_committed {
+                if surviving.contains(&object_id) {
+                    continue;
+                }
+                let mut pending_del_table = txn
+                    .open_table(PENDING_DELETIONS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                pending_del_table
+                    .insert(object_id, timestamp)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(pending_del_table);
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddPendingDeletion {
+                        object_id,
+                        timestamp,
+                    },
+                )?;
+            }
+
+            attr.committed_size = attr.size;
+            attr.committed_content_epoch = attr.content_epoch;
+            attr.upload_state = UploadState::Ready;
+            let attr_data = encode(&attr)?;
+            inodes
+                .insert(ino, attr_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::PublishFileManifest {
+                    ino,
+                    blocks: published_blocks.clone(),
+                },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+            )?;
         }
 
         txn.commit()
@@ -5010,6 +5287,149 @@ mod tests {
 
         assert!(!engine.commit_uploaded_block(file.ino, 0, 0, &old).unwrap());
         assert!(engine.commit_uploaded_block(file.ino, 0, 0, &new).unwrap());
+    }
+
+    #[test]
+    fn redb_manifest_publish_sets_committed_head() {
+        let engine = temp_engine();
+
+        let file = engine
+            .create_file(ROOT_INO, b"publish-head.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 8192;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+
+        let block0 = BlockRef::new_partial(101, 4096);
+        let block1 = BlockRef::new_partial(102, 4096);
+        engine.set_file_block(file.ino, 0, &block0).unwrap();
+        engine.set_file_block(file.ino, 1, &block1).unwrap();
+
+        assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+        let published_attr = engine.get_attr(file.ino).unwrap();
+        assert_eq!(published_attr.committed_size, 8192);
+        assert_eq!(published_attr.committed_content_epoch, 1);
+        assert_eq!(published_attr.upload_state, UploadState::Ready);
+
+        let snapshot = engine.export_remote_snapshot().unwrap();
+        let remote = temp_engine();
+        remote.import_snapshot(&snapshot).unwrap();
+        let remote_attr = remote.get_attr(file.ino).unwrap();
+        assert_eq!(remote_attr.size, 8192);
+        assert_eq!(remote_attr.committed_size, 8192);
+        assert_eq!(remote_attr.committed_content_epoch, 1);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+
+        let remote_blocks = remote.get_file_blocks(file.ino).unwrap();
+        assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
+    }
+
+    #[test]
+    fn redb_upload_state_transitions_follow_inode_fields() {
+        let engine = temp_engine();
+
+        let file = engine
+            .create_file(ROOT_INO, b"upload-state.bin", 1000, 1000, 0o644)
+            .unwrap();
+        assert_eq!(
+            engine.get_attr(file.ino).unwrap().upload_state,
+            UploadState::Ready
+        );
+
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+        engine
+            .set_file_block(file.ino, 0, &BlockRef::new_partial(201, 4096))
+            .unwrap();
+        let uploading = engine.get_attr(file.ino).unwrap();
+        assert_eq!(uploading.upload_state, UploadState::Uploading);
+        assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+        let ready = engine.get_attr(file.ino).unwrap();
+        assert_eq!(ready.upload_state, UploadState::Ready);
+        assert_eq!(ready.committed_content_epoch, 1);
+
+        let mut update_attr = ready.clone();
+        update_attr.content_epoch = 2;
+        engine.set_attr(&update_attr).unwrap();
+        engine
+            .set_file_block(file.ino, 0, &BlockRef::new_partial(202, 4096))
+            .unwrap();
+        let updating = engine.get_attr(file.ino).unwrap();
+        assert_eq!(updating.upload_state, UploadState::Updating);
+        assert_eq!(updating.committed_content_epoch, 1);
+    }
+
+    #[test]
+    fn redb_partial_update_does_not_expose_new_blocks_before_publish() {
+        let engine = temp_engine();
+
+        let file = engine
+            .create_file(ROOT_INO, b"partial-update.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+        let committed = BlockRef::new_partial(301, 4096);
+        engine.set_file_block(file.ino, 0, &committed).unwrap();
+        assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+        let mut update_attr = engine.get_attr(file.ino).unwrap();
+        update_attr.content_epoch = 2;
+        engine.set_attr(&update_attr).unwrap();
+        let staged = BlockRef::new_partial(302, 4096);
+        engine.set_file_block(file.ino, 0, &staged).unwrap();
+
+        let local = engine.get_file_block(file.ino, 0).unwrap().unwrap();
+        assert_eq!(local.object_id, 302);
+
+        let snapshot = engine.export_remote_snapshot().unwrap();
+        let remote = temp_engine();
+        remote.import_snapshot(&snapshot).unwrap();
+
+        let remote_attr = remote.get_attr(file.ino).unwrap();
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_content_epoch, 1);
+        assert_eq!(remote_attr.upload_state, UploadState::Updating);
+        let remote_block = remote.get_file_block(file.ino, 0).unwrap().unwrap();
+        assert_eq!(remote_block.object_id, 301);
+    }
+
+    #[test]
+    fn redb_rename_keeps_same_inode_and_incarnation_ids() {
+        let engine = temp_engine();
+
+        let file = engine
+            .create_file(ROOT_INO, b"rename-inc.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 7;
+        engine.set_attr(&attr).unwrap();
+        engine
+            .set_file_block(file.ino, 0, &BlockRef::new_partial(401, 4096))
+            .unwrap();
+        assert!(engine.publish_file_manifest(file.ino, 7).unwrap());
+
+        engine
+            .rename_atomic(
+                ROOT_INO,
+                b"rename-inc.bin",
+                ROOT_INO,
+                b"rename-inc-next.bin",
+            )
+            .unwrap();
+
+        let renamed = engine.lookup(ROOT_INO, b"rename-inc-next.bin").unwrap();
+        assert_eq!(renamed.ino, file.ino);
+        let renamed_attr = engine.get_attr(renamed.ino).unwrap();
+        assert_eq!(renamed_attr.content_epoch, 7);
+        assert_eq!(renamed_attr.committed_content_epoch, 7);
+        assert_eq!(renamed_attr.upload_state, UploadState::Ready);
     }
 
     #[test]

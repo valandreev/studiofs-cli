@@ -214,7 +214,8 @@ impl PgMetaEngine {
             MetaEvent::SetFileBlock { .. } => false,
             MetaEvent::RemoveFileBlock { ino, .. }
             | MetaEvent::RemoveFileBlocks { ino }
-            | MetaEvent::CommitFileBlock { ino, .. } => overlay.block_inodes.contains(ino),
+            | MetaEvent::CommitFileBlock { ino, .. }
+            | MetaEvent::PublishFileManifest { ino, .. } => overlay.block_inodes.contains(ino),
             MetaEvent::SetSymlinkTarget { ino, .. } => {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -244,6 +245,7 @@ impl PgMetaEngine {
             | MetaEvent::RemoveFileBlock { .. }
             | MetaEvent::RemoveFileBlocks { .. }
             | MetaEvent::CommitFileBlock { .. }
+            | MetaEvent::PublishFileManifest { .. }
             | MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
@@ -318,6 +320,7 @@ impl PgMetaEngine {
             | MetaEvent::RemoveFileBlocks { .. }
             | MetaEvent::SetFileBlocksBatch { .. }
             | MetaEvent::CommitFileBlock { .. }
+            | MetaEvent::PublishFileManifest { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. } => false,
         }
@@ -921,6 +924,14 @@ impl MetaEngine for PgMetaEngine {
     ) -> MetaResult<bool> {
         let result = self
             .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
+        if matches!(result, Ok(true)) {
+            self.force_flush.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+        let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
         if matches!(result, Ok(true)) {
             self.force_flush.store(true, Ordering::SeqCst);
         }

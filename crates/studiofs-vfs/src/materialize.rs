@@ -268,7 +268,8 @@ impl Materializer {
         let mut drained_spill_bytes = 0u64;
 
         for (idx, extent) in extents.iter().enumerate() {
-            vfs.block_cache.stage_l1(extent.object_id, extent.data.clone());
+            vfs.block_cache
+                .stage_l1(extent.object_id, extent.data.clone());
             l2_work.push((extent.object_id, extent.data.clone()));
 
             let file_offset = (extent.block_index as u64) * vfs.block_size as u64;
@@ -311,8 +312,7 @@ impl Materializer {
 
             if extent.from_spill {
                 drained_spill_blocks = drained_spill_blocks.saturating_add(1);
-                drained_spill_bytes =
-                    drained_spill_bytes.saturating_add(extent.data.len() as u64);
+                drained_spill_bytes = drained_spill_bytes.saturating_add(extent.data.len() as u64);
             } else {
                 drained_mem_blocks = drained_mem_blocks.saturating_add(1);
                 drained_mem_bytes = drained_mem_bytes.saturating_add(extent.data.len() as u64);

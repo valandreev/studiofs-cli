@@ -245,6 +245,14 @@ pub trait MetaEngine: Send + Sync {
         Ok(true)
     }
 
+    /// Atomically publish the current file manifest as the new committed head.
+    ///
+    /// This switches the committed manifest at file granularity and updates the
+    /// inode's coarse remote upload state to `ready` when successful.
+    fn publish_file_manifest(&self, _ino: Ino, _expected_epoch: u64) -> MetaResult<bool> {
+        Ok(false)
+    }
+
     // ─── Pending Deletions (GC) ───────────────────────
 
     /// Add a block to pending deletions (mark for GC).

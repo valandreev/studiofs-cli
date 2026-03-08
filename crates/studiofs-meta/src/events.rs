@@ -63,6 +63,12 @@ pub enum MetaEvent {
         block: BlockRef,
     },
 
+    /// Atomically publish the committed manifest head for a file.
+    PublishFileManifest {
+        ino: u64,
+        blocks: Vec<(u32, BlockRef)>,
+    },
+
     // ─── Target & Extended Attributes ────────────────────────────────────────
     /// Set a symlink target.
     SetSymlinkTarget { ino: u64, target: Vec<u8> },
@@ -99,6 +105,7 @@ impl MetaEvent {
             Self::RemoveFileBlocks { .. } => "remove_file_blocks",
             Self::SetFileBlocksBatch { .. } => "set_file_blocks_batch",
             Self::CommitFileBlock { .. } => "commit_file_block",
+            Self::PublishFileManifest { .. } => "publish_file_manifest",
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",
@@ -121,6 +128,7 @@ impl MetaEvent {
             Self::RemoveFileBlocks { ino } => Some(*ino),
             Self::SetFileBlocksBatch { blocks } => blocks.first().map(|(ino, _, _)| *ino),
             Self::CommitFileBlock { ino, .. } => Some(*ino),
+            Self::PublishFileManifest { ino, .. } => Some(*ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),
             Self::SetXattr { ino, .. } => Some(*ino),
             Self::RemoveXattr { ino, .. } => Some(*ino),

@@ -2539,7 +2539,9 @@ fn restart_replays_only_live_pending_extents() {
             )
             .unwrap();
 
-            let attr = vfs.create(1, b"restart-live-only.bin", 0, 0, 0o644).unwrap();
+            let attr = vfs
+                .create(1, b"restart-live-only.bin", 0, 0, 0o644)
+                .unwrap();
             ino = attr.ino;
 
             vfs.write(ino, 0, &first).await.unwrap();
@@ -2638,7 +2640,9 @@ fn offline_s3_does_not_break_local_read_after_write() {
         )
         .unwrap();
 
-        let attr = vfs.create(1, b"offline-local-read.bin", 0, 0, 0o644).unwrap();
+        let attr = vfs
+            .create(1, b"offline-local-read.bin", 0, 0, 0o644)
+            .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
@@ -2760,7 +2764,10 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 "offline phase should leave the whole replacement pending"
             );
 
-            let read = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+            let read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
             assert_eq!(read.as_ref(), replacement_payload.as_slice());
         });
         rt.shutdown_background();
@@ -2799,7 +2806,10 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
 
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
-                let read = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+                let read = vfs
+                    .read(ino, 0, replacement_payload.len() as u32)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     read.as_ref(),
                     replacement_payload.as_slice(),
@@ -2809,11 +2819,17 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 if vfs.pending_uploads_for_inode(ino).is_empty() {
                     break;
                 }
-                assert!(Instant::now() < deadline, "pending uploads did not drain under sequential completion");
+                assert!(
+                    Instant::now() < deadline,
+                    "pending uploads did not drain under sequential completion"
+                );
                 tokio::time::sleep(Duration::from_millis(75)).await;
             }
 
-            let final_read = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+            let final_read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
             assert_eq!(final_read.as_ref(), replacement_payload.as_slice());
         });
         rt.shutdown_background();
