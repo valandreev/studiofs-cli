@@ -367,6 +367,19 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     }
 }
 
+fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool) -> bool {
+    match e {
+        studiofs_vfs::VfsError::Meta(me) => match me {
+            studiofs_meta::MetaError::InodeNotFound(_)
+            | studiofs_meta::MetaError::EntryNotFound { .. } => true,
+            studiofs_meta::MetaError::NotADirectory(_) => deleting_dir,
+            studiofs_meta::MetaError::IsADirectory(_) => !deleting_dir,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 // ─── FileSystemContext ───────────────────────────────────────────────────────
 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
@@ -739,19 +752,39 @@ impl FileSystemContext for StudioFsContext {
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
-            if let Some(fname) = file_name
-                && let Ok((parent_ino, name)) = resolve_parent(&self.vfs, fname)
-            {
-                let res = if context.is_dir {
-                    self.vfs.rmdir(parent_ino, &name)
-                } else {
-                    self.vfs.unlink(parent_ino, &name)
-                };
+            if let Some(fname) = file_name {
+                match resolve_parent(&self.vfs, fname) {
+                    Ok((parent_ino, name)) => {
+                        let res = if context.is_dir {
+                            self.vfs.rmdir(parent_ino, &name)
+                        } else {
+                            self.vfs.unlink(parent_ino, &name)
+                        };
 
-                if let Err(e) = res {
-                    error!("cleanup delete failed: {:?}", e);
-                } else {
-                    debug!(ino = context.ino, "cleanup delete");
+                        match res {
+                            Ok(()) => {
+                                debug!(ino = context.ino, "cleanup delete");
+                            }
+                            Err(e) if is_benign_cleanup_delete_error(&e, context.is_dir) => {
+                                debug!(
+                                    ino = context.ino,
+                                    is_dir = context.is_dir,
+                                    error = ?e,
+                                    "cleanup delete skipped stale race"
+                                );
+                            }
+                            Err(e) => {
+                                error!("cleanup delete failed: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        debug!(
+                            ino = context.ino,
+                            is_dir = context.is_dir,
+                            "cleanup delete skipped: path already gone"
+                        );
+                    }
                 }
             }
         } else {
@@ -1061,5 +1094,33 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
             notifier.notify(&info);
             debug!(ino, path, "WinFSP notify sent");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_benign_cleanup_delete_error;
+    use studiofs_meta::MetaError;
+    use studiofs_vfs::VfsError;
+
+    #[test]
+    fn cleanup_delete_not_found_is_benign() {
+        let err = VfsError::Meta(MetaError::EntryNotFound {
+            parent: 1,
+            name: "gone".into(),
+        });
+        assert!(is_benign_cleanup_delete_error(&err, false));
+        assert!(is_benign_cleanup_delete_error(&err, true));
+    }
+
+    #[test]
+    fn cleanup_delete_race_directory_is_idempotent() {
+        let file_delete = VfsError::Meta(MetaError::IsADirectory(42));
+        assert!(is_benign_cleanup_delete_error(&file_delete, false));
+        assert!(!is_benign_cleanup_delete_error(&file_delete, true));
+
+        let dir_delete = VfsError::Meta(MetaError::NotADirectory(42));
+        assert!(is_benign_cleanup_delete_error(&dir_delete, true));
+        assert!(!is_benign_cleanup_delete_error(&dir_delete, false));
     }
 }

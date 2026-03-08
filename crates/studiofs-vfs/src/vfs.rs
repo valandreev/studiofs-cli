@@ -52,6 +52,7 @@ use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_bl
 use studiofs_meta::*;
 use thiserror::Error;
 use tokio::sync::Semaphore;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 // =============================================================================
@@ -1121,6 +1122,20 @@ struct VfsState {
     file_locks: Mutex<std::collections::HashMap<Ino, FileLock>>,
     /// Notification for waiters blocked on flock.
     lock_notify: tokio::sync::Notify,
+    /// Global shutdown gate for non-uploader background loops.
+    shutdown_requested: std::sync::atomic::AtomicBool,
+    /// Global shutdown gate for upload dispatch/worker tasks.
+    uploader_shutdown_requested: std::sync::atomic::AtomicBool,
+    /// Marks that `StudioVfs::shutdown()` has finished once successfully.
+    shutdown_completed: std::sync::atomic::AtomicBool,
+    /// Wake non-uploader background loops so shutdown does not wait for long sleeps.
+    shutdown_notify: tokio::sync::Notify,
+    /// Wake uploader dispatch/worker loops so shutdown can stop queue consumption.
+    uploader_shutdown_notify: tokio::sync::Notify,
+    /// Join handles for top-level non-uploader background tasks.
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Top-level uploader task; it owns and joins its worker pool internally.
+    uploader_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -1690,6 +1705,13 @@ impl StudioVfs {
                     ingress_checkpoint_notify: tokio::sync::Notify::new(),
                     file_locks: Mutex::new(std::collections::HashMap::new()),
                     lock_notify: tokio::sync::Notify::new(),
+                    shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+                    uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+                    shutdown_completed: std::sync::atomic::AtomicBool::new(false),
+                    shutdown_notify: tokio::sync::Notify::new(),
+                    uploader_shutdown_notify: tokio::sync::Notify::new(),
+                    background_tasks: Mutex::new(Vec::new()),
+                    uploader_task: Mutex::new(None),
                 }),
                 upload_scheduler,
                 upload_delay,
@@ -1735,35 +1757,56 @@ impl StudioVfs {
             // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
             let vfs_for_prefetch = vfs.clone();
             let prefetch_limit = vfs.prefetch_concurrency.max(1);
-            tokio::spawn(async move {
+            vfs.track_background_task(tokio::spawn(async move {
                 let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
-                while let Some((ino, block_idx)) = prefetch_rx.recv().await {
-                    let permit = prefetch_sem.clone().acquire_owned().await.unwrap();
-                    let v = vfs_for_prefetch.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let _ = v.read_block_for_prefetch(ino, block_idx).await;
-                    });
+                let mut inflight = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = vfs_for_prefetch.state.shutdown_notify.notified() => {
+                            inflight.abort_all();
+                            while inflight.join_next().await.is_some() {}
+                            break;
+                        }
+                        Some((ino, block_idx)) = prefetch_rx.recv() => {
+                            if vfs_for_prefetch.shutdown_requested() {
+                                continue;
+                            }
+                            let permit = match prefetch_sem.clone().acquire_owned().await {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            };
+                            let v = vfs_for_prefetch.clone();
+                            inflight.spawn(async move {
+                                let _permit = permit;
+                                let _ = v.read_block_for_prefetch(ino, block_idx).await;
+                            });
+                        }
+                        joined = inflight.join_next(), if !inflight.is_empty() => {
+                            if joined.is_none() {
+                                break;
+                            }
+                        }
+                    }
                 }
-            });
+            }));
 
             // Spawn Upload Worker
             let vfs_clone = vfs.clone();
-            tokio::spawn(async move {
+            vfs.set_uploader_task(tokio::spawn(async move {
                 vfs_clone.background_uploader(upload_rx).await;
-            });
+            }));
 
             // Spawn upload stats logger.
             let vfs_clone = vfs.clone();
-            tokio::spawn(async move {
+            vfs.track_background_task(tokio::spawn(async move {
                 vfs_clone.background_upload_stats().await;
-            });
+            }));
 
             // Spawn periodic ingress checkpoint worker.
             let vfs_clone = vfs.clone();
-            tokio::spawn(async move {
+            vfs.track_background_task(tokio::spawn(async move {
                 vfs_clone.background_ingress_checkpoint().await;
-            });
+            }));
 
             // Warm up the HTTP GET connection pool asynchronously.
             // Avoid blocking here: `Handle::block_on` from another thread can
@@ -1772,22 +1815,22 @@ impl StudioVfs {
             {
                 let fs = fetch_scheduler.clone();
                 let timeout = Duration::from_secs(3);
-                tokio::spawn(async move {
+                vfs.track_background_task(tokio::spawn(async move {
                     let _ = fs.warmup(timeout).await;
-                });
+                }));
             }
 
             // Spawn GC Worker
             let vfs_clone = vfs.clone();
-            tokio::spawn(async move {
+            vfs.track_background_task(tokio::spawn(async move {
                 vfs_clone.background_gc().await;
-            });
+            }));
 
             // Spawn Janitor Worker (automatic orphan scan/cleanup)
             let vfs_clone = vfs.clone();
-            tokio::spawn(async move {
+            vfs.track_background_task(tokio::spawn(async move {
                 vfs_clone.background_janitor().await;
-            });
+            }));
 
             // Spawn Background Slab Flusher
             // Drains dirty_mem → slab → upload queue asynchronously after flush() returns.
@@ -1795,12 +1838,98 @@ impl StudioVfs {
                 drop(dirty_flush_rx);
             } else {
                 let vfs_clone = vfs.clone();
-                tokio::spawn(async move {
+                vfs.track_background_task(tokio::spawn(async move {
                     vfs_clone.background_slab_flusher(dirty_flush_rx).await;
-                });
+                }));
             }
 
             Ok(vfs)
+        }
+    }
+
+    fn track_background_task(&self, handle: JoinHandle<()>) {
+        self.state.background_tasks.lock().push(handle);
+    }
+
+    fn set_uploader_task(&self, handle: JoinHandle<()>) {
+        *self.state.uploader_task.lock() = Some(handle);
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.state.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    fn uploader_shutdown_requested(&self) -> bool {
+        self.state
+            .uploader_shutdown_requested
+            .load(Ordering::Acquire)
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_requested()
+            || self.uploader_shutdown_requested()
+            || self.state.shutdown_completed.load(Ordering::Acquire)
+    }
+
+    fn request_uploader_shutdown(&self) {
+        if !self
+            .state
+            .uploader_shutdown_requested
+            .swap(true, Ordering::AcqRel)
+        {
+            self.state.uploader_shutdown_notify.notify_waiters();
+        }
+    }
+
+    async fn join_background_tasks(&self, timeout: Duration) {
+        let handles = {
+            let mut handles = self.state.background_tasks.lock();
+            std::mem::take(&mut *handles)
+        };
+        for mut handle in handles {
+            if !handle.is_finished() {
+                match tokio::time::timeout(timeout, &mut handle).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if e.is_cancelled() => {}
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "background task join failed");
+                    }
+                    Err(_) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        warn!(
+                            timeout_ms = timeout.as_millis() as u64,
+                            "background task did not stop in time, aborted"
+                        );
+                    }
+                }
+            } else if let Err(e) = handle.await
+                && !e.is_cancelled()
+            {
+                warn!(error = %e, "background task join failed");
+            }
+        }
+    }
+
+    async fn join_uploader_task(&self, timeout: Duration) {
+        let handle = self.state.uploader_task.lock().take();
+        let Some(mut handle) = handle else {
+            return;
+        };
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if e.is_cancelled() => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, "uploader task join failed");
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "uploader task did not stop in time, aborted"
+                );
+            }
         }
     }
 
@@ -4272,7 +4401,7 @@ impl StudioVfs {
     /// Called after every successful `read_into()` to amortise scheduling overhead.
     #[inline]
     fn maybe_prefetch(&self, ino: Ino, blocks_needed: &[(u32, usize, usize)]) {
-        if blocks_needed.is_empty() || self.readahead.width == 0 {
+        if self.shutdown_requested() || blocks_needed.is_empty() || self.readahead.width == 0 {
             return;
         }
         // After transient transport failures, pause best-effort prefetch briefly
@@ -4368,6 +4497,10 @@ impl StudioVfs {
     /// Like `read_block()` but silently ignores errors and always marks the
     /// readahead inflight state as done when finished.
     async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
+        if self.shutdown_requested() {
+            self.readahead.finish_prefetch(ino, block_index);
+            return;
+        }
         if !self.readahead.is_prefetch_relevant(ino, block_index) {
             self.readahead.finish_prefetch(ino, block_index);
             return;
@@ -4383,6 +4516,10 @@ impl StudioVfs {
 
         // Skip if block is already cached (L1 or L2) — avoid any S3 I/O.
         if self.block_cache.contains(block_ref.object_id) {
+            self.readahead.finish_prefetch(ino, block_index);
+            return;
+        }
+        if self.shutdown_requested() {
             self.readahead.finish_prefetch(ino, block_index);
             return;
         }
@@ -4650,6 +4787,7 @@ impl StudioVfs {
         let dispatch_capacity = worker_count.max(1) * 2;
         let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<PendingUpload>(dispatch_capacity);
         let worker_rx = std::sync::Arc::new(tokio::sync::Mutex::new(worker_rx));
+        let mut workers = JoinSet::new();
         info!(
             upload_worker_count = worker_count,
             dispatch_capacity, "upload worker pool started"
@@ -4658,17 +4796,26 @@ impl StudioVfs {
         for _ in 0..worker_count {
             let rx = worker_rx.clone();
             let vfs = self.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 loop {
-                    let op = {
-                        let mut rx = rx.lock().await;
-                        rx.recv().await
+                    let op = tokio::select! {
+                        _ = vfs.state.uploader_shutdown_notify.notified() => None,
+                        op = async {
+                            let mut rx = rx.lock().await;
+                            rx.recv().await
+                        } => op,
                     };
                     let Some(op) = op else {
                         break;
                     };
+                    if vfs.uploader_shutdown_requested() {
+                        break;
+                    }
 
                     if let Err(e) = vfs.process_upload(op.clone()).await {
+                        if vfs.uploader_shutdown_requested() {
+                            break;
+                        }
                         // If the inode was deleted, don't retry — cancel the upload.
                         if vfs.state.deleted_inodes.lock().contains(&op.ino) {
                             info!(
@@ -4692,8 +4839,11 @@ impl StudioVfs {
                                 "upload processing error, will requeue: {}",
                                 e
                             );
-                            tokio::time::sleep(delay).await;
-                            if !vfs.block_cache.requeue_upload(retry_op) {
+                            let should_requeue = tokio::select! {
+                                _ = vfs.state.uploader_shutdown_notify.notified() => false,
+                                _ = tokio::time::sleep(delay) => !vfs.uploader_shutdown_requested(),
+                            };
+                            if should_requeue && !vfs.block_cache.requeue_upload(retry_op) {
                                 error!("failed to requeue upload op after error");
                             }
                         }
@@ -4705,12 +4855,13 @@ impl StudioVfs {
         let mut fair = FairInodeScheduler::default();
         let mut inbound_closed = false;
         loop {
-            if inbound_closed && fair.is_empty() {
+            if self.uploader_shutdown_requested() || (inbound_closed && fair.is_empty()) {
                 break;
             }
 
             tokio::select! {
                 biased;
+                _ = self.state.uploader_shutdown_notify.notified() => break,
                 permit = worker_tx.reserve(), if !fair.is_empty() => {
                     match permit {
                         Ok(permit) => {
@@ -4729,6 +4880,33 @@ impl StudioVfs {
                 }
             }
         }
+
+        drop(worker_tx);
+        let join_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if workers.is_empty() {
+                break;
+            }
+            let remaining = join_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+                break;
+            }
+            match tokio::time::timeout(remaining, workers.join_next()).await {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(e))) if e.is_cancelled() => {}
+                Ok(Some(Err(e))) => {
+                    warn!(error = %e, "uploader worker join failed");
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                    break;
+                }
+            }
+        }
     }
 
     /// Process a single upload operation.
@@ -4740,12 +4918,21 @@ impl StudioVfs {
     /// If the owning inode has been deleted, the upload is cancelled immediately
     /// (no S3 write) and the block is evicted from cache.
     async fn process_upload(&self, op: PendingUpload) -> VfsResult<()> {
+        if self.uploader_shutdown_requested() {
+            return Ok(());
+        }
         if self.upload_delay > Duration::from_millis(0) {
             let age_ms = Self::now_unix_millis().saturating_sub(op.created_unix_ms);
             let delay_ms = self.upload_delay.as_millis() as u64;
             if age_ms < delay_ms {
-                tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)).await;
+                tokio::select! {
+                    _ = self.state.uploader_shutdown_notify.notified() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)) => {}
+                }
             }
+        }
+        if self.uploader_shutdown_requested() {
+            return Ok(());
         }
 
         // ── Fast-path: inode deleted → cancel upload, skip S3 write ──────
@@ -4967,7 +5154,13 @@ impl StudioVfs {
 
     async fn background_upload_stats(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(self.upload_stats_interval).await;
+            tokio::select! {
+                _ = self.state.shutdown_notify.notified() => break,
+                _ = tokio::time::sleep(self.upload_stats_interval) => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
             let pending = self.block_cache.pending_upload_count();
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
@@ -5014,6 +5207,7 @@ impl StudioVfs {
             let timer = tokio::time::sleep(self.ingress_checkpoint_interval);
             tokio::pin!(timer);
             let timer_fired = tokio::select! {
+                _ = self.state.shutdown_notify.notified() => return,
                 _ = &mut timer => true,
                 _ = self.state.ingress_checkpoint_notify.notified() => false,
             };
@@ -5021,6 +5215,7 @@ impl StudioVfs {
                 .state
                 .ingress_checkpoint_stopped
                 .load(Ordering::Acquire)
+                || self.shutdown_requested()
             {
                 return;
             }
@@ -5060,7 +5255,13 @@ impl StudioVfs {
         let grace_period = 3600i64; // 1 hour grace period
 
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = self.state.shutdown_notify.notified() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
 
             // Get current timestamp
             let now = std::time::SystemTime::now()
@@ -5136,7 +5337,13 @@ impl StudioVfs {
 
         loop {
             cycle = cycle.saturating_add(1);
-            tokio::time::sleep(self.janitor_interval).await;
+            tokio::select! {
+                _ = self.state.shutdown_notify.notified() => break,
+                _ = tokio::time::sleep(self.janitor_interval) => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
 
             if let Some(lease) = &self.janitor_lease
                 && !self.acquire_janitor_lease(lease).await
@@ -5367,18 +5574,27 @@ impl StudioVfs {
     /// Best-effort graceful shutdown: drain dirty buffers, wait for pending
     /// uploads to complete, then persist cache checkpoint.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
+        if self.state.shutdown_completed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.state.shutdown_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let t0 = Instant::now();
+        let background_join_timeout = Duration::from_secs(2);
 
-        // Phase 0: stop the background materializer so shutdown can finish the
-        // remaining accepted ingress without a concurrent drainer racing it.
+        // Phase 0: quiesce non-uploader background work so shutdown can finish
+        // the remaining accepted ingress without concurrent producers racing it.
         self.state
             .slab_flusher_stopped
             .store(true, Ordering::Release);
         self.state
             .ingress_checkpoint_stopped
             .store(true, Ordering::Release);
-        // Give the flusher one tick (50ms) to notice and exit.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        self.state.shutdown_notify.notify_waiters();
+        self.state.ingress_checkpoint_notify.notify_waiters();
+        let _ = self.dirty_flush_tx.send(());
+        self.join_background_tasks(background_join_timeout).await;
 
         // Phase 1: flush pending write buffer → dirty_mem.
         let dirty_before = self.state.dirty_bytes.load(Ordering::Relaxed);
@@ -5473,6 +5689,8 @@ impl StudioVfs {
                 }
             }
         }
+        self.request_uploader_shutdown();
+        self.join_uploader_task(background_join_timeout).await;
 
         // Phase 4: persist metadata + cache checkpoint.
         info!(
@@ -5489,6 +5707,7 @@ impl StudioVfs {
             warn!("VFS shutdown: metadata flush failed: {}", e);
         }
         self.persist_cache().await;
+        self.state.shutdown_completed.store(true, Ordering::Release);
         info!(
             total_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: complete"

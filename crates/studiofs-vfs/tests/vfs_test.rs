@@ -221,6 +221,16 @@ fn make_vfs_with_meta(
     .expect("failed to create StudioVfs")
 }
 
+fn reopen_vfs(db_path: &std::path::Path, cache_dir: &std::path::Path) -> Arc<StudioVfs> {
+    let meta = Arc::new(RedbMetaEngine::open(db_path).expect("reopen RedbMetaEngine"));
+    let format_info = meta.get_format_info().expect("reload format info");
+    make_vfs_with_meta(
+        meta,
+        &format_info,
+        cache_dir.to_str().expect("cache path utf-8"),
+    )
+}
+
 fn import_remote_snapshot(
     source: &RedbMetaEngine,
     target: &RedbMetaEngine,
@@ -6461,6 +6471,222 @@ async fn test_flock_shared_then_exclusive_conflict() {
 
 /// Shutdown after writes should drain dirty buffers and persist metadata.
 /// After shutdown, blocks should be uploaded to S3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_with_pending_uploads_completes_within_bound() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-bounded-shutdown-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let payload = vec![0x5Au8; format_info.block_size as usize * 2];
+    let attr = vfs.create(1, b"bounded-shutdown.bin", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, &payload).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+        })
+        .await,
+        "offline upload scenario should queue pending uploads before shutdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        .await
+        .expect("shutdown should stay bounded even with offline pending uploads");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_during_small_file_churn_does_not_hang() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-ctrlc-small-churn-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let churn_vfs = vfs.clone();
+    let churn = tokio::spawn(async move {
+        let payload = vec![0xABu8; 16 * 1024];
+        let mut idx = 0u64;
+        loop {
+            if churn_vfs.is_shutting_down() {
+                break;
+            }
+            let name = format!("ctrlc-churn-{idx}.txt");
+            if let Ok(attr) = churn_vfs.create(1, name.as_bytes(), 0, 0, 0o644) {
+                let _ = churn_vfs.write(attr.ino, 0, &payload).await;
+                let _ = churn_vfs.flush(attr.ino).await;
+                let _ = churn_vfs.unlink(1, name.as_bytes());
+            }
+            idx = idx.saturating_add(1);
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        .await
+        .expect("shutdown should stay bounded during small-file churn");
+    tokio::time::timeout(Duration::from_secs(2), churn)
+        .await
+        .expect("foreground churn task should observe shutdown and exit")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-remount-delete-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+
+    {
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let dir = vfs.mkdir(1, b"ghost-dir", 0, 0, 0o755).unwrap();
+        let attr = vfs.create(dir.ino, b"ghost.txt", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"ghost-bytes").await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+        vfs.unlink(dir.ino, b"ghost.txt").unwrap();
+        vfs.rmdir(1, b"ghost-dir").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            .await
+            .expect("shutdown after delete should stay bounded");
+    }
+
+    let reopened = reopen_vfs(&db_path, &cache_dir);
+    assert!(reopened.lookup(1, b"ghost-dir").is_err());
+    let entries = reopened.readdir(1).unwrap();
+    assert!(
+        !entries.iter().any(|entry| {
+            entry.name.as_slice() == b"ghost-dir" || entry.name.as_slice() == b"ghost.txt"
+        }),
+        "deleted directory must not reappear as a ghost root entry after remount"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-recursive-delete-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+
+    {
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let root = vfs.mkdir(1, b"delete-tree", 0, 0, 0o755).unwrap();
+        let nested = vfs.mkdir(root.ino, b"nested", 0, 0, 0o755).unwrap();
+        let a = vfs.create(root.ino, b"a.txt", 0, 0, 0o644).unwrap();
+        let b = vfs.create(nested.ino, b"b.txt", 0, 0, 0o644).unwrap();
+        vfs.write(a.ino, 0, b"root-data").await.unwrap();
+        vfs.flush(a.ino).await.unwrap();
+        vfs.write(b.ino, 0, b"nested-data").await.unwrap();
+        vfs.flush(b.ino).await.unwrap();
+        vfs.unlink(root.ino, b"a.txt").unwrap();
+        vfs.unlink(nested.ino, b"b.txt").unwrap();
+        vfs.rmdir(root.ino, b"nested").unwrap();
+        vfs.rmdir(1, b"delete-tree").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            .await
+            .expect("shutdown after recursive delete should stay bounded");
+    }
+
+    let reopened = reopen_vfs(&db_path, &cache_dir);
+    assert!(reopened.lookup(1, b"delete-tree").is_err());
+    let root_entries = reopened.readdir(1).unwrap();
+    assert!(
+        !root_entries.iter().any(|entry| {
+            let name = entry.name.as_slice();
+            name == b"delete-tree" || name == b"nested" || name == b"a.txt" || name == b"b.txt"
+        }),
+        "recursive delete should not leave ghost entries in the root namespace after remount"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_shutdown_drains_dirty_buffers() {
