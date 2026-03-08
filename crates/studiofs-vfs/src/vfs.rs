@@ -21,6 +21,9 @@
 //! 3. Validate object payload + checksum
 //! 4. Assemble response
 
+use crate::incarnation::{
+    CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
+};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{run_blocking, run_meta};
@@ -1010,6 +1013,8 @@ fn recover_spill_dir(
 struct VfsState {
     /// Pending blocks: (inode, block_index) -> PendingBlock
     pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
+    /// Explicit per-inode pending/committed incarnation model for local serving.
+    inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
     /// Dirty attributes cache (from writes not yet synced to redb).
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
@@ -1605,6 +1610,7 @@ impl StudioVfs {
                 data_prefix,
                 state: Arc::new(VfsState {
                     pending_blocks: Mutex::new(std::collections::HashMap::new()),
+                    inode_incarnations: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
@@ -2034,6 +2040,208 @@ impl StudioVfs {
             Ok(engine.get_attr(ino)?.content_epoch)
         })
         .await
+    }
+
+    fn inode_has_local_overlay(&self, ino: Ino) -> bool {
+        if self
+            .state
+            .pending_blocks
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+        {
+            return true;
+        }
+        if self
+            .state
+            .dirty_mem
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+        {
+            return true;
+        }
+        self.state
+            .ingress_live
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+    }
+
+    fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
+        self.block_cache
+            .snapshot_pending_uploads()
+            .iter()
+            .any(|op| op.ino == ino)
+    }
+
+    fn derive_committed_incarnation_from_attr(
+        &self,
+        attr: &InodeAttr,
+    ) -> Option<CommittedIncarnation> {
+        if attr.kind != FileType::RegularFile {
+            return None;
+        }
+        Some(CommittedIncarnation {
+            content_epoch: attr.content_epoch,
+            size: attr.committed_size,
+        })
+    }
+
+    fn update_pending_incarnation_size(&self, ino: Ino, size: u64) {
+        if let Some(state) = self.state.inode_incarnations.lock().get_mut(&ino) {
+            let base_size = state
+                .committed_incarnation
+                .as_ref()
+                .map(|committed| committed.size)
+                .unwrap_or(0);
+            if let Some(pending) = state.pending_incarnation.as_mut() {
+                pending.size = size;
+                pending.base_size = base_size;
+            }
+        }
+    }
+
+    fn begin_pending_incarnation(&self, ino: Ino, attr: &mut InodeAttr) {
+        if attr.kind != FileType::RegularFile {
+            return;
+        }
+
+        let mut states = self.state.inode_incarnations.lock();
+        let state = states.entry(ino).or_insert_with(|| InodeIncarnationState {
+            committed_incarnation: self.derive_committed_incarnation_from_attr(attr),
+            pending_incarnation: None,
+            upload_state: VfsUploadState::Idle,
+        });
+
+        if state.pending_incarnation.is_none() {
+            let committed = state.committed_incarnation.clone().or_else(|| {
+                if attr.committed_size == 0 {
+                    None
+                } else {
+                    Some(CommittedIncarnation {
+                        content_epoch: attr.content_epoch,
+                        size: attr.committed_size,
+                    })
+                }
+            });
+            let next_epoch = attr.content_epoch.saturating_add(1);
+            state.committed_incarnation = committed.clone();
+            state.pending_incarnation = Some(PendingIncarnation {
+                content_epoch: next_epoch,
+                size: attr.size,
+                base_size: committed.as_ref().map(|base| base.size).unwrap_or(0),
+            });
+            state.upload_state = if committed.is_some() {
+                VfsUploadState::Updating
+            } else {
+                VfsUploadState::Uploading
+            };
+            attr.content_epoch = next_epoch;
+        } else {
+            attr.content_epoch = state
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch)
+                .unwrap_or(attr.content_epoch);
+        }
+
+        let base_size = state
+            .committed_incarnation
+            .as_ref()
+            .map(|committed| committed.size)
+            .unwrap_or(0);
+        if let Some(pending) = state.pending_incarnation.as_mut() {
+            pending.size = attr.size;
+            pending.base_size = base_size;
+        }
+    }
+
+    fn refresh_inode_incarnation_state_from_attr(
+        &self,
+        ino: Ino,
+        attr: &InodeAttr,
+    ) -> InodeIncarnationState {
+        let has_local_overlay = self.inode_has_local_overlay(ino);
+        let has_pending_uploads = self.inode_has_pending_uploads(ino);
+
+        let mut states = self.state.inode_incarnations.lock();
+        let previous = states
+            .get(&ino)
+            .cloned()
+            .unwrap_or_else(|| InodeIncarnationState {
+                committed_incarnation: self.derive_committed_incarnation_from_attr(attr),
+                pending_incarnation: None,
+                upload_state: VfsUploadState::Idle,
+            });
+
+        let needs_pending = previous.pending_incarnation.is_some()
+            || has_local_overlay
+            || has_pending_uploads
+            || attr.size != attr.committed_size;
+
+        let next_state = if needs_pending {
+            let committed = if previous.pending_incarnation.is_some() {
+                previous.committed_incarnation.clone()
+            } else if previous.committed_incarnation.is_some()
+                && previous.upload_state != VfsUploadState::Idle
+            {
+                previous.committed_incarnation.clone()
+            } else if attr.committed_size == 0
+                && previous.committed_incarnation.is_none()
+                && previous.upload_state == VfsUploadState::Uploading
+            {
+                None
+            } else {
+                self.derive_committed_incarnation_from_attr(attr)
+                    .map(|mut committed| {
+                        if attr.size != attr.committed_size
+                            && committed.content_epoch == attr.content_epoch
+                        {
+                            committed.content_epoch = committed.content_epoch.saturating_sub(1);
+                        }
+                        committed
+                    })
+            };
+
+            let pending_epoch = previous
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch)
+                .unwrap_or(attr.content_epoch);
+
+            InodeIncarnationState {
+                committed_incarnation: committed.clone(),
+                pending_incarnation: Some(PendingIncarnation {
+                    content_epoch: pending_epoch,
+                    size: attr.size,
+                    base_size: committed.as_ref().map(|base| base.size).unwrap_or(0),
+                }),
+                upload_state: if committed.is_some() {
+                    VfsUploadState::Updating
+                } else {
+                    VfsUploadState::Uploading
+                },
+            }
+        } else {
+            InodeIncarnationState {
+                committed_incarnation: self.derive_committed_incarnation_from_attr(attr),
+                pending_incarnation: None,
+                upload_state: VfsUploadState::Idle,
+            }
+        };
+
+        states.insert(ino, next_state.clone());
+        next_state
+    }
+
+    fn clear_inode_incarnation(&self, ino: Ino) {
+        self.state.inode_incarnations.lock().remove(&ino);
+    }
+
+    pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
+        let attr = self.getattr_async(ino).await?;
+        Ok(self.refresh_inode_incarnation_state_from_attr(ino, &attr))
     }
 
     fn logical_block_len(&self, file_size: u64, block_index: u32) -> usize {
@@ -2834,13 +3042,14 @@ impl StudioVfs {
         if let Some(new_size) = args.size
             && new_size != attr.size
         {
+            self.begin_pending_incarnation(ino, &mut attr);
             if new_size < attr.size {
                 // Truncate - may need to remove blocks
-                attr.content_epoch = attr.content_epoch.saturating_add(1);
                 self.truncate_blocks(ino, new_size, attr.size)?;
                 attr.committed_size = attr.committed_size.min(new_size);
             }
             attr.size = new_size;
+            self.update_pending_incarnation_size(ino, attr.size);
             changed = true;
         }
 
@@ -2891,6 +3100,7 @@ impl StudioVfs {
 
             // Commit to metadata
             self.meta.set_attr(&attr)?;
+            self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
         Ok(attr)
@@ -3085,6 +3295,7 @@ impl StudioVfs {
                 removed_ids.len(),
                 total_bytes
             );
+            self.clear_inode_incarnation(ino);
             self.state.dirty_attrs.lock().remove(&ino);
             self.state.attr_read_cache.lock().remove(&ino);
         }
@@ -3322,6 +3533,18 @@ impl StudioVfs {
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
         let attr = self.meta.create_file(parent, name, uid, gid, mode)?;
+        self.state.inode_incarnations.lock().insert(
+            attr.ino,
+            InodeIncarnationState {
+                committed_incarnation: None,
+                pending_incarnation: Some(PendingIncarnation {
+                    content_epoch: attr.content_epoch,
+                    size: attr.size,
+                    base_size: 0,
+                }),
+                upload_state: VfsUploadState::Uploading,
+            },
+        );
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
@@ -3487,6 +3710,7 @@ impl StudioVfs {
                 );
 
                 // Clear dirty attrs and read-through cache
+                self.clear_inode_incarnation(attr.ino);
                 self.state.dirty_attrs.lock().remove(&attr.ino);
             } else {
                 info!(
@@ -3563,6 +3787,7 @@ impl StudioVfs {
 
             self.state.dirty_attrs.lock().remove(&ino);
             self.state.attr_read_cache.lock().remove(&ino);
+            self.clear_inode_incarnation(ino);
         }
 
         // Invalidate source and dest parent directory caches
@@ -3689,6 +3914,7 @@ impl StudioVfs {
     /// Delegates to `read_into()` to avoid code duplication.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         let attr = self.getattr_async(ino).await?;
+        self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         let end = (offset + size as u64).min(attr.size);
         if offset >= end {
             return Ok(Bytes::new());
@@ -3714,6 +3940,8 @@ impl StudioVfs {
         }
         let _guard = ForegroundReadGuard(self);
         let attr = self.getattr_async(ino).await?;
+        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let prefer_pending_overlay = incarnation_state.pending_incarnation.is_some();
 
         // Clamp read to file size
         let end = (offset + buffer.len() as u64).min(attr.size);
@@ -3737,7 +3965,10 @@ impl StudioVfs {
         // If only one block, read sequentially to avoid overhead
         if blocks_needed.len() == 1 {
             let (block_idx, off_in, to_copy) = blocks_needed[0];
-            return match self.read_block_or_pending(ino, block_idx).await {
+            return match self
+                .read_block_or_pending(ino, block_idx, prefer_pending_overlay)
+                .await
+            {
                 Ok(block_data) => {
                     let copy_len = if to_copy == 0 || off_in >= block_data.len() {
                         0
@@ -3765,7 +3996,10 @@ impl StudioVfs {
             .iter()
             .map(|(idx, _, _)| {
                 let block_idx = *idx;
-                async move { self.read_block_or_pending(ino, block_idx).await }
+                async move {
+                    self.read_block_or_pending(ino, block_idx, prefer_pending_overlay)
+                        .await
+                }
             })
             .collect();
 
@@ -3855,29 +4089,41 @@ impl StudioVfs {
         }
     }
 
-    /// Read a block from storage or pending writes. Helper for parallel reads.
-    async fn read_block_or_pending(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
-        // 1. In-progress write buffer (not yet flushed to any tier)
+    fn read_pending_overlay_block(&self, ino: Ino, block_index: u32) -> Option<Bytes> {
         {
             let pending = self.state.pending_blocks.lock();
             if let Some(pending_block) = pending.get(&(ino, block_index)) {
-                return Ok(pending_block.data.clone().freeze());
+                return Some(pending_block.data.clone().freeze());
             }
         }
 
-        // 2. Dirty memory buffer (accepted by flush(), not yet on slab)
         {
             let dirty = self.state.dirty_mem.lock();
             if let Some(data) = dirty.get(&(ino, block_index)) {
-                return Ok(data.clone());
+                return Some(data.clone());
             }
         }
 
-        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
-            return Ok(data);
+        None
+    }
+
+    /// Read a block from the local pending incarnation overlay first, then
+    /// fall back to the committed/current base.
+    async fn read_block_or_pending(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        prefer_pending_overlay: bool,
+    ) -> VfsResult<Bytes> {
+        if prefer_pending_overlay {
+            if let Some(data) = self.read_pending_overlay_block(ino, block_index) {
+                return Ok(data);
+            }
+            if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
+                return Ok(data);
+            }
         }
 
-        // 3. Slab cache / S3
         self.read_block(ino, block_index).await
     }
 
@@ -4049,15 +4295,19 @@ impl StudioVfs {
             data_offset += to_write;
         }
 
-        // Update file size in dirty attrs.
-        let base_attr = self.getattr_async(ino).await?;
+        // Enter or reuse a single pending incarnation for this inode and keep
+        // all subsequent writes in the same local version until upload/commit catches up.
+        let mut base_attr = self.getattr_async(ino).await?;
+        self.begin_pending_incarnation(ino, &mut base_attr);
         {
             let mut dirty = self.state.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
+            attr.content_epoch = base_attr.content_epoch;
             if current_offset > attr.size {
                 attr.size = current_offset;
                 attr.touch_mtime();
             }
+            self.update_pending_incarnation_size(ino, attr.size);
         }
 
         // Eagerly move full blocks into the dirty memory buffer so write() returns
@@ -4135,12 +4385,14 @@ impl StudioVfs {
         // and commit attrs; background flusher materializes block refs asynchronously.
         let dirty_attr = { self.state.dirty_attrs.lock().remove(&ino) };
         if let Some(attr) = dirty_attr {
+            let attr_for_meta = attr.clone();
             let meta = self.meta.clone();
             run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.set_attr(&attr)
+                engine.set_attr(&attr_for_meta)
             })
             .await?;
             self.state.attr_read_cache.lock().remove(&ino);
+            self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
         Ok(())
@@ -4721,6 +4973,15 @@ impl StudioVfs {
         }
 
         self.block_cache.complete_upload(&op);
+        if let Ok(attr) = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+            engine.get_attr(op.ino)
+        })
+        .await
+        {
+            self.refresh_inode_incarnation_state_from_attr(op.ino, &attr);
+        } else {
+            self.clear_inode_incarnation(op.ino);
+        }
 
         // Post-upload cleanup: if the block was marked for deferred eviction
         // (inode was deleted while the upload was in flight), remove it now.

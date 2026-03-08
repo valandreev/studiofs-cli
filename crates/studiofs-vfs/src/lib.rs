@@ -4,6 +4,7 @@
 
 pub mod aimd;
 pub mod fetch;
+pub mod incarnation;
 pub mod readahead;
 mod runtime;
 pub mod upload;
@@ -11,6 +12,9 @@ pub mod vfs;
 
 pub use aimd::{AimdConfig, AimdController};
 pub use fetch::FetchScheduler;
+pub use incarnation::{
+    CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
+};
 pub use readahead::{DirAccessTracker, ReadAheadTracker};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;

@@ -27,7 +27,7 @@ use studiofs_meta::{
     FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
     types::{BlockFlags, BlockRef},
 };
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane};
+use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState};
 
 // PR-01 Gate-Named Scenarios (reserved)
 //
@@ -1515,6 +1515,397 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 replacement_payload.as_slice(),
                 "read after restart with offline endpoint should use recovered spill overlay"
             );
+        });
+        rt.shutdown_background();
+    }
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    old: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            old: std::env::var(key).ok(),
+        }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.old {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+#[test]
+fn new_file_enters_uploading_state() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-new-uploading-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"pending-new.bin", 0, 0, 0o644).unwrap();
+        let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
+        assert_eq!(state.upload_state, VfsUploadState::Uploading);
+        assert!(
+            state.committed_incarnation.is_none(),
+            "brand-new file must not expose a committed incarnation yet"
+        );
+        let pending = state
+            .pending_incarnation
+            .expect("brand-new file must enter a pending incarnation");
+        assert_eq!(pending.size, 0);
+        assert_eq!(pending.base_size, 0);
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn committed_file_mutation_enters_updating_state() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-updating-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x41u8; 512 * 1024];
+    let patch = vec![0x42u8; 4096];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"updating.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("baseline file must reach committed block refs before mutation");
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    meta.get_attr(ino)
+                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .unwrap_or(false)
+                })
+                .await,
+                "baseline file must become committed before entering updating state"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            vfs.write(ino, 0, &patch).await.unwrap();
+
+            let state = vfs.inode_incarnation_state(ino).await.unwrap();
+            assert_eq!(state.upload_state, VfsUploadState::Updating);
+            let committed = state
+                .committed_incarnation
+                .expect("committed file must retain committed incarnation during local mutation");
+            let pending = state
+                .pending_incarnation
+                .expect("mutated committed file must expose a pending incarnation");
+            assert_eq!(committed.size, baseline_payload.len() as u64);
+            assert_eq!(pending.size, baseline_payload.len() as u64);
+            assert_eq!(pending.base_size, committed.size);
+            assert!(
+                pending.content_epoch > committed.content_epoch,
+                "updating state must advance into a newer pending incarnation"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn local_reads_prefer_pending_overlay_over_committed_base() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-overlay-read-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x31u8; 512 * 1024];
+    let patch = vec![0x7Au8; 8192];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"overlay-read.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("baseline file must commit before overlay read test");
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    meta.get_attr(ino)
+                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .unwrap_or(false)
+                })
+                .await,
+                "baseline file must become committed before overlay read test"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            vfs.write(ino, 0, &patch).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let mut expected = baseline_payload.clone();
+            expected[..patch.len()].copy_from_slice(&patch);
+            let read = vfs.read(ino, 0, expected.len() as u32).await.unwrap();
+            assert_eq!(
+                read.as_ref(),
+                expected.as_slice(),
+                "local read must apply pending overlay bytes over the committed base"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn single_inode_never_has_two_pending_incarnations() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-single-pending-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x51u8; 512 * 1024];
+    let patch_a = vec![0x61u8; 4096];
+    let patch_b = vec![0x71u8; 4096];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"single-pending.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("baseline file must commit before pending incarnation test");
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    meta.get_attr(ino)
+                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .unwrap_or(false)
+                })
+                .await,
+                "baseline file must become committed before pending incarnation test"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &patch_a).await.unwrap();
+            let first = vfs
+                .inode_incarnation_state(ino)
+                .await
+                .unwrap()
+                .pending_incarnation
+                .expect("first mutation must create one pending incarnation");
+
+            vfs.write(ino, 64 * 1024, &patch_b).await.unwrap();
+            let second_state = vfs.inode_incarnation_state(ino).await.unwrap();
+            let second = second_state
+                .pending_incarnation
+                .expect("second mutation must reuse the same pending incarnation");
+
+            assert_eq!(second_state.upload_state, VfsUploadState::Updating);
+            assert_eq!(
+                first.content_epoch, second.content_epoch,
+                "multiple writes to the same inode before commit must stay in one pending incarnation"
+            );
+            assert_eq!(second.base_size, baseline_payload.len() as u64);
         });
         rt.shutdown_background();
     }
