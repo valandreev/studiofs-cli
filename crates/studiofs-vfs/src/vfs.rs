@@ -2072,6 +2072,82 @@ impl StudioVfs {
         .await
     }
 
+    fn pending_content_epoch_for_inode(&self, ino: Ino) -> Option<u64> {
+        self.state
+            .inode_incarnations
+            .lock()
+            .get(&ino)
+            .and_then(|state| {
+                state
+                    .pending_incarnation
+                    .as_ref()
+                    .map(|pending| pending.content_epoch)
+            })
+    }
+
+    fn pending_live_extent_record(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+    ) -> Option<ExtentRecordId> {
+        let pending_content_epoch = pending_content_epoch?;
+        self.state
+            .live_extent_records
+            .lock()
+            .get(&(ino, block_index))
+            .copied()
+            .filter(|extent| extent.content_epoch == pending_content_epoch)
+    }
+
+    fn read_pending_overlay_block_sync(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+    ) -> VfsResult<Option<Bytes>> {
+        if let Some(pending_block) = self.state.pending_blocks.lock().get(&(ino, block_index)) {
+            return Ok(Some(pending_block.data.clone().freeze()));
+        }
+        if let Some(data) = self.state.dirty_mem.lock().get(&(ino, block_index)) {
+            return Ok(Some(data.clone()));
+        }
+        if let Some(extent) =
+            self.pending_live_extent_record(ino, block_index, pending_content_epoch)
+            && let Some(data) = self.block_cache.get_sync(extent.object_id)
+        {
+            return Ok(Some(data));
+        }
+        if let Some(data) = self.load_spill_block((ino, block_index))? {
+            return Ok(Some(data));
+        }
+        Ok(None)
+    }
+
+    async fn read_pending_overlay_block_async(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+    ) -> VfsResult<Option<Bytes>> {
+        if let Some(pending_block) = self.state.pending_blocks.lock().get(&(ino, block_index)) {
+            return Ok(Some(pending_block.data.clone().freeze()));
+        }
+        if let Some(data) = self.state.dirty_mem.lock().get(&(ino, block_index)) {
+            return Ok(Some(data.clone()));
+        }
+        if let Some(extent) =
+            self.pending_live_extent_record(ino, block_index, pending_content_epoch)
+            && let Some(data) = self.block_cache.get(extent.object_id).await
+        {
+            return Ok(Some(data));
+        }
+        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
+            return Ok(Some(data));
+        }
+        Ok(None)
+    }
+
     fn inode_has_local_overlay(&self, ino: Ino) -> bool {
         if self
             .state
@@ -2460,13 +2536,10 @@ impl StudioVfs {
         block_index: u32,
         object_id: u64,
     ) -> VfsResult<Option<Bytes>> {
-        if let Some(pending_block) = self.state.pending_blocks.lock().get(&(ino, block_index)) {
-            return Ok(Some(pending_block.data.clone().freeze()));
-        }
-        if let Some(data) = self.state.dirty_mem.lock().get(&(ino, block_index)) {
-            return Ok(Some(data.clone()));
-        }
-        if let Some(data) = self.load_spill_block((ino, block_index))? {
+        let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
+        if let Some(data) =
+            self.read_pending_overlay_block_sync(ino, block_index, pending_content_epoch)?
+        {
             return Ok(Some(data));
         }
         Ok(self.block_cache.get_sync(object_id))
@@ -4097,7 +4170,10 @@ impl StudioVfs {
             return Err(VfsError::WouldBlock);
         }
         let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-        let prefer_pending_overlay = incarnation_state.pending_incarnation.is_some();
+        let pending_content_epoch = incarnation_state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch);
 
         // Clamp read to file size
         let end = (offset + buffer.len() as u64).min(attr.size);
@@ -4122,7 +4198,7 @@ impl StudioVfs {
         if blocks_needed.len() == 1 {
             let (block_idx, off_in, to_copy) = blocks_needed[0];
             return match self
-                .read_block_or_pending(ino, block_idx, prefer_pending_overlay)
+                .read_block_or_pending(ino, block_idx, pending_content_epoch)
                 .await
             {
                 Ok(block_data) => {
@@ -4153,7 +4229,7 @@ impl StudioVfs {
             .map(|(idx, _, _)| {
                 let block_idx = *idx;
                 async move {
-                    self.read_block_or_pending(ino, block_idx, prefer_pending_overlay)
+                    self.read_block_or_pending(ino, block_idx, pending_content_epoch)
                         .await
                 }
             })
@@ -4245,39 +4321,19 @@ impl StudioVfs {
         }
     }
 
-    fn read_pending_overlay_block(&self, ino: Ino, block_index: u32) -> Option<Bytes> {
-        {
-            let pending = self.state.pending_blocks.lock();
-            if let Some(pending_block) = pending.get(&(ino, block_index)) {
-                return Some(pending_block.data.clone().freeze());
-            }
-        }
-
-        {
-            let dirty = self.state.dirty_mem.lock();
-            if let Some(data) = dirty.get(&(ino, block_index)) {
-                return Some(data.clone());
-            }
-        }
-
-        None
-    }
-
     /// Read a block from the local pending incarnation overlay first, then
     /// fall back to the committed/current base.
     async fn read_block_or_pending(
         &self,
         ino: Ino,
         block_index: u32,
-        prefer_pending_overlay: bool,
+        pending_content_epoch: Option<u64>,
     ) -> VfsResult<Bytes> {
-        if prefer_pending_overlay {
-            if let Some(data) = self.read_pending_overlay_block(ino, block_index) {
-                return Ok(data);
-            }
-            if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
-                return Ok(data);
-            }
+        if let Some(data) = self
+            .read_pending_overlay_block_async(ino, block_index, pending_content_epoch)
+            .await?
+        {
+            return Ok(data);
         }
 
         self.read_block(ino, block_index).await
@@ -4381,7 +4437,9 @@ impl StudioVfs {
             return Ok(0);
         }
 
-        let current_size = self.getattr_async(ino).await?.size;
+        let initial_attr = self.getattr_async(ino).await?;
+        let current_size = initial_attr.size;
+        self.refresh_inode_incarnation_state_from_attr(ino, &initial_attr);
         let mut written = 0u64;
         let mut remaining = data.len();
         let mut current_offset = offset;
@@ -4426,6 +4484,7 @@ impl StudioVfs {
             {
                 let mut pending = self.state.pending_blocks.lock();
                 let pending_block = pending.get_mut(&(ino, block_index)).unwrap();
+                self.remove_live_extent(ino, block_index);
 
                 // Ensure buffer is large enough
                 let end_pos = offset_in_block + to_write;
@@ -4476,16 +4535,11 @@ impl StudioVfs {
 
     /// Read a block if it exists, returns None if block not found.
     async fn read_block_if_exists(&self, ino: Ino, block_index: u32) -> VfsResult<Option<Bytes>> {
-        // Check dirty memory buffer first: blocks live here between flush() and
-        // the background slab write, so metadata may not yet list them.
+        let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
+        if let Some(data) = self
+            .read_pending_overlay_block_async(ino, block_index, pending_content_epoch)
+            .await?
         {
-            let dirty = self.state.dirty_mem.lock();
-            if let Some(data) = dirty.get(&(ino, block_index)) {
-                return Ok(Some(data.clone()));
-            }
-        }
-
-        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
             return Ok(Some(data));
         }
 
