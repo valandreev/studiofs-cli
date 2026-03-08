@@ -769,22 +769,21 @@ async fn test_pending_deletions_gc() {
     vfs.write(ino, 0, b"new data here!!").await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Wait for the overwrite to be flushed — the new block will have a
-    // different object_id, so poll until the block ref changes.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
-            && !blocks.is_empty()
-            && blocks[0].1.object_id != old_block_id
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Timed out waiting for overwrite flush"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let attr = vfs.meta().get_attr(ino).unwrap();
+            attr.upload_state == UploadState::Ready
+                && attr.committed_content_epoch == attr.content_epoch
+                && vfs
+                    .meta()
+                    .get_file_blocks(ino)
+                    .unwrap()
+                    .first()
+                    .is_some_and(|(_, block)| block.object_id != old_block_id)
+        })
+        .await,
+        "overwrite GC check should begin only after the replacement incarnation is fully published"
+    );
 
     assert!(
         wait_until(Duration::from_secs(20), || {
