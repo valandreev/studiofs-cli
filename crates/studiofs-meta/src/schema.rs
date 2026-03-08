@@ -404,14 +404,8 @@ pub struct FormatInfo {
     /// Metadata backend configuration.
     #[serde(default)]
     pub metadata: MetadataConfig,
-    /// Manifest version token (used as ETag/If-Match in remote metadata backends).
-    #[serde(default)]
-    pub version: String,
     /// Block size in bytes (configurable at init, default 8MB).
     pub block_size: u32,
-    /// Chunk size - deprecated, kept for compatibility.
-    #[serde(default)]
-    pub chunk_size: u64,
 }
 
 /// Metadata backend selection.
@@ -457,14 +451,6 @@ pub struct MetadataConfig {
     pub remote: Option<RemoteStoreConfig>,
     #[serde(default)]
     pub postgres: Option<PostgresConfig>,
-    #[serde(default = "default_cache_ttl_secs")]
-    pub cache_ttl_secs: u64,
-    #[serde(default = "default_flush_interval_secs")]
-    pub flush_interval_secs: u64,
-    #[serde(default = "default_flush_ops_threshold")]
-    pub flush_ops_threshold: u32,
-    #[serde(default = "default_flush_bytes_threshold")]
-    pub flush_bytes_threshold: u64,
 }
 
 impl Default for MetadataConfig {
@@ -473,10 +459,6 @@ impl Default for MetadataConfig {
             backend: MetadataBackend::RedbLocal,
             remote: None,
             postgres: None,
-            cache_ttl_secs: default_cache_ttl_secs(),
-            flush_interval_secs: default_flush_interval_secs(),
-            flush_ops_threshold: default_flush_ops_threshold(),
-            flush_bytes_threshold: default_flush_bytes_threshold(),
         }
     }
 }
@@ -495,22 +477,6 @@ fn default_metadata_prefix() -> String {
     "metadata/".to_string()
 }
 
-fn default_cache_ttl_secs() -> u64 {
-    20
-}
-
-fn default_flush_interval_secs() -> u64 {
-    60
-}
-
-fn default_flush_ops_threshold() -> u32 {
-    100
-}
-
-fn default_flush_bytes_threshold() -> u64 {
-    1024 * 1024
-}
-
 impl Default for FormatInfo {
     fn default() -> Self {
         Self {
@@ -523,9 +489,7 @@ impl Default for FormatInfo {
             region: String::new(),
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
-            version: String::new(),
             block_size: DEFAULT_BLOCK_SIZE,
-            chunk_size: 0, // Deprecated
         }
     }
 }
@@ -553,9 +517,7 @@ impl FormatInfo {
             region,
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
-            version: String::new(),
             block_size: block_size_mb * 1024 * 1024, // Convert MB to bytes
-            chunk_size: 0,
         }
     }
 

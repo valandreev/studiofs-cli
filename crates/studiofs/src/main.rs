@@ -185,12 +185,13 @@ EXAMPLES:
       --meta postgres://studiofs:studiofs@127.0.0.1:5432 \\
       --block-size 16MB
 
-  Multi-client tuning (aggressive convergence):
-    studiofs init teamdisk --endpoint http://127.0.0.1:9000 \\
-      --bucket data-bucket --access-key minioadmin --secret-key minioadmin \\
-      --meta postgres://studiofs:studiofs@127.0.0.1:5432 \\
-      --metadata-cache-ttl-secs 5 --metadata-flush-interval-secs 15 \\
-      --metadata-flush-ops-threshold 20 --metadata-flush-bytes-threshold 262144
+RUNTIME POLICY:
+  PG batching / sync cadence is configured per client at mount/runtime, not
+  stored in the volume. Use environment variables such as:
+    STUDIOFS_PG_FLUSH_INTERVAL_SECS
+    STUDIOFS_PG_FLUSH_OPS_THRESHOLD
+    STUDIOFS_PG_FLUSH_IDLE_MS
+    STUDIOFS_PG_SYNC_POLL_SECS
 ")]
     Init {
         /// Disk name (used in object paths like <name>/objects)
@@ -239,22 +240,6 @@ EXAMPLES:
         /// Deprecated legacy option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_region: Option<String>,
-
-        /// Metadata cache TTL in seconds (read-through refresh window).
-        #[arg(long, default_value_t = 20)]
-        metadata_cache_ttl_secs: u64,
-
-        /// Maximum flush interval in seconds for batched remote metadata push.
-        #[arg(long, default_value_t = 60)]
-        metadata_flush_interval_secs: u64,
-
-        /// Flush early when queued metadata ops reach this threshold.
-        #[arg(long, default_value_t = 100)]
-        metadata_flush_ops_threshold: u32,
-
-        /// Flush early when queued metadata bytes reach this threshold.
-        #[arg(long, default_value_t = 1024 * 1024)]
-        metadata_flush_bytes_threshold: u64,
 
         /// Block size in bytes (e.g. 4MB, 8MB, 16MB). Defaults to 8MB if not specified.
         /// Larger blocks reduce metadata overhead but increase memory usage per operation.
@@ -311,6 +296,13 @@ EXAMPLES:
 
 SIZE FORMATS:
   --memory-limit and --cache-size accept: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
+
+RUNTIME PG POLICY:
+  PG batching / sync cadence is client-side and can be tuned per mount via:
+    STUDIOFS_PG_FLUSH_INTERVAL_SECS
+    STUDIOFS_PG_FLUSH_OPS_THRESHOLD
+    STUDIOFS_PG_FLUSH_IDLE_MS
+    STUDIOFS_PG_SYNC_POLL_SECS
 ")]
     Mount {
         /// Volume name (must be initialized first via `studiofs init`)
@@ -446,10 +438,6 @@ fn main() -> anyhow::Result<()> {
             metadata_access_key,
             metadata_secret_key,
             metadata_region,
-            metadata_cache_ttl_secs,
-            metadata_flush_interval_secs,
-            metadata_flush_ops_threshold,
-            metadata_flush_bytes_threshold,
             block_size,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -466,10 +454,6 @@ fn main() -> anyhow::Result<()> {
                 metadata_access_key.as_deref(),
                 metadata_secret_key.as_deref(),
                 metadata_region.as_deref(),
-                metadata_cache_ttl_secs,
-                metadata_flush_interval_secs,
-                metadata_flush_ops_threshold,
-                metadata_flush_bytes_threshold,
                 &meta_dir,
                 block_size.as_deref(),
             )?;

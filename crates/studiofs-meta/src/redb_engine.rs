@@ -4415,9 +4415,7 @@ mod tests {
             region: "".into(),
             data_prefix: "test-volume/objects/".into(),
             metadata: MetadataConfig::default(),
-            version: String::new(),
             block_size: DEFAULT_BLOCK_SIZE,
-            chunk_size: 0,
         };
         engine.set_format_info(&info).unwrap();
         let loaded = engine.get_format_info().unwrap();

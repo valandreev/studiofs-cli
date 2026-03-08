@@ -4,11 +4,15 @@ use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use crate::types::*;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_PG_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
+const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
+const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
+const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 
 /// PostgreSQL-backed metadata engine.
 ///
@@ -30,6 +34,7 @@ pub struct PgMetaEngine {
     flush_interval: Duration,
     flush_idle_grace: Duration,
     flush_ops_threshold: u32,
+    inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
 }
 
@@ -63,6 +68,42 @@ struct OverlayConflictSets {
 }
 
 impl PgMetaEngine {
+    fn load_persisted_local_version(local: &RedbMetaEngine) -> MetaResult<i64> {
+        let version = local.get_counter(LOCAL_PG_VERSION_COUNTER)?;
+        Ok(version.min(i64::MAX as u64) as i64)
+    }
+
+    fn persist_local_version(&self, version: i64) -> MetaResult<()> {
+        if version < 0 {
+            return Ok(());
+        }
+        self.local
+            .set_counter(LOCAL_PG_VERSION_COUNTER, version as u64)?;
+        self.local_version.store(version, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn has_any_local_overlay_mutation(local: &RedbMetaEngine) -> MetaResult<bool> {
+        Ok(!local.local_overlay_inodes()?.is_empty()
+            || !local.local_overlay_attr_inodes()?.is_empty()
+            || !local.local_overlay_dentries()?.is_empty()
+            || !local.local_overlay_symlink_inodes()?.is_empty()
+            || !local.local_overlay_xattr_keys()?.is_empty())
+    }
+
+    fn should_pull_startup_snapshot(
+        local: &RedbMetaEngine,
+        persisted_version: i64,
+    ) -> MetaResult<bool> {
+        if persisted_version > 0 {
+            return Ok(false);
+        }
+        if Self::has_any_local_overlay_mutation(local)? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn reserve_counter_range_base(slot: u64, stride: u64, min_value: u64) -> u64 {
         let base = slot.saturating_mul(stride);
         base.max(min_value)
@@ -114,29 +155,43 @@ impl PgMetaEngine {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(2_000),
+                .unwrap_or(5_000),
         );
-        let flush_interval = Duration::from_secs(info.metadata.flush_interval_secs.max(1));
-        let flush_ops_threshold = info.metadata.flush_ops_threshold.max(1);
+        let flush_interval = Duration::from_secs(
+            std::env::var("STUDIOFS_PG_FLUSH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_PG_FLUSH_INTERVAL_SECS),
+        );
+        let flush_ops_threshold = std::env::var("STUDIOFS_PG_FLUSH_OPS_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
 
+        let restored_local_version = Self::load_persisted_local_version(&local)?;
         let client_slot = NEXT_PG_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
         let engine = Arc::new(Self {
             local,
             postgres_url: pg.url,
             volume_id: pg.volume_id,
             client_id: format!("pid:{}:{client_slot}", std::process::id()),
-            local_version: AtomicI64::new(0),
+            local_version: AtomicI64::new(restored_local_version),
             replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(poll_secs),
             flush_interval,
             flush_idle_grace,
             flush_ops_threshold,
+            inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
         });
 
         // Bootstrap from the last checkpoint if present, then catch up from
         // append-only event deltas.
-        let _ = engine.pull_snapshot_locked();
+        if Self::should_pull_startup_snapshot(&engine.local, restored_local_version)? {
+            let _ = engine.pull_snapshot_locked();
+        }
         let _ = engine.sync_metadata();
         let _ = engine.prime_local_id_ranges(client_slot);
         Self::start_background_poll(Arc::downgrade(&engine), engine.poll_interval);
@@ -494,7 +549,7 @@ impl PgMetaEngine {
 
         let snapshot = Self::decode_snapshot(&bytes)?;
         self.local.import_snapshot(&snapshot)?;
-        let _ = version;
+        self.persist_local_version(version)?;
         Ok(true)
     }
 
@@ -542,48 +597,53 @@ impl PgMetaEngine {
                 })?
                 .get(0);
 
-            let mut last_seq = 0_i64;
-            for event in &events_vec {
-                let payload = Self::encode_postcard(event)?;
-                let row = tx
-                    .query_one(
-                        r#"
-                        INSERT INTO event_log (
-                            vol,
-                            batch_version,
-                            event_type,
-                            event_payload,
-                            client_id,
-                            client_timestamp
-                        )
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                        RETURNING seq_id
-                        "#,
-                        &[
-                            &volume_id,
-                            &batch_version,
-                            &event.kind(),
-                            &payload,
-                            &client_id,
-                            &now_ms,
-                        ],
+            for chunk in events_vec.chunks(PG_EVENT_INSERT_CHUNK_SIZE) {
+                let event_types: Vec<&str> = chunk.iter().map(|event| event.kind()).collect();
+                let payloads: Vec<Vec<u8>> = chunk
+                    .iter()
+                    .map(Self::encode_postcard)
+                    .collect::<MetaResult<Vec<_>>>()?;
+                tx.execute(
+                    r#"
+                    INSERT INTO event_log (
+                        vol,
+                        batch_version,
+                        event_type,
+                        event_payload,
+                        client_id,
+                        client_timestamp
                     )
-                    .await
-                    .map_err(|e| {
-                        MetaError::Storage(format!("postgres event_log insert failed: {e}"))
-                    })?;
-                last_seq = row.get(0);
+                    SELECT
+                        $1,
+                        $2,
+                        batch.event_type,
+                        batch.event_payload,
+                        $3,
+                        $4
+                    FROM UNNEST($5::text[], $6::bytea[]) AS batch(event_type, event_payload)
+                    "#,
+                    &[
+                        &volume_id,
+                        &batch_version,
+                        &client_id,
+                        &now_ms,
+                        &event_types,
+                        &payloads,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres event_log batch insert failed: {e}"))
+                })?;
             }
 
-            if last_seq > 0 {
-                let channel = format!("studiofs_vol_{volume_id}");
-                let _ = tx
-                    .execute(
-                        "SELECT pg_notify($1, $2)",
-                        &[&channel, &batch_version.to_string()],
-                    )
-                    .await;
-            }
+            let channel = format!("studiofs_vol_{volume_id}");
+            let _ = tx
+                .execute(
+                    "SELECT pg_notify($1, $2)",
+                    &[&channel, &batch_version.to_string()],
+                )
+                .await;
 
             tx.commit()
                 .await
@@ -686,7 +746,7 @@ impl PgMetaEngine {
             }
             max_version = batch_version;
         }
-        self.local_version.store(max_version, Ordering::SeqCst);
+        self.persist_local_version(max_version)?;
         Ok(applied_any)
     }
 
@@ -758,10 +818,17 @@ impl PgMetaEngine {
             event_end: state.event_end,
         };
         Self::clear_pending_state(&mut state);
+        self.inflight_replication_ops
+            .fetch_add(batch.ops, Ordering::SeqCst);
         Some(batch)
     }
 
     fn restore_pending_batch(&self, batch: ClaimedPendingBatch) {
+        self.inflight_replication_ops
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(batch.ops))
+            })
+            .ok();
         if let Ok(mut state) = self.pending_state.lock() {
             state.ops = state.ops.saturating_add(batch.ops);
             state.force_flush |= batch.force_flush;
@@ -794,7 +861,8 @@ impl PgMetaEngine {
         if events.is_empty() {
             return Ok(());
         }
-        let _version = self.push_event_log_batch_locked(&events)?;
+        let version = self.push_event_log_batch_locked(&events)?;
+        self.persist_local_version(version)?;
         Ok(())
     }
 
@@ -806,6 +874,11 @@ impl PgMetaEngine {
             self.restore_pending_batch(batch);
             return Err(err);
         }
+        self.inflight_replication_ops
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(batch.ops))
+            })
+            .ok();
         Ok(())
     }
 
@@ -865,6 +938,19 @@ impl MetaEngine for PgMetaEngine {
 
     fn metadata_version_token(&self) -> Option<String> {
         Some(self.local_version.load(Ordering::SeqCst).to_string())
+    }
+
+    fn replication_backlog(&self) -> crate::engine::MetadataReplicationBacklog {
+        let pending_ops = self
+            .pending_state
+            .lock()
+            .map(|state| state.ops)
+            .unwrap_or(0);
+        let inflight_ops = self.inflight_replication_ops.load(Ordering::SeqCst);
+        crate::engine::MetadataReplicationBacklog {
+            pending_ops,
+            inflight_ops,
+        }
     }
 
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
@@ -1227,6 +1313,7 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             flush_idle_grace: Duration::from_secs(60),
             flush_ops_threshold: 8,
+            inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
         };
 
@@ -1354,13 +1441,9 @@ mod tests {
                     url: dsn.to_string(),
                     volume_id,
                 }),
-                flush_interval_secs: 1,
-                flush_ops_threshold: 1,
                 ..MetadataConfig::default()
             },
-            version: String::new(),
             block_size: DEFAULT_BLOCK_SIZE,
-            chunk_size: 0,
         }
     }
 
@@ -1436,6 +1519,95 @@ mod tests {
         let end = state.event_end;
         assert_eq!(start, baseline);
         assert!(end > start);
+    }
+
+    #[test]
+    fn startup_snapshot_is_skipped_when_local_overlay_exists() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        pg.local
+            .create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+            .expect("create local draft");
+
+        assert!(
+            PgMetaEngine::has_any_local_overlay_mutation(&pg.local)
+                .expect("local overlay mutation"),
+            "local draft namespace should register as a local overlay mutation"
+        );
+        assert!(
+            !PgMetaEngine::should_pull_startup_snapshot(&pg.local, 0)
+                .expect("startup snapshot decision"),
+            "startup snapshot must not clobber a local overlay after crash/restart"
+        );
+    }
+
+    #[test]
+    fn persisted_pg_version_roundtrips_in_local_counter() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        pg.persist_local_version(42).expect("persist local version");
+
+        assert_eq!(pg.local_version.load(Ordering::SeqCst), 42);
+        assert_eq!(
+            PgMetaEngine::load_persisted_local_version(&pg.local).expect("reload local version"),
+            42
+        );
+        assert!(
+            !PgMetaEngine::should_pull_startup_snapshot(&pg.local, 42)
+                .expect("startup snapshot decision"),
+            "persisted PG version should suppress checkpoint bootstrap overwrite"
+        );
+    }
+
+    #[test]
+    fn replication_backlog_reports_pending_and_inflight_ops() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            state.ops = 7;
+        }
+        pg.inflight_replication_ops.store(3, Ordering::SeqCst);
+
+        let backlog = pg.replication_backlog();
+        assert_eq!(backlog.pending_ops, 7);
+        assert_eq!(backlog.inflight_ops, 3);
+        assert_eq!(backlog.total_ops(), 10);
+    }
+
+    #[test]
+    fn claim_and_restore_pending_batch_updates_replication_backlog() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            state.ops = 4;
+            state.force_flush = true;
+            state.event_start = Some(10);
+            state.event_end = 14;
+            state.started_at = Some(Instant::now());
+            state.last_mutation_at = Some(Instant::now());
+        }
+
+        let batch = pg.claim_pending_batch(true).expect("claimed batch");
+        let claimed = pg.replication_backlog();
+        assert_eq!(claimed.pending_ops, 0);
+        assert_eq!(claimed.inflight_ops, 4);
+
+        pg.restore_pending_batch(batch);
+        let restored = pg.replication_backlog();
+        assert_eq!(restored.pending_ops, 4);
+        assert_eq!(restored.inflight_ops, 0);
+    }
+
+    #[test]
+    fn pg_event_insert_chunking_covers_all_events() {
+        let events = vec![MetaEvent::RemoveAttr { ino: 1 }; 1_025];
+        let chunk_sizes: Vec<usize> = events
+            .chunks(PG_EVENT_INSERT_CHUNK_SIZE)
+            .map(|chunk| chunk.len())
+            .collect();
+
+        assert_eq!(chunk_sizes, vec![512, 512, 1]);
     }
 
     #[test]

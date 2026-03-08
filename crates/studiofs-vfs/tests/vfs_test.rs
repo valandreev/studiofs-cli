@@ -73,9 +73,7 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         metadata: MetadataConfig {
             ..MetadataConfig::default()
         },
-        version: String::new(),
-        block_size: 4 * 1024 * 1024,  // 4 MiB
-        chunk_size: 64 * 1024 * 1024, // 64 MiB (deprecated)
+        block_size: 4 * 1024 * 1024, // 4 MiB
     }
 }
 
@@ -3215,6 +3213,118 @@ fn restart_replays_only_live_pending_extents() {
             .await,
             "replay should materialize only the last live pending extent for the block"
         );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn recovered_pending_uploads_publish_new_file_after_restart() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("restart-publish-ready-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x6Du8; 512 * 1024];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let attr = vfs
+                .create(1, b"restart-publish-ready.bin", 0, 0, 0o644)
+                .unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 1
+                        && meta
+                            .get_attr(ino)
+                            .map(|attr| attr.upload_state == UploadState::Uploading)
+                            .unwrap_or(false)
+                })
+                .await,
+                "crash setup should leave one recovered upload journal entry for the new file"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                vfs.pending_uploads_for_inode(ino).is_empty()
+                    && meta
+                        .get_attr(ino)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.committed_content_epoch == attr.content_epoch
+                        })
+                        .unwrap_or(false)
+            })
+            .await,
+            "recovered uploads should publish the new file to Ready after restart"
+        );
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDONLY, false)
+            .expect("published file should no longer look locked after restart");
+        vfs.release_fh(fh).await.unwrap();
     });
     rt.shutdown_background();
 }

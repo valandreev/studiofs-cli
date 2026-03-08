@@ -265,7 +265,7 @@ impl UploadScheduler {
         if upload_log_is_idle(pending, self.aimd.in_flight()) {
             return;
         }
-        info!(
+        debug!(
             window = format!("{:.1}", self.aimd.window()),
             inflight = self.aimd.in_flight(),
             pending,

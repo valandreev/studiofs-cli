@@ -20,10 +20,6 @@ studiofs init <name> \
   --secret-key <s3-secret-key> \
   --meta <postgres-server-dsn> \
   [--region <region>] \
-  [--metadata-cache-ttl-secs <u64>] \
-  [--metadata-flush-interval-secs <u64>] \
-  [--metadata-flush-ops-threshold <u32>] \
-  [--metadata-flush-bytes-threshold <u64>] \
   [--block-size <e.g. 8MB>]
 ```
 
@@ -59,6 +55,7 @@ studiofs mount <name> <mount-point> \
 Notes:
 - No `--nats` option (removed).
 - Cross-client metadata convergence is handled through PostgreSQL sync.
+- Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 
 ### `umount`
 
@@ -110,7 +107,9 @@ studiofs mount projectfs Y:
 | `STUDIOFS_JANITOR_MAX_DELETES` | `500` | Janitor delete cap |
 | `STUDIOFS_JANITOR_LEASE_TTL_SECS` | `2700` | Janitor lease TTL |
 | `STUDIOFS_PG_SYNC_POLL_SECS` | `2` | Background PG delta sync / flush loop period |
-| `STUDIOFS_PG_FLUSH_IDLE_MS` | `2000` | Idle grace before PG flush of accumulated local metadata events |
+| `STUDIOFS_PG_FLUSH_INTERVAL_SECS` | `60` | Max interval before the client flushes accumulated local PG metadata events |
+| `STUDIOFS_PG_FLUSH_OPS_THRESHOLD` | `500` | Client-side PG metadata flush op batch threshold |
+| `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
 | `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |

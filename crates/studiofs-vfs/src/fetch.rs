@@ -376,7 +376,7 @@ impl FetchScheduler {
             Ok(results) => {
                 let ok_count = results.iter().filter(|r| r.is_ok()).count();
                 let err_count = results.len() - ok_count;
-                info!(
+                debug!(
                     ok = ok_count,
                     not_found = err_count,
                     "FetchScheduler: warmup done ({WARMUP_CONCURRENCY} connections primed)"

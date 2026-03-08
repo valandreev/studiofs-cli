@@ -356,10 +356,6 @@ pub fn run(
     metadata_access_key: Option<&str>,
     metadata_secret_key: Option<&str>,
     metadata_region: Option<&str>,
-    metadata_cache_ttl_secs: u64,
-    metadata_flush_interval_secs: u64,
-    metadata_flush_ops_threshold: u32,
-    metadata_flush_bytes_threshold: u64,
     meta_dir: &Path,
     block_size: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -520,14 +516,8 @@ pub fn run(
                 url: postgres_dsn.to_string(),
                 volume_id: postgres_volume_id,
             }),
-            cache_ttl_secs: metadata_cache_ttl_secs.max(1),
-            flush_interval_secs: metadata_flush_interval_secs.max(1),
-            flush_ops_threshold: metadata_flush_ops_threshold.max(1),
-            flush_bytes_threshold: metadata_flush_bytes_threshold.max(1),
         },
-        version: String::new(),
         block_size: actual_block_size,
-        chunk_size: 0,
     };
     engine.set_format_info(&format_info)?;
 

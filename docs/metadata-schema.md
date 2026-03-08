@@ -51,13 +51,29 @@ Important cursor rule:
 
 ## Config Fields
 
+Persisted in `FormatInfo`:
+- `name`
+- `uuid`
+- `endpoint`
+- `bucket`
+- `access_key`
+- `secret_key`
+- `region`
+- `data_prefix`
+- `block_size`
 - `metadata.postgres.url`
   - PostgreSQL server DSN; StudioFS rewrites it to database `studiofs`
 - `metadata.postgres.volume_id`
 
-## Runtime Defaults
+Not persisted in the volume format:
+- PG flush cadence / op thresholds
+- metadata cache TTL
+- legacy `chunk_size`
+- legacy per-volume format `version`
 
-- `cache_ttl_secs = 20`
-- `flush_interval_secs = 60`
-- `flush_ops_threshold = 100`
-- `flush_bytes_threshold = 1 MiB`
+## Client Runtime Defaults
+
+- `STUDIOFS_PG_FLUSH_INTERVAL_SECS = 60`
+- `STUDIOFS_PG_FLUSH_OPS_THRESHOLD = 500`
+- `STUDIOFS_PG_FLUSH_IDLE_MS = 5000`
+- `STUDIOFS_PG_SYNC_POLL_SECS = 2`

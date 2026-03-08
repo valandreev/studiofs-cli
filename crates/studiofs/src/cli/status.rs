@@ -210,10 +210,6 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         "  Block size: {} MiB",
         format_info.block_size / (1024 * 1024)
     );
-    println!(
-        "  Chunk size: {} MiB",
-        format_info.chunk_size / (1024 * 1024)
-    );
     println!("  Meta backend: {:?}", format_info.metadata.backend);
     if let Some(remote) = &format_info.metadata.remote {
         println!("  Meta endpoint: {}", remote.endpoint);
@@ -224,19 +220,6 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         println!("  Postgres URL:  {}", pg.url);
         println!("  Postgres vol:  {}", pg.volume_id);
     }
-    println!("  Meta cache TTL: {}s", format_info.metadata.cache_ttl_secs);
-    println!(
-        "  Meta flush interval: {}s",
-        format_info.metadata.flush_interval_secs
-    );
-    println!(
-        "  Meta flush ops threshold: {}",
-        format_info.metadata.flush_ops_threshold
-    );
-    println!(
-        "  Meta flush bytes threshold: {}",
-        format_info.metadata.flush_bytes_threshold
-    );
     println!();
     println!("  Inodes:     {}", total_inodes);
     println!("  Used space: {} bytes", used_space);

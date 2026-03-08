@@ -114,7 +114,11 @@ Important fields:
 - `backend = Postgres`
 - `postgres.url`
 - `postgres.volume_id`
-- `cache_ttl_secs`
-- `flush_interval_secs`
-- `flush_ops_threshold`
-- `flush_bytes_threshold`
+
+Client runtime policy is not stored in the volume format.
+PG batching / sync cadence is controlled per client through runtime settings
+such as:
+- `STUDIOFS_PG_FLUSH_INTERVAL_SECS`
+- `STUDIOFS_PG_FLUSH_OPS_THRESHOLD`
+- `STUDIOFS_PG_FLUSH_IDLE_MS`
+- `STUDIOFS_PG_SYNC_POLL_SECS`

@@ -65,6 +65,18 @@ pub enum MetaError {
 
 pub type MetaResult<T> = Result<T, MetaError>;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataReplicationBacklog {
+    pub pending_ops: u32,
+    pub inflight_ops: u32,
+}
+
+impl MetadataReplicationBacklog {
+    pub fn total_ops(self) -> u32 {
+        self.pending_ops.saturating_add(self.inflight_ops)
+    }
+}
+
 /// Abstract metadata engine interface.
 ///
 /// All operations are synchronous (redb is sync). The VFS layer wraps them
@@ -108,6 +120,12 @@ pub trait MetaEngine: Send + Sync {
     /// actually observed a newer remote snapshot.
     fn metadata_version_token(&self) -> Option<String> {
         None
+    }
+
+    /// Best-effort count of local metadata mutations not yet durably pushed to
+    /// the shared remote metadata source.
+    fn replication_backlog(&self) -> MetadataReplicationBacklog {
+        MetadataReplicationBacklog::default()
     }
 
     // ─── Format / Settings ───────────────────────────────────────────────

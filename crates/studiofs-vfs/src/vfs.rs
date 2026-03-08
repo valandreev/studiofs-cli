@@ -282,6 +282,7 @@ const DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS: u64 = 128;
 const DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG: u64 = 2;
 const DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS: u64 = 4;
+const DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
@@ -697,6 +698,34 @@ fn active_ingress_segment_path(dir: &std::path::Path, active_segment_id: u64) ->
 
 fn latest_ingress_checkpoint_path(dir: &std::path::Path) -> PathBuf {
     dir.join("latest.json")
+}
+
+fn shutdown_metadata_flush_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS),
+    )
+}
+
+fn run_sync_with_timeout<T: Send + 'static>(
+    timeout: Duration,
+    operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
+) -> VfsResult<Option<T>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = operation();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(VfsError::Other(
+            "timed operation thread disconnected".to_string(),
+        )),
+    }
 }
 
 fn ingress_state_path(spill_dir: &std::path::Path) -> PathBuf {
@@ -1228,6 +1257,46 @@ pub struct StudioVfs {
 }
 
 impl StudioVfs {
+    fn restore_live_extents_from_pending_uploads(&self) {
+        let pending = self.block_cache.snapshot_pending_uploads();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut restored = 0usize;
+        let mut attrs = HashMap::<Ino, Option<InodeAttr>>::new();
+        for op in pending {
+            let block_index = block_index_from_offset(op.offset, self.block_size);
+            let attr = attrs
+                .entry(op.ino)
+                .or_insert_with(|| self.meta.get_attr(op.ino).ok());
+            let Some(attr) = attr.as_ref() else {
+                continue;
+            };
+            if attr.content_epoch != op.content_epoch {
+                continue;
+            }
+
+            let current = match self.meta.get_file_block(op.ino, block_index) {
+                Ok(Some(block_ref)) => block_ref,
+                _ => continue,
+            };
+            if current.object_id != op.object_id {
+                continue;
+            }
+
+            self.record_live_extent(op.ino, block_index, op.object_id, op.content_epoch);
+            restored += 1;
+        }
+
+        if restored > 0 {
+            info!(
+                restored_live_extents = restored,
+                "restored pending live extents from upload journal"
+            );
+        }
+    }
+
     /// Create a new VFS instance.
     pub fn new(
         meta: Arc<dyn MetaEngine>,
@@ -1753,6 +1822,8 @@ impl StudioVfs {
                 distributed_flock,
                 kernel_invalidator: std::sync::RwLock::new(None),
             });
+
+            vfs.restore_live_extents_from_pending_uploads();
 
             // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
             let vfs_for_prefetch = vfs.clone();
@@ -5172,12 +5243,16 @@ impl StudioVfs {
                 break;
             }
             let pending = self.block_cache.pending_upload_count();
+            let metadata_backlog = self.meta.replication_backlog();
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
-            if self.upload_pipeline_is_idle(pending, &ingress) {
-                info!(pending_uploads = pending, "upload pipeline");
-            } else {
-                info!(
+            info!(
+                pending_uploads = pending,
+                pending_metadata_ops = metadata_backlog.total_ops(),
+                "upload pipeline"
+            );
+            if !self.upload_pipeline_is_idle(pending, &ingress) {
+                debug!(
                     requeues = self.state.upload_requeues.load(Ordering::Relaxed),
                     canceled_deleted = self.state.upload_canceled_deleted.load(Ordering::Relaxed),
                     canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
@@ -5209,6 +5284,8 @@ impl StudioVfs {
                     qos_upload_available = self.qos.upload_available(),
                     qos_commit_available = self.qos.commit_available(),
                     qos_fetch_available = self.qos.fetch_available(),
+                    pending_metadata_ops = metadata_backlog.pending_ops,
+                    inflight_metadata_ops = metadata_backlog.inflight_ops,
                     "upload pipeline counters"
                 );
             }
@@ -5712,13 +5789,20 @@ impl StudioVfs {
             "VFS shutdown: persisting metadata"
         );
         let meta = self.meta.clone();
-        if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            engine.flush_metadata()?;
-            Ok(())
-        })
-        .await
-        {
-            warn!("VFS shutdown: metadata flush failed: {}", e);
+        let metadata_flush_timeout = shutdown_metadata_flush_timeout();
+        match run_sync_with_timeout(metadata_flush_timeout, move || {
+            meta.flush_metadata().map_err(VfsError::Meta)
+        }) {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                warn!(
+                    timeout_ms = metadata_flush_timeout.as_millis() as u64,
+                    "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
+                );
+            }
+            Err(e) => {
+                warn!("VFS shutdown: metadata flush failed: {}", e);
+            }
         }
         self.persist_cache().await;
         self.state.shutdown_completed.store(true, Ordering::Release);
@@ -5736,6 +5820,8 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     #[test]
     fn test_block_index_calculation() {
@@ -5745,6 +5831,31 @@ mod tests {
         assert_eq!(block_index_from_offset(1, block_size), 0);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024, block_size), 1);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024 + 1, block_size), 1);
+    }
+
+    #[test]
+    fn test_run_sync_with_timeout_returns_result_before_deadline() {
+        let result = run_sync_with_timeout(Duration::from_millis(100), || Ok::<_, VfsError>(7))
+            .expect("operation should succeed");
+        assert_eq!(result, Some(7));
+    }
+
+    #[test]
+    fn test_run_sync_with_timeout_returns_none_on_timeout() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let result = run_sync_with_timeout(Duration::from_millis(10), move || {
+            std::thread::sleep(Duration::from_millis(100));
+            finished_clone.store(true, AtomicOrdering::Release);
+            Ok::<_, VfsError>(())
+        })
+        .expect("timeout helper should not fail");
+
+        assert_eq!(result, None);
+        assert!(
+            !finished.load(AtomicOrdering::Acquire),
+            "timed-out helper should return before the slow operation finishes"
+        );
     }
 
     #[test]
