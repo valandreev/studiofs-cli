@@ -21,6 +21,8 @@
 //! 3. Validate object payload + checksum
 //! 4. Assemble response
 
+#[path = "commit.rs"]
+mod commit;
 #[path = "materialize.rs"]
 mod materialize;
 
@@ -1034,6 +1036,8 @@ struct VfsState {
     inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
     /// Live extent identity per inode/block used to invalidate superseded uploads.
     live_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
+    /// Successfully uploaded live extents waiting for atomic file-level publish.
+    uploaded_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
     /// Dirty attributes cache (from writes not yet synced to redb).
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
@@ -1631,6 +1635,7 @@ impl StudioVfs {
                     pending_blocks: Mutex::new(std::collections::HashMap::new()),
                     inode_incarnations: Mutex::new(std::collections::HashMap::new()),
                     live_extent_records: Mutex::new(std::collections::HashMap::new()),
+                    uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
@@ -2103,7 +2108,7 @@ impl StudioVfs {
             return None;
         }
         Some(CommittedIncarnation {
-            content_epoch: attr.content_epoch,
+            content_epoch: attr.committed_content_epoch,
             size: attr.committed_size,
         })
     }
@@ -2272,11 +2277,19 @@ impl StudioVfs {
                 content_epoch,
             },
         );
+        self.state
+            .uploaded_extent_records
+            .lock()
+            .remove(&(ino, block_index));
     }
 
     fn remove_live_extent(&self, ino: Ino, block_index: u32) {
         self.state
             .live_extent_records
+            .lock()
+            .remove(&(ino, block_index));
+        self.state
+            .uploaded_extent_records
             .lock()
             .remove(&(ino, block_index));
     }
@@ -2286,6 +2299,50 @@ impl StudioVfs {
             .live_extent_records
             .lock()
             .retain(|(candidate, _), _| *candidate != ino);
+        self.state
+            .uploaded_extent_records
+            .lock()
+            .retain(|(candidate, _), _| *candidate != ino);
+    }
+
+    fn record_uploaded_extent(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        object_id: u64,
+        content_epoch: u64,
+    ) {
+        self.state.uploaded_extent_records.lock().insert(
+            (ino, block_index),
+            ExtentRecordId {
+                object_id,
+                content_epoch,
+            },
+        );
+    }
+
+    fn uploaded_extent_records_for_inode_epoch(
+        &self,
+        ino: Ino,
+        content_epoch: u64,
+    ) -> Vec<(u32, ExtentRecordId)> {
+        self.state
+            .uploaded_extent_records
+            .lock()
+            .iter()
+            .filter_map(|((candidate_ino, block_index), extent)| {
+                (*candidate_ino == ino && extent.content_epoch == content_epoch)
+                    .then_some((*block_index, *extent))
+            })
+            .collect()
+    }
+
+    fn remote_upload_placeholder_visible(&self, ino: Ino, attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state == UploadState::Uploading
+            && attr.committed_size == 0
+            && !self.inode_has_local_overlay(ino)
+            && !self.inode_has_pending_uploads(ino)
     }
 
     pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
@@ -3299,6 +3356,9 @@ impl StudioVfs {
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
         // Verify the inode exists
         let attr = self.getattr(ino)?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::WouldBlock);
+        }
 
         // If O_TRUNC requested, truncate to 0
         if trunc {
@@ -3998,6 +4058,9 @@ impl StudioVfs {
     /// Delegates to `read_into()` to avoid code duplication.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         let attr = self.getattr_async(ino).await?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::WouldBlock);
+        }
         self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         let end = (offset + size as u64).min(attr.size);
         if offset >= end {
@@ -4024,6 +4087,9 @@ impl StudioVfs {
         }
         let _guard = ForegroundReadGuard(self);
         let attr = self.getattr_async(ino).await?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::WouldBlock);
+        }
         let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         let prefer_pending_overlay = incarnation_state.pending_incarnation.is_some();
 
@@ -4754,7 +4820,6 @@ impl StudioVfs {
             engine.get_file_block(op.ino, block_index)
         })
         .await?;
-        let current_ref = current.as_ref().cloned();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -4771,24 +4836,8 @@ impl StudioVfs {
                     .await
                     .unwrap_or(false) =>
             {
-                let block_ref = current_ref.expect("current present");
-                let committed = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-                    engine.commit_uploaded_block(op.ino, block_index, op.content_epoch, &block_ref)
-                })
-                .await?;
-                if !committed {
-                    run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-                        engine.add_pending_deletion(op.object_id, timestamp)
-                    })
-                    .await?;
-                    debug!(
-                        object_id = op.object_id,
-                        ino = op.ino,
-                        block_index,
-                        queued_epoch = op.content_epoch,
-                        "upload completion rejected by metadata precondition"
-                    );
-                }
+                self.block_cache.complete_upload(&op);
+                commit::CommitCoordinator::finish_extent_upload(self, &op, block_index).await?;
             }
             _ => {
                 run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
@@ -4801,10 +4850,10 @@ impl StudioVfs {
                     block_index,
                     "upload completed for stale block, marked for deletion"
                 );
+                self.block_cache.complete_upload(&op);
             }
         }
 
-        self.block_cache.complete_upload(&op);
         if let Ok(attr) = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
             engine.get_attr(op.ino)
         })
@@ -5197,6 +5246,17 @@ impl StudioVfs {
             {
                 Ok(Ok(true)) => {
                     self.block_cache.complete_upload(op);
+                    let block_index = block_index_from_offset(op.offset, self.block_size);
+                    if let Err(e) =
+                        commit::CommitCoordinator::finish_extent_upload(self, op, block_index).await
+                    {
+                        debug!(
+                            object_id = op.object_id,
+                            ino = op.ino,
+                            error = %e,
+                            "VFS shutdown: publish reconcile after remote exists() failed"
+                        );
+                    }
                     reconciled += 1;
                 }
                 Ok(Ok(false)) => {}

@@ -25,7 +25,7 @@ use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
     FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
-    types::{BlockFlags, BlockRef},
+    types::{BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState};
 
@@ -122,6 +122,40 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
         512 * 1024 * 1024,
     )
     .expect("failed to create StudioVfs")
+}
+
+fn make_vfs_with_meta(
+    meta: Arc<RedbMetaEngine>,
+    format_info: &FormatInfo,
+    cache_dir_str: &str,
+) -> Arc<StudioVfs> {
+    meta.set_format_info(format_info)
+        .expect("failed to set format info");
+    let data_config = DataStoreConfig::from(format_info);
+    StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir_str,
+        1024 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+    .expect("failed to create StudioVfs")
+}
+
+fn import_remote_snapshot(
+    source: &RedbMetaEngine,
+    target: &RedbMetaEngine,
+    format_info: &FormatInfo,
+) {
+    let snapshot = source
+        .export_remote_snapshot()
+        .expect("export remote snapshot");
+    target
+        .import_snapshot(&snapshot)
+        .expect("import remote snapshot");
+    target
+        .set_format_info(format_info)
+        .expect("reset imported format info");
 }
 
 /// Ensure the test bucket exists.
@@ -1373,6 +1407,344 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
         });
         rt.shutdown_background();
     }
+}
+
+#[test]
+fn remote_clients_see_uploading_marker_without_precise_progress() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-remote-uploading-marker-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x11u8; 512 * 1024];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        let attr = writer_vfs
+            .create(1, b"uploading-remote.txt", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+        writer_vfs.flush(attr.ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let remote_attr = remote_vfs.lookup(1, b"uploading-remote.txt").unwrap();
+        assert_eq!(remote_attr.ino, attr.ino);
+        assert_eq!(remote_attr.size, 0);
+        assert_eq!(remote_attr.committed_size, 0);
+        assert_eq!(remote_attr.upload_state, UploadState::Uploading);
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-remote-open-uploading-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x22u8; 256 * 1024];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        let attr = writer_vfs
+            .create(1, b"remote-open-uploading.txt", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+        writer_vfs.flush(attr.ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let remote_attr = remote_vfs.lookup(1, b"remote-open-uploading.txt").unwrap();
+        assert!(matches!(
+            remote_vfs.open_file(remote_attr.ino, OpenFlags::RDONLY, false),
+            Err(VfsError::WouldBlock)
+        ));
+        assert!(matches!(
+            remote_vfs
+                .read(remote_attr.ino, 0, payload.len() as u32)
+                .await,
+            Err(VfsError::WouldBlock)
+        ));
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn remote_clients_keep_previous_committed_version_during_update() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-remote-old-committed-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&online_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x33u8; block_size];
+    let replacement_payload = vec![0x44u8; block_size];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &writer_meta,
+                &online_info,
+                b"remote-old.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &offline_info, &writer_cache_str);
+        writer_vfs
+            .write(ino, 0, &replacement_payload)
+            .await
+            .unwrap();
+        writer_vfs.flush(ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &online_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &online_info, &remote_cache_str);
+        let remote_attr = remote_vfs.lookup(1, b"remote-old.bin").unwrap();
+        assert_eq!(remote_attr.upload_state, UploadState::Updating);
+        assert_eq!(remote_attr.committed_size, baseline_payload.len() as u64);
+        let read = remote_vfs
+            .read(remote_attr.ino, 0, baseline_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.as_ref(),
+            baseline_payload.as_slice(),
+            "remote client must keep reading committed content while writer update is pending"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn atomic_switch_to_new_incarnation_after_full_commit() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "250");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-atomic-switch-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let baseline_payload = vec![0x55u8; block_size * 2];
+    let mut replacement_payload = vec![0x66u8; block_size * 2];
+    replacement_payload[block_size..].fill(0x77);
+    let mut ino = 0u64;
+    let mut baseline_blocks = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, seeded_blocks) = seed_committed_file(
+                &writer_meta,
+                &format_info,
+                b"atomic-switch.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+            baseline_blocks = seeded_blocks;
+        });
+        rt.shutdown_background();
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        writer_vfs.write(ino, 0, &replacement_payload).await.unwrap();
+        writer_vfs.flush(ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        {
+            let remote_vfs =
+                make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+            let remote_attr = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
+            assert_eq!(remote_attr.upload_state, UploadState::Updating);
+            let remote_blocks_before = remote_meta.get_file_blocks(ino).unwrap();
+            assert_eq!(remote_blocks_before, baseline_blocks);
+            let read_before = remote_vfs
+                .read(ino, 0, baseline_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(read_before.as_ref(), baseline_payload.as_slice());
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                writer_vfs.pending_uploads_for_inode(ino).is_empty()
+                    && writer_meta
+                        .get_attr(ino)
+                        .map(|attr| attr.upload_state == UploadState::Ready)
+                        .unwrap_or(false)
+            })
+            .await,
+            "writer should publish the new incarnation after the full upload set completes"
+        );
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        {
+            let remote_vfs =
+                make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+            let remote_attr_after = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
+            assert_eq!(remote_attr_after.upload_state, UploadState::Ready);
+            let remote_blocks_after = remote_meta.get_file_blocks(ino).unwrap();
+            assert_eq!(remote_blocks_after.len(), 2);
+            assert_ne!(remote_blocks_after, baseline_blocks);
+            let read_after = remote_vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_after.as_ref(),
+                replacement_payload.as_slice(),
+                "remote view should switch atomically from old committed incarnation to the fully published new incarnation"
+            );
+        }
+    });
+    rt.shutdown_background();
 }
 
 #[test]
