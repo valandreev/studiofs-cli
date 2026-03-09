@@ -114,11 +114,14 @@ pub fn mount_and_serve(
         // Instead we implement access() → ok() so the FUSE daemon decides.
     ];
     // macOS-specific options:
-    //  noappledouble – suppress creation of ._  AppleDouble resource files
-    //  volname       – display name in Finder
+    //  volname – display name in Finder
+    //
+    // Do not use `noappledouble` or `noapplexattr`: macOS copy flows rely on
+    // AppleDouble/xattr fallback semantics for Finder metadata and resource
+    // forks. We return `ENOTSUP` for `com.apple.*` xattrs so macFUSE can handle
+    // those through AppleDouble while keeping non-Apple xattrs in StudioFS.
     #[cfg(target_os = "macos")]
     {
-        options.push(fuser::MountOption::CUSTOM("noappledouble".into()));
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
     }
     if foreground {

@@ -47,6 +47,31 @@ pub struct L2DiskCache {
 }
 
 impl L2DiskCache {
+    fn write_block_file(path: &Path, tmp_path: &Path, data: &[u8]) -> io::Result<()> {
+        match std::fs::write(tmp_path, data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(tmp_path, data)?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        match std::fs::rename(tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(tmp_path, data)?;
+                std::fs::rename(tmp_path, path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Open (or create) the disk cache at `cache_dir`.
     ///
     /// If the directory already exists, it is reused.  All 256 shard
@@ -207,9 +232,7 @@ impl L2DiskCache {
         let owned = data.to_vec();
 
         tokio::task::spawn_blocking(move || -> io::Result<()> {
-            std::fs::write(&tmp_path, &owned)?;
-            std::fs::rename(&tmp_path, &path)?;
-            Ok(())
+            Self::write_block_file(&path, &tmp_path, &owned)
         })
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
@@ -234,9 +257,7 @@ impl L2DiskCache {
                 object_id,
                 data.len() as u64,
                 tokio::task::spawn_blocking(move || -> io::Result<()> {
-                    std::fs::write(&tmp_path, &owned)?;
-                    std::fs::rename(&tmp_path, &path)?;
-                    Ok(())
+                    Self::write_block_file(&path, &tmp_path, &owned)
                 }),
             ));
         }
@@ -262,8 +283,7 @@ impl L2DiskCache {
         let path = self.block_path(object_id);
         let tmp_path = path.with_extension("tmp");
 
-        std::fs::write(&tmp_path, data)?;
-        std::fs::rename(&tmp_path, &path)?;
+        Self::write_block_file(&path, &tmp_path, data)?;
 
         self.total_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -437,6 +457,20 @@ mod tests {
         assert!(!cache.contains(42));
         assert_eq!(cache.total_bytes(), 0);
         assert!(cache.get(42).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_recreates_missing_shard_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+        let object_id = 0xab00000000000001;
+        let shard_dir = dir.path().join("blocks").join("ab");
+
+        std::fs::remove_dir_all(&shard_dir).unwrap();
+        cache.put(object_id, b"recreate shard").await.unwrap();
+
+        let got = cache.get(object_id).await.unwrap();
+        assert_eq!(&got[..], b"recreate shard");
     }
 
     #[tokio::test]

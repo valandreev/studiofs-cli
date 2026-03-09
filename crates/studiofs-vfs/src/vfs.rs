@@ -3480,7 +3480,7 @@ impl StudioVfs {
         }
 
         if let Some(mode) = args.mode {
-            attr.mode = mode;
+            attr.mode = mode & 0o7777;
             changed = true;
         }
 
@@ -3962,7 +3962,9 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
-        let attr = self.meta.create_file(parent, name, uid, gid, mode)?;
+        let attr = self
+            .meta
+            .create_file(parent, name, uid, gid, mode & 0o7777)?;
         self.state.inode_incarnations.lock().insert(
             attr.ino,
             InodeIncarnationState {
@@ -3991,7 +3993,7 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
-        let attr = self.meta.create_dir(parent, name, uid, gid, mode)?;
+        let attr = self.meta.create_dir(parent, name, uid, gid, mode & 0o7777)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
