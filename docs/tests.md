@@ -45,6 +45,11 @@ The current architecture relies on these focused regressions:
   - `test_pg_peer_can_update_foreign_visible_symlink_target`
   - `test_pg_local_xattr_overlay_masks_foreign_update_until_flush`
   - `test_pg_checkpoint_excludes_uncommitted_local_blocks`
+  - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
+  - `test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover`
+  - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
+  - `test_pg_reopen_after_claimed_batch_crash_flushes_without_discover`
+  - `test_pg_reopen_after_claimed_multi_event_batch_preserves_sequence_without_discover`
 - local write-path correctness:
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
   - `test_truncate_to_zero_then_rewrite`
@@ -83,6 +88,9 @@ Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^
 - Check `STUDIOFS_TEST_PG_DSN` correctness.
 - Verify PostgreSQL is reachable and database `studiofs` can be created or already exists.
 - Re-run single test with `--nocapture`.
+- Prefer the documented `--test-threads=1` mode for ignored PG suite runs; the
+  suite uses background poll/flush timing and is intentionally validated in
+  single-threaded mode.
 
 ### MinIO failures
 - Validate endpoint/credentials/bucket.

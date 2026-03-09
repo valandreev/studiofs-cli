@@ -20,6 +20,8 @@ Current behavior:
 - local mutations append to the local metadata event log
 - background flush projects remote-visible deltas into PostgreSQL `event_log`
 - background pull applies only newer foreign delta batches
+- restart/reopen rebuilds pending replication state from the local event log when
+  unpublished local overlay mutations still exist
 - foreign namespace/attr/symlink/xattr apply updates the local `base_*` view
 - local serving view is `overlay over base`
 - `metadata_state` is used as a bootstrap/checkpoint store, not the primary runtime sync channel
@@ -73,8 +75,12 @@ Events that stay local-only are not published as remote-visible deltas:
 - local regular-file `size` ahead of `committed_size`
 
 Operational note:
-- `sync_metadata()` is explicit "flush then pull": when local pending ops exist,
-  it triggers a flush path before pulling newer remote batches.
+- `flush_metadata()` is explicit "flush then pull".
+- `sync_metadata()` is pull-only; it does not publish local pending metadata.
+- on reopen, unpublished local events between `flushed_event_seq` and
+  `nextEventSeq` are reconstructed into pending replication state when the local
+  overlay is still live, so ordinary recovery should not require wiping local
+  metadata or running `discover`.
 
 ### Pull from PostgreSQL
 
@@ -82,8 +88,12 @@ Operational note:
 2. Decode batches in `(batch_version, client_id)` order.
 3. Apply foreign batches in order.
 4. Apply self batches only to remote-visible/base reconciliation (not as local overlay writes).
-5. Apply foreign namespace/attr/symlink/xattr state into local `base_*`.
-6. Skip auxiliary serving-view updates for events that conflict with local overlay state and continue applying later
+5. Use self batches to acknowledge already-published local event prefixes and
+   advance the local flushed watermark after restart/crash windows.
+6. Do not skip earlier foreign batches just because the client has already
+   published a newer self batch.
+7. Apply foreign namespace/attr/symlink/xattr state into local `base_*`.
+8. Skip auxiliary serving-view updates for events that conflict with local overlay state and continue applying later
    independent batches.
 
 This avoids replaying a client's own changes and avoids clobbering local staged
@@ -107,6 +117,9 @@ writes with foreign state, while still advancing the remote-visible base view.
 - remote-visible file size advances only with committed blocks
 - foreign namespace can be present in local `base_*` before local overlay stops masking it
 - stale async completions are rejected using `content_epoch` plus block identity checks
+- crash/reopen recovery should converge through ordinary restart plus
+  `sync_metadata()` / `flush_metadata()`; `discover` is bootstrap/manual repair,
+  not the expected path for normal PG replication recovery
 
 ## MetadataConfig
 

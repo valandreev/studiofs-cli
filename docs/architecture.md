@@ -38,6 +38,8 @@ studiofs (CLI)
 - bootstrap: load the latest remote-visible checkpoint from `metadata_state`
 - steady-state sync: exchange only ordered delta events through `event_log`
 - local client view: serve merged `overlay over base` from local `redb`
+- restart recovery: rebuild pending replication state from the local event-log
+  tail when unpublished local overlay mutations survived a crash
 - foreign visibility: eventual, driven by background `flush_metadata()` / `sync_metadata()`
 
 Core invariants:
@@ -45,6 +47,8 @@ Core invariants:
 - local pending incarnation data may be ahead of remote-visible committed manifest
 - remote-visible manifest switches only after full pending incarnation publish
 - local echoed PostgreSQL batches are applied only to remote-visible/base state reconciliation and do not clobber local overlay
+- ordinary restart/reopen should recover pending metadata convergence without
+  requiring local metadata wipe + `discover`
 - foreign namespace/attr/symlink/xattr apply lands in local `base_*`
 - local mutations remain in overlay tables (`inodes`, `dentries`, `symlinks`, `xattrs`)
 - local tombstones hide remote-visible base state for dentries, symlinks, and xattrs

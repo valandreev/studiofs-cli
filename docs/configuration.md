@@ -42,6 +42,10 @@ What it does:
 - stores discovered `FormatInfo` locally,
 - then normal runtime sync continues through PostgreSQL delta batches.
 
+`discover` is the bootstrap path for a new client and a manual repair tool. A
+normal client restart/reopen should recover pending PG metadata convergence
+without requiring `discover`.
+
 ### `mount`
 
 ```bash
