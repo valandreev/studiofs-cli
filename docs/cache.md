@@ -5,22 +5,22 @@ The cache subsystem (`studiofs-cache`) implements a two-level block cache design
 ## Architecture
 
 ```
-                  ┌───────────────────────────┐
+                  ┌────────────────────────────┐
                   │       BlockCache           │
                   │  (unified API + eviction)  │
                   └─────┬───────────┬──────────┘
                         │           │
-              ┌─────────▼──┐  ┌────▼──────────┐
+              ┌─────────▼──┐  ┌─────▼──────────┐
               │  L1 Memory │  │   L2 Disk      │
               │  (sharded) │  │  (file/block)  │
               └─────┬──────┘  └───────┬────────┘
                     │                 │
               ┌─────▼─────────────────▼────────┐
-              │     LRU Tracker (64 shards)     │
+              │     LRU Tracker (64 shards)    │
               └────────────────────────────────┘
                             │
               ┌─────────────▼──────────────────┐
-              │     Upload Queue (journal)      │
+              │     Upload Queue (journal)     │
               └────────────────────────────────┘
 ```
 
