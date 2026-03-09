@@ -1,8 +1,24 @@
 # StudioFS
 
-StudioFS is a cross-platform virtual filesystem that mounts S3-compatible
-object storage as a local drive, while using PostgreSQL for shared metadata
-replication between clients.
+An open-source, self-hosted virtual filesystem optimized for VFX and post-production studios. Access and edit large files instantly from the cloud or remote hosted storage. No downloads, no syncing, just pure collaboration.
+
+- **Real-time access to heavy media**
+  Work directly with proxy, 4K, and RAW footage from the cloud as if it were on a local SSD. No more waiting for downloads.
+
+- **A single source of truth**
+  Say goodbye to duplicate files, broken links, and version chaos. The entire team sees the exact same workspace, always in sync.
+
+- **Seamless NLE integration**
+  Edit collaboratively out of your existing toolkit, including DaVinci Resolve, Flame, Fusion, Nuke, After Effects, Maya, Houdini, and Blender.
+
+- **Built for performance with Rust**
+  Engineered from the ground up in Rust to guarantee memory safety, zero-overhead performance, and rock-solid stability under the heaviest multi-gigabyte editing workloads.
+
+Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-hosted**, giving you absolute control over your storage and infrastructure.
+
+## Technical Foundation
+
+StudioFS mounts S3-compatible object storage as a local cross-platform drive, using PostgreSQL for shared metadata storage and replication between clients. 
 
 It is built around a local-first runtime model:
 - foreground filesystem operations work from local state,
