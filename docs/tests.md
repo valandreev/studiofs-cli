@@ -5,8 +5,6 @@
 1. Fast local/unit tests (default).
 2. Ignored integration tests with MinIO + PostgreSQL.
 
-NATS/Tonbo suites removed.
-
 ## Prerequisites
 
 - Rust toolchain

@@ -23,10 +23,10 @@ studiofs (CLI)
 ```
 
 Key points:
-- PostgreSQL is the shared metadata backend. Legacy Tonbo/S3 metadata flow is no longer supported.
+- PostgreSQL is the shared metadata backend.
 - Local metadata lives in `redb`; PostgreSQL is used for bootstrap, checkpoints, and ordered delta replication.
 - Writes become readable locally before remote upload/metadata publish fully completes.
-- Multi-client mounts converge through PostgreSQL sync. The old NATS-based flow has been removed.
+- Multi-client mounts converge through PostgreSQL sync.
 
 ## Features
 
@@ -116,6 +116,8 @@ Useful test/runtime variables include:
 
 Project docs live in [docs/](docs/):
 
+- [docs/roadmap.md](docs/roadmap.md) - future development plans
+- [docs/examples.md](docs/examples.md) - usage variants and examples
 - [docs/architecture.md](docs/architecture.md) - current system design and data flow
 - [docs/configuration.md](docs/configuration.md) - CLI commands, flags, env vars
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow

@@ -162,8 +162,7 @@ Path layout is fixed by disk name:
 
 `--meta` is required and must point at the PostgreSQL server. StudioFS always \
 stores metadata in database `studiofs`; it will create that database during \
-`init` when the server allows it. S3-backed metadata manifests and Tonbo/NATS \
-metadata flows are no longer supported.
+`init` when the server allows it.
 
 The target S3 bucket is created automatically if it does not exist and the \
 provided credentials allow it.")]
