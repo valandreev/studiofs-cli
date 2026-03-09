@@ -90,7 +90,6 @@ studiofs mount myvolume Y:
 | `umount` | Unmount an active mountpoint |
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
-| `test` | Run storage/backend validation helpers |
 | `destroy` | Remove a volume locally or locally + remotely |
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.

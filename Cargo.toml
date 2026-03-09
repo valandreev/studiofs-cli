@@ -17,7 +17,7 @@ fuser = { path = "vendor/fuser" }
 version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0"
-repository = "https://github.com/user/studiofs"
+repository = "https://github.com/valandreev/studiofs-cli"
 
 [workspace.dependencies]
 # Async

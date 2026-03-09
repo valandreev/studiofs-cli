@@ -319,7 +319,7 @@ RUNTIME PG POLICY:
         cache_size: String,
 
         /// Maximum in-memory cache size (e.g. 1GB, 512MB, 4GB)
-        #[arg(long, default_value = "1GB")]
+        #[arg(long, default_value = "2GB")]
         memory_limit: String,
 
         /// Run in foreground (keep terminal attached)

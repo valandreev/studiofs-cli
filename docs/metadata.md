@@ -251,11 +251,11 @@ Namespace/attrs gain the same split:
 
 - `base_inodes`
   - remote-visible attrs
-- `overlay_inodes`
+- `inodes`
   - local replacements for attrs
 - `base_dentries`
   - remote-visible namespace entries
-- `overlay_dentries`
+- `dentries`
   - local namespace replacements and tombstones
 
 Symlink/xattr metadata uses the same split:
@@ -283,7 +283,7 @@ Still single-copy:
 
 ### Overlay inode
 
-`overlay_inodes[ino]` means:
+`inodes[ino]` means:
 
 - this inode has a local attr replacement
 - reads must return overlay attr instead of base attr
@@ -296,7 +296,7 @@ removes the last visible reference.
 
 ### Overlay dentry
 
-`overlay_dentries[(parent, name)]` stores one of:
+`dentries[(parent, name)]` stores one of:
 
 - `Present(DirEntryValue)`
   - local name resolves to this entry
@@ -315,7 +315,7 @@ This is enough for:
 
 ### `getattr(ino)`
 
-1. If `overlay_inodes[ino]` exists, return it.
+1. If `inodes[ino]` exists, return it.
 2. Else if `base_inodes[ino]` exists, return it.
 3. Else `InodeNotFound`.
 
@@ -328,7 +328,7 @@ For regular files:
 
 ### `lookup(parent, name)`
 
-1. Check `overlay_dentries[(parent, name)]`.
+1. Check `dentries[(parent, name)]`.
 2. If it is `Tombstone`, return `EntryNotFound`.
 3. If it is `Present(entry)`, return that entry.
 4. Else fall back to `base_dentries[(parent, name)]`.
@@ -338,7 +338,7 @@ For regular files:
 Build the merged directory view as:
 
 1. Start from all `base_dentries` for `parent`.
-2. Apply every `overlay_dentries` entry for `parent`.
+2. Apply every `dentries` entry for `parent`.
 3. `Tombstone` removes the name from the result.
 4. `Present(entry)` inserts or replaces the name in the result.
 
@@ -367,14 +367,14 @@ local `xattrs`.
 
 - Validate parent via merged `getattr`.
 - Fail if merged `lookup(parent, name)` already exists.
-- Write new attr to `overlay_inodes`.
-- Write `Present(entry)` to `overlay_dentries`.
+- Write new attr to `inodes`.
+- Write `Present(entry)` to `dentries`.
 
 ### `unlink`
 
 - Resolve victim via merged `lookup`.
-- Write `Tombstone` for `(parent, name)` into `overlay_dentries`.
-- Update victim attr in `overlay_inodes` if `nlink` stays non-zero.
+- Write `Tombstone` for `(parent, name)` into `dentries`.
+- Update victim attr in `inodes` if `nlink` stays non-zero.
 - If local view drops final link, remove local block state and local overlay attr.
 - Remote-visible removal is published later through PG flush.
 
@@ -389,13 +389,13 @@ Destination side:
 
 - if destination exists in merged view, treat it as overwritten
 - write `Present(src_entry)` at destination name
-- update moved inode attr in `overlay_inodes` when parent changes
-- update overwritten inode attr in `overlay_inodes` if `nlink` drops but inode
+- update moved inode attr in `inodes` when parent changes
+- update overwritten inode attr in `inodes` if `nlink` drops but inode
   survives locally
 
 ### `truncate` / `setattr(size)`
 
-- update attr only in `overlay_inodes`
+- update attr only in `inodes`
 - modify local-serving `file_blocks`
 - leave `base_inodes.committed_size` and committed blocks untouched until upload
   completion and PG flush publish remote-visible state

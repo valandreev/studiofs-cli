@@ -2,8 +2,6 @@
 
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
-This behavior is frozen by
-[`file-visibility-and-incarnation-model.md`](./refactor/file-visibility-and-incarnation-model.md):
 
 - `flush()`/`close()` and local WAL accept guarantee immediate read-after-write for
   the same mounted client.
@@ -29,7 +27,7 @@ Holds all runtime state:
 |-------|---------|-------------|
 | `meta_path` | — | Path to redb database |
 | `cache_dir` | — | Root for block cache + journals |
-| `cache_size` | 50 GiB | L2 disk cache budget |
+| `cache_size` | 100 GiB | L2 disk cache budget |
 | `memory_limit` | 2 GiB | L1 memory cache budget |
 | `block_size` | 8 MiB | Block size (from format info) |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
@@ -198,8 +196,6 @@ Per-inode sequential read detection with adaptive prefetch depth.
 
 Runtime tuning knobs:
 - `STUDIOFS_READ_BUFFER_MB` (default `2048`) - high-level read buffer budget; drives fetch AIMD max window
-- `STUDIOFS_MAX_READAHEAD_MB` (default `512`) - high-level sequential readahead budget
-- `STUDIOFS_PREFETCH` (default `2`) - high-level prefetch pressure knob
 - `STUDIOFS_READAHEAD_WIDTH` (default `128` blocks)
 - `STUDIOFS_READAHEAD_MIN_PREFETCH` (default `16` blocks)
 - `STUDIOFS_READAHEAD_SEQ_STEP` (default `4`)
@@ -208,7 +204,6 @@ Runtime tuning knobs:
 - `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `max(32, prefetch_concurrency / 2)`, keeps fetch headroom for direct reads)
 - `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `96`)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `250`, temporarily pauses prefetch after transport send errors)
-- `STUDIOFS_FETCH_PREFETCH_RESERVE` (default equals foreground reserve; prefetch cannot consume these slots)
 - `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
 - `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
@@ -267,7 +262,7 @@ All file/directory names are validated:
 - Non-empty, max 255 bytes
 - No `/` character
 - Not `.` or `..`
-- No Windows-invalid characters: `<`, `>`, `:`, `"`, `|`, `?`, `*`, control chars 0x00–0x1F
+- No Windows-invalid characters: `<`, `>`, `:`, `"`, `|`, `?`, `*`, `\`, control chars 0x00–0x1F
 
 ## StatFs
 

@@ -41,8 +41,8 @@ mod checkpoint {
 /// Default L1 (RAM) size: 2 GiB.
 pub const DEFAULT_L1_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Default L2 (NVMe) size: 50 GiB.
-pub const DEFAULT_L2_SIZE: u64 = 50 * 1024 * 1024 * 1024;
+/// Default L2 (NVMe) size: 100 GiB.
+pub const DEFAULT_L2_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 
 /// Default free-disk-space ratio threshold for emergency eviction.
 pub const DEFAULT_DISK_FREE_RATIO: f64 = 0.10;

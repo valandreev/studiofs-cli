@@ -111,7 +111,7 @@ Unified API combining all components above.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `l1_size` | 2 GiB | Maximum L1 memory |
-| `l2_size` | 50 GiB | Maximum L2 disk |
+| `l2_size` | 100 GiB | Maximum L2 disk |
 | `cache_dir` | — | Root directory for L2 + journals |
 | `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
 

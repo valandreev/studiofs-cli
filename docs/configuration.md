@@ -52,7 +52,7 @@ studiofs mount <name> <mount-point> \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
-  [--foreground]
+  [--detach | -d]
 ```
 
 Notes:
@@ -132,6 +132,16 @@ studiofs mount projectfs Y:
 | `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-attempt upload timeout |
 | `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base backoff |
 | `STUDIOFS_UPLOAD_RETRY_MAX_MS` | `5000` | Upload retry max backoff |
+| `STUDIOFS_UPLOAD_DELAY_MS` | `2000` | Delay uploads for overwrite/delete coalescing |
+| `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
+| `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
+| `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `10` | Upload metrics log interval |
+| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval |
+| `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots |
+| `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Penalty multiplied by client wait penalty |
+| `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
+| `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Shutdown upload drain max wait |
+| `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
 ### Testing
 

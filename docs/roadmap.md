@@ -1,13 +1,13 @@
 # Roadmap
 
-Текущие планы по развитию проекта:
+Current plans for project development:
 
-- Оптимизация скорости работы и отзывчивости клиента
-- Оптимизация скорости работы с s3 хранилищем
-- Шифрование данных
-- Отдельный hub-service для управления дисками
-- Пользователи и базовые пермишены
-- Warmup/pin файлов и директорий в локальном кеше
-- Автоматический бекап метаданных
-- Кроссплатформенные ссылки для файлов и директорий
-- Снепшоты
+- Optimization of client speed and responsiveness
+- Optimization of S3 storage upload speed in WAN environments
+- Data encryption
+- Separate hub-service for volume management
+- Users and basic permissions
+- Warmup/pin files and directories in local cache
+- Automatic metadata backup
+- Cross-platform links for files and directories
+- Snapshots

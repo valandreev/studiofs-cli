@@ -1,8 +1,8 @@
-# Примеры использования (Examples)
+# Usage Examples
 
-## 1. Создание нового виртуального диска (Инициализация)
+## 1. Create a New Virtual Volume (Init)
 
-Инициализация диска с использованием локального MinIO и PostgreSQL для метаданных:
+Initialize a volume using a local MinIO and PostgreSQL for metadata:
 
 ```bash
 studiofs init myvolume \
@@ -13,61 +13,61 @@ studiofs init myvolume \
   --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ```
 
-## 2. Подключение (Mount) диска
+## 2. Mount a Volume
 
-### На ОС Windows
+### On Windows
 
-Подключить как диск Z:
+Mount as drive Z:
 
 ```bash
 studiofs mount myvolume Z:
 ```
 
-### На Linux / macOS
+### On Linux / macOS
 
-Подключить в локальную директорию:
+Mount to a local directory:
 
 ```bash
 mkdir -p /mnt/studio
 studiofs mount myvolume /mnt/studio
 ```
 
-## 3. Фоновый режим (Daemon Mode)
+## 3. Daemon Mode (Background)
 
-Подключить диск в фоновом режиме (терминал не будет заблокирован):
+Mount a volume in the background (terminal will not be blocked):
 
 ```bash
 studiofs mount myvolume Z: -d
 ```
 
-Для отключения диска в фоновом режиме:
+To unmount a volume running in the background:
 
 ```bash
 studiofs umount Z:
 ```
 
-## 4. Подключение существующего диска на новом клиенте (Discover)
+## 4. Mount an Existing Volume on a New Client (Discover)
 
-Если диск уже был проинициализирован на другом компьютере, вам не нужно вызывать `init`. Достаточно получить последние метаданные:
+If a volume has already been initialized on another machine, you do not need to call `init`. You only need to retrieve the latest metadata:
 
 ```bash
 studiofs discover myvolume \
   --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ```
-После этого диск можно монтировать:
+After that, you can mount the volume:
 ```bash
 studiofs mount myvolume Y:
 ```
 
-## 5. Очистка старых объектов (Janitor)
+## 5. Clean Up Old Objects (Janitor)
 
-Посмотреть, какие объекты больше не используются (dry-run):
+See which objects are no longer used (dry-run):
 
 ```bash
 studiofs janitor myvolume --dry-run
 ```
 
-Запуск реальной очистки (удалить до 500 старых объектов):
+Run actual cleanup (delete up to 500 old objects):
 
 ```bash
 studiofs janitor myvolume --max-deletes 500
