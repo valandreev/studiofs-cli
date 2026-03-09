@@ -17,18 +17,18 @@ StudioFS is designed for serverless and distributed deployments where multiple c
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    studiofs (CLI)                    │
+│                    studiofs (CLI)                   │
 ├────────────────────┬────────────────────────────────┤
 │   studiofs-winfsp  │  studiofs-fuse                 │
 │   (Windows)        │  (Linux / macOS)               │
 ├────────────────────┴────────────────────────────────┤
-│                   studiofs-vfs                       │
+│                   studiofs-vfs                      │
 │        read/write paths · readahead · AIMD          │
 ├──────────┬──────────────────┬───────────────────────┤
-│ studiofs │   studiofs-data  │    studiofs-cache      │
-│   -meta  │   (S3 I/O)      │  L1 RAM · L2 NVMe     │
-│  redb +  │  OpenDAL + LZ4  │  LRU · upload queue   │
-│  Tonbo   │                  │                        │
+│ studiofs │   studiofs-data  │    studiofs-cache     │
+│   -meta  │    (S3 I/O)      │  L1 RAM · L2 NVMe     │
+│  redb +  │   OpenDAL + LZ4  │  LRU · upload queue   │
+│  Tonbo   │                  │                       │
 └──────────┴──────────────────┴───────────────────────┘
 ```
 
