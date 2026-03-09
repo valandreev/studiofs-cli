@@ -201,16 +201,13 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
-        match self
-            .vfs
-            .mkdir(
-                parent,
-                &name_bytes,
-                req.uid(),
-                req.gid(),
-                normalize_unix_mode(mode),
-            )
-        {
+        match self.vfs.mkdir(
+            parent,
+            &name_bytes,
+            req.uid(),
+            req.gid(),
+            normalize_unix_mode(mode),
+        ) {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
@@ -243,16 +240,13 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
-        match self
-            .vfs
-            .create(
-                parent,
-                &name_bytes,
-                req.uid(),
-                req.gid(),
-                normalize_unix_mode(mode),
-            )
-        {
+        match self.vfs.create(
+            parent,
+            &name_bytes,
+            req.uid(),
+            req.gid(),
+            normalize_unix_mode(mode),
+        ) {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
@@ -276,16 +270,13 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyCreate,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
-        match self
-            .vfs
-            .create(
-                parent,
-                &name_bytes,
-                req.uid(),
-                req.gid(),
-                normalize_unix_mode(mode),
-            )
-        {
+        match self.vfs.create(
+            parent,
+            &name_bytes,
+            req.uid(),
+            req.gid(),
+            normalize_unix_mode(mode),
+        ) {
             Ok(attr) => {
                 // Open a handle for the newly created file
                 let (open_flags, _trunc) = posix_flags_to_open_flags(flags);
@@ -807,7 +798,8 @@ impl Filesystem for StudioFuseFs {
     fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
         match self.vfs.getattr(ino) {
             Ok(attr) => {
-                let crtime = UNIX_EPOCH + Duration::from_nanos(attr.effective_crtime().max(0) as u64);
+                let crtime =
+                    UNIX_EPOCH + Duration::from_nanos(attr.effective_crtime().max(0) as u64);
                 let bkuptime = UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64);
                 reply.xtimes(bkuptime, crtime);
             }
@@ -1094,13 +1086,17 @@ impl FuseKernelInvalidator {
     }
 }
 
+fn should_log_fuse_invalidation_error(err: &std::io::Error) -> bool {
+    err.kind() != std::io::ErrorKind::NotFound
+}
+
 impl KernelInvalidator for FuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
         // offset=0, len=-1 invalidates the entire inode (attributes + all
         // cached page data / directory listing).
         if let Err(e) = self.notifier.inval_inode(ino, 0, -1) {
             // ENOENT is harmless (kernel already evicted the entry).
-            if e.kind() != std::io::ErrorKind::NotFound {
+            if should_log_fuse_invalidation_error(&e) {
                 warn!(ino, error = %e, "FUSE notify_inval_inode failed");
             }
         }
@@ -1109,7 +1105,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_unix_mode;
+    use super::{normalize_unix_mode, should_log_fuse_invalidation_error};
 
     #[cfg(target_os = "macos")]
     use super::{is_kernel_managed_macos_xattr, merge_xattr_write};
@@ -1119,6 +1115,15 @@ mod tests {
         assert_eq!(normalize_unix_mode(0o40755), 0o755);
         assert_eq!(normalize_unix_mode(0o100644), 0o644);
         assert_eq!(normalize_unix_mode(0o100644 | 0o4000), 0o4644);
+    }
+
+    #[test]
+    fn fuse_invalidation_not_found_is_benign() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert!(!should_log_fuse_invalidation_error(&not_found));
+        assert!(should_log_fuse_invalidation_error(&other));
     }
 
     #[cfg(target_os = "macos")]

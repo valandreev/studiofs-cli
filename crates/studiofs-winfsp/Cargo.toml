@@ -14,6 +14,9 @@ tracing.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 winfsp = { version = "0.12", features = ["windows-62", "notify"] }
 winfsp-sys = "0.12"

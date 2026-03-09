@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-static NEXT_PG_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
+const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
+const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
+const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
@@ -29,6 +31,7 @@ pub struct PgMetaEngine {
     volume_id: i64,
     client_id: String,
     local_version: AtomicI64,
+    flushed_event_seq: AtomicU64,
     replication_lock: Mutex<()>,
     poll_interval: Duration,
     flush_interval: Duration,
@@ -58,6 +61,7 @@ struct ClaimedPendingBatch {
     event_end: u64,
 }
 
+#[derive(Clone, Default)]
 struct OverlayConflictSets {
     block_inodes: HashSet<Ino>,
     attr_inodes: HashSet<Ino>,
@@ -67,7 +71,20 @@ struct OverlayConflictSets {
     xattr_keys: HashSet<Vec<u8>>,
 }
 
+struct RecentFlush {
+    batch_version: i64,
+    overlay: OverlayConflictSets,
+}
+
 impl PgMetaEngine {
+    fn format_pg_error(e: tokio_postgres::Error) -> String {
+        if let Some(db) = e.as_db_error() {
+            format!("{} (sqlstate={})", db.message(), db.code().code())
+        } else {
+            e.to_string()
+        }
+    }
+
     fn load_persisted_local_version(local: &RedbMetaEngine) -> MetaResult<i64> {
         let version = local.get_counter(LOCAL_PG_VERSION_COUNTER)?;
         Ok(version.min(i64::MAX as u64) as i64)
@@ -81,6 +98,34 @@ impl PgMetaEngine {
             .set_counter(LOCAL_PG_VERSION_COUNTER, version as u64)?;
         self.local_version.store(version, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn load_persisted_flushed_event_seq(local: &RedbMetaEngine) -> MetaResult<u64> {
+        local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+    }
+
+    fn persist_flushed_event_seq(&self, seq: u64) -> MetaResult<()> {
+        self.local
+            .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, seq)?;
+        self.flushed_event_seq.store(seq, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn load_persisted_client_slot(local: &RedbMetaEngine) -> MetaResult<Option<u64>> {
+        let stored = local.get_counter(LOCAL_PG_CLIENT_SLOT_COUNTER)?;
+        if stored == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(stored - 1))
+        }
+    }
+
+    fn persist_client_slot(local: &RedbMetaEngine, slot: u64) -> MetaResult<()> {
+        local.set_counter(
+            LOCAL_PG_CLIENT_SLOT_COUNTER,
+            slot.checked_add(1)
+                .ok_or_else(|| MetaError::Storage("pg client slot overflow".to_string()))?,
+        )
     }
 
     fn has_any_local_overlay_mutation(local: &RedbMetaEngine) -> MetaResult<bool> {
@@ -107,6 +152,113 @@ impl PgMetaEngine {
     fn reserve_counter_range_base(slot: u64, stride: u64, min_value: u64) -> u64 {
         let base = slot.saturating_mul(stride);
         base.max(min_value)
+    }
+
+    fn run_async_once<T, F>(fut: F) -> MetaResult<T>
+    where
+        F: std::future::Future<Output = MetaResult<T>>,
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
+        rt.block_on(fut)
+    }
+
+    fn reserve_global_client_slot(postgres_url: &str, volume_id: i64) -> MetaResult<u64> {
+        let postgres_url = postgres_url.to_string();
+        Self::run_async_once(async move {
+            let (mut client, connection) =
+                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres connect failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let tx = client.transaction().await.map_err(|e| {
+                MetaError::Storage(format!("postgres tx failed: {}", Self::format_pg_error(e)))
+            })?;
+            tx.batch_execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS counters (
+                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    value BIGINT NOT NULL,
+                    PRIMARY KEY (vol, name)
+                )
+                "#,
+            )
+            .await
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres counters ensure failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?;
+            tx.execute(
+                r#"
+                INSERT INTO counters (vol, name, value)
+                VALUES ($1, $2, 0)
+                ON CONFLICT (vol, name) DO NOTHING
+                "#,
+                &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
+            )
+            .await
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres slot seed failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?;
+            let row = tx
+                .query_one(
+                    r#"
+                    UPDATE counters
+                    SET value = value + 1
+                    WHERE vol = $1 AND name = $2
+                    RETURNING value - 1
+                    "#,
+                    &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
+                )
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!(
+                        "postgres slot reserve failed: {}",
+                        Self::format_pg_error(e)
+                    ))
+                })?;
+            tx.commit().await.map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres slot commit failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?;
+            conn_task.abort();
+
+            let slot: i64 = row.get(0);
+            u64::try_from(slot)
+                .map_err(|_| MetaError::Storage(format!("invalid negative pg client slot: {slot}")))
+        })
+    }
+
+    fn ensure_client_slot(
+        local: &RedbMetaEngine,
+        postgres_url: &str,
+        volume_id: i64,
+    ) -> MetaResult<u64> {
+        if let Some(slot) = Self::load_persisted_client_slot(local)? {
+            return Ok(slot);
+        }
+        let slot = Self::reserve_global_client_slot(postgres_url, volume_id)?;
+        Self::persist_client_slot(local, slot)?;
+        Ok(slot)
     }
 
     fn prime_local_id_ranges(&self, slot: u64) -> MetaResult<()> {
@@ -170,14 +322,22 @@ impl PgMetaEngine {
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
 
+        let client_slot = Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?;
         let restored_local_version = Self::load_persisted_local_version(&local)?;
-        let client_slot = NEXT_PG_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+        let restored_flushed_event_seq = Self::load_persisted_flushed_event_seq(&local)?;
+        let restored_flushed_event_seq =
+            if restored_flushed_event_seq == 0 && !Self::has_any_local_overlay_mutation(&local)? {
+                local.get_counter("nextEventSeq")?
+            } else {
+                restored_flushed_event_seq
+            };
         let engine = Arc::new(Self {
             local,
             postgres_url: pg.url,
             volume_id: pg.volume_id,
-            client_id: format!("pid:{}:{client_slot}", std::process::id()),
+            client_id: format!("client-slot:{client_slot}"),
             local_version: AtomicI64::new(restored_local_version),
+            flushed_event_seq: AtomicU64::new(restored_flushed_event_seq),
             replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(poll_secs),
             flush_interval,
@@ -193,6 +353,7 @@ impl PgMetaEngine {
             let _ = engine.pull_snapshot_locked();
         }
         let _ = engine.sync_metadata();
+        let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
         Self::start_background_poll(Arc::downgrade(&engine), engine.poll_interval);
         Ok(engine)
@@ -272,19 +433,28 @@ impl PgMetaEngine {
         &self,
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
+        removed_inodes: &HashSet<Ino>,
     ) -> MetaResult<bool> {
         let conflict = match event {
             MetaEvent::RemoveAttr { ino } => {
+                if removed_inodes.contains(ino) {
+                    return Ok(false);
+                }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
             MetaEvent::SetFileBlock { .. } => false,
-            MetaEvent::RemoveFileBlock { ino, .. }
-            | MetaEvent::RemoveFileBlocks { ino }
-            | MetaEvent::CommitFileBlock { ino, .. }
-            | MetaEvent::PublishFileManifest { ino, .. } => overlay.block_inodes.contains(ino),
+            MetaEvent::RemoveFileBlock { ino, .. } | MetaEvent::RemoveFileBlocks { ino } => {
+                if removed_inodes.contains(ino) {
+                    return Ok(false);
+                }
+                overlay.block_inodes.contains(ino)
+            }
+            MetaEvent::CommitFileBlock { ino, .. } | MetaEvent::PublishFileManifest { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+            }
             MetaEvent::SetSymlinkTarget { ino, .. } => {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -343,26 +513,138 @@ impl PgMetaEngine {
         key
     }
 
+    fn removed_inodes_for_batch(&self, batch_events: &[MetaEvent]) -> HashSet<Ino> {
+        let mut removed = HashSet::new();
+        for event in batch_events {
+            if let MetaEvent::RemoveEntry { parent, name } = event
+                && let Ok(entry) = self.local.lookup(*parent, name)
+            {
+                removed.insert(entry.ino);
+            }
+        }
+        removed
+    }
+
+    fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
+        let mut overlay = OverlayConflictSets::default();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr } => {
+                    overlay.attr_inodes.insert(attr.ino);
+                }
+                MetaEvent::RemoveAttr { ino } => {
+                    overlay.attr_inodes.insert(*ino);
+                    overlay.block_inodes.insert(*ino);
+                    overlay.symlink_inodes.insert(*ino);
+                    overlay.xattr_inodes.insert(*ino);
+                }
+                MetaEvent::AddEntry { parent, name, .. }
+                | MetaEvent::RemoveEntry { parent, name } => {
+                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
+                }
+                MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                } => {
+                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
+                    overlay
+                        .dentry_keys
+                        .insert(Self::dentry_key(*new_parent, new_name));
+                    overlay.attr_inodes.insert(entry.ino);
+                    if let Some(attr) = displaced_set_attr {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        overlay.attr_inodes.insert(*ino);
+                    }
+                    if let Some(attr) = moved_dir_attr {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                    if let Some(attr) = old_parent_attr {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                    if let Some(attr) = new_parent_attr {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                }
+                MetaEvent::SetFileBlock { ino, .. }
+                | MetaEvent::RemoveFileBlock { ino, .. }
+                | MetaEvent::RemoveFileBlocks { ino }
+                | MetaEvent::CommitFileBlock { ino, .. }
+                | MetaEvent::PublishFileManifest { ino, .. } => {
+                    overlay.block_inodes.insert(*ino);
+                }
+                MetaEvent::SetFileBlocksBatch { blocks } => {
+                    for (ino, _, _) in blocks {
+                        overlay.block_inodes.insert(*ino);
+                    }
+                }
+                MetaEvent::SetSymlinkTarget { ino, .. } => {
+                    overlay.symlink_inodes.insert(*ino);
+                    overlay.attr_inodes.insert(*ino);
+                }
+                MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                    overlay.xattr_inodes.insert(*ino);
+                    overlay.xattr_keys.insert(Self::xattr_key(*ino, name));
+                }
+                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+            }
+        }
+        overlay
+    }
+
+    fn merge_overlay_conflicts(
+        base: &OverlayConflictSets,
+        extra: &OverlayConflictSets,
+    ) -> OverlayConflictSets {
+        let mut merged = base.clone();
+        merged
+            .block_inodes
+            .extend(extra.block_inodes.iter().copied());
+        merged.attr_inodes.extend(extra.attr_inodes.iter().copied());
+        merged.dentry_keys.extend(extra.dentry_keys.iter().cloned());
+        merged
+            .symlink_inodes
+            .extend(extra.symlink_inodes.iter().copied());
+        merged
+            .xattr_inodes
+            .extend(extra.xattr_inodes.iter().copied());
+        merged.xattr_keys.extend(extra.xattr_keys.iter().cloned());
+        merged
+    }
+
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
-        Ok(OverlayConflictSets {
-            block_inodes: self.local.local_overlay_inodes()?,
-            attr_inodes: self.local.local_overlay_attr_inodes()?,
-            dentry_keys: self.local.local_overlay_dentries()?,
-            symlink_inodes: self.local.local_overlay_symlink_inodes()?,
-            xattr_inodes: self.local.local_overlay_xattr_inodes()?,
-            xattr_keys: self.local.local_overlay_xattr_keys()?,
-        })
+        let start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let end = self.local.get_counter("nextEventSeq")?;
+        if end <= start {
+            return Ok(OverlayConflictSets::default());
+        }
+
+        let events = self.local.read_events_range(start, end)?;
+        Ok(Self::overlay_conflicts_for_events(&events))
     }
 
     fn serving_event_conflicts_with_overlay(
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
+        removed_inodes: &HashSet<Ino>,
     ) -> bool {
         match event {
             MetaEvent::SetAttr { attr } => {
                 overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
             }
             MetaEvent::RemoveAttr { ino } => {
+                if removed_inodes.contains(ino) {
+                    return false;
+                }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
                     || overlay.symlink_inodes.contains(ino)
@@ -428,10 +710,13 @@ impl PgMetaEngine {
         batch_events: &[MetaEvent],
         overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
+        let removed_inodes = self.removed_inodes_for_batch(batch_events);
         self.local.apply_replica_events_to_base(batch_events)?;
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
-            .filter(|event| !Self::serving_event_conflicts_with_overlay(event, overlay))
+            .filter(|event| {
+                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
+            })
             .cloned()
             .collect();
         self.local.apply_replica_serving_state(&serving_events)?;
@@ -440,7 +725,7 @@ impl PgMetaEngine {
             if !Self::event_has_aux_apply_effect(event) {
                 continue;
             }
-            if !self.aux_event_conflicts_with_overlay(event, overlay)? {
+            if !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)? {
                 aux_events.push(event.clone());
             }
         }
@@ -489,6 +774,39 @@ impl PgMetaEngine {
 
         self.local.apply_replica_aux_state(&aux_events)?;
         Ok(true)
+    }
+
+    fn acknowledge_local_prefix_from_self_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<()> {
+        if batch_events.is_empty() {
+            return Ok(());
+        }
+
+        let start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let end = self.local.get_counter("nextEventSeq")?;
+        if end <= start {
+            return Ok(());
+        }
+
+        let local_events = self.local.read_events_range(start, end)?;
+        if local_events.len() < batch_events.len() {
+            return Ok(());
+        }
+
+        let matches_prefix = local_events
+            .iter()
+            .zip(batch_events.iter())
+            .take(batch_events.len())
+            .all(|(local, remote)| {
+                Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
+            });
+        if matches_prefix {
+            let next_seq = start.max(1).saturating_add(batch_events.len() as u64);
+            self.persist_flushed_event_seq(next_seq)?;
+        }
+        Ok(())
     }
 
     fn pull_snapshot_locked(&self) -> MetaResult<bool> {
@@ -692,7 +1010,7 @@ impl PgMetaEngine {
         })
     }
 
-    fn pull_foreign_events_locked(&self) -> MetaResult<bool> {
+    fn pull_foreign_events_locked(&self, recent_flush: Option<&RecentFlush>) -> MetaResult<bool> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
@@ -730,7 +1048,7 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
-        let overlay = self.local_overlay_conflicts()?;
+        let mut overlay = self.local_overlay_conflicts()?;
         let mut applied_any = false;
         let mut max_version = last_seq;
         let mut idx = 0;
@@ -741,10 +1059,21 @@ impl PgMetaEngine {
 
             if is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch_events)?;
+                self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
             } else {
-                applied_any |= self.apply_foreign_batch(&batch_events, &overlay)?;
+                let effective_overlay = if let Some(recent_flush) = recent_flush {
+                    if batch_version < recent_flush.batch_version {
+                        Self::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
+                    } else {
+                        overlay.clone()
+                    }
+                } else {
+                    overlay.clone()
+                };
+                applied_any |= self.apply_foreign_batch(&batch_events, &effective_overlay)?;
             }
             max_version = batch_version;
+            overlay = self.local_overlay_conflicts()?;
         }
         self.persist_local_version(max_version)?;
         Ok(applied_any)
@@ -752,6 +1081,38 @@ impl PgMetaEngine {
 
     fn clear_pending_state(state: &mut PendingReplicationState) {
         *state = PendingReplicationState::default();
+    }
+
+    fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
+        if !Self::has_any_local_overlay_mutation(&self.local)? {
+            let mut state = self
+                .pending_state
+                .lock()
+                .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+            Self::clear_pending_state(&mut state);
+            return Ok(());
+        }
+
+        let event_start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let event_end = self.local.get_counter("nextEventSeq")?;
+        let mut state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        if event_end <= event_start {
+            Self::clear_pending_state(&mut state);
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let pending_events = event_end.saturating_sub(event_start);
+        state.ops = u32::try_from(pending_events).unwrap_or(u32::MAX);
+        state.force_flush = true;
+        state.event_start = Some(event_start);
+        state.event_end = event_end;
+        state.started_at = Some(now);
+        state.last_mutation_at = Some(now);
+        Ok(())
     }
 
     fn mark_pending_after_mutation(&self, before_seq: u64, after_seq: u64) {
@@ -854,32 +1215,46 @@ impl PgMetaEngine {
         }
     }
 
-    fn flush_pending_claimed_batch(&self, batch: ClaimedPendingBatch) -> MetaResult<()> {
+    fn flush_pending_claimed_batch(
+        &self,
+        batch: ClaimedPendingBatch,
+    ) -> MetaResult<Option<RecentFlush>> {
         let events = self
             .local
             .read_events_range(batch.event_start, batch.event_end)?;
         if events.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let version = self.push_event_log_batch_locked(&events)?;
-        self.persist_local_version(version)?;
-        Ok(())
+        let batch_version = self.push_event_log_batch_locked(&events)?;
+        // Do not advance `local_version` here. The writer may have published a
+        // newer batch_version while still missing earlier foreign batches.
+        // `pull_foreign_events_locked()` must remain able to read the full gap.
+        self.apply_visible_self_batch(&events)?;
+        self.persist_flushed_event_seq(batch.event_end)?;
+        Ok(Some(RecentFlush {
+            batch_version,
+            overlay: Self::overlay_conflicts_for_events(&events),
+        }))
     }
 
     fn flush_pending_claimed_batch_with_restore(
         &self,
         batch: ClaimedPendingBatch,
-    ) -> MetaResult<()> {
-        if let Err(err) = self.flush_pending_claimed_batch(batch) {
-            self.restore_pending_batch(batch);
-            return Err(err);
+    ) -> MetaResult<Option<RecentFlush>> {
+        match self.flush_pending_claimed_batch(batch) {
+            Ok(recent_flush) => {
+                self.inflight_replication_ops
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        Some(current.saturating_sub(batch.ops))
+                    })
+                    .ok();
+                Ok(recent_flush)
+            }
+            Err(err) => {
+                self.restore_pending_batch(batch);
+                Err(err)
+            }
         }
-        self.inflight_replication_ops
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(current.saturating_sub(batch.ops))
-            })
-            .ok();
-        Ok(())
     }
 
     fn flush_due_pending(&self) -> MetaResult<()> {
@@ -890,7 +1265,9 @@ impl PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        self.flush_pending_claimed_batch_with_restore(batch)
+        let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
+        let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
+        Ok(())
     }
 
     fn mutate<T, F>(&self, f: F) -> MetaResult<T>
@@ -911,10 +1288,12 @@ impl MetaEngine for PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        if let Some(batch) = self.claim_pending_batch(true) {
-            self.flush_pending_claimed_batch_with_restore(batch)?;
-        }
-        let _ = self.pull_foreign_events_locked()?;
+        let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
+            self.flush_pending_claimed_batch_with_restore(batch)?
+        } else {
+            None
+        };
+        let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
         Ok(())
     }
@@ -928,7 +1307,7 @@ impl MetaEngine for PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let _ = self.pull_foreign_events_locked()?;
+        let _ = self.pull_foreign_events_locked(None)?;
         Ok(())
     }
 
@@ -1227,6 +1606,20 @@ mod tests {
         })
     }
 
+    fn reopen_pg_engine_with_retry(path: &std::path::Path) -> Arc<PgMetaEngine> {
+        let mut reopened = None;
+        assert!(wait_until(Duration::from_secs(3), || {
+            match PgMetaEngine::open(path) {
+                Ok(engine) => {
+                    reopened = Some(engine);
+                    true
+                }
+                Err(_) => false,
+            }
+        }));
+        reopened.expect("reopen pg engine")
+    }
+
     struct PgTestVolume {
         dsn: String,
         name: String,
@@ -1287,6 +1680,33 @@ mod tests {
         seed.init_root(0, 0).expect("init root");
     }
 
+    struct TestEnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, previous);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        TestEnvGuard { key, previous }
+    }
+
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -1301,6 +1721,7 @@ mod tests {
         let path = dir.path().join("meta.redb");
         let local = Arc::new(RedbMetaEngine::open(&path).expect("open local redb"));
         local.init_root(0, 0).expect("init root");
+        let flushed_event_seq = local.get_counter("nextEventSeq").expect("nextEventSeq");
 
         let engine = PgMetaEngine {
             local,
@@ -1308,6 +1729,7 @@ mod tests {
             volume_id: 1,
             client_id: "unit-test".to_string(),
             local_version: AtomicI64::new(0),
+            flushed_event_seq: AtomicU64::new(flushed_event_seq),
             replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(60),
             flush_interval: Duration::from_secs(60),
@@ -1500,6 +1922,7 @@ mod tests {
                     flags: 0,
                 },
                 &overlay,
+                &HashSet::new(),
             )
             .expect("xattr conflict")
         );
@@ -1510,6 +1933,7 @@ mod tests {
                     target: b"target-c".to_vec(),
                 },
                 &overlay,
+                &HashSet::new(),
             )
             .expect("symlink conflict")
         );
@@ -1560,6 +1984,40 @@ mod tests {
     }
 
     #[test]
+    fn persisted_pg_client_slot_roundtrips_in_local_counter() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        assert_eq!(
+            PgMetaEngine::load_persisted_client_slot(&pg.local).expect("initial client slot"),
+            None
+        );
+        PgMetaEngine::persist_client_slot(&pg.local, 7).expect("persist client slot");
+        assert_eq!(
+            PgMetaEngine::load_persisted_client_slot(&pg.local).expect("reload client slot"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn persisted_pg_flushed_event_seq_roundtrips_in_local_counter() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        assert_eq!(
+            PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+                .expect("initial flushed event seq"),
+            0
+        );
+        pg.persist_flushed_event_seq(19)
+            .expect("persist flushed event seq");
+        assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), 19);
+        assert_eq!(
+            PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+                .expect("reload flushed event seq"),
+            19
+        );
+    }
+
+    #[test]
     fn replication_backlog_reports_pending_and_inflight_ops() {
         let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -1597,6 +2055,35 @@ mod tests {
         let restored = pg.replication_backlog();
         assert_eq!(restored.pending_ops, 4);
         assert_eq!(restored.inflight_ops, 0);
+    }
+
+    #[test]
+    fn restore_pending_state_from_local_log_rebuilds_unpublished_range() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let start = pg.local.get_counter("nextEventSeq").expect("baseline seq");
+
+        pg.local
+            .create_dir(ROOT_INO, b"draft", 0, 0, 0o755)
+            .expect("create draft dir");
+        pg.local
+            .create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+            .expect("create draft file");
+
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            *state = PendingReplicationState::default();
+        }
+
+        pg.restore_pending_state_from_local_log()
+            .expect("restore pending state");
+
+        let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+        let backlog = pg.replication_backlog();
+        assert_eq!(backlog.pending_ops, (end - start) as u32);
+        let state = pg.pending_state.lock().expect("pending_state");
+        assert!(state.force_flush);
+        assert_eq!(state.event_start, Some(start));
+        assert_eq!(state.event_end, end);
     }
 
     #[test]
@@ -1647,6 +2134,68 @@ mod tests {
             .unwrap_or(false)
         });
         assert!(ok, "expected metadata_state version >= 1");
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_clients_reserve_disjoint_local_id_ranges() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-client-slots");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let a_slot = PgMetaEngine::load_persisted_client_slot(&a.local)
+            .expect("read a slot")
+            .expect("a slot");
+        let b_slot = PgMetaEngine::load_persisted_client_slot(&b.local)
+            .expect("read b slot")
+            .expect("b slot");
+        assert_ne!(
+            a_slot, b_slot,
+            "distinct clients must reserve distinct slots"
+        );
+
+        let a_next_inode = a
+            .local
+            .get_counter(counters::NEXT_INODE)
+            .expect("a next inode");
+        let b_next_inode = b
+            .local
+            .get_counter(counters::NEXT_INODE)
+            .expect("b next inode");
+        let a_next_block = a
+            .local
+            .get_counter(counters::NEXT_BLOCK_ID)
+            .expect("a next block");
+        let b_next_block = b
+            .local
+            .get_counter(counters::NEXT_BLOCK_ID)
+            .expect("b next block");
+
+        assert_ne!(a_next_inode, b_next_inode);
+        assert_ne!(a_next_block, b_next_block);
+
+        let a_file = a
+            .create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
+            .expect("a create file");
+        let b_file = b
+            .create_file(ROOT_INO, b"b.txt", 0, 0, 0o644)
+            .expect("b create file");
+        assert_ne!(
+            a_file.ino, b_file.ino,
+            "new inode allocations must not collide"
+        );
     }
 
     #[test]
@@ -1973,6 +2522,10 @@ mod tests {
         a.flush_metadata().expect("flush foreign file");
 
         assert!(wait_until(Duration::from_secs(10), || {
+            if let Ok(mut state) = b.pending_state.lock() {
+                state.force_flush = false;
+                state.last_mutation_at = Some(Instant::now());
+            }
             let _ = b.sync_metadata();
             b.lookup(ROOT_INO, b"foreign.txt").is_ok()
         }));
@@ -1987,6 +2540,10 @@ mod tests {
             .expect("local draft block");
         assert_eq!(local_block.object_id, 1001);
 
+        if let Ok(mut state) = b.pending_state.lock() {
+            state.force_flush = false;
+            state.last_mutation_at = Some(Instant::now());
+        }
         let _ = c.sync_metadata();
         assert!(
             c.lookup(ROOT_INO, b"draft.bin").is_err(),
@@ -2304,6 +2861,70 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_peer_can_unlink_foreign_visible_uploading_entry() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-peer-unlink-uploading");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
+            .expect("create uploading file");
+        set_file_state(&a, file.ino, 4096, 1);
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(777, 4096))
+            .expect("set local uploading block");
+        a.flush_metadata().expect("flush uploading namespace");
+
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            b.lookup(ROOT_INO, b"uploading.bin")
+                .map(|entry| {
+                    b.get_attr(entry.ino)
+                        .map(|attr| attr.upload_state == UploadState::Uploading)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        }));
+
+        b.unlink(ROOT_INO, b"uploading.bin")
+            .expect("unlink uploading file on peer");
+        b.flush_metadata().expect("flush peer unlink");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.lookup(ROOT_INO, b"uploading.bin").is_err()
+        }));
+        assert!(
+            a.get_attr(file.ino).is_err(),
+            "writer must eventually drop the inode after peer unlink"
+        );
+        assert!(
+            a.get_file_block(file.ino, 0)
+                .expect("get local block after peer unlink")
+                .is_none(),
+            "writer must eventually drop local pending block refs after peer unlink"
+        );
+
+        drop(a);
+        let reopened = reopen_pg_engine_with_retry(&db_a);
+        reopened.sync_metadata().expect("sync reopened a");
+        assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_err());
+        assert!(reopened.get_attr(file.ino).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_remote_rename_overwrite_converges_to_source_inode() {
         let Some(dsn) = pg_dsn() else {
             return;
@@ -2447,6 +3068,132 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_peer_unlink_base_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-peer-unlink-base");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
+            .expect("create on a");
+        a.flush_metadata().expect("flush create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote.txt",
+            Duration::from_secs(10)
+        ));
+
+        b.unlink(ROOT_INO, b"remote.txt").expect("unlink on b");
+        b.flush_metadata().expect("flush unlink on b");
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.sync_metadata();
+            a.lookup(ROOT_INO, b"remote.txt").is_err()
+        }));
+
+        drop(a);
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened_a.sync_metadata();
+            reopened_a.lookup(ROOT_INO, b"remote.txt").is_err()
+                && reopened_a.get_attr(file.ino).is_err()
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_own_flush_does_not_skip_earlier_foreign_batch() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-own-flush-gap");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        a.create_file(ROOT_INO, b"from_a.txt", 0, 0, 0o644)
+            .expect("create on a");
+        a.flush_metadata().expect("flush a");
+
+        b.create_file(ROOT_INO, b"from_b.txt", 0, 0, 0o644)
+            .expect("create on b");
+        b.flush_metadata().expect("flush b");
+
+        assert!(
+            wait_visible(&b, ROOT_INO, b"from_a.txt", Duration::from_secs(12)),
+            "client B must not skip an earlier foreign batch when it publishes its own batch"
+        );
+        assert!(
+            wait_visible(&a, ROOT_INO, b"from_b.txt", Duration::from_secs(12)),
+            "client A should observe client B's batch too"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_earlier_foreign_batch_gap_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-gap");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        a.create_file(ROOT_INO, b"from_a.txt", 0, 0, 0o644)
+            .expect("create on a");
+        a.flush_metadata().expect("flush a");
+
+        b.create_file(ROOT_INO, b"from_b.txt", 0, 0, 0o644)
+            .expect("create on b");
+        b.flush_metadata().expect("flush b");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"from_a.txt",
+            Duration::from_secs(12)
+        ));
+        drop(b);
+
+        let reopened_b = reopen_pg_engine_with_retry(&db_b);
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened_b.sync_metadata();
+            reopened_b.lookup(ROOT_INO, b"from_a.txt").is_ok()
+                && reopened_b.lookup(ROOT_INO, b"from_b.txt").is_ok()
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_two_clients_different_dirs_no_loss() {
         let Some(dsn) = pg_dsn() else {
             return;
@@ -2526,6 +3273,85 @@ mod tests {
             20,
             "client B should see all files from B"
         );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_same_dir_concurrent_writes_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-samedir");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let shared = a
+            .create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
+            .expect("create shared dir");
+        a.flush_metadata().expect("flush shared");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"shared",
+            Duration::from_secs(10)
+        ));
+
+        for i in 0..20 {
+            let name = format!("a_{i:02}.dat");
+            a.create_file(shared.ino, name.as_bytes(), 0, 0, 0o644)
+                .expect("a create file");
+        }
+        for i in 0..20 {
+            let name = format!("b_{i:02}.dat");
+            b.create_file(shared.ino, name.as_bytes(), 0, 0, 0o644)
+                .expect("b create file");
+        }
+
+        a.flush_metadata().expect("flush a");
+        b.flush_metadata().expect("flush b");
+        assert!(wait_until(Duration::from_secs(20), || {
+            let _ = a.flush_metadata();
+            let _ = b.flush_metadata();
+            let _ = a.sync_metadata();
+            let _ = b.sync_metadata();
+            a.readdir(shared.ino)
+                .map(|v| v.len() == 40)
+                .unwrap_or(false)
+                && b.readdir(shared.ino)
+                    .map(|v| v.len() == 40)
+                    .unwrap_or(false)
+        }));
+
+        drop(a);
+        drop(b);
+
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        let reopened_b = reopen_pg_engine_with_retry(&db_b);
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened_a.sync_metadata();
+            let _ = reopened_b.sync_metadata();
+            reopened_a
+                .lookup(ROOT_INO, b"shared")
+                .ok()
+                .and_then(|dir| reopened_a.readdir(dir.ino).ok())
+                .map(|v| v.len() == 40)
+                .unwrap_or(false)
+                && reopened_b
+                    .lookup(ROOT_INO, b"shared")
+                    .ok()
+                    .and_then(|dir| reopened_b.readdir(dir.ino).ok())
+                    .map(|v| v.len() == 40)
+                    .unwrap_or(false)
+        }));
     }
 
     #[test]
@@ -2657,6 +3483,168 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_concurrent_file_vs_dir_same_name_single_winner() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-file-vs-dir-race");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let a2 = Arc::clone(&a);
+        let b2 = Arc::clone(&b);
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        let t1 = std::thread::spawn(move || {
+            barrier_a.wait();
+            let out = a2.create_file(ROOT_INO, b"victim", 0, 0, 0o644);
+            if out.is_ok() {
+                let _ = a2.flush_metadata();
+            }
+            out.map(|attr| (attr.ino, FileType::RegularFile))
+        });
+        let t2 = std::thread::spawn(move || {
+            barrier_b.wait();
+            let out = b2.create_dir(ROOT_INO, b"victim", 0, 0, 0o755);
+            if out.is_ok() {
+                let _ = b2.flush_metadata();
+            }
+            out.map(|attr| (attr.ino, FileType::Directory))
+        });
+
+        let r1 = t1.join().expect("thread a");
+        let r2 = t2.join().expect("thread b");
+        assert!(
+            r1.is_ok() || r2.is_ok(),
+            "at least one side must win the namespace race"
+        );
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.flush_metadata();
+            let _ = b.flush_metadata();
+            let _ = a.sync_metadata();
+            let _ = b.sync_metadata();
+            match (a.lookup(ROOT_INO, b"victim"), b.lookup(ROOT_INO, b"victim")) {
+                (Ok(ae), Ok(be)) => match (a.get_attr(ae.ino), b.get_attr(be.ino)) {
+                    (Ok(a_attr), Ok(b_attr)) => ae.ino == be.ino && a_attr.kind == b_attr.kind,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }));
+
+        let a_entry = a.lookup(ROOT_INO, b"victim").expect("a lookup victim");
+        let b_entry = b.lookup(ROOT_INO, b"victim").expect("b lookup victim");
+        let a_attr = a.get_attr(a_entry.ino).expect("a attr victim");
+        let b_attr = b.get_attr(b_entry.ino).expect("b attr victim");
+        assert_eq!(a_entry.ino, b_entry.ino);
+        assert_eq!(a_attr.kind, b_attr.kind);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_file_dir_race_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-file-dir-race");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let a2 = Arc::clone(&a);
+        let b2 = Arc::clone(&b);
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        let t1 = std::thread::spawn(move || {
+            barrier_a.wait();
+            let out = a2.create_file(ROOT_INO, b"victim", 0, 0, 0o644);
+            if out.is_ok() {
+                let _ = a2.flush_metadata();
+            }
+            out
+        });
+        let t2 = std::thread::spawn(move || {
+            barrier_b.wait();
+            let out = b2.create_dir(ROOT_INO, b"victim", 0, 0, 0o755);
+            if out.is_ok() {
+                let _ = b2.flush_metadata();
+            }
+            out
+        });
+
+        let _ = t1.join().expect("thread a");
+        let _ = t2.join().expect("thread b");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = a.flush_metadata();
+            let _ = b.flush_metadata();
+            let _ = a.sync_metadata();
+            let _ = b.sync_metadata();
+            match (a.lookup(ROOT_INO, b"victim"), b.lookup(ROOT_INO, b"victim")) {
+                (Ok(ae), Ok(be)) => match (a.get_attr(ae.ino), b.get_attr(be.ino)) {
+                    (Ok(a_attr), Ok(b_attr)) => ae.ino == be.ino && a_attr.kind == b_attr.kind,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }));
+
+        let expected = a.lookup(ROOT_INO, b"victim").expect("winner on a");
+        let expected_attr = a.get_attr(expected.ino).expect("winner attr on a");
+
+        drop(a);
+        drop(b);
+
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        let reopened_b = reopen_pg_engine_with_retry(&db_b);
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened_a.sync_metadata();
+            let _ = reopened_b.sync_metadata();
+            match (
+                reopened_a.lookup(ROOT_INO, b"victim"),
+                reopened_b.lookup(ROOT_INO, b"victim"),
+            ) {
+                (Ok(ae), Ok(be)) => {
+                    match (reopened_a.get_attr(ae.ino), reopened_b.get_attr(be.ino)) {
+                        (Ok(a_attr), Ok(b_attr)) => {
+                            ae.ino == expected.ino
+                                && be.ino == expected.ino
+                                && a_attr.kind == expected_attr.kind
+                                && b_attr.kind == expected_attr.kind
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_concurrent_rename_single_winner() {
         let Some(dsn) = pg_dsn() else {
             return;
@@ -2721,6 +3709,282 @@ mod tests {
             a.lookup(ROOT_INO, b"source.txt").is_err(),
             "source must be gone"
         );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_remote_rename_overwrite_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-rename-overwrite");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let src = a
+            .create_file(ROOT_INO, b"src.txt", 0, 0, 0o644)
+            .expect("create src");
+        let dst = a
+            .create_file(ROOT_INO, b"dst.txt", 0, 0, 0o644)
+            .expect("create dst");
+        a.flush_metadata().expect("flush seed files");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"src.txt",
+            Duration::from_secs(10)
+        ));
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"dst.txt",
+            Duration::from_secs(10)
+        ));
+
+        a.rename(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt")
+            .expect("rename overwrite on a");
+        a.flush_metadata().expect("flush rename overwrite");
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            b.lookup(ROOT_INO, b"src.txt").is_err()
+                && b.lookup(ROOT_INO, b"dst.txt")
+                    .map(|entry| entry.ino == src.ino)
+                    .unwrap_or(false)
+        }));
+
+        drop(b);
+        let reopened_b = reopen_pg_engine_with_retry(&db_b);
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened_b.sync_metadata();
+            reopened_b.lookup(ROOT_INO, b"src.txt").is_err()
+                && reopened_b
+                    .lookup(ROOT_INO, b"dst.txt")
+                    .map(|entry| entry.ino == src.ino)
+                    .unwrap_or(false)
+                && reopened_b.get_attr(dst.ino).is_err()
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
+
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("meta.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-crash-after-publish");
+        let info = volume.format_info();
+        seed_local(&db, &info);
+
+        let a = PgMetaEngine::open(&db).expect("open a");
+        a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+            .expect("create local file");
+
+        let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
+        let events = a.local.read_events_range(0, end).expect("local events");
+        let _version = a
+            .push_event_log_batch_locked(&events)
+            .expect("push batch without local persist");
+
+        drop(a);
+
+        let reopened = reopen_pg_engine_with_retry(&db);
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened.sync_metadata();
+            reopened.lookup(ROOT_INO, b"draft.txt").is_ok()
+                && reopened.flushed_event_seq.load(Ordering::SeqCst)
+                    == reopened.local.get_counter("nextEventSeq").unwrap_or(0)
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-crash-publish-then-unlink");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
+            .expect("create local file");
+        let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
+        let events = a.local.read_events_range(0, end).expect("local events");
+        let _version = a
+            .push_event_log_batch_locked(&events)
+            .expect("push batch without local persist");
+
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"remote.txt",
+            Duration::from_secs(12)
+        ));
+        b.unlink(ROOT_INO, b"remote.txt").expect("peer unlink");
+        b.flush_metadata().expect("flush peer unlink");
+
+        drop(a);
+
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = reopened_a.sync_metadata();
+            reopened_a.lookup(ROOT_INO, b"remote.txt").is_err()
+                && reopened_a.get_attr(file.ino).is_err()
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_unpublished_local_create_flushes_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-unpublished-create");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+            .expect("create local draft");
+        drop(a);
+
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        assert!(
+            reopened_a.replication_backlog().pending_ops > 0,
+            "reopen must rebuild pending state for unpublished local events"
+        );
+
+        reopened_a
+            .flush_metadata()
+            .expect("flush restored unpublished events");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"draft.txt",
+            Duration::from_secs(12)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_claimed_batch_crash_flushes_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-claimed-batch-crash");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+            .expect("create local draft");
+        let claimed = a.claim_pending_batch(true).expect("claim pending batch");
+        assert!(claimed.event_end > claimed.event_start);
+        drop(a);
+
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        assert!(
+            reopened_a.replication_backlog().pending_ops > 0,
+            "reopen must recover a claimed-but-unpublished batch after crash"
+        );
+
+        reopened_a.flush_metadata().expect("flush recovered batch");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"draft.txt",
+            Duration::from_secs(12)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_reopen_after_claimed_multi_event_batch_preserves_sequence_without_discover() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-reopen-claimed-multievent");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let dir = a
+            .create_dir(ROOT_INO, b"drafts", 0, 0, 0o755)
+            .expect("create drafts dir");
+        let file = a
+            .create_file(dir.ino, b"temp.txt", 0, 0, 0o644)
+            .expect("create temp file");
+        a.rename(dir.ino, b"temp.txt", dir.ino, b"final.txt")
+            .expect("rename temp to final");
+        let claimed = a.claim_pending_batch(true).expect("claim pending batch");
+        assert!(claimed.event_end > claimed.event_start);
+        drop(a);
+
+        let reopened_a = reopen_pg_engine_with_retry(&db_a);
+        reopened_a
+            .flush_metadata()
+            .expect("flush recovered multi-event batch");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            match b.lookup(ROOT_INO, b"drafts") {
+                Ok(dir_entry) => {
+                    b.lookup(dir_entry.ino, b"temp.txt").is_err()
+                        && b.lookup(dir_entry.ino, b"final.txt")
+                            .map(|entry| entry.ino == file.ino)
+                            .unwrap_or(false)
+                }
+                Err(_) => false,
+            }
+        }));
     }
 
     #[test]
@@ -3155,6 +4419,7 @@ mod tests {
             let name = format!("vis_{i:02}.dat");
             a.create_file(ROOT_INO, name.as_bytes(), 0, 0, 0o644)
                 .expect("create");
+            a.flush_metadata().expect("flush a");
             let start = std::time::Instant::now();
             let mut seen = false;
             for _ in 0..50 {

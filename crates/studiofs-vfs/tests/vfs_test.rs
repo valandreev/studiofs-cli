@@ -13,6 +13,7 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -24,10 +25,14 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
+    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PgMetaEngine, PostgresConfig,
+    ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     types::{BlockFlags, BlockRef, UploadState},
 };
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState};
+use studiofs_vfs::{
+    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState,
+};
+use uuid::Uuid;
 
 // PR-01 Gate-Named Scenarios (reserved)
 //
@@ -201,6 +206,22 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     .expect("failed to create StudioVfs")
 }
 
+fn make_vfs_from_meta(
+    meta: Arc<dyn MetaEngine>,
+    format_info: &FormatInfo,
+    cache_dir_str: &str,
+) -> Arc<StudioVfs> {
+    let data_config = DataStoreConfig::from(format_info);
+    StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir_str,
+        1024 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+    .expect("failed to create StudioVfs")
+}
+
 fn make_vfs_with_meta(
     meta: Arc<RedbMetaEngine>,
     format_info: &FormatInfo,
@@ -217,6 +238,207 @@ fn make_vfs_with_meta(
         512 * 1024 * 1024,
     )
     .expect("failed to create StudioVfs")
+}
+
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    cond()
+}
+
+fn pg_dsn() -> Option<String> {
+    let _ = dotenvy::dotenv();
+    let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        ensure_studiofs_database(&raw)
+            .await
+            .ok()
+            .map(|v| v.metadata_dsn)
+    })
+}
+
+fn run_pg_async<T, F>(fut: F) -> studiofs_meta::MetaResult<T>
+where
+    F: std::future::Future<Output = studiofs_meta::MetaResult<T>>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("failed to build tokio runtime: {e}"))
+        })?;
+    rt.block_on(fut)
+}
+
+fn setup_pg_volume(
+    dsn: &str,
+    name: &str,
+    uuid: &str,
+    block_size: u32,
+) -> studiofs_meta::MetaResult<i64> {
+    run_pg_async(async move {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| {
+                studiofs_meta::MetaError::Storage(format!("postgres connect failed: {e}"))
+            })?;
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let tx = client.transaction().await.map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("postgres begin tx failed: {e}"))
+        })?;
+
+        let row = tx
+            .query_one(
+                r#"
+                INSERT INTO volumes (name, uuid, block_size)
+                VALUES ($1, $2, $3)
+                RETURNING vol
+                "#,
+                &[&name, &uuid, &(block_size as i32)],
+            )
+            .await
+            .map_err(|e| {
+                studiofs_meta::MetaError::Storage(format!("postgres volume insert failed: {e}"))
+            })?;
+        let volume_id: i64 = row.get(0);
+
+        tx.execute(
+            r#"
+            INSERT INTO metadata_state (vol, version, snapshot)
+            VALUES ($1, 0, $2)
+            ON CONFLICT (vol) DO NOTHING
+            "#,
+            &[&volume_id, &Vec::<u8>::new()],
+        )
+        .await
+        .map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("postgres metadata_state seed failed: {e}"))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("postgres commit failed: {e}"))
+        })?;
+        conn_task.abort();
+        Ok(volume_id)
+    })
+}
+
+fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {
+    FormatInfo {
+        name: name.to_string(),
+        uuid: uuid.to_string(),
+        endpoint: "http://127.0.0.1:9000".to_string(),
+        bucket: "studiofs-test".to_string(),
+        access_key: "test".to_string(),
+        secret_key: "test".to_string(),
+        region: "us-east-1".to_string(),
+        data_prefix: format!("{name}/objects/"),
+        metadata: MetadataConfig {
+            backend: MetadataBackend::Postgres,
+            remote: None,
+            postgres: Some(PostgresConfig {
+                url: dsn.to_string(),
+                volume_id,
+            }),
+            ..MetadataConfig::default()
+        },
+        block_size: 4 * 1024 * 1024,
+    }
+}
+
+fn seed_local(db_path: &std::path::Path, info: &FormatInfo) {
+    let seed = RedbMetaEngine::open(db_path).expect("seed redb open");
+    seed.set_format_info(info).expect("seed format info");
+    seed.init_root(0, 0).expect("seed root");
+}
+
+struct PgTestVolume {
+    dsn: String,
+    volume_id: i64,
+    name: String,
+    uuid: String,
+}
+
+impl PgTestVolume {
+    fn new(dsn: &str, prefix: &str) -> Self {
+        let name = format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        );
+        let uuid = Uuid::new_v4().to_string();
+        let volume_id =
+            setup_pg_volume(dsn, &name, &uuid, 4 * 1024 * 1024).expect("setup pg volume");
+        Self {
+            dsn: dsn.to_string(),
+            volume_id,
+            name,
+            uuid,
+        }
+    }
+
+    fn format_info(&self) -> FormatInfo {
+        pg_format_info(&self.name, &self.uuid, &self.dsn, self.volume_id)
+    }
+}
+
+impl Drop for PgTestVolume {
+    fn drop(&mut self) {
+        let _ = run_pg_async(async {
+            let (client, connection) = tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    studiofs_meta::MetaError::Storage(format!("postgres connect failed: {e}"))
+                })?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
+                .await
+                .map_err(|e| {
+                    studiofs_meta::MetaError::Storage(format!("postgres cleanup failed: {e}"))
+                })?;
+            conn_task.abort();
+            Ok(())
+        });
+    }
+}
+
+#[derive(Default)]
+struct SpyInvalidator {
+    seen: Mutex<Vec<u64>>,
+}
+
+impl SpyInvalidator {
+    fn snapshot(&self) -> Vec<u64> {
+        self.seen.lock().clone()
+    }
+
+    fn clear(&self) {
+        self.seen.lock().clear();
+    }
+}
+
+impl KernelInvalidator for SpyInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.seen.lock().push(ino);
+    }
 }
 
 fn reopen_vfs(db_path: &std::path::Path, cache_dir: &std::path::Path) -> Arc<StudioVfs> {

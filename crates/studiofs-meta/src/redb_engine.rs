@@ -279,6 +279,30 @@ impl RedbMetaEngine {
         Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
     }
 
+    fn remove_all_file_blocks_in_txn(
+        blocks: &mut redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let rows: Vec<(Vec<u8>, u64)> = {
+            let iter = blocks
+                .range(prefix.as_slice()..range_end.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            iter.filter_map(|r| r.ok())
+                .filter_map(|(k, v)| {
+                    let block: BlockRef = decode(v.value()).ok()?;
+                    Some((k.value().to_vec(), block.object_id))
+                })
+                .collect()
+        };
+        for (key, _) in &rows {
+            let _ = blocks.remove(key.as_slice());
+        }
+        Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
+    }
+
     fn get_attr_from_table(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<u64, &[u8]>,
@@ -1942,6 +1966,11 @@ impl RedbMetaEngine {
                         let _ = xattrs.remove(key.as_slice());
                     }
 
+                    let mut blocks = txn
+                        .open_table(FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_file_blocks_in_txn(&mut blocks, *ino)?;
+                    drop(blocks);
                     let mut committed = txn
                         .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1959,6 +1988,11 @@ impl RedbMetaEngine {
                     let _ = committed.remove(key.as_slice());
                 }
                 crate::events::MetaEvent::RemoveFileBlocks { ino } => {
+                    let mut blocks = txn
+                        .open_table(FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_file_blocks_in_txn(&mut blocks, *ino)?;
+                    drop(blocks);
                     let mut committed = txn
                         .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -4312,6 +4346,12 @@ impl MetaEngine for RedbMetaEngine {
                 },
             )?;
             if result_attr.nlink == 0 {
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::RemoveFileBlocks {
+                        ino: result_attr.ino,
+                    },
+                )?;
                 Self::append_event_in_txn(
                     &txn,
                     &crate::events::MetaEvent::RemoveAttr {

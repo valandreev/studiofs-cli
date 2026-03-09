@@ -38,7 +38,7 @@ use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -283,6 +283,7 @@ const DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS: u64 = 128;
 const DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG: u64 = 2;
 const DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS: u64 = 4;
 const DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
@@ -1341,6 +1342,13 @@ impl StudioVfs {
                     .filter(|v| *v > 0)
                     .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
             );
+            let metadata_invalidation_sync_interval = Duration::from_millis(
+                std::env::var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS),
+            );
             let read_buffer_mb = std::env::var("STUDIOFS_READ_BUFFER_MB")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -1897,6 +1905,15 @@ impl StudioVfs {
                 vfs_clone.background_gc().await;
             }));
 
+            // Spawn periodic metadata sync watcher that turns remote metadata
+            // version changes into kernel inode invalidations for the mounted FS.
+            let vfs_clone = vfs.clone();
+            vfs.track_background_task(tokio::spawn(async move {
+                vfs_clone
+                    .background_metadata_invalidation(metadata_invalidation_sync_interval)
+                    .await;
+            }));
+
             // Spawn Janitor Worker (automatic orphan scan/cleanup)
             let vfs_clone = vfs.clone();
             vfs.track_background_task(tokio::spawn(async move {
@@ -1924,6 +1941,115 @@ impl StudioVfs {
 
     fn set_uploader_task(&self, handle: JoinHandle<()>) {
         *self.state.uploader_task.lock() = Some(handle);
+    }
+
+    fn kernel_invalidator(&self) -> Option<Arc<dyn KernelInvalidator>> {
+        self.kernel_invalidator.read().unwrap().clone()
+    }
+
+    fn collect_metadata_inodes(engine: &dyn MetaEngine) -> MetaResult<HashSet<Ino>> {
+        let mut seen = HashSet::from([ROOT_INO]);
+        let mut stack = vec![ROOT_INO];
+
+        while let Some(ino) = stack.pop() {
+            let attr = match engine.get_attr(ino) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            if attr.kind != FileType::Directory {
+                continue;
+            }
+            let entries = match engine.readdir(ino) {
+                Ok(entries) => entries,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            for entry in entries {
+                if seen.insert(entry.ino) {
+                    stack.push(entry.ino);
+                }
+            }
+        }
+
+        Ok(seen)
+    }
+
+    fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
+        let Some(invalidator) = self.kernel_invalidator() else {
+            return;
+        };
+        let mut unique = HashSet::new();
+        for ino in inodes {
+            if unique.insert(ino) {
+                invalidator.inval_inode(ino);
+            }
+        }
+    }
+
+    async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
+        let mut last_token = self.meta.metadata_version_token();
+        let mut last_snapshot: HashSet<Ino> = HashSet::new();
+
+        if last_token.is_some() {
+            let meta = self.meta.clone();
+            if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                Self::collect_metadata_inodes(engine.as_ref())
+            })
+            .await
+            {
+                last_snapshot = snapshot;
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = self.state.shutdown_notify.notified() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
+            if self.kernel_invalidator().is_none() {
+                continue;
+            }
+
+            let meta = self.meta.clone();
+            let sync = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+                let before = engine.metadata_version_token();
+                engine.sync_metadata()?;
+                let after = engine.metadata_version_token();
+                Ok((before, after))
+            })
+            .await;
+            let Ok((_before, after_token)) = sync else {
+                continue;
+            };
+
+            let changed = matches!(
+                (&last_token, &after_token),
+                (Some(previous), Some(current)) if previous != current
+            );
+            last_token = after_token.clone();
+
+            if !changed {
+                continue;
+            }
+
+            let meta = self.meta.clone();
+            let Ok(current_snapshot) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                Self::collect_metadata_inodes(engine.as_ref())
+            })
+            .await
+            else {
+                continue;
+            };
+
+            let mut to_invalidate = last_snapshot.clone();
+            to_invalidate.extend(current_snapshot.iter().copied());
+            self.invalidate_kernel_inodes(to_invalidate);
+            last_snapshot = current_snapshot;
+        }
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -3993,7 +4119,9 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
-        let attr = self.meta.create_dir(parent, name, uid, gid, mode & 0o7777)?;
+        let attr = self
+            .meta
+            .create_dir(parent, name, uid, gid, mode & 0o7777)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();

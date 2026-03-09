@@ -991,6 +991,25 @@ const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
 const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
 const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 
+fn notify_filter_for_kind(kind: FileType) -> u32 {
+    if kind == FileType::Directory {
+        FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
+    } else {
+        FILE_NOTIFY_CHANGE_FILE_NAME
+            | FILE_NOTIFY_CHANGE_SIZE
+            | FILE_NOTIFY_CHANGE_ATTRIBUTES
+            | FILE_NOTIFY_CHANGE_LAST_WRITE
+    }
+}
+
+fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo<512>> {
+    let mut info = NotifyInfo::<512>::new();
+    info.filter = notify_filter_for_kind(kind);
+    info.action = FILE_ACTION_MODIFIED;
+    info.set_name(path).ok()?;
+    Some(info)
+}
+
 /// Resolve an inode number to a Windows-style path (`\dir\file`) by walking
 /// the parent chain.  Returns `None` if the inode or any ancestor no longer
 /// exists (e.g. already deleted).
@@ -1068,29 +1087,17 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
                 continue;
             };
 
-            let is_dir = self
+            let kind = self
                 .vfs
                 .meta()
                 .get_attr(*ino)
-                .map(|a| a.kind == FileType::Directory)
-                .unwrap_or(false);
+                .map(|a| a.kind)
+                .unwrap_or(FileType::RegularFile);
 
-            let filter = if is_dir {
-                FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
-            } else {
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_SIZE
-                    | FILE_NOTIFY_CHANGE_ATTRIBUTES
-                    | FILE_NOTIFY_CHANGE_LAST_WRITE
-            };
-
-            let mut info = NotifyInfo::<512>::new();
-            info.filter = filter;
-            info.action = FILE_ACTION_MODIFIED;
-            if info.set_name(&path).is_err() {
+            let Some(info) = build_notify_info(&path, kind) else {
                 warn!(ino, path, "notify path too long, skipping");
                 continue;
-            }
+            };
             notifier.notify(&info);
             debug!(ino, path, "WinFSP notify sent");
         }
@@ -1100,8 +1107,74 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
 #[cfg(test)]
 mod tests {
     use super::is_benign_cleanup_delete_error;
+    use super::{
+        FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        StudioFsContext, WinfspKernelInvalidator, build_notify_info, ino_to_windows_path,
+        notify_filter_for_kind,
+    };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::MetaError;
+    use studiofs_meta::{FormatInfo, MetaEngine, MetadataConfig, ROOT_INO, RedbMetaEngine};
     use studiofs_vfs::VfsError;
+    use studiofs_vfs::{KernelInvalidator, StudioVfs};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("winfsp-test-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            name: volume_name.clone(),
+            uuid: format!("winfsp-test-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    fn make_test_vfs(tmp: &TempDir, volume_suffix: &str, rt: &Runtime) -> Arc<StudioVfs> {
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info(volume_suffix);
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+
+        let cache_dir = tmp.path().join("cache");
+        let _guard = rt.enter();
+        StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+        )
+        .expect("create vfs")
+    }
+
+    fn make_test_context(
+        volume_suffix: &str,
+    ) -> (
+        TempDir,
+        Arc<StudioVfs>,
+        StudioFsContext,
+        Arc<Mutex<Vec<u64>>>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
+        let ctx = StudioFsContext::new(vfs.clone(), rt, queue.clone());
+        (tmp, vfs, ctx, queue)
+    }
 
     #[test]
     fn cleanup_delete_not_found_is_benign() {
@@ -1122,5 +1195,103 @@ mod tests {
         let dir_delete = VfsError::Meta(MetaError::NotADirectory(42));
         assert!(is_benign_cleanup_delete_error(&dir_delete, true));
         assert!(!is_benign_cleanup_delete_error(&dir_delete, false));
+    }
+
+    #[test]
+    fn winfsp_invalidator_enqueues_inode_numbers() {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+
+        invalidator.inval_inode(42);
+        invalidator.inval_inode(7);
+
+        assert_eq!(*queue.lock(), vec![42, 7]);
+    }
+
+    #[test]
+    fn should_notify_drains_and_deduplicates_queue() {
+        let (_tmp, _vfs, ctx, queue) = make_test_context("notify_dedup");
+        queue.lock().extend([9, 2, 9, 7, 2]);
+
+        let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
+        assert_eq!(first, Some(vec![2, 7, 9]));
+        assert!(
+            queue.lock().is_empty(),
+            "queue should be drained after should_notify"
+        );
+
+        let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
+        assert_eq!(second, None);
+    }
+
+    #[test]
+    fn ino_to_windows_path_resolves_nested_entries() {
+        let (_tmp, vfs, _ctx, _queue) = make_test_context("nested_path");
+
+        let dir = vfs.mkdir(ROOT_INO, b"parent", 0, 0, 0o755).expect("mkdir");
+        let file = vfs
+            .create(dir.ino, b"child.txt", 0, 0, 0o644)
+            .expect("create");
+
+        assert_eq!(ino_to_windows_path(&vfs, ROOT_INO), Some("\\".to_string()));
+        assert_eq!(
+            ino_to_windows_path(&vfs, dir.ino),
+            Some("\\parent".to_string())
+        );
+        assert_eq!(
+            ino_to_windows_path(&vfs, file.ino),
+            Some("\\parent\\child.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn ino_to_windows_path_returns_none_after_unlink() {
+        let (_tmp, vfs, _ctx, _queue) = make_test_context("deleted_path");
+
+        let file = vfs
+            .create(ROOT_INO, b"gone.txt", 0, 0, 0o644)
+            .expect("create");
+        assert_eq!(
+            ino_to_windows_path(&vfs, file.ino),
+            Some("\\gone.txt".to_string())
+        );
+
+        vfs.unlink(ROOT_INO, b"gone.txt").expect("unlink");
+        assert_eq!(ino_to_windows_path(&vfs, file.ino), None);
+    }
+
+    #[test]
+    fn notify_filter_matches_inode_kind() {
+        assert_eq!(
+            notify_filter_for_kind(studiofs_meta::FileType::Directory),
+            FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
+        );
+        assert_eq!(
+            notify_filter_for_kind(studiofs_meta::FileType::RegularFile),
+            FILE_NOTIFY_CHANGE_FILE_NAME
+                | FILE_NOTIFY_CHANGE_SIZE
+                | FILE_NOTIFY_CHANGE_ATTRIBUTES
+                | FILE_NOTIFY_CHANGE_LAST_WRITE
+        );
+    }
+
+    #[test]
+    fn build_notify_info_rejects_overlong_paths() {
+        let info = build_notify_info("\\short.txt", studiofs_meta::FileType::RegularFile)
+            .expect("notify info");
+        assert_eq!(info.action, FILE_ACTION_MODIFIED);
+        assert_eq!(
+            info.filter,
+            FILE_NOTIFY_CHANGE_FILE_NAME
+                | FILE_NOTIFY_CHANGE_SIZE
+                | FILE_NOTIFY_CHANGE_ATTRIBUTES
+                | FILE_NOTIFY_CHANGE_LAST_WRITE
+        );
+
+        let overlong = format!("\\{}", "a".repeat(1024));
+        assert!(
+            build_notify_info(&overlong, studiofs_meta::FileType::RegularFile).is_none(),
+            "WinFSP notify helper should skip overlong paths"
+        );
     }
 }
