@@ -1,7 +1,7 @@
 target/
 *.db
 Cargo.lock
-/docs/ideas
+/docs/backlog
 docs/logs/*.*
 *.exe
 .env
