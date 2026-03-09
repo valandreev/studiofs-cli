@@ -50,6 +50,16 @@ impl FileType {
     }
 }
 
+/// Coarse remote upload lifecycle exposed by metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
+pub enum UploadState {
+    Uploading = 1,
+    Updating = 2,
+    #[default]
+    Ready = 3,
+}
+
 /// Inode attributes - stored in ATTRIBUTES table.
 ///
 /// Key design: timestamps stored as nanoseconds since Unix epoch,
@@ -68,6 +78,9 @@ pub struct InodeAttr {
     pub gid: u32,
     /// File size in bytes.
     pub size: u64,
+    /// Size visible to remote clients after committed block uploads.
+    #[serde(default)]
+    pub committed_size: u64,
     /// Number of hard links.
     pub nlink: u32,
     /// Modification time (nanoseconds since Unix epoch).
@@ -87,6 +100,15 @@ pub struct InodeAttr {
     /// Stored as raw Win32 FILE_ATTRIBUTE_* bitmask. 0 = not set (derive from kind).
     #[serde(default)]
     pub win_attrs: u32,
+    /// Monotonic content generation used to discard stale async completions.
+    #[serde(default)]
+    pub content_epoch: u64,
+    /// Last committed content generation visible to remote clients.
+    #[serde(default)]
+    pub committed_content_epoch: u64,
+    /// Coarse remote upload lifecycle for the current inode view.
+    #[serde(default)]
+    pub upload_state: UploadState,
 }
 
 impl InodeAttr {
@@ -108,6 +130,7 @@ impl InodeAttr {
             uid,
             gid,
             size: 4096,
+            committed_size: 4096,
             nlink: 2, // '.' and '..'
             mtime: now,
             ctime: now,
@@ -115,6 +138,9 @@ impl InodeAttr {
             parent,
             crtime: now,
             win_attrs: 0x10, // FILE_ATTRIBUTE_DIRECTORY
+            content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: UploadState::Ready,
         }
     }
 
@@ -128,6 +154,7 @@ impl InodeAttr {
             uid,
             gid,
             size: 0,
+            committed_size: 0,
             nlink: 1,
             mtime: now,
             ctime: now,
@@ -135,6 +162,9 @@ impl InodeAttr {
             parent,
             crtime: now,
             win_attrs: 0x20, // FILE_ATTRIBUTE_ARCHIVE
+            content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: UploadState::Ready,
         }
     }
 
@@ -165,6 +195,7 @@ impl InodeAttr {
             uid,
             gid,
             size: target_len as u64,
+            committed_size: target_len as u64,
             nlink: 1,
             mtime: now,
             ctime: now,
@@ -172,6 +203,9 @@ impl InodeAttr {
             parent,
             crtime: now,
             win_attrs: 0x0400, // FILE_ATTRIBUTE_REPARSE_POINT
+            content_epoch: 0,
+            committed_content_epoch: 0,
+            upload_state: UploadState::Ready,
         }
     }
 
@@ -297,7 +331,7 @@ impl Default for BlockFlags {
 /// - Sequential object_id (not content hash) - simpler and faster
 /// - No reference counting - block belongs to exactly one file position
 /// - Immutable objects - never modified, only created/deleted
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRef {
     /// Sequential block ID (unique across the volume).
     pub object_id: u64,
@@ -370,14 +404,8 @@ pub struct FormatInfo {
     /// Metadata backend configuration.
     #[serde(default)]
     pub metadata: MetadataConfig,
-    /// Manifest version token (used as ETag/If-Match in remote metadata backends).
-    #[serde(default)]
-    pub version: String,
     /// Block size in bytes (configurable at init, default 8MB).
     pub block_size: u32,
-    /// Chunk size - deprecated, kept for compatibility.
-    #[serde(default)]
-    pub chunk_size: u64,
 }
 
 /// Metadata backend selection.
@@ -386,7 +414,7 @@ pub struct FormatInfo {
 pub enum MetadataBackend {
     #[default]
     RedbLocal,
-    Tonbo,
+    Postgres,
 }
 
 /// Connection details for remote metadata object store.
@@ -421,14 +449,8 @@ pub struct MetadataConfig {
     pub backend: MetadataBackend,
     #[serde(default)]
     pub remote: Option<RemoteStoreConfig>,
-    #[serde(default = "default_cache_ttl_secs")]
-    pub cache_ttl_secs: u64,
-    #[serde(default = "default_flush_interval_secs")]
-    pub flush_interval_secs: u64,
-    #[serde(default = "default_flush_ops_threshold")]
-    pub flush_ops_threshold: u32,
-    #[serde(default = "default_flush_bytes_threshold")]
-    pub flush_bytes_threshold: u64,
+    #[serde(default)]
+    pub postgres: Option<PostgresConfig>,
 }
 
 impl Default for MetadataConfig {
@@ -436,32 +458,23 @@ impl Default for MetadataConfig {
         Self {
             backend: MetadataBackend::RedbLocal,
             remote: None,
-            cache_ttl_secs: default_cache_ttl_secs(),
-            flush_interval_secs: default_flush_interval_secs(),
-            flush_ops_threshold: default_flush_ops_threshold(),
-            flush_bytes_threshold: default_flush_bytes_threshold(),
+            postgres: None,
         }
     }
 }
 
+/// Connection details for PostgreSQL metadata backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresConfig {
+    /// PostgreSQL server DSN (e.g. postgres://user:pass@host:5432).
+    /// StudioFS rewrites it to database `studiofs`.
+    pub url: String,
+    /// Logical volume id in shared PG schema.
+    pub volume_id: i64,
+}
+
 fn default_metadata_prefix() -> String {
     "metadata/".to_string()
-}
-
-fn default_cache_ttl_secs() -> u64 {
-    20
-}
-
-fn default_flush_interval_secs() -> u64 {
-    60
-}
-
-fn default_flush_ops_threshold() -> u32 {
-    100
-}
-
-fn default_flush_bytes_threshold() -> u64 {
-    1024 * 1024
 }
 
 impl Default for FormatInfo {
@@ -476,9 +489,7 @@ impl Default for FormatInfo {
             region: String::new(),
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
-            version: String::new(),
             block_size: DEFAULT_BLOCK_SIZE,
-            chunk_size: 0, // Deprecated
         }
     }
 }
@@ -506,9 +517,7 @@ impl FormatInfo {
             region,
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
-            version: String::new(),
             block_size: block_size_mb * 1024 * 1024, // Convert MB to bytes
-            chunk_size: 0,
         }
     }
 

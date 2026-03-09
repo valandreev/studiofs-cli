@@ -383,7 +383,9 @@ impl LruTracker {
                 let oldest_rank = (entries.len() - 1 - i) as u128;
                 ((oldest_rank * max_back_secs as u128) / denom) as u64
             };
-            let access = now.checked_sub(Duration::from_secs(offset_secs)).unwrap_or(now);
+            let access = now
+                .checked_sub(Duration::from_secs(offset_secs))
+                .unwrap_or(now);
             self.shards[shard_idx].lock().insert(LruEntry {
                 object_id: ce.object_id,
                 size: ce.size,

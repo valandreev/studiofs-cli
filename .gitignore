@@ -5,3 +5,6 @@ Cargo.lock
 docs/logs/*.*
 *.exe
 .env
+/tools/fstest/results/*
+/tools/fstest/__pycache__
+/tools/fstest/results-new

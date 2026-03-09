@@ -10,6 +10,9 @@ members = [
 ]
 resolver = "3"
 
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -21,7 +24,9 @@ repository = "https://github.com/user/studiofs"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
-async-nats = "0.39"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+postgres-types = "0.2"
 
 # Storage
 opendal = { version = "0.55", features = ["services-s3"] }
@@ -52,8 +57,9 @@ thiserror = "2"
 anyhow = "1"
 
 # Platform - FUSE (Linux/macOS)
-# Pure-Rust /dev/fuse transport (default); avoids linking libfuse3 and the
-# "library too old" warning that the C library emits on newer distros.
+# Linux can use fuser's pure-Rust /dev/fuse transport, which avoids linking
+# libfuse3 and the "library too old" warning emitted by the C library on some
+# newer distros. macOS still requires libfuse via macFUSE/osxfuse.
 fuser = "0.16"
 libc = "0.2"
 
@@ -67,6 +73,7 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 home = "0.5"
 dotenvy = "0.15"
+url = "2"
 
 # Internal crates
 studiofs-meta = { path = "crates/studiofs-meta" }

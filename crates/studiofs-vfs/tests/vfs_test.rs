@@ -13,7 +13,7 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
-use std::path::{Path, PathBuf};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -25,10 +25,26 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine, RemoteStoreConfig,
-    TonboMetaEngine, types::BlockRef,
+    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PgMetaEngine, PostgresConfig,
+    ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    types::{BlockFlags, BlockRef, UploadState},
 };
-use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
+use studiofs_vfs::{
+    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState,
+};
+use uuid::Uuid;
+
+// PR-01 Gate-Named Scenarios (reserved)
+//
+// - writer_reads_full_file_before_any_remote_commit
+// - writer_recovers_local_file_after_restart_before_upload_complete
+// - remote_clients_see_uploading_marker_without_precise_progress
+// - remote_open_on_uploading_new_file_returns_transient_unavailable
+// - remote_clients_keep_previous_committed_version_during_update
+// - large_file_unlink_cancels_pending_uploads
+// - large_file_partial_overwrite_reuploads_only_touched_extents
+// - stale_upload_completion_is_ignored_after_extent_invalidate
+// - large_file_rename_does_not_restart_or_duplicate_uploads
 
 // =============================================================================
 // Test Helpers
@@ -37,13 +53,10 @@ use studiofs_vfs::{LockKind, OpenFlags, StudioVfs, VfsError};
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
     load_test_env();
-    let endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
-    let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
-    let access_key =
-        std::env::var("STUDIOFS_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
-    let secret_key =
-        std::env::var("STUDIOFS_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let bucket = test_env_var("STUDIOFS_MINIO_BUCKET", "studiofs-test");
+    let access_key = test_env_var("STUDIOFS_MINIO_ACCESS_KEY", "minioadmin");
+    let secret_key = test_env_var("STUDIOFS_MINIO_SECRET_KEY", "minioadmin");
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let run_id = RUN_ID.get_or_init(|| {
         let ts = SystemTime::now()
@@ -63,28 +76,99 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig {
-            backend: MetadataBackend::Tonbo,
-            remote: Some(RemoteStoreConfig {
-                endpoint,
-                bucket,
-                access_key,
-                secret_key,
-                region: "us-east-1".into(),
-                prefix: format!("{volume_name}/metadata/"),
-            }),
             ..MetadataConfig::default()
         },
-        version: String::new(),
-        block_size: 4 * 1024 * 1024,  // 4 MiB
-        chunk_size: 64 * 1024 * 1024, // 64 MiB (deprecated)
+        block_size: 4 * 1024 * 1024, // 4 MiB
     }
+}
+
+fn workspace_root() -> &'static std::path::Path {
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .and_then(|dir| dir.parent())
+            .unwrap_or(manifest_dir)
+            .to_path_buf()
+    })
+    .as_path()
+}
+
+fn workspace_env_path() -> std::path::PathBuf {
+    workspace_root().join(".env")
+}
+
+fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
+    static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    VARS.get_or_init(|| {
+        let mut vars = std::collections::HashMap::new();
+        let env_path = workspace_env_path();
+        if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
+            for item in iter.flatten() {
+                vars.insert(item.0, item.1);
+            }
+        }
+        vars
+    })
+}
+
+fn workspace_dotenv_var(key: &str) -> Option<String> {
+    workspace_dotenv_vars().get(key).cloned()
+}
+
+fn test_env_var(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .or_else(|| workspace_dotenv_var(key))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn load_test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     let _ = ONCE.get_or_init(|| {
-        let _ = dotenvy::dotenv();
+        let env_path = workspace_env_path();
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
     });
+}
+
+struct TestMinioEnv {
+    endpoint: String,
+    bucket: String,
+    access_key: String,
+    secret_key: String,
+}
+
+fn test_online_minio_env() -> &'static TestMinioEnv {
+    static ENV: OnceLock<TestMinioEnv> = OnceLock::new();
+    ENV.get_or_init(|| {
+        load_test_env();
+
+        TestMinioEnv {
+            endpoint: workspace_dotenv_var("STUDIOFS_MINIO_ENDPOINT")
+                .unwrap_or_else(|| "http://127.0.0.1:9000".to_string()),
+            bucket: workspace_dotenv_var("STUDIOFS_MINIO_BUCKET")
+                .unwrap_or_else(|| "studiofs-test".to_string()),
+            access_key: workspace_dotenv_var("STUDIOFS_MINIO_ACCESS_KEY")
+                .unwrap_or_else(|| "minioadmin".to_string()),
+            secret_key: workspace_dotenv_var("STUDIOFS_MINIO_SECRET_KEY")
+                .unwrap_or_else(|| "minioadmin".to_string()),
+        }
+    })
+}
+
+fn apply_test_online_minio_env() {
+    let env = test_online_minio_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &env.endpoint);
+        std::env::set_var("STUDIOFS_MINIO_BUCKET", &env.bucket);
+        std::env::set_var("STUDIOFS_MINIO_ACCESS_KEY", &env.access_key);
+        std::env::set_var("STUDIOFS_MINIO_SECRET_KEY", &env.secret_key);
+    }
 }
 
 fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
@@ -122,19 +206,277 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     .expect("failed to create StudioVfs")
 }
 
+fn make_vfs_from_meta(
+    meta: Arc<dyn MetaEngine>,
+    format_info: &FormatInfo,
+    cache_dir_str: &str,
+) -> Arc<StudioVfs> {
+    let data_config = DataStoreConfig::from(format_info);
+    StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir_str,
+        1024 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+    .expect("failed to create StudioVfs")
+}
+
+fn make_vfs_with_meta(
+    meta: Arc<RedbMetaEngine>,
+    format_info: &FormatInfo,
+    cache_dir_str: &str,
+) -> Arc<StudioVfs> {
+    meta.set_format_info(format_info)
+        .expect("failed to set format info");
+    let data_config = DataStoreConfig::from(format_info);
+    StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir_str,
+        1024 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+    .expect("failed to create StudioVfs")
+}
+
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    cond()
+}
+
+fn pg_dsn() -> Option<String> {
+    let _ = dotenvy::dotenv();
+    let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        ensure_studiofs_database(&raw)
+            .await
+            .ok()
+            .map(|v| v.metadata_dsn)
+    })
+}
+
+fn run_pg_async<T, F>(fut: F) -> studiofs_meta::MetaResult<T>
+where
+    F: std::future::Future<Output = studiofs_meta::MetaResult<T>>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("failed to build tokio runtime: {e}"))
+        })?;
+    rt.block_on(fut)
+}
+
+fn setup_pg_volume(
+    dsn: &str,
+    name: &str,
+    uuid: &str,
+    block_size: u32,
+) -> studiofs_meta::MetaResult<i64> {
+    run_pg_async(async move {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| {
+                studiofs_meta::MetaError::Storage(format!("postgres connect failed: {e}"))
+            })?;
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let tx = client.transaction().await.map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("postgres begin tx failed: {e}"))
+        })?;
+
+        let row = tx
+            .query_one(
+                r#"
+                INSERT INTO volumes (name, uuid, block_size)
+                VALUES ($1, $2, $3)
+                RETURNING vol
+                "#,
+                &[&name, &uuid, &(block_size as i32)],
+            )
+            .await
+            .map_err(|e| {
+                studiofs_meta::MetaError::Storage(format!("postgres volume insert failed: {e}"))
+            })?;
+        let volume_id: i64 = row.get(0);
+
+        tx.execute(
+            r#"
+            INSERT INTO metadata_state (vol, version, snapshot)
+            VALUES ($1, 0, $2)
+            ON CONFLICT (vol) DO NOTHING
+            "#,
+            &[&volume_id, &Vec::<u8>::new()],
+        )
+        .await
+        .map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("postgres metadata_state seed failed: {e}"))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("postgres commit failed: {e}"))
+        })?;
+        conn_task.abort();
+        Ok(volume_id)
+    })
+}
+
+fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {
+    FormatInfo {
+        name: name.to_string(),
+        uuid: uuid.to_string(),
+        endpoint: "http://127.0.0.1:9000".to_string(),
+        bucket: "studiofs-test".to_string(),
+        access_key: "test".to_string(),
+        secret_key: "test".to_string(),
+        region: "us-east-1".to_string(),
+        data_prefix: format!("{name}/objects/"),
+        metadata: MetadataConfig {
+            backend: MetadataBackend::Postgres,
+            remote: None,
+            postgres: Some(PostgresConfig {
+                url: dsn.to_string(),
+                volume_id,
+            }),
+            ..MetadataConfig::default()
+        },
+        block_size: 4 * 1024 * 1024,
+    }
+}
+
+fn seed_local(db_path: &std::path::Path, info: &FormatInfo) {
+    let seed = RedbMetaEngine::open(db_path).expect("seed redb open");
+    seed.set_format_info(info).expect("seed format info");
+    seed.init_root(0, 0).expect("seed root");
+}
+
+struct PgTestVolume {
+    dsn: String,
+    volume_id: i64,
+    name: String,
+    uuid: String,
+}
+
+impl PgTestVolume {
+    fn new(dsn: &str, prefix: &str) -> Self {
+        let name = format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        );
+        let uuid = Uuid::new_v4().to_string();
+        let volume_id =
+            setup_pg_volume(dsn, &name, &uuid, 4 * 1024 * 1024).expect("setup pg volume");
+        Self {
+            dsn: dsn.to_string(),
+            volume_id,
+            name,
+            uuid,
+        }
+    }
+
+    fn format_info(&self) -> FormatInfo {
+        pg_format_info(&self.name, &self.uuid, &self.dsn, self.volume_id)
+    }
+}
+
+impl Drop for PgTestVolume {
+    fn drop(&mut self) {
+        let _ = run_pg_async(async {
+            let (client, connection) = tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    studiofs_meta::MetaError::Storage(format!("postgres connect failed: {e}"))
+                })?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
+                .await
+                .map_err(|e| {
+                    studiofs_meta::MetaError::Storage(format!("postgres cleanup failed: {e}"))
+                })?;
+            conn_task.abort();
+            Ok(())
+        });
+    }
+}
+
+#[derive(Default)]
+struct SpyInvalidator {
+    seen: Mutex<Vec<u64>>,
+}
+
+impl SpyInvalidator {
+    fn snapshot(&self) -> Vec<u64> {
+        self.seen.lock().clone()
+    }
+
+    fn clear(&self) {
+        self.seen.lock().clear();
+    }
+}
+
+impl KernelInvalidator for SpyInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.seen.lock().push(ino);
+    }
+}
+
+fn reopen_vfs(db_path: &std::path::Path, cache_dir: &std::path::Path) -> Arc<StudioVfs> {
+    let meta = Arc::new(RedbMetaEngine::open(db_path).expect("reopen RedbMetaEngine"));
+    let format_info = meta.get_format_info().expect("reload format info");
+    make_vfs_with_meta(
+        meta,
+        &format_info,
+        cache_dir.to_str().expect("cache path utf-8"),
+    )
+}
+
+fn import_remote_snapshot(
+    source: &RedbMetaEngine,
+    target: &RedbMetaEngine,
+    format_info: &FormatInfo,
+) {
+    let snapshot = source
+        .export_remote_snapshot()
+        .expect("export remote snapshot");
+    target
+        .import_snapshot(&snapshot)
+        .expect("import remote snapshot");
+    target
+        .set_format_info(format_info)
+        .expect("reset imported format info");
+}
+
 /// Ensure the test bucket exists.
 async fn ensure_bucket() {
     use aws_sdk_s3::Client as S3Client;
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
-    let endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
-    let bucket = std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into());
-    let access_key =
-        std::env::var("STUDIOFS_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
-    let secret_key =
-        std::env::var("STUDIOFS_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let bucket = test_env_var("STUDIOFS_MINIO_BUCKET", "studiofs-test");
+    let access_key = test_env_var("STUDIOFS_MINIO_ACCESS_KEY", "minioadmin");
+    let secret_key = test_env_var("STUDIOFS_MINIO_SECRET_KEY", "minioadmin");
 
     let builder = S3::default()
         .endpoint(&endpoint)
@@ -202,6 +544,67 @@ async fn wait_until_absent(ds: &DataStore, path: &str, timeout: Duration) -> boo
     }
 }
 
+async fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn seed_committed_file(
+    meta: &Arc<RedbMetaEngine>,
+    format_info: &FormatInfo,
+    name: &[u8],
+    payload: &[u8],
+) -> (u64, Vec<(u32, BlockRef)>) {
+    let attr = meta.create_file(1, name, 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+    let mut file_attr = meta.get_attr(ino).unwrap();
+    file_attr.size = payload.len() as u64;
+    meta.set_attr(&file_attr).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let block_count = payload.len().div_ceil(block_size);
+    let object_ids = meta.next_block_ids(block_count as u32).unwrap();
+    let store = DataStore::new(&DataStoreConfig::from(format_info)).unwrap();
+
+    for (block_index, chunk) in payload.chunks(block_size).enumerate() {
+        let object_id = object_ids[block_index];
+        let key = format_object_key(&format_info.data_prefix, object_id);
+        let object_bytes = Bytes::from(create_object(chunk).unwrap());
+        store.put_by_key(&key, object_bytes).await.unwrap();
+
+        let block_ref = if chunk.len() == block_size {
+            BlockRef::new_full(object_id, chunk.len() as u32)
+        } else {
+            BlockRef::new_partial(object_id, chunk.len() as u32)
+        };
+        meta.set_file_block(ino, block_index as u32, &block_ref)
+            .unwrap();
+        assert!(
+            meta.commit_uploaded_block(
+                ino,
+                block_index as u32,
+                file_attr.content_epoch,
+                &block_ref
+            )
+            .unwrap(),
+            "seeded committed block should satisfy metadata preconditions"
+        );
+    }
+
+    (ino, meta.get_file_blocks(ino).unwrap())
+}
+
 fn wait_until_blocks(
     vfs: &Arc<StudioVfs>,
     ino: u64,
@@ -244,121 +647,6 @@ fn wait_until_n_blocks(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-fn nats_test_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-struct EnvVarRestore {
-    key: &'static str,
-    old: Option<String>,
-}
-
-impl EnvVarRestore {
-    fn set(key: &'static str, value: &str) -> Self {
-        let old = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, old }
-    }
-}
-
-impl Drop for EnvVarRestore {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(v) = &self.old {
-                std::env::set_var(self.key, v);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
-async fn ensure_nats(url: &str) -> bool {
-    match tokio::time::timeout(Duration::from_secs(2), async_nats::connect(url)).await {
-        Ok(Ok(client)) => {
-            drop(client);
-            true
-        }
-        _ => false,
-    }
-}
-
-async fn wait_until<F>(timeout: Duration, mut cond: F) -> bool
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn block_cache_path(cache_dir: &Path, object_id: u64) -> PathBuf {
-    let shard = (object_id >> 56) as u8;
-    cache_dir
-        .join("blocks")
-        .join(format!("{:02x}", shard))
-        .join(format!("{:016x}.block", object_id))
-}
-
-struct TonboTestClient {
-    _tmp: tempfile::TempDir,
-    cache_dir: PathBuf,
-    vfs: Arc<StudioVfs>,
-}
-
-fn make_tonbo_test_client(format_info: &FormatInfo, label: &str) -> TonboTestClient {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join(format!("meta-{label}.redb"));
-
-    let seed = RedbMetaEngine::open(&db_path).expect("failed to open seed RedbMetaEngine");
-    seed.init_root(0, 0)
-        .expect("failed to initialize root inode");
-    seed.set_format_info(format_info)
-        .expect("failed to set tonbo format info");
-    drop(seed);
-
-    let meta = TonboMetaEngine::open(&db_path).expect("failed to open TonboMetaEngine");
-    let data_config = DataStoreConfig::from(format_info);
-    let cache_dir = tmp.path().join(format!("cache-{label}"));
-    let vfs = StudioVfs::new(
-        meta,
-        &data_config,
-        cache_dir.to_str().unwrap(),
-        512 * 1024 * 1024,
-        256 * 1024 * 1024,
-    )
-    .expect("failed to create tonbo StudioVfs");
-
-    TonboTestClient {
-        _tmp: tmp,
-        cache_dir,
-        vfs,
-    }
-}
-
-fn make_tuned_tonbo_format_info(volume_suffix: &str) -> FormatInfo {
-    let mut info = make_format_info(volume_suffix);
-    info.block_size = 64 * 1024;
-    info.metadata.backend = MetadataBackend::Tonbo;
-    info.metadata.cache_ttl_secs = 300;
-    info.metadata.flush_interval_secs = 600;
-    // Keep auto-flush effectively disabled in these NATS tests so each scenario
-    // publishes one explicit, complete metadata snapshot at controlled points.
-    info.metadata.flush_ops_threshold = 1_000_000;
-    info.metadata.flush_bytes_threshold = 1_000_000_000;
-    info
 }
 
 // =============================================================================
@@ -672,6 +960,8 @@ async fn test_pending_deletions_gc() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "gc");
+    let info = vfs.meta().get_format_info().unwrap();
+    let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
 
     let attr = vfs.create(1, b"gc_test.txt", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -685,33 +975,43 @@ async fn test_pending_deletions_gc() {
         .expect("Should have 1 block after initial write");
     assert_eq!(blocks_before.len(), 1);
     let old_block_id = blocks_before[0].1.object_id;
+    let old_key = format_object_key(&info.data_prefix, old_block_id);
 
-    // Overwrite with new data (should mark old block for deletion)
+    // Under the committed/overlay model, the old block becomes GC-eligible
+    // only after it has actually been uploaded.
+    assert!(
+        wait_until_exists(&ds, &old_key, Duration::from_secs(20)).await,
+        "initial object should be uploaded before overwrite GC check"
+    );
+
+    // Overwrite with new data. The displaced old block should be marked for
+    // deletion once the replacement upload commits.
     vfs.write(ino, 0, b"new data here!!").await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Wait for the overwrite to be flushed — the new block will have a
-    // different object_id, so poll until the block ref changes.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
-            && !blocks.is_empty()
-            && blocks[0].1.object_id != old_block_id
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Timed out waiting for overwrite flush"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Verify old block is in pending deletions
-    let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
-        pending.iter().any(|(id, _)| *id == old_block_id),
-        "Old block should be in pending deletions"
+        wait_until(Duration::from_secs(20), || {
+            let attr = vfs.meta().get_attr(ino).unwrap();
+            attr.upload_state == UploadState::Ready
+                && attr.committed_content_epoch == attr.content_epoch
+                && vfs
+                    .meta()
+                    .get_file_blocks(ino)
+                    .unwrap()
+                    .first()
+                    .is_some_and(|(_, block)| block.object_id != old_block_id)
+        })
+        .await,
+        "overwrite GC check should begin only after the replacement incarnation is fully published"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let pending = vfs.meta().get_pending_deletions().unwrap();
+            pending.iter().any(|(id, _)| *id == old_block_id)
+        })
+        .await,
+        "old committed block should eventually enter pending deletions"
     );
 
     // Verify new block is different
@@ -965,8 +1265,7 @@ fn test_crash_recovery_replays_pending_journal() {
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
-    let online_endpoint =
-        std::env::var("STUDIOFS_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let online_endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
     let online_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     meta.set_format_info(&online_info).unwrap();
 
@@ -1003,12 +1302,3739 @@ fn test_crash_recovery_replays_pending_journal() {
     let pending_after = std::fs::read_dir(&pending_dir)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "journal"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pending"))
         .count();
     assert_eq!(
         pending_after, 0,
-        "pending journals must be cleaned up after recovery"
+        "pending upload journals must be cleaned up after recovery"
     );
+}
+
+#[test]
+fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+
+    let volume_suffix = format!("spill-crash-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x11u8; 512 * 1024];
+    let replacement_payload = vec![0x22u8; baseline_payload.len()];
+    let mut ino = 0u64;
+    let mut baseline_object_id = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("expected committed block refs for baseline payload");
+            baseline_object_id = blocks[0].1.object_id;
+
+            let ds = DataStore::new(&data_config).unwrap();
+            let key = format_object_key(&format_info.data_prefix, baseline_object_id);
+            assert!(
+                wait_until_exists(&ds, &key, Duration::from_secs(15)).await,
+                "baseline object should be uploaded before overwrite crash test"
+            );
+
+            vfs.shutdown(Duration::from_secs(15)).await;
+        });
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_fetch_attempts = EnvRestore {
+        key: "STUDIOFS_FETCH_MAX_ATTEMPTS",
+        old: std::env::var("STUDIOFS_FETCH_MAX_ATTEMPTS").ok(),
+    };
+    let _restore_fetch_timeout = EnvRestore {
+        key: "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
+        old: std::env::var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS").ok(),
+    };
+    let _restore_upload_attempts = EnvRestore {
+        key: "STUDIOFS_UPLOAD_MAX_ATTEMPTS",
+        old: std::env::var("STUDIOFS_UPLOAD_MAX_ATTEMPTS").ok(),
+    };
+    let _restore_upload_timeout = EnvRestore {
+        key: "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
+        old: std::env::var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        // Keep this regression deterministic and fast when it accidentally
+        // falls back to remote fetch/upload paths.
+        std::env::set_var("STUDIOFS_FETCH_MAX_ATTEMPTS", "1");
+        std::env::set_var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS", "2");
+        std::env::set_var("STUDIOFS_UPLOAD_MAX_ATTEMPTS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "2");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let before = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(
+                before.len(),
+                1,
+                "baseline file should have one committed block"
+            );
+            assert_eq!(
+                before[0].1.object_id, baseline_object_id,
+                "baseline committed block must remain visible before overwrite"
+            );
+
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let after = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(
+                after[0].1.object_id, baseline_object_id,
+                "spill-backed overwrite must not advance metadata before simulated crash"
+            );
+            assert!(
+                segment_file_count(&spill_dir) > 0,
+                "flush should leave at least one ingress segment on disk before crash"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    assert!(
+        segment_file_count(&spill_dir) > 0,
+        "simulated crash should leave ingress segments for restart recovery"
+    );
+    let blocks_after_crash = meta.get_file_blocks(ino).unwrap();
+    assert_eq!(
+        blocks_after_crash[0].1.object_id, baseline_object_id,
+        "metadata should still point at baseline block after crash"
+    );
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let blocks = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(
+                blocks[0].1.object_id, baseline_object_id,
+                "restart should not require metadata flush before serving recovered spill"
+            );
+
+            let data = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(
+                data.as_ref(),
+                replacement_payload.as_slice(),
+                "read-after-restart should serve bytes from recovered spill overlay"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn writer_reads_full_file_before_any_remote_commit() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_disable = EnvRestore {
+        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
+        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
+    };
+    let _restore_endpoint = EnvRestore {
+        key: "STUDIOFS_MINIO_ENDPOINT",
+        old: std::env::var("STUDIOFS_MINIO_ENDPOINT").ok(),
+    };
+
+    unsafe {
+        // Keep writes local-only: acceptance into cache + WAL, no slab drain.
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("writer-full-local-read-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0xA1u8; 1024 * 1024];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"local-full-read.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert!(
+            blocks.is_empty(),
+            "metadata should remain empty while background slab flusher is disabled"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "same mounted writer should read full file before any remote commit"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn writer_recovers_local_file_after_restart_before_upload_complete() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_disable = EnvRestore {
+        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
+        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
+    };
+
+    unsafe {
+        // Force spill path and avoid background drain so acceptance is WAL-backed.
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("writer-restart-before-upload-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0xB2u8; 2 * 1024 * 1024];
+    let mut inode = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"restart-local.bin", 0, 0, 0o644).unwrap();
+            inode = attr.ino;
+            vfs.write(inode, 0, &payload).await.unwrap();
+            vfs.flush(inode).await.unwrap();
+            let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(
+                read.as_ref(),
+                payload.as_slice(),
+                "writer should read accepted content before upload completion"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta,
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(
+                read.as_ref(),
+                payload.as_slice(),
+                "restarted instance should recover from WAL-backed ingress"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn remote_clients_see_uploading_marker_without_precise_progress() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-remote-uploading-marker-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x11u8; 512 * 1024];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        let attr = writer_vfs
+            .create(1, b"uploading-remote.txt", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+        writer_vfs.flush(attr.ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let remote_attr = remote_vfs.lookup(1, b"uploading-remote.txt").unwrap();
+        assert_eq!(remote_attr.ino, attr.ino);
+        assert_eq!(remote_attr.size, 0);
+        assert_eq!(remote_attr.committed_size, 0);
+        assert_eq!(remote_attr.upload_state, UploadState::Uploading);
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-remote-open-uploading-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x22u8; 256 * 1024];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        let attr = writer_vfs
+            .create(1, b"remote-open-uploading.txt", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+        writer_vfs.flush(attr.ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let remote_attr = remote_vfs.lookup(1, b"remote-open-uploading.txt").unwrap();
+        assert!(matches!(
+            remote_vfs.open_file(remote_attr.ino, OpenFlags::RDONLY, false),
+            Err(VfsError::WouldBlock)
+        ));
+        assert!(matches!(
+            remote_vfs
+                .read(remote_attr.ino, 0, payload.len() as u32)
+                .await,
+            Err(VfsError::WouldBlock)
+        ));
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn remote_clients_keep_previous_committed_version_during_update() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-remote-old-committed-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&online_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x33u8; block_size];
+    let replacement_payload = vec![0x44u8; block_size];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &writer_meta,
+                &online_info,
+                b"remote-old.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &offline_info, &writer_cache_str);
+        writer_vfs
+            .write(ino, 0, &replacement_payload)
+            .await
+            .unwrap();
+        writer_vfs.flush(ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &online_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &online_info, &remote_cache_str);
+        let remote_attr = remote_vfs.lookup(1, b"remote-old.bin").unwrap();
+        assert_eq!(remote_attr.upload_state, UploadState::Updating);
+        assert_eq!(remote_attr.committed_size, baseline_payload.len() as u64);
+        let read = remote_vfs
+            .read(remote_attr.ino, 0, baseline_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.as_ref(),
+            baseline_payload.as_slice(),
+            "remote client must keep reading committed content while writer update is pending"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn atomic_switch_to_new_incarnation_after_full_commit() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_minio_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "250");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr08-atomic-switch-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let baseline_payload = vec![0x55u8; block_size * 2];
+    let mut replacement_payload = vec![0x66u8; block_size * 2];
+    replacement_payload[block_size..].fill(0x77);
+    let mut ino = 0u64;
+    let mut baseline_blocks = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, seeded_blocks) = seed_committed_file(
+                &writer_meta,
+                &format_info,
+                b"atomic-switch.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+            baseline_blocks = seeded_blocks;
+        });
+        rt.shutdown_background();
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        writer_vfs.write(ino, 0, &replacement_payload).await.unwrap();
+        writer_vfs.flush(ino).await.unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        {
+            let remote_vfs =
+                make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+            let remote_attr = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
+            assert_eq!(remote_attr.upload_state, UploadState::Updating);
+            let remote_blocks_before = remote_meta.get_file_blocks(ino).unwrap();
+            assert_eq!(remote_blocks_before, baseline_blocks);
+            let read_before = remote_vfs
+                .read(ino, 0, baseline_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(read_before.as_ref(), baseline_payload.as_slice());
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                writer_vfs.pending_uploads_for_inode(ino).is_empty()
+                    && writer_meta
+                        .get_attr(ino)
+                        .map(|attr| attr.upload_state == UploadState::Ready)
+                        .unwrap_or(false)
+            })
+            .await,
+            "writer should publish the new incarnation after the full upload set completes"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+            let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+            let remote_attr_after = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
+            let remote_blocks_after = remote_meta.get_file_blocks(ino).unwrap();
+            let read_after = remote_vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+
+            if remote_attr_after.upload_state == UploadState::Ready
+                && remote_blocks_after.len() == 2
+                && remote_blocks_after != baseline_blocks
+                && read_after.as_ref() == replacement_payload.as_slice()
+            {
+                break;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "remote view should switch atomically from old committed incarnation to the fully published new incarnation"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_endpoint = EnvRestore {
+        key: "STUDIOFS_MINIO_ENDPOINT",
+        old: std::env::var("STUDIOFS_MINIO_ENDPOINT").ok(),
+    };
+    let _restore_disable = EnvRestore {
+        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
+        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
+    };
+    let _restore_fetch_attempts = EnvRestore {
+        key: "STUDIOFS_FETCH_MAX_ATTEMPTS",
+        old: std::env::var("STUDIOFS_FETCH_MAX_ATTEMPTS").ok(),
+    };
+    let _restore_fetch_timeout = EnvRestore {
+        key: "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
+        old: std::env::var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS").ok(),
+    };
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+    let volume_suffix = format!("crash-remote-fetch-{}", std::process::id());
+    let baseline_payload = vec![0xC1u8; 512 * 1024];
+    let replacement_payload = vec![0xC2u8; 512 * 1024];
+    let mut ino = 0u64;
+    let mut baseline_object_id = 0u64;
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    let online_endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let mut format_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
+    let data_config_online = DataStoreConfig::from(&format_info);
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_FETCH_MAX_ATTEMPTS", "1");
+        std::env::set_var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS", "2");
+    }
+
+    {
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_online,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let attr = vfs
+                .create(1, b"remote-fetch-block.bin", 0, 0, 0o644)
+                .unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            let baseline = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("expected committed baseline block refs");
+            baseline_object_id = baseline[0].1.object_id;
+            let ds = DataStore::new(&data_config_online).unwrap();
+            let key = format_object_key(&format_info.data_prefix, baseline_object_id);
+            assert!(
+                wait_until_exists(&ds, &key, Duration::from_secs(15)).await,
+                "baseline object should exist before replacement spill replay test"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    }
+
+    let data_config_offline = DataStoreConfig::from(&format_info);
+    {
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            assert!(
+                segment_file_count(&spill_dir) > 0,
+                "replacement should be present in ingress spill before restart"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    {
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+            assert_eq!(
+                blocks[0].1.object_id, baseline_object_id,
+                "metadata should still point to baseline block"
+            );
+            let read = tokio::time::timeout(
+                Duration::from_secs(10),
+                vfs.read(ino, 0, replacement_payload.len() as u32),
+            )
+            .await
+            .expect("read should complete from local ingress without remote fetch")
+            .unwrap();
+            assert_eq!(
+                read.as_ref(),
+                replacement_payload.as_slice(),
+                "read after restart with offline endpoint should use recovered spill overlay"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    old: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            old: std::env::var(key).ok(),
+        }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.old {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+#[test]
+fn new_file_enters_uploading_state() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-new-uploading-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"pending-new.bin", 0, 0, 0o644).unwrap();
+        let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
+        assert_eq!(state.upload_state, VfsUploadState::Uploading);
+        assert!(
+            state.committed_incarnation.is_none(),
+            "brand-new file must not expose a committed incarnation yet"
+        );
+        let pending = state
+            .pending_incarnation
+            .expect("brand-new file must enter a pending incarnation");
+        assert_eq!(pending.size, 0);
+        assert_eq!(pending.base_size, 0);
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn committed_file_mutation_enters_updating_state() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-updating-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x41u8; 512 * 1024];
+    let patch = vec![0x42u8; 4096];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"updating.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("baseline file must reach committed block refs before mutation");
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    meta.get_attr(ino)
+                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .unwrap_or(false)
+                })
+                .await,
+                "baseline file must become committed before entering updating state"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            vfs.write(ino, 0, &patch).await.unwrap();
+
+            let state = vfs.inode_incarnation_state(ino).await.unwrap();
+            assert_eq!(state.upload_state, VfsUploadState::Updating);
+            let committed = state
+                .committed_incarnation
+                .expect("committed file must retain committed incarnation during local mutation");
+            let pending = state
+                .pending_incarnation
+                .expect("mutated committed file must expose a pending incarnation");
+            assert_eq!(committed.size, baseline_payload.len() as u64);
+            assert_eq!(pending.size, baseline_payload.len() as u64);
+            assert_eq!(pending.base_size, committed.size);
+            assert!(
+                pending.content_epoch > committed.content_epoch,
+                "updating state must advance into a newer pending incarnation"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn local_reads_prefer_pending_overlay_over_committed_base() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-overlay-read-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x31u8; 512 * 1024];
+    let patch = vec![0x7Au8; 8192];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"overlay-read.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("baseline file must commit before overlay read test");
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    meta.get_attr(ino)
+                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .unwrap_or(false)
+                })
+                .await,
+                "baseline file must become committed before overlay read test"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            vfs.write(ino, 0, &patch).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let mut expected = baseline_payload.clone();
+            expected[..patch.len()].copy_from_slice(&patch);
+            let read = vfs.read(ino, 0, expected.len() as u32).await.unwrap();
+            assert_eq!(
+                read.as_ref(),
+                expected.as_slice(),
+                "local read must apply pending overlay bytes over the committed base"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr11-pending-read-fast-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let mut payload = vec![0x41u8; block_size * 2];
+    payload[block_size..].fill(0x62u8);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs
+            .create(1, b"pending-fast-read.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let ingress = vfs.ingress_stats();
+                vfs.live_extent_records_for_inode(attr.ino).len() == 2
+                    && vfs.pending_uploads_for_inode(attr.ino).len() == 2
+                    && ingress.spill_records == 0
+                    && ingress.dirty_mem_blocks == 0
+            })
+            .await,
+            "pending file should become fully materialized locally before any upload succeeds"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "local read must succeed from materialized pending extents even after spill is gone"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr11-partial-overwrite-base-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let baseline = vec![0x33u8; block_size];
+    let patch_offset = 128 * 1024usize;
+    let patch = vec![0x7Au8; 8192];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs
+            .create(1, b"pending-partial-base.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &baseline).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let ingress = vfs.ingress_stats();
+                vfs.live_extent_records_for_inode(attr.ino).len() == 1
+                    && vfs.pending_uploads_for_inode(attr.ino).len() == 1
+                    && ingress.spill_records == 0
+            })
+            .await,
+            "baseline pending block must be materialized before the follow-up partial write"
+        );
+
+        vfs.write(attr.ino, patch_offset as u64, &patch).await.unwrap();
+
+        let mut expected = baseline.clone();
+        expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+        let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            expected.as_slice(),
+            "follow-up write must load the materialized pending block as its base, not the committed view"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn single_inode_never_has_two_pending_incarnations() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-single-pending-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x51u8; 512 * 1024];
+    let patch_a = vec![0x61u8; 4096];
+    let patch_b = vec![0x71u8; 4096];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"single-pending.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &baseline_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+                .expect("baseline file must commit before pending incarnation test");
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    meta.get_attr(ino)
+                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .unwrap_or(false)
+                })
+                .await,
+                "baseline file must become committed before pending incarnation test"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &patch_a).await.unwrap();
+            let first = vfs
+                .inode_incarnation_state(ino)
+                .await
+                .unwrap()
+                .pending_incarnation
+                .expect("first mutation must create one pending incarnation");
+
+            vfs.write(ino, 64 * 1024, &patch_b).await.unwrap();
+            let second_state = vfs.inode_incarnation_state(ino).await.unwrap();
+            let second = second_state
+                .pending_incarnation
+                .expect("second mutation must reuse the same pending incarnation");
+
+            assert_eq!(second_state.upload_state, VfsUploadState::Updating);
+            assert_eq!(
+                first.content_epoch, second.content_epoch,
+                "multiple writes to the same inode before commit must stay in one pending incarnation"
+            );
+            assert_eq!(second.base_size, baseline_payload.len() as u64);
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn large_file_unlink_cancels_pending_uploads() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr05-unlink-cancel-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let payload = vec![0x44u8; block_size * 2];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"unlink-cancel.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+            })
+            .await,
+            "two full-block uploads should be pending before unlink"
+        );
+
+        vfs.unlink(1, b"unlink-cancel.bin").unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    && vfs.upload_stats().canceled_deleted >= 2
+            })
+            .await,
+            "unlink must cancel the whole pending incarnation and stop useful upload work"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "unlink must clear live extent identities for the inode"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn large_file_partial_overwrite_reuploads_only_touched_extents() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr05-partial-overwrite-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x21u8; block_size * 3];
+    let patch_a = vec![0xA1u8; block_size];
+    let patch_b = vec![0xB2u8; block_size];
+    let mut ino = 0u64;
+    let mut baseline_blocks = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, seeded_blocks) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"partial-overwrite.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+            baseline_blocks = seeded_blocks;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &patch_a).await.unwrap();
+            vfs.write(ino, (block_size * 2) as u64, &patch_b)
+                .await
+                .unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.live_extent_records_for_inode(ino).len() == 2
+                })
+                .await,
+                "only the two touched extents should remain live for re-upload"
+            );
+            let live_extents = vfs.live_extent_records_for_inode(ino);
+            assert_eq!(live_extents.len(), 2);
+            assert_eq!(live_extents[0].0, 0);
+            assert_eq!(live_extents[1].0, 2);
+
+            let after_blocks = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(after_blocks.len(), 3);
+            assert_ne!(after_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
+            assert_eq!(after_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
+            assert_ne!(after_blocks[2].1.object_id, baseline_blocks[2].1.object_id);
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn stale_upload_completion_is_ignored_after_extent_invalidate() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr05-stale-completion-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_online = DataStoreConfig::from(&online_info);
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x11u8; block_size];
+    let patch_a = vec![0x22u8; block_size];
+    let patch_b = vec![0x33u8; block_size];
+    let mut ino = 0u64;
+    let mut first_extent_object_id = 0u64;
+    let mut second_extent_object_id = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"stale-completion.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &patch_a).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.live_extent_records_for_inode(ino).is_empty()
+                })
+                .await,
+                "first patched extent should become live before supersession"
+            );
+            first_extent_object_id = vfs.live_extent_records_for_inode(ino)[0].1;
+
+            vfs.write(ino, 0, &patch_b).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    let extents = vfs.live_extent_records_for_inode(ino);
+                    extents.len() == 1 && extents[0].1 != first_extent_object_id
+                })
+                .await,
+                "second patch should supersede the first extent identity"
+            );
+            second_extent_object_id = vfs.live_extent_records_for_inode(ino)[0].1;
+            assert_ne!(first_extent_object_id, second_extent_object_id);
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &online_info.endpoint);
+    }
+    meta.set_format_info(&online_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_online,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    vfs.pending_uploads_for_inode(ino).is_empty()
+                        && vfs.upload_stats().canceled_stale > 0
+                })
+                .await,
+                "stale superseded upload must be canceled instead of committing"
+            );
+            let blocks = meta.get_file_blocks(ino).unwrap();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].1.object_id, second_extent_object_id);
+            let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+            assert_eq!(
+                read.as_ref(),
+                patch_b.as_slice(),
+                "latest patch must remain authoritative after stale upload recovery"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn large_file_rename_does_not_restart_or_duplicate_uploads() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr05-rename-neutral-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let payload = vec![0x66u8; block_size * 2];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"rename-source.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+            })
+            .await,
+            "rename neutrality test needs pending uploads in flight"
+        );
+        let pending_before = vfs.pending_uploads_for_inode(attr.ino);
+        let extents_before = vfs.live_extent_records_for_inode(attr.ino);
+
+        vfs.rename(1, b"rename-source.bin", 1, b"rename-dest.bin")
+            .unwrap();
+
+        let renamed = vfs.lookup(1, b"rename-dest.bin").unwrap();
+        assert_eq!(renamed.ino, attr.ino);
+        assert!(vfs.lookup(1, b"rename-source.bin").is_err());
+        assert_eq!(
+            vfs.pending_uploads_for_inode(attr.ino),
+            pending_before,
+            "rename must not restart or duplicate pending uploads"
+        );
+        assert_eq!(
+            vfs.live_extent_records_for_inode(attr.ino),
+            extents_before,
+            "rename must be namespace-only for live extent identity"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn update_manifest_reuses_untouched_committed_extents() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-manifest-reuse-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x31u8; block_size * 3];
+    let patch = vec![0xABu8; block_size];
+    let mut ino = 0u64;
+    let mut baseline_blocks = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, seeded_blocks) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"manifest-reuse.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+            baseline_blocks = seeded_blocks;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config_offline,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        vfs.write(ino, block_size as u64, &patch).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.live_extent_records_for_inode(ino).len() == 1
+            })
+            .await,
+            "single-block update should materialize exactly one live pending extent"
+        );
+
+        let visible_blocks = meta.get_file_blocks(ino).unwrap();
+        assert_eq!(visible_blocks.len(), 3);
+        assert_eq!(visible_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
+        assert_ne!(visible_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
+        assert_eq!(visible_blocks[2].1.object_id, baseline_blocks[2].1.object_id);
+
+        let read = vfs
+            .read(ino, block_size as u64, block_size as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.as_ref(),
+            patch.as_slice(),
+            "pending update manifest must expose the touched extent while preserving untouched committed refs"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn restart_replays_only_live_pending_extents() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-restart-live-only-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let first = vec![0x41u8; block_size];
+    let second = vec![0x52u8; block_size];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let attr = vfs
+                .create(1, b"restart-live-only.bin", 0, 0, 0o644)
+                .unwrap();
+            ino = attr.ino;
+
+            vfs.write(ino, 0, &first).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            vfs.write(ino, 0, &second).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+            assert_eq!(read.as_ref(), second.as_slice());
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            second.as_slice(),
+            "restart must replay the live pending extent before any remote activity"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(ino).len() == 1
+                    && vfs.live_extent_records_for_inode(ino).len() == 1
+            })
+            .await,
+            "replay should materialize only the last live pending extent for the block"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn recovered_pending_uploads_publish_new_file_after_restart() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("restart-publish-ready-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x6Du8; 512 * 1024];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let attr = vfs
+                .create(1, b"restart-publish-ready.bin", 0, 0, 0o644)
+                .unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 1
+                        && meta
+                            .get_attr(ino)
+                            .map(|attr| attr.upload_state == UploadState::Uploading)
+                            .unwrap_or(false)
+                })
+                .await,
+                "crash setup should leave one recovered upload journal entry for the new file"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                vfs.pending_uploads_for_inode(ino).is_empty()
+                    && meta
+                        .get_attr(ino)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.committed_content_epoch == attr.content_epoch
+                        })
+                        .unwrap_or(false)
+            })
+            .await,
+            "recovered uploads should publish the new file to Ready after restart"
+        );
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDONLY, false)
+            .expect("published file should no longer look locked after restart");
+        vfs.release_fh(fh).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn offline_s3_does_not_break_local_read_after_write() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-offline-local-read-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let mut payload = vec![0x61u8; block_size * 2];
+    payload[block_size..].fill(0x7Cu8);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let attr = vfs
+            .create(1, b"offline-local-read.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+            })
+            .await,
+            "offline S3 scenario needs local materialization and queued uploads"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "local read must succeed even while every upload is failing and requeuing"
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let read_again = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read_again.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn upload_completion_batching_does_not_change_visibility_contract() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_minio_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr06-upload-batching-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_online = DataStoreConfig::from(&online_info);
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x10u8; block_size * 2];
+    let mut replacement_payload = vec![0x90u8; block_size * 2];
+    replacement_payload[block_size..].fill(0xA5u8);
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"upload-batching.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 2
+                })
+                .await,
+                "offline phase should leave the whole replacement pending"
+            );
+
+            let read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(read.as_ref(), replacement_payload.as_slice());
+        });
+        rt.shutdown_background();
+    }
+
+    unsafe {
+        apply_test_online_minio_env();
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+    meta.set_format_info(&online_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_online,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(ino).is_empty()
+                })
+                .await,
+                "restart should recover the pending upload batch"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let read = vfs
+                    .read(ino, 0, replacement_payload.len() as u32)
+                    .await
+                    .unwrap();
+                if read.as_ref() == replacement_payload.as_slice() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "upload completion batching must not change the local visible file contents"
+                );
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+
+            loop {
+                let read = vfs
+                    .read(ino, 0, replacement_payload.len() as u32)
+                    .await
+                    .unwrap();
+                if read.as_ref() != replacement_payload.as_slice() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "upload completion batching must not change the local visible file contents"
+                    );
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                    continue;
+                }
+                if vfs.pending_uploads_for_inode(ino).is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pending uploads did not drain under sequential completion"
+                );
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+
+            let final_read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(final_read.as_ref(), replacement_payload.as_slice());
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn slow_s3_does_not_stall_local_reads_and_writes() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
+    let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
+    let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "128MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
+        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr10-slow-s3-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let backlog_payload = vec![0x41u8; block_size * 3];
+    let foreground_payload = vec![0x7Eu8; 256 * 1024];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let backlog = vfs.create(1, b"slow-backlog.bin", 0, 0, 0o644).unwrap();
+        vfs.write(backlog.ino, 0, &backlog_payload).await.unwrap();
+        vfs.flush(backlog.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(backlog.ino).len() == 3
+            })
+            .await,
+            "backlog file should queue uploads even while S3 is offline"
+        );
+
+        let started = Instant::now();
+        let foreground = vfs.create(1, b"foreground.bin", 0, 0, 0o644).unwrap();
+        vfs.write(foreground.ino, 0, &foreground_payload)
+            .await
+            .unwrap();
+        vfs.flush(foreground.ino).await.unwrap();
+        let read = tokio::time::timeout(
+            Duration::from_secs(2),
+            vfs.read(foreground.ino, 0, foreground_payload.len() as u32),
+        )
+        .await
+        .expect("foreground read timed out under slow/offline S3")
+        .unwrap();
+        assert_eq!(read.as_ref(), foreground_payload.as_slice());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "foreground write+flush+read should complete quickly despite failing uploads"
+        );
+
+        let stats = vfs.ingress_stats();
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "upload backlog alone should not create foreground backpressure waits"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn backpressure_only_on_local_budget_exhaustion() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
+    let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
+    let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
+
+    let roomy_tmp = tempfile::tempdir().unwrap();
+    let roomy_db = roomy_tmp.path().join("meta.redb");
+    let roomy_cache = roomy_tmp.path().join("cache");
+    let roomy_cache_str = roomy_cache.to_str().unwrap().to_string();
+    let roomy_suffix = format!("pr10-backpressure-roomy-{}", std::process::id());
+    let roomy_info = make_format_info_with_endpoint(&roomy_suffix, "http://127.0.0.1:59999");
+    let roomy_data = DataStoreConfig::from(&roomy_info);
+    let roomy_meta = Arc::new(RedbMetaEngine::open(&roomy_db).unwrap());
+    roomy_meta.init_root(0, 0).unwrap();
+    roomy_meta.set_format_info(&roomy_info).unwrap();
+    let payload = vec![0x55u8; roomy_info.block_size as usize];
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(3)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                roomy_meta.clone(),
+                &roomy_data,
+                &roomy_cache_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            for idx in 0..4 {
+                assert_eq!(
+                    vfs.ingress_pressure_for(payload.len()).lane,
+                    VfsIngressLane::Spill,
+                    "upload backlog should keep routing new writes to spill instead of backpressure"
+                );
+                let name = format!("spill-only-{idx}.bin");
+                let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                vfs.write(attr.ino, 0, &payload).await.unwrap();
+                vfs.flush(attr.ino).await.unwrap();
+            }
+
+            let stats = vfs.ingress_stats();
+            assert_eq!(
+                stats.write_backpressure_wait_ms, 0,
+                "slow/offline upload activity should not count as foreground backpressure"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    let tight_tmp = tempfile::tempdir().unwrap();
+    let tight_db = tight_tmp.path().join("meta.redb");
+    let tight_cache = tight_tmp.path().join("cache");
+    let tight_cache_str = tight_cache.to_str().unwrap().to_string();
+    let tight_suffix = format!("pr10-backpressure-tight-{}", std::process::id());
+    let tight_info = make_format_info_with_endpoint(&tight_suffix, "http://127.0.0.1:59999");
+    let tight_data = DataStoreConfig::from(&tight_info);
+    let tight_meta = Arc::new(RedbMetaEngine::open(&tight_db).unwrap());
+    tight_meta.init_root(0, 0).unwrap();
+    tight_meta.set_format_info(&tight_info).unwrap();
+    let tight_spill_bytes = tight_info.block_size as usize;
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", tight_spill_bytes.to_string());
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                tight_meta.clone(),
+                &tight_data,
+                &tight_cache_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let attr = vfs.create(1, b"budget-full.bin", 0, 0, 0o644).unwrap();
+            vfs.write(attr.ino, 0, &payload).await.unwrap();
+            vfs.flush(attr.ino).await.unwrap();
+
+            assert_eq!(
+                vfs.ingress_pressure_for(payload.len()).lane,
+                VfsIngressLane::Backpressure,
+                "foreground backpressure should appear only once local durable spill budget is actually full"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+fn single_large_file_upload_does_not_starve_small_foreground_io() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
+    let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "256MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "400");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let format_info = make_format_info("pr10-fair-upload");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+    let block_size = format_info.block_size as usize;
+    let mut large_payload = vec![0x11u8; block_size * 8];
+    for (index, chunk) in large_payload.chunks_mut(block_size).enumerate() {
+        chunk.fill(0x11u8.saturating_add(index as u8));
+    }
+    let small_payload = vec![0xA4u8; 128 * 1024];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(3)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let large = vfs.create(1, b"large-upload.bin", 0, 0, 0o644).unwrap();
+        vfs.write(large.ino, 0, &large_payload).await.unwrap();
+        vfs.flush(large.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(large.ino).len() >= 6
+            })
+            .await,
+            "large file should establish a backlog before the small file enters"
+        );
+
+        let small = vfs.create(1, b"small-upload.bin", 0, 0, 0o644).unwrap();
+        vfs.write(small.ino, 0, &small_payload).await.unwrap();
+        vfs.flush(small.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                vfs.meta()
+                    .get_attr(small.ino)
+                    .map(|attr| attr.upload_state == UploadState::Ready)
+                    .unwrap_or(false)
+                    && !vfs.pending_uploads_for_inode(large.ino).is_empty()
+            })
+            .await,
+            "small file should finish while the large upload backlog is still draining"
+        );
+
+        let read = vfs
+            .read(small.ino, 0, small_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(read.as_ref(), small_payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn recovery_after_offline_s3_preserves_local_accepted_view() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr10-recovery-offline-{}", std::process::id());
+    let online_info = make_format_info(&volume_suffix);
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    let block_size = online_info.block_size as usize;
+    let baseline_payload = vec![0x20u8; block_size * 2];
+    let mut replacement_payload = vec![0xB0u8; block_size * 2];
+    replacement_payload[block_size..].fill(0xC7u8);
+    let ino = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ino = rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"restart-offline.bin",
+                &baseline_payload,
+            )
+            .await;
+            seeded_ino
+        });
+        rt.shutdown_background();
+        ino
+    };
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+    }
+    meta.set_format_info(&offline_info).unwrap();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 2
+                })
+                .await,
+                "offline update should stay pending before restart"
+            );
+
+            let read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(read.as_ref(), replacement_payload.as_slice());
+        });
+        rt.shutdown_background();
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(
+                read.as_ref(),
+                replacement_payload.as_slice(),
+                "restart with offline S3 must preserve the accepted local view"
+            );
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(ino).is_empty()
+                })
+                .await,
+                "restart should recover the pending offline uploads"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+#[ignore]
+fn twenty_four_hour_soak_no_global_fs_stall() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
+    let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
+    let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "256MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
+        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
+    }
+
+    let iterations = std::env::var("STUDIOFS_SOAK_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(200);
+    let max_op_ms = std::env::var("STUDIOFS_SOAK_MAX_OP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1500);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr10-soak-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let backlog_payload = vec![0x33u8; block_size * 6];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let backlog = vfs.create(1, b"soak-backlog.bin", 0, 0, 0o644).unwrap();
+        vfs.write(backlog.ino, 0, &backlog_payload).await.unwrap();
+        vfs.flush(backlog.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(backlog.ino).len() == 6
+            })
+            .await,
+            "soak needs a standing upload backlog"
+        );
+
+        for idx in 0..iterations {
+            let name = format!("soak-{idx:04}.bin");
+            let payload = vec![(idx % 251) as u8; 256 * 1024];
+            let read = tokio::time::timeout(Duration::from_millis(max_op_ms), async {
+                let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                vfs.write(attr.ino, 0, &payload).await.unwrap();
+                vfs.flush(attr.ino).await.unwrap();
+
+                loop {
+                    match vfs.read(attr.ino, 0, payload.len() as u32).await {
+                        Ok(read) => return read,
+                        Err(VfsError::WouldBlock) => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(err) => {
+                            panic!("unexpected soak read error on iteration {idx}: {err:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("iteration {idx} exceeded the no-stall budget of {max_op_ms}ms")
+            });
+            assert_eq!(read.as_ref(), payload.as_slice());
+        }
+
+        let stats = vfs.ingress_stats();
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "soak should not accumulate foreground backpressure from upload stall alone"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_prefers_spill_before_backpressure() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-preferred-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let attr = vfs.create(1, b"spill-first.bin", 0, 0, 0o644).unwrap();
+        let payload = vec![0x33u8; 512 * 1024];
+
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill,
+            "with RAM budget exhausted by config and spill budget available, acceptance should prefer spill"
+        );
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.spill_records > 0,
+            "flush should materialize at least one accepted spill record"
+        );
+        assert!(
+            stats.spill_bytes >= payload.len(),
+            "spill bytes should include the flushed payload"
+        );
+        assert!(
+            stats.forced_spill_blocks > 0,
+            "forced spill counter should advance when RAM budget is too small"
+        );
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "foreground should not accumulate backpressure wait while spill still has headroom"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(1).lane,
+            VfsIngressLane::Spill,
+            "small follow-up payloads should still prefer spill before entering backpressure"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_flush = EnvRestore {
+        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
+        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
+    };
+    let _restore_assist = EnvRestore {
+        key: "STUDIOFS_FOREGROUND_DRAIN_ASSIST",
+        old: std::env::var("STUDIOFS_FOREGROUND_DRAIN_ASSIST").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
+        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
+        std::env::set_var("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-backpressure-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let attr = vfs
+            .create(1, b"spill-backpressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x44u8; 512 * 1024];
+
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill,
+            "before spill is populated, the next payload should still fit into spill"
+        );
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.spill_bytes >= payload.len(),
+            "first payload should consume the configured spill budget"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Backpressure,
+            "once spill is full and RAM is over budget, the next payload should report backpressure"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-wait-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let payload = vec![0x55u8; 512 * 1024];
+
+        let first = vfs.create(1, b"spill-full.bin", 0, 0, 0o644).unwrap();
+        vfs.write(first.ino, 0, &payload).await.unwrap();
+        vfs.flush(first.ino).await.unwrap();
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Backpressure,
+            "after the first spill-backed flush, the same payload should hit backpressure"
+        );
+
+        let blocked_vfs = vfs.clone();
+        let blocked = tokio::spawn(async move {
+            let second = blocked_vfs.create(1, b"blocked.bin", 0, 0, 0o644).unwrap();
+            blocked_vfs.write(second.ino, 0, &payload).await.unwrap();
+            match tokio::time::timeout(Duration::from_secs(30), blocked_vfs.flush(second.ino)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!("flush failed: {e}"),
+                Err(_) => {
+                    let stats = blocked_vfs.ingress_stats();
+                    panic!(
+                        "flush timed out after 30s: dirty_mem={} spill={} wait_ms={}",
+                        stats.dirty_mem_bytes, stats.spill_bytes, stats.write_backpressure_wait_ms
+                    );
+                }
+            }
+        });
+        blocked.await.unwrap();
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.write_backpressure_wait_ms > 0,
+            "foreground backpressure wait time should accumulate before the drain path releases spill capacity"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_flush = EnvRestore {
+        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
+        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
+    };
+    let _restore_disable_flush = EnvRestore {
+        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
+        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "4MB");
+        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "5000");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("spill-multi-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let writer_count = 4usize;
+        let payload = vec![0x66u8; 256 * 1024];
+
+        let mut tasks = Vec::new();
+        for idx in 0..writer_count {
+            let writer_vfs = vfs.clone();
+            let payload = payload.clone();
+            tasks.push(tokio::spawn(async move {
+                let name = format!("spill-writer-{idx}.bin");
+                let attr = writer_vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+                writer_vfs.flush(attr.ino).await.unwrap();
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let stats = vfs.ingress_stats();
+        assert!(
+            stats.spill_records >= writer_count,
+            "concurrent writers should leave accepted spill-backed state while background drain is disabled"
+        );
+        assert!(
+            stats.forced_spill_blocks >= writer_count as u64,
+            "each writer should contribute to forced spill accounting under RAM pressure"
+        );
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "foreground writers should not block while spill still has available capacity"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill,
+            "after concurrent accepted writes, spill should still be preferred until its budget is exhausted"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_ingress_multi_writer_spill_recovers_after_crash() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    let _restore_flush = EnvRestore {
+        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
+        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
+    };
+    let _restore_disable_flush = EnvRestore {
+        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
+        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "5000");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+    let volume_suffix = format!("spill-multi-crash-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let writer_count = 3usize;
+    let mut files: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(4)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            ensure_bucket().await;
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            let mut tasks = Vec::new();
+            for idx in 0..writer_count {
+                let writer_vfs = vfs.clone();
+                tasks.push(tokio::spawn(async move {
+                    let payload = vec![(0x70 + idx) as u8; 256 * 1024];
+                    let name = format!("spill-crash-{idx}.bin");
+                    let attr = writer_vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+                    writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+                    writer_vfs.flush(attr.ino).await.unwrap();
+                    (attr.ino, payload)
+                }));
+            }
+
+            for task in tasks {
+                files.push(task.await.unwrap());
+            }
+
+            assert!(
+                segment_file_count(&spill_dir) > 0,
+                "segment directory should contain accepted ingress records before crash"
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    assert!(
+        segment_file_count(&spill_dir) > 0,
+        "simulated crash should leave ingress segments for accepted writers"
+    );
+    unsafe {
+        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            ensure_bucket().await;
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+
+            for (ino, payload) in &files {
+                let data = vfs.read(*ino, 0, payload.len() as u32).await.unwrap();
+                assert_eq!(
+                    data.as_ref(),
+                    payload.as_slice(),
+                    "read-after-restart should return recovered spill-backed bytes for every file"
+                );
+            }
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
+#[ignore]
+fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(v) = &self.old {
+                    std::env::set_var(self.key, v);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    let _restore_dirty = EnvRestore {
+        key: "STUDIOFS_MAX_DIRTY_BYTES",
+        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
+    };
+    let _restore_spill = EnvRestore {
+        key: "STUDIOFS_MAX_SPILL_BYTES",
+        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
+    };
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+
+    let volume_suffix = format!("segment-crash-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x77u8; 512 * 1024];
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            tokio::time::timeout(Duration::from_secs(15), vfs.write(ino, 0, &payload))
+                .await
+                .expect("write timed out in crash-recovery regression")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(15), vfs.flush(ino))
+                .await
+                .expect("flush timed out in crash-recovery regression")
+                .unwrap();
+        });
+        rt.shutdown_background();
+    }
+
+    for entry in std::fs::read_dir(&spill_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "spill") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+            )
+            .unwrap();
+            let data =
+                tokio::time::timeout(Duration::from_secs(20), vfs.read(ino, 0, payload.len() as u32))
+                    .await
+                    .expect("read timed out in crash-recovery regression")
+                    .unwrap();
+            assert_eq!(
+                data.as_ref(),
+                payload.as_slice(),
+                "segment replay should recover accepted staged data even if legacy spill files are gone"
+            );
+        });
+        rt.shutdown_background();
+    }
 }
 
 // =============================================================================
@@ -1149,372 +5175,8 @@ async fn test_attr_cache_ttl() {
 }
 
 // =============================================================================
-// NATS Invalidation Tests
+// metadata sync Invalidation Tests
 // =============================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn test_nats_delete_updates_metadata_and_clears_cached_block() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_delete_updates_metadata_and_clears_cached_block: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-delete");
-    let writer = make_tonbo_test_client(&info, "writer-delete");
-    let reader = make_tonbo_test_client(&info, "reader-delete");
-    let wait = Duration::from_secs(15);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let attr = writer
-        .vfs
-        .create(1, b"nats-delete.bin", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    let payload = vec![0xA5; info.block_size as usize];
-    writer.vfs.write(ino, 0, &payload).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let writer_blocks = wait_until_n_blocks(&writer.vfs, ino, 1, Duration::from_secs(15))
-        .expect("writer metadata did not materialize initial block");
-    assert!(
-        !writer_blocks.is_empty(),
-        "writer metadata missing initial block before publish"
-    );
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let visible = wait_until(wait, || reader.vfs.lookup(1, b"nats-delete.bin").is_ok()).await;
-    assert!(visible, "reader did not observe file creation");
-
-    let reader_ino = reader.vfs.lookup(1, b"nats-delete.bin").unwrap().ino;
-    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 1, Duration::from_secs(15))
-        .expect("reader metadata missing initial block after create invalidation");
-    assert!(
-        !reader_blocks.is_empty(),
-        "reader did not materialize initial block"
-    );
-    let got = reader
-        .vfs
-        .read(reader_ino, 0, payload.len() as u32)
-        .await
-        .unwrap();
-    assert_eq!(got, payload);
-
-    let block_id = reader.vfs.meta().get_file_blocks(reader_ino).unwrap()[0]
-        .1
-        .object_id;
-    let cached_path = block_cache_path(&reader.cache_dir, block_id);
-    assert!(
-        wait_until(wait, || cached_path.exists()).await,
-        "expected reader L2 cache to contain the block before delete"
-    );
-
-    let _ = reader.vfs.getattr(reader_ino).unwrap(); // prime attr_read_cache
-
-    writer.vfs.unlink(1, b"nats-delete.bin").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || {
-            reader.vfs.lookup(1, b"nats-delete.bin").is_err()
-        })
-        .await,
-        "reader still resolves deleted entry"
-    );
-
-    assert!(
-        wait_until(wait, || reader.vfs.getattr(reader_ino).is_err()).await,
-        "reader attr cache was not invalidated after delete"
-    );
-
-    assert!(
-        wait_until(wait, || !cached_path.exists()).await,
-        "cached deleted block was not evicted"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn test_nats_overwrite_evicts_only_changed_block_cache() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_overwrite_evicts_only_changed_block_cache: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-overwrite");
-    let writer = make_tonbo_test_client(&info, "writer-overwrite");
-    let reader = make_tonbo_test_client(&info, "reader-overwrite");
-    let wait = Duration::from_secs(15);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let bs = info.block_size as usize;
-    let block0_v1 = vec![0x11; bs];
-    let block1_static = vec![0x22; bs];
-    let mut initial = block0_v1.clone();
-    initial.extend_from_slice(&block1_static);
-
-    let attr = writer
-        .vfs
-        .create(1, b"nats-overwrite.bin", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, &initial).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let mut writer_refs_v1 = wait_until_n_blocks(&writer.vfs, ino, 2, Duration::from_secs(15))
-        .expect("writer metadata did not materialize initial two blocks");
-    writer_refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(writer_refs_v1.len(), 2);
-    let writer_old_id0 = writer_refs_v1[0].1.object_id;
-    let writer_old_id1 = writer_refs_v1[1].1.object_id;
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || {
-            reader.vfs.lookup(1, b"nats-overwrite.bin").is_ok()
-        })
-        .await,
-        "reader did not observe file creation"
-    );
-
-    let reader_ino = reader.vfs.lookup(1, b"nats-overwrite.bin").unwrap().ino;
-    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
-        .expect("reader metadata missing initial blocks after create invalidation");
-    assert_eq!(reader_blocks.len(), 2);
-    let got_v1 = reader
-        .vfs
-        .read(reader_ino, 0, (2 * bs) as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_v1, initial);
-
-    let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
-    refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(refs_v1.len(), 2);
-    let old_id0 = refs_v1[0].1.object_id;
-    let old_id1 = refs_v1[1].1.object_id;
-
-    let old_path0 = block_cache_path(&reader.cache_dir, old_id0);
-    let old_path1 = block_cache_path(&reader.cache_dir, old_id1);
-    assert!(
-        wait_until(wait, || old_path0.exists() && old_path1.exists()).await,
-        "reader cache did not materialize both initial blocks"
-    );
-
-    let block0_v2 = vec![0x33; bs];
-    writer.vfs.write(ino, 0, &block0_v2).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let writer_overwrite_ready = wait_until(wait, || {
-        let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 2
-            && refs[0].1.object_id != writer_old_id0
-            && refs[1].1.object_id == writer_old_id1
-    })
-    .await;
-    assert!(
-        writer_overwrite_ready,
-        "writer metadata did not materialize overwrite before publish"
-    );
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let refs_updated = wait_until(wait, || {
-        let mut refs = match reader.vfs.meta().get_file_blocks(reader_ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 2 && refs[0].1.object_id != old_id0 && refs[1].1.object_id == old_id1
-    })
-    .await;
-    assert!(
-        refs_updated,
-        "reader metadata did not reflect selective overwrite"
-    );
-
-    assert!(
-        wait_until(wait, || !old_path0.exists() && old_path1.exists()).await,
-        "changed block cache should be evicted while unchanged block should remain"
-    );
-
-    let mut expected = block0_v2.clone();
-    expected.extend_from_slice(&block1_static);
-    let got_v2 = reader
-        .vfs
-        .read(reader_ino, 0, (2 * bs) as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_v2, expected);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_append_keeps_existing_cache_and_fetches_new_block_on_read: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-append");
-    let writer = make_tonbo_test_client(&info, "writer-append");
-    let reader = make_tonbo_test_client(&info, "reader-append");
-    let wait = Duration::from_secs(15);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let bs = info.block_size as usize;
-    let block0 = vec![0x41; bs];
-    let block1 = vec![0x42; bs];
-    let mut initial = block0.clone();
-    initial.extend_from_slice(&block1);
-
-    let attr = writer
-        .vfs
-        .create(1, b"nats-append.bin", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, &initial).await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let mut writer_refs_v1 = wait_until_n_blocks(&writer.vfs, ino, 2, Duration::from_secs(15))
-        .expect("writer metadata did not materialize initial two blocks");
-    writer_refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(writer_refs_v1.len(), 2);
-    let writer_id0 = writer_refs_v1[0].1.object_id;
-    let writer_id1 = writer_refs_v1[1].1.object_id;
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || {
-            reader.vfs.lookup(1, b"nats-append.bin").is_ok()
-        })
-        .await,
-        "reader did not observe file creation"
-    );
-
-    let reader_ino = reader.vfs.lookup(1, b"nats-append.bin").unwrap().ino;
-    let reader_blocks = wait_until_n_blocks(&reader.vfs, reader_ino, 2, Duration::from_secs(15))
-        .expect("reader metadata missing initial blocks after create invalidation");
-    assert_eq!(reader_blocks.len(), 2);
-    let got_v1 = reader
-        .vfs
-        .read(reader_ino, 0, (2 * bs) as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_v1, initial);
-
-    let mut refs_v1 = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
-    refs_v1.sort_by_key(|(idx, _)| *idx);
-    assert_eq!(refs_v1.len(), 2);
-    let id0 = refs_v1[0].1.object_id;
-    let id1 = refs_v1[1].1.object_id;
-    let path0 = block_cache_path(&reader.cache_dir, id0);
-    let path1 = block_cache_path(&reader.cache_dir, id1);
-    assert!(
-        wait_until(wait, || path0.exists() && path1.exists()).await,
-        "reader cache did not materialize initial blocks"
-    );
-
-    let block2 = vec![0x43; bs];
-    writer
-        .vfs
-        .write(ino, (2 * bs) as u64, &block2)
-        .await
-        .unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    let writer_append_ready = wait_until(wait, || {
-        let mut refs = match writer.vfs.meta().get_file_blocks(ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 3 && refs[0].1.object_id == writer_id0 && refs[1].1.object_id == writer_id1
-    })
-    .await;
-    assert!(
-        writer_append_ready,
-        "writer metadata did not materialize append before publish"
-    );
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let append_visible = wait_until(wait, || {
-        let mut refs = match reader.vfs.meta().get_file_blocks(reader_ino) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        refs.sort_by_key(|(idx, _)| *idx);
-        refs.len() == 3 && refs[0].1.object_id == id0 && refs[1].1.object_id == id1
-    })
-    .await;
-    assert!(
-        append_visible,
-        "reader metadata did not reflect appended block"
-    );
-
-    assert!(
-        path0.exists() && path1.exists(),
-        "unchanged cached blocks should be preserved after append"
-    );
-
-    let got_new = reader
-        .vfs
-        .read(reader_ino, (2 * bs) as u64, bs as u32)
-        .await
-        .unwrap();
-    assert_eq!(got_new, block2);
-
-    let mut refs_after = reader.vfs.meta().get_file_blocks(reader_ino).unwrap();
-    refs_after.sort_by_key(|(idx, _)| *idx);
-    let id2 = refs_after[2].1.object_id;
-    let path2 = block_cache_path(&reader.cache_dir, id2);
-    assert!(
-        wait_until(wait, || path2.exists()).await,
-        "new appended block should be fetched and cached on read"
-    );
-}
 
 // =============================================================================
 // Handle Tracking Tests
@@ -1591,6 +5253,16 @@ async fn test_open_unlink_deferred_cleanup() {
     // Write data
     vfs.write(ino, 0, b"orphan data").await.unwrap();
     vfs.flush(ino).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            vfs.meta()
+                .get_attr(ino)
+                .map(|attr| attr.upload_state == UploadState::Ready)
+                .unwrap_or(false)
+        })
+        .await,
+        "orphan cleanup test should begin after the file reaches committed ready state"
+    );
 
     // Open a handle
     let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -1624,6 +5296,16 @@ async fn test_multiple_handles_open_unlink() {
 
     vfs.write(ino, 0, b"multi-handle data").await.unwrap();
     vfs.flush(ino).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            vfs.meta()
+                .get_attr(ino)
+                .map(|attr| attr.upload_state == UploadState::Ready)
+                .unwrap_or(false)
+        })
+        .await,
+        "multi-handle orphan test should begin after the file reaches committed ready state"
+    );
 
     // Open two handles
     let fh1 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
@@ -1862,6 +5544,16 @@ async fn test_hardlink_unlink_keeps_data() {
     let ino = attr.ino;
     vfs.write(ino, 0, b"survive unlink").await.unwrap();
     vfs.flush(ino).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            vfs.meta()
+                .get_attr(ino)
+                .map(|attr| attr.upload_state == UploadState::Ready)
+                .unwrap_or(false)
+        })
+        .await,
+        "hardlink/unlink test should begin after the source file reaches committed ready state"
+    );
 
     // Create hardlink, then remove the original
     vfs.link(ino, 1, b"backup.txt").unwrap();
@@ -2153,484 +5845,19 @@ async fn test_statfs_after_write() {
 }
 
 // =============================================================================
-// Phase 8 — Eager Flush + Kernel Cache Invalidation Tests
+// Phase 8 — Notes On PG Sync Coverage
 // =============================================================================
 
-/// Mock `KernelInvalidator` that records every invalidated inode for assertions.
-struct MockKernelInvalidator {
-    invocations: parking_lot::Mutex<Vec<u64>>,
-}
-
-impl MockKernelInvalidator {
-    fn new() -> Self {
-        Self {
-            invocations: parking_lot::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Return a sorted, deduplicated snapshot of all invalidated inodes.
-    fn drain_unique(&self) -> Vec<u64> {
-        let mut v = std::mem::take(&mut *self.invocations.lock());
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
-
-    /// Return total number of `inval_inode` calls (including duplicates).
-    fn call_count(&self) -> usize {
-        self.invocations.lock().len()
-    }
-}
-
-impl studiofs_vfs::KernelInvalidator for MockKernelInvalidator {
-    fn inval_inode(&self, ino: u64) {
-        self.invocations.lock().push(ino);
-    }
-}
-
-/// Verify that `request_eager_flush()` causes the TonboMetaEngine background
-/// flush to publish metadata to NATS within seconds (instead of waiting for
-/// the full 600 s `flush_interval`).  Reader observes writer's `create` quickly.
+/// PG convergence and remote-visible metadata semantics are primarily covered in
+/// `studiofs-meta::pg_engine` ignored tests now:
+/// - checkpoint bootstrap
+/// - delta pull by batch version
+/// - committed-vs-staged block visibility
+/// - overlay conflict handling
 ///
-/// This exercises the end-to-end path:
-///   writer.create() → request_eager_flush() → 250 ms tick → flush_remote_snapshot()
-///   → NATS publish → reader invalidation listener → sync_metadata() → lookup OK
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_create_visible_quickly() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_create_visible_quickly: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    // Use a very long base flush_interval (600 s) — if the file becomes visible
-    // within 10 s, it must be due to eager flush, not the normal timer.
-    let info = make_tuned_tonbo_format_info("nats-eager-create");
-    let writer = make_tonbo_test_client(&info, "writer-eager-create");
-    let reader = make_tonbo_test_client(&info, "reader-eager-create");
-    // Let the NATS subscriptions settle.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let t0 = Instant::now();
-    // create() internally calls request_eager_flush().
-    let attr = writer
-        .vfs
-        .create(1, b"eager-file.txt", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, b"eager").await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-
-    // Do NOT call writer.vfs.meta().flush_metadata() — the whole point is
-    // that eager flush triggers the background worker automatically.
-
-    // Reader should see the file within a few seconds (eager 250 ms batching
-    // window + 250 ms tick + NATS propagation + sync).
-    let visible = wait_until(Duration::from_secs(10), || {
-        reader.vfs.lookup(1, b"eager-file.txt").is_ok()
-    })
-    .await;
-    let elapsed = t0.elapsed();
-
-    assert!(
-        visible,
-        "reader did not observe writer's create within 10 s — eager flush may be broken"
-    );
-    println!(
-        "eager flush: file visible on reader after {:.2} s (expected < 10 s)",
-        elapsed.as_secs_f64()
-    );
-
-    // Sanity: data should be readable.
-    let reader_ino = reader.vfs.lookup(1, b"eager-file.txt").unwrap().ino;
-    let data = wait_until(Duration::from_secs(10), || {
-        reader.vfs.meta().get_attr(reader_ino).is_ok()
-    })
-    .await;
-    assert!(data, "reader could not resolve attr for eagerly created file");
-}
-
-/// Like above but for `unlink` — verify eager flush after delete propagates
-/// quickly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_unlink_visible_quickly() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_unlink_visible_quickly: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-eager-unlink");
-    let writer = make_tonbo_test_client(&info, "writer-eager-unlink");
-    let reader = make_tonbo_test_client(&info, "reader-eager-unlink");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // First: create the file and explicitly flush so both clients see it.
-    let attr = writer
-        .vfs
-        .create(1, b"eager-del.txt", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, b"todelete").await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let visible = wait_until(Duration::from_secs(10), || {
-        reader.vfs.lookup(1, b"eager-del.txt").is_ok()
-    })
-    .await;
-    assert!(visible, "reader did not observe initial file creation");
-
-    // Now unlink — this internally calls request_eager_flush().
-    let t0 = Instant::now();
-    writer.vfs.unlink(1, b"eager-del.txt").unwrap();
-
-    // Reader should see the deletion within a few seconds.
-    let deleted = wait_until(Duration::from_secs(10), || {
-        reader.vfs.lookup(1, b"eager-del.txt").is_err()
-    })
-    .await;
-    let elapsed = t0.elapsed();
-
-    assert!(
-        deleted,
-        "reader still sees deleted file after 10 s — eager flush for unlink may be broken"
-    );
-    println!(
-        "eager flush: unlink visible on reader after {:.2} s",
-        elapsed.as_secs_f64()
-    );
-}
-
-/// Verify that `mkdir` + `rmdir` + `rename` also trigger eager flush.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_dir_ops() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_dir_ops: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-eager-dirops");
-    let writer = make_tonbo_test_client(&info, "writer-eager-dirops");
-    let reader = make_tonbo_test_client(&info, "reader-eager-dirops");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(10);
-
-    // 1. mkdir — eager flush
-    writer.vfs.mkdir(1, b"subdir", 0, 0, 0o755).unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_ok()).await,
-        "reader did not see mkdir within 10 s"
-    );
-
-    // 2. create file in subdir via rename from root
-    let subdir_ino = writer.vfs.lookup(1, b"subdir").unwrap().ino;
-    let _attr = writer
-        .vfs
-        .create(subdir_ino, b"before.txt", 0, 0, 0o644)
-        .unwrap();
-    // Wait for the remote reader to see the subdir inode first
-    let reader_subdir_ino = wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_ok()).await;
-    assert!(reader_subdir_ino, "reader did not see subdir");
-    // Now flush the create
-    writer.vfs.meta().flush_metadata().unwrap();
-    let r_sdir = reader.vfs.lookup(1, b"subdir").unwrap().ino;
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(r_sdir, b"before.txt").is_ok()).await,
-        "reader did not see file in subdir"
-    );
-
-    // 3. rename — eager flush
-    writer
-        .vfs
-        .rename(subdir_ino, b"before.txt", subdir_ino, b"after.txt")
-        .unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(r_sdir, b"after.txt").is_ok()).await,
-        "reader did not see rename within 10 s"
-    );
-
-    // 4. rmdir (need to remove files first)
-    writer.vfs.unlink(subdir_ino, b"after.txt").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(r_sdir, b"after.txt").is_err()).await,
-        "reader still sees deleted file"
-    );
-    writer.vfs.rmdir(1, b"subdir").unwrap();
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"subdir").is_err()).await,
-        "reader did not see rmdir within 10 s"
-    );
-}
-
-/// Verify that the `KernelInvalidator` receives `inval_inode` calls when NATS
-/// invalidation events arrive on the reader.
-///
-/// This confirms the plumbing works — the same trait is implemented by
-/// `FuseKernelInvalidator` (Linux) and `WinfspKernelInvalidator` (Windows).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_kernel_invalidator_receives_inode_events() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_kernel_invalidator_receives_inode_events: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-invalidator");
-    let writer = make_tonbo_test_client(&info, "writer-invalidator");
-    let reader = make_tonbo_test_client(&info, "reader-invalidator");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Register a mock kernel invalidator on the reader.
-    let mock_inv = Arc::new(MockKernelInvalidator::new());
-    reader.vfs.set_kernel_invalidator(mock_inv.clone());
-
-    // Pre-warm reader's attr cache for root (ino 1) so that the invalidation
-    // actually has something to clear.
-    let _ = reader.vfs.getattr(1).unwrap();
-
-    // Writer creates a file — triggers eager flush → NATS → reader invalidation.
-    let attr = writer
-        .vfs
-        .create(1, b"notify-test.txt", 0, 0, 0o644)
-        .unwrap();
-    let ino = attr.ino;
-    writer.vfs.write(ino, 0, b"data").await.unwrap();
-    writer.vfs.flush(ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Wait for the reader to process the NATS invalidation event.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"notify-test.txt").is_ok()).await,
-        "reader did not observe file creation via NATS"
-    );
-
-    // The mock invalidator should have been called.  The global "all"
-    // invalidation always invalidates root (ino 1) plus any other cached inodes.
-    let invoked = wait_until(Duration::from_secs(5), || mock_inv.call_count() > 0).await;
-    assert!(
-        invoked,
-        "KernelInvalidator::inval_inode was never called on the reader"
-    );
-
-    let invalidated = mock_inv.drain_unique();
-    println!(
-        "kernel invalidator received inval_inode calls for inodes: {:?}",
-        invalidated
-    );
-    // Root inode should always be in the list (invalidate_all_read_caches
-    // explicitly invalidates ino 1).
-    assert!(
-        invalidated.contains(&1),
-        "expected root inode (1) to be invalidated, got: {:?}",
-        invalidated
-    );
-
-    // Now test a second round: create another file, verify invalidator fires again.
-    let prev_count = mock_inv.call_count();
-    let attr2 = writer
-        .vfs
-        .create(1, b"notify-test-2.txt", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.flush(attr2.ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"notify-test-2.txt").is_ok()).await,
-        "reader did not observe second file creation"
-    );
-    assert!(
-        wait_until(Duration::from_secs(5), || mock_inv.call_count() > prev_count).await,
-        "KernelInvalidator was not called again for the second event"
-    );
-    println!(
-        "kernel invalidator total calls after two events: {}",
-        mock_inv.call_count()
-    );
-}
-
-/// Verify that eager-flush batching and kernel-cache invalidation work
-/// together end-to-end.
-///
-/// **Batching semantics:** `request_eager_flush()` uses a 250 ms collection
-/// window so that rapid sequential mutations (e.g. multi-file create/delete)
-/// are grouped into one remote flush + one NATS event.  The reader may see
-/// the S3 data *before* the NATS event arrives (via `read_with_refresh`
-/// cache-miss → direct `pull_remote_snapshot`).  When this happens the NATS
-/// handler's `sync_and_apply_invalidation` observes no version advancement
-/// and enters a multi-attempt retry loop.  Because the handler is sequential,
-/// back-to-back events can queue up and exceed tight timeouts.
-///
-/// This test therefore keeps the number of NATS events minimal:
-///   1. Rapid creates → eager-flush visibility check (no explicit flush).
-///   2. One explicit `flush_metadata()` to produce a deterministic NATS event
-///      that the handler can resolve in a single attempt, triggering
-///      `invalidate_all_read_caches()` and the `KernelInvalidator` mock.
-///
-/// More complex mutation sequences (rename, unlink, dir-ops) are covered
-/// by the dedicated eager-flush tests above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_eager_flush_with_kernel_invalidation_rapid_mutations() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!(
-            "skip test_nats_eager_flush_with_kernel_invalidation_rapid_mutations: NATS unreachable at {}",
-            nats_url
-        );
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-eager-rapid");
-    let writer = make_tonbo_test_client(&info, "writer-eager-rapid");
-    let reader = make_tonbo_test_client(&info, "reader-eager-rapid");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-    let mock_inv = Arc::new(MockKernelInvalidator::new());
-    reader.vfs.set_kernel_invalidator(mock_inv.clone());
-
-    // Warm reader caches so there is at least inode 1 in the attr cache.
-    let _ = reader.vfs.getattr(1).unwrap();
-    let _ = reader.vfs.readdir(1).unwrap();
-
-    // ── Phase 1: Eager-flush visibility ────────────────────────────────────
-    // Create 3 files in quick succession.  `request_eager_flush()` fires for
-    // each mutation; the background flush thread batches them and pushes to S3
-    // after the 250 ms collection window.  We verify the reader can see all
-    // three files WITHOUT an explicit `flush_metadata()`.
-    let t0 = Instant::now();
-    for i in 0..3 {
-        let name = format!("rapid-{i}.txt");
-        let attr = writer
-            .vfs
-            .create(1, name.as_bytes(), 0, 0, 0o644)
-            .unwrap();
-        writer
-            .vfs
-            .write(attr.ino, 0, format!("content-{i}").as_bytes())
-            .await
-            .unwrap();
-        writer.vfs.flush(attr.ino).await.unwrap();
-    }
-
-    // Do NOT call flush_metadata — rely on eager flush for visibility.
-
-    for i in 0..3 {
-        let name = format!("rapid-{i}.txt");
-        assert!(
-            wait_until(wait, || reader.vfs.lookup(1, name.as_bytes()).is_ok()).await,
-            "reader did not see {name} within {wait:?}"
-        );
-    }
-    let batch_elapsed = t0.elapsed();
-    println!(
-        "rapid 3-file create visible on reader after {:.2} s",
-        batch_elapsed.as_secs_f64()
-    );
-
-    // ── Phase 2: Kernel invalidator via explicit flush ─────────────────────
-    // The reader's `wait_until` polling above may have pulled the writer's
-    // snapshot directly from S3 (cache-miss path), racing ahead of the NATS
-    // invalidation event.  Every queued NATS event then enters a ~4 s retry
-    // loop because the handler sees no version advancement.
-    //
-    // To verify kernel invalidation deterministically we:
-    //  1. Wait a short while so the handler can drain any earlier events.
-    //  2. Create one more mutation + explicit `flush_metadata()` to produce a
-    //     NATS event with a guaranteed new etag.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    writer
-        .vfs
-        .create(1, b"kernel-inv-trigger.txt", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(Duration::from_secs(15), || mock_inv.call_count() > 0).await,
-        "KernelInvalidator was not called after explicit flush trigger"
-    );
-
-    let calls = mock_inv.call_count();
-    let inodes = mock_inv.drain_unique();
-    println!(
-        "test complete — kernel invalidator called {calls} time(s), inodes: {inodes:?}"
-    );
-    // Root (ino 1) must always be present because invalidate_all_read_caches()
-    // unconditionally sends it.
-    assert!(
-        inodes.contains(&1),
-        "expected root inode (1) in invalidated set, got: {inodes:?}"
-    );
-}
-
+/// The VFS ignored suite below focuses on end-to-end data path correctness:
+/// reads, writes, truncation, crash recovery, upload completion, and cache
+/// behavior on top of the local metadata serving model.
 // =============================================================================
 // Phase 9 — Deep Integration & Edge-Case Tests
 // =============================================================================
@@ -2653,8 +5880,8 @@ async fn test_truncate_to_exact_block_boundary() {
     let attr = vfs.create(1, b"trunc-bound.bin", 0, 0, 0o644).unwrap();
     vfs.write(attr.ino, 0, &payload).await.unwrap();
     vfs.flush(attr.ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, attr.ino, 3, Duration::from_secs(15))
-        .expect("Expected 3 blocks");
+    let _ =
+        wait_until_n_blocks(&vfs, attr.ino, 3, Duration::from_secs(15)).expect("Expected 3 blocks");
 
     // Truncate to exactly 1 block boundary = block_size bytes.
     vfs.setattr(attr.ino, SetattrArgs::size_only(block_size as u64))
@@ -2664,10 +5891,16 @@ async fn test_truncate_to_exact_block_boundary() {
 
     let (idx, blk) = &after[0];
     assert_eq!(*idx, 0);
-    // When truncating to exactly block_size, the last_block_offset+1 == block_size
-    // so the block ref length should equal block_size and the partial flag
-    // must be set (the truncate code always sets PARTIAL_BLOCK when size > 0).
-    assert_eq!(blk.length, block_size, "block length should equal block_size");
+    // Exact boundary truncate keeps a full block and must not leave it marked
+    // as partial.
+    assert_eq!(
+        blk.length, block_size,
+        "block length should equal block_size"
+    );
+    assert!(
+        !blk.flags.contains(BlockFlags::PARTIAL_BLOCK),
+        "exact block-boundary truncate must clear PARTIAL_BLOCK"
+    );
 
     // Verify read returns correct data.
     let data = vfs.read(attr.ino, 0, block_size).await.unwrap();
@@ -2712,6 +5945,37 @@ async fn test_truncate_extend_creates_sparse_hole() {
     );
 }
 
+/// Shrink inside a block, then extend by writing later in the same block.
+/// Bytes between the truncated EOF and the new write offset must be zeroed,
+/// not preserved from the old tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "trunc-shrink-extend");
+
+    let attr = vfs.create(1, b"tail-zero.bin", 0, 0, 0o644).unwrap();
+    let ino = attr.ino;
+
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    vfs.write(ino, 0, &payload).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+
+    vfs.setattr(ino, SetattrArgs::size_only(1024)).unwrap();
+    vfs.write(ino, 2048, &[0xEE]).await.unwrap();
+    vfs.flush(ino).await.unwrap();
+
+    let data = vfs.read(ino, 0, 2049).await.unwrap();
+    assert_eq!(&data[..1024], &payload[..1024]);
+    assert!(
+        data[1024..2048].iter().all(|&b| b == 0),
+        "gap after truncate must be zero-filled"
+    );
+    assert_eq!(data[2048], 0xEE);
+}
+
 /// Write exactly block_size bytes then 1 byte at the next block boundary.
 /// Exercises the full-block eager flush path + new partial block creation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2735,8 +5999,8 @@ async fn test_write_at_exact_block_boundary_transition() {
     vfs.flush(attr.ino).await.unwrap();
 
     // Wait for blocks to materialise.
-    let blocks = wait_until_n_blocks(&vfs, attr.ino, 2, Duration::from_secs(15))
-        .expect("Expected 2 blocks");
+    let blocks =
+        wait_until_n_blocks(&vfs, attr.ino, 2, Duration::from_secs(15)).expect("Expected 2 blocks");
     assert_eq!(blocks.len(), 2);
 
     // Verify file size.
@@ -2744,7 +6008,10 @@ async fn test_write_at_exact_block_boundary_transition() {
     assert_eq!(a.size, (block_size + 1) as u64);
 
     // Verify data integrity.
-    let data = vfs.read(attr.ino, 0, (block_size + 1) as u32).await.unwrap();
+    let data = vfs
+        .read(attr.ino, 0, (block_size + 1) as u32)
+        .await
+        .unwrap();
     assert_eq!(&data[..block_size], &full_block[..]);
     assert_eq!(data[block_size], 0xFF);
 }
@@ -3026,7 +6293,10 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
 
     // Blocks should still exist (not yet GC'd).
     let blocks = vfs.meta().get_file_blocks(ino).unwrap();
-    assert!(!blocks.is_empty(), "blocks should survive until last handle closes");
+    assert!(
+        !blocks.is_empty(),
+        "blocks should survive until last handle closes"
+    );
     let block_id = blocks[0].1.object_id;
 
     // Release the last handle — triggers orphan cleanup.
@@ -3034,7 +6304,10 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
 
     // Now blocks should be removed and pending deletion.
     let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
-    assert!(blocks_after.is_empty(), "blocks should be removed after release_fh");
+    assert!(
+        blocks_after.is_empty(),
+        "blocks should be removed after release_fh"
+    );
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
         pending.iter().any(|(id, _)| *id == block_id),
@@ -3189,9 +6462,7 @@ async fn test_create_write_unlink_race() {
     // Create and immediately delete files in a tight loop.
     for i in 0..20 {
         let name = format!("race-{i}.txt");
-        let attr = vfs
-            .create(1, name.as_bytes(), 0, 0, 0o644)
-            .unwrap();
+        let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, b"race data").await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
         vfs.unlink(1, name.as_bytes()).unwrap();
@@ -3266,9 +6537,7 @@ async fn test_open_trunc_clears_data() {
     assert!(vfs.getattr(attr.ino).unwrap().size > 0);
 
     // Open with trunc flag.
-    let fh = vfs
-        .open_file(attr.ino, OpenFlags::WRONLY, true)
-        .unwrap();
+    let fh = vfs.open_file(attr.ino, OpenFlags::WRONLY, true).unwrap();
     assert_eq!(
         vfs.getattr(attr.ino).unwrap().size,
         0,
@@ -3277,210 +6546,10 @@ async fn test_open_trunc_clears_data() {
     vfs.release_fh(fh).await.unwrap();
 }
 
-// ─── 9.6 Multi-Client NATS Integration ─────────────────────────────────────
+// ─── 9.6 Multi-Client metadata sync Integration ─────────────────────────────────────
 
-/// Two Tonbo clients create files simultaneously, triggering CAS conflict.
-/// Client A flushes first, then Client B flushes and must merge with A's
-/// snapshot so both files survive.  Verifies the pre-merge path where a
-/// client with no cached etag discovers a remote manifest and merges before
-/// writing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_concurrent_write_conflict_cas_merge() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_concurrent_write_conflict_cas_merge: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-cas-merge");
-    let client_a = make_tonbo_test_client(&info, "cas-a");
-    let client_b = make_tonbo_test_client(&info, "cas-b");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Both clients create different files without flushing.
-    client_a
-        .vfs
-        .create(1, b"from-a.txt", 0, 0, 0o644)
-        .unwrap();
-    client_b
-        .vfs
-        .create(1, b"from-b.txt", 0, 0, 0o644)
-        .unwrap();
-
-    // Flush client_a first so its snapshot lands on S3.
-    client_a.vfs.meta().flush_metadata().unwrap();
-
-    // client_b flushes — this should trigger CAS conflict because S3 now has
-    // client_a's snapshot. The merge logic must combine both snapshots.
-    client_b.vfs.meta().flush_metadata().unwrap();
-
-    // After the merge, client_b should have BOTH files in its local state
-    // (the merge pulled client_a's snapshot and combined it with its local delta).
-    // Give client_b a moment to settle, then sync to refresh.
-    client_b.vfs.meta().sync_metadata().unwrap();
-    assert!(
-        client_b.vfs.lookup(1, b"from-b.txt").is_ok(),
-        "client_b should see from-b.txt"
-    );
-
-    // Check if the CAS merge preserved from-a.txt on client_b.
-    assert!(
-        client_b.vfs.lookup(1, b"from-a.txt").is_ok(),
-        "CAS merge should preserve from-a.txt on client_b"
-    );
-
-    // client_a syncs to get the latest.
-    client_a.vfs.meta().sync_metadata().unwrap();
-
-    // Both files should be visible on both clients after merge.
-    assert!(
-        client_a.vfs.lookup(1, b"from-a.txt").is_ok(),
-        "client_a should see from-a.txt after sync"
-    );
-    assert!(
-        client_a.vfs.lookup(1, b"from-b.txt").is_ok(),
-        "client_a should see from-b.txt after sync"
-    );
-    assert!(
-        client_b.vfs.lookup(1, b"from-b.txt").is_ok(),
-        "client_b should see from-b.txt"
-    );
-
-    println!("CAS merge resolved — both files visible on both clients");
-}
-
-/// NATS global invalidation should evict dropped blocks from cache.
-/// Client A caches file data, Client B deletes the file + publishes invalidation,
-/// verify Client A's block cache no longer contains the deleted blocks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_invalidation_evicts_dropped_blocks() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_invalidation_evicts_dropped_blocks: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-evict-blocks");
-    let writer = make_tonbo_test_client(&info, "evict-writer");
-    let reader = make_tonbo_test_client(&info, "evict-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Writer creates file with data.
-    let attr = writer
-        .vfs
-        .create(1, b"evict-me.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"block data to evict")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader sees and reads the file (caches the block).
-    let wait = Duration::from_secs(10);
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"evict-me.txt").is_ok()).await,
-        "reader should see evict-me.txt"
-    );
-    let reader_attr = reader.vfs.lookup(1, b"evict-me.txt").unwrap();
-    let _data = reader
-        .vfs
-        .read(reader_attr.ino, 0, 100)
-        .await
-        .unwrap();
-
-    // Writer deletes the file and flushes.
-    writer.vfs.unlink(1, b"evict-me.txt").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should eventually not see the file via NATS invalidation.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"evict-me.txt").is_err()).await,
-        "reader should stop seeing evict-me.txt after invalidation"
-    );
-}
-
-/// Verify kernel invalidator receives correct inodes for single-inode events
-/// (not just global invalidation).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_kernel_invalidator_global_includes_root() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_kernel_invalidator_global_includes_root: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-kinv-root");
-    let writer = make_tonbo_test_client(&info, "kinv-root-writer");
-    let reader = make_tonbo_test_client(&info, "kinv-root-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let mock_inv = Arc::new(MockKernelInvalidator::new());
-    reader.vfs.set_kernel_invalidator(mock_inv.clone());
-
-    // Warm reader caches for root + a file.
-    let _ = reader.vfs.getattr(1).unwrap();
-    let _ = reader.vfs.readdir(1).unwrap();
-
-    // Writer creates a file and flush.
-    let attr = writer
-        .vfs
-        .create(1, b"kinv-file.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"hello")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Wait for kernel invalidator to be called.
-    assert!(
-        wait_until(Duration::from_secs(15), || mock_inv.call_count() > 0).await,
-        "kernel invalidator should be called"
-    );
-
-    let inodes = mock_inv.drain_unique();
-    assert!(
-        inodes.contains(&1),
-        "root inode (1) must be invalidated in global invalidation"
-    );
-    println!("invalidated inodes: {inodes:?}");
-}
-
+/// Multi-client metadata convergence coverage now lives in `studiofs-meta`
+/// PostgreSQL tests. VFS integration below stays focused on local FS semantics.
 // ─── 9.7 Attribute & Metadata Edge Cases ───────────────────────────────────
 
 /// Setattr mode/uid/gid/times on a directory (not just files).
@@ -3673,9 +6742,7 @@ async fn test_flock_exclusive_nonblocking_conflict() {
     let ino = attr.ino;
 
     // Owner 1 acquires exclusive.
-    vfs.flock(ino, LockKind::Exclusive, 1, false)
-        .await
-        .unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 1, false).await.unwrap();
 
     // Owner 2 tries non-blocking exclusive — should fail.
     let result = vfs.flock(ino, LockKind::Exclusive, 2, false).await;
@@ -3688,9 +6755,7 @@ async fn test_flock_exclusive_nonblocking_conflict() {
     vfs.flock(ino, LockKind::Unlock, 1, false).await.unwrap();
 
     // Now owner 2 should succeed.
-    vfs.flock(ino, LockKind::Exclusive, 2, false)
-        .await
-        .unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 2, false).await.unwrap();
     vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
 }
 
@@ -3722,341 +6787,295 @@ async fn test_flock_shared_then_exclusive_conflict() {
     vfs.flock(ino, LockKind::Unlock, 2, false).await.unwrap();
 
     // Now exclusive should succeed.
-    vfs.flock(ino, LockKind::Exclusive, 3, false)
-        .await
-        .unwrap();
+    vfs.flock(ino, LockKind::Exclusive, 3, false).await.unwrap();
     vfs.flock(ino, LockKind::Unlock, 3, false).await.unwrap();
 }
 
 // ─── 9.10 Multi-Client Visibility Smoke Tests ──────────────────────────────
 
 /// Writer creates a deeply nested directory tree, reader can traverse the full path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_deep_directory_tree_visible() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_deep_directory_tree_visible: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-deep-tree");
-    let writer = make_tonbo_test_client(&info, "deep-writer");
-    let reader = make_tonbo_test_client(&info, "deep-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates: /a/b/c/d/leaf.txt
-    let a = writer.vfs.mkdir(1, b"a", 0, 0, 0o755).unwrap();
-    let b = writer.vfs.mkdir(a.ino, b"b", 0, 0, 0o755).unwrap();
-    let c = writer.vfs.mkdir(b.ino, b"c", 0, 0, 0o755).unwrap();
-    let d = writer.vfs.mkdir(c.ino, b"d", 0, 0, 0o755).unwrap();
-    let leaf = writer
-        .vfs
-        .create(d.ino, b"leaf.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(leaf.ino, 0, b"deep leaf content")
-        .await
-        .unwrap();
-    writer.vfs.flush(leaf.ino).await.unwrap();
-    // Wait for block upload to S3 so reader can fetch it.
-    let _ = wait_until_n_blocks(&writer.vfs, leaf.ino, 1, Duration::from_secs(15));
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader follows full path.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"a").is_ok()).await,
-        "reader must see /a"
-    );
-    let ra = reader.vfs.lookup(1, b"a").unwrap();
-    let rb = reader.vfs.lookup(ra.ino, b"b").unwrap();
-    let rc = reader.vfs.lookup(rb.ino, b"c").unwrap();
-    let rd = reader.vfs.lookup(rc.ino, b"d").unwrap();
-    let rleaf = reader.vfs.lookup(rd.ino, b"leaf.txt").unwrap();
-
-    // The block may still be arriving from S3 — retry reads until we see
-    // the actual content instead of zero-filled placeholder bytes.
-    let deadline = Instant::now() + wait;
-    let mut data;
-    loop {
-        data = reader.vfs.read(rleaf.ino, 0, 100).await.unwrap();
-        if !data.is_empty() && data[0] != 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for leaf.txt data on reader"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert_eq!(&data[..], b"deep leaf content");
-    println!("deep directory tree fully visible on reader");
-}
-
 /// Writer creates a large file (multi-block), reader reads and verifies integrity.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_large_file_cross_client_integrity() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_large_file_cross_client_integrity: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-large-file");
-    let writer = make_tonbo_test_client(&info, "large-writer");
-    let reader = make_tonbo_test_client(&info, "large-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let block_size = info.block_size as usize;
-    // Write ~3 blocks of patterned data.
-    let total_size = block_size * 2 + block_size / 2; // 2.5 blocks
-    let payload: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
-
-    let attr = writer
-        .vfs
-        .create(1, b"large.bin", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.write(attr.ino, 0, &payload).await.unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-
-    // Wait for blocks to be uploaded.
-    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 3, Duration::from_secs(30));
-    assert!(
-        writer.vfs.wait_for_uploads_idle(Duration::from_secs(30)).await,
-        "uploads should complete within timeout"
-    );
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    let wait = Duration::from_secs(15);
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"large.bin").is_ok()).await,
-        "reader should see large.bin"
-    );
-
-    let reader_attr = reader.vfs.lookup(1, b"large.bin").unwrap();
-    assert_eq!(reader_attr.size, total_size as u64);
-
-    // Read and verify full content.
-    let data = reader
-        .vfs
-        .read(reader_attr.ino, 0, total_size as u32)
-        .await
-        .unwrap();
-    assert_eq!(data.len(), total_size);
-    assert_eq!(&data[..], &payload[..], "cross-client large file data mismatch");
-    println!(
-        "cross-client large file integrity verified ({} bytes, {} blocks)",
-        total_size,
-        (total_size + block_size - 1) / block_size
-    );
-}
-
-/// Writer does setattr (chmod, chown), reader sees updated attributes via NATS.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_setattr_propagation() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_setattr_propagation: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-setattr");
-    let writer = make_tonbo_test_client(&info, "setattr-writer");
-    let reader = make_tonbo_test_client(&info, "setattr-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates file.
-    let attr = writer
-        .vfs
-        .create(1, b"attr-test.txt", 0, 0, 0o644)
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"attr-test.txt").is_ok()).await,
-        "reader should see attr-test.txt"
-    );
-
-    // Writer changes mode.
-    let mut args = SetattrArgs::default();
-    args.mode = Some(0o755);
-    args.uid = Some(42);
-    writer.vfs.setattr(attr.ino, args).unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should eventually see updated attrs.
-    let reader_ino = reader.vfs.lookup(1, b"attr-test.txt").unwrap().ino;
-    assert!(
-        wait_until(wait, || {
-            let a = reader.vfs.getattr(reader_ino).unwrap();
-            a.mode & 0o777 == 0o755 && a.uid == 42
-        })
-        .await,
-        "reader should see updated mode/uid"
-    );
-    println!("setattr propagated via NATS");
-}
-
+/// Writer does setattr (chmod, chown), reader sees updated attributes via metadata sync.
 /// Writer creates symlink, reader resolves it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_symlink_cross_client() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_symlink_cross_client: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-symlink");
-    let writer = make_tonbo_test_client(&info, "symlink-writer");
-    let reader = make_tonbo_test_client(&info, "symlink-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates target file + symlink.
-    let _file = writer
-        .vfs
-        .create(1, b"real-file.txt", 0, 0, 0o644)
-        .unwrap();
-    let sym = writer
-        .vfs
-        .symlink(1, b"my-link", b"real-file.txt", 0, 0)
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should see the symlink and read its target.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"my-link").is_ok()).await,
-        "reader should see symlink"
-    );
-    let reader_sym = reader.vfs.lookup(1, b"my-link").unwrap();
-    let target = reader.vfs.readlink(reader_sym.ino).unwrap();
-    assert_eq!(&target[..], b"real-file.txt");
-    assert_eq!(reader_sym.ino, sym.ino);
-    println!("symlink visible on reader");
-}
-
 /// Writer creates hardlink, reader sees it and reads shared data.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_hardlink_cross_client() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_hardlink_cross_client: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-hardlink");
-    let writer = make_tonbo_test_client(&info, "hardlink-writer");
-    let reader = make_tonbo_test_client(&info, "hardlink-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    let attr = writer
-        .vfs
-        .create(1, b"hl-origin.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"shared via hardlink")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    // Wait for block upload to S3 so reader can fetch it.
-    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader sees both names.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"hl-origin.txt").is_ok()
-            && reader.vfs.lookup(1, b"hl-link.txt").is_ok())
-        .await,
-        "reader should see both hardlink names"
-    );
-
-    let r_orig = reader.vfs.lookup(1, b"hl-origin.txt").unwrap();
-    let r_link = reader.vfs.lookup(1, b"hl-link.txt").unwrap();
-    assert_eq!(r_orig.ino, r_link.ino, "both names should share the same ino");
-
-    // Read from the link — retry until we see non-zero data (S3 upload race).
-    let deadline = Instant::now() + wait;
-    let mut data;
-    loop {
-        data = reader.vfs.read(r_link.ino, 0, 100).await.unwrap();
-        if !data.is_empty() && data[0] != 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for hardlink data on reader"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert_eq!(&data[..], b"shared via hardlink");
-    println!("hardlink visible on reader, data shared");
-}
-
 // ─── 9.11 Shutdown & Drain Tests ────────────────────────────────────────────
 
 /// Shutdown after writes should drain dirty buffers and persist metadata.
 /// After shutdown, blocks should be uploaded to S3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_with_pending_uploads_completes_within_bound() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-bounded-shutdown-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let payload = vec![0x5Au8; format_info.block_size as usize * 2];
+    let attr = vfs.create(1, b"bounded-shutdown.bin", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, &payload).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+        })
+        .await,
+        "offline upload scenario should queue pending uploads before shutdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        .await
+        .expect("shutdown should stay bounded even with offline pending uploads");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_during_small_file_churn_does_not_hang() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-ctrlc-small-churn-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let churn_vfs = vfs.clone();
+    let churn = tokio::spawn(async move {
+        let payload = vec![0xABu8; 16 * 1024];
+        let mut idx = 0u64;
+        loop {
+            if churn_vfs.is_shutting_down() {
+                break;
+            }
+            let name = format!("ctrlc-churn-{idx}.txt");
+            if let Ok(attr) = churn_vfs.create(1, name.as_bytes(), 0, 0, 0o644) {
+                let _ = churn_vfs.write(attr.ino, 0, &payload).await;
+                let _ = churn_vfs.flush(attr.ino).await;
+                let _ = churn_vfs.unlink(1, name.as_bytes());
+            }
+            idx = idx.saturating_add(1);
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        .await
+        .expect("shutdown should stay bounded during small-file churn");
+    tokio::time::timeout(Duration::from_secs(2), churn)
+        .await
+        .expect("foreground churn task should observe shutdown and exit")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-remount-delete-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+
+    {
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let dir = vfs.mkdir(1, b"ghost-dir", 0, 0, 0o755).unwrap();
+        let attr = vfs.create(dir.ino, b"ghost.txt", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"ghost-bytes").await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+        vfs.unlink(dir.ino, b"ghost.txt").unwrap();
+        vfs.rmdir(1, b"ghost-dir").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            .await
+            .expect("shutdown after delete should stay bounded");
+    }
+
+    let reopened = reopen_vfs(&db_path, &cache_dir);
+    assert!(reopened.lookup(1, b"ghost-dir").is_err());
+    let entries = reopened.readdir(1).unwrap();
+    assert!(
+        !entries.iter().any(|entry| {
+            entry.name.as_slice() == b"ghost-dir" || entry.name.as_slice() == b"ghost.txt"
+        }),
+        "deleted directory must not reappear as a ghost root entry after remount"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr12-recursive-delete-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+
+    {
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let root = vfs.mkdir(1, b"delete-tree", 0, 0, 0o755).unwrap();
+        let nested = vfs.mkdir(root.ino, b"nested", 0, 0, 0o755).unwrap();
+        let a = vfs.create(root.ino, b"a.txt", 0, 0, 0o644).unwrap();
+        let b = vfs.create(nested.ino, b"b.txt", 0, 0, 0o644).unwrap();
+        vfs.write(a.ino, 0, b"root-data").await.unwrap();
+        vfs.flush(a.ino).await.unwrap();
+        vfs.write(b.ino, 0, b"nested-data").await.unwrap();
+        vfs.flush(b.ino).await.unwrap();
+        vfs.unlink(root.ino, b"a.txt").unwrap();
+        vfs.unlink(nested.ino, b"b.txt").unwrap();
+        vfs.rmdir(root.ino, b"nested").unwrap();
+        vfs.rmdir(1, b"delete-tree").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            .await
+            .expect("shutdown after recursive delete should stay bounded");
+    }
+
+    let reopened = reopen_vfs(&db_path, &cache_dir);
+    assert!(reopened.lookup(1, b"delete-tree").is_err());
+    let root_entries = reopened.readdir(1).unwrap();
+    assert!(
+        !root_entries.iter().any(|entry| {
+            let name = entry.name.as_slice();
+            name == b"delete-tree" || name == b"nested" || name == b"a.txt" || name == b"b.txt"
+        }),
+        "recursive delete should not leave ghost entries in the root namespace after remount"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_upload_helpers_use_live_index_without_directory_scan() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr13-live-upload-index-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let payload = vec![0x22u8; format_info.block_size as usize * 2];
+    let attr = vfs.create(1, b"live-index.bin", 0, 0, 0o644).unwrap();
+    vfs.write(attr.ino, 0, &payload).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            vfs.pending_uploads_for_inode(attr.ino).len() == 2
+        })
+        .await,
+        "offline upload scenario should surface pending uploads before the upload dir is hidden"
+    );
+
+    let upload_dir = cache_dir.join("upload");
+    let hidden_dir = cache_dir.join("upload-hidden");
+    std::fs::rename(&upload_dir, &hidden_dir).unwrap();
+
+    let pending = vfs.pending_uploads_for_inode(attr.ino);
+    assert_eq!(
+        pending.len(),
+        2,
+        "pending upload helpers must use the live in-memory index instead of scanning upload/"
+    );
+    assert_eq!(
+        vfs.upload_stats().pending_uploads,
+        2,
+        "pending upload count should stay available even if upload/ is temporarily unavailable"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_shutdown_drains_dirty_buffers() {
@@ -4187,9 +7206,7 @@ async fn test_unlink_child_then_rmdir_parent() {
     let vfs = make_vfs(&tmp, "rmdir-after-unlink");
 
     let dir = vfs.mkdir(1, b"parent", 0, 0, 0o755).unwrap();
-    let child = vfs
-        .create(dir.ino, b"child.txt", 0, 0, 0o644)
-        .unwrap();
+    let child = vfs.create(dir.ino, b"child.txt", 0, 0, 0o644).unwrap();
     vfs.write(child.ino, 0, b"data").await.unwrap();
     vfs.flush(child.ino).await.unwrap();
 
@@ -4305,9 +7322,7 @@ async fn test_rename_directory_with_children() {
     let vfs = make_vfs(&tmp, "rename-dir-tree");
 
     let dir = vfs.mkdir(1, b"old-name", 0, 0, 0o755).unwrap();
-    let child = vfs
-        .create(dir.ino, b"child.txt", 0, 0, 0o644)
-        .unwrap();
+    let child = vfs.create(dir.ino, b"child.txt", 0, 0, 0o644).unwrap();
     vfs.write(child.ino, 0, b"child data").await.unwrap();
     vfs.flush(child.ino).await.unwrap();
 
@@ -4326,73 +7341,4 @@ async fn test_rename_directory_with_children() {
     assert_eq!(found_child.ino, child.ino);
     let data = vfs.read(child.ino, 0, 100).await.unwrap();
     assert_eq!(&data[..], b"child data");
-}
-
-// ─── 9.13 Multi-Client Rename & Delete via NATS ─────────────────────────────
-
-/// Writer renames a file, reader sees the update.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn test_nats_rename_cross_client() {
-    load_test_env();
-    ensure_bucket().await;
-
-    let nats_url =
-        std::env::var("STUDIOFS_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if !ensure_nats(&nats_url).await {
-        eprintln!("skip test_nats_rename_cross_client: NATS unreachable");
-        return;
-    }
-
-    let _env_lock = nats_test_env_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _nats_env = EnvVarRestore::set("STUDIOFS_NATS_URL", &nats_url);
-
-    let info = make_tuned_tonbo_format_info("nats-rename");
-    let writer = make_tonbo_test_client(&info, "rename-writer");
-    let reader = make_tonbo_test_client(&info, "rename-reader");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let wait = Duration::from_secs(15);
-
-    // Writer creates a file.
-    let attr = writer
-        .vfs
-        .create(1, b"before.txt", 0, 0, 0o644)
-        .unwrap();
-    writer
-        .vfs
-        .write(attr.ino, 0, b"rename me")
-        .await
-        .unwrap();
-    writer.vfs.flush(attr.ino).await.unwrap();
-    let _ = wait_until_n_blocks(&writer.vfs, attr.ino, 1, Duration::from_secs(15));
-    writer.vfs.wait_for_uploads_idle(Duration::from_secs(10)).await;
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader sees the file.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"before.txt").is_ok()).await,
-        "reader should see before.txt"
-    );
-
-    // Writer renames.
-    writer
-        .vfs
-        .rename(1, b"before.txt", 1, b"after.txt")
-        .unwrap();
-    writer.vfs.meta().flush_metadata().unwrap();
-
-    // Reader should see the rename via NATS.
-    assert!(
-        wait_until(wait, || reader.vfs.lookup(1, b"after.txt").is_ok()).await,
-        "reader should see after.txt"
-    );
-
-    // Read the data through the new name.
-    let reader_attr = reader.vfs.lookup(1, b"after.txt").unwrap();
-    let data = reader.vfs.read(reader_attr.ino, 0, 100).await.unwrap();
-    assert_eq!(&data[..], b"rename me");
-    println!("NATS rename propagated successfully");
 }

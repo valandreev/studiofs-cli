@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, RedbMetaEngine,
-    RemoteStoreConfig, TonboMetaEngine,
+    DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PostgresConfig,
+    RedbMetaEngine, ensure_studiofs_database,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -142,6 +142,204 @@ fn cleanup_delete_bucket(
     }
 }
 
+fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
+    rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        client
+            .query_one("SELECT 1", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("postgres health query failed: {e}"))?;
+
+        conn_task.abort();
+        Ok(())
+    })
+}
+
+fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> anyhow::Result<bool> {
+    rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        let has_volumes_table = client
+            .query_one("SELECT to_regclass('public.volumes') IS NOT NULL", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("postgres schema probe failed: {e}"))?;
+        let has_volumes_table: bool = has_volumes_table.get(0);
+        if !has_volumes_table {
+            conn_task.abort();
+            return Ok(false);
+        }
+
+        let row = client
+            .query_opt("SELECT vol FROM volumes WHERE name = $1 LIMIT 1", &[&name])
+            .await
+            .map_err(|e| anyhow::anyhow!("postgres volume lookup failed: {e}"))?;
+
+        conn_task.abort();
+        Ok(row.is_some())
+    })
+}
+
+fn init_postgres_schema_and_volume(
+    rt: &tokio::runtime::Runtime,
+    dsn: &str,
+    name: &str,
+    uuid: &str,
+    block_size: u32,
+) -> anyhow::Result<i64> {
+    rt.block_on(async {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        let tx = client.transaction().await?;
+
+        // Serialize DDL across concurrent initializers to avoid sequence-name races.
+        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
+            .await?;
+
+        // Phase 1 schema (MVP): enough to register volume and counters.
+        tx.batch_execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS volumes (
+                vol BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                uuid TEXT NOT NULL UNIQUE,
+                block_size INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS counters (
+                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                value BIGINT NOT NULL,
+                PRIMARY KEY (vol, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS event_log (
+                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                seq_id BIGSERIAL PRIMARY KEY,
+                batch_version BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_payload BYTEA NOT NULL,
+                client_id TEXT,
+                client_timestamp BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata_state (
+                vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+                version BIGINT NOT NULL,
+                snapshot BYTEA NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            ALTER TABLE event_log
+                ADD COLUMN IF NOT EXISTS batch_version BIGINT;
+            UPDATE event_log
+                SET batch_version = 0
+                WHERE batch_version IS NULL;
+            ALTER TABLE event_log
+                ALTER COLUMN batch_version SET NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq
+                ON event_log(vol, seq_id);
+            CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
+                ON event_log(vol, batch_version, seq_id);
+            "#,
+        )
+        .await?;
+
+        let row = tx
+            .query_one(
+                r#"
+                INSERT INTO volumes (name, uuid, block_size)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (uuid) DO UPDATE
+                SET name = EXCLUDED.name,
+                    block_size = EXCLUDED.block_size
+                RETURNING vol
+                "#,
+                &[&name, &uuid, &(block_size as i32)],
+            )
+            .await?;
+        let volume_id: i64 = row.get(0);
+
+        tx.execute(
+            r#"
+            INSERT INTO counters (vol, name, value)
+            VALUES
+                ($1, 'next_inode', 2),
+                ($1, 'next_block_id', 1),
+                ($1, 'used_space', 0),
+                ($1, 'total_inodes', 1)
+            ON CONFLICT (vol, name) DO NOTHING
+            "#,
+            &[&volume_id],
+        )
+        .await?;
+
+        tx.commit().await?;
+        conn_task.abort();
+        Ok(volume_id)
+    })
+}
+
+fn seed_postgres_metadata_state(
+    rt: &tokio::runtime::Runtime,
+    dsn: &str,
+    volume_id: i64,
+    snapshot_json: &[u8],
+) -> anyhow::Result<()> {
+    rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        client
+            .execute(
+                r#"
+                INSERT INTO metadata_state (vol, version, snapshot)
+                VALUES ($1, 1, $2)
+                ON CONFLICT (vol) DO NOTHING
+                "#,
+                &[&volume_id, &snapshot_json],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
+
+        conn_task.abort();
+        Ok(())
+    })
+}
+
 // ── Main run function ─────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -152,75 +350,41 @@ pub fn run(
     data_access_key: &str,
     data_secret_key: &str,
     data_region: &str,
+    postgres_dsn: Option<&str>,
     metadata_endpoint: Option<&str>,
     metadata_bucket: Option<&str>,
     metadata_access_key: Option<&str>,
     metadata_secret_key: Option<&str>,
     metadata_region: Option<&str>,
-    metadata_cache_ttl_secs: u64,
-    metadata_flush_interval_secs: u64,
-    metadata_flush_ops_threshold: u32,
-    metadata_flush_bytes_threshold: u64,
     meta_dir: &Path,
     block_size: Option<&str>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let meta_dsn = postgres_dsn.ok_or_else(|| {
+        anyhow::anyhow!(
+            "PostgreSQL metadata backend is required. Pass --meta postgres://user:pass@host:5432"
+        )
+    })?;
+    let postgres_dsn = rt
+        .block_on(async { ensure_studiofs_database(meta_dsn).await })
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .metadata_dsn;
     let eff_data_region = if data_region.is_empty() {
         "us-east-1"
     } else {
         data_region
     };
 
-    // ── Resolve metadata credentials early ───────────────────────────────────
-    // If --metadata-endpoint is provided, use a separate metadata store;
-    // otherwise fall back to the data store credentials.
-    let (
-        eff_meta_endpoint,
-        eff_meta_bucket,
-        eff_meta_access_key,
-        eff_meta_secret_key,
-        eff_meta_region,
-    ) = if let Some(ep) = metadata_endpoint {
-        let bk = metadata_bucket
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--metadata-bucket is required when --metadata-endpoint is provided"
-                )
-            })?
-            .to_string();
-        let ak = metadata_access_key
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--metadata-access-key is required when --metadata-endpoint is provided"
-                )
-            })?
-            .to_string();
-        let sk = metadata_secret_key
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--metadata-secret-key is required when --metadata-endpoint is provided"
-                )
-            })?
-            .to_string();
-        let rg = metadata_region.unwrap_or("").to_string();
-        let rg = if rg.is_empty() {
-            "us-east-1".to_string()
-        } else {
-            rg
-        };
-        (ep.to_string(), bk, ak, sk, rg)
-    } else {
-        (
-            data_endpoint.to_string(),
-            data_bucket.to_string(),
-            data_access_key.to_string(),
-            data_secret_key.to_string(),
-            eff_data_region.to_string(),
-        )
-    };
-
-    // Are data and metadata using the exact same physical bucket / endpoint?
-    let meta_is_same_bucket = eff_meta_endpoint == data_endpoint && eff_meta_bucket == data_bucket;
+    if metadata_endpoint.is_some()
+        || metadata_bucket.is_some()
+        || metadata_access_key.is_some()
+        || metadata_secret_key.is_some()
+        || metadata_region.is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "--metadata-* options are removed. StudioFS now uses PostgreSQL metadata backend only."
+        ));
+    }
 
     // ── 1. Ensure buckets are accessible (create if missing) ─────────────────
     println!("Checking storage backends...");
@@ -235,20 +399,19 @@ pub fn run(
         eff_data_region,
     )?;
 
-    let meta_bucket_created = if meta_is_same_bucket {
-        false // already handled above
-    } else {
-        ensure_bucket_accessible(
-            &rt,
-            "metadata",
-            &eff_meta_endpoint,
-            &eff_meta_bucket,
-            &eff_meta_access_key,
-            &eff_meta_secret_key,
-            &eff_meta_region,
-        )?
-    };
+    let meta_bucket_created = false;
     println!();
+
+    println!("Checking PostgreSQL backend...");
+    check_postgres_accessible(&rt, &postgres_dsn)?;
+    println!("✓ PostgreSQL connectivity check passed.");
+    println!();
+
+    if volume_name_exists(&rt, &postgres_dsn, name)? {
+        return Err(anyhow::anyhow!(
+            "Volume '{name}' already exists in PostgreSQL metadata. Run `studiofs destroy {name}` first, then retry `studiofs init {name}`."
+        ));
+    }
 
     // ── 2. Compatibility pre-flight check ─────────────────────────────────────
     println!("Running compatibility pre-flight check...");
@@ -264,42 +427,13 @@ pub fn run(
         &rt,
     )?;
 
-    let meta_compat = if meta_is_same_bucket {
-        None // same physical bucket — reuse data result for verdict
-    } else {
-        println!();
-        println!(
-            "  [Metadata store: {} / {}]",
-            eff_meta_endpoint, eff_meta_bucket
-        );
-        Some(super::test::run_compat_on_bucket(
-            &eff_meta_endpoint,
-            &eff_meta_bucket,
-            &eff_meta_access_key,
-            &eff_meta_secret_key,
-            &eff_meta_region,
-            &rt,
-        )?)
-    };
-
     // ── 3. Evaluate compat results ────────────────────────────────────────────
     let data_ok = data_compat.suitable_for_data();
-    // When same bucket: it must also pass metadata CAS tests.
-    let meta_ok = if meta_is_same_bucket {
-        data_compat.suitable_for_metadata()
-    } else {
-        meta_compat
-            .as_ref()
-            .map(|r| r.suitable_for_metadata())
-            .unwrap_or(true)
-    };
+    let meta_ok = true;
 
     if !data_ok || !meta_ok {
         // Print full reports so the user sees exactly what failed.
         data_compat.print_report();
-        if let Some(mc) = &meta_compat {
-            mc.print_report();
-        }
 
         // Cleanup: delete buckets we created during this run.
         println!("Compatibility check FAILED — cleaning up...");
@@ -314,26 +448,13 @@ pub fn run(
                 eff_data_region,
             );
         }
-        if meta_bucket_created {
-            cleanup_delete_bucket(
-                &rt,
-                "metadata",
-                &eff_meta_endpoint,
-                &eff_meta_bucket,
-                &eff_meta_access_key,
-                &eff_meta_secret_key,
-                &eff_meta_region,
-            );
-        }
+        let _ = meta_bucket_created;
 
         // Collect failure details for the error message.
-        let mut failures: Vec<String> = data_compat.failure_summary();
-        if let Some(mc) = &meta_compat {
-            failures.extend(mc.failure_summary());
-        }
+        let failures: Vec<String> = data_compat.failure_summary();
         let detail = failures.join("\n  ");
         return Err(anyhow::anyhow!(
-            "Storage compatibility check failed — this backend is not suitable for StudioFS:\n  {detail}\n\nRun `studiofs test` for detailed diagnostics."
+            "Storage compatibility check failed — this backend is not suitable for StudioFS:\n  {detail}"
         ));
     }
 
@@ -372,34 +493,16 @@ pub fn run(
     } else {
         DEFAULT_BLOCK_SIZE
     };
+    let volume_uuid = Uuid::new_v4().to_string();
 
-    let metadata_prefix = format!("{name}/metadata/");
     let data_prefix = format!("{name}/objects/");
-
-    let metadata_remote = if meta_is_same_bucket {
-        Some(RemoteStoreConfig {
-            endpoint: data_endpoint.to_string(),
-            bucket: data_bucket.to_string(),
-            access_key: data_access_key.to_string(),
-            secret_key: data_secret_key.to_string(),
-            region: eff_data_region.to_string(),
-            prefix: metadata_prefix.clone(),
-        })
-    } else {
-        Some(RemoteStoreConfig {
-            endpoint: eff_meta_endpoint.clone(),
-            bucket: eff_meta_bucket.clone(),
-            access_key: eff_meta_access_key.clone(),
-            secret_key: eff_meta_secret_key.clone(),
-            region: eff_meta_region.clone(),
-            prefix: metadata_prefix.clone(),
-        })
-    };
+    let postgres_volume_id =
+        init_postgres_schema_and_volume(&rt, &postgres_dsn, name, &volume_uuid, actual_block_size)?;
 
     // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
         name: name.to_string(),
-        uuid: Uuid::new_v4().to_string(),
+        uuid: volume_uuid,
         endpoint: data_endpoint.to_string(),
         bucket: data_bucket.to_string(),
         access_key: data_access_key.to_string(),
@@ -407,29 +510,24 @@ pub fn run(
         region: data_region.to_string(),
         data_prefix,
         metadata: MetadataConfig {
-            backend: MetadataBackend::Tonbo,
-            remote: metadata_remote,
-            cache_ttl_secs: metadata_cache_ttl_secs.max(1),
-            flush_interval_secs: metadata_flush_interval_secs.max(1),
-            flush_ops_threshold: metadata_flush_ops_threshold.max(1),
-            flush_bytes_threshold: metadata_flush_bytes_threshold.max(1),
+            backend: MetadataBackend::Postgres,
+            remote: None,
+            postgres: Some(PostgresConfig {
+                url: postgres_dsn.to_string(),
+                volume_id: postgres_volume_id,
+            }),
         },
-        version: String::new(),
         block_size: actual_block_size,
-        chunk_size: 0,
     };
     engine.set_format_info(&format_info)?;
 
     // Initialize root inode owned by the current user
     let (uid, gid) = get_current_ids();
     engine.init_root(uid, gid)?;
+    let snapshot = engine.export_snapshot()?;
+    let snapshot_json = serde_json::to_vec(&snapshot)?;
+    seed_postgres_metadata_state(&rt, &postgres_dsn, postgres_volume_id, &snapshot_json)?;
     drop(engine);
-
-    // Seed initial remote metadata manifest for Tonbo backend.
-    if format_info.metadata.backend == MetadataBackend::Tonbo {
-        let tonbo = TonboMetaEngine::open(&db_path)?;
-        tonbo.flush_now()?;
-    }
 
     // ── 7. Report success ─────────────────────────────────────────────────────
     info!("volume {name:?} initialized successfully");
@@ -442,12 +540,10 @@ pub fn run(
     );
     println!("  Data endpoint: {}", data_endpoint);
     println!("  Data bucket:   {}", data_bucket);
-    if let Some(remote) = &format_info.metadata.remote {
-        if !meta_is_same_bucket {
-            println!("  Metadata endpoint: {}", remote.endpoint);
-            println!("  Metadata bucket:   {}", remote.bucket);
-        }
-        println!("  Metadata prefix:   {}", remote.prefix);
+    if let Some(pg) = &format_info.metadata.postgres {
+        println!("  Metadata backend: Postgres");
+        println!("  Postgres: {}", pg.url);
+        println!("  Volume ID: {}", pg.volume_id);
     }
     println!("  Metadata:   {:?}", db_path);
     println!();

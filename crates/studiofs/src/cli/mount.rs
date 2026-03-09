@@ -32,7 +32,6 @@ pub fn run(
     cache_dir: Option<&Path>,
     cache_size: &str,
     memory_limit: &str,
-    nats_url: &str,
     foreground: bool,
     detach: bool,
 ) -> anyhow::Result<()> {
@@ -61,7 +60,7 @@ pub fn run(
     let db_path = meta_dir.join(format!("{name}.db"));
     info!("opening volume {name:?} from {db_path:?}");
 
-    // Open metadata (redb-local or Tonbo wrapper depending on stored backend config).
+    // Open metadata engine configured for this volume.
     let meta = open_meta_engine(&db_path)?;
     let format_info = meta.get_format_info()?;
 
@@ -95,34 +94,31 @@ pub fn run(
     );
     let _guard = rt.enter();
 
-    // Create VFS
-    // StudioVfs::new returns VfsResult<Arc<Self>>
-    let vfs = StudioVfs::new_with_nats_url(
+    // Create VFS.
+    let vfs = StudioVfs::new(
         meta.clone(),
         &data_config,
         cache_path_str,
         cache_size_bytes,
         mem_limit,
-        Some(nats_url),
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
-    println!("  NATS:         {}", nats_url);
+    println!("  Invalidation: PostgreSQL sync");
 
     // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
 
     // Write PID file so `studiofs umount` can find us
     let _ = super::utils::write_pid_file(mount_point, name, std::process::id());
 
-    // Named event for external graceful shutdown (used by `studiofs umount` on Windows)
-    let event_name = super::utils::shutdown_event_name(mount_point);
-
     // Start platform-specific FUSE mount
     #[cfg(windows)]
     {
+        // Named event for external graceful shutdown (used by `studiofs umount`).
+        let event_name = super::utils::shutdown_event_name(mount_point);
         info!("starting WinFSP mount at {mount_point}");
         studiofs_winfsp::mount_and_serve(
             vfs,
@@ -200,9 +196,9 @@ fn spawn_daemon(name: &str, mount_point: &str) -> anyhow::Result<()> {
         }
     }
 
-    let child = cmd.spawn().map_err(|e| {
-        anyhow::anyhow!("failed to spawn background mount process: {e}")
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn background mount process: {e}"))?;
     let pid = child.id();
 
     // Write PID file (the child will overwrite with identical data once it starts)

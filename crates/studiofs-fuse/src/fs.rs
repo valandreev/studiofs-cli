@@ -1,6 +1,7 @@
 //! fuser::Filesystem implementation — bridges FUSE kernel calls to StudioVfs.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,50 @@ use tokio::runtime::Runtime;
 use tracing::{debug, error, warn};
 
 const TTL: Duration = Duration::from_secs(1);
+
+fn os_str_bytes(name: &OsStr) -> &[u8] {
+    name.as_bytes()
+}
+
+fn debug_name(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn is_kernel_managed_macos_xattr(key: &[u8]) -> bool {
+    key.starts_with(b"com.apple.")
+}
+
+#[cfg(target_os = "macos")]
+fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> Vec<u8> {
+    let offset = position as usize;
+    let existing_len = existing.as_ref().map_or(0, Vec::len);
+    let new_len = existing_len.max(offset.saturating_add(value.len()));
+    let mut merged = vec![0; new_len];
+
+    if let Some(existing) = existing {
+        merged[..existing.len()].copy_from_slice(&existing);
+    }
+    merged[offset..offset + value.len()].copy_from_slice(value);
+    merged
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_xattr_flags(flags: i32) -> u32 {
+    let mut normalized = 0;
+    if flags & 0x0002 != 0 {
+        normalized |= 1; // XATTR_CREATE -> VFS create-if-missing flag
+    }
+    if flags & 0x0004 != 0 {
+        normalized |= 2; // XATTR_REPLACE -> VFS replace-only flag
+    }
+    normalized
+}
+
+fn normalize_unix_mode(mode: u32) -> u16 {
+    // VFS stores only Unix permission bits; file type is tracked separately.
+    (mode & 0o7777) as u16
+}
 
 /// Convert POSIX O_* flags to our OpenFlags.
 fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
@@ -77,7 +122,7 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32)
             FileType::Directory => FuseFileType::Directory,
             FileType::Symlink => FuseFileType::Symlink,
         },
-        perm: attr.mode,
+        perm: attr.mode & 0o7777,
         nlink: attr.nlink as u32,
         uid,
         gid,
@@ -122,7 +167,7 @@ impl StudioFuseFs {
 
 impl Filesystem for StudioFuseFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_bytes = name.to_string_lossy().as_bytes().to_vec();
+        let name_bytes = os_str_bytes(name).to_vec();
         match self.vfs.lookup(parent, &name_bytes) {
             Ok(attr) => reply.entry(
                 &TTL,
@@ -155,18 +200,30 @@ impl Filesystem for StudioFuseFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let name_bytes = name.to_string_lossy().as_bytes().to_vec();
-        match self
-            .vfs
-            .mkdir(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
-        {
+        let name_bytes = os_str_bytes(name).to_vec();
+        match self.vfs.mkdir(
+            parent,
+            &name_bytes,
+            req.uid(),
+            req.gid(),
+            normalize_unix_mode(mode),
+        ) {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                 0,
             ),
             Err(e) => {
-                error!("mkdir({parent}, {:?}) -> {e}", name);
+                error!(
+                    parent,
+                    uid = req.uid(),
+                    gid = req.gid(),
+                    mode,
+                    umask = _umask,
+                    name = %debug_name(&name_bytes),
+                    name_bytes = ?name_bytes,
+                    "mkdir -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -182,11 +239,14 @@ impl Filesystem for StudioFuseFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let name_bytes = name.to_string_lossy().as_bytes().to_vec();
-        match self
-            .vfs
-            .create(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
-        {
+        let name_bytes = os_str_bytes(name).to_vec();
+        match self.vfs.create(
+            parent,
+            &name_bytes,
+            req.uid(),
+            req.gid(),
+            normalize_unix_mode(mode),
+        ) {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
@@ -209,11 +269,14 @@ impl Filesystem for StudioFuseFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let name_bytes = name.to_string_lossy().as_bytes().to_vec();
-        match self
-            .vfs
-            .create(parent, &name_bytes, req.uid(), req.gid(), mode as u16)
-        {
+        let name_bytes = os_str_bytes(name).to_vec();
+        match self.vfs.create(
+            parent,
+            &name_bytes,
+            req.uid(),
+            req.gid(),
+            normalize_unix_mode(mode),
+        ) {
             Ok(attr) => {
                 // Open a handle for the newly created file
                 let (open_flags, _trunc) = posix_flags_to_open_flags(flags);
@@ -234,29 +297,49 @@ impl Filesystem for StudioFuseFs {
                 }
             }
             Err(e) => {
-                error!("create({parent}, {:?}) -> {e}", name);
+                error!(
+                    parent,
+                    uid = req.uid(),
+                    gid = req.gid(),
+                    mode,
+                    umask = _umask,
+                    flags,
+                    name = %debug_name(&name_bytes),
+                    name_bytes = ?name_bytes,
+                    "create -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name_bytes = name.to_string_lossy().as_bytes().to_vec();
+        let name_bytes = os_str_bytes(name).to_vec();
         match self.vfs.unlink(parent, &name_bytes) {
             Ok(()) => reply.ok(),
             Err(e) => {
-                error!("unlink({parent}, {:?}) -> {e}", name);
+                error!(
+                    parent,
+                    name = %debug_name(&name_bytes),
+                    name_bytes = ?name_bytes,
+                    "unlink -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name_bytes = name.to_string_lossy().as_bytes().to_vec();
+        let name_bytes = os_str_bytes(name).to_vec();
         match self.vfs.rmdir(parent, &name_bytes) {
             Ok(()) => reply.ok(),
             Err(e) => {
-                error!("rmdir({parent}, {:?}) -> {e}", name);
+                error!(
+                    parent,
+                    name = %debug_name(&name_bytes),
+                    name_bytes = ?name_bytes,
+                    "rmdir -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -270,8 +353,8 @@ impl Filesystem for StudioFuseFs {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        let name = link_name.to_string_lossy().as_bytes().to_vec();
-        let tgt = target.to_string_lossy().as_bytes().to_vec();
+        let name = os_str_bytes(link_name).to_vec();
+        let tgt = target.as_os_str().as_bytes().to_vec();
         match self.vfs.symlink(parent, &name, &tgt, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(
                 &TTL,
@@ -303,7 +386,7 @@ impl Filesystem for StudioFuseFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let name = newname.to_string_lossy().as_bytes().to_vec();
+        let name = os_str_bytes(newname).to_vec();
         match self.vfs.link(ino, newparent, &name) {
             Ok(attr) => {
                 let fattr = to_fuse_attr(&attr, self.mount_uid, self.mount_gid);
@@ -326,15 +409,50 @@ impl Filesystem for StudioFuseFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let old_name = name.to_string_lossy().as_bytes().to_vec();
-        let new_name = newname.to_string_lossy().as_bytes().to_vec();
+        let old_name = os_str_bytes(name).to_vec();
+        let new_name = os_str_bytes(newname).to_vec();
         match self.vfs.rename(parent, &old_name, newparent, &new_name) {
             Ok(()) => reply.ok(),
             Err(e) => {
-                error!("rename -> {e}");
+                error!(
+                    parent,
+                    newparent,
+                    flags = _flags,
+                    old_name = %debug_name(&old_name),
+                    new_name = %debug_name(&new_name),
+                    old_name_bytes = ?old_name,
+                    new_name_bytes = ?new_name,
+                    "rename -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exchange(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        options: u64,
+        reply: ReplyEmpty,
+    ) {
+        let old_name = os_str_bytes(name).to_vec();
+        let new_name = os_str_bytes(newname).to_vec();
+        warn!(
+            parent,
+            newparent,
+            options,
+            old_name = %debug_name(&old_name),
+            new_name = %debug_name(&new_name),
+            old_name_bytes = ?old_name,
+            new_name_bytes = ?new_name,
+            "macOS exchange is not implemented"
+        );
+        reply.error(libc::ENOSYS);
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -342,7 +460,11 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => reply.opened(fh, 0),
             Err(e) => {
-                error!("open({ino}) -> {e}");
+                if matches!(e, VfsError::WouldBlock) {
+                    debug!("open({ino}) -> {e}");
+                } else {
+                    error!("open({ino}) -> {e}");
+                }
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -487,9 +609,13 @@ impl Filesystem for StudioFuseFs {
             if entry_idx < idx {
                 continue;
             }
-            let name = String::from_utf8_lossy(&entry.name);
             let ft = fuse_file_type(entry.kind);
-            if reply.add(entry.ino, (entry_idx + 1) as i64, ft, name.as_ref()) {
+            if reply.add(
+                entry.ino,
+                (entry_idx + 1) as i64,
+                ft,
+                OsStr::from_bytes(&entry.name),
+            ) {
                 break;
             }
         }
@@ -554,7 +680,6 @@ impl Filesystem for StudioFuseFs {
             if entry_idx < idx {
                 continue;
             }
-            let name = String::from_utf8_lossy(&entry.name);
             let fattr = match self.vfs.getattr(entry.ino) {
                 Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
                 Err(_) => continue, // skip entries we can't stat
@@ -562,7 +687,7 @@ impl Filesystem for StudioFuseFs {
             if reply.add(
                 entry.ino,
                 (entry_idx + 1) as i64,
-                name.as_ref(),
+                OsStr::from_bytes(&entry.name),
                 &TTL,
                 &fattr,
                 0,
@@ -594,7 +719,7 @@ impl Filesystem for StudioFuseFs {
     ) {
         let args = SetattrArgs {
             size,
-            mode: mode.map(|m| m as u16),
+            mode: mode.map(normalize_unix_mode),
             uid,
             gid,
             atime: match atime {
@@ -628,7 +753,20 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.setattr(ino, args) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
-                error!("setattr({ino}) -> {e}");
+                error!(
+                    ino,
+                    mode = ?mode,
+                    uid = ?uid,
+                    gid = ?gid,
+                    size = ?size,
+                    atime = ?atime,
+                    mtime = ?mtime,
+                    crtime = ?_crtime,
+                    chgtime = ?_chgtime,
+                    bkuptime = ?_bkuptime,
+                    flags = ?_flags,
+                    "setattr -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -656,6 +794,22 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
+        match self.vfs.getattr(ino) {
+            Ok(attr) => {
+                let crtime =
+                    UNIX_EPOCH + Duration::from_nanos(attr.effective_crtime().max(0) as u64);
+                let bkuptime = UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64);
+                reply.xtimes(bkuptime, crtime);
+            }
+            Err(e) => {
+                error!(ino, "getxtimes -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+            }
+        }
+    }
+
     // macOS calls access() to determine if writing is allowed.
     // With DefaultPermissions set the kernel already checked mode bits,
     // so we just say OK here.
@@ -672,6 +826,12 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyXattr,
     ) {
         let key = name.as_encoded_bytes();
+        #[cfg(target_os = "macos")]
+        if is_kernel_managed_macos_xattr(key) {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
         match self.vfs.get_xattr(ino, key) {
             Ok(Some(val)) => {
                 if size == 0 {
@@ -688,7 +848,16 @@ impl Filesystem for StudioFuseFs {
                 #[cfg(not(target_os = "macos"))]
                 reply.error(libc::ENODATA);
             }
-            Err(e) => reply.error(vfs_err_to_errno(&e)),
+            Err(e) => {
+                error!(
+                    ino,
+                    key = %debug_name(key),
+                    key_bytes = ?key,
+                    size,
+                    "getxattr -> {e}"
+                );
+                reply.error(vfs_err_to_errno(&e));
+            }
         }
     }
 
@@ -703,23 +872,92 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEmpty,
     ) {
         let key = name.as_encoded_bytes();
-        match self.vfs.set_xattr(ino, key, value, flags as u32) {
+        #[cfg(target_os = "macos")]
+        if is_kernel_managed_macos_xattr(key) {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        let normalized_flags = normalize_macos_xattr_flags(flags);
+        #[cfg(not(target_os = "macos"))]
+        let normalized_flags = flags as u32;
+
+        #[cfg(target_os = "macos")]
+        let value_buf = if _position > 0 {
+            match self.vfs.get_xattr(ino, key) {
+                Ok(existing) => merge_xattr_write(existing, _position, value),
+                Err(e) => {
+                    error!(
+                        ino,
+                        key = %debug_name(key),
+                        key_bytes = ?key,
+                        position = _position,
+                        value_len = value.len(),
+                        flags,
+                        "setxattr preload -> {e}"
+                    );
+                    reply.error(vfs_err_to_errno(&e));
+                    return;
+                }
+            }
+        } else {
+            value.to_vec()
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let value_buf = value.to_vec();
+
+        match self.vfs.set_xattr(ino, key, &value_buf, normalized_flags) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(vfs_err_to_errno(&e)),
+            Err(e) => {
+                error!(
+                    ino,
+                    key = %debug_name(key),
+                    key_bytes = ?key,
+                    value_len = value.len(),
+                    stored_value_len = value_buf.len(),
+                    flags,
+                    normalized_flags,
+                    position = _position,
+                    "setxattr -> {e}"
+                );
+                reply.error(vfs_err_to_errno(&e));
+            }
         }
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         let key = name.as_encoded_bytes();
+        #[cfg(target_os = "macos")]
+        if is_kernel_managed_macos_xattr(key) {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
         match self.vfs.remove_xattr(ino, key) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(vfs_err_to_errno(&e)),
+            Err(e) => {
+                error!(
+                    ino,
+                    key = %debug_name(key),
+                    key_bytes = ?key,
+                    "removexattr -> {e}"
+                );
+                reply.error(vfs_err_to_errno(&e));
+            }
         }
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
         match self.vfs.list_xattrs(ino) {
             Ok(names) => {
+                #[cfg(target_os = "macos")]
+                let names: Vec<Vec<u8>> = names
+                    .into_iter()
+                    .filter(|name| !is_kernel_managed_macos_xattr(name))
+                    .collect();
+
                 // xattr list format: null-terminated name strings concatenated
                 let data: Vec<u8> = names
                     .iter()
@@ -836,7 +1074,7 @@ impl Filesystem for StudioFuseFs {
 // ─── Kernel Cache Invalidator ────────────────────────────────────────────────
 
 /// Bridges `fuser::Notifier` to the VFS `KernelInvalidator` trait so that
-/// NATS-driven metadata refreshes can immediately clear the Linux kernel's
+/// Metadata refreshes can immediately clear the Linux kernel's
 /// FUSE dentry and attribute caches.
 pub struct FuseKernelInvalidator {
     notifier: fuser::Notifier,
@@ -848,15 +1086,65 @@ impl FuseKernelInvalidator {
     }
 }
 
+fn should_log_fuse_invalidation_error(err: &std::io::Error) -> bool {
+    err.kind() != std::io::ErrorKind::NotFound
+}
+
 impl KernelInvalidator for FuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
         // offset=0, len=-1 invalidates the entire inode (attributes + all
         // cached page data / directory listing).
         if let Err(e) = self.notifier.inval_inode(ino, 0, -1) {
             // ENOENT is harmless (kernel already evicted the entry).
-            if e.kind() != std::io::ErrorKind::NotFound {
+            if should_log_fuse_invalidation_error(&e) {
                 warn!(ino, error = %e, "FUSE notify_inval_inode failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_unix_mode, should_log_fuse_invalidation_error};
+
+    #[cfg(target_os = "macos")]
+    use super::{is_kernel_managed_macos_xattr, merge_xattr_write};
+
+    #[test]
+    fn normalize_unix_mode_strips_file_type_bits() {
+        assert_eq!(normalize_unix_mode(0o40755), 0o755);
+        assert_eq!(normalize_unix_mode(0o100644), 0o644);
+        assert_eq!(normalize_unix_mode(0o100644 | 0o4000), 0o4644);
+    }
+
+    #[test]
+    fn fuse_invalidation_not_found_is_benign() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert!(!should_log_fuse_invalidation_error(&not_found));
+        assert!(should_log_fuse_invalidation_error(&other));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kernel_managed_macos_xattr_matches_com_apple_prefix() {
+        assert!(is_kernel_managed_macos_xattr(b"com.apple.FinderInfo"));
+        assert!(is_kernel_managed_macos_xattr(b"com.apple.quarantine"));
+        assert!(!is_kernel_managed_macos_xattr(b"user.color"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn merge_xattr_write_overwrites_from_offset() {
+        let merged = merge_xattr_write(Some(b"abcdef".to_vec()), 2, b"ZZ");
+        assert_eq!(merged, b"abZZef");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn merge_xattr_write_zero_fills_gap() {
+        let merged = merge_xattr_write(None, 3, b"xy");
+        assert_eq!(merged, vec![0, 0, 0, b'x', b'y']);
     }
 }

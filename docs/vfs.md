@@ -2,6 +2,14 @@
 
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
+This behavior is frozen by
+[`file-visibility-and-incarnation-model.md`](./refactor/file-visibility-and-incarnation-model.md):
+
+- `flush()`/`close()` and local WAL accept guarantee immediate read-after-write for
+  the same mounted client.
+- remote readers see only coarse `upload_state` (`uploading`, `updating`, `ready`).
+- remote visibility is file-version atomic via incarnation publish.
+
 ## Core Struct: `StudioVfs`
 
 Holds all runtime state:
@@ -9,9 +17,9 @@ Holds all runtime state:
 | Field | Type | Purpose |
 |-------|------|---------|
 | `meta` | `Arc<dyn MetaEngine>` | Metadata operations |
-| `data` | `DataStore` | S3 read/write (dedicated pools) |
-| `cache` | `Arc<BlockCache>` | L1 + L2 block cache |
-| `fetch` | `Arc<FetchScheduler>` | Adaptive S3 fetcher |
+| `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
+| `block_cache` | `Arc<BlockCache>` | L1 + L2 block cache |
+| `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Open files, dirty buffers, backpressure |
 
@@ -26,7 +34,7 @@ Holds all runtime state:
 | `block_size` | 8 MiB | Block size (from format info) |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Max prefetch depth |
-| `max_dirty_bytes` | 8 GiB | Dirty memory limit before backpressure |
+| `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
 
 ## Write Path
 
@@ -36,14 +44,9 @@ Holds all runtime state:
 data arrives
   │
   ├─ Split into block-aligned chunks
-  ├─ Allocate block IDs (batch: next_block_ids)
-  ├─ Store in pending_blocks (per-inode HashMap)
-  ├─ Increment dirty_bytes counter
-  │
-  ├─ If dirty_bytes > max_dirty_bytes:
-  │    └─ Await dirty_drained_notify (backpressure)
-  │
-  └─ Update inode size if extending file
+  ├─ Store/merge in `pending_blocks`
+  ├─ Update local inode size and pending incarnation overlay
+  └─ Full blocks can be moved immediately into dirty staging
 ```
 
 ### 2. `flush(ino)` / `close(ino)`
@@ -51,33 +54,35 @@ data arrives
 ```
 pending_blocks for this inode
   │
-  ├─ Move all blocks to dirty_mem global pool
-  └─ Notify background flusher
+  ├─ Append accepted records to ingress segments (durable local accept)
+  ├─ Update live ingress index / pending incarnation state
+  └─ Notify background pipeline
 ```
 
-### 3. Background Flusher (`drain_dirty_mem`)
+### 3. Background Materializer (`drain_dirty_mem` lineage)
 
 Runs every 10ms, processes continuously while data exists:
 
 ```
-dirty_mem pool
+dirty_mem + ingress_spill
   │
-  ├─ Take batch of up to 256 blocks
+  ├─ Take batch of up to 1024 blocks
   │
-  ├─ Phase 1: L1 stage + metadata
-  │    ├─ cache.stage_l1(id, data) for each block
-  │    └─ meta.flush_blocks_batch() — single redb transaction
+  ├─ Phase 1: pending manifest state update + L1 stage
+  │    ├─ allocate object ids
+  │    ├─ cache.stage_l1(id, data)
+  │    └─ meta.flush_blocks_batch()   ← local pending refs only
   │
   ├─ Phase 2: L2 commit (parallel)
   │    └─ cache.commit_l2_batch(blocks) — parallel NVMe writes
   │
-  ├─ Phase 3: Upload enqueue
-  │    └─ cache.submit_upload(ino, offset, id) for each
+  ├─ Phase 3: Upload enqueue for accepted incarnation extents
+  │    └─ cache.submit_upload(..., content_epoch) for each
   │
   ├─ Decrement dirty_bytes
   ├─ Notify dirty_drained_notify (wake backpressured writers)
   │
-  └─ If batch was full (256), loop immediately
+  └─ If batch was full, loop immediately
 ```
 
 ### 4. Upload Worker
@@ -88,25 +93,34 @@ Consumes from upload queue channel:
 PendingUpload received
   │
   ├─ Read block from cache (L1 or L2)
+  ├─ Reject stale op if inode/incarnation no longer match
   ├─ Build object (header + raw payload), compute xxh64 checksum
   ├─ PUT to S3 via UploadScheduler (AIMD + retry/timeout policy)
+  ├─ Mark extent record as uploaded only after upload success
   ├─ cache.complete_upload(pending) — unpin LRU entry
   │
   └─ On failure: requeue with backoff
 ```
+
+Remote-visible regular-file size advances only when a full incarnation is committed
+through `committed_size`, not through the local foreground `size`.
 
 ## Read Path
 
 ### `read(ino, offset, size)`
 
 ```
-                         ┌─ pending_blocks (uncommitted)
-  lookup BlockRef   ──── ├─ dirty_mem (staged)
-  from metadata          └─ meta.get_file_block()
+local metadata view ──┬─ pending incarnation extents
+                        └─ fallback `committed_file_blocks`
          │
          ▼
-  resolve block data ─── ┌─ L1 memory cache
-  (first match wins)     ├─ L2 disk cache
+  resolve block data ─── ┌─ pending_blocks
+  (first match wins)     ├─ dirty_mem
+                         ├─ open handle dirty state
+                         ├─ pending incarnation extents
+                         ├─ ingress_spill
+                         ├─ L1 memory cache
+                         ├─ L2 disk cache
                          └─ FetchScheduler → S3
          │
          ▼
@@ -141,7 +155,7 @@ fetch_block(object_id)
   ├─ Register singleflight entry
   ├─ Acquire AIMD permit (may block if at capacity)
   │
-  ├─ S3 GET with configurable timeout (default 30s)
+  ├─ S3 GET with configurable timeout (default 45s)
   ├─ Decode object + verify checksum
   ├─ Populate L1 + L2 cache
   ├─ Resolve AIMD permit (success/failure)
@@ -169,6 +183,7 @@ Prefetch reads use `fetch_block_prefetch()`:
 ### Connection Warmup
 
 On startup, `warmup(timeout)` primes the HTTP connection pool by issuing 4 parallel lightweight S3 requests.
+Warmup runs in a background task and does not block `StudioVfs::new`.
 
 ## ReadAhead (`readahead.rs`)
 
@@ -194,8 +209,8 @@ Runtime tuning knobs:
 - `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `96`)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `250`, temporarily pauses prefetch after transport send errors)
 - `STUDIOFS_FETCH_PREFETCH_RESERVE` (default equals foreground reserve; prefetch cannot consume these slots)
-- `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `2`, prefetch retries are intentionally short)
-- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `25`)
+- `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
+- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
 On each `read()`:
 1. `record_read(ino, first_block, last_block)` returns blocks to prefetch
@@ -229,11 +244,11 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 ## Backpressure
 
-When `dirty_bytes` exceeds `max_dirty_bytes` (8 GiB):
+When accepted local staging exceeds configured budget:
 
-1. `write()` and `flush()` await `dirty_drained_notify`
-2. Background flusher processes blocks and calls `notify_waiters()`
-3. Writers unblock with near-zero latency (no polling)
+1. StudioFS prefers spilling to NVMe ingress (`ingress_spill`)
+2. only after RAM + spill budget are exhausted do `write()` / `flush()` wait
+3. background flusher drains staged blocks and wakes waiters
 
 This prevents unbounded memory growth during sustained writes.
 

@@ -9,7 +9,6 @@ studiofs-meta.workspace = true
 studiofs-data.workspace = true
 studiofs-cache.workspace = true
 tokio.workspace = true
-async-nats.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
@@ -19,6 +18,8 @@ futures.workspace = true
 opendal.workspace = true
 tokio-stream = "0.1.18"
 dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -28,3 +29,5 @@ aws-config = "1"
 aws-sdk-s3 = "1"
 aws-smithy-http-client = "1"
 dotenvy.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true

@@ -65,6 +65,18 @@ pub enum MetaError {
 
 pub type MetaResult<T> = Result<T, MetaError>;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataReplicationBacklog {
+    pub pending_ops: u32,
+    pub inflight_ops: u32,
+}
+
+impl MetadataReplicationBacklog {
+    pub fn total_ops(self) -> u32 {
+        self.pending_ops.saturating_add(self.inflight_ops)
+    }
+}
+
 /// Abstract metadata engine interface.
 ///
 /// All operations are synchronous (redb is sync). The VFS layer wraps them
@@ -96,7 +108,7 @@ pub trait MetaEngine: Send + Sync {
     /// Request a near-immediate flush of pending metadata mutations.
     ///
     /// Called by the VFS after user-visible directory mutations (create,
-    /// unlink, rmdir, rename, …) so that changes reach remote/NATS within
+    /// unlink, rmdir, rename, …) so that changes reach remote metadata within
     /// a short batching window (~250 ms) instead of waiting for the full
     /// `flush_interval` (default 60 s).  The default is a no-op.
     fn request_eager_flush(&self) {}
@@ -108,6 +120,12 @@ pub trait MetaEngine: Send + Sync {
     /// actually observed a newer remote snapshot.
     fn metadata_version_token(&self) -> Option<String> {
         None
+    }
+
+    /// Best-effort count of local metadata mutations not yet durably pushed to
+    /// the shared remote metadata source.
+    fn replication_backlog(&self) -> MetadataReplicationBacklog {
+        MetadataReplicationBacklog::default()
     }
 
     // ─── Format / Settings ───────────────────────────────────────────────
@@ -205,19 +223,14 @@ pub trait MetaEngine: Send + Sync {
     ///
     /// For each entry:
     /// - Sets the new `BlockRef` in `FILE_BLOCKS`
-    /// - If an old block existed at `(ino, block_index)`, adds it to pending
-    ///   deletions and adjusts `USED_SPACE`
+    /// - If an old block existed at `(ino, block_index)`, returns it to the
+    ///   caller so remote-visible replacement/GC can be decided later
     /// - Increments `USED_SPACE` by the new block's length
     ///
     /// Returns one [`BatchFlushResult`] per entry (same order).
     ///
     /// Default implementation calls individual methods sequentially.
     fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
         let mut results = Vec::with_capacity(entries.len());
         for e in entries {
             let block_ref = BlockRef {
@@ -228,13 +241,34 @@ pub trait MetaEngine: Send + Sync {
             };
             let old = self.set_file_block(e.ino, e.block_index, &block_ref)?;
             if let Some(ref old_block) = old {
-                self.add_pending_deletion(old_block.object_id, timestamp)?;
                 self.decr_counter(counters::USED_SPACE, old_block.length as u64)?;
             }
             self.incr_counter(counters::USED_SPACE, e.length as u64)?;
             results.push(BatchFlushResult { old_block: old });
         }
         Ok(results)
+    }
+
+    /// Mark a block as remote-visible after its object upload has completed.
+    ///
+    /// Remote-backed engines can use this to publish block visibility and
+    /// advance remote-visible file size independently from the local write view.
+    fn commit_uploaded_block(
+        &self,
+        _ino: Ino,
+        _block_index: u32,
+        _expected_epoch: u64,
+        _block: &BlockRef,
+    ) -> MetaResult<bool> {
+        Ok(true)
+    }
+
+    /// Atomically publish the current file manifest as the new committed head.
+    ///
+    /// This switches the committed manifest at file granularity and updates the
+    /// inode's coarse remote upload state to `ready` when successful.
+    fn publish_file_manifest(&self, _ino: Ino, _expected_epoch: u64) -> MetaResult<bool> {
+        Ok(false)
     }
 
     // ─── Pending Deletions (GC) ───────────────────────

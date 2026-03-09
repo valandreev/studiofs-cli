@@ -2,60 +2,41 @@
 
 ## Stack
 
-- **Language:** Rust (2024 edition)
-- **Build:** Cargo workspace with 7 crates
-- **Metadata:** `redb` (local) + Tonbo manifest over S3-compatible storage
-- **Object I/O:** OpenDAL (`services-s3`)
-- **Compression:** LZ4 (`lz4_flex`) + xxh64 checksums
-- **Cache:** Two-level (RAM + NVMe) with LRU and crash-safe writeback
-- **Platform:** WinFSP (Windows), FUSE (Linux/macOS)
-- **Test storage:** MinIO (or any S3-compatible endpoint)
-- **Invalidation bus:** NATS (optional, Core or JetStream delivery)
+- Rust 2024 workspace
+- Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
+- Data I/O: OpenDAL (S3-compatible)
+- Cache: RAM + disk + writeback queue
+- Bridges: WinFSP (Windows), FUSE (Linux/macOS)
 
 ## Project Structure
 
 ```
 studiofs-cli/
-  ├── Cargo.toml                  # workspace root
   ├── crates/
-  │   ├── studiofs/               # CLI binary
-  │   │   └── src/cli/            # subcommand modules
-  │   ├── studiofs-meta/          # metadata engine (redb + Tonbo)
-  │   ├── studiofs-data/          # S3 I/O + object format
-  │   ├── studiofs-cache/         # L1 RAM + L2 NVMe cache
-  │   ├── studiofs-vfs/           # platform-agnostic VFS core
-  │   ├── studiofs-fuse/          # FUSE bridge (Linux/macOS)
-  │   └── studiofs-winfsp/        # WinFSP bridge (Windows)
-  └── docs/                       # documentation
+  │   ├── studiofs/           # CLI
+  │   ├── studiofs-meta/      # metadata engines
+  │   ├── studiofs-data/      # S3 object I/O
+  │   ├── studiofs-cache/     # L1/L2 cache
+  │   ├── studiofs-vfs/       # filesystem core
+  │   ├── studiofs-fuse/      # Unix bridge
+  │   └── studiofs-winfsp/    # Windows bridge
+  └── docs/
 ```
-
-See [Architecture Overview](architecture.md) for crate dependency graph and data flows.
 
 ## Local Setup
 
-1. Clone and pull latest:
-```bash
-git clone <repo-url>
-cd studiofs-cli
-git pull
-```
-
-2. Create local `.env` in repository root:
 ```bash
 cp .env.example .env
 ```
 
-3. Edit `.env` for your local environment.
+Recommended `.env` values:
+- `STUDIOFS_MINIO_ENDPOINT`
+- `STUDIOFS_MINIO_ACCESS_KEY`
+- `STUDIOFS_MINIO_SECRET_KEY`
+- `STUDIOFS_MINIO_BUCKET`
+- `STUDIOFS_TEST_PG_DSN`
 
-Notes:
-- `.env` is ignored by git and must not be committed.
-- If `.env` is missing or values are unset, tests fall back to defaults:
-  - MinIO endpoint: `http://127.0.0.1:9000`
-  - MinIO credentials: `minioadmin:minioadmin`
-  - Bucket default in tests: `studiofs-test`
-  - NATS URL default for local dev: `nats://127.0.0.1:4222`
-  - NATS delivery mode default: `STUDIOFS_NATS_DELIVERY=core`
-- Tests that require a bucket will try to create it if missing.
+`.env` is gitignored and must not be committed.
 
 ## Build
 
@@ -63,56 +44,52 @@ Notes:
 cargo build --release
 ```
 
-## Test Commands
+## Tests
 
-Run regular tests:
+Fast suite:
 ```bash
-cargo test --release
+cargo test --workspace --all-targets -- --nocapture
 ```
 
-Run ignored integration tests:
+Infra-heavy ignored suite:
 ```bash
-cargo test --release -- --ignored
+cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
-Targeted suites:
-```bash
-# Metadata Tonbo/MinIO tests
-cargo test -p studiofs-meta --release -- --ignored
+On Windows/PowerShell, clear proxy env before infra tests when MinIO/PG are
+directly reachable in LAN/VPN:
 
-# VFS flock/distributed lock tests
-cargo test -p studiofs-vfs flock --release -- --ignored
-
-# Data path integration tests
-cargo test -p studiofs-data --test integration_test --release -- --ignored
+```powershell
+Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY -ErrorAction SilentlyContinue
+$env:NO_PROXY='localhost,127.0.0.1,::1'
 ```
 
-## Environment Variables
+Targeted:
+```bash
+cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-data --test integration_test -- --ignored --nocapture
+```
 
-Required for custom test endpoints/credentials:
-- `STUDIOFS_MINIO_ENDPOINT`
-- `STUDIOFS_MINIO_ACCESS_KEY`
-- `STUDIOFS_MINIO_SECRET_KEY`
-- `STUDIOFS_MINIO_BUCKET`
+## Multi-Client Dev Flow
 
-Optional:
-- `STUDIOFS_NATS_URL`
-- `STUDIOFS_NATS_DELIVERY` (`core`, `auto`, `jetstream`)
+1. Client A:
+```bash
+studiofs init <name> ... --meta <postgres-server-dsn>
+studiofs mount <name> <mount-point>
+```
 
-## Infrastructure Requirements
+2. Client B/C/...:
+```bash
+studiofs discover <name> --meta <postgres-server-dsn>
+studiofs mount <name> <mount-point>
+```
 
-- Reachable MinIO/S3-compatible endpoint from test environment
-- Credentials with permission to create/read/write/delete test objects
-- For invalidation bus scenarios: reachable NATS server
+## Related Docs
 
-## Related Documentation
-
-- [Architecture Overview](architecture.md) — system design and data flows
-- [Cache System](cache.md) — L1/L2 cache internals
-- [Metadata Engine](metadata.md) — redb, Tonbo sync, schema
-- [NATS Invalidation Bus](nats.md) — invalidation flow and recommended tuning
-- [VFS Layer](vfs.md) — read/write paths, readahead, AIMD
-- [Data Layer](data-layer.md) — S3 object format, compression
-- [Platform Bridges](platform-bridges.md) — WinFSP and FUSE
-- [Configuration Reference](configuration.md) — CLI options, env vars, tuning
-- [Metadata Schema](metadata-schema.md) — schema types and compatibility
+- [Architecture Overview](architecture.md)
+- [Metadata Engine](metadata.md)
+- [Configuration Reference](configuration.md)
+- [Tests Guide](tests.md)
+- [Cache System](cache.md)
+- [VFS Layer](vfs.md)

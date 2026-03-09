@@ -7,6 +7,5 @@ pub mod janitor;
 pub mod mount;
 pub mod status;
 pub mod test;
-pub mod tune_metadata;
 pub mod umount;
 pub mod utils;

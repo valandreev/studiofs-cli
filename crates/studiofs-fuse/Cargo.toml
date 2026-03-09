@@ -9,8 +9,14 @@ studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
 studiofs-cache.workspace = true
 studiofs-data.workspace = true
-[target.'cfg(unix)'.dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
 fuser.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { workspace = true, features = ["libfuse"] }
+
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 tokio.workspace = true
 tracing.workspace = true

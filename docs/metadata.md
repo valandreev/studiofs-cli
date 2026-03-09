@@ -1,199 +1,137 @@
 # Metadata Engine
 
-The metadata subsystem (`studiofs-meta`) provides all filesystem metadata operations through the `MetaEngine` trait, with two implementations for local and distributed use.
-
-## MetaEngine Trait
-
-All methods are **synchronous** — the VFS wraps them with `spawn_blocking` for async integration. This keeps the metadata layer simple and transactional.
-
-### Operation Groups
-
-| Group | Key Methods |
-|-------|-------------|
-| **Format** | `set_format_info`, `get_format_info` |
-| **Counters** | `get_counter`, `incr_counter`, `decr_counter`, `set_counter` |
-| **Inodes** | `next_inode`, `get_attr`, `set_attr`, `remove_attr` |
-| **Directory entries** | `lookup`, `readdir`, `add_entry`, `remove_entry` |
-| **File blocks** | `get_file_block`, `set_file_block`, `get_file_blocks`, `remove_file_blocks`, `next_block_id`, `next_block_ids`, `flush_blocks_batch` |
-| **GC** | `add_pending_deletion`, `remove_pending_deletion`, `get_pending_deletions`, `get_referenced_object_ids` |
-| **High-level** | `create_file`, `create_dir`, `unlink`, `rmdir`, `rename`, `link` |
-| **Sync** | `flush_metadata`, `sync_metadata` |
-
-### Error Types
-
-| Error | Description |
-|-------|-------------|
-| `InodeNotFound` | Inode does not exist |
-| `EntryNotFound` | Directory entry not found |
-| `EntryExists` | Name already exists (create/link) |
-| `NotADirectory` | Operation requires a directory |
-| `DirNotEmpty` | Cannot remove non-empty directory |
-| `IsADirectory` | Operation not valid on directory |
-| `Storage` | Underlying storage error |
-| `Serialization` | Encode/decode error |
-| `NotFormatted` | Database not initialized |
+`studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
 
 ## Engines
 
-### RedbMetaEngine
+### `RedbMetaEngine`
 
-Local-only engine backed by [redb](https://github.com/cberner/redb), an embedded key-value store.
+Local embedded serving store.
+- ACID local transactions
+- foreground source of truth for the mounted client
+- stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, staged blocks, committed blocks, counters, local event log
 
-**Database tables (9):**
+### `PgMetaEngine`
 
-| Table | Key | Value | Description |
-|-------|-----|-------|-------------|
-| `settings` | `&str` | JSON `&[u8]` | Volume config (`FormatInfo`) |
-| `counters` | `&str` | `u64` | Named counters |
-| `inodes` | `u64` | postcard `&[u8]` | Inode attributes |
-| `dentries` | `parent_ino+name` | postcard `&[u8]` | Directory entries |
-| `file_blocks` | `ino+block_idx` (12B) | postcard `&[u8]` | Block references |
-| `pending_deletions` | `u64` | `i64` | GC pending objects |
-| `symlinks` | `u64` | `&[u8]` | Symlink targets |
-| `xattrs` | `ino+name` | `&[u8]` | Extended attributes |
-| `event_log` | `u64` (seq) | postcard `&[u8]` | Event sourcing log |
+Distributed wrapper around `RedbMetaEngine`.
 
-All operations execute within redb write transactions for ACID guarantees.
+Current behavior:
+- foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
+- local mutations append to the local metadata event log
+- background flush projects remote-visible deltas into PostgreSQL `event_log`
+- background pull applies only newer foreign delta batches
+- restart/reopen rebuilds pending replication state from the local event log when
+  unpublished local overlay mutations still exist
+- foreign namespace/attr/symlink/xattr apply updates the local `base_*` view
+- local serving view is `overlay over base`
+- `metadata_state` is used as a bootstrap/checkpoint store, not the primary runtime sync channel
 
-**Additional methods:**
-- `open(path)` — open or create database
-- `init_root(uid, gid)` — create root inode (#1) if not present
-- `export_snapshot()` → `RedbSnapshot` — full database dump
-- `import_snapshot(snapshot)` — replace all data from snapshot
+## Sync Model
 
-### TonboMetaEngine
+### Local vs Remote-Visible State
 
-Distributed engine wrapping `RedbMetaEngine` with remote S3 manifest synchronization.
+For regular files StudioFS keeps two views:
+- local view:
+  - `size`
+  - staged `file_blocks`
+- remote-visible view:
+  - `committed_size`
+  - `committed_file_blocks`
 
-**Architecture:**
-```
-Local redb (read/write cache)
-       ↕  batch flush
-Remote S3 manifest (shared source of truth)
-       ↕  invalidation
-Optional NATS bus
-```
+This is required so a client can finish local writes immediately while remote
+clients only see blocks that have actually finished uploading.
 
-**Key fields:**
-- `local: Arc<RedbMetaEngine>` — all reads/writes go here first
-- `remote: Option<RemoteStore>` — S3 manifest storage
-- `baseline_snapshot` — last known remote state (for delta computation)
-- `inode_ranges / block_ranges` — pre-allocated ID ranges to avoid remote contention
+For namespace, attrs, symlink targets, and xattrs StudioFS also keeps two views:
+- base view:
+  - `base_inodes`
+  - `base_dentries`
+  - `base_symlinks`
+  - `base_xattrs`
+- local overlay view:
+  - current local inode attrs in `inodes`
+  - current local dentries in `dentries`
+  - current local symlink targets in `symlinks`
+  - current local xattrs in `xattrs`
+  - local tombstones in `symlink_tombstones` / `xattr_tombstones`
 
-**Flush process:**
+Serving rules are:
+- `getattr`: overlay wins, otherwise fall back to base
+- `lookup`: overlay wins, otherwise fall back to base
+- `readdir`: merged `overlay over base`
+- `readlink` / `getxattr` / `listxattrs`: merged `overlay over base`
 
-1. Compute delta between current redb state and baseline snapshot
-2. Serialize delta and PUT to S3 with `If-Match: <etag>` (CAS)
-3. On success: update baseline, reset counters
-4. On 412 conflict: pull remote manifest, merge with local changes, retry
-5. Optional: publish `fs.invalidate.<volume>.all` to NATS (Core or JetStream mode)
+### Flush to PostgreSQL
 
-**Range-based ID allocation:**
+1. Read the pending local event range from the local event log.
+2. Project events into a remote-visible stream.
+3. Start a PostgreSQL transaction.
+4. Bump `metadata_state.version` and use that value as the batch cursor.
+5. Append projected events into `event_log`.
+6. Periodically refresh the remote-visible checkpoint in `metadata_state`.
 
-To avoid contending on remote counters for every `next_inode()` / `next_block_id()`:
-- Pre-allocate ranges from remote: 4,096 inodes, 65,536 block IDs at a time
-- Use CAS on the remote counter to claim a range
-- Serve local calls from the pre-allocated range
-- Retry up to 10 times on contention
+Events that stay local-only are not published as remote-visible deltas:
+- staged `SetFileBlock` / `SetFileBlocksBatch`
+- pending deletion churn
+- local regular-file `size` ahead of `committed_size`
 
-**Metrics tracked:**
-- `remote_round_trips`, `cas_retries` — sync performance
-- `cache_hits`, `cache_misses`, `ttl_expirations` — cache effectiveness
-- `flush_cycles` — total flushes performed
+Operational note:
+- `flush_metadata()` is explicit "flush then pull".
+- `sync_metadata()` is pull-only; it does not publish local pending metadata.
+- on reopen, unpublished local events between `flushed_event_seq` and
+  `nextEventSeq` are reconstructed into pending replication state when the local
+  overlay is still live, so ordinary recovery should not require wiping local
+  metadata or running `discover`.
 
-## Schema (`schema.rs`)
+### Pull from PostgreSQL
 
-### Constants
+1. Load only rows with `batch_version > local_version`.
+2. Decode batches in `(batch_version, client_id)` order.
+3. Apply foreign batches in order.
+4. Apply self batches only to remote-visible/base reconciliation (not as local overlay writes).
+5. Use self batches to acknowledge already-published local event prefixes and
+   advance the local flushed watermark after restart/crash windows.
+6. Do not skip earlier foreign batches just because the client has already
+   published a newer self batch.
+7. Apply foreign namespace/attr/symlink/xattr state into local `base_*`.
+8. Skip auxiliary serving-view updates for events that conflict with local overlay state and continue applying later
+   independent batches.
 
-| Constant | Value |
-|----------|-------|
-| `DEFAULT_BLOCK_SIZE` | 8 MiB (8,388,608) |
-| `ROOT_INO` | 1 |
+This avoids replaying a client's own changes and avoids clobbering local staged
+writes with foreign state, while still advancing the remote-visible base view.
 
-### Core Types
+## PostgreSQL Tables
 
-**`Ino`** = `u64` — inode number
+- `volumes`
+- `event_log`
+- `metadata_state`
 
-**`FileType`** — `RegularFile` (1), `Directory` (2), `Symlink` (3)
+`event_log` is the runtime delta stream. `metadata_state` stores:
+- the monotonic `version`
+- the latest remote-visible checkpoint snapshot
 
-**`InodeAttr`** — full inode metadata:
-- `ino`, `kind` (FileType), `mode`, `uid`, `gid`
-- `size`, `nlink`
-- `mtime`, `ctime`, `atime`, `crtime` (nanosecond timestamps)
-- `parent` (parent inode)
-- `win_attrs` (Windows file attributes, `u32`)
+## Consistency
 
-**`DirEntryValue`** — stored directory entry: `{ ino, kind }`
+- local operations are synchronous and immediate for the current client
+- cross-client visibility is eventual
+- namespace visibility may arrive before all file blocks are committed
+- remote-visible file size advances only with committed blocks
+- foreign namespace can be present in local `base_*` before local overlay stops masking it
+- stale async completions are rejected using `content_epoch` plus block identity checks
+- crash/reopen recovery should converge through ordinary restart plus
+  `sync_metadata()` / `flush_metadata()`; `discover` is bootstrap/manual repair,
+  not the expected path for normal PG replication recovery
 
-**`BlockRef`** — reference to a data block:
-- `object_id: u64` — sequential object ID
-- `offset: u64` — offset within object (currently always 0, one block per object)
-- `length: u32` — uncompressed data length
-- `flags: BlockFlags` — `COMPRESSED_LZ4` (0x01), `PARTIAL_BLOCK` (0x02)
+## MetadataConfig
 
-**`FormatInfo`** — volume configuration persisted in redb `settings` table:
-- `name`, `uuid` — volume identity
-- `endpoint`, `bucket`, `access_key`, `secret_key`, `region` — data S3 config
-- `data_prefix` — S3 key prefix for data objects
-- `metadata: MetadataConfig` — backend type + remote config + tuning
-- `block_size` — block size in bytes
-- `version` — format version for migration
+Important fields:
+- `backend = Postgres`
+- `postgres.url`
+- `postgres.volume_id`
 
-**`MetadataConfig`:**
-- `backend` — `RedbLocal` or `Tonbo`
-- `remote: Option<RemoteStoreConfig>` — S3 config for Tonbo manifest
-- `cache_ttl_secs` — read cache TTL (default 20s)
-- `flush_interval_secs` — batch flush interval (default 60s)
-- `flush_ops_threshold` — flush after N operations (default 100)
-- `flush_bytes_threshold` — flush after N bytes changed (default 1 MiB)
-
-### Named Counters
-
-| Counter | Purpose |
-|---------|---------|
-| `NEXT_INODE` | Next inode number to allocate |
-| `NEXT_BLOCK_ID` | Next object ID to allocate |
-| `USED_SPACE` | Total bytes used by file data |
-| `TOTAL_INODES` | Total inodes in filesystem |
-
-### Helper Functions
-
-- `block_index_from_offset(offset, block_size)` → block index
-- `offset_within_block(offset, block_size)` → offset within block
-- `blocks_for_size(size, block_size)` → number of blocks
-
-## Events (`events.rs`)
-
-Event-sourced mutation log for Tonbo replication.
-
-**`MetaEvent` variants:**
-
-| Category | Events |
-|----------|--------|
-| Inodes | `SetAttr`, `RemoveAttr` |
-| Directory | `AddEntry`, `RemoveEntry` |
-| Blocks | `SetFileBlock`, `RemoveFileBlock`, `RemoveFileBlocks`, `SetFileBlocksBatch` |
-| Symlinks | `SetSymlinkTarget` |
-| Extended attrs | `SetXattr`, `RemoveXattr` |
-| GC | `AddPendingDeletion`, `RemovePendingDeletion` |
-
-Each event has a `primary_ino()` method for partitioning/ordering.
-
-## Multi-Client Consistency
-
-### Without NATS
-
-- Writes are locally consistent (redb ACID transactions)
-- Remote consistency via periodic flush (CAS ensures no lost updates)
-- Read staleness bounded by `cache_ttl_secs` (default 20s)
-- On cache miss, immediate remote refresh
-
-### With NATS
-
-- After successful metadata flush, publisher broadcasts `fs.invalidate.<volume>.all`
-- Subscribers run immediate metadata sync and invalidate read caches
-- Block cache eviction is selective: dropped object IDs are evicted, unchanged blocks remain cached
-- Effective staleness is usually bounded by flush latency + NATS delivery + sync time
-- NATS is optional — correctness never depends on it
-
-For full flow, subject model, and tuning guidance, see [NATS Invalidation Bus](nats.md).
+Client runtime policy is not stored in the volume format.
+PG batching / sync cadence is controlled per client through runtime settings
+such as:
+- `STUDIOFS_PG_FLUSH_INTERVAL_SECS`
+- `STUDIOFS_PG_FLUSH_OPS_THRESHOLD`
+- `STUDIOFS_PG_FLUSH_IDLE_MS`
+- `STUDIOFS_PG_SYNC_POLL_SECS`

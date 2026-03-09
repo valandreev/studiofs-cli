@@ -4,13 +4,23 @@
 
 pub mod aimd;
 pub mod fetch;
+pub mod incarnation;
+pub mod qos;
 pub mod readahead;
+mod runtime;
 pub mod upload;
 pub mod vfs;
 
 pub use aimd::{AimdConfig, AimdController};
 pub use fetch::FetchScheduler;
+pub use incarnation::{
+    CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
+};
+pub use qos::QosController;
 pub use readahead::{DirAccessTracker, ReadAheadTracker};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
-pub use vfs::{LockKind, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError, VfsResult, KernelInvalidator};
+pub use vfs::{
+    KernelInvalidator, LockKind, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsResult, VfsUploadStats,
+};

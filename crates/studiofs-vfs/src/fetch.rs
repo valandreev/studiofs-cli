@@ -10,6 +10,7 @@
 //!    OpenDAL's internal `RetryLayer`.
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
+use crate::qos::QosController;
 use bytes::Bytes;
 use dashmap::DashMap;
 use opendal::ErrorKind;
@@ -138,6 +139,9 @@ pub struct FetchScheduler {
     prefetch_acquire_wait: Duration,
     /// Metrics.
     pub metrics: FetchMetrics,
+    /// Independent fetch-stage credits so uploads/materialize cannot consume
+    /// all execution capacity even if AIMD window is large.
+    qos: Arc<QosController>,
 }
 
 impl FetchScheduler {
@@ -152,6 +156,7 @@ impl FetchScheduler {
         cache: Arc<BlockCache>,
         aimd_config: AimdConfig,
         default_prefetch_reserve_slots: usize,
+        qos: Arc<QosController>,
     ) -> Self {
         fn env_u32(key: &str, default: u32) -> u32 {
             std::env::var(key)
@@ -215,6 +220,7 @@ impl FetchScheduler {
             prefetch_reserve_slots,
             prefetch_acquire_wait: Duration::from_millis(prefetch_acquire_wait_ms),
             metrics: FetchMetrics::new(),
+            qos,
         }
     }
 
@@ -370,7 +376,7 @@ impl FetchScheduler {
             Ok(results) => {
                 let ok_count = results.iter().filter(|r| r.is_ok()).count();
                 let err_count = results.len() - ok_count;
-                info!(
+                debug!(
                     ok = ok_count,
                     not_found = err_count,
                     "FetchScheduler: warmup done ({WARMUP_CONCURRENCY} connections primed)"
@@ -460,6 +466,11 @@ impl FetchScheduler {
                     }
                 }
             };
+            let _fetch_qos = self.qos.acquire_fetch().await.map_err(|e| {
+                FetchError::CacheWrite(std::io::Error::other(format!(
+                    "fetch qos permit failed: {e}"
+                )))
+            })?;
             let wait_ms = wait_start.elapsed().as_millis();
             if wait_ms > 100 {
                 debug!(
