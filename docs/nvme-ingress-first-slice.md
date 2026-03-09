@@ -1,9 +1,5 @@
 # NVMe Ingress First Slice
 
-This document narrows [NVMe-ingress-architecture.md](./ideas/NVMe-ingress-architecture.md)
-to the first implementation slice StudioFS should ship before a full ingest/WAL
-subsystem exists.
-
 ## Goal
 
 Remove the most visible foreground stalls caused by draining `dirty_mem`
