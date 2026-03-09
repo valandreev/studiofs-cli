@@ -74,7 +74,7 @@ impl CommitCoordinator {
             return Ok(());
         }
 
-        vfs.remove_live_extents_for_inode(op.ino);
+        vfs.remove_live_extents_for_inode_epoch(op.ino, op.content_epoch);
         if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
             engine.get_attr(ino)
         })

@@ -2722,6 +2722,21 @@ impl StudioVfs {
             .retain(|(candidate, _), _| *candidate != ino);
     }
 
+    fn remove_live_extents_for_inode_epoch(&self, ino: Ino, content_epoch: u64) {
+        self.state
+            .live_extent_records
+            .lock()
+            .retain(|(candidate, _), extent| {
+                *candidate != ino || extent.content_epoch != content_epoch
+            });
+        self.state
+            .uploaded_extent_records
+            .lock()
+            .retain(|(candidate, _), extent| {
+                *candidate != ino || extent.content_epoch != content_epoch
+            });
+    }
+
     fn record_uploaded_extent(
         &self,
         ino: Ino,
@@ -5309,8 +5324,8 @@ impl StudioVfs {
                     .await
                     .unwrap_or(false) =>
             {
-                self.block_cache.complete_upload(&op);
                 commit::CommitCoordinator::finish_extent_upload(self, &op, block_index).await?;
+                self.block_cache.complete_upload(&op);
             }
             _ => {
                 run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
@@ -5753,7 +5768,6 @@ impl StudioVfs {
             .await
             {
                 Ok(Ok(true)) => {
-                    self.block_cache.complete_upload(op);
                     let block_index = block_index_from_offset(op.offset, self.block_size);
                     if let Err(e) =
                         commit::CommitCoordinator::finish_extent_upload(self, op, block_index).await
@@ -5764,6 +5778,8 @@ impl StudioVfs {
                             error = %e,
                             "VFS shutdown: publish reconcile after remote exists() failed"
                         );
+                    } else {
+                        self.block_cache.complete_upload(op);
                     }
                     reconciled += 1;
                 }
