@@ -95,7 +95,7 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
             _ => libc::EIO,
         },
         VfsError::BlockNotFound(_, _) => libc::EIO,
-        VfsError::WouldBlock => libc::EAGAIN,
+        VfsError::WouldBlock | VfsError::RemoteContentPending => libc::EAGAIN,
         VfsError::InvalidName(_) => libc::EINVAL,
         _ => libc::EIO,
     }
@@ -460,7 +460,7 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => reply.opened(fh, 0),
             Err(e) => {
-                if matches!(e, VfsError::WouldBlock) {
+                if matches!(e, VfsError::WouldBlock | VfsError::RemoteContentPending) {
                     debug!("open({ino}) -> {e}");
                 } else {
                     error!("open({ino}) -> {e}");

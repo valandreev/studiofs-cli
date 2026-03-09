@@ -360,6 +360,14 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             }
         },
         studiofs_vfs::VfsError::InvalidName(_) => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
+        studiofs_vfs::VfsError::WouldBlock => {
+            debug!("vfs lock conflict: {e}");
+            winfsp::FspError::from(STATUS_UNSUCCESSFUL)
+        }
+        studiofs_vfs::VfsError::RemoteContentPending => {
+            debug!("vfs remote content pending: {e}");
+            winfsp::FspError::from(STATUS_UNSUCCESSFUL)
+        }
         _ => {
             error!("vfs error: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)

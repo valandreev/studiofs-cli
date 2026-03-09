@@ -82,6 +82,9 @@ pub enum VfsError {
     #[error("lock conflict (EAGAIN)")]
     WouldBlock,
 
+    #[error("remote content is still uploading (EAGAIN)")]
+    RemoteContentPending,
+
     #[error("invalid filename: {0}")]
     InvalidName(String),
 
@@ -3787,7 +3790,7 @@ impl StudioVfs {
         // Verify the inode exists
         let attr = self.getattr(ino)?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
-            return Err(VfsError::WouldBlock);
+            return Err(VfsError::RemoteContentPending);
         }
 
         // If O_TRUNC requested, truncate to 0
@@ -4493,7 +4496,7 @@ impl StudioVfs {
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         let attr = self.getattr_async(ino).await?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
-            return Err(VfsError::WouldBlock);
+            return Err(VfsError::RemoteContentPending);
         }
         self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         let end = (offset + size as u64).min(attr.size);
@@ -4522,7 +4525,7 @@ impl StudioVfs {
         let _guard = ForegroundReadGuard(self);
         let attr = self.getattr_async(ino).await?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
-            return Err(VfsError::WouldBlock);
+            return Err(VfsError::RemoteContentPending);
         }
         let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         let pending_content_epoch = incarnation_state

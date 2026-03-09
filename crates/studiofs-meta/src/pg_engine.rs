@@ -3,6 +3,7 @@ use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use crate::types::*;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,8 @@ const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
+const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
 /// PostgreSQL-backed metadata engine.
 ///
@@ -37,6 +40,8 @@ pub struct PgMetaEngine {
     flush_interval: Duration,
     flush_idle_grace: Duration,
     flush_ops_threshold: u32,
+    connect_timeout: Duration,
+    command_timeout: Duration,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
 }
@@ -77,12 +82,43 @@ struct RecentFlush {
 }
 
 impl PgMetaEngine {
+    fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
+        Duration::from_millis(
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default_ms),
+        )
+    }
+
+    fn default_connect_timeout() -> Duration {
+        Self::env_duration_ms(
+            "STUDIOFS_PG_CONNECT_TIMEOUT_MS",
+            DEFAULT_PG_CONNECT_TIMEOUT_MS,
+        )
+    }
+
+    fn default_command_timeout() -> Duration {
+        Self::env_duration_ms(
+            "STUDIOFS_PG_COMMAND_TIMEOUT_MS",
+            DEFAULT_PG_COMMAND_TIMEOUT_MS,
+        )
+    }
+
     fn format_pg_error(e: tokio_postgres::Error) -> String {
         if let Some(db) = e.as_db_error() {
             format!("{} (sqlstate={})", db.message(), db.code().code())
         } else {
             e.to_string()
         }
+    }
+
+    fn pg_timeout_error(context: &str, timeout: Duration) -> MetaError {
+        MetaError::Storage(format!(
+            "postgres {context} timed out after {} ms",
+            timeout.as_millis()
+        ))
     }
 
     fn load_persisted_local_version(local: &RedbMetaEngine) -> MetaResult<i64> {
@@ -165,86 +201,124 @@ impl PgMetaEngine {
         rt.block_on(fut)
     }
 
+    async fn with_postgres_client_timeout<T, F, Fut>(
+        postgres_url: String,
+        connect_timeout: Duration,
+        command_timeout: Duration,
+        context: &'static str,
+        f: F,
+    ) -> MetaResult<T>
+    where
+        F: FnOnce(tokio_postgres::Client) -> Fut,
+        Fut: Future<Output = MetaResult<T>>,
+    {
+        let connect = tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls);
+        let (client, connection) = tokio::time::timeout(connect_timeout, connect)
+            .await
+            .map_err(|_| Self::pg_timeout_error(&format!("{context} connect"), connect_timeout))?
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres connect failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?;
+
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let result = tokio::time::timeout(command_timeout, f(client))
+            .await
+            .map_err(|_| Self::pg_timeout_error(context, command_timeout));
+
+        conn_task.abort();
+        match result {
+            Ok(result) => result,
+            Err(err) => Err(err),
+        }
+    }
+
     fn reserve_global_client_slot(postgres_url: &str, volume_id: i64) -> MetaResult<u64> {
         let postgres_url = postgres_url.to_string();
+        let connect_timeout = Self::default_connect_timeout();
+        let command_timeout = Self::default_command_timeout();
         Self::run_async_once(async move {
-            let (mut client, connection) =
-                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "reserve client slot",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres tx failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    tx.batch_execute(
+                        r#"
+                        CREATE TABLE IF NOT EXISTS counters (
+                            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                            name TEXT NOT NULL,
+                            value BIGINT NOT NULL,
+                            PRIMARY KEY (vol, name)
+                        )
+                        "#,
+                    )
                     .await
                     .map_err(|e| {
                         MetaError::Storage(format!(
-                            "postgres connect failed: {}",
+                            "postgres counters ensure failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    tx.execute(
+                        r#"
+                        INSERT INTO counters (vol, name, value)
+                        VALUES ($1, $2, 0)
+                        ON CONFLICT (vol, name) DO NOTHING
+                        "#,
+                        &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres slot seed failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    let row = tx
+                        .query_one(
+                            r#"
+                            UPDATE counters
+                            SET value = value + 1
+                            WHERE vol = $1 AND name = $2
+                            RETURNING value - 1
+                            "#,
+                            &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres slot reserve failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    tx.commit().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres slot commit failed: {}",
                             Self::format_pg_error(e)
                         ))
                     })?;
 
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let tx = client.transaction().await.map_err(|e| {
-                MetaError::Storage(format!("postgres tx failed: {}", Self::format_pg_error(e)))
-            })?;
-            tx.batch_execute(
-                r#"
-                CREATE TABLE IF NOT EXISTS counters (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    name TEXT NOT NULL,
-                    value BIGINT NOT NULL,
-                    PRIMARY KEY (vol, name)
-                )
-                "#,
+                    let slot: i64 = row.get(0);
+                    u64::try_from(slot).map_err(|_| {
+                        MetaError::Storage(format!("invalid negative pg client slot: {slot}"))
+                    })
+                },
             )
             .await
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres counters ensure failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?;
-            tx.execute(
-                r#"
-                INSERT INTO counters (vol, name, value)
-                VALUES ($1, $2, 0)
-                ON CONFLICT (vol, name) DO NOTHING
-                "#,
-                &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
-            )
-            .await
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres slot seed failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?;
-            let row = tx
-                .query_one(
-                    r#"
-                    UPDATE counters
-                    SET value = value + 1
-                    WHERE vol = $1 AND name = $2
-                    RETURNING value - 1
-                    "#,
-                    &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!(
-                        "postgres slot reserve failed: {}",
-                        Self::format_pg_error(e)
-                    ))
-                })?;
-            tx.commit().await.map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres slot commit failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?;
-            conn_task.abort();
-
-            let slot: i64 = row.get(0);
-            u64::try_from(slot)
-                .map_err(|_| MetaError::Storage(format!("invalid negative pg client slot: {slot}")))
         })
     }
 
@@ -321,6 +395,8 @@ impl PgMetaEngine {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
+        let connect_timeout = Self::default_connect_timeout();
+        let command_timeout = Self::default_command_timeout();
 
         let client_slot = Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?;
         let restored_local_version = Self::load_persisted_local_version(&local)?;
@@ -343,6 +419,8 @@ impl PgMetaEngine {
             flush_interval,
             flush_idle_grace,
             flush_ops_threshold,
+            connect_timeout,
+            command_timeout,
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
         });
@@ -813,49 +891,52 @@ impl PgMetaEngine {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
         let local_version = self.local_version.load(Ordering::SeqCst);
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
 
         let row = self.run_async(async move {
-            let (client, connection) =
-                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "pull snapshot",
+                move |client| async move {
+                    let version_row = client
+                        .query_opt(
+                            "SELECT version FROM metadata_state WHERE vol=$1",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres snapshot version select failed: {e}"
+                            ))
+                        })?;
 
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
+                    let Some(version_row) = version_row else {
+                        return Ok(None);
+                    };
+                    let version: i64 = version_row.get(0);
+                    if version <= local_version {
+                        return Ok(None);
+                    }
 
-            let version_row = client
-                .query_opt(
-                    "SELECT version FROM metadata_state WHERE vol=$1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres snapshot version select failed: {e}"))
-                })?;
+                    let row = client
+                        .query_one(
+                            "SELECT version, snapshot FROM metadata_state WHERE vol=$1",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres snapshot payload select failed: {e}"
+                            ))
+                        })?;
 
-            let Some(version_row) = version_row else {
-                conn_task.abort();
-                return Ok(None);
-            };
-            let version: i64 = version_row.get(0);
-            if version <= local_version {
-                conn_task.abort();
-                return Ok(None);
-            }
-
-            let row = client
-                .query_one(
-                    "SELECT version, snapshot FROM metadata_state WHERE vol=$1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres snapshot payload select failed: {e}"))
-                })?;
-
-            conn_task.abort();
-            Ok(Some(row))
+                    Ok(Some(row))
+                },
+            )
+            .await
         })?;
 
         let Some(row) = row else {
@@ -882,92 +963,96 @@ impl PgMetaEngine {
         let client_id = self.client_id.clone();
         let now_ms = Self::now_millis();
         let events_vec = remote_events;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
 
         self.run_async(async move {
-            let (mut client, connection) =
-                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "push event log batch",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!("postgres begin tx failed: {e}"))
+                    })?;
 
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
+                    let batch_version: i64 = tx
+                        .query_one(
+                            r#"
+                            UPDATE metadata_state
+                            SET version = version + 1,
+                                updated_at = now()
+                            WHERE vol = $1
+                            RETURNING version
+                            "#,
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!("postgres metadata_state bump failed: {e}"))
+                        })?
+                        .get(0);
 
-            let tx = client
-                .transaction()
-                .await
-                .map_err(|e| MetaError::Storage(format!("postgres begin tx failed: {e}")))?;
+                    for chunk in events_vec.chunks(PG_EVENT_INSERT_CHUNK_SIZE) {
+                        let event_types: Vec<&str> =
+                            chunk.iter().map(|event| event.kind()).collect();
+                        let payloads: Vec<Vec<u8>> = chunk
+                            .iter()
+                            .map(Self::encode_postcard)
+                            .collect::<MetaResult<Vec<_>>>()?;
+                        tx.execute(
+                            r#"
+                            INSERT INTO event_log (
+                                vol,
+                                batch_version,
+                                event_type,
+                                event_payload,
+                                client_id,
+                                client_timestamp
+                            )
+                            SELECT
+                                $1,
+                                $2,
+                                batch.event_type,
+                                batch.event_payload,
+                                $3,
+                                $4
+                            FROM UNNEST($5::text[], $6::bytea[]) AS batch(event_type, event_payload)
+                            "#,
+                            &[
+                                &volume_id,
+                                &batch_version,
+                                &client_id,
+                                &now_ms,
+                                &event_types,
+                                &payloads,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres event_log batch insert failed: {e}"
+                            ))
+                        })?;
+                    }
 
-            let batch_version: i64 = tx
-                .query_one(
-                    r#"
-                    UPDATE metadata_state
-                    SET version = version + 1,
-                        updated_at = now()
-                    WHERE vol = $1
-                    RETURNING version
-                    "#,
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres metadata_state bump failed: {e}"))
-                })?
-                .get(0);
+                    let channel = format!("studiofs_vol_{volume_id}");
+                    let _ = tx
+                        .execute(
+                            "SELECT pg_notify($1, $2)",
+                            &[&channel, &batch_version.to_string()],
+                        )
+                        .await;
 
-            for chunk in events_vec.chunks(PG_EVENT_INSERT_CHUNK_SIZE) {
-                let event_types: Vec<&str> = chunk.iter().map(|event| event.kind()).collect();
-                let payloads: Vec<Vec<u8>> = chunk
-                    .iter()
-                    .map(Self::encode_postcard)
-                    .collect::<MetaResult<Vec<_>>>()?;
-                tx.execute(
-                    r#"
-                    INSERT INTO event_log (
-                        vol,
-                        batch_version,
-                        event_type,
-                        event_payload,
-                        client_id,
-                        client_timestamp
-                    )
-                    SELECT
-                        $1,
-                        $2,
-                        batch.event_type,
-                        batch.event_payload,
-                        $3,
-                        $4
-                    FROM UNNEST($5::text[], $6::bytea[]) AS batch(event_type, event_payload)
-                    "#,
-                    &[
-                        &volume_id,
-                        &batch_version,
-                        &client_id,
-                        &now_ms,
-                        &event_types,
-                        &payloads,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres event_log batch insert failed: {e}"))
-                })?;
-            }
-
-            let channel = format!("studiofs_vol_{volume_id}");
-            let _ = tx
-                .execute(
-                    "SELECT pg_notify($1, $2)",
-                    &[&channel, &batch_version.to_string()],
-                )
-                .await;
-
-            tx.commit()
-                .await
-                .map_err(|e| MetaError::Storage(format!("postgres commit failed: {e}")))?;
-            conn_task.abort();
-            Ok(batch_version)
+                    tx.commit()
+                        .await
+                        .map_err(|e| MetaError::Storage(format!("postgres commit failed: {e}")))?;
+                    Ok(batch_version)
+                },
+            )
+            .await
         })
     }
 
@@ -978,35 +1063,37 @@ impl PgMetaEngine {
         let payload = serde_json::to_vec(&snapshot)
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
         let version = self.local_version.load(Ordering::SeqCst);
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
 
         self.run_async(async move {
-            let (client, connection) =
-                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "write checkpoint",
+                move |client| async move {
+                    client
+                        .execute(
+                            r#"
+                            INSERT INTO metadata_state (vol, version, snapshot)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (vol) DO UPDATE
+                            SET version = EXCLUDED.version,
+                                snapshot = EXCLUDED.snapshot,
+                                updated_at = now()
+                            "#,
+                            &[&volume_id, &version, &payload],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!("postgres checkpoint upsert failed: {e}"))
+                        })?;
 
-            client
-                .execute(
-                    r#"
-                    INSERT INTO metadata_state (vol, version, snapshot)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (vol) DO UPDATE
-                    SET version = EXCLUDED.version,
-                        snapshot = EXCLUDED.snapshot,
-                        updated_at = now()
-                    "#,
-                    &[&volume_id, &version, &payload],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres checkpoint upsert failed: {e}"))
-                })?;
-
-            conn_task.abort();
-            Ok(())
+                    Ok(())
+                },
+            )
+            .await
         })
     }
 
@@ -1015,33 +1102,34 @@ impl PgMetaEngine {
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
         let last_seq = self.local_version.load(Ordering::SeqCst);
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
 
         let rows = self.run_async(async move {
-            let (client, connection) =
-                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
-
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let rows = client
-                .query(
-                    r#"
-                    SELECT batch_version, seq_id, event_payload, client_id
-                    FROM event_log
-                    WHERE vol=$1 AND batch_version > $2
-                    ORDER BY batch_version ASC, seq_id ASC
-                    "#,
-                    &[&volume_id, &last_seq],
-                )
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres event_log select failed: {e}"))
-                })?;
-            conn_task.abort();
-            Ok::<_, MetaError>(rows)
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "pull foreign events",
+                move |client| async move {
+                    let rows = client
+                        .query(
+                            r#"
+                            SELECT batch_version, seq_id, event_payload, client_id
+                            FROM event_log
+                            WHERE vol=$1 AND batch_version > $2
+                            ORDER BY batch_version ASC, seq_id ASC
+                            "#,
+                            &[&volume_id, &last_seq],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!("postgres event_log select failed: {e}"))
+                        })?;
+                    Ok::<_, MetaError>(rows)
+                },
+            )
+            .await
         })?;
 
         if rows.is_empty() {
@@ -1081,6 +1169,14 @@ impl PgMetaEngine {
 
     fn clear_pending_state(state: &mut PendingReplicationState) {
         *state = PendingReplicationState::default();
+    }
+
+    fn finish_claimed_batch(&self, batch: ClaimedPendingBatch) {
+        self.inflight_replication_ops
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(batch.ops))
+            })
+            .ok();
     }
 
     fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
@@ -1185,11 +1281,7 @@ impl PgMetaEngine {
     }
 
     fn restore_pending_batch(&self, batch: ClaimedPendingBatch) {
-        self.inflight_replication_ops
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(current.saturating_sub(batch.ops))
-            })
-            .ok();
+        self.finish_claimed_batch(batch);
         if let Ok(mut state) = self.pending_state.lock() {
             state.ops = state.ops.saturating_add(batch.ops);
             state.force_flush |= batch.force_flush;
@@ -1243,14 +1335,18 @@ impl PgMetaEngine {
     ) -> MetaResult<Option<RecentFlush>> {
         match self.flush_pending_claimed_batch(batch) {
             Ok(recent_flush) => {
-                self.inflight_replication_ops
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                        Some(current.saturating_sub(batch.ops))
-                    })
-                    .ok();
+                self.finish_claimed_batch(batch);
                 Ok(recent_flush)
             }
             Err(err) => {
+                let recovered_from_remote = self
+                    .pull_foreign_events_locked(None)
+                    .map(|_| self.flushed_event_seq.load(Ordering::SeqCst) >= batch.event_end)
+                    .unwrap_or(false);
+                if recovered_from_remote {
+                    self.finish_claimed_batch(batch);
+                    return Ok(None);
+                }
                 self.restore_pending_batch(batch);
                 Err(err)
             }
@@ -1678,6 +1774,9 @@ mod tests {
         let seed = RedbMetaEngine::open(path).expect("seed open");
         seed.set_format_info(info).expect("set format");
         seed.init_root(0, 0).expect("init root");
+        let next_event_seq = seed.get_counter("nextEventSeq").expect("nextEventSeq");
+        seed.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, next_event_seq)
+            .expect("seed flushed event seq");
     }
 
     struct TestEnvGuard {
@@ -1735,6 +1834,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             flush_idle_grace: Duration::from_secs(60),
             flush_ops_threshold: 8,
+            connect_timeout: Duration::from_millis(50),
+            command_timeout: Duration::from_millis(50),
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
         };
@@ -3792,8 +3893,9 @@ mod tests {
         a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
             .expect("create local file");
 
+        let start = a.flushed_event_seq.load(Ordering::SeqCst);
         let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
-        let events = a.local.read_events_range(0, end).expect("local events");
+        let events = a.local.read_events_range(start, end).expect("local events");
         let _version = a
             .push_event_log_batch_locked(&events)
             .expect("push batch without local persist");
@@ -3832,8 +3934,9 @@ mod tests {
         let file = a
             .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
             .expect("create local file");
+        let start = a.flushed_event_seq.load(Ordering::SeqCst);
         let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
-        let events = a.local.read_events_range(0, end).expect("local events");
+        let events = a.local.read_events_range(start, end).expect("local events");
         let _version = a
             .push_event_log_batch_locked(&events)
             .expect("push batch without local persist");

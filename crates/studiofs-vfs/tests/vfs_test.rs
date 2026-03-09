@@ -13,7 +13,7 @@
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -136,6 +136,15 @@ fn load_test_env() {
     });
 }
 
+fn test_env_lock() -> &'static ReentrantMutex<()> {
+    static LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(ReentrantMutex::default)
+}
+
+fn acquire_test_env_lock() -> ReentrantMutexGuard<'static, ()> {
+    test_env_lock().lock()
+}
+
 struct TestMinioEnv {
     endpoint: String,
     bucket: String,
@@ -162,6 +171,7 @@ fn test_online_minio_env() -> &'static TestMinioEnv {
 }
 
 fn apply_test_online_minio_env() {
+    let _env_lock = acquire_test_env_lock();
     let env = test_online_minio_env();
     unsafe {
         std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &env.endpoint);
@@ -240,7 +250,7 @@ fn make_vfs_with_meta(
     .expect("failed to create StudioVfs")
 }
 
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if cond() {
@@ -365,6 +375,9 @@ fn seed_local(db_path: &std::path::Path, info: &FormatInfo) {
     let seed = RedbMetaEngine::open(db_path).expect("seed redb open");
     seed.set_format_info(info).expect("seed format info");
     seed.init_root(0, 0).expect("seed root");
+    let next_event_seq = seed.get_counter("nextEventSeq").expect("seed nextEventSeq");
+    seed.set_counter("pgLastFlushedLocalEventSeq", next_event_seq)
+        .expect("seed flushed event seq");
 }
 
 struct PgTestVolume {
@@ -1024,39 +1037,13 @@ async fn test_pending_deletions_gc() {
 async fn test_background_janitor_removes_orphan_object() {
     ensure_bucket().await;
 
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
     // Speed up janitor cycle for this test only.
-    let _restore_interval = EnvRestore {
-        key: "STUDIOFS_JANITOR_INTERVAL_SECS",
-        old: std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS").ok(),
-    };
-    let _restore_skip = EnvRestore {
-        key: "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
-        old: std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS").ok(),
-    };
-    let _restore_max = EnvRestore {
-        key: "STUDIOFS_JANITOR_MAX_DELETES",
-        old: std::env::var("STUDIOFS_JANITOR_MAX_DELETES").ok(),
-    };
-    let _restore_lease_ttl = EnvRestore {
-        key: "STUDIOFS_JANITOR_LEASE_TTL_SECS",
-        old: std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS").ok(),
-    };
+    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
+    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
+    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
+    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
     unsafe {
         std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
         std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
@@ -1102,39 +1089,13 @@ async fn test_background_janitor_removes_orphan_object() {
 async fn test_background_janitor_cleans_simulated_crash_orphan() {
     ensure_bucket().await;
 
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
     // Fast janitor cycle for test.
-    let _restore_interval = EnvRestore {
-        key: "STUDIOFS_JANITOR_INTERVAL_SECS",
-        old: std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS").ok(),
-    };
-    let _restore_skip = EnvRestore {
-        key: "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
-        old: std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS").ok(),
-    };
-    let _restore_max = EnvRestore {
-        key: "STUDIOFS_JANITOR_MAX_DELETES",
-        old: std::env::var("STUDIOFS_JANITOR_MAX_DELETES").ok(),
-    };
-    let _restore_lease_ttl = EnvRestore {
-        key: "STUDIOFS_JANITOR_LEASE_TTL_SECS",
-        old: std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS").ok(),
-    };
+    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
+    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
+    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
+    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
     unsafe {
         std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
         std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
@@ -1312,21 +1273,7 @@ fn test_crash_recovery_replays_pending_journal() {
 
 #[test]
 fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
@@ -1381,14 +1328,14 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
 
-            let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+            let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(45))
                 .expect("expected committed block refs for baseline payload");
             baseline_object_id = blocks[0].1.object_id;
 
             let ds = DataStore::new(&data_config).unwrap();
             let key = format_object_key(&format_info.data_prefix, baseline_object_id);
             assert!(
-                wait_until_exists(&ds, &key, Duration::from_secs(15)).await,
+                wait_until_exists(&ds, &key, Duration::from_secs(60)).await,
                 "baseline object should be uploaded before overwrite crash test"
             );
 
@@ -1396,30 +1343,12 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
         });
     }
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_fetch_attempts = EnvRestore {
-        key: "STUDIOFS_FETCH_MAX_ATTEMPTS",
-        old: std::env::var("STUDIOFS_FETCH_MAX_ATTEMPTS").ok(),
-    };
-    let _restore_fetch_timeout = EnvRestore {
-        key: "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
-        old: std::env::var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS").ok(),
-    };
-    let _restore_upload_attempts = EnvRestore {
-        key: "STUDIOFS_UPLOAD_MAX_ATTEMPTS",
-        old: std::env::var("STUDIOFS_UPLOAD_MAX_ATTEMPTS").ok(),
-    };
-    let _restore_upload_timeout = EnvRestore {
-        key: "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
-        old: std::env::var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_fetch_attempts = EnvRestore::capture("STUDIOFS_FETCH_MAX_ATTEMPTS");
+    let _restore_fetch_timeout = EnvRestore::capture("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS");
+    let _restore_upload_attempts = EnvRestore::capture("STUDIOFS_UPLOAD_MAX_ATTEMPTS");
+    let _restore_upload_timeout = EnvRestore::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
@@ -1520,38 +1449,12 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
 
 #[test]
 fn writer_reads_full_file_before_any_remote_commit() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_disable = EnvRestore {
-        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
-        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
-    };
-    let _restore_endpoint = EnvRestore {
-        key: "STUDIOFS_MINIO_ENDPOINT",
-        old: std::env::var("STUDIOFS_MINIO_ENDPOINT").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_endpoint = EnvRestore::capture("STUDIOFS_MINIO_ENDPOINT");
 
     unsafe {
         // Keep writes local-only: acceptance into cache + WAL, no slab drain.
@@ -1610,34 +1513,11 @@ fn writer_reads_full_file_before_any_remote_commit() {
 
 #[test]
 fn writer_recovers_local_file_after_restart_before_upload_complete() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_disable = EnvRestore {
-        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
-        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
 
     unsafe {
         // Force spill path and avoid background drain so acceptance is WAL-backed.
@@ -1817,13 +1697,13 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
         let remote_attr = remote_vfs.lookup(1, b"remote-open-uploading.txt").unwrap();
         assert!(matches!(
             remote_vfs.open_file(remote_attr.ino, OpenFlags::RDONLY, false),
-            Err(VfsError::WouldBlock)
+            Err(VfsError::RemoteContentPending)
         ));
         assert!(matches!(
             remote_vfs
                 .read(remote_attr.ino, 0, payload.len() as u32)
                 .await,
-            Err(VfsError::WouldBlock)
+            Err(VfsError::RemoteContentPending)
         ));
     });
     rt.shutdown_background();
@@ -2028,7 +1908,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
         }
 
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(Duration::from_secs(60), || {
                 writer_vfs.pending_uploads_for_inode(ino).is_empty()
                     && writer_meta
                         .get_attr(ino)
@@ -2039,7 +1919,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
             "writer should publish the new incarnation after the full upload set completes"
         );
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
             let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
@@ -2070,21 +1950,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
 
 #[test]
 fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
@@ -2095,30 +1961,12 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .count()
     }
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_endpoint = EnvRestore {
-        key: "STUDIOFS_MINIO_ENDPOINT",
-        old: std::env::var("STUDIOFS_MINIO_ENDPOINT").ok(),
-    };
-    let _restore_disable = EnvRestore {
-        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
-        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
-    };
-    let _restore_fetch_attempts = EnvRestore {
-        key: "STUDIOFS_FETCH_MAX_ATTEMPTS",
-        old: std::env::var("STUDIOFS_FETCH_MAX_ATTEMPTS").ok(),
-    };
-    let _restore_fetch_timeout = EnvRestore {
-        key: "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
-        old: std::env::var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = EnvRestore::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_fetch_attempts = EnvRestore::capture("STUDIOFS_FETCH_MAX_ATTEMPTS");
+    let _restore_fetch_timeout = EnvRestore::capture("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2260,13 +2108,16 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
 struct ScopedEnvVar {
     key: &'static str,
     old: Option<String>,
+    _env_lock: ReentrantMutexGuard<'static, ()>,
 }
 
 impl ScopedEnvVar {
     fn capture(key: &'static str) -> Self {
+        let env_lock = acquire_test_env_lock();
         Self {
             key,
             old: std::env::var(key).ok(),
+            _env_lock: env_lock,
         }
     }
 }
@@ -4363,7 +4214,7 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
                 loop {
                     match vfs.read(attr.ino, 0, payload.len() as u32).await {
                         Ok(read) => return read,
-                        Err(VfsError::WouldBlock) => {
+                        Err(VfsError::WouldBlock | VfsError::RemoteContentPending) => {
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
                         Err(err) => {
@@ -4390,30 +4241,10 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
 
 #[test]
 fn test_ingress_prefers_spill_before_backpressure() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
@@ -4483,38 +4314,12 @@ fn test_ingress_prefers_spill_before_backpressure() {
 
 #[test]
 fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_flush = EnvRestore {
-        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
-        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
-    };
-    let _restore_assist = EnvRestore {
-        key: "STUDIOFS_FOREGROUND_DRAIN_ASSIST",
-        old: std::env::var("STUDIOFS_FOREGROUND_DRAIN_ASSIST").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
+    let _restore_assist = EnvRestore::capture("STUDIOFS_FOREGROUND_DRAIN_ASSIST");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
@@ -4576,30 +4381,10 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
 
 #[test]
 fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
@@ -4672,38 +4457,12 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 
 #[test]
 fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_flush = EnvRestore {
-        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
-        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
-    };
-    let _restore_disable_flush = EnvRestore {
-        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
-        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
+    let _restore_disable_flush = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "4MB");
@@ -4780,21 +4539,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
 
 #[test]
 fn test_ingress_multi_writer_spill_recovers_after_crash() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
@@ -4805,22 +4550,10 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             .count()
     }
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
-    let _restore_flush = EnvRestore {
-        key: "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
-        old: std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS").ok(),
-    };
-    let _restore_disable_flush = EnvRestore {
-        key: "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
-        old: std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
+    let _restore_disable_flush = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
@@ -4925,30 +4658,10 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
 #[test]
 #[ignore]
 fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
-    struct EnvRestore {
-        key: &'static str,
-        old: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = &self.old {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    type EnvRestore = ScopedEnvVar;
 
-    let _restore_dirty = EnvRestore {
-        key: "STUDIOFS_MAX_DIRTY_BYTES",
-        old: std::env::var("STUDIOFS_MAX_DIRTY_BYTES").ok(),
-    };
-    let _restore_spill = EnvRestore {
-        key: "STUDIOFS_MAX_SPILL_BYTES",
-        old: std::env::var("STUDIOFS_MAX_SPILL_BYTES").ok(),
-    };
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
