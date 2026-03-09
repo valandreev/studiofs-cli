@@ -47,7 +47,7 @@ studiofs init myvolume \
   --bucket studiofs-test \
   --access-key minioadmin \
   --secret-key minioadmin \
-  --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+  --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ```
 
 Mount it:
@@ -60,7 +60,7 @@ studiofs mount myvolume /mnt/studio
 Attach another client to an existing volume:
 
 ```bash
-studiofs discover myvolume --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+studiofs discover myvolume --meta postgres://studiofs:studiofs@127.0.0.1:5432
 studiofs mount myvolume Y:
 ```
 

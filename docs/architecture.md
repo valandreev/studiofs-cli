@@ -13,9 +13,6 @@ Core principles:
   committed state.
 - RAM + NVMe cache tiers hide most object-store latency.
 
-This document is constrained by the contract in
-[`file-visibility-and-incarnation-model.md`](./refactor/file-visibility-and-incarnation-model.md):
-
 - `flush()` and `close()` must make accepted data readable locally without waiting for S3/upload/metadata.
 - Remote readers observe only coarse states: `uploading`, `updating`, `ready`.
 - Remote visibility switches atomically by file incarnation, not block-by-block.
@@ -76,10 +73,6 @@ Core invariants:
 
 This lets the local client read accepted data immediately, while remote clients
 still observe committed incarnations as they become published.
-
-Ingress follow-up:
-- concrete first-slice scope is frozen in
-  [`nvme-ingress-first-slice.md`](./nvme-ingress-first-slice.md)
 
 ## Read Path
 

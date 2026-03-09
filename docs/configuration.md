@@ -24,7 +24,6 @@ studiofs init <name> \
 ```
 
 Important:
-- `--metadata-*` endpoint/bucket/keys options are legacy and rejected.
 - PostgreSQL metadata backend is required.
 - StudioFS always uses database `studiofs` and will create it during `init` when permissions allow.
 
@@ -57,7 +56,6 @@ studiofs mount <name> <mount-point> \
 ```
 
 Notes:
-- No `--nats` option (removed).
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 
@@ -90,13 +88,13 @@ studiofs destroy <name> --local
 
 Client A:
 ```bash
-studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key minioadmin --secret-key minioadmin --meta "host=100.123.245.11 port=5432 user=studiofs password=studiofs sslmode=disable"
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key minioadmin --secret-key minioadmin --meta postgres://studiofs:studiofs@127.0.0.1:5432
 studiofs mount projectfs Z:
 ```
 
 Client B:
 ```bash
-studiofs discover projectfs --meta "host=100.123.245.11 port=5432 user=studiofs password=studiofs sslmode=disable"
+studiofs discover projectfs --meta postgres://studiofs:studiofs@127.0.0.1:5432
 studiofs mount projectfs Y:
 ```
 
