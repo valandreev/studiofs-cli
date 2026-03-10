@@ -74,6 +74,14 @@ cargo test --workspace --all-targets -- --nocapture
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
+## Doc/Test Name Sync Check
+
+To ensure regression names in this document do not drift from code:
+
+```powershell
+pwsh -File tools/check-doc-test-names.ps1
+```
+
 PowerShell one-liner with `.env` + proxy cleanup (recommended for infra tests):
 
 ```powershell
