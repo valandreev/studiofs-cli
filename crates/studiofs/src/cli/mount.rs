@@ -25,51 +25,6 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
     Ok(num * multiplier)
 }
 
-#[cfg(all(windows, not(test)))]
-fn serve_mount(
-    vfs: Arc<StudioVfs>,
-    rt: Arc<tokio::runtime::Runtime>,
-    mount_point: &str,
-    volume_name: &str,
-    foreground: bool,
-) -> anyhow::Result<()> {
-    let event_name = super::utils::shutdown_event_name(mount_point);
-    info!("starting WinFSP mount at {mount_point}");
-    studiofs_winfsp::mount_and_serve(
-        vfs,
-        rt,
-        mount_point,
-        volume_name,
-        foreground,
-        Some(&event_name),
-    )
-    .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))
-}
-
-#[cfg(all(unix, not(test)))]
-fn serve_mount(
-    vfs: Arc<StudioVfs>,
-    rt: Arc<tokio::runtime::Runtime>,
-    mount_point: &str,
-    volume_name: &str,
-    foreground: bool,
-) -> anyhow::Result<()> {
-    info!("starting FUSE mount at {mount_point}");
-    studiofs_fuse::mount_and_serve(vfs, rt, mount_point, volume_name, foreground)
-        .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))
-}
-
-#[cfg(test)]
-fn serve_mount(
-    _vfs: Arc<StudioVfs>,
-    _rt: Arc<tokio::runtime::Runtime>,
-    mount_point: &str,
-    _volume_name: &str,
-    _foreground: bool,
-) -> anyhow::Result<()> {
-    anyhow::bail!("mount backend is unavailable in unit tests for '{mount_point}'")
-}
-
 pub fn run(
     name: &str,
     mount_point: &str,
@@ -161,16 +116,31 @@ pub fn run(
     // Write PID file so `studiofs umount` can find us
     let _ = super::utils::write_pid_file(mount_point, name, std::process::id());
 
-    serve_mount(vfs, rt, mount_point, &format_info.name, run_in_foreground)?;
-
+    // Start platform-specific FUSE mount
     #[cfg(windows)]
     {
+        // Named event for external graceful shutdown (used by `studiofs umount`).
+        let event_name = super::utils::shutdown_event_name(mount_point);
+        info!("starting WinFSP mount at {mount_point}");
+        studiofs_winfsp::mount_and_serve(
+            vfs,
+            rt,
+            mount_point,
+            &format_info.name,
+            run_in_foreground,
+            Some(&event_name),
+        )
+        .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
+
         // WinFSP returns normally — clean up PID file
         let _ = super::utils::remove_pid_file(mount_point);
     }
 
-    #[cfg(all(unix, not(test)))]
+    #[cfg(unix)]
     {
+        info!("starting FUSE mount at {mount_point}");
+        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, run_in_foreground)
+            .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
         // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
         // PID file is cleaned up by the umount command or overwritten on next mount.
     }
