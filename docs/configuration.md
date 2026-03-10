@@ -52,12 +52,16 @@ studiofs mount <name> <mount-point> \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
+  [--foreground] \
   [--detach | -d]
 ```
 
 Notes:
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
+- If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
+- `--detach` runs the mount as a background daemon.
+- `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 
 ### `umount`
 

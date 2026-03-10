@@ -40,6 +40,8 @@ pub fn run(
         return spawn_daemon(name, mount_point);
     }
 
+    let run_in_foreground = foreground || !detach;
+
     // ── Guard against double-mount ──────────────────────────────────────────
     // Note: when launched via `mount -d`, the parent pre-writes the PID file
     // with the child's PID before the child starts.  The child must therefore
@@ -125,7 +127,7 @@ pub fn run(
             rt,
             mount_point,
             &format_info.name,
-            foreground,
+            run_in_foreground,
             Some(&event_name),
         )
         .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
@@ -137,7 +139,7 @@ pub fn run(
     #[cfg(unix)]
     {
         info!("starting FUSE mount at {mount_point}");
-        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, foreground)
+        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, run_in_foreground)
             .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
         // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
         // PID file is cleaned up by the umount command or overwritten on next mount.
