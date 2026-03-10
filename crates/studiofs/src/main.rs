@@ -322,14 +322,14 @@ RUNTIME PG POLICY:
         #[arg(long, default_value = "2GB")]
         memory_limit: String,
 
-        /// Run in foreground (keep terminal attached)
-        #[arg(long)]
+        /// Run in foreground (keep terminal attached, default behavior)
+        #[arg(long, conflicts_with = "detach")]
         foreground: bool,
 
         /// Detach and run mount in the background (daemon mode).
         /// Logs are written to ~/.studiofs/logs/.
         /// Use `studiofs umount <mount_point>` to stop.
-        #[arg(short = 'd', long)]
+        #[arg(short = 'd', long, conflicts_with = "foreground")]
         detach: bool,
     },
 
@@ -520,10 +520,14 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("studiofs").chain(args.iter().copied()))
+    }
+
+    fn mount_runs_in_foreground(foreground: bool, detach: bool) -> bool {
+        foreground || !detach
     }
 
     // ── mount --detach / -d ──────────────────────────────────────────────────
@@ -541,6 +545,7 @@ mod tests {
             } => {
                 assert!(detach);
                 assert!(!foreground);
+                assert!(!mount_runs_in_foreground(foreground, detach));
                 assert_eq!(name, "vol");
                 assert_eq!(mount_point, "Z:");
             }
@@ -566,6 +571,7 @@ mod tests {
             } => {
                 assert!(!detach);
                 assert!(!foreground);
+                assert!(mount_runs_in_foreground(foreground, detach));
             }
             other => panic!("expected Mount, got {other:?}"),
         }
@@ -573,17 +579,14 @@ mod tests {
 
     #[test]
     fn mount_foreground_and_detach_together() {
-        // Both flags can be parsed (the implementation handles conflicts at runtime).
-        let cli = parse(&["mount", "vol", "Z:", "--foreground", "-d"]).unwrap();
-        match cli.command {
-            Commands::Mount {
-                detach, foreground, ..
-            } => {
-                assert!(detach);
-                assert!(foreground);
-            }
-            other => panic!("expected Mount, got {other:?}"),
-        }
+        let err = match parse(&["mount", "vol", "Z:", "--foreground", "-d"]) {
+            Ok(_) => panic!("expected clap conflict error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        let rendered = err.to_string();
+        assert!(rendered.contains("--foreground"));
+        assert!(rendered.contains("--detach") || rendered.contains("-d"));
     }
 
     #[test]
