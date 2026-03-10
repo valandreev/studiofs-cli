@@ -102,6 +102,14 @@ Build:
 cargo build --release
 ```
 
+Checks:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets
+cargo check --workspace
+```
+
 Fast test suite:
 
 ```bash

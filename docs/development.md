@@ -44,6 +44,14 @@ Recommended `.env` values:
 cargo build --release
 ```
 
+## Checks
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets
+cargo check --workspace
+```
+
 ## Tests
 
 Fast suite:
