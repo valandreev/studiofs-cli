@@ -48,7 +48,9 @@ fn apply_volume_params(
     options: &WinfspMountOptions,
 ) {
     volume_params.filesystem_name("StudioFS");
-    volume_params.prefix(&options.volume_label);
+    // `Prefix` switches WinFSP to network-device mode (WinFsp.Net). We mount
+    // as a local disk (drive letter), so leave Prefix empty and keep the
+    // human-readable label in `get_volume_info`.
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
 }
