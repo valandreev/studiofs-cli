@@ -28,8 +28,8 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     // 3. Confirm with user
     println!("WARNING: You are about to DESTROY volume '{}'.", name);
     if local_only {
-        println!("This will permanently delete local metadata/cache only:");
-        println!("  1. ALL local metadata and cache at {:?}", meta_dir);
+        println!("This will permanently delete local metadata only:");
+        println!("  1. Local metadata files at {:?}", meta_dir);
         println!("Remote data and remote metadata will be kept.");
     } else {
         println!("This will permanently delete:");
@@ -37,8 +37,15 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
             "  1. All data in S3 bucket '{}' with prefix '{}/'",
             format_info.bucket, name
         );
-        println!("  2. ALL local metadata and cache at {:?}", meta_dir);
+        println!("  2. Local metadata files at {:?}", meta_dir);
     }
+    println!(
+        "NOTE: Custom local data cache directories are not auto-detected and will NOT be removed."
+    );
+    println!(
+        "After destroy, remove local cache manually for volume UUID '{}'.",
+        format_info.uuid
+    );
     println!();
 
     print!("Do you want to proceed? [y/N]: ");
@@ -126,12 +133,16 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     }
 
     // 5. Delete metadata directory
-    println!("Deleting local metadata and cache...");
+    println!("Deleting local metadata files...");
     if meta_dir.exists() {
         std::fs::remove_dir_all(meta_dir)?;
     }
 
-    println!("✓ Local files deleted.");
+    println!("✓ Local metadata files deleted.");
+    println!(
+        "Reminder: remove custom local cache directories for volume UUID '{}'.",
+        format_info.uuid
+    );
     if local_only {
         println!("Volume '{}' detached locally.", name);
     } else {

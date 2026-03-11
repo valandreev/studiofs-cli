@@ -84,6 +84,10 @@ studiofs destroy <name>
 studiofs destroy <name> --local
 ```
 
+Notes:
+- `destroy` removes StudioFS local metadata files for the volume.
+- Custom local data cache directories are not auto-detected; remove them manually after destroy (the command prints the volume UUID for this).
+
 ## Multi-Client Workflow
 
 Client A:
