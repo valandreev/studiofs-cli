@@ -10,10 +10,6 @@ use log::{debug, error, warn};
 use std::convert::TryFrom;
 #[cfg(feature = "abi-7-28")]
 use std::convert::TryInto;
-#[cfg(target_os = "macos")]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "macos")]
-use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::Filesystem;
@@ -25,26 +21,6 @@ use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplySender};
 use crate::session::{Session, SessionACL};
 use crate::{KernelConfig, ll};
-
-#[cfg(target_os = "macos")]
-fn debug_path(path: &Path) -> String {
-    String::from_utf8_lossy(path.as_os_str().as_bytes()).into_owned()
-}
-
-#[cfg(target_os = "macos")]
-fn debug_path_bytes(path: &Path) -> Vec<u8> {
-    path.as_os_str().as_bytes().to_vec()
-}
-
-#[cfg(target_os = "macos")]
-fn debug_os_str(name: &OsStr) -> String {
-    String::from_utf8_lossy(name.as_bytes()).into_owned()
-}
-
-#[cfg(target_os = "macos")]
-fn debug_os_str_bytes(name: &OsStr) -> Vec<u8> {
-    name.as_bytes().to_vec()
-}
 
 /// Request data structure
 #[derive(Debug)]
@@ -220,22 +196,6 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::SetAttr(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch setattr ino={:?} mode={:?} uid={:?} gid={:?} size={:?} atime={:?} mtime={:?} ctime={:?} crtime={:?} chgtime={:?} bkuptime={:?} flags={:?}",
-                    self.request.nodeid(),
-                    x.mode(),
-                    x.uid(),
-                    x.gid(),
-                    x.size(),
-                    x.atime(),
-                    x.mtime(),
-                    x.ctime(),
-                    x.crtime(),
-                    x.chgtime(),
-                    x.bkuptime(),
-                    x.flags()
-                );
                 se.filesystem.setattr(
                     self,
                     self.request.nodeid().into(),
@@ -270,15 +230,6 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::MkDir(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch mkdir parent={:?} name={} name_bytes={:?} mode={} umask={}",
-                    self.request.nodeid(),
-                    debug_path(x.name()),
-                    debug_path_bytes(x.name()),
-                    x.mode(),
-                    x.umask()
-                );
                 se.filesystem.mkdir(
                     self,
                     self.request.nodeid().into(),
@@ -289,13 +240,6 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::Unlink(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch unlink parent={:?} name={} name_bytes={:?}",
-                    self.request.nodeid(),
-                    debug_path(x.name()),
-                    debug_path_bytes(x.name())
-                );
                 se.filesystem.unlink(
                     self,
                     self.request.nodeid().into(),
@@ -304,13 +248,6 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::RmDir(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch rmdir parent={:?} name={} name_bytes={:?}",
-                    self.request.nodeid(),
-                    debug_path(x.name()),
-                    debug_path_bytes(x.name())
-                );
                 se.filesystem.rmdir(
                     self,
                     self.request.nodeid().into(),
@@ -328,16 +265,6 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::Rename(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch rename parent={:?} newparent={:?} old_name={} old_name_bytes={:?} new_name={} new_name_bytes={:?}",
-                    self.request.nodeid(),
-                    x.dest().dir,
-                    debug_path(x.src().name),
-                    debug_path_bytes(x.src().name),
-                    debug_path(x.dest().name),
-                    debug_path_bytes(x.dest().name)
-                );
                 se.filesystem.rename(
                     self,
                     self.request.nodeid().into(),
@@ -416,20 +343,10 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::OpenDir(x) => {
-                #[cfg(target_os = "macos")]
-                debug!("macOS dispatch opendir ino={:?} flags={}", self.request.nodeid(), x.flags());
                 se.filesystem
                     .opendir(self, self.request.nodeid().into(), x.flags(), self.reply());
             }
             ll::Operation::ReadDir(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch readdir ino={:?} fh={:?} offset={} size={}",
-                    self.request.nodeid(),
-                    x.file_handle(),
-                    x.offset(),
-                    x.size()
-                );
                 se.filesystem.readdir(
                     self,
                     self.request.nodeid().into(),
@@ -465,16 +382,6 @@ impl<'a> Request<'a> {
                     .statfs(self, self.request.nodeid().into(), self.reply());
             }
             ll::Operation::SetXAttr(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch setxattr ino={:?} name={} name_bytes={:?} value_len={} flags={:#x} position={}",
-                    self.request.nodeid(),
-                    debug_os_str(x.name()),
-                    debug_os_str_bytes(x.name()),
-                    x.value().len(),
-                    x.flags(),
-                    x.position()
-                );
                 se.filesystem.setxattr(
                     self,
                     self.request.nodeid().into(),
@@ -499,13 +406,6 @@ impl<'a> Request<'a> {
                     .listxattr(self, self.request.nodeid().into(), x.size(), self.reply());
             }
             ll::Operation::RemoveXAttr(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch removexattr ino={:?} name={} name_bytes={:?}",
-                    self.request.nodeid(),
-                    debug_os_str(x.name()),
-                    debug_os_str_bytes(x.name())
-                );
                 se.filesystem.removexattr(
                     self,
                     self.request.nodeid().into(),
@@ -514,22 +414,10 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::Access(x) => {
-                #[cfg(target_os = "macos")]
-                debug!("macOS dispatch access ino={:?} mask={:#x}", self.request.nodeid(), x.mask());
                 se.filesystem
                     .access(self, self.request.nodeid().into(), x.mask(), self.reply());
             }
             ll::Operation::Create(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch create parent={:?} name={} name_bytes={:?} mode={} umask={} flags={:#x}",
-                    self.request.nodeid(),
-                    debug_path(x.name()),
-                    debug_path_bytes(x.name()),
-                    x.mode(),
-                    x.umask(),
-                    x.flags()
-                );
                 se.filesystem.create(
                     self,
                     self.request.nodeid().into(),
@@ -641,14 +529,6 @@ impl<'a> Request<'a> {
             }
             #[cfg(feature = "abi-7-21")]
             ll::Operation::ReadDirPlus(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch readdirplus ino={} fh={:?} offset={} size={}",
-                    self.request.nodeid(),
-                    x.file_handle(),
-                    x.offset(),
-                    x.size()
-                );
                 se.filesystem.readdirplus(
                     self,
                     self.request.nodeid().into(),
@@ -663,17 +543,6 @@ impl<'a> Request<'a> {
             }
             #[cfg(feature = "abi-7-23")]
             ll::Operation::Rename2(x) => {
-                #[cfg(target_os = "macos")]
-                debug!(
-                    "macOS dispatch rename2 parent={:?} newparent={:?} old_name={} old_name_bytes={:?} new_name={} new_name_bytes={:?} flags={:#x}",
-                    x.from().dir,
-                    x.to().dir,
-                    debug_path(x.from().name),
-                    debug_path_bytes(x.from().name),
-                    debug_path(x.to().name),
-                    debug_path_bytes(x.to().name),
-                    x.flags()
-                );
                 se.filesystem.rename(
                     self,
                     x.from().dir.into(),
@@ -713,31 +582,15 @@ impl<'a> Request<'a> {
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName(x) => {
-                debug!(
-                    "macOS dispatch setvolname name={} name_bytes={:?}",
-                    debug_os_str(x.name()),
-                    debug_os_str_bytes(x.name())
-                );
                 se.filesystem.setvolname(self, x.name(), self.reply());
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes(x) => {
-                debug!("macOS dispatch getxtimes ino={:?}", x.nodeid());
                 se.filesystem
                     .getxtimes(self, x.nodeid().into(), self.reply());
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange(x) => {
-                debug!(
-                    "macOS dispatch exchange parent={:?} newparent={:?} old_name={} old_name_bytes={:?} new_name={} new_name_bytes={:?} options={:#x}",
-                    x.from().dir,
-                    x.to().dir,
-                    debug_path(x.from().name),
-                    debug_path_bytes(x.from().name),
-                    debug_path(x.to().name),
-                    debug_path_bytes(x.to().name),
-                    x.options()
-                );
                 se.filesystem.exchange(
                     self,
                     x.from().dir.into(),

@@ -19,7 +19,6 @@
 //! Items without a version annotation are valid with ABI 7.8 and later
 
 #![warn(missing_debug_implementations)]
-#![allow(dead_code)]
 #![allow(missing_docs)]
 
 use crate::consts::{FATTR_ATIME_NOW, FATTR_MTIME_NOW};
