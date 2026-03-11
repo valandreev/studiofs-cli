@@ -2506,6 +2506,15 @@ impl StudioVfs {
         {
             return true;
         }
+        if self
+            .state
+            .live_extent_records
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+        {
+            return true;
+        }
         self.state
             .ingress_live
             .lock()
@@ -2775,6 +2784,7 @@ impl StudioVfs {
     fn remote_upload_placeholder_visible(&self, ino: Ino, attr: &InodeAttr) -> bool {
         attr.kind == FileType::RegularFile
             && attr.upload_state == UploadState::Uploading
+            && attr.size == 0
             && attr.committed_size == 0
             && !self.inode_has_local_overlay(ino)
             && !self.inode_has_pending_uploads(ino)
