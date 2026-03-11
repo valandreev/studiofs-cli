@@ -25,8 +25,8 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PgMetaEngine, PostgresConfig,
-    ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PostgresConfig,
+    RedbMetaEngine, ensure_studiofs_database,
     types::{BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
@@ -216,6 +216,7 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     .expect("failed to create StudioVfs")
 }
 
+#[allow(dead_code)]
 fn make_vfs_from_meta(
     meta: Arc<dyn MetaEngine>,
     format_info: &FormatInfo,
@@ -250,6 +251,7 @@ fn make_vfs_with_meta(
     .expect("failed to create StudioVfs")
 }
 
+#[allow(dead_code)]
 fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -261,6 +263,7 @@ fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> boo
     cond()
 }
 
+#[allow(dead_code)]
 fn pg_dsn() -> Option<String> {
     let _ = dotenvy::dotenv();
     let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
@@ -279,6 +282,7 @@ fn pg_dsn() -> Option<String> {
     })
 }
 
+#[allow(dead_code)]
 fn run_pg_async<T, F>(fut: F) -> studiofs_meta::MetaResult<T>
 where
     F: std::future::Future<Output = studiofs_meta::MetaResult<T>>,
@@ -292,6 +296,7 @@ where
     rt.block_on(fut)
 }
 
+#[allow(dead_code)]
 fn setup_pg_volume(
     dsn: &str,
     name: &str,
@@ -348,6 +353,7 @@ fn setup_pg_volume(
     })
 }
 
+#[allow(dead_code)]
 fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {
     FormatInfo {
         name: name.to_string(),
@@ -371,6 +377,7 @@ fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatIn
     }
 }
 
+#[allow(dead_code)]
 fn seed_local(db_path: &std::path::Path, info: &FormatInfo) {
     let seed = RedbMetaEngine::open(db_path).expect("seed redb open");
     seed.set_format_info(info).expect("seed format info");
@@ -380,6 +387,7 @@ fn seed_local(db_path: &std::path::Path, info: &FormatInfo) {
         .expect("seed flushed event seq");
 }
 
+#[allow(dead_code)]
 struct PgTestVolume {
     dsn: String,
     volume_id: i64,
@@ -387,6 +395,7 @@ struct PgTestVolume {
     uuid: String,
 }
 
+#[allow(dead_code)]
 impl PgTestVolume {
     fn new(dsn: &str, prefix: &str) -> Self {
         let name = format!(
@@ -434,10 +443,12 @@ impl Drop for PgTestVolume {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct SpyInvalidator {
     seen: Mutex<Vec<u64>>,
 }
 
+#[allow(dead_code)]
 impl SpyInvalidator {
     fn snapshot(&self) -> Vec<u64> {
         self.seen.lock().clone()
