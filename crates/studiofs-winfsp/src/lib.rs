@@ -7,6 +7,51 @@
 mod context;
 
 pub use context::{StudioFsContext, WinfspKernelInvalidator};
+use thiserror::Error;
+
+const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
+const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WinfspMountOptions {
+    volume_label: String,
+    file_info_timeout_ms: u32,
+    dir_info_timeout_ms: u32,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum MountOptionError {
+    #[error("volume label cannot be empty")]
+    EmptyVolumeLabel,
+    #[error("volume label cannot contain NUL")]
+    VolumeLabelContainsNul,
+}
+
+fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOptionError> {
+    let trimmed = volume_label.trim();
+    if trimmed.is_empty() {
+        return Err(MountOptionError::EmptyVolumeLabel);
+    }
+    if trimmed.contains('\0') {
+        return Err(MountOptionError::VolumeLabelContainsNul);
+    }
+
+    Ok(WinfspMountOptions {
+        volume_label: trimmed.to_string(),
+        file_info_timeout_ms: DEFAULT_FILE_INFO_TIMEOUT_MS,
+        dir_info_timeout_ms: DEFAULT_DIR_INFO_TIMEOUT_MS,
+    })
+}
+
+fn apply_volume_params(
+    volume_params: &mut winfsp::host::VolumeParams,
+    options: &WinfspMountOptions,
+) {
+    volume_params.filesystem_name("StudioFS");
+    volume_params.prefix(&options.volume_label);
+    volume_params.file_info_timeout(options.file_info_timeout_ms);
+    volume_params.dir_info_timeout(options.dir_info_timeout_ms);
+}
 
 fn shutdown_upload_drain_timeout() -> std::time::Duration {
     let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
@@ -24,13 +69,14 @@ pub fn mount_and_serve(
     vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
     rt: std::sync::Arc<tokio::runtime::Runtime>,
     mount_point: &str,
-    _volume_label: &str,
+    volume_label: &str,
     _foreground: bool,
     shutdown_event_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
+    let options = parse_mount_options(volume_label)?;
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
@@ -46,12 +92,9 @@ pub fn mount_and_serve(
     volume_params.sectors_per_allocation_unit(1);
     volume_params.max_component_length(255);
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
-    volume_params.filesystem_name("StudioFS");
     // WinFSP layer tuning:
-    // - Shorter file_info_timeout for quick invalidation on overwrites (P1.2)
-    // - Longer dir_info_timeout since directory entries change less frequently
-    volume_params.file_info_timeout(1000);
-    volume_params.dir_info_timeout(1000);
+    // - file_info_timeout and dir_info_timeout tuned for fast metadata refresh.
+    apply_volume_params(&mut volume_params, &options);
 
     // Keep a reference for shutdown() (vfs is moved into context).
     let vfs_ref = vfs.clone();
@@ -167,4 +210,32 @@ unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
         let _ = tx.send(());
     }
     1 // TRUE — handled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS, MountOptionError,
+        parse_mount_options,
+    };
+
+    #[test]
+    fn parse_mount_options_rejects_invalid_labels() {
+        assert_eq!(
+            parse_mount_options("   ").unwrap_err(),
+            MountOptionError::EmptyVolumeLabel
+        );
+        assert_eq!(
+            parse_mount_options("bad\0label").unwrap_err(),
+            MountOptionError::VolumeLabelContainsNul
+        );
+    }
+
+    #[test]
+    fn parse_mount_options_normalizes_and_sets_defaults() {
+        let opts = parse_mount_options("  StudioFS  ").expect("options");
+        assert_eq!(opts.volume_label, "StudioFS");
+        assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
+        assert_eq!(opts.dir_info_timeout_ms, DEFAULT_DIR_INFO_TIMEOUT_MS);
+    }
 }

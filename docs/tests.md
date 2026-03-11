@@ -31,6 +31,8 @@ StudioFS will use PostgreSQL database `studiofs` automatically.
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
+| FUSE bridge unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1` |
+| WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
 ## Important Current Regressions
 
@@ -73,6 +75,21 @@ cargo test -p studiofs-vfs --test vfs_test test_truncate_shrink_then_extend_zero
 ```bash
 cargo test --workspace --all-targets -- --nocapture
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
+```
+
+## Platform Bridge Smoke Tests
+
+The bridge mount/unmount smoke tests are intentionally `#[ignore]` because they
+require host platform support (`/dev/fuse` or WinFSP driver/runtime). Enable
+them only when validating platform bridge changes:
+
+```bash
+STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
+```
+
+```powershell
+$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'
+cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1
 ```
 
 ## Doc/Test Name Sync Check

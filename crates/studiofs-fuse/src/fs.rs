@@ -97,6 +97,14 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
         VfsError::BlockNotFound(_, _) => libc::EIO,
         VfsError::WouldBlock | VfsError::RemoteContentPending => libc::EAGAIN,
         VfsError::InvalidName(_) => libc::EINVAL,
+        VfsError::Io(ioe) => match ioe.kind() {
+            std::io::ErrorKind::NotFound => libc::ENOENT,
+            std::io::ErrorKind::PermissionDenied => libc::EACCES,
+            std::io::ErrorKind::AlreadyExists => libc::EEXIST,
+            std::io::ErrorKind::WouldBlock => libc::EAGAIN,
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => libc::EINVAL,
+            _ => libc::EIO,
+        },
         _ => libc::EIO,
     }
 }
@@ -1105,10 +1113,15 @@ impl KernelInvalidator for FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_unix_mode, should_log_fuse_invalidation_error};
+    use super::{
+        normalize_unix_mode, posix_flags_to_open_flags, should_log_fuse_invalidation_error,
+        vfs_err_to_errno,
+    };
 
     #[cfg(target_os = "macos")]
     use super::{is_kernel_managed_macos_xattr, merge_xattr_write};
+    use studiofs_meta::MetaError;
+    use studiofs_vfs::{OpenFlags, VfsError};
 
     #[test]
     fn normalize_unix_mode_strips_file_type_bits() {
@@ -1124,6 +1137,49 @@ mod tests {
 
         assert!(!should_log_fuse_invalidation_error(&not_found));
         assert!(should_log_fuse_invalidation_error(&other));
+    }
+
+    #[test]
+    fn vfs_error_maps_to_expected_errno_codes() {
+        let not_found = VfsError::Meta(MetaError::EntryNotFound {
+            parent: 1,
+            name: "missing".into(),
+        });
+        assert_eq!(vfs_err_to_errno(&not_found), libc::ENOENT);
+
+        let exists = VfsError::Meta(MetaError::EntryExists {
+            parent: 1,
+            name: "dup".into(),
+        });
+        assert_eq!(vfs_err_to_errno(&exists), libc::EEXIST);
+
+        let invalid = VfsError::InvalidName("bad".into());
+        assert_eq!(vfs_err_to_errno(&invalid), libc::EINVAL);
+
+        let blocked = VfsError::WouldBlock;
+        assert_eq!(vfs_err_to_errno(&blocked), libc::EAGAIN);
+    }
+
+    #[test]
+    fn io_permission_denied_maps_to_eacces() {
+        let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(vfs_err_to_errno(&err), libc::EACCES);
+    }
+
+    #[test]
+    fn posix_open_flags_translate_access_and_truncate_bits() {
+        let (rdonly, trunc) = posix_flags_to_open_flags(libc::O_RDONLY);
+        assert!(rdonly.contains(OpenFlags::RDONLY));
+        assert!(!trunc);
+
+        let (append, trunc) = posix_flags_to_open_flags(libc::O_WRONLY | libc::O_APPEND);
+        assert!(append.contains(OpenFlags::WRONLY));
+        assert!(append.contains(OpenFlags::APPEND));
+        assert!(!trunc);
+
+        let (rdwr, trunc) = posix_flags_to_open_flags(libc::O_RDWR | libc::O_TRUNC);
+        assert!(rdwr.contains(OpenFlags::RDWR));
+        assert!(trunc);
     }
 
     #[cfg(target_os = "macos")]

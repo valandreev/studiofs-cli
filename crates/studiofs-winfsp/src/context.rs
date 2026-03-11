@@ -35,6 +35,7 @@ const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
 const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
 const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
+const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
@@ -360,6 +361,17 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             }
         },
         studiofs_vfs::VfsError::InvalidName(_) => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
+        studiofs_vfs::VfsError::Io(ioe) => match ioe.kind() {
+            std::io::ErrorKind::NotFound => winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND),
+            std::io::ErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
+            std::io::ErrorKind::AlreadyExists => {
+                winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION)
+            }
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                winfsp::FspError::from(STATUS_INVALID_PARAMETER)
+            }
+            _ => winfsp::FspError::from(STATUS_UNSUCCESSFUL),
+        },
         studiofs_vfs::VfsError::WouldBlock => {
             debug!("vfs lock conflict: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
@@ -1118,8 +1130,9 @@ mod tests {
     use super::{
         FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
         FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_NOT_FOUND,
         StudioFsContext, WinfspKernelInvalidator, build_notify_info, ino_to_windows_path,
-        notify_filter_for_kind,
+        notify_filter_for_kind, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1192,6 +1205,27 @@ mod tests {
         });
         assert!(is_benign_cleanup_delete_error(&err, false));
         assert!(is_benign_cleanup_delete_error(&err, true));
+    }
+
+    #[test]
+    fn vfs_error_maps_to_expected_ntstatus() {
+        let not_found = VfsError::Meta(MetaError::EntryNotFound {
+            parent: 1,
+            name: "missing".into(),
+        });
+        let status = vfs_to_winfsp_err(not_found).to_ntstatus();
+        assert_eq!(status, STATUS_OBJECT_NAME_NOT_FOUND.0);
+
+        let invalid = VfsError::InvalidName("bad".into());
+        let status = vfs_to_winfsp_err(invalid).to_ntstatus();
+        assert_eq!(status, STATUS_INVALID_PARAMETER.0);
+    }
+
+    #[test]
+    fn io_permission_denied_maps_to_access_denied() {
+        let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let status = vfs_to_winfsp_err(err).to_ntstatus();
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
     }
 
     #[test]
