@@ -30,6 +30,7 @@ StudioFS will use PostgreSQL database `studiofs` automatically.
 | PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1` |
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
+| Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 
 ## Important Current Regressions
 
