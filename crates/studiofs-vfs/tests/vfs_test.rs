@@ -1710,6 +1710,113 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
 }
 
 #[test]
+fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_minio_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("sfs9-local-finalize-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 512 * 1024;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x5Au8; (format_info.block_size as usize) * 4];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+        let attr = vfs
+            .create(1, b"sfs9-local-finalize.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "test setup requires queued uploads for the new file"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match vfs.open_file(attr.ino, OpenFlags::RDONLY, false) {
+                Ok(fh) => {
+                    vfs.release_fh(fh).await.unwrap();
+                }
+                Err(VfsError::RemoteContentPending) => {
+                    panic!("local open_file must not fail with RemoteContentPending");
+                }
+                Err(err) => {
+                    panic!("local open_file failed during upload finalization: {err}");
+                }
+            }
+
+            match vfs.read(attr.ino, 0, payload.len() as u32).await {
+                Ok(bytes) => assert_eq!(bytes.as_ref(), payload.as_slice()),
+                Err(VfsError::RemoteContentPending) => {
+                    panic!("local read must not fail with RemoteContentPending");
+                }
+                Err(err) => {
+                    panic!("local read failed during upload finalization: {err}");
+                }
+            }
+
+            let current_attr = vfs.getattr(attr.ino).unwrap();
+            if vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                && current_attr.upload_state == UploadState::Ready
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "upload pipeline did not stabilize before timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn remote_clients_keep_previous_committed_version_during_update() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
