@@ -423,6 +423,11 @@ const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
+const DEFAULT_DENTRY_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const DENTRY_CACHE_PROTECTED_PERCENT: usize = 80;
+const DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER: usize = 2;
+const DENTRY_CACHE_ORDER_COMPACT_SLACK: usize = 64;
+const DENTRY_CACHE_INDEX_NODE_OVERHEAD: usize = 32;
 const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
 const INGRESS_RECORD_PUT: u8 = 1;
@@ -586,14 +591,14 @@ struct IgnoredEntryRegistry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DentryCacheKey {
     parent: Ino,
-    name: Vec<u8>,
+    name: Arc<[u8]>,
 }
 
 impl DentryCacheKey {
     fn new(parent: Ino, name: &[u8]) -> Self {
         Self {
             parent,
-            name: name.to_vec(),
+            name: Arc::from(name),
         }
     }
 }
@@ -607,85 +612,189 @@ enum DentryCacheValue {
 #[derive(Debug, Clone)]
 struct DentryCacheEntry {
     value: DentryCacheValue,
+    segment: DentryCacheSegment,
+    charge: usize,
     stamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DentryCacheSegment {
+    Probationary,
+    Protected,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DentryCacheMetrics {
+    hits: u64,
+    misses: u64,
+    negative_hits: u64,
+    evictions: u64,
+    occupancy_entries: usize,
+    occupancy_bytes: usize,
+    entry_budget: usize,
+    byte_budget: usize,
+}
+
+impl DentryCacheMetrics {
+    fn negative_hit_ratio(self) -> f64 {
+        if self.hits == 0 {
+            return 0.0;
+        }
+        self.negative_hits as f64 / self.hits as f64
+    }
 }
 
 #[derive(Debug)]
 struct DentryCache {
-    capacity: usize,
+    entry_budget: usize,
+    byte_budget: usize,
+    protected_entry_budget: usize,
+    protected_byte_budget: usize,
     next_stamp: u64,
+    used_bytes: usize,
+    protected_entries: usize,
+    protected_bytes: usize,
+    hits: u64,
+    misses: u64,
+    negative_hits: u64,
+    evictions: u64,
     entries: HashMap<DentryCacheKey, DentryCacheEntry>,
-    order: VecDeque<(DentryCacheKey, u64)>,
+    probationary_order: VecDeque<(DentryCacheKey, u64)>,
+    protected_order: VecDeque<(DentryCacheKey, u64)>,
     parent_index: HashMap<Ino, HashSet<DentryCacheKey>>,
 }
 
 impl DentryCache {
-    fn new(capacity: usize) -> Self {
+    fn new(entry_budget: usize, byte_budget: usize) -> Self {
+        let protected_entry_budget = if entry_budget <= 1 {
+            0
+        } else {
+            ((entry_budget * DENTRY_CACHE_PROTECTED_PERCENT) / 100).clamp(1, entry_budget - 1)
+        };
+        let protected_byte_budget = if byte_budget <= 1 {
+            0
+        } else {
+            ((byte_budget * DENTRY_CACHE_PROTECTED_PERCENT) / 100).clamp(1, byte_budget - 1)
+        };
         Self {
-            capacity,
+            entry_budget,
+            byte_budget,
+            protected_entry_budget,
+            protected_byte_budget,
             next_stamp: 1,
+            used_bytes: 0,
+            protected_entries: 0,
+            protected_bytes: 0,
+            hits: 0,
+            misses: 0,
+            negative_hits: 0,
+            evictions: 0,
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            probationary_order: VecDeque::new(),
+            protected_order: VecDeque::new(),
             parent_index: HashMap::new(),
         }
     }
 
+    fn estimate_entry_charge(name: &[u8]) -> usize {
+        std::mem::size_of::<DentryCacheKey>()
+            .saturating_add(std::mem::size_of::<DentryCacheEntry>())
+            .saturating_add(name.len())
+            .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD * 2)
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.entry_budget > 0 && self.byte_budget > 0
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.saturating_add(1);
+        stamp
+    }
+
+    fn metrics(&self) -> DentryCacheMetrics {
+        DentryCacheMetrics {
+            hits: self.hits,
+            misses: self.misses,
+            negative_hits: self.negative_hits,
+            evictions: self.evictions,
+            occupancy_entries: self.entries.len(),
+            occupancy_bytes: self.used_bytes,
+            entry_budget: self.entry_budget,
+            byte_budget: self.byte_budget,
+        }
+    }
+
     fn get(&mut self, parent: Ino, name: &[u8]) -> Option<DentryCacheValue> {
-        if self.capacity == 0 {
+        if !self.is_enabled() {
+            self.misses = self.misses.saturating_add(1);
             return None;
         }
         let key = DentryCacheKey::new(parent, name);
-        let value = self.entries.get(&key)?.value;
-        let stamp = self.next_stamp;
-        self.next_stamp = self.next_stamp.saturating_add(1);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.stamp = stamp;
+        let (value, segment) = match self.entries.get(&key) {
+            Some(entry) => (entry.value, entry.segment),
+            None => {
+                self.misses = self.misses.saturating_add(1);
+                return None;
+            }
+        };
+        self.hits = self.hits.saturating_add(1);
+        if matches!(value, DentryCacheValue::Negative) {
+            self.negative_hits = self.negative_hits.saturating_add(1);
         }
-        self.order.push_back((key, stamp));
+        match segment {
+            DentryCacheSegment::Probationary => self.promote_to_protected(&key),
+            DentryCacheSegment::Protected => self.touch_protected(&key),
+        }
         Some(value)
     }
 
     fn put(&mut self, parent: Ino, name: &[u8], value: DentryCacheValue) {
-        if self.capacity == 0 {
+        if !self.is_enabled() {
             return;
         }
         let key = DentryCacheKey::new(parent, name);
-        let stamp = self.next_stamp;
-        self.next_stamp = self.next_stamp.saturating_add(1);
+        let stamp = self.next_stamp();
 
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.value = value;
             entry.stamp = stamp;
-            self.order.push_back((key, stamp));
+            match entry.segment {
+                DentryCacheSegment::Probationary => self.probationary_order.push_back((key, stamp)),
+                DentryCacheSegment::Protected => self.protected_order.push_back((key, stamp)),
+            }
+            self.maybe_compact_orders();
             return;
         }
 
-        while self.entries.len() >= self.capacity {
-            if !self.evict_one() {
-                break;
-            }
+        let charge = Self::estimate_entry_charge(name);
+        if charge > self.byte_budget {
+            return;
         }
 
-        self.entries
-            .insert(key.clone(), DentryCacheEntry { value, stamp });
+        self.entries.insert(
+            key.clone(),
+            DentryCacheEntry {
+                value,
+                segment: DentryCacheSegment::Probationary,
+                charge,
+                stamp,
+            },
+        );
         self.parent_index
             .entry(parent)
             .or_default()
             .insert(key.clone());
-        self.order.push_back((key, stamp));
+        self.probationary_order.push_back((key, stamp));
+        self.used_bytes = self.used_bytes.saturating_add(charge);
+        self.maybe_compact_orders();
+        self.enforce_limits();
     }
 
     fn invalidate(&mut self, parent: Ino, name: &[u8]) {
         let key = DentryCacheKey::new(parent, name);
-        if self.entries.remove(&key).is_some()
-            && let Some(keys) = self.parent_index.get_mut(&parent)
-        {
-            keys.remove(&key);
-            let empty = keys.is_empty();
-            if empty {
-                self.parent_index.remove(&parent);
-            }
-        }
+        self.remove_entry(&key);
     }
 
     fn invalidate_parent(&mut self, parent: Ino) {
@@ -693,36 +802,172 @@ impl DentryCache {
             return;
         };
         for key in keys {
-            self.entries.remove(&key);
+            self.remove_entry_accounting_only(&key);
         }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.order.clear();
+        self.probationary_order.clear();
+        self.protected_order.clear();
         self.parent_index.clear();
+        self.used_bytes = 0;
+        self.protected_entries = 0;
+        self.protected_bytes = 0;
     }
 
-    fn evict_one(&mut self) -> bool {
-        while let Some((key, stamp)) = self.order.pop_front() {
+    fn touch_protected(&mut self, key: &DentryCacheKey) {
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.stamp = stamp;
+            self.protected_order.push_back((key.clone(), stamp));
+        }
+        self.maybe_compact_orders();
+    }
+
+    fn promote_to_protected(&mut self, key: &DentryCacheKey) {
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(key) {
+            if entry.segment == DentryCacheSegment::Probationary {
+                entry.segment = DentryCacheSegment::Protected;
+                self.protected_entries = self.protected_entries.saturating_add(1);
+                self.protected_bytes = self.protected_bytes.saturating_add(entry.charge);
+            }
+            entry.stamp = stamp;
+            self.protected_order.push_back((key.clone(), stamp));
+        }
+        self.maybe_compact_orders();
+        self.enforce_protected_budget();
+    }
+
+    fn enforce_limits(&mut self) {
+        self.enforce_protected_budget();
+        while self.entries.len() > self.entry_budget || self.used_bytes > self.byte_budget {
+            if !self.evict_one() {
+                break;
+            }
+        }
+    }
+
+    fn enforce_protected_budget(&mut self) {
+        while self.protected_entries > self.protected_entry_budget
+            || self.protected_bytes > self.protected_byte_budget
+        {
+            if !self.demote_one_protected() {
+                break;
+            }
+        }
+    }
+
+    fn demote_one_protected(&mut self) -> bool {
+        while let Some((key, stamp)) = self.protected_order.pop_front() {
             let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
-            if entry.stamp != stamp {
+            if entry.stamp != stamp || entry.segment != DentryCacheSegment::Protected {
                 continue;
             }
-            let parent = key.parent;
-            self.entries.remove(&key);
-            if let Some(keys) = self.parent_index.get_mut(&parent) {
-                keys.remove(&key);
-                let empty = keys.is_empty();
-                if empty {
-                    self.parent_index.remove(&parent);
-                }
+            let demote_stamp = self.next_stamp();
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.segment = DentryCacheSegment::Probationary;
+                entry.stamp = demote_stamp;
+                self.protected_entries = self.protected_entries.saturating_sub(1);
+                self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
+                self.probationary_order.push_back((key, demote_stamp));
+                return true;
             }
-            return true;
         }
         false
+    }
+
+    fn evict_one(&mut self) -> bool {
+        self.evict_one_from(DentryCacheSegment::Probationary)
+            || self.evict_one_from(DentryCacheSegment::Protected)
+    }
+
+    fn maybe_compact_orders(&mut self) {
+        let probationary_live = self.entries.len().saturating_sub(self.protected_entries);
+        let probationary_limit = probationary_live
+            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
+            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
+        if self.probationary_order.len() > probationary_limit {
+            self.compact_order(DentryCacheSegment::Probationary);
+        }
+
+        let protected_limit = self
+            .protected_entries
+            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
+            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
+        if self.protected_order.len() > protected_limit {
+            self.compact_order(DentryCacheSegment::Protected);
+        }
+    }
+
+    fn compact_order(&mut self, segment: DentryCacheSegment) {
+        let mut live: Vec<(u64, DentryCacheKey)> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (entry.segment == segment).then_some((entry.stamp, key.clone()))
+            })
+            .collect();
+        live.sort_unstable_by_key(|(stamp, _)| *stamp);
+
+        let order = match segment {
+            DentryCacheSegment::Probationary => &mut self.probationary_order,
+            DentryCacheSegment::Protected => &mut self.protected_order,
+        };
+        order.clear();
+        order.extend(live.into_iter().map(|(stamp, key)| (key, stamp)));
+    }
+
+    fn evict_one_from(&mut self, segment: DentryCacheSegment) -> bool {
+        let order = match segment {
+            DentryCacheSegment::Probationary => &mut self.probationary_order,
+            DentryCacheSegment::Protected => &mut self.protected_order,
+        };
+        while let Some((key, stamp)) = order.pop_front() {
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if entry.stamp != stamp || entry.segment != segment {
+                continue;
+            }
+            return self.evict_key(&key);
+        }
+        false
+    }
+
+    fn evict_key(&mut self, key: &DentryCacheKey) -> bool {
+        let removed = self.remove_entry(key);
+        if removed {
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        removed
+    }
+
+    fn remove_entry(&mut self, key: &DentryCacheKey) -> bool {
+        let parent = key.parent;
+        let removed = self.remove_entry_accounting_only(key);
+        if removed && let Some(keys) = self.parent_index.get_mut(&parent) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.parent_index.remove(&parent);
+            }
+        }
+        removed
+    }
+
+    fn remove_entry_accounting_only(&mut self, key: &DentryCacheKey) -> bool {
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
+        if entry.segment == DentryCacheSegment::Protected {
+            self.protected_entries = self.protected_entries.saturating_sub(1);
+            self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
+        }
+        true
     }
 }
 
@@ -1752,6 +1997,10 @@ impl StudioVfs {
         self.state.dentry_cache.lock().clear();
     }
 
+    fn dentry_cache_metrics(&self) -> DentryCacheMetrics {
+        self.state.dentry_cache.lock().metrics()
+    }
+
     fn restore_live_extents_from_pending_uploads(&self) {
         let pending = self.block_cache.snapshot_pending_uploads();
         if pending.is_empty() {
@@ -1937,6 +2186,11 @@ impl StudioVfs {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_DENTRY_CACHE_CAPACITY);
+            let dentry_cache_bytes = std::env::var("STUDIOFS_DENTRY_CACHE_BYTES")
+                .ok()
+                .and_then(|v| parse_size_bytes_env(&v))
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_DENTRY_CACHE_BYTES);
             let max_spill_bytes = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
                 .ok()
                 .and_then(|v| parse_size_bytes_env(&v))
@@ -2216,6 +2470,7 @@ impl StudioVfs {
                 max_dirty_bytes,
                 max_spill_bytes,
                 dentry_cache_capacity,
+                dentry_cache_bytes,
                 "upload pipeline v2 enabled"
             );
 
@@ -2232,7 +2487,10 @@ impl StudioVfs {
                     uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                     ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
-                    dentry_cache: Mutex::new(DentryCache::new(dentry_cache_capacity)),
+                    dentry_cache: Mutex::new(DentryCache::new(
+                        dentry_cache_capacity,
+                        dentry_cache_bytes,
+                    )),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
@@ -6299,9 +6557,12 @@ impl StudioVfs {
             let metadata_backlog = self.meta.replication_backlog();
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
+            let dentry_cache = self.dentry_cache_metrics();
             info!(
                 pending_uploads = pending,
                 pending_metadata_ops = metadata_backlog.total_ops(),
+                dentry_cache_entries = dentry_cache.occupancy_entries,
+                dentry_cache_bytes = dentry_cache.occupancy_bytes,
                 "upload pipeline"
             );
             if !self.upload_pipeline_is_idle(pending, &ingress) {
@@ -6339,6 +6600,15 @@ impl StudioVfs {
                     qos_fetch_available = self.qos.fetch_available(),
                     pending_metadata_ops = metadata_backlog.pending_ops,
                     inflight_metadata_ops = metadata_backlog.inflight_ops,
+                    dentry_cache_hits = dentry_cache.hits,
+                    dentry_cache_misses = dentry_cache.misses,
+                    dentry_cache_evictions = dentry_cache.evictions,
+                    dentry_cache_negative_hits = dentry_cache.negative_hits,
+                    dentry_cache_negative_hit_ratio = dentry_cache.negative_hit_ratio(),
+                    dentry_cache_entries = dentry_cache.occupancy_entries,
+                    dentry_cache_bytes = dentry_cache.occupancy_bytes,
+                    dentry_cache_entry_budget = dentry_cache.entry_budget,
+                    dentry_cache_byte_budget = dentry_cache.byte_budget,
                     "upload pipeline counters"
                 );
             }
@@ -7117,7 +7387,8 @@ mod tests {
 
     #[test]
     fn dentry_cache_is_bounded_and_supports_negative_entries() {
-        let mut cache = DentryCache::new(2);
+        let single_charge = DentryCache::estimate_entry_charge(b"a");
+        let mut cache = DentryCache::new(2, single_charge * 4);
 
         cache.put(ROOT_INO, b"a", DentryCacheValue::Positive(11));
         cache.put(ROOT_INO, b"b", DentryCacheValue::Negative);
@@ -7135,6 +7406,72 @@ mod tests {
         assert_eq!(
             cache.get(ROOT_INO, b"c"),
             Some(DentryCacheValue::Positive(33))
+        );
+    }
+
+    #[test]
+    fn dentry_cache_enforces_byte_budget_under_scan() {
+        let charge = DentryCache::estimate_entry_charge(b"k0000");
+        let mut cache = DentryCache::new(1024, charge * 32);
+
+        for i in 0..2000usize {
+            let key = format!("k{i:04}");
+            cache.put(
+                ROOT_INO,
+                key.as_bytes(),
+                DentryCacheValue::Positive(i as u64),
+            );
+        }
+
+        let metrics = cache.metrics();
+        assert!(metrics.occupancy_entries <= metrics.entry_budget);
+        assert!(metrics.occupancy_bytes <= metrics.byte_budget);
+    }
+
+    #[test]
+    fn dentry_cache_tracks_hits_misses_and_negative_ratio() {
+        let charge = DentryCache::estimate_entry_charge(b"a");
+        let mut cache = DentryCache::new(1, charge * 8);
+
+        assert_eq!(cache.get(ROOT_INO, b"missing"), None);
+        cache.put(ROOT_INO, b"a", DentryCacheValue::Negative);
+        assert_eq!(cache.get(ROOT_INO, b"a"), Some(DentryCacheValue::Negative));
+        cache.put(ROOT_INO, b"b", DentryCacheValue::Positive(22));
+
+        let metrics = cache.metrics();
+        assert_eq!(metrics.hits, 1);
+        assert_eq!(metrics.misses, 1);
+        assert_eq!(metrics.negative_hits, 1);
+        assert_eq!(metrics.evictions, 1);
+        assert!((metrics.negative_hit_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dentry_cache_compacts_lazy_orders_without_budget_pressure() {
+        let charge = DentryCache::estimate_entry_charge(b"hot");
+        let mut cache = DentryCache::new(8, charge * 128);
+        cache.put(ROOT_INO, b"hot", DentryCacheValue::Positive(1));
+
+        for _ in 0..5000 {
+            assert_eq!(
+                cache.get(ROOT_INO, b"hot"),
+                Some(DentryCacheValue::Positive(1))
+            );
+        }
+
+        assert!(
+            cache.protected_order.len() <= DENTRY_CACHE_ORDER_COMPACT_SLACK + 2,
+            "protected lazy queue should stay compact under steady-state hits"
+        );
+    }
+
+    #[test]
+    fn dentry_cache_key_clone_is_refcounted() {
+        let key = DentryCacheKey::new(ROOT_INO, b"shared-name");
+        let cloned = key.clone();
+        assert!(
+            Arc::ptr_eq(&key.name, &cloned.name),
+            "key clone should not duplicate name bytes"
         );
     }
 
