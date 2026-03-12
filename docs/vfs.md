@@ -262,12 +262,28 @@ Besides generic filename validation, the VFS also applies a small platform
 compatibility filter for macOS metadata noise:
 - `.DS_Store`
 - AppleDouble sidecars matching `._*`
+- Root-only system metadata directories: `.Spotlight-V100`, `.Trashes`, `.fseventsd`
 
 These names are accepted through the local client flow as ephemeral ignored
 files, but they are never written into the metadata engine, cache pipeline, or
 object storage. This is intentionally different from ordinary files because
 Finder expects these operations to appear successful even when the shared
 filesystem should remain clean.
+
+For the root-only system directories, StudioFS uses slightly different behavior
+from ignored files:
+- root `mkdir` is accepted and returns an ephemeral directory inode
+- any nested `mkdir` / `create` / `symlink` activity under that ignored
+  directory is blackholed into ephemeral entries
+- reads from ignored file children return zero-filled bytes sized to the
+  synthetic file length
+- ignored directories never appear in `readdir`
+- persisted legacy root entries with those names are also filtered out of
+  `lookup` and `readdir`
+
+This keeps Spotlight, Trash metadata, and `fseventsd` churn from polluting the
+shared namespace while still presenting macOS with a tolerant enough surface
+for background services.
 
 All file/directory names are validated:
 - Non-empty, max 255 bytes

@@ -6195,6 +6195,81 @@ async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
     assert_eq!(unique.len(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_children() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-root-macos-dirs");
+
+    let dir = vfs.mkdir(1, b".Spotlight-V100", 1000, 1000, 0o755).unwrap();
+    assert_eq!(dir.kind, studiofs_meta::types::FileType::Directory);
+    assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
+
+    let looked_up_dir = vfs.lookup(1, b".Spotlight-V100").unwrap();
+    assert_eq!(looked_up_dir.ino, dir.ino);
+
+    let nested_dir = vfs.mkdir(dir.ino, b"Store-V2", 1000, 1000, 0o755).unwrap();
+    let attr = vfs
+        .create(nested_dir.ino, b"store.db", 1000, 1000, 0o644)
+        .unwrap();
+    let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+    let written = vfs.write(attr.ino, 0, b"spotlight").await.unwrap();
+    assert_eq!(written, b"spotlight".len() as u32);
+    vfs.flush(attr.ino).await.unwrap();
+
+    let read_back = vfs.read(attr.ino, 0, written).await.unwrap();
+    assert_eq!(read_back.len(), written as usize);
+    assert!(read_back.iter().all(|byte| *byte == 0));
+
+    vfs.release_fh(fh).await.unwrap();
+    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+
+    assert_eq!(vfs.readdir(1).unwrap().len(), 0);
+    assert_eq!(vfs.readdir(dir.ino).unwrap().len(), 0);
+    assert_eq!(vfs.readdir(nested_dir.ino).unwrap().len(), 0);
+    assert!(vfs.lookup(1, b".Spotlight-V100").is_ok());
+    assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
+    assert!(vfs.meta().lookup(dir.ino, b"Store-V2").is_err());
+    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    let ingress = vfs.ingress_stats();
+    assert_eq!(ingress.dirty_mem_bytes, 0);
+    assert_eq!(ingress.spill_bytes, 0);
+
+    vfs.rmdir(1, b".Spotlight-V100").unwrap();
+    assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hide-legacy-root-macos-dirs");
+
+    vfs.meta()
+        .create_dir(1, b".Spotlight-V100", 1000, 1000, 0o755)
+        .unwrap();
+    vfs.meta()
+        .create_dir(1, b".Trashes", 1000, 1000, 0o755)
+        .unwrap();
+    vfs.meta()
+        .create_dir(1, b".fseventsd", 1000, 1000, 0o755)
+        .unwrap();
+    vfs.meta()
+        .create_dir(1, b"visible", 1000, 1000, 0o755)
+        .unwrap();
+
+    let entries = vfs.readdir(1).unwrap();
+    let names: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.name).collect();
+    assert_eq!(names, vec![b"visible".to_vec()]);
+
+    assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
+    assert!(vfs.lookup(1, b".Trashes").is_err());
+    assert!(vfs.lookup(1, b".fseventsd").is_err());
+    assert!(vfs.lookup(1, b"visible").is_ok());
+}
+
 // ─── 9.3 Rename & Unlink Edge Cases ────────────────────────────────────────
 
 /// Rename a file across directories.

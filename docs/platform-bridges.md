@@ -140,12 +140,17 @@ from Finder-driven deletes.
 ### macOS metadata file filtering
 
 Finder and related macOS services may also try to create metadata sidecar files
-such as `.DS_Store` and AppleDouble `._*`.
+such as `.DS_Store`, AppleDouble `._*`, and root-level system directories like
+`.Spotlight-V100`, `.Trashes`, and `.fseventsd`.
 
 StudioFS drops these names at the VFS layer:
 - `create` / `open` flows succeed locally so Finder does not surface errors
-- the file stays ephemeral to the mounting client only
+- ignored files stay ephemeral to the mounting client only
+- root metadata directories are represented by ephemeral directory inodes and
+  any nested activity underneath them is blackholed
 - no inode, xattr, cache, or object-store state is persisted for these names
+- these root metadata directories are filtered from `readdir`, even if a legacy
+  metadata entry already exists
 
 This keeps shared directories free of macOS-only garbage while preserving normal
 Finder interaction.
