@@ -287,6 +287,23 @@ This keeps Spotlight, Trash metadata, and `fseventsd` churn from polluting the
 shared namespace while still presenting macOS with a tolerant enough surface
 for background services.
 
+## Namespace Resolution
+
+Path resolution is centralized in `NamespaceResolver` (`studiofs-vfs`):
+- `lookup_component(parent, name)` for component-by-component lookup
+- `resolve_path(path)` for full path walks
+- `resolve_parent(path)` for parent/name extraction
+- `path_for_inode(ino)` for reverse path rendering used by bridge notifications
+
+The resolver is the single entrypoint for namespace semantics. It always routes
+through VFS lookup/readdir/getattr behavior, so runtime rules (ignored entries,
+blocked root metadata names, and local-only ignored subtrees) are identical for
+both full-path and component-based resolution.
+
+Path normalization is style-aware:
+- `NamespacePathStyle::Posix`: `/`, `.`, `..`
+- `NamespacePathStyle::Windows`: `\`, `.`, `..`, trailing `.`/space trimming
+
 All file/directory names are validated:
 - Non-empty, max 255 bytes
 - No `/` character

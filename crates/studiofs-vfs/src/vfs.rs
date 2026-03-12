@@ -190,6 +190,142 @@ pub struct VfsUploadStats {
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespacePathStyle {
+    Posix,
+    Windows,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceParent {
+    pub parent: Ino,
+    pub name: Vec<u8>,
+}
+
+pub struct NamespaceResolver<'a> {
+    vfs: &'a StudioVfs,
+    style: NamespacePathStyle,
+}
+
+impl<'a> NamespaceResolver<'a> {
+    fn new(vfs: &'a StudioVfs, style: NamespacePathStyle) -> Self {
+        Self { vfs, style }
+    }
+
+    fn path_components(&self, path: &str) -> Vec<String> {
+        let stripped = match self.style {
+            NamespacePathStyle::Posix => path.trim_start_matches('/'),
+            NamespacePathStyle::Windows => path.trim_start_matches('\\'),
+        };
+
+        let mut components: Vec<String> = Vec::new();
+        let parts: Box<dyn Iterator<Item = &str>> = match self.style {
+            NamespacePathStyle::Posix => Box::new(stripped.split('/')),
+            NamespacePathStyle::Windows => Box::new(stripped.split('\\')),
+        };
+
+        for raw in parts {
+            if raw.is_empty() || raw == "." {
+                continue;
+            }
+            if raw == ".." {
+                components.pop();
+                continue;
+            }
+            let normalized = match self.style {
+                NamespacePathStyle::Posix => raw,
+                NamespacePathStyle::Windows => raw.trim_end_matches(['.', ' ']),
+            };
+            if !normalized.is_empty() {
+                components.push(normalized.to_string());
+            }
+        }
+        components
+    }
+
+    fn path_not_found(path: &str) -> VfsError {
+        VfsError::Meta(MetaError::EntryNotFound {
+            parent: ROOT_INO,
+            name: path.to_string(),
+        })
+    }
+
+    pub fn lookup_component(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
+        self.vfs.lookup_component_impl(parent, name)
+    }
+
+    pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
+        let components = self.path_components(path);
+        if components.is_empty() {
+            return self.vfs.getattr(ROOT_INO);
+        }
+
+        let mut current = ROOT_INO;
+        let mut attr = self.vfs.getattr(ROOT_INO)?;
+        for component in components {
+            attr = self.lookup_component(current, component.as_bytes())?;
+            current = attr.ino;
+        }
+        Ok(attr)
+    }
+
+    pub fn resolve_parent(&self, path: &str) -> VfsResult<NamespaceParent> {
+        let components = self.path_components(path);
+        if components.is_empty() {
+            return Err(Self::path_not_found(path));
+        }
+
+        let mut current = ROOT_INO;
+        for component in &components[..components.len() - 1] {
+            let attr = self.lookup_component(current, component.as_bytes())?;
+            current = attr.ino;
+        }
+
+        Ok(NamespaceParent {
+            parent: current,
+            name: components.last().unwrap().as_bytes().to_vec(),
+        })
+    }
+
+    pub fn path_for_inode(&self, ino: Ino) -> Option<String> {
+        if ino == ROOT_INO {
+            return Some(match self.style {
+                NamespacePathStyle::Posix => "/".to_string(),
+                NamespacePathStyle::Windows => "\\".to_string(),
+            });
+        }
+
+        let mut components: Vec<String> = Vec::new();
+        let mut current = ino;
+        for _ in 0..256 {
+            let attr = self.vfs.getattr(current).ok()?;
+            let parent = attr.parent;
+            if parent == 0 || current == ROOT_INO {
+                break;
+            }
+
+            let entries = self.vfs.readdir(parent).ok()?;
+            let name = entries
+                .iter()
+                .find(|entry| entry.ino == current)
+                .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())?;
+            components.push(name);
+            current = parent;
+        }
+
+        if current != ROOT_INO {
+            return None;
+        }
+
+        components.reverse();
+        let separator = match self.style {
+            NamespacePathStyle::Posix => "/",
+            NamespacePathStyle::Windows => "\\",
+        };
+        Some(format!("{}{}", separator, components.join(separator)))
+    }
+}
+
 // =============================================================================
 // Kernel Cache Invalidation
 // =============================================================================
@@ -1291,6 +1427,10 @@ pub struct StudioVfs {
 }
 
 impl StudioVfs {
+    pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
+        NamespaceResolver::new(self, style)
+    }
+
     fn ignored_entry_attr(&self, ino: Ino) -> Option<InodeAttr> {
         self.state
             .ignored_entries
@@ -3987,8 +4127,7 @@ impl StudioVfs {
     // Directory Operations
     // =========================================================================
 
-    /// Lookup an entry in a directory.
-    pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
+    fn lookup_component_impl(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         if let Some(ignored) = self.ignored_entry_lookup(parent, name) {
             return Ok(ignored.attr);
         }
@@ -4000,6 +4139,12 @@ impl StudioVfs {
         }
         let entry = self.meta.lookup(parent, name)?;
         Ok(self.meta.get_attr(entry.ino)?)
+    }
+
+    /// Lookup an entry in a directory.
+    pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
+        self.namespace_resolver(NamespacePathStyle::Posix)
+            .lookup_component(parent, name)
     }
 
     /// Read directory entries.
@@ -6474,6 +6619,51 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: volume_name.clone(),
+            uuid: format!("namespace-resolver-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    fn make_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info(volume_suffix);
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+
+        let cache_dir = tmp.path().join("cache");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+        )
+        .expect("create vfs");
+        (rt, vfs, meta)
+    }
 
     #[test]
     fn test_block_index_calculation() {
@@ -6666,6 +6856,84 @@ mod tests {
             validate_name(b"file*name"),
             Err(VfsError::InvalidName(_))
         ));
+    }
+
+    #[test]
+    fn namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "fullpath-component-parity");
+
+        let ignored_dir = vfs
+            .mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
+            .expect("mkdir ignored root metadata dir");
+        let ignored_child = vfs
+            .mkdir(ignored_dir.ino, b"Store-V2", 1000, 1000, 0o755)
+            .expect("mkdir child under ignored dir");
+
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
+        let full_path_attr = resolver
+            .resolve_path("\\.Spotlight-V100\\Store-V2")
+            .expect("resolve ignored subtree");
+        let component_attr = vfs
+            .lookup(
+                vfs.lookup(ROOT_INO, b".Spotlight-V100").unwrap().ino,
+                b"Store-V2",
+            )
+            .expect("component lookup ignored subtree");
+        assert_eq!(full_path_attr.ino, ignored_child.ino);
+        assert_eq!(component_attr.ino, ignored_child.ino);
+
+        meta.create_dir(ROOT_INO, b".Trashes", 1000, 1000, 0o755)
+            .expect("seed blocked root dir in metadata");
+        assert!(
+            vfs.lookup(ROOT_INO, b".Trashes").is_err(),
+            "component lookup must hide blocked root metadata entry"
+        );
+        assert!(
+            resolver.resolve_path("\\.Trashes").is_err(),
+            "full-path resolver must hide blocked root metadata entry"
+        );
+    }
+
+    #[test]
+    fn namespace_resolver_windows_and_posix_match_on_same_namespace_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-posix-parity");
+
+        let dir = vfs
+            .mkdir(ROOT_INO, b"docs", 1000, 1000, 0o755)
+            .expect("mkdir docs");
+        let file = vfs
+            .create(dir.ino, b"readme.txt", 1000, 1000, 0o644)
+            .expect("create readme");
+
+        let posix = vfs
+            .namespace_resolver(NamespacePathStyle::Posix)
+            .resolve_path("/docs/readme.txt")
+            .expect("resolve posix path");
+        let windows = vfs
+            .namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_path("\\docs\\readme.txt")
+            .expect("resolve windows path");
+        assert_eq!(posix.ino, file.ino);
+        assert_eq!(windows.ino, file.ino);
+    }
+
+    #[test]
+    fn namespace_resolver_windows_parent_normalization_matches_winfsp_semantics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-parent-normalization");
+
+        let dir = vfs
+            .mkdir(ROOT_INO, b"folder", 1000, 1000, 0o755)
+            .expect("mkdir folder");
+        let resolved = vfs
+            .namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_parent("\\folder\\child.txt.  ")
+            .expect("resolve parent with trailing dot/space");
+
+        assert_eq!(resolved.parent, dir.ino);
+        assert_eq!(resolved.name, b"child.txt".to_vec());
     }
 
     #[test]

@@ -63,6 +63,10 @@ The current architecture relies on these focused regressions:
   - `test_ingress_multi_writer_pressure_prefers_spill_without_wait`
   - `test_ingress_multi_writer_spill_recovers_after_crash`
   - `test_crash_recovery_replays_from_segments_when_spill_files_are_missing`
+- namespace resolver parity:
+  - `namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths`
+  - `namespace_resolver_windows_and_posix_match_on_same_namespace_entry`
+  - `namespace_resolver_windows_parent_normalization_matches_winfsp_semantics`
 
 Run a single focused regression:
 
