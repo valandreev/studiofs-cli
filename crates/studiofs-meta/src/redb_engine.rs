@@ -3592,7 +3592,7 @@ impl MetaEngine for RedbMetaEngine {
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
-    ) -> MetaResult<Option<Ino>> {
+    ) -> MetaResult<RenameAtomicResult> {
         let src_entry = self.lookup(parent, name)?;
         let dst_entry_opt = self.lookup(new_parent, new_name).ok();
         if let Some(dst_entry) = &dst_entry_opt
@@ -3706,7 +3706,10 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(displaced_ino)
+        Ok(RenameAtomicResult {
+            moved_ino: src_entry.ino,
+            displaced_ino,
+        })
     }
 
     // --- Hardlinks -------------------------------------------------------
@@ -4547,14 +4550,14 @@ mod tests {
     #[test]
     fn test_rename() {
         let engine = temp_engine();
-        engine
+        let src = engine
             .create_file(ROOT_INO, b"old.txt", 1000, 1000, 0o644)
             .unwrap();
-        // rename_atomic returns None when no overwrite
         let displaced = engine
             .rename_atomic(ROOT_INO, b"old.txt", ROOT_INO, b"new.txt")
             .unwrap();
-        assert!(displaced.is_none());
+        assert_eq!(displaced.moved_ino, src.ino);
+        assert!(displaced.displaced_ino.is_none());
 
         assert!(engine.lookup(ROOT_INO, b"old.txt").is_err());
         assert!(engine.lookup(ROOT_INO, b"new.txt").is_ok());
@@ -4575,7 +4578,8 @@ mod tests {
             .unwrap();
 
         // Should return the displaced inode
-        assert_eq!(displaced, Some(dst.ino));
+        assert_eq!(displaced.moved_ino, src.ino);
+        assert_eq!(displaced.displaced_ino, Some(dst.ino));
         // Source is gone, dest now points to src's inode
         assert!(engine.lookup(ROOT_INO, b"src.txt").is_err());
         let entry = engine.lookup(ROOT_INO, b"dst.txt").unwrap();
@@ -4598,7 +4602,8 @@ mod tests {
             .rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"empty_dir")
             .unwrap();
 
-        assert_eq!(displaced, Some(dir.ino));
+        assert_eq!(displaced.moved_ino, file.ino);
+        assert_eq!(displaced.displaced_ino, Some(dir.ino));
         assert!(engine.get_attr(dir.ino).is_err());
         let entry = engine.lookup(ROOT_INO, b"empty_dir").unwrap();
         assert_eq!(entry.ino, file.ino);
@@ -4648,7 +4653,8 @@ mod tests {
         let displaced = engine
             .rename_atomic(dir_a.ino, b"sub", dir_b.ino, b"sub")
             .unwrap();
-        assert!(displaced.is_none());
+        assert_eq!(displaced.moved_ino, sub.ino);
+        assert!(displaced.displaced_ino.is_none());
 
         // /a nlink = 2 (lost subdir)
         assert_eq!(engine.get_attr(dir_a.ino).unwrap().nlink, 2);

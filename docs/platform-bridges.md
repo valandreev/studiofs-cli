@@ -121,6 +121,22 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground)
 | macOS: `noappledouble` | Suppress `._*` files |
 | macOS: `volname` | `"StudioFS"` |
 
+### macOS Trash behavior
+
+On macOS, Finder-style delete may arrive at the filesystem as a rename into a
+Trash directory (`.Trash`, `.Trashes`, `.Trash-<uid>`) instead of a direct
+`unlink`.
+
+StudioFS handles this as a namespace-preserving trash move plus **local
+cache-only eviction**:
+- the file remains available in Trash
+- inode metadata is preserved
+- local L1/L2 cache blocks for the file are evicted promptly to release disk
+  space
+
+This keeps Trash recovery semantics intact while preventing local cache growth
+from Finder-driven deletes.
+
 ### Implementation: `StudioFuseFs`
 
 Implements `fuser::Filesystem` trait.

@@ -587,6 +587,15 @@ pub struct DirEntry {
     pub kind: FileType,
 }
 
+/// Result of an atomic rename operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameAtomicResult {
+    /// Inode that was moved to the destination path.
+    pub moved_ino: Ino,
+    /// Inode displaced at the destination path, if any.
+    pub displaced_ino: Option<Ino>,
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

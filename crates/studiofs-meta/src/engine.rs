@@ -333,7 +333,7 @@ pub trait MetaEngine: Send + Sync {
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
-    ) -> MetaResult<Option<Ino>>;
+    ) -> MetaResult<RenameAtomicResult>;
 
     /// Rename a file or directory (delegates to `rename_atomic`).
     fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
