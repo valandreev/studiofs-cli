@@ -3084,22 +3084,6 @@ impl StudioVfs {
         );
     }
 
-    fn uploaded_extent_records_for_inode_epoch(
-        &self,
-        ino: Ino,
-        content_epoch: u64,
-    ) -> Vec<(u32, ExtentRecordId)> {
-        self.state
-            .uploaded_extent_records
-            .lock()
-            .iter()
-            .filter_map(|((candidate_ino, block_index), extent)| {
-                (*candidate_ino == ino && extent.content_epoch == content_epoch)
-                    .then_some((*block_index, *extent))
-            })
-            .collect()
-    }
-
     fn remote_upload_placeholder_visible(&self, ino: Ino, attr: &InodeAttr) -> bool {
         attr.kind == FileType::RegularFile
             && attr.upload_state == UploadState::Uploading
@@ -5841,34 +5825,6 @@ impl StudioVfs {
         // Coalescing: if this file block has already been replaced in metadata
         // with a newer object_id, skip uploading this stale one.
         let block_index = block_index_from_offset(op.offset, self.block_size);
-        let expected_extent = ExtentRecordId {
-            object_id: op.object_id,
-            content_epoch: op.content_epoch,
-        };
-        if let Some(current_extent) = self
-            .state
-            .live_extent_records
-            .lock()
-            .get(&(op.ino, block_index))
-            .copied()
-            && current_extent != expected_extent
-        {
-            self.state
-                .upload_canceled_stale
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(
-                object_id = op.object_id,
-                ino = op.ino,
-                block_index,
-                queued_epoch = op.content_epoch,
-                current_object_id = current_extent.object_id,
-                current_epoch = current_extent.content_epoch,
-                "upload cancelled: stale extent record superseded"
-            );
-            self.block_cache.cancel_upload(&op, true);
-            self.state.pending_evictions.lock().remove(&op.object_id);
-            return Ok(());
-        }
         if let Some(attr) = attr.as_ref()
             && attr.content_epoch != op.content_epoch
         {
@@ -5883,7 +5839,7 @@ impl StudioVfs {
                 current_epoch = attr.content_epoch,
                 "upload cancelled: stale content epoch"
             );
-            self.block_cache.cancel_upload(&op, true);
+            self.block_cache.cancel_upload(&op, false);
             self.state.pending_evictions.lock().remove(&op.object_id);
             return Ok(());
         }
@@ -5903,12 +5859,50 @@ impl StudioVfs {
                 block_index,
                 "upload cancelled: stale block superseded by newer object"
             );
-            self.block_cache.cancel_upload(&op, true);
+            self.block_cache.cancel_upload(&op, false);
             self.state.pending_evictions.lock().remove(&op.object_id);
             return Ok(());
         }
 
         let t0 = Instant::now();
+        let key = format_object_key(&self.data_prefix, op.object_id);
+        let mut remote_object_visible = false;
+        if op.retry_count > 0 {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.fetch_scheduler.data_store().exists(&key),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {
+                    remote_object_visible = true;
+                    debug!(
+                        object_id = op.object_id,
+                        ino = op.ino,
+                        block_index,
+                        retry_count = op.retry_count,
+                        "upload reconcile: remote object already visible, skipping re-upload"
+                    );
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(err)) => {
+                    debug!(
+                        object_id = op.object_id,
+                        error = %err,
+                        retry_count = op.retry_count,
+                        "upload reconcile: remote exists() check failed, falling back to upload"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        object_id = op.object_id,
+                        retry_count = op.retry_count,
+                        "upload reconcile: remote exists() check timed out, falling back to upload"
+                    );
+                }
+            }
+        }
+
         let _upload_qos = self
             .qos
             .acquire_upload()
@@ -5928,32 +5922,77 @@ impl StudioVfs {
             .acquire_many_owned(upload_io_cost)
             .await
             .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
-        // Read raw block payload from cache, then package for S3.
-        let raw_payload = match self.block_cache.get(op.object_id).await {
-            Some(data) => data,
-            None => {
-                // Block data is missing from cache.  If the inode was deleted
-                // between our check above and now (race), cancel cleanly.
-                // Otherwise this is a genuine error — let the caller requeue.
-                if self.state.deleted_inodes.lock().contains(&op.ino) {
-                    self.block_cache.cancel_upload(&op, false);
-                    self.state.pending_evictions.lock().remove(&op.object_id);
-                    return Ok(());
+        // Read raw block payload from cache only when we really need to upload.
+        let object_bytes = if remote_object_visible {
+            None
+        } else {
+            let raw_payload = match self.block_cache.get(op.object_id).await {
+                Some(data) => data,
+                None => {
+                    // Block data is missing from cache. If remote already has
+                    // this object, we can still continue with commit reconcile.
+                    if op.retry_count > 0 {
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            self.fetch_scheduler.data_store().exists(&key),
+                        )
+                        .await
+                        {
+                            Ok(Ok(true)) => {
+                                debug!(
+                                    object_id = op.object_id,
+                                    ino = op.ino,
+                                    block_index,
+                                    retry_count = op.retry_count,
+                                    "upload reconcile: cache entry missing but remote object exists"
+                                );
+                                remote_object_visible = true;
+                                Bytes::new()
+                            }
+                            _ => {
+                                // If the inode was deleted between our checks
+                                // (race), cancel cleanly. Otherwise this remains a
+                                // genuine error and will be retried.
+                                if self.state.deleted_inodes.lock().contains(&op.ino) {
+                                    self.block_cache.cancel_upload(&op, false);
+                                    self.state.pending_evictions.lock().remove(&op.object_id);
+                                    return Ok(());
+                                }
+                                return Err(VfsError::Other(format!(
+                                    "object {} missing from cache",
+                                    op.object_id
+                                )));
+                            }
+                        }
+                    } else {
+                        // First attempt without cache data is unexpected; retry
+                        // through normal error path.
+                        if self.state.deleted_inodes.lock().contains(&op.ino) {
+                            self.block_cache.cancel_upload(&op, false);
+                            self.state.pending_evictions.lock().remove(&op.object_id);
+                            return Ok(());
+                        }
+                        return Err(VfsError::Other(format!(
+                            "object {} missing from cache",
+                            op.object_id
+                        )));
+                    }
                 }
-                return Err(VfsError::Other(format!(
-                    "object {} missing from cache",
-                    op.object_id
-                )));
+            };
+            if remote_object_visible {
+                None
+            } else {
+                Some(Bytes::from(create_object(&raw_payload)?))
             }
         };
-        let object_bytes = Bytes::from(create_object(&raw_payload)?);
         drop(_upload_io_permit);
 
-        let key = format_object_key(&self.data_prefix, op.object_id);
-        self.upload_scheduler
-            .put(&key, object_bytes)
-            .await
-            .map_err(|e| VfsError::Other(e.to_string()))?;
+        if let Some(object_bytes) = object_bytes {
+            self.upload_scheduler
+                .put(&key, object_bytes)
+                .await
+                .map_err(|e| VfsError::Other(e.to_string()))?;
+        }
 
         let current = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
             engine.get_file_block(op.ino, block_index)

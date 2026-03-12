@@ -3,6 +3,15 @@ use super::*;
 pub(super) struct CommitCoordinator;
 
 impl CommitCoordinator {
+    fn publish_visibility_timeout() -> Duration {
+        let timeout_secs = std::env::var("STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(30);
+        Duration::from_secs(timeout_secs)
+    }
+
     pub(super) async fn finish_extent_upload(
         vfs: &StudioVfs,
         op: &PendingUpload,
@@ -28,35 +37,32 @@ impl CommitCoordinator {
             return Ok(());
         }
 
-        let live_extents: Vec<(u32, ExtentRecordId)> = vfs
-            .state
-            .live_extent_records
-            .lock()
+        let ino = op.ino;
+        let required_blocks = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+            engine.get_file_blocks(ino)
+        })
+        .await?;
+        if required_blocks.is_empty() {
+            return Ok(());
+        }
+
+        let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
             .iter()
-            .filter_map(|((candidate_ino, block_index), extent)| {
-                (*candidate_ino == op.ino && extent.content_epoch == op.content_epoch)
-                    .then_some((*block_index, *extent))
+            .map(|(block_index, block_ref)| {
+                (
+                    *block_index,
+                    ExtentRecordId {
+                        object_id: block_ref.object_id,
+                        content_epoch: op.content_epoch,
+                    },
+                )
             })
             .collect();
-        if live_extents.is_empty() {
-            return Ok(());
+        if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await {
+            requeue_missing_manifest_uploads(vfs, op.ino, op.content_epoch, &required_blocks).await;
+            return Err(err);
         }
 
-        let uploaded = vfs.uploaded_extent_records_for_inode_epoch(op.ino, op.content_epoch);
-        let uploaded_map: std::collections::HashMap<u32, ExtentRecordId> =
-            uploaded.into_iter().collect();
-        let all_live_uploaded = live_extents.iter().all(|(block_index, extent)| {
-            uploaded_map
-                .get(block_index)
-                .is_some_and(|current| current == extent)
-        });
-        if !all_live_uploaded {
-            return Ok(());
-        }
-
-        Self::wait_until_remote_objects_visible(vfs, &live_extents).await?;
-
-        let ino = op.ino;
         let attr = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
             engine.get_attr(ino)
         })
@@ -92,7 +98,8 @@ impl CommitCoordinator {
         vfs: &StudioVfs,
         live_extents: &[(u32, ExtentRecordId)],
     ) -> VfsResult<()> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let visibility_timeout = Self::publish_visibility_timeout();
+        let deadline = tokio::time::Instant::now() + visibility_timeout;
         loop {
             let mut all_visible = true;
             for (_, extent) in live_extents {
@@ -104,10 +111,13 @@ impl CommitCoordinator {
                         break;
                     }
                     Err(err) => {
-                        return Err(VfsError::Other(format!(
-                            "publish visibility check failed for object {}: {err}",
-                            extent.object_id
-                        )));
+                        all_visible = false;
+                        tracing::debug!(
+                            object_id = extent.object_id,
+                            error = %err,
+                            "publish visibility check failed, will retry"
+                        );
+                        break;
                     }
                 }
             }
@@ -116,12 +126,59 @@ impl CommitCoordinator {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(VfsError::Other(
-                    "timed out waiting for uploaded extents to become remotely visible".into(),
-                ));
+                return Err(VfsError::Other(format!(
+                    "timed out after {:?} waiting for uploaded extents to become remotely visible",
+                    visibility_timeout
+                )));
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+async fn requeue_missing_manifest_uploads(
+    vfs: &StudioVfs,
+    ino: Ino,
+    content_epoch: u64,
+    required_blocks: &[(u32, BlockRef)],
+) {
+    let pending = vfs.block_cache.snapshot_pending_uploads();
+    let pending_keys: std::collections::HashSet<(u64, u64)> = pending
+        .into_iter()
+        .filter(|op| op.ino == ino && op.content_epoch == content_epoch)
+        .map(|op| (op.offset, op.object_id))
+        .collect();
+
+    for (block_index, block_ref) in required_blocks {
+        let offset = (*block_index as u64).saturating_mul(vfs.block_size as u64);
+        if pending_keys.contains(&(offset, block_ref.object_id)) {
+            continue;
+        }
+
+        let key = format_object_key(&vfs.data_prefix, block_ref.object_id);
+        let visible = match tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.fetch_scheduler.data_store().exists(&key),
+        )
+        .await
+        {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => false,
+            Ok(Err(_)) => false,
+            Err(_) => false,
+        };
+        if visible {
+            continue;
+        }
+
+        tracing::warn!(
+            ino,
+            block_index,
+            object_id = block_ref.object_id,
+            content_epoch,
+            "commit reconcile: requeueing missing manifest upload"
+        );
+        vfs.block_cache
+            .submit_upload(ino, offset, block_ref.object_id, content_epoch);
     }
 }
