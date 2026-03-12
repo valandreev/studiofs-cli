@@ -1429,7 +1429,9 @@ impl StudioVfs {
     }
 
     fn should_ignore_regular_file_path(&self, parent: Ino, name: &[u8]) -> bool {
-        is_ignored_macos_metadata_name(name) || self.ignored_dir_attr(parent).is_some()
+        is_ignored_macos_metadata_name(name)
+            || self.is_blocked_root_metadata_path(parent, name)
+            || self.ignored_dir_attr(parent).is_some()
     }
 
     fn should_ignore_directory_path(&self, parent: Ino, name: &[u8]) -> bool {
@@ -4357,6 +4359,27 @@ impl StudioVfs {
     /// Create a hard link: add a new directory entry pointing to an existing inode.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
         validate_name(new_name)?;
+        if self.should_ignore_regular_file_path(new_parent, new_name) {
+            let source_attr = self.getattr(ino)?;
+            let ignored = self.create_ignored_entry(
+                new_parent,
+                new_name,
+                source_attr.uid,
+                source_attr.gid,
+                source_attr.mode,
+                FileType::RegularFile,
+            );
+            return Ok(self
+                .update_ignored_entry(ignored.ino, |attr| {
+                    attr.size = source_attr.size;
+                    attr.committed_size = source_attr.committed_size;
+                    attr.atime = source_attr.atime;
+                    attr.mtime = source_attr.mtime;
+                    attr.ctime = source_attr.ctime;
+                    attr.crtime = source_attr.crtime;
+                })
+                .unwrap_or(ignored));
+        }
         let attr = self.meta.link(ino, new_parent, new_name)?;
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(&ino);
@@ -4445,7 +4468,7 @@ impl StudioVfs {
         gid: u32,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
-        if self.ignored_dir_attr(parent).is_some() {
+        if self.should_ignore_regular_file_path(parent, name) {
             return Ok(self.create_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink));
         }
         let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
@@ -4506,10 +4529,7 @@ impl StudioVfs {
     /// decremented, but the inode and blocks are kept alive (orphan).
     /// Actual cleanup happens in `release_fh()` when the last handle closes.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        if self.unlink_ignored_entry(parent, name)
-            || self.is_blocked_root_metadata_path(parent, name)
-            || self.ignored_dir_attr(parent).is_some()
-        {
+        if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
             return Ok(());
         }
 
@@ -4620,10 +4640,7 @@ impl StudioVfs {
 
     /// Remove a directory.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        if self.unlink_ignored_subtree(parent, name)
-            || self.is_blocked_root_metadata_path(parent, name)
-            || self.ignored_dir_attr(parent).is_some()
-        {
+        if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
             return Ok(());
         }
         self.meta.rmdir(parent, name)?;
