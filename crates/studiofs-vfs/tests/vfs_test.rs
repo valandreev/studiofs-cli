@@ -25,8 +25,8 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PostgresConfig,
-    RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig,
+    PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
     types::{BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
@@ -67,6 +67,7 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
     });
     let volume_name = format!("vfs-test-{volume_suffix}-{run_id}");
     FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
         name: volume_name.clone(),
         uuid: format!("test-uuid-{volume_suffix}"),
         endpoint: endpoint.clone(),
@@ -356,6 +357,7 @@ fn setup_pg_volume(
 #[allow(dead_code)]
 fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {
     FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: uuid.to_string(),
         endpoint: "http://127.0.0.1:9000".to_string(),

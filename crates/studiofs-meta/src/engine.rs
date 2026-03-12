@@ -61,6 +61,9 @@ pub enum MetaError {
 
     #[error("format info not found — run `studiofs init` first")]
     NotFormatted,
+
+    #[error("unsupported format version: found {found}, expected {expected}")]
+    UnsupportedFormatVersion { found: u16, expected: u16 },
 }
 
 pub type MetaResult<T> = Result<T, MetaError>;

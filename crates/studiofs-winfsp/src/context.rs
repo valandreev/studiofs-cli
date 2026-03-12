@@ -1138,7 +1138,9 @@ mod tests {
     use std::sync::Arc;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::MetaError;
-    use studiofs_meta::{FormatInfo, MetaEngine, MetadataConfig, ROOT_INO, RedbMetaEngine};
+    use studiofs_meta::{
+        CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataConfig, ROOT_INO, RedbMetaEngine,
+    };
     use studiofs_vfs::VfsError;
     use studiofs_vfs::{KernelInvalidator, StudioVfs};
     use tempfile::TempDir;
@@ -1147,6 +1149,7 @@ mod tests {
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("winfsp-test-{volume_suffix}-{}", std::process::id());
         FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
             name: volume_name.clone(),
             uuid: format!("winfsp-test-uuid-{volume_suffix}"),
             endpoint: "http://127.0.0.1:9000".into(),

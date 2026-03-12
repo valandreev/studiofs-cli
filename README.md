@@ -90,6 +90,8 @@ studiofs mount myvolume Y:
 | `umount` | Unmount an active mountpoint |
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
+| `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
+| `load` | Import a metadata dump into PostgreSQL |
 | `destroy` | Remove a volume locally or locally + remotely |
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.

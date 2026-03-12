@@ -18,6 +18,8 @@ use std::time::SystemTime;
 
 /// Default block size: 8 MiB (configurable at volume init).
 pub const DEFAULT_BLOCK_SIZE: u32 = 8 * 1024 * 1024;
+/// Current on-disk metadata format version.
+pub const CURRENT_FORMAT_VERSION: u16 = 1;
 
 /// Root inode number.
 pub const ROOT_INO: Ino = 1;
@@ -384,6 +386,8 @@ impl BlockRef {
 /// Created at volume initialization, immutable thereafter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormatInfo {
+    /// Schema format version for compatibility checks.
+    pub format_version: u16,
     /// Volume name (user-friendly identifier).
     pub name: String,
     /// Unique volume UUID.
@@ -480,6 +484,7 @@ fn default_metadata_prefix() -> String {
 impl Default for FormatInfo {
     fn default() -> Self {
         Self {
+            format_version: CURRENT_FORMAT_VERSION,
             name: String::new(),
             uuid: String::new(),
             endpoint: String::new(),
@@ -508,6 +513,7 @@ impl FormatInfo {
         block_size_mb: u32,
     ) -> Self {
         Self {
+            format_version: CURRENT_FORMAT_VERSION,
             name,
             uuid,
             endpoint,
