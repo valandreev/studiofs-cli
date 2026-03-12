@@ -141,6 +141,14 @@ Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^
 - If process-level `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` is set, clear them for test runs.
 - Keep `NO_PROXY` including `localhost,127.0.0.1,::1` (and your direct RustFS/S3 host if needed).
 
+### Intermittent VFS crash-recovery failures
+- `test_crash_recovery_replays_ingress_spill_before_metadata_flush` and
+  `test_crash_recovery_replays_ingress_spill_before_remote_fetch` have shown
+  non-deterministic failures during full-suite runs.
+- Current tracking issue: [SFS-30](https://linear.app/valandreev/issue/SFS-30/stabilize-crash-recovery-vfs-tests-env-isolation-deterministic-startup)
+- `--test-threads=1` can reduce noise for reproductions, but does not fully
+  eliminate this flake pattern.
+
 ### Windows lock issues
 - Close processes that hold files in `target/`.
 - Re-run with `--test-threads=1`.
