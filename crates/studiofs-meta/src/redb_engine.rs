@@ -499,6 +499,40 @@ impl RedbMetaEngine {
         Ok(None)
     }
 
+    fn has_slice_marker_in_write(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], u8>,
+        key: &[u8],
+    ) -> MetaResult<bool> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
+    fn lookup_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let key = encode_dentry_key(parent, name);
+        if Self::has_slice_marker_in_write(txn, DENTRY_TOMBSTONES_TABLE, key.as_slice())? {
+            return Ok(None);
+        }
+
+        if let Some(entry) = Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, name)? {
+            return Ok(Some(entry));
+        }
+        if let Some(entry) = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)? {
+            return Ok(Some(entry));
+        }
+
+        Ok(None)
+    }
+
     fn readdir_from_table(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -3634,8 +3668,17 @@ impl MetaEngine for RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
     ) -> MetaResult<RenameAtomicResult> {
-        let src_entry = self.lookup(parent, name)?;
-        let dst_entry_opt = self.lookup(new_parent, new_name).ok();
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
+            MetaError::EntryNotFound {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            }
+        })?;
+        let dst_entry_opt = Self::lookup_merged_in_write_txn(&txn, new_parent, new_name)?;
         if let Some(dst_entry) = &dst_entry_opt
             && dst_entry.kind == FileType::Directory
             && !self.readdir(dst_entry.ino)?.is_empty()
@@ -3665,10 +3708,6 @@ impl MetaEngine for RedbMetaEngine {
             _ => None,
         };
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let displaced_ino: Option<Ino>;
         let mut displaced_attr_event: Option<crate::events::MetaEvent> = None;
         let mut moved_dir_attr = moved_dir_seed;
@@ -4745,6 +4784,57 @@ mod tests {
         let engine = temp_engine();
         let result = engine.rename_atomic(ROOT_INO, b"nope.txt", ROOT_INO, b"dst.txt");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rename_concurrent_single_winner() {
+        let engine = Arc::new(temp_engine());
+        let src = engine
+            .create_file(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let a_engine = Arc::clone(&engine);
+        let a_barrier = Arc::clone(&barrier);
+        let t_a = std::thread::spawn(move || {
+            a_barrier.wait();
+            a_engine.rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"moved_by_a.txt")
+        });
+
+        let b_engine = Arc::clone(&engine);
+        let b_barrier = Arc::clone(&barrier);
+        let t_b = std::thread::spawn(move || {
+            b_barrier.wait();
+            b_engine.rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"moved_by_b.txt")
+        });
+
+        barrier.wait();
+
+        let out_a = t_a.join().expect("rename thread a panicked");
+        let out_b = t_b.join().expect("rename thread b panicked");
+        let ok_count = [out_a.is_ok(), out_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(ok_count, 1, "exactly one concurrent rename should win");
+        assert!(
+            engine.lookup(ROOT_INO, b"source.txt").is_err(),
+            "source entry must be removed after winning rename"
+        );
+
+        let a_entry = engine.lookup(ROOT_INO, b"moved_by_a.txt").ok();
+        let b_entry = engine.lookup(ROOT_INO, b"moved_by_b.txt").ok();
+        assert_ne!(
+            a_entry.is_some(),
+            b_entry.is_some(),
+            "only one destination name should remain visible"
+        );
+        if let Some(entry) = a_entry {
+            assert_eq!(entry.ino, src.ino);
+        }
+        if let Some(entry) = b_entry {
+            assert_eq!(entry.ino, src.ino);
+        }
     }
 
     #[test]
