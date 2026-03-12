@@ -1596,7 +1596,7 @@ impl MetaEngine for PgMetaEngine {
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
-    ) -> MetaResult<Option<Ino>> {
+    ) -> MetaResult<RenameAtomicResult> {
         self.mutate(|local| local.rename_atomic(parent, name, new_parent, new_name))
     }
 

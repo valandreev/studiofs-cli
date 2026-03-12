@@ -4347,15 +4347,15 @@ impl StudioVfs {
             return Ok(());
         }
         validate_name(new_name)?;
-        let source_entry = self.meta.lookup(parent, name)?;
-        let moved_into_trash = source_entry.kind == FileType::RegularFile
-            && self.directory_has_probable_trash_ancestor(new_parent)?;
-        let displaced_ino = self
+        let rename_result = self
             .meta
             .rename_atomic(parent, name, new_parent, new_name)?;
+        let moved_attr = self.meta.get_attr(rename_result.moved_ino)?;
+        let moved_into_trash = moved_attr.kind == FileType::RegularFile
+            && self.directory_has_probable_trash_ancestor(new_parent)?;
 
         // If an existing entry was overwritten, schedule GC + evict caches
-        if let Some(ino) = displaced_ino {
+        if let Some(ino) = rename_result.displaced_ino {
             self.state.deleted_inodes.lock().insert(ino);
 
             // Compute total bytes for USED_SPACE before removing blocks
@@ -4390,7 +4390,7 @@ impl StudioVfs {
         }
 
         if moved_into_trash {
-            self.evict_file_cache_only(source_entry.ino)?;
+            self.evict_file_cache_only(rename_result.moved_ino)?;
         }
 
         // Invalidate source and dest parent directory caches
@@ -4506,20 +4506,23 @@ impl StudioVfs {
     }
 
     fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {
+        let trash_roots = self.root_trash_dir_inodes()?;
+        if trash_roots.is_empty() {
+            return Ok(false);
+        }
         let mut current = dir_ino;
         let mut hops = 0usize;
-        while current != ROOT_INO && current != 0 && hops < 1024 {
+        while current != 0 && hops < 1024 {
+            if trash_roots.contains(&current) {
+                return Ok(true);
+            }
             let attr = self.meta.get_attr(current)?;
             let parent = attr.parent;
             if parent == 0 || parent == current {
                 break;
             }
-            if let Some(name) = self.lookup_child_name(parent, current)? {
-                if is_probable_trash_component(&name) {
-                    return Ok(true);
-                }
-            } else {
-                break;
+            if trash_roots.contains(&parent) {
+                return Ok(true);
             }
             current = parent;
             hops += 1;
@@ -4527,13 +4530,19 @@ impl StudioVfs {
         Ok(false)
     }
 
-    fn lookup_child_name(&self, parent: Ino, child: Ino) -> VfsResult<Option<Vec<u8>>> {
-        Ok(self
+    fn root_trash_dir_inodes(&self) -> VfsResult<HashSet<Ino>> {
+        let mut trash_roots = HashSet::new();
+        for entry in self
             .meta
-            .readdir(parent)?
+            .readdir(ROOT_INO)?
             .into_iter()
-            .find(|entry| entry.ino == child)
-            .map(|entry| entry.name))
+            .filter(|entry| entry.kind == FileType::Directory)
+        {
+            if is_probable_trash_component(&entry.name) {
+                trash_roots.insert(entry.ino);
+            }
+        }
+        Ok(trash_roots)
     }
 
     /// Immediately evict a single block from every cache tier.
