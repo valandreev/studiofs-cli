@@ -22,6 +22,11 @@ Both bridges follow the same pattern:
 3. Call `StudioVfs` (via `rt.block_on()`)
 4. Convert the result back to OS-specific response
 
+Path walks are centralized in VFS `NamespaceResolver`:
+- WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.
+- FUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
+- Bridge-local namespace traversal should not bypass VFS runtime filtering.
+
 ## WinFSP Bridge (`studiofs-winfsp`)
 
 ### Requirements
@@ -59,8 +64,8 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | WinFSP Callback | VFS Method |
 |-----------------|------------|
 | `get_volume_info` | `statfs()` |
-| `get_security_by_name` | `lookup()` + `getattr()` |
-| `open` | `open()` |
+| `get_security_by_name` | `NamespaceResolver::resolve_path()` |
+| `open` | `NamespaceResolver::resolve_path()` + `open()` |
 | `close` | `release()` |
 | `read` | `read()` |
 | `write` | `write()` |
@@ -70,8 +75,8 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `set_basic_info` | `setattr()` |
 | `set_file_size` | `setattr()` (truncate) |
 | `read_directory` | `readdir()` |
-| `create` | `create_file()` / `mkdir()` |
-| `rename` | `rename()` |
+| `create` | `NamespaceResolver::resolve_parent()` + `create_file()` / `mkdir()` |
+| `rename` | `NamespaceResolver::resolve_parent()` + `rename()` |
 | `set_delete` | _(mark for delete)_ |
 | `cleanup` + delete flag | `unlink()` / `rmdir()` |
 

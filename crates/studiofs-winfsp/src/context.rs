@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
-use studiofs_meta::{FileType, Ino, InodeAttr, ROOT_INO};
-use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs};
+use studiofs_meta::{FileType, Ino, InodeAttr};
+use studiofs_vfs::{KernelInvalidator, NamespacePathStyle, OpenFlags, StudioVfs};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
@@ -138,38 +138,9 @@ fn unix_nanos_to_filetime(unix_nanos: i64) -> u64 {
 /// dots/spaces from path components (standard Windows path semantics).
 fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
     let s = path.to_string_lossy();
-    let s = s.trim_start_matches('\\');
-
-    if s.is_empty() {
-        return vfs.getattr(ROOT_INO).map_err(vfs_to_winfsp_err);
-    }
-
-    let mut ino_stack: Vec<u64> = vec![ROOT_INO];
-
-    for component in s.split('\\') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            if ino_stack.len() > 1 {
-                ino_stack.pop();
-            }
-            continue;
-        }
-        // Strip trailing dots and spaces (Win32 path normalisation)
-        let component = component.trim_end_matches(['.', ' ']);
-        if component.is_empty() {
-            continue;
-        }
-        let current_ino = *ino_stack.last().unwrap();
-        let attr = vfs
-            .lookup(current_ino, component.as_bytes())
-            .map_err(vfs_to_winfsp_err)?;
-        ino_stack.push(attr.ino);
-    }
-
-    let final_ino = *ino_stack.last().unwrap();
-    vfs.getattr(final_ino).map_err(vfs_to_winfsp_err)
+    vfs.namespace_resolver(NamespacePathStyle::Windows)
+        .resolve_path(&s)
+        .map_err(vfs_to_winfsp_err)
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -177,39 +148,11 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
 /// Handles `.`, `..`, and trailing-dot/space stripping like `resolve_path`.
 fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u8>)> {
     let s = path.to_string_lossy();
-    let s = s.trim_start_matches('\\');
-
-    // Normalise components: skip `.`, resolve `..`, strip trailing dots/spaces.
-    let mut components: Vec<String> = Vec::new();
-    for raw in s.split('\\') {
-        if raw.is_empty() || raw == "." {
-            continue;
-        }
-        if raw == ".." {
-            components.pop();
-            continue;
-        }
-        let trimmed = raw.trim_end_matches(['.', ' ']);
-        if !trimmed.is_empty() {
-            components.push(trimmed.to_string());
-        }
-    }
-
-    if components.is_empty() {
-        return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
-    }
-
-    let name = components.last().unwrap().as_bytes().to_vec();
-    let mut parent_ino = ROOT_INO;
-
-    for component in &components[..components.len() - 1] {
-        let attr = vfs
-            .lookup(parent_ino, component.as_bytes())
-            .map_err(vfs_to_winfsp_err)?;
-        parent_ino = attr.ino;
-    }
-
-    Ok((parent_ino, name))
+    let parent = vfs
+        .namespace_resolver(NamespacePathStyle::Windows)
+        .resolve_parent(&s)
+        .map_err(vfs_to_winfsp_err)?;
+    Ok((parent.parent, parent.name))
 }
 
 /// Encode a symlink target as a Windows REPARSE_DATA_BUFFER (IO_REPARSE_TAG_SYMLINK).
@@ -1034,35 +977,8 @@ fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo<512>> {
 /// the parent chain.  Returns `None` if the inode or any ancestor no longer
 /// exists (e.g. already deleted).
 fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
-    if ino == ROOT_INO {
-        return Some("\\".to_string());
-    }
-
-    let mut components: Vec<String> = Vec::new();
-    let mut current = ino;
-
-    // Walk up the parent chain (bounded to 256 levels to avoid loops).
-    for _ in 0..256 {
-        let attr = vfs.meta().get_attr(current).ok()?;
-        let parent = attr.parent;
-
-        if parent == 0 || current == ROOT_INO {
-            break;
-        }
-
-        // Find our name in the parent's directory listing.
-        let entries = vfs.meta().readdir(parent).ok()?;
-        let name = entries
-            .iter()
-            .find(|e| e.ino == current)
-            .map(|e| String::from_utf8_lossy(&e.name).into_owned())?;
-
-        components.push(name);
-        current = parent;
-    }
-
-    components.reverse();
-    Some(format!("\\{}", components.join("\\")))
+    vfs.namespace_resolver(NamespacePathStyle::Windows)
+        .path_for_inode(ino)
 }
 
 /// Bridges VFS kernel cache invalidation to WinFSP's
