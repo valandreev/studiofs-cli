@@ -190,7 +190,7 @@ pub struct VfsUploadStats {
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NamespacePathStyle {
     Posix,
     Windows,
@@ -250,23 +250,97 @@ impl<'a> NamespaceResolver<'a> {
         })
     }
 
+    fn component_not_found(parent: Ino, name: &[u8]) -> VfsError {
+        VfsError::Meta(MetaError::EntryNotFound {
+            parent,
+            name: String::from_utf8_lossy(name).into_owned(),
+        })
+    }
+
+    fn is_entry_not_found(err: &VfsError) -> bool {
+        matches!(err, VfsError::Meta(MetaError::EntryNotFound { .. }))
+    }
+
+    fn resolve_components_cached(&self, components: &[String]) -> VfsResult<InodeAttr> {
+        if components.is_empty() {
+            return self.vfs.getattr(ROOT_INO);
+        }
+
+        if let Some(cached) = self.vfs.path_shortcut_cache_lookup(self.style, components) {
+            return match cached {
+                PathShortcutCacheValue::Positive(ino) => match self.vfs.getattr(ino) {
+                    Ok(attr) => Ok(attr),
+                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                        let mut current = ROOT_INO;
+                        let mut attr = self.vfs.getattr(ROOT_INO)?;
+                        let mut parent_tokens = Vec::with_capacity(components.len());
+                        for component in components {
+                            parent_tokens.push(PathShortcutParentToken {
+                                parent: current,
+                                generation: self.vfs.directory_generation(current),
+                            });
+                            attr = self.lookup_component(current, component.as_bytes())?;
+                            current = attr.ino;
+                        }
+                        self.vfs.path_shortcut_cache_insert_positive(
+                            self.style,
+                            components,
+                            attr.ino,
+                            parent_tokens,
+                        );
+                        Ok(attr)
+                    }
+                    Err(err) => Err(err),
+                },
+                PathShortcutCacheValue::Negative { parent, name } => {
+                    Err(Self::component_not_found(parent, name.as_ref()))
+                }
+            };
+        }
+
+        let mut current = ROOT_INO;
+        let mut attr = self.vfs.getattr(ROOT_INO)?;
+        let mut parent_tokens = Vec::with_capacity(components.len());
+        for component in components {
+            parent_tokens.push(PathShortcutParentToken {
+                parent: current,
+                generation: self.vfs.directory_generation(current),
+            });
+            match self.lookup_component(current, component.as_bytes()) {
+                Ok(next_attr) => {
+                    current = next_attr.ino;
+                    attr = next_attr;
+                }
+                Err(err) if Self::is_entry_not_found(&err) => {
+                    self.vfs.path_shortcut_cache_insert_negative(
+                        self.style,
+                        components,
+                        current,
+                        component.as_bytes(),
+                        parent_tokens,
+                    );
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.vfs.path_shortcut_cache_insert_positive(
+            self.style,
+            components,
+            attr.ino,
+            parent_tokens,
+        );
+        Ok(attr)
+    }
+
     pub fn lookup_component(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.vfs.lookup_component_impl(parent, name)
     }
 
     pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
         let components = self.path_components(path);
-        if components.is_empty() {
-            return self.vfs.getattr(ROOT_INO);
-        }
-
-        let mut current = ROOT_INO;
-        let mut attr = self.vfs.getattr(ROOT_INO)?;
-        for component in components {
-            attr = self.lookup_component(current, component.as_bytes())?;
-            current = attr.ino;
-        }
-        Ok(attr)
+        self.resolve_components_cached(&components)
     }
 
     pub fn resolve_parent(&self, path: &str) -> VfsResult<NamespaceParent> {
@@ -275,11 +349,12 @@ impl<'a> NamespaceResolver<'a> {
             return Err(Self::path_not_found(path));
         }
 
-        let mut current = ROOT_INO;
-        for component in &components[..components.len() - 1] {
-            let attr = self.lookup_component(current, component.as_bytes())?;
-            current = attr.ino;
-        }
+        let current = if components.len() == 1 {
+            ROOT_INO
+        } else {
+            self.resolve_components_cached(&components[..components.len() - 1])?
+                .ino
+        };
 
         Ok(NamespaceParent {
             parent: current,
@@ -424,6 +499,8 @@ const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
 const DEFAULT_DENTRY_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY: usize = 16_384;
+const DEFAULT_PATH_SHORTCUT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const DENTRY_CACHE_PROTECTED_PERCENT: usize = 80;
 const DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER: usize = 2;
 const DENTRY_CACHE_ORDER_COMPACT_SLACK: usize = 64;
@@ -993,6 +1070,301 @@ impl DentryCache {
             self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
         }
         true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PathShortcutCacheKey {
+    style: NamespacePathStyle,
+    path: Arc<[u8]>,
+}
+
+impl PathShortcutCacheKey {
+    fn from_components(style: NamespacePathStyle, components: &[String]) -> Option<Self> {
+        if components.is_empty() {
+            return None;
+        }
+        let estimated = components
+            .iter()
+            .map(|component| component.len())
+            .sum::<usize>()
+            .saturating_add(components.len().saturating_sub(1));
+        let mut encoded = Vec::with_capacity(estimated);
+        for (idx, component) in components.iter().enumerate() {
+            if idx > 0 {
+                encoded.push(0);
+            }
+            encoded.extend_from_slice(component.as_bytes());
+        }
+        Some(Self {
+            style,
+            path: Arc::from(encoded.into_boxed_slice()),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PathShortcutCacheValue {
+    Positive(Ino),
+    Negative { parent: Ino, name: Arc<[u8]> },
+}
+
+#[derive(Debug, Clone)]
+struct PathShortcutParentToken {
+    parent: Ino,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PathShortcutCacheEntry {
+    value: PathShortcutCacheValue,
+    namespace_epoch: u64,
+    parent_tokens: Arc<[PathShortcutParentToken]>,
+    charge: usize,
+    stamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PathShortcutCacheMetrics {
+    hits: u64,
+    misses: u64,
+    negative_hits: u64,
+    evictions: u64,
+    occupancy_entries: usize,
+    occupancy_bytes: usize,
+    entry_budget: usize,
+    byte_budget: usize,
+}
+
+impl PathShortcutCacheMetrics {
+    fn negative_hit_ratio(self) -> f64 {
+        if self.hits == 0 {
+            return 0.0;
+        }
+        self.negative_hits as f64 / self.hits as f64
+    }
+}
+
+#[derive(Debug)]
+struct PathShortcutCache {
+    entry_budget: usize,
+    byte_budget: usize,
+    next_stamp: u64,
+    used_bytes: usize,
+    hits: u64,
+    misses: u64,
+    negative_hits: u64,
+    evictions: u64,
+    entries: HashMap<PathShortcutCacheKey, PathShortcutCacheEntry>,
+    order: VecDeque<(PathShortcutCacheKey, u64)>,
+}
+
+impl PathShortcutCache {
+    fn new(entry_budget: usize, byte_budget: usize) -> Self {
+        Self {
+            entry_budget,
+            byte_budget,
+            next_stamp: 1,
+            used_bytes: 0,
+            hits: 0,
+            misses: 0,
+            negative_hits: 0,
+            evictions: 0,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.entry_budget > 0 && self.byte_budget > 0
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.saturating_add(1);
+        stamp
+    }
+
+    fn estimate_entry_charge(
+        key: &PathShortcutCacheKey,
+        value: &PathShortcutCacheValue,
+        parent_tokens: &[PathShortcutParentToken],
+    ) -> usize {
+        let negative_name_len = match value {
+            PathShortcutCacheValue::Positive(_) => 0,
+            PathShortcutCacheValue::Negative { name, .. } => name.len(),
+        };
+        std::mem::size_of::<PathShortcutCacheKey>()
+            .saturating_add(std::mem::size_of::<PathShortcutCacheEntry>())
+            .saturating_add(key.path.len())
+            .saturating_add(negative_name_len)
+            .saturating_add(
+                parent_tokens
+                    .len()
+                    .saturating_mul(std::mem::size_of::<PathShortcutParentToken>()),
+            )
+            .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD)
+    }
+
+    fn metrics(&self) -> PathShortcutCacheMetrics {
+        PathShortcutCacheMetrics {
+            hits: self.hits,
+            misses: self.misses,
+            negative_hits: self.negative_hits,
+            evictions: self.evictions,
+            occupancy_entries: self.entries.len(),
+            occupancy_bytes: self.used_bytes,
+            entry_budget: self.entry_budget,
+            byte_budget: self.byte_budget,
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &PathShortcutCacheKey,
+        namespace_epoch: u64,
+        mut generation_of: impl FnMut(Ino) -> u64,
+    ) -> Option<PathShortcutCacheValue> {
+        if !self.is_enabled() {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        }
+
+        let (value, stale) = match self.entries.get(key) {
+            Some(entry) => (
+                entry.value.clone(),
+                entry.namespace_epoch != namespace_epoch
+                    || entry
+                        .parent_tokens
+                        .iter()
+                        .any(|token| generation_of(token.parent) != token.generation),
+            ),
+            None => {
+                self.misses = self.misses.saturating_add(1);
+                return None;
+            }
+        };
+
+        if stale {
+            self.remove_entry(key);
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        }
+
+        self.hits = self.hits.saturating_add(1);
+        if matches!(value, PathShortcutCacheValue::Negative { .. }) {
+            self.negative_hits = self.negative_hits.saturating_add(1);
+        }
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.stamp = stamp;
+            self.order.push_back((key.clone(), stamp));
+        }
+        self.maybe_compact_order();
+        Some(value)
+    }
+
+    fn put(
+        &mut self,
+        key: PathShortcutCacheKey,
+        value: PathShortcutCacheValue,
+        namespace_epoch: u64,
+        parent_tokens: Vec<PathShortcutParentToken>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+
+        let parent_tokens: Arc<[PathShortcutParentToken]> = Arc::from(parent_tokens);
+        let charge = Self::estimate_entry_charge(&key, &value, &parent_tokens);
+        if charge > self.byte_budget {
+            return;
+        }
+
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
+            entry.value = value;
+            entry.namespace_epoch = namespace_epoch;
+            entry.parent_tokens = parent_tokens;
+            entry.charge = charge;
+            entry.stamp = stamp;
+            self.used_bytes = self.used_bytes.saturating_add(charge);
+            self.order.push_back((key, stamp));
+            self.maybe_compact_order();
+            self.enforce_limits();
+            return;
+        }
+
+        self.entries.insert(
+            key.clone(),
+            PathShortcutCacheEntry {
+                value,
+                namespace_epoch,
+                parent_tokens,
+                charge,
+                stamp,
+            },
+        );
+        self.used_bytes = self.used_bytes.saturating_add(charge);
+        self.order.push_back((key, stamp));
+        self.maybe_compact_order();
+        self.enforce_limits();
+    }
+
+    fn remove_entry(&mut self, key: &PathShortcutCacheKey) -> bool {
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
+        true
+    }
+
+    fn enforce_limits(&mut self) {
+        while self.entries.len() > self.entry_budget || self.used_bytes > self.byte_budget {
+            if !self.evict_one() {
+                break;
+            }
+        }
+    }
+
+    fn evict_one(&mut self) -> bool {
+        while let Some((key, stamp)) = self.order.pop_front() {
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if entry.stamp != stamp {
+                continue;
+            }
+            if self.remove_entry(&key) {
+                self.evictions = self.evictions.saturating_add(1);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn maybe_compact_order(&mut self) {
+        let limit = self
+            .entries
+            .len()
+            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
+            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
+        if self.order.len() > limit {
+            self.compact_order();
+        }
+    }
+
+    fn compact_order(&mut self) {
+        let mut live: Vec<(u64, PathShortcutCacheKey)> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.stamp, key.clone()))
+            .collect();
+        live.sort_unstable_by_key(|(stamp, _)| *stamp);
+        self.order.clear();
+        self.order
+            .extend(live.into_iter().map(|(stamp, key)| (key, stamp)));
     }
 }
 
@@ -1653,6 +2025,8 @@ struct VfsState {
     ignored_entries: Mutex<IgnoredEntryRegistry>,
     /// Bounded dentry cache keyed by `(parent_ino, name) -> child_ino|ENOENT`.
     dentry_cache: Mutex<DentryCache>,
+    /// Bounded full-path shortcut cache keyed by normalized namespace path.
+    path_shortcut_cache: Mutex<PathShortcutCache>,
     /// Global namespace epoch used to lazily invalidate stale namespace cache
     /// entries after broad topology changes.
     namespace_epoch: AtomicU64,
@@ -2095,6 +2469,77 @@ impl StudioVfs {
         self.state.dentry_cache.lock().metrics()
     }
 
+    fn directory_generation(&self, ino: Ino) -> u64 {
+        self.state
+            .directory_generations
+            .lock()
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn path_shortcut_cache_lookup(
+        &self,
+        style: NamespacePathStyle,
+        components: &[String],
+    ) -> Option<PathShortcutCacheValue> {
+        let key = PathShortcutCacheKey::from_components(style, components)?;
+        let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
+        let generations = self.state.directory_generations.lock();
+        self.state
+            .path_shortcut_cache
+            .lock()
+            .get(&key, namespace_epoch, |parent| {
+                generations.get(&parent).copied().unwrap_or(0)
+            })
+    }
+
+    fn path_shortcut_cache_insert_positive(
+        &self,
+        style: NamespacePathStyle,
+        components: &[String],
+        child_ino: Ino,
+        parent_tokens: Vec<PathShortcutParentToken>,
+    ) {
+        let Some(key) = PathShortcutCacheKey::from_components(style, components) else {
+            return;
+        };
+        let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
+        self.state.path_shortcut_cache.lock().put(
+            key,
+            PathShortcutCacheValue::Positive(child_ino),
+            namespace_epoch,
+            parent_tokens,
+        );
+    }
+
+    fn path_shortcut_cache_insert_negative(
+        &self,
+        style: NamespacePathStyle,
+        components: &[String],
+        parent: Ino,
+        name: &[u8],
+        parent_tokens: Vec<PathShortcutParentToken>,
+    ) {
+        let Some(key) = PathShortcutCacheKey::from_components(style, components) else {
+            return;
+        };
+        let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
+        self.state.path_shortcut_cache.lock().put(
+            key,
+            PathShortcutCacheValue::Negative {
+                parent,
+                name: Arc::from(name),
+            },
+            namespace_epoch,
+            parent_tokens,
+        );
+    }
+
+    fn path_shortcut_cache_metrics(&self) -> PathShortcutCacheMetrics {
+        self.state.path_shortcut_cache.lock().metrics()
+    }
+
     fn restore_live_extents_from_pending_uploads(&self) {
         let pending = self.block_cache.snapshot_pending_uploads();
         if pending.is_empty() {
@@ -2285,6 +2730,16 @@ impl StudioVfs {
                 .and_then(|v| parse_size_bytes_env(&v))
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_DENTRY_CACHE_BYTES);
+            let path_shortcut_cache_capacity =
+                std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY);
+            let path_shortcut_cache_bytes = std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
+                .ok()
+                .and_then(|v| parse_size_bytes_env(&v))
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_PATH_SHORTCUT_CACHE_BYTES);
             let max_spill_bytes = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
                 .ok()
                 .and_then(|v| parse_size_bytes_env(&v))
@@ -2565,6 +3020,8 @@ impl StudioVfs {
                 max_spill_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
+                path_shortcut_cache_capacity,
+                path_shortcut_cache_bytes,
                 "upload pipeline v2 enabled"
             );
 
@@ -2584,6 +3041,10 @@ impl StudioVfs {
                     dentry_cache: Mutex::new(DentryCache::new(
                         dentry_cache_capacity,
                         dentry_cache_bytes,
+                    )),
+                    path_shortcut_cache: Mutex::new(PathShortcutCache::new(
+                        path_shortcut_cache_capacity,
+                        path_shortcut_cache_bytes,
                     )),
                     namespace_epoch: AtomicU64::new(0),
                     directory_generations: Mutex::new(std::collections::HashMap::new()),
@@ -6668,11 +7129,14 @@ impl StudioVfs {
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
             let dentry_cache = self.dentry_cache_metrics();
+            let path_shortcut_cache = self.path_shortcut_cache_metrics();
             info!(
                 pending_uploads = pending,
                 pending_metadata_ops = metadata_backlog.total_ops(),
                 dentry_cache_entries = dentry_cache.occupancy_entries,
                 dentry_cache_bytes = dentry_cache.occupancy_bytes,
+                path_shortcut_cache_entries = path_shortcut_cache.occupancy_entries,
+                path_shortcut_cache_bytes = path_shortcut_cache.occupancy_bytes,
                 "upload pipeline"
             );
             if !self.upload_pipeline_is_idle(pending, &ingress) {
@@ -6719,6 +7183,16 @@ impl StudioVfs {
                     dentry_cache_bytes = dentry_cache.occupancy_bytes,
                     dentry_cache_entry_budget = dentry_cache.entry_budget,
                     dentry_cache_byte_budget = dentry_cache.byte_budget,
+                    path_shortcut_cache_hits = path_shortcut_cache.hits,
+                    path_shortcut_cache_misses = path_shortcut_cache.misses,
+                    path_shortcut_cache_evictions = path_shortcut_cache.evictions,
+                    path_shortcut_cache_negative_hits = path_shortcut_cache.negative_hits,
+                    path_shortcut_cache_negative_hit_ratio =
+                        path_shortcut_cache.negative_hit_ratio(),
+                    path_shortcut_cache_entries = path_shortcut_cache.occupancy_entries,
+                    path_shortcut_cache_bytes = path_shortcut_cache.occupancy_bytes,
+                    path_shortcut_cache_entry_budget = path_shortcut_cache.entry_budget,
+                    path_shortcut_cache_byte_budget = path_shortcut_cache.byte_budget,
                     "upload pipeline counters"
                 );
             }
@@ -7615,6 +8089,111 @@ mod tests {
     }
 
     #[test]
+    fn path_shortcut_cache_is_bounded_and_supports_negative_entries() {
+        let key_a = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[String::from("a"), String::from("b")],
+        )
+        .expect("path key a");
+        let key_b = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[String::from("a"), String::from("missing")],
+        )
+        .expect("path key b");
+        let tokens = vec![PathShortcutParentToken {
+            parent: ROOT_INO,
+            generation: 0,
+        }];
+        let single_charge = PathShortcutCache::estimate_entry_charge(
+            &key_a,
+            &PathShortcutCacheValue::Positive(11),
+            &tokens,
+        );
+        let mut cache = PathShortcutCache::new(2, single_charge * 4);
+
+        cache.put(
+            key_a.clone(),
+            PathShortcutCacheValue::Positive(11),
+            0,
+            tokens.clone(),
+        );
+        cache.put(
+            key_b.clone(),
+            PathShortcutCacheValue::Negative {
+                parent: ROOT_INO,
+                name: Arc::from(&b"missing"[..]),
+            },
+            0,
+            tokens.clone(),
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert!(matches!(
+            cache.get(&key_a, 0, |_| 0),
+            Some(PathShortcutCacheValue::Positive(11))
+        ));
+        assert!(matches!(
+            cache.get(&key_b, 0, |_| 0),
+            Some(PathShortcutCacheValue::Negative { .. })
+        ));
+
+        let key_c = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[String::from("a"), String::from("c")],
+        )
+        .expect("path key c");
+        cache.put(
+            key_c.clone(),
+            PathShortcutCacheValue::Positive(33),
+            0,
+            tokens,
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get(&key_c, 0, |_| 0).is_some());
+    }
+
+    #[test]
+    fn path_shortcut_cache_rejects_stale_parent_generations() {
+        let key = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[
+                String::from("a"),
+                String::from("b"),
+                String::from("file.txt"),
+            ],
+        )
+        .expect("path key");
+        let tokens = vec![
+            PathShortcutParentToken {
+                parent: ROOT_INO,
+                generation: 1,
+            },
+            PathShortcutParentToken {
+                parent: 42,
+                generation: 7,
+            },
+        ];
+        let charge = PathShortcutCache::estimate_entry_charge(
+            &key,
+            &PathShortcutCacheValue::Positive(9),
+            &tokens,
+        );
+        let mut cache = PathShortcutCache::new(8, charge * 8);
+        cache.put(key.clone(), PathShortcutCacheValue::Positive(9), 3, tokens);
+
+        assert!(
+            cache
+                .get(&key, 3, |ino| if ino == 42 { 7 } else { 1 })
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(&key, 3, |ino| if ino == 42 { 8 } else { 1 })
+                .is_none(),
+            "parent generation drift must invalidate cached path"
+        );
+    }
+
+    #[test]
     fn namespace_mutations_update_dentry_cache_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "dentry-cache-hooks");
@@ -7742,6 +8321,72 @@ mod tests {
         assert_eq!(
             cache.entries.get(&key).map(|entry| entry.value),
             Some(DentryCacheValue::Positive(created.ino))
+        );
+    }
+
+    #[test]
+    fn namespace_resolver_path_shortcut_hits_and_renames_invalidate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-rename-invalidate");
+
+        let a = vfs
+            .mkdir(ROOT_INO, b"a", 1000, 1000, 0o755)
+            .expect("mkdir a");
+        let b = vfs.mkdir(a.ino, b"b", 1000, 1000, 0o755).expect("mkdir b");
+        let file = vfs
+            .create(b.ino, b"file.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        let first = resolver
+            .resolve_path("/a/b/file.txt")
+            .expect("resolve first path");
+        let second = resolver
+            .resolve_path("/a/b/file.txt")
+            .expect("resolve warm path");
+        assert_eq!(first.ino, file.ino);
+        assert_eq!(second.ino, file.ino);
+        let metrics = vfs.path_shortcut_cache_metrics();
+        assert!(
+            metrics.hits >= 1,
+            "second full-path resolution should hit path shortcut cache"
+        );
+
+        vfs.rename(ROOT_INO, b"a", ROOT_INO, b"x")
+            .expect("rename subtree root");
+        assert!(
+            resolver.resolve_path("/a/b/file.txt").is_err(),
+            "old path must stop resolving after rename"
+        );
+        let moved = resolver
+            .resolve_path("/x/b/file.txt")
+            .expect("new path resolves after rename");
+        assert_eq!(moved.ino, file.ino);
+    }
+
+    #[test]
+    fn namespace_resolver_path_shortcut_invalidation_on_delete_subtree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-delete-invalidate");
+
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("mkdir parent");
+        let child = vfs
+            .mkdir(parent.ino, b"child", 1000, 1000, 0o755)
+            .expect("mkdir child");
+        vfs.create(child.ino, b"gone.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        resolver
+            .resolve_path("/parent/child/gone.txt")
+            .expect("warm full path");
+        vfs.unlink(child.ino, b"gone.txt")
+            .expect("unlink leaf file");
+        assert!(
+            resolver.resolve_path("/parent/child/gone.txt").is_err(),
+            "deleted path must not resolve from stale shortcut"
         );
     }
 
