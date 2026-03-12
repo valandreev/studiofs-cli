@@ -6097,6 +6097,104 @@ async fn test_write_zero_bytes_is_noop() {
     assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn create_should_ignore_ds_store_without_persisting_metadata_or_data() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-ds-store");
+
+    let attr = vfs.create(1, b".DS_Store", 1000, 1000, 0o644).unwrap();
+    let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+    let written = vfs.write(attr.ino, 0, b"finder metadata").await.unwrap();
+    assert_eq!(written, b"finder metadata".len() as u32);
+
+    vfs.flush(attr.ino).await.unwrap();
+    vfs.release_fh(fh).await.unwrap();
+
+    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    let ingress = vfs.ingress_stats();
+    assert_eq!(ingress.dirty_mem_bytes, 0);
+    assert_eq!(ingress.spill_bytes, 0);
+    assert!(vfs.meta().lookup(1, b".DS_Store").is_err());
+    assert!(vfs.lookup(1, b".DS_Store").is_err());
+    assert!(vfs.readdir(1).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-appledouble");
+
+    let attr = vfs.create(1, b"._photo.jpg", 1000, 1000, 0o644).unwrap();
+    let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+    let written = vfs.write(attr.ino, 0, b"appledouble").await.unwrap();
+    assert_eq!(written, b"appledouble".len() as u32);
+
+    vfs.flush(attr.ino).await.unwrap();
+    vfs.release_fh(fh).await.unwrap();
+
+    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    let ingress = vfs.ingress_stats();
+    assert_eq!(ingress.dirty_mem_bytes, 0);
+    assert_eq!(ingress.spill_bytes, 0);
+    assert!(vfs.meta().lookup(1, b"._photo.jpg").is_err());
+    assert!(vfs.lookup(1, b"._photo.jpg").is_err());
+    assert!(vfs.readdir(1).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn rename_should_drop_blocked_macos_metadata_target_without_persisting_it() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rename-ignore-ds-store");
+
+    let attr = vfs.create(1, b"normal.txt", 1000, 1000, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"payload").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    vfs.rename(1, b"normal.txt", 1, b".DS_Store").unwrap();
+
+    assert!(vfs.lookup(1, b"normal.txt").is_err());
+    assert!(vfs.lookup(1, b".DS_Store").is_err());
+    assert!(vfs.meta().lookup(1, b".DS_Store").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-concurrent-create");
+
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let inos = Arc::new(Mutex::new(Vec::new()));
+    let mut tasks = Vec::new();
+
+    for _ in 0..8 {
+        let vfs = vfs.clone();
+        let barrier = barrier.clone();
+        let inos = inos.clone();
+        tasks.push(thread::spawn(move || {
+            barrier.wait();
+            let attr = vfs.create(1, b".DS_Store", 1000, 1000, 0o644).unwrap();
+            inos.lock().push(attr.ino);
+        }));
+    }
+
+    for task in tasks {
+        task.join().unwrap();
+    }
+
+    let inos = inos.lock().clone();
+    assert!(!inos.is_empty());
+    let unique: std::collections::HashSet<_> = inos.into_iter().collect();
+    assert_eq!(unique.len(), 1);
+}
+
 // ─── 9.3 Rename & Unlink Edge Cases ────────────────────────────────────────
 
 /// Rename a file across directories.

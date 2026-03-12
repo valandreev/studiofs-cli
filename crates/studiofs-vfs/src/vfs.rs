@@ -248,6 +248,10 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
 }
 
+fn is_ignored_macos_metadata_name(name: &[u8]) -> bool {
+    name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
+}
+
 // =============================================================================
 // Constants & Configuration
 // =============================================================================
@@ -423,6 +427,19 @@ impl std::ops::BitOr for OpenFlags {
 pub struct OpenFile {
     pub ino: Ino,
     pub flags: OpenFlags,
+}
+
+#[derive(Debug, Clone)]
+struct IgnoredFile {
+    attr: InodeAttr,
+    parent: Ino,
+    name: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct IgnoredFileRegistry {
+    by_ino: HashMap<Ino, IgnoredFile>,
+    by_name: HashMap<(Ino, Vec<u8>), Ino>,
 }
 
 // =============================================================================
@@ -1079,6 +1096,9 @@ struct VfsState {
     uploaded_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
     /// Dirty attributes cache (from writes not yet synced to redb).
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
+    /// Ephemeral macOS metadata files that are intentionally ignored and never
+    /// persisted to the metadata store or object storage.
+    ignored_files: Mutex<IgnoredFileRegistry>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
     attr_read_cache: Mutex<std::collections::HashMap<Ino, (InodeAttr, Instant)>>,
     /// Dirty blocks accepted by `flush()` that have not yet been written to
@@ -1114,6 +1134,8 @@ struct VfsState {
     dirty_drain_lock: tokio::sync::Mutex<()>,
     /// Sequence used to generate unique spill file names.
     spill_seq: AtomicU64,
+    /// Synthetic inode allocator for ephemeral ignored files.
+    next_ignored_ino: AtomicU64,
     /// Current active append-only ingress segment id.
     active_ingress_segment_id: AtomicU64,
     /// Inodes that have been unlinked.  The background flusher checks this
@@ -1265,6 +1287,84 @@ pub struct StudioVfs {
 }
 
 impl StudioVfs {
+    fn ignored_file_attr(&self, ino: Ino) -> Option<InodeAttr> {
+        self.state
+            .ignored_files
+            .lock()
+            .by_ino
+            .get(&ino)
+            .map(|ignored| ignored.attr.clone())
+    }
+
+    fn ignored_file_lookup(&self, parent: Ino, name: &[u8]) -> Option<IgnoredFile> {
+        let key = (parent, name.to_vec());
+        let registry = self.state.ignored_files.lock();
+        let ino = registry.by_name.get(&key).copied()?;
+        registry.by_ino.get(&ino).cloned()
+    }
+
+    fn create_ignored_file(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> InodeAttr {
+        let mut registry = self.state.ignored_files.lock();
+        let key = (parent, name.to_vec());
+        if let Some(ino) = registry.by_name.get(&key).copied()
+            && let Some(existing) = registry.by_ino.get(&ino)
+        {
+            return existing.attr.clone();
+        }
+
+        let ino = self.state.next_ignored_ino.fetch_add(1, Ordering::Relaxed);
+        let attr = InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777);
+        let ignored = IgnoredFile {
+            attr: attr.clone(),
+            parent,
+            name: key.1.clone(),
+        };
+        registry.by_name.insert(key, ino);
+        registry.by_ino.insert(ino, ignored);
+        attr
+    }
+
+    fn update_ignored_file<F>(&self, ino: Ino, update: F) -> Option<InodeAttr>
+    where
+        F: FnOnce(&mut InodeAttr),
+    {
+        let mut registry = self.state.ignored_files.lock();
+        let ignored = registry.by_ino.get_mut(&ino)?;
+        update(&mut ignored.attr);
+        Some(ignored.attr.clone())
+    }
+
+    fn unlink_ignored_file(&self, parent: Ino, name: &[u8]) -> bool {
+        let key = (parent, name.to_vec());
+        let mut registry = self.state.ignored_files.lock();
+        let Some(ino) = registry.by_name.remove(&key) else {
+            return false;
+        };
+
+        if self.handle_table.open_count(ino) > 0 {
+            self.handle_table.mark_orphan(ino);
+        } else {
+            registry.by_ino.remove(&ino);
+        }
+        true
+    }
+
+    fn release_ignored_file(&self, ino: Ino) -> bool {
+        let mut registry = self.state.ignored_files.lock();
+        let Some(ignored) = registry.by_ino.remove(&ino) else {
+            return false;
+        };
+        registry.by_name.remove(&(ignored.parent, ignored.name));
+        true
+    }
+
     fn restore_live_extents_from_pending_uploads(&self) {
         let pending = self.block_cache.snapshot_pending_uploads();
         if pending.is_empty() {
@@ -1740,6 +1840,7 @@ impl StudioVfs {
                     live_extent_records: Mutex::new(std::collections::HashMap::new()),
                     uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
+                    ignored_files: Mutex::new(IgnoredFileRegistry::default()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
@@ -1757,6 +1858,7 @@ impl StudioVfs {
                     dirty_drained_notify: tokio::sync::Notify::new(),
                     dirty_drain_lock: tokio::sync::Mutex::new(()),
                     spill_seq: AtomicU64::new(recovered_spill_seq),
+                    next_ignored_ino: AtomicU64::new(1u64 << 63),
                     active_ingress_segment_id: AtomicU64::new(active_ingress_segment_id),
                     deleted_inodes: Mutex::new(std::collections::HashSet::new()),
                     pending_evictions: Mutex::new(std::collections::HashSet::new()),
@@ -3572,6 +3674,10 @@ impl StudioVfs {
 
     /// Get file attributes.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        if let Some(attr) = self.ignored_file_attr(ino) {
+            return Ok(attr);
+        }
+
         // 1. Check dirty attrs cache first (write path data takes precedence)
         if let Some(attr) = self.state.dirty_attrs.lock().get(&ino) {
             return Ok(attr.clone());
@@ -3598,6 +3704,10 @@ impl StudioVfs {
     }
 
     async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        if let Some(attr) = self.ignored_file_attr(ino) {
+            return Ok(attr);
+        }
+
         if let Some(attr) = self.state.dirty_attrs.lock().get(&ino) {
             return Ok(attr.clone());
         }
@@ -3624,6 +3734,37 @@ impl StudioVfs {
     ///
     /// Accepts `SetattrArgs` — any field set to `None`/`Omit` is left unchanged.
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
+        if let Some(attr) = self.update_ignored_file(ino, |attr| {
+            if let Some(new_size) = args.size {
+                attr.size = new_size;
+                attr.committed_size = new_size;
+            }
+            if let Some(mode) = args.mode {
+                attr.mode = mode & 0o7777;
+            }
+            if let Some(uid) = args.uid {
+                attr.uid = uid;
+            }
+            if let Some(gid) = args.gid {
+                attr.gid = gid;
+            }
+            if let Some(ns) = args.atime.resolve() {
+                attr.atime = ns;
+            }
+            if let Some(ns) = args.mtime.resolve() {
+                attr.mtime = ns;
+            }
+            if let Some(ns) = args.crtime.resolve() {
+                attr.crtime = ns;
+            }
+            if let Some(wa) = args.win_attrs {
+                attr.win_attrs = wa;
+            }
+            attr.touch_ctime();
+        }) {
+            return Ok(attr);
+        }
+
         let mut attr = self.getattr(ino)?;
         let mut changed = false;
 
@@ -3775,6 +3916,9 @@ impl StudioVfs {
 
     /// Lookup an entry in a directory.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
+        if let Some(ignored) = self.ignored_file_lookup(parent, name) {
+            return Ok(ignored.attr);
+        }
         let entry = self.meta.lookup(parent, name)?;
         Ok(self.meta.get_attr(entry.ino)?)
     }
@@ -3805,6 +3949,17 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
+        if self.ignored_file_attr(ino).is_some() {
+            let fh = self.handle_table.open(ino, flags);
+            debug!(
+                "open_file ignored ino={} fh={} flags={:#x}",
+                ino,
+                fh,
+                flags.bits()
+            );
+            return Ok(fh);
+        }
+
         // Verify the inode exists
         let attr = self.getattr(ino)?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
@@ -3844,7 +3999,15 @@ impl StudioVfs {
         };
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
 
+        if remaining == 0 && self.release_ignored_file(ino) {
+            let _ = self.handle_table.take_orphan(ino);
+            return Ok(());
+        }
+
         if remaining == 0 && self.handle_table.take_orphan(ino) {
+            if self.release_ignored_file(ino) {
+                return Ok(());
+            }
             // Last handle closed on an unlinked file — final cleanup
             debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
@@ -3911,6 +4074,10 @@ impl StudioVfs {
     ///
     /// S3 upload remains async — same as LucidLink behaviour.
     pub async fn fsync(&self, ino: Ino, datasync: bool) -> VfsResult<()> {
+        if self.ignored_file_attr(ino).is_some() {
+            return Ok(());
+        }
+
         // Flush pending write buffer
         self.flush(ino).await?;
 
@@ -4124,6 +4291,9 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
+        if is_ignored_macos_metadata_name(name) {
+            return Ok(self.create_ignored_file(parent, name, uid, gid, mode));
+        }
         let attr = self
             .meta
             .create_file(parent, name, uid, gid, mode & 0o7777)?;
@@ -4191,23 +4361,35 @@ impl StudioVfs {
 
     /// Get an extended attribute value.
     pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
+        if self.ignored_file_attr(ino).is_some() {
+            return Ok(None);
+        }
         Ok(self.meta.get_xattr(ino, name)?)
     }
 
     /// Set an extended attribute.
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
+        if self.ignored_file_attr(ino).is_some() {
+            return Ok(());
+        }
         self.meta.set_xattr(ino, name, value, flags)?;
         Ok(())
     }
 
     /// Remove an extended attribute.
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
+        if self.ignored_file_attr(ino).is_some() {
+            return Ok(());
+        }
         self.meta.remove_xattr(ino, name)?;
         Ok(())
     }
 
     /// List all extended attribute names for an inode.
     pub fn list_xattrs(&self, ino: Ino) -> VfsResult<Vec<Vec<u8>>> {
+        if self.ignored_file_attr(ino).is_some() {
+            return Ok(Vec::new());
+        }
         Ok(self.meta.list_xattrs(ino)?)
     }
 
@@ -4217,6 +4399,10 @@ impl StudioVfs {
     /// decremented, but the inode and blocks are kept alive (orphan).
     /// Actual cleanup happens in `release_fh()` when the last handle closes.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        if self.unlink_ignored_file(parent, name) {
+            return Ok(());
+        }
+
         // First, look up the entry to get the ino so we can check open handles.
         let entry = self.meta.lookup(parent, name)?;
         let ino = entry.ino;
@@ -4347,6 +4533,12 @@ impl StudioVfs {
             return Ok(());
         }
         validate_name(new_name)?;
+        if is_ignored_macos_metadata_name(new_name) {
+            if self.unlink_ignored_file(parent, name) {
+                return Ok(());
+            }
+            return self.unlink(parent, name);
+        }
         let rename_result = self
             .meta
             .rename_atomic(parent, name, new_parent, new_name)?;
@@ -4587,6 +4779,11 @@ impl StudioVfs {
     /// Read file data at the given offset.
     /// Delegates to `read_into()` to avoid code duplication.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
+        if let Some(attr) = self.ignored_file_attr(ino) {
+            let end = (offset + size as u64).min(attr.size);
+            let len = end.saturating_sub(offset) as usize;
+            return Ok(Bytes::from(vec![0; len]));
+        }
         let attr = self.getattr_async(ino).await?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
             return Err(VfsError::RemoteContentPending);
@@ -4608,6 +4805,15 @@ impl StudioVfs {
     /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
     /// Returns the number of bytes written.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
+        if let Some(attr) = self.ignored_file_attr(ino) {
+            let end = (offset + buffer.len() as u64).min(attr.size);
+            let len = end.saturating_sub(offset) as usize;
+            if len > 0 {
+                buffer[..len].fill(0);
+            }
+            return Ok(len as u32);
+        }
+
         self.mark_foreground_read();
         struct ForegroundReadGuard<'a>(&'a StudioVfs);
         impl Drop for ForegroundReadGuard<'_> {
@@ -4892,6 +5098,18 @@ impl StudioVfs {
     /// the final `flush()` only handles the last partial block, eliminating the
     /// end-of-write stall where all blocks were previously processed at once.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
+        if self.ignored_file_attr(ino).is_some() {
+            let size = offset.saturating_add(data.len() as u64);
+            let _ = self.update_ignored_file(ino, |attr| {
+                if size > attr.size {
+                    attr.size = size;
+                    attr.committed_size = size;
+                }
+                attr.touch_mtime();
+            });
+            return Ok(data.len() as u32);
+        }
+
         if data.is_empty() {
             return Ok(0);
         }
@@ -5030,6 +5248,10 @@ impl StudioVfs {
     /// This handles only the remaining dirty blocks (typically just the last partial block).
     /// Remaining blocks are flushed in parallel for best performance.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
+        if self.ignored_file_attr(ino).is_some() {
+            return Ok(());
+        }
+
         // Move all remaining dirty pending blocks into the dirty memory buffer.
         // The background slab flusher handles package + slab write + upload queue.
         // This function returns immediately after the in-memory move — no disk I/O.

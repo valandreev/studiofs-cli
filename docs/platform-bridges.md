@@ -137,6 +137,19 @@ cache-only eviction**:
 This keeps Trash recovery semantics intact while preventing local cache growth
 from Finder-driven deletes.
 
+### macOS metadata file filtering
+
+Finder and related macOS services may also try to create metadata sidecar files
+such as `.DS_Store` and AppleDouble `._*`.
+
+StudioFS drops these names at the VFS layer:
+- `create` / `open` flows succeed locally so Finder does not surface errors
+- the file stays ephemeral to the mounting client only
+- no inode, xattr, cache, or object-store state is persisted for these names
+
+This keeps shared directories free of macOS-only garbage while preserving normal
+Finder interaction.
+
 ### Implementation: `StudioFuseFs`
 
 Implements `fuser::Filesystem` trait.

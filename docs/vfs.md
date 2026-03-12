@@ -258,6 +258,17 @@ StudioFS supports distributed `flock`-style locks via S3:
 
 ## Filename Validation
 
+Besides generic filename validation, the VFS also applies a small platform
+compatibility filter for macOS metadata noise:
+- `.DS_Store`
+- AppleDouble sidecars matching `._*`
+
+These names are accepted through the local client flow as ephemeral ignored
+files, but they are never written into the metadata engine, cache pipeline, or
+object storage. This is intentionally different from ordinary files because
+Finder expects these operations to appear successful even when the shared
+filesystem should remain clean.
+
 All file/directory names are validated:
 - Non-empty, max 255 bytes
 - No `/` character
