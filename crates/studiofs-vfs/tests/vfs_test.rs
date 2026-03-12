@@ -6195,6 +6195,129 @@ async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
     assert_eq!(unique.len(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_children() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-root-macos-dirs");
+
+    let dir = vfs.mkdir(1, b".Spotlight-V100", 1000, 1000, 0o755).unwrap();
+    assert_eq!(dir.kind, studiofs_meta::types::FileType::Directory);
+    assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
+
+    let looked_up_dir = vfs.lookup(1, b".Spotlight-V100").unwrap();
+    assert_eq!(looked_up_dir.ino, dir.ino);
+
+    let nested_dir = vfs.mkdir(dir.ino, b"Store-V2", 1000, 1000, 0o755).unwrap();
+    let attr = vfs
+        .create(nested_dir.ino, b"store.db", 1000, 1000, 0o644)
+        .unwrap();
+    let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+    let written = vfs.write(attr.ino, 0, b"spotlight").await.unwrap();
+    assert_eq!(written, b"spotlight".len() as u32);
+    vfs.flush(attr.ino).await.unwrap();
+
+    let read_back = vfs.read(attr.ino, 0, written).await.unwrap();
+    assert_eq!(read_back.len(), written as usize);
+    assert!(read_back.iter().all(|byte| *byte == 0));
+
+    vfs.release_fh(fh).await.unwrap();
+    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+
+    assert_eq!(vfs.readdir(1).unwrap().len(), 0);
+    assert_eq!(vfs.readdir(dir.ino).unwrap().len(), 0);
+    assert_eq!(vfs.readdir(nested_dir.ino).unwrap().len(), 0);
+    assert!(vfs.lookup(1, b".Spotlight-V100").is_ok());
+    assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
+    assert!(vfs.meta().lookup(dir.ino, b"Store-V2").is_err());
+    assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
+    let ingress = vfs.ingress_stats();
+    assert_eq!(ingress.dirty_mem_bytes, 0);
+    assert_eq!(ingress.spill_bytes, 0);
+
+    vfs.rmdir(1, b".Spotlight-V100").unwrap();
+    assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn blocked_root_metadata_names_should_be_ignored_for_file_and_symlink_creation() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-root-macos-metadata-names");
+
+    let file = vfs.create(1, b".Trashes", 1000, 1000, 0o644).unwrap();
+    let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+    let written = vfs.write(file.ino, 0, b"trash-marker").await.unwrap();
+    assert_eq!(written, b"trash-marker".len() as u32);
+    vfs.flush(file.ino).await.unwrap();
+    assert!(vfs.lookup(1, b".Trashes").is_ok());
+    vfs.release_fh(fh).await.unwrap();
+
+    let symlink = vfs
+        .symlink(1, b".fseventsd", b"/tmp/ignored", 1000, 1000)
+        .unwrap();
+    assert_eq!(symlink.kind, studiofs_meta::types::FileType::Symlink);
+    assert_eq!(vfs.readlink(symlink.ino).unwrap(), Vec::<u8>::new());
+
+    assert!(vfs.lookup(1, b".Trashes").is_err());
+    assert!(vfs.lookup(1, b".fseventsd").is_ok());
+    assert!(vfs.meta().lookup(1, b".Trashes").is_err());
+    assert!(vfs.meta().lookup(1, b".fseventsd").is_err());
+    assert!(vfs.readdir(1).unwrap().is_empty());
+
+    vfs.unlink(1, b".fseventsd").unwrap();
+    assert!(vfs.lookup(1, b".Trashes").is_err());
+    assert!(vfs.lookup(1, b".fseventsd").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "hide-legacy-root-macos-dirs");
+
+    vfs.meta()
+        .create_dir(1, b".Spotlight-V100", 1000, 1000, 0o755)
+        .unwrap();
+    vfs.meta()
+        .create_dir(1, b".Trashes", 1000, 1000, 0o755)
+        .unwrap();
+    vfs.meta()
+        .create_dir(1, b".fseventsd", 1000, 1000, 0o755)
+        .unwrap();
+    vfs.meta()
+        .create_dir(1, b"visible", 1000, 1000, 0o755)
+        .unwrap();
+
+    let entries = vfs.readdir(1).unwrap();
+    let names: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.name).collect();
+    assert_eq!(names, vec![b"visible".to_vec()]);
+
+    assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
+    assert!(vfs.lookup(1, b".Trashes").is_err());
+    assert!(vfs.lookup(1, b".fseventsd").is_err());
+    assert!(vfs.lookup(1, b"visible").is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn unlink_should_remove_legacy_persisted_root_blocked_regular_file() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "unlink-legacy-root-blocked-file");
+
+    vfs.meta()
+        .create_file(1, b".Trashes", 1000, 1000, 0o644)
+        .unwrap();
+
+    assert!(vfs.lookup(1, b".Trashes").is_err());
+    vfs.unlink(1, b".Trashes").unwrap();
+    assert!(vfs.meta().lookup(1, b".Trashes").is_err());
+}
+
 // ─── 9.3 Rename & Unlink Edge Cases ────────────────────────────────────────
 
 /// Rename a file across directories.

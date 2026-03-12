@@ -252,6 +252,10 @@ fn is_ignored_macos_metadata_name(name: &[u8]) -> bool {
     name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
 }
 
+fn is_blocked_root_macos_metadata_dir(name: &[u8]) -> bool {
+    matches!(name, b".Spotlight-V100" | b".Trashes" | b".fseventsd")
+}
+
 // =============================================================================
 // Constants & Configuration
 // =============================================================================
@@ -430,15 +434,15 @@ pub struct OpenFile {
 }
 
 #[derive(Debug, Clone)]
-struct IgnoredFile {
+struct IgnoredEntry {
     attr: InodeAttr,
     parent: Ino,
     name: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
-struct IgnoredFileRegistry {
-    by_ino: HashMap<Ino, IgnoredFile>,
+struct IgnoredEntryRegistry {
+    by_ino: HashMap<Ino, IgnoredEntry>,
     by_name: HashMap<(Ino, Vec<u8>), Ino>,
 }
 
@@ -1098,7 +1102,7 @@ struct VfsState {
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Ephemeral macOS metadata files that are intentionally ignored and never
     /// persisted to the metadata store or object storage.
-    ignored_files: Mutex<IgnoredFileRegistry>,
+    ignored_entries: Mutex<IgnoredEntryRegistry>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
     attr_read_cache: Mutex<std::collections::HashMap<Ino, (InodeAttr, Instant)>>,
     /// Dirty blocks accepted by `flush()` that have not yet been written to
@@ -1287,31 +1291,41 @@ pub struct StudioVfs {
 }
 
 impl StudioVfs {
-    fn ignored_file_attr(&self, ino: Ino) -> Option<InodeAttr> {
+    fn ignored_entry_attr(&self, ino: Ino) -> Option<InodeAttr> {
         self.state
-            .ignored_files
+            .ignored_entries
             .lock()
             .by_ino
             .get(&ino)
             .map(|ignored| ignored.attr.clone())
     }
 
-    fn ignored_file_lookup(&self, parent: Ino, name: &[u8]) -> Option<IgnoredFile> {
+    fn ignored_dir_attr(&self, ino: Ino) -> Option<InodeAttr> {
+        self.ignored_entry_attr(ino)
+            .filter(|attr| attr.kind == FileType::Directory)
+    }
+
+    fn ignored_entry_lookup(&self, parent: Ino, name: &[u8]) -> Option<IgnoredEntry> {
         let key = (parent, name.to_vec());
-        let registry = self.state.ignored_files.lock();
+        let registry = self.state.ignored_entries.lock();
         let ino = registry.by_name.get(&key).copied()?;
         registry.by_ino.get(&ino).cloned()
     }
 
-    fn create_ignored_file(
+    fn ignored_entry(&self, ino: Ino) -> Option<IgnoredEntry> {
+        self.state.ignored_entries.lock().by_ino.get(&ino).cloned()
+    }
+
+    fn create_ignored_entry(
         &self,
         parent: Ino,
         name: &[u8],
         uid: u32,
         gid: u32,
         mode: u16,
+        kind: FileType,
     ) -> InodeAttr {
-        let mut registry = self.state.ignored_files.lock();
+        let mut registry = self.state.ignored_entries.lock();
         let key = (parent, name.to_vec());
         if let Some(ino) = registry.by_name.get(&key).copied()
             && let Some(existing) = registry.by_ino.get(&ino)
@@ -1320,8 +1334,12 @@ impl StudioVfs {
         }
 
         let ino = self.state.next_ignored_ino.fetch_add(1, Ordering::Relaxed);
-        let attr = InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777);
-        let ignored = IgnoredFile {
+        let attr = match kind {
+            FileType::Directory => InodeAttr::new_dir(ino, parent, uid, gid, mode & 0o7777),
+            FileType::RegularFile => InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777),
+            FileType::Symlink => InodeAttr::new_symlink(ino, parent, uid, gid, 0),
+        };
+        let ignored = IgnoredEntry {
             attr: attr.clone(),
             parent,
             name: key.1.clone(),
@@ -1331,19 +1349,19 @@ impl StudioVfs {
         attr
     }
 
-    fn update_ignored_file<F>(&self, ino: Ino, update: F) -> Option<InodeAttr>
+    fn update_ignored_entry<F>(&self, ino: Ino, update: F) -> Option<InodeAttr>
     where
         F: FnOnce(&mut InodeAttr),
     {
-        let mut registry = self.state.ignored_files.lock();
+        let mut registry = self.state.ignored_entries.lock();
         let ignored = registry.by_ino.get_mut(&ino)?;
         update(&mut ignored.attr);
         Some(ignored.attr.clone())
     }
 
-    fn unlink_ignored_file(&self, parent: Ino, name: &[u8]) -> bool {
+    fn unlink_ignored_entry(&self, parent: Ino, name: &[u8]) -> bool {
         let key = (parent, name.to_vec());
-        let mut registry = self.state.ignored_files.lock();
+        let mut registry = self.state.ignored_entries.lock();
         let Some(ino) = registry.by_name.remove(&key) else {
             return false;
         };
@@ -1356,13 +1374,68 @@ impl StudioVfs {
         true
     }
 
-    fn release_ignored_file(&self, ino: Ino) -> bool {
-        let mut registry = self.state.ignored_files.lock();
+    fn unlink_ignored_subtree(&self, parent: Ino, name: &[u8]) -> bool {
+        let key = (parent, name.to_vec());
+        let mut registry = self.state.ignored_entries.lock();
+        let Some(root_ino) = registry.by_name.remove(&key) else {
+            return false;
+        };
+
+        let mut pending = vec![root_ino];
+        let mut to_remove = Vec::new();
+        while let Some(current) = pending.pop() {
+            to_remove.push(current);
+            let children: Vec<Ino> = registry
+                .by_ino
+                .iter()
+                .filter_map(|(ino, entry)| (entry.parent == current).then_some(*ino))
+                .collect();
+            pending.extend(children);
+        }
+
+        for ino in to_remove {
+            if let Some(ignored) = registry.by_ino.get(&ino).cloned() {
+                registry
+                    .by_name
+                    .remove(&(ignored.parent, ignored.name.clone()));
+                if self.handle_table.open_count(ino) > 0 {
+                    self.handle_table.mark_orphan(ino);
+                } else {
+                    registry.by_ino.remove(&ino);
+                }
+            }
+        }
+        true
+    }
+
+    fn release_ignored_entry(&self, ino: Ino) -> bool {
+        let mut registry = self.state.ignored_entries.lock();
         let Some(ignored) = registry.by_ino.remove(&ino) else {
             return false;
         };
         registry.by_name.remove(&(ignored.parent, ignored.name));
         true
+    }
+
+    fn ignored_entry_not_found(parent: Ino, name: &[u8]) -> VfsError {
+        VfsError::Meta(MetaError::EntryNotFound {
+            parent,
+            name: String::from_utf8_lossy(name).into_owned(),
+        })
+    }
+
+    fn is_blocked_root_metadata_path(&self, parent: Ino, name: &[u8]) -> bool {
+        parent == ROOT_INO && is_blocked_root_macos_metadata_dir(name)
+    }
+
+    fn should_ignore_regular_file_path(&self, parent: Ino, name: &[u8]) -> bool {
+        is_ignored_macos_metadata_name(name)
+            || self.is_blocked_root_metadata_path(parent, name)
+            || self.ignored_dir_attr(parent).is_some()
+    }
+
+    fn should_ignore_directory_path(&self, parent: Ino, name: &[u8]) -> bool {
+        self.is_blocked_root_metadata_path(parent, name) || self.ignored_dir_attr(parent).is_some()
     }
 
     fn restore_live_extents_from_pending_uploads(&self) {
@@ -1840,7 +1913,7 @@ impl StudioVfs {
                     live_extent_records: Mutex::new(std::collections::HashMap::new()),
                     uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
-                    ignored_files: Mutex::new(IgnoredFileRegistry::default()),
+                    ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
@@ -3674,7 +3747,7 @@ impl StudioVfs {
 
     /// Get file attributes.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        if let Some(attr) = self.ignored_file_attr(ino) {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
             return Ok(attr);
         }
 
@@ -3704,7 +3777,7 @@ impl StudioVfs {
     }
 
     async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        if let Some(attr) = self.ignored_file_attr(ino) {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
             return Ok(attr);
         }
 
@@ -3734,7 +3807,7 @@ impl StudioVfs {
     ///
     /// Accepts `SetattrArgs` — any field set to `None`/`Omit` is left unchanged.
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
-        if let Some(attr) = self.update_ignored_file(ino, |attr| {
+        if let Some(attr) = self.update_ignored_entry(ino, |attr| {
             if let Some(new_size) = args.size {
                 attr.size = new_size;
                 attr.committed_size = new_size;
@@ -3916,8 +3989,14 @@ impl StudioVfs {
 
     /// Lookup an entry in a directory.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
-        if let Some(ignored) = self.ignored_file_lookup(parent, name) {
+        if let Some(ignored) = self.ignored_entry_lookup(parent, name) {
             return Ok(ignored.attr);
+        }
+        if self.is_blocked_root_metadata_path(parent, name) {
+            return Err(Self::ignored_entry_not_found(parent, name));
+        }
+        if self.ignored_dir_attr(parent).is_some() {
+            return Err(Self::ignored_entry_not_found(parent, name));
         }
         let entry = self.meta.lookup(parent, name)?;
         Ok(self.meta.get_attr(entry.ino)?)
@@ -3925,7 +4004,14 @@ impl StudioVfs {
 
     /// Read directory entries.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
-        let entries = self.meta.readdir(ino)?;
+        if self.ignored_dir_attr(ino).is_some() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = self.meta.readdir(ino)?;
+        if ino == ROOT_INO {
+            entries.retain(|entry| !is_blocked_root_macos_metadata_dir(&entry.name));
+        }
 
         // Feed the directory prefetch tracker with regular-file children.
         let file_children: Vec<Ino> = entries
@@ -3949,7 +4035,7 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             let fh = self.handle_table.open(ino, flags);
             debug!(
                 "open_file ignored ino={} fh={} flags={:#x}",
@@ -3999,13 +4085,13 @@ impl StudioVfs {
         };
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
 
-        if remaining == 0 && self.release_ignored_file(ino) {
+        if remaining == 0 && self.release_ignored_entry(ino) {
             let _ = self.handle_table.take_orphan(ino);
             return Ok(());
         }
 
         if remaining == 0 && self.handle_table.take_orphan(ino) {
-            if self.release_ignored_file(ino) {
+            if self.release_ignored_entry(ino) {
                 return Ok(());
             }
             // Last handle closed on an unlinked file — final cleanup
@@ -4074,7 +4160,7 @@ impl StudioVfs {
     ///
     /// S3 upload remains async — same as LucidLink behaviour.
     pub async fn fsync(&self, ino: Ino, datasync: bool) -> VfsResult<()> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
 
@@ -4273,6 +4359,27 @@ impl StudioVfs {
     /// Create a hard link: add a new directory entry pointing to an existing inode.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
         validate_name(new_name)?;
+        if self.should_ignore_regular_file_path(new_parent, new_name) {
+            let source_attr = self.getattr(ino)?;
+            let ignored = self.create_ignored_entry(
+                new_parent,
+                new_name,
+                source_attr.uid,
+                source_attr.gid,
+                source_attr.mode,
+                FileType::RegularFile,
+            );
+            return Ok(self
+                .update_ignored_entry(ignored.ino, |attr| {
+                    attr.size = source_attr.size;
+                    attr.committed_size = source_attr.committed_size;
+                    attr.atime = source_attr.atime;
+                    attr.mtime = source_attr.mtime;
+                    attr.ctime = source_attr.ctime;
+                    attr.crtime = source_attr.crtime;
+                })
+                .unwrap_or(ignored));
+        }
         let attr = self.meta.link(ino, new_parent, new_name)?;
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(&ino);
@@ -4291,8 +4398,15 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
-        if is_ignored_macos_metadata_name(name) {
-            return Ok(self.create_ignored_file(parent, name, uid, gid, mode));
+        if self.should_ignore_regular_file_path(parent, name) {
+            return Ok(self.create_ignored_entry(
+                parent,
+                name,
+                uid,
+                gid,
+                mode,
+                FileType::RegularFile,
+            ));
         }
         let attr = self
             .meta
@@ -4325,6 +4439,16 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
+        if self.should_ignore_directory_path(parent, name) {
+            return Ok(self.create_ignored_entry(
+                parent,
+                name,
+                uid,
+                gid,
+                mode,
+                FileType::Directory,
+            ));
+        }
         let attr = self
             .meta
             .create_dir(parent, name, uid, gid, mode & 0o7777)?;
@@ -4344,6 +4468,9 @@ impl StudioVfs {
         gid: u32,
     ) -> VfsResult<InodeAttr> {
         validate_name(name)?;
+        if self.should_ignore_regular_file_path(parent, name) {
+            return Ok(self.create_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink));
+        }
         let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
@@ -4352,6 +4479,9 @@ impl StudioVfs {
 
     /// Read the target of a symbolic link.
     pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
+        if matches!(self.ignored_entry_attr(ino), Some(attr) if attr.kind == FileType::Symlink) {
+            return Ok(Vec::new());
+        }
         Ok(self.meta.get_symlink_target(ino)?)
     }
 
@@ -4361,7 +4491,7 @@ impl StudioVfs {
 
     /// Get an extended attribute value.
     pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             return Ok(None);
         }
         Ok(self.meta.get_xattr(ino, name)?)
@@ -4369,7 +4499,7 @@ impl StudioVfs {
 
     /// Set an extended attribute.
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
         self.meta.set_xattr(ino, name, value, flags)?;
@@ -4378,7 +4508,7 @@ impl StudioVfs {
 
     /// Remove an extended attribute.
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
         self.meta.remove_xattr(ino, name)?;
@@ -4387,7 +4517,7 @@ impl StudioVfs {
 
     /// List all extended attribute names for an inode.
     pub fn list_xattrs(&self, ino: Ino) -> VfsResult<Vec<Vec<u8>>> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             return Ok(Vec::new());
         }
         Ok(self.meta.list_xattrs(ino)?)
@@ -4399,7 +4529,7 @@ impl StudioVfs {
     /// decremented, but the inode and blocks are kept alive (orphan).
     /// Actual cleanup happens in `release_fh()` when the last handle closes.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        if self.unlink_ignored_file(parent, name) {
+        if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
             return Ok(());
         }
 
@@ -4510,6 +4640,9 @@ impl StudioVfs {
 
     /// Remove a directory.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
+            return Ok(());
+        }
         self.meta.rmdir(parent, name)?;
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
@@ -4533,9 +4666,48 @@ impl StudioVfs {
             return Ok(());
         }
         validate_name(new_name)?;
-        if is_ignored_macos_metadata_name(new_name) {
-            if self.unlink_ignored_file(parent, name) {
-                return Ok(());
+        let source_ignored = self.ignored_entry_lookup(parent, name);
+        let target_is_ignored = self.should_ignore_regular_file_path(new_parent, new_name)
+            || self.should_ignore_directory_path(new_parent, new_name);
+        if let Some(source) = source_ignored {
+            if target_is_ignored {
+                let _ = self.create_ignored_entry(
+                    new_parent,
+                    new_name,
+                    source.attr.uid,
+                    source.attr.gid,
+                    source.attr.mode,
+                    source.attr.kind,
+                );
+            }
+            self.unlink_ignored_subtree(parent, name);
+            return Ok(());
+        }
+        if target_is_ignored {
+            let source_entry = self.meta.lookup(parent, name)?;
+            let source_attr = self.meta.get_attr(source_entry.ino)?;
+            let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
+                && self.ignored_directory_has_probable_trash_ancestor(new_parent);
+            if target_is_ignored_trash {
+                let ignored = self.create_ignored_entry(
+                    new_parent,
+                    new_name,
+                    source_attr.uid,
+                    source_attr.gid,
+                    source_attr.mode,
+                    source_attr.kind,
+                );
+                let _ = self.update_ignored_entry(ignored.ino, |attr| {
+                    attr.size = source_attr.size;
+                    attr.committed_size = source_attr.committed_size;
+                    attr.atime = source_attr.atime;
+                    attr.mtime = source_attr.mtime;
+                    attr.ctime = source_attr.ctime;
+                    attr.crtime = source_attr.crtime;
+                });
+                if source_attr.kind == FileType::RegularFile {
+                    self.evict_file_cache_only(source_attr.ino)?;
+                }
             }
             return self.unlink(parent, name);
         }
@@ -4737,6 +4909,22 @@ impl StudioVfs {
         Ok(trash_roots)
     }
 
+    fn ignored_directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> bool {
+        let mut current = dir_ino;
+        let mut hops = 0usize;
+        while current != 0 && hops < 1024 {
+            let Some(entry) = self.ignored_entry(current) else {
+                break;
+            };
+            if entry.parent == ROOT_INO && is_probable_trash_component(&entry.name) {
+                return true;
+            }
+            current = entry.parent;
+            hops += 1;
+        }
+        false
+    }
+
     /// Immediately evict a single block from every cache tier.
     ///
     /// Called by `truncate_blocks()` for each block that is removed by a
@@ -4779,7 +4967,7 @@ impl StudioVfs {
     /// Read file data at the given offset.
     /// Delegates to `read_into()` to avoid code duplication.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
-        if let Some(attr) = self.ignored_file_attr(ino) {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
             let end = (offset + size as u64).min(attr.size);
             let len = end.saturating_sub(offset) as usize;
             return Ok(Bytes::from(vec![0; len]));
@@ -4805,7 +4993,7 @@ impl StudioVfs {
     /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
     /// Returns the number of bytes written.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
-        if let Some(attr) = self.ignored_file_attr(ino) {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
             let end = (offset + buffer.len() as u64).min(attr.size);
             let len = end.saturating_sub(offset) as usize;
             if len > 0 {
@@ -5098,9 +5286,9 @@ impl StudioVfs {
     /// the final `flush()` only handles the last partial block, eliminating the
     /// end-of-write stall where all blocks were previously processed at once.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             let size = offset.saturating_add(data.len() as u64);
-            let _ = self.update_ignored_file(ino, |attr| {
+            let _ = self.update_ignored_entry(ino, |attr| {
                 if size > attr.size {
                     attr.size = size;
                     attr.committed_size = size;
@@ -5248,7 +5436,7 @@ impl StudioVfs {
     /// This handles only the remaining dirty blocks (typically just the last partial block).
     /// Remaining blocks are flushed in parallel for best performance.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
-        if self.ignored_file_attr(ino).is_some() {
+        if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
 

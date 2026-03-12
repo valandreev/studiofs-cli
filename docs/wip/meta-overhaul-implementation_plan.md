@@ -31,8 +31,8 @@
   * **Статус:** Done.
   * **Причина:** VFS теперь перехватывает `.DS_Store` и `._*`, оставляет их только как локальные ephemeral handles для Finder, и не пишет их в metadata/cache/S3.
 * **[SFS-11] Block macOS system metadata directories (.Spotlight-V100, .Trashes, .fseventsd)**
-  * **Статус:** Аналогично SFS-10.
-  * **Причина:** Декоративная блокировка мусорных папок Finder'а.
+  * **Статус:** Done.
+  * **Причина:** Root-level `mkdir` для этих директорий теперь возвращает ephemeral ignored directory inode, все вложенные операции идут в blackhole, а сами директории скрываются из `readdir` и не попадают в metadata/cache/S3.
 * **[SFS-12] Native xattr + Resource fork**
   * **Статус:** Оставить. Мастхэв для нативной работы под macOS. Полностью ложится в текущую схему `Redb`, и решает проблему AppleDouble (так как macOS будет писать resource forks прямо в xattr, а не в файлы `._*`, что автоматически закрывает половину SFS-10).
 
