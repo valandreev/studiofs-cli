@@ -244,6 +244,10 @@ fn validate_name(name: &[u8]) -> VfsResult<()> {
     Ok(())
 }
 
+fn is_probable_trash_component(name: &[u8]) -> bool {
+    matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
+}
+
 // =============================================================================
 // Constants & Configuration
 // =============================================================================
@@ -2817,6 +2821,10 @@ impl StudioVfs {
         out
     }
 
+    pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
+        self.block_cache.get_sync(object_id)
+    }
+
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
             pending_uploads: self.block_cache.pending_upload_count(),
@@ -4339,6 +4347,9 @@ impl StudioVfs {
             return Ok(());
         }
         validate_name(new_name)?;
+        let source_entry = self.meta.lookup(parent, name)?;
+        let moved_into_trash = source_entry.kind == FileType::RegularFile
+            && self.directory_has_probable_trash_ancestor(new_parent)?;
         let displaced_ino = self
             .meta
             .rename_atomic(parent, name, new_parent, new_name)?;
@@ -4376,6 +4387,10 @@ impl StudioVfs {
             self.state.dirty_attrs.lock().remove(&ino);
             self.state.attr_read_cache.lock().remove(&ino);
             self.clear_inode_incarnation(ino);
+        }
+
+        if moved_into_trash {
+            self.evict_file_cache_only(source_entry.ino)?;
         }
 
         // Invalidate source and dest parent directory caches
@@ -4460,6 +4475,65 @@ impl StudioVfs {
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
+    }
+
+    fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
+        let object_ids: Vec<u64> = self
+            .meta
+            .get_file_blocks(ino)?
+            .into_iter()
+            .map(|(_, block_ref)| block_ref.object_id)
+            .collect();
+        let mut evicted = 0;
+        let mut deferred_pinned = 0;
+        for object_id in object_ids {
+            if self.block_cache.is_pinned(object_id) {
+                self.state.pending_evictions.lock().insert(object_id);
+                deferred_pinned += 1;
+                continue;
+            }
+            self.block_cache.remove_sync(object_id);
+            evicted += 1;
+        }
+        if evicted > 0 || deferred_pinned > 0 {
+            info!(
+                "trash-move cache eviction: ino={} evicted {} blocks, deferred pinned={}",
+                ino, evicted, deferred_pinned
+            );
+        }
+        self.readahead.evict(ino);
+        Ok(())
+    }
+
+    fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {
+        let mut current = dir_ino;
+        let mut hops = 0usize;
+        while current != ROOT_INO && current != 0 && hops < 1024 {
+            let attr = self.meta.get_attr(current)?;
+            let parent = attr.parent;
+            if parent == 0 || parent == current {
+                break;
+            }
+            if let Some(name) = self.lookup_child_name(parent, current)? {
+                if is_probable_trash_component(&name) {
+                    return Ok(true);
+                }
+            } else {
+                break;
+            }
+            current = parent;
+            hops += 1;
+        }
+        Ok(false)
+    }
+
+    fn lookup_child_name(&self, parent: Ino, child: Ino) -> VfsResult<Option<Vec<u8>>> {
+        Ok(self
+            .meta
+            .readdir(parent)?
+            .into_iter()
+            .find(|entry| entry.ino == child)
+            .map(|entry| entry.name))
     }
 
     /// Immediately evict a single block from every cache tier.
@@ -6173,6 +6247,15 @@ mod tests {
             validate_name(b"file*name"),
             Err(VfsError::InvalidName(_))
         ));
+    }
+
+    #[test]
+    fn test_probable_trash_component_names() {
+        assert!(is_probable_trash_component(b".Trash"));
+        assert!(is_probable_trash_component(b".Trashes"));
+        assert!(is_probable_trash_component(b".Trash-501"));
+        assert!(!is_probable_trash_component(b"Trash"));
+        assert!(!is_probable_trash_component(b".Trashcan"));
     }
 
     #[test]
