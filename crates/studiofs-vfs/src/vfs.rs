@@ -266,30 +266,49 @@ impl<'a> NamespaceResolver<'a> {
             return self.vfs.getattr(ROOT_INO);
         }
 
-        if let Some(cached) = self.vfs.path_shortcut_cache_lookup(self.style, components) {
+        let cache_key = PathShortcutCacheKey::from_components(self.style, components);
+        let do_resolve = || -> VfsResult<InodeAttr> {
+            let mut current = ROOT_INO;
+            let mut attr = self.vfs.getattr(ROOT_INO)?;
+            let mut parent_tokens = Vec::with_capacity(components.len());
+            for component in components {
+                parent_tokens.push(PathShortcutParentToken {
+                    parent: current,
+                    generation: self.vfs.directory_generation(current),
+                });
+                match self.lookup_component(current, component.as_bytes()) {
+                    Ok(next_attr) => {
+                        current = next_attr.ino;
+                        attr = next_attr;
+                    }
+                    Err(err) if Self::is_entry_not_found(&err) => {
+                        if let Some(key) = cache_key.clone() {
+                            self.vfs.path_shortcut_cache_insert_negative_by_key(
+                                key,
+                                current,
+                                component.as_bytes(),
+                                parent_tokens,
+                            );
+                        }
+                        return Err(err);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if let Some(key) = cache_key.clone() {
+                self.vfs
+                    .path_shortcut_cache_insert_positive_by_key(key, attr.ino, parent_tokens);
+            }
+            Ok(attr)
+        };
+
+        if let Some(key) = &cache_key
+            && let Some(cached) = self.vfs.path_shortcut_cache_lookup_by_key(key)
+        {
             return match cached {
                 PathShortcutCacheValue::Positive(ino) => match self.vfs.getattr(ino) {
                     Ok(attr) => Ok(attr),
-                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                        let mut current = ROOT_INO;
-                        let mut attr = self.vfs.getattr(ROOT_INO)?;
-                        let mut parent_tokens = Vec::with_capacity(components.len());
-                        for component in components {
-                            parent_tokens.push(PathShortcutParentToken {
-                                parent: current,
-                                generation: self.vfs.directory_generation(current),
-                            });
-                            attr = self.lookup_component(current, component.as_bytes())?;
-                            current = attr.ino;
-                        }
-                        self.vfs.path_shortcut_cache_insert_positive(
-                            self.style,
-                            components,
-                            attr.ino,
-                            parent_tokens,
-                        );
-                        Ok(attr)
-                    }
+                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => do_resolve(),
                     Err(err) => Err(err),
                 },
                 PathShortcutCacheValue::Negative { parent, name } => {
@@ -298,40 +317,7 @@ impl<'a> NamespaceResolver<'a> {
             };
         }
 
-        let mut current = ROOT_INO;
-        let mut attr = self.vfs.getattr(ROOT_INO)?;
-        let mut parent_tokens = Vec::with_capacity(components.len());
-        for component in components {
-            parent_tokens.push(PathShortcutParentToken {
-                parent: current,
-                generation: self.vfs.directory_generation(current),
-            });
-            match self.lookup_component(current, component.as_bytes()) {
-                Ok(next_attr) => {
-                    current = next_attr.ino;
-                    attr = next_attr;
-                }
-                Err(err) if Self::is_entry_not_found(&err) => {
-                    self.vfs.path_shortcut_cache_insert_negative(
-                        self.style,
-                        components,
-                        current,
-                        component.as_bytes(),
-                        parent_tokens,
-                    );
-                    return Err(err);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        self.vfs.path_shortcut_cache_insert_positive(
-            self.style,
-            components,
-            attr.ino,
-            parent_tokens,
-        );
-        Ok(attr)
+        do_resolve()
     }
 
     pub fn lookup_component(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
@@ -2478,32 +2464,26 @@ impl StudioVfs {
             .unwrap_or(0)
     }
 
-    fn path_shortcut_cache_lookup(
+    fn path_shortcut_cache_lookup_by_key(
         &self,
-        style: NamespacePathStyle,
-        components: &[String],
+        key: &PathShortcutCacheKey,
     ) -> Option<PathShortcutCacheValue> {
-        let key = PathShortcutCacheKey::from_components(style, components)?;
         let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
         let generations = self.state.directory_generations.lock();
         self.state
             .path_shortcut_cache
             .lock()
-            .get(&key, namespace_epoch, |parent| {
+            .get(key, namespace_epoch, |parent| {
                 generations.get(&parent).copied().unwrap_or(0)
             })
     }
 
-    fn path_shortcut_cache_insert_positive(
+    fn path_shortcut_cache_insert_positive_by_key(
         &self,
-        style: NamespacePathStyle,
-        components: &[String],
+        key: PathShortcutCacheKey,
         child_ino: Ino,
         parent_tokens: Vec<PathShortcutParentToken>,
     ) {
-        let Some(key) = PathShortcutCacheKey::from_components(style, components) else {
-            return;
-        };
         let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
         self.state.path_shortcut_cache.lock().put(
             key,
@@ -2513,17 +2493,13 @@ impl StudioVfs {
         );
     }
 
-    fn path_shortcut_cache_insert_negative(
+    fn path_shortcut_cache_insert_negative_by_key(
         &self,
-        style: NamespacePathStyle,
-        components: &[String],
+        key: PathShortcutCacheKey,
         parent: Ino,
         name: &[u8],
         parent_tokens: Vec<PathShortcutParentToken>,
     ) {
-        let Some(key) = PathShortcutCacheKey::from_components(style, components) else {
-            return;
-        };
         let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
         self.state.path_shortcut_cache.lock().put(
             key,
