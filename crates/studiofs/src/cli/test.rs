@@ -22,7 +22,7 @@ type HmacSha256 = Hmac<Sha256>;
 // ── Payload sizes ─────────────────────────────────────────────────────────────
 
 /// 1 KB — typical metadata object (manifest counter, inode counter).
-const SMALL_SIZE: usize = 1 * 1024;
+const SMALL_SIZE: usize = 1024;
 /// 4 MB — large data object probe for throughput checks.
 const LARGE_SIZE: usize = 4 * 1024 * 1024;
 
@@ -432,8 +432,10 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
                     anyhow!("skipped — preceding ETag test failed; cannot test CAS update")
                 })?;
 
-                let mut opts = WriteOptions::default();
-                opts.if_match = Some(etag);
+                let opts = WriteOptions {
+                    if_match: Some(etag),
+                    ..WriteOptions::default()
+                };
 
                 let new_payload = Bytes::from(b"{\"version\":1,\"seq\":1}\n".to_vec());
                 op2.write_options(&k, new_payload, opts)
@@ -461,8 +463,10 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
             "conditional PUT If-Match: <wrong-etag> → must reject (412)",
             Some("prevents lost-update races; must return 412 PreconditionFailed"),
             async move {
-                let mut opts = WriteOptions::default();
-                opts.if_match = Some("wrong-etag-aabbccdd".to_string());
+                let opts = WriteOptions {
+                    if_match: Some("wrong-etag-aabbccdd".to_string()),
+                    ..WriteOptions::default()
+                };
 
                 let payload = Bytes::from(b"{\"version\":1,\"seq\":99}\n".to_vec());
                 match op2.write_options(&k, payload, opts).await {
@@ -491,8 +495,10 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
             "conditional PUT If-None-Match: * on new key → must succeed",
             Some("used when writing the inode/block counter for the first time"),
             async move {
-                let mut opts = WriteOptions::default();
-                opts.if_not_exists = true;
+                let opts = WriteOptions {
+                    if_not_exists: true,
+                    ..WriteOptions::default()
+                };
 
                 let payload = Bytes::from(b"1000\n".to_vec());
                 op2.write_options(&k, payload, opts)
@@ -514,8 +520,10 @@ async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>
             "conditional PUT If-None-Match: * on existing key → must reject (412)",
             Some("first-writer-wins gate; must prevent double-initialisation"),
             async move {
-                let mut opts = WriteOptions::default();
-                opts.if_not_exists = true;
+                let opts = WriteOptions {
+                    if_not_exists: true,
+                    ..WriteOptions::default()
+                };
 
                 let payload = Bytes::from(b"9999\n".to_vec());
                 match op2.write_options(&k, payload, opts).await {
@@ -771,6 +779,7 @@ fn fmt_datetime_now() -> (String, String) {
     (datetime, date)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_signed_headers(
     method: &str,
     endpoint_url: &str,

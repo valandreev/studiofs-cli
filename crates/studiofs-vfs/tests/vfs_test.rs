@@ -76,9 +76,7 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         secret_key: secret_key.clone(),
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
-        metadata: MetadataConfig {
-            ..MetadataConfig::default()
-        },
+        metadata: MetadataConfig::default(),
         block_size: 4 * 1024 * 1024, // 4 MiB
     }
 }
@@ -373,7 +371,6 @@ fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatIn
                 url: dsn.to_string(),
                 volume_id,
             }),
-            ..MetadataConfig::default()
         },
         block_size: 4 * 1024 * 1024,
     }
@@ -5772,16 +5769,17 @@ async fn test_statfs_after_write() {
 // Phase 8 — Notes On PG Sync Coverage
 // =============================================================================
 
-/// PG convergence and remote-visible metadata semantics are primarily covered in
-/// `studiofs-meta::pg_engine` ignored tests now:
-/// - checkpoint bootstrap
-/// - delta pull by batch version
-/// - committed-vs-staged block visibility
-/// - overlay conflict handling
-///
-/// The VFS ignored suite below focuses on end-to-end data path correctness:
-/// reads, writes, truncation, crash recovery, upload completion, and cache
-/// behavior on top of the local metadata serving model.
+// PG convergence and remote-visible metadata semantics are primarily covered in
+// `studiofs-meta::pg_engine` ignored tests now:
+// - checkpoint bootstrap
+// - delta pull by batch version
+// - committed-vs-staged block visibility
+// - overlay conflict handling
+//
+// The VFS ignored suite below focuses on end-to-end data path correctness:
+// reads, writes, truncation, crash recovery, upload completion, and cache
+// behavior on top of the local metadata serving model.
+
 // =============================================================================
 // Phase 9 — Deep Integration & Edge-Case Tests
 // =============================================================================
@@ -6693,8 +6691,9 @@ async fn test_open_trunc_clears_data() {
 
 // ─── 9.6 Multi-Client metadata sync Integration ─────────────────────────────────────
 
-/// Multi-client metadata convergence coverage now lives in `studiofs-meta`
-/// PostgreSQL tests. VFS integration below stays focused on local FS semantics.
+// Multi-client metadata convergence coverage now lives in `studiofs-meta`
+// PostgreSQL tests. VFS integration below stays focused on local FS semantics.
+
 // ─── 9.7 Attribute & Metadata Edge Cases ───────────────────────────────────
 
 /// Setattr mode/uid/gid/times on a directory (not just files).
@@ -6708,15 +6707,19 @@ async fn test_setattr_on_directory() {
     let dir = vfs.mkdir(1, b"mydir", 0, 0, 0o755).unwrap();
 
     // Change mode.
-    let mut args = SetattrArgs::default();
-    args.mode = Some(0o700);
+    let args = SetattrArgs {
+        mode: Some(0o700),
+        ..SetattrArgs::default()
+    };
     let updated = vfs.setattr(dir.ino, args).unwrap();
     assert_eq!(updated.mode & 0o777, 0o700);
 
     // Change uid/gid.
-    let mut args = SetattrArgs::default();
-    args.uid = Some(1000);
-    args.gid = Some(1000);
+    let args = SetattrArgs {
+        uid: Some(1000),
+        gid: Some(1000),
+        ..SetattrArgs::default()
+    };
     let updated = vfs.setattr(dir.ino, args).unwrap();
     assert_eq!(updated.uid, 1000);
     assert_eq!(updated.gid, 1000);
@@ -6938,11 +6941,12 @@ async fn test_flock_shared_then_exclusive_conflict() {
 
 // ─── 9.10 Multi-Client Visibility Smoke Tests ──────────────────────────────
 
-/// Writer creates a deeply nested directory tree, reader can traverse the full path.
-/// Writer creates a large file (multi-block), reader reads and verifies integrity.
-/// Writer does setattr (chmod, chown), reader sees updated attributes via metadata sync.
-/// Writer creates symlink, reader resolves it.
-/// Writer creates hardlink, reader sees it and reads shared data.
+// Writer creates a deeply nested directory tree, reader can traverse the full path.
+// Writer creates a large file (multi-block), reader reads and verifies integrity.
+// Writer does setattr (chmod, chown), reader sees updated attributes via metadata sync.
+// Writer creates symlink, reader resolves it.
+// Writer creates hardlink, reader sees it and reads shared data.
+
 // ─── 9.11 Shutdown & Drain Tests ────────────────────────────────────────────
 
 /// Shutdown after writes should drain dirty buffers and persist metadata.

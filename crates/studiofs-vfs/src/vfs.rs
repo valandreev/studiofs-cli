@@ -929,6 +929,10 @@ struct IngressStateFile {
     next_seq: u64,
 }
 
+type RecoveredIngressMap = HashMap<(Ino, u32), RecoveredIngressRecord>;
+type RecoveredSpillMap = HashMap<(Ino, u32), SpillEntry>;
+type RecoveredSpillState = (RecoveredSpillMap, usize, u64, u64);
+
 fn oldest_spill_age_ms(
     now_ms: u64,
     spill: &std::collections::HashMap<(Ino, u32), SpillEntry>,
@@ -940,6 +944,7 @@ fn oldest_spill_age_ms(
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingress_checkpoint_due_with_policy(
     pending_bytes: u64,
     pending_mutations: u64,
@@ -1202,7 +1207,7 @@ fn append_ingress_record(
 
 fn replay_ingress_segment_records(
     segment_dir: &std::path::Path,
-    recovered: &mut HashMap<(Ino, u32), RecoveredIngressRecord>,
+    recovered: &mut RecoveredIngressMap,
     next_seq: &mut u64,
     resume_after: Option<(u64, u64)>,
 ) -> VfsResult<()> {
@@ -1301,24 +1306,17 @@ fn replay_ingress_segment_records(
 #[cfg(test)]
 fn recover_ingress_segment_records(
     segment_dir: &std::path::Path,
-) -> VfsResult<(HashMap<(Ino, u32), RecoveredIngressRecord>, u64)> {
-    let mut recovered = HashMap::<(Ino, u32), RecoveredIngressRecord>::new();
+) -> VfsResult<(RecoveredIngressMap, u64)> {
+    let mut recovered = RecoveredIngressMap::new();
     let mut next_seq = 1u64;
     replay_ingress_segment_records(segment_dir, &mut recovered, &mut next_seq, None)?;
     Ok((recovered, next_seq))
 }
 
-fn recover_spill_dir(
-    spill_dir: &std::path::Path,
-) -> VfsResult<(
-    std::collections::HashMap<(Ino, u32), SpillEntry>,
-    usize,
-    u64,
-    u64,
-)> {
+fn recover_spill_dir(spill_dir: &std::path::Path) -> VfsResult<RecoveredSpillState> {
     let segment_dir = spill_dir.join("segments");
     let checkpoint_dir = spill_dir.join("checkpoints");
-    let mut recovered = HashMap::<(Ino, u32), RecoveredIngressRecord>::new();
+    let mut recovered = RecoveredIngressMap::new();
     let mut next_seq = 1u64;
     let mut active_segment_id = INITIAL_INGRESS_SEGMENT_ID;
     let mut resume_after = None;
@@ -1347,7 +1345,7 @@ fn recover_spill_dir(
     replay_ingress_segment_records(&segment_dir, &mut recovered, &mut next_seq, resume_after)?;
 
     let mut total_bytes = 0usize;
-    let mut spill_entries = std::collections::HashMap::new();
+    let mut spill_entries = RecoveredSpillMap::new();
     for (key, record) in recovered {
         let spill = SpillEntry {
             seq: record.seq,
@@ -1981,8 +1979,7 @@ impl StudioVfs {
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
-            let (block_cache, upload_rx) =
-                BlockCache::open(cache_config).map_err(|e| VfsError::Io(e))?;
+            let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
             block_cache.spawn_background_tasks();
 
             // Init ReadAhead tracker + prefetch channel
@@ -3071,7 +3068,7 @@ impl StudioVfs {
         });
 
         if state.pending_incarnation.is_none() {
-            let committed = state.committed_incarnation.clone().or_else(|| {
+            let committed = state.committed_incarnation.clone().or({
                 if attr.committed_size == 0 {
                     None
                 } else {
@@ -3137,11 +3134,10 @@ impl StudioVfs {
             || attr.size != attr.committed_size;
 
         let next_state = if needs_pending {
-            let committed = if previous.pending_incarnation.is_some() {
-                previous.committed_incarnation.clone()
-            } else if previous.committed_incarnation.is_some()
-                && previous.upload_state != VfsUploadState::Idle
-            {
+            let keep_previous_committed = previous.pending_incarnation.is_some()
+                || (previous.committed_incarnation.is_some()
+                    && previous.upload_state != VfsUploadState::Idle);
+            let committed = if keep_previous_committed {
                 previous.committed_incarnation.clone()
             } else if attr.committed_size == 0
                 && previous.committed_incarnation.is_none()
@@ -3613,8 +3609,10 @@ impl StudioVfs {
         let lease_until = now.saturating_add(self.janitor_lease_ttl.as_secs() as i64);
 
         let create_payload = Self::encode_lease_record(&lease.owner_id, lease_until, 1);
-        let mut create_opts = WriteOptions::default();
-        create_opts.if_not_exists = true;
+        let create_opts = WriteOptions {
+            if_not_exists: true,
+            ..WriteOptions::default()
+        };
         match lease
             .op
             .write_options(&lease.lock_path, create_payload, create_opts)
@@ -4400,10 +4398,9 @@ impl StudioVfs {
         if attr.kind == studiofs_meta::types::FileType::RegularFile
             && attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
+            && self.readahead.start_prefetch(ino, 0)
         {
-            if self.readahead.start_prefetch(ino, 0) {
-                let _ = self.prefetch_tx.send((ino, 0));
-            }
+            let _ = self.prefetch_tx.send((ino, 0));
         }
 
         Ok(fh)
@@ -4503,7 +4500,12 @@ impl StudioVfs {
         self.flush(ino).await?;
 
         // If full fsync (not datasync), also persist dirty attributes to redb
-        if !datasync && let Some(attr) = self.state.dirty_attrs.lock().remove(&ino) {
+        let dirty_attr = if datasync {
+            None
+        } else {
+            self.state.dirty_attrs.lock().remove(&ino)
+        };
+        if let Some(attr) = dirty_attr {
             let meta = self.meta.clone();
             run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.set_attr(&attr)

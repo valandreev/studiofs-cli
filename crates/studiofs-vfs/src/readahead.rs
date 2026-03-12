@@ -117,7 +117,7 @@ impl ReadAheadTracker {
             .min(MAX_SCORE as u32) as u8;
 
         if is_sequential {
-            state.score = state.score.saturating_add(seq_gain).min(MAX_SCORE);
+            state.score = state.score.saturating_add(seq_gain);
         } else if is_same_block {
             // Keep score as-is.
         } else {
