@@ -72,11 +72,15 @@ The current architecture relies on these focused regressions:
 - path shortcut cache:
   - `path_shortcut_cache_is_bounded_and_supports_negative_entries`
   - `path_shortcut_cache_rejects_stale_parent_generations`
+  - `path_shortcut_cache_tracks_hotset_occupancy_and_hits`
   - `namespace_resolver_path_shortcut_hits_and_renames_invalidate`
   - `namespace_resolver_path_shortcut_invalidation_on_delete_subtree`
 - namespace cache invalidation tokens:
   - `dentry_cache_rejects_stale_namespace_tokens_lazily`
   - `setattr_does_not_bump_namespace_generations`
+- metadata hotset promotion:
+  - `dentry_cache_tracks_hotset_occupancy_and_hits`
+  - `attr_read_cache_is_bounded_and_tracks_hotset_hits`
 
 Run a single focused regression:
 
