@@ -476,6 +476,8 @@ const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 32;
 const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 96;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
+const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
+const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
 const DEFAULT_UPLOAD_DELAY_MS: u64 = 2000;
 const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 5000;
 const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
@@ -2683,6 +2685,8 @@ pub struct StudioVfs {
     janitor_lease_ttl: Duration,
     prefetch_concurrency: usize,
     dir_prefetch_max_batch: usize,
+    readdir_attr_batch_chunk: usize,
+    readdir_attr_batch_max_inodes: usize,
     prefetch_foreground_reserve: usize,
     prefetch_max_per_cycle: usize,
     prefetch_pause_on_neterr: Duration,
@@ -3144,6 +3148,17 @@ impl StudioVfs {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_DIR_PREFETCH_MAX_BATCH);
+            let readdir_attr_batch_chunk = std::env::var("STUDIOFS_READDIR_ATTR_BATCH_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READDIR_ATTR_BATCH_CHUNK);
+            let readdir_attr_batch_max_inodes =
+                std::env::var("STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_READDIR_ATTR_BATCH_MAX_INODES);
             let prefetch_foreground_reserve_default =
                 (prefetch_concurrency / 2).clamp(16, (buffer_blocks_default as usize).max(16));
             let prefetch_foreground_reserve = std::env::var("STUDIOFS_PREFETCH_FOREGROUND_RESERVE")
@@ -3502,6 +3517,8 @@ impl StudioVfs {
                 path_shortcut_cache_bytes,
                 attr_read_cache_capacity,
                 attr_read_cache_bytes,
+                readdir_attr_batch_chunk,
+                readdir_attr_batch_max_inodes,
                 "upload pipeline v2 enabled"
             );
 
@@ -3622,6 +3639,8 @@ impl StudioVfs {
                 janitor_lease_ttl,
                 prefetch_concurrency,
                 dir_prefetch_max_batch,
+                readdir_attr_batch_chunk,
+                readdir_attr_batch_max_inodes,
                 prefetch_foreground_reserve,
                 prefetch_max_per_cycle,
                 prefetch_pause_on_neterr,
@@ -5646,8 +5665,54 @@ impl StudioVfs {
         if !file_children.is_empty() {
             self.dir_prefetch.on_readdir(ino, file_children);
         }
+        self.hydrate_readdir_attr_cache(&entries);
 
         Ok(entries)
+    }
+
+    fn hydrate_readdir_attr_cache(&self, entries: &[DirEntry]) {
+        if entries.is_empty()
+            || self.readdir_attr_batch_chunk == 0
+            || self.readdir_attr_batch_max_inodes == 0
+        {
+            return;
+        }
+
+        let mut inodes = Vec::with_capacity(entries.len().min(self.readdir_attr_batch_max_inodes));
+        for entry in entries.iter().take(self.readdir_attr_batch_max_inodes) {
+            if self.ignored_entry_attr(entry.ino).is_some() {
+                continue;
+            }
+            inodes.push(entry.ino);
+        }
+        if inodes.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        for chunk in inodes.chunks(self.readdir_attr_batch_chunk) {
+            let attrs = match self.meta.get_attrs_batch(chunk) {
+                Ok(attrs) => attrs,
+                Err(err) => {
+                    debug!(
+                        chunk_len = chunk.len(),
+                        error = %err,
+                        "readdir attr hydration batch failed"
+                    );
+                    break;
+                }
+            };
+
+            for attr in attrs {
+                if self.state.dirty_attrs.lock().contains_key(&attr.ino) {
+                    continue;
+                }
+                self.state
+                    .attr_read_cache
+                    .lock()
+                    .put(attr.ino, attr, ATTR_CACHE_TTL, now);
+            }
+        }
     }
 
     // =========================================================================
@@ -8770,6 +8835,41 @@ mod tests {
         assert!(metrics.protected_occupancy_entries >= 1);
         assert!(metrics.protected_hits >= 1);
         assert!(metrics.hot_hit_ratio() > 0.0);
+    }
+
+    #[test]
+    fn readdir_hydrates_attr_cache_for_followup_getattr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "readdir-attr-hydration");
+        let created = vfs
+            .create(ROOT_INO, b"batch-stat.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let entries = vfs.readdir(ROOT_INO).expect("readdir root");
+        assert!(
+            entries.iter().any(|entry| entry.ino == created.ino),
+            "test file should be visible in root readdir"
+        );
+
+        let cached_after_readdir = vfs
+            .state
+            .attr_read_cache
+            .lock()
+            .entries
+            .contains_key(&created.ino);
+        assert!(
+            cached_after_readdir,
+            "readdir should hydrate attr cache for listed children"
+        );
+
+        let before = vfs.attr_read_cache_metrics();
+        let loaded = vfs.getattr(created.ino).expect("getattr");
+        let after = vfs.attr_read_cache_metrics();
+        assert_eq!(loaded.ino, created.ino);
+        assert!(
+            after.hits > before.hits,
+            "follow-up getattr should hit attr cache after readdir hydration"
+        );
     }
 
     #[test]

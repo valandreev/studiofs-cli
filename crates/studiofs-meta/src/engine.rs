@@ -170,6 +170,18 @@ pub trait MetaEngine: Send + Sync {
     /// Get inode attributes.
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>;
 
+    /// Batch-fetch inode attributes.
+    ///
+    /// Default implementation calls [`MetaEngine::get_attr`] for each inode in
+    /// order and returns results in the same order as `inos`.
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        let mut attrs = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            attrs.push(self.get_attr(ino)?);
+        }
+        Ok(attrs)
+    }
+
     /// Set (create or update) inode attributes.
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>;
 

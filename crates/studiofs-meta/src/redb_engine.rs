@@ -318,6 +318,107 @@ impl RedbMetaEngine {
             .transpose()
     }
 
+    fn local_overlay_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
+        let mut overlay = HashSet::new();
+
+        let file_blocks = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let committed = txn
+            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in file_blocks
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (ino, _block_index) = decode_file_block_key(key.value());
+            let committed_value = committed
+                .get(key.value())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            match committed_value {
+                Some(committed_value) if committed_value.value() == value.value() => {}
+                _ => {
+                    overlay.insert(ino);
+                }
+            }
+        }
+
+        Ok(overlay)
+    }
+
+    fn local_overlay_attr_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
+        let current = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut overlay = HashSet::new();
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, current_bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let ino = ino.value();
+            match base
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_bytes) if base_bytes.value() == current_bytes.value() => {}
+                _ => {
+                    overlay.insert(ino);
+                }
+            }
+        }
+
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(ino.value());
+        }
+
+        Ok(overlay)
+    }
+
+    fn resolve_attr_in_read_snapshot(
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+        overlay_block_inodes: &HashSet<Ino>,
+        overlay_attr_inodes: &HashSet<Ino>,
+    ) -> MetaResult<InodeAttr> {
+        if Self::has_u64_marker(txn, INODE_TOMBSTONES_TABLE, ino)? {
+            return Err(MetaError::InodeNotFound(ino));
+        }
+
+        if overlay_attr_inodes.contains(&ino) {
+            return Self::get_attr_from_table(txn, INODES_TABLE, ino)?
+                .ok_or(MetaError::InodeNotFound(ino));
+        }
+
+        if overlay_block_inodes.contains(&ino) {
+            if let Some(attr) = Self::get_attr_from_table(txn, INODES_TABLE, ino)? {
+                return Ok(attr);
+            }
+            if let Some(attr) = Self::get_attr_from_table(txn, BASE_INODES_TABLE, ino)? {
+                return Ok(attr);
+            }
+            return Err(MetaError::InodeNotFound(ino));
+        }
+
+        if let Some(attr) = Self::get_attr_from_table(txn, BASE_INODES_TABLE, ino)? {
+            return Ok(attr);
+        }
+
+        Self::get_attr_from_table(txn, INODES_TABLE, ino)?.ok_or(MetaError::InodeNotFound(ino))
+    }
+
     fn lookup_in_table(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -1322,33 +1423,7 @@ impl RedbMetaEngine {
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut overlay = HashSet::new();
-
-        let file_blocks = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        for row in file_blocks
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (ino, _block_index) = decode_file_block_key(key.value());
-            let committed_value = committed
-                .get(key.value())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            match committed_value {
-                Some(committed_value) if committed_value.value() == value.value() => {}
-                _ => {
-                    overlay.insert(ino);
-                }
-            }
-        }
-
-        Ok(overlay)
+        Self::local_overlay_inodes_from_txn(&txn)
     }
 
     /// Returns inode attrs that diverged from the last imported/applied base view.
@@ -1357,44 +1432,7 @@ impl RedbMetaEngine {
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let current = txn
-            .open_table(INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let base = txn
-            .open_table(BASE_INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let tombstones = txn
-            .open_table(INODE_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut overlay = HashSet::new();
-        for row in current
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (ino, current_bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let ino = ino.value();
-            match base
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(base_bytes) if base_bytes.value() == current_bytes.value() => {}
-                _ => {
-                    overlay.insert(ino);
-                }
-            }
-        }
-
-        for row in tombstones
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (ino, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            overlay.insert(ino.value());
-        }
-
-        Ok(overlay)
+        Self::local_overlay_attr_inodes_from_txn(&txn)
     }
 
     /// Returns dentry keys `(parent, name)` that diverged from the base namespace.
@@ -2588,32 +2626,31 @@ impl MetaEngine for RedbMetaEngine {
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if Self::has_u64_marker(&txn, INODE_TOMBSTONES_TABLE, ino)? {
-            return Err(MetaError::InodeNotFound(ino));
-        }
-        let overlay_block_inodes = self.local_overlay_inodes()?;
-        let overlay_attr_inodes = self.local_overlay_attr_inodes()?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
+    }
 
-        if overlay_attr_inodes.contains(&ino) {
-            return Self::get_attr_from_table(&txn, INODES_TABLE, ino)?
-                .ok_or(MetaError::InodeNotFound(ino));
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        if inos.is_empty() {
+            return Ok(Vec::new());
         }
-
-        if overlay_block_inodes.contains(&ino) {
-            if let Some(attr) = Self::get_attr_from_table(&txn, INODES_TABLE, ino)? {
-                return Ok(attr);
-            }
-            if let Some(attr) = Self::get_attr_from_table(&txn, BASE_INODES_TABLE, ino)? {
-                return Ok(attr);
-            }
-            return Err(MetaError::InodeNotFound(ino));
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        let mut attrs = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            attrs.push(Self::resolve_attr_in_read_snapshot(
+                &txn,
+                ino,
+                &overlay_block_inodes,
+                &overlay_attr_inodes,
+            )?);
         }
-
-        if let Some(attr) = Self::get_attr_from_table(&txn, BASE_INODES_TABLE, ino)? {
-            return Ok(attr);
-        }
-
-        Self::get_attr_from_table(&txn, INODES_TABLE, ino)?.ok_or(MetaError::InodeNotFound(ino))
+        Ok(attrs)
     }
 
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
@@ -4505,6 +4542,22 @@ mod tests {
         let entries = engine.readdir(ROOT_INO).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, b"subdir");
+    }
+
+    #[test]
+    fn test_get_attrs_batch_returns_ordered_attrs() {
+        let engine = temp_engine();
+        let a = engine
+            .create_file(ROOT_INO, b"a.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let b = engine
+            .create_file(ROOT_INO, b"b.txt", 1000, 1000, 0o644)
+            .unwrap();
+
+        let attrs = engine.get_attrs_batch(&[b.ino, a.ino]).unwrap();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].ino, b.ino);
+        assert_eq!(attrs[1].ino, a.ino);
     }
 
     #[test]
