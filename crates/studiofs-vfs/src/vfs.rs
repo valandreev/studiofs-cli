@@ -3776,6 +3776,10 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    pub fn resolve_path_components(&self, components: &[&[u8]]) -> VfsResult<InodeAttr> {
+        self.meta.resolve_path(components).map_err(Into::into)
+    }
+
     async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
         if let Some(attr) = self.ignored_entry_attr(ino) {
             return Ok(attr);

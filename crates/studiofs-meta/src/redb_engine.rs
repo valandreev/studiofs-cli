@@ -4,10 +4,12 @@
 
 use crate::engine::*;
 use crate::types::*;
+use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 // ─── Table Definitions ──────────────────────────────────────────────────────
@@ -160,6 +162,23 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Arc<Database>,
+    path_shortcuts: Mutex<PathShortcutCache>,
+    path_shortcut_hits: AtomicU64,
+    path_shortcut_misses: AtomicU64,
+}
+
+#[derive(Default)]
+struct PathShortcutCache {
+    by_path: HashMap<Vec<u8>, PathShortcutEntry>,
+    by_lookup: HashMap<(Ino, Vec<u8>), HashSet<Vec<u8>>>,
+}
+
+#[derive(Clone)]
+struct PathShortcutEntry {
+    ino: Ino,
+    lineage: Vec<Ino>,
+    parent: Ino,
+    name: Vec<u8>,
 }
 
 impl RedbMetaEngine {
@@ -196,7 +215,12 @@ impl RedbMetaEngine {
         }
 
         debug!("opened metadata database at {:?}", path.as_ref());
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            path_shortcuts: Mutex::new(PathShortcutCache::default()),
+            path_shortcut_hits: AtomicU64::new(0),
+            path_shortcut_misses: AtomicU64::new(0),
+        })
     }
 
     /// Initialize a fresh filesystem with root inode.
@@ -220,6 +244,148 @@ impl RedbMetaEngine {
 
         debug!("initialized root inode");
         Ok(())
+    }
+
+    fn path_key(components: &[&[u8]]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(
+            1 + components
+                .iter()
+                .map(|component| component.len() + 1)
+                .sum::<usize>(),
+        );
+        key.push(b'/');
+        for (idx, component) in components.iter().enumerate() {
+            if idx > 0 {
+                key.push(b'/');
+            }
+            key.extend_from_slice(component);
+        }
+        key
+    }
+
+    fn clear_path_shortcuts(&self) {
+        *self.path_shortcuts.lock() = PathShortcutCache::default();
+    }
+
+    fn remove_shortcut_path_locked(cache: &mut PathShortcutCache, path: &[u8]) {
+        let Some(entry) = cache.by_path.remove(path) else {
+            return;
+        };
+        let lookup_key = (entry.parent, entry.name);
+
+        let should_remove_lookup = if let Some(paths) = cache.by_lookup.get_mut(&lookup_key) {
+            paths.remove(path);
+            paths.is_empty()
+        } else {
+            false
+        };
+        if should_remove_lookup {
+            cache.by_lookup.remove(&lookup_key);
+        }
+    }
+
+    fn cache_shortcut_path(
+        &self,
+        path: Vec<u8>,
+        parent: Ino,
+        name: &[u8],
+        ino: Ino,
+        lineage: &[Ino],
+    ) {
+        let mut cache = self.path_shortcuts.lock();
+        Self::remove_shortcut_path_locked(&mut cache, &path);
+        cache
+            .by_lookup
+            .entry((parent, name.to_vec()))
+            .or_default()
+            .insert(path.clone());
+        cache.by_path.insert(
+            path,
+            PathShortcutEntry {
+                ino,
+                lineage: lineage.to_vec(),
+                parent,
+                name: name.to_vec(),
+            },
+        );
+    }
+
+    fn invalidate_path_shortcuts_for_lookup(&self, parent: Ino, name: &[u8]) {
+        let mut cache = self.path_shortcuts.lock();
+        let paths = cache
+            .by_lookup
+            .remove(&(parent, name.to_vec()))
+            .unwrap_or_default();
+        for path in paths {
+            cache.by_path.remove(&path);
+        }
+    }
+
+    fn invalidate_path_shortcuts_for_inode(&self, ino: Ino) {
+        let mut cache = self.path_shortcuts.lock();
+        let paths_to_remove: Vec<Vec<u8>> = cache
+            .by_path
+            .iter()
+            .filter(|(_, entry)| entry.lineage.contains(&ino))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths_to_remove {
+            Self::remove_shortcut_path_locked(&mut cache, &path);
+        }
+    }
+
+    fn invalidate_path_shortcuts_for_events(&self, events: &[crate::events::MetaEvent]) {
+        for event in events {
+            match event {
+                crate::events::MetaEvent::RemoveAttr { ino } => {
+                    self.invalidate_path_shortcuts_for_inode(*ino);
+                }
+                crate::events::MetaEvent::RemoveEntry { parent, name } => {
+                    self.invalidate_path_shortcuts_for_lookup(*parent, name);
+                }
+                crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    ..
+                } => {
+                    self.invalidate_path_shortcuts_for_lookup(*parent, name);
+                    self.invalidate_path_shortcuts_for_lookup(*new_parent, new_name);
+                    self.invalidate_path_shortcuts_for_inode(entry.ino);
+                    if let Some(attr) = displaced_set_attr {
+                        self.invalidate_path_shortcuts_for_inode(attr.ino);
+                    }
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        self.invalidate_path_shortcuts_for_inode(*ino);
+                    }
+                }
+                crate::events::MetaEvent::SetAttr { .. }
+                | crate::events::MetaEvent::AddEntry { .. }
+                | crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::RemoveFileBlock { .. }
+                | crate::events::MetaEvent::RemoveFileBlocks { .. }
+                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
+                | crate::events::MetaEvent::CommitFileBlock { .. }
+                | crate::events::MetaEvent::PublishFileManifest { .. }
+                | crate::events::MetaEvent::AddPendingDeletion { .. }
+                | crate::events::MetaEvent::RemovePendingDeletion { .. }
+                | crate::events::MetaEvent::SetSymlinkTarget { .. }
+                | crate::events::MetaEvent::SetXattr { .. }
+                | crate::events::MetaEvent::RemoveXattr { .. } => {}
+            }
+        }
+    }
+
+    pub fn path_shortcut_cache_stats(&self) -> (u64, u64, usize) {
+        (
+            self.path_shortcut_hits.load(Ordering::Relaxed),
+            self.path_shortcut_misses.load(Ordering::Relaxed),
+            self.path_shortcuts.lock().by_path.len(),
+        )
     }
 
     /// Append a MetaEvent to the local event log table within an existing write transaction.
@@ -1891,6 +2057,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.clear_path_shortcuts();
         Ok(())
     }
 
@@ -2075,6 +2242,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_events(events);
         Ok(())
     }
 
@@ -2263,6 +2431,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_events(events);
         Ok(())
     }
 
@@ -2383,6 +2552,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_events(events);
         Ok(())
     }
 
@@ -2421,6 +2591,9 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
+        self.invalidate_path_shortcuts_for_lookup(new_parent, new_name);
+        self.invalidate_path_shortcuts_for_inode(entry.ino);
         Ok(())
     }
 }
@@ -2645,6 +2818,7 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_inode(attr.ino);
         Ok(())
     }
 
@@ -2662,6 +2836,7 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_inode(ino);
         Ok(())
     }
 
@@ -2698,6 +2873,45 @@ impl MetaEngine for RedbMetaEngine {
             parent,
             name: String::from_utf8_lossy(name).to_string(),
         })
+    }
+
+    fn resolve_path(&self, components: &[&[u8]]) -> MetaResult<InodeAttr> {
+        if components.is_empty() {
+            return self.get_attr(ROOT_INO);
+        }
+
+        let full_path = Self::path_key(components);
+        if let Some(ino) = self
+            .path_shortcuts
+            .lock()
+            .by_path
+            .get(&full_path)
+            .map(|entry| entry.ino)
+        {
+            self.path_shortcut_hits.fetch_add(1, Ordering::Relaxed);
+            match self.get_attr(ino) {
+                Ok(attr) => return Ok(attr),
+                Err(_) => self.invalidate_path_shortcuts_for_inode(ino),
+            }
+        }
+
+        self.path_shortcut_misses.fetch_add(1, Ordering::Relaxed);
+        let mut current = ROOT_INO;
+        let mut attr = self.get_attr(ROOT_INO)?;
+        let mut lineage = Vec::with_capacity(components.len());
+
+        for depth in 0..components.len() {
+            let component = components[depth];
+            let parent = current;
+            let entry = self.lookup(parent, component)?;
+            current = entry.ino;
+            lineage.push(current);
+            attr = self.get_attr(current)?;
+            let path = Self::path_key(&components[..=depth]);
+            self.cache_shortcut_path(path, parent, component, current, &lineage);
+        }
+
+        Ok(attr)
     }
 
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
@@ -2796,6 +3010,8 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
+        self.invalidate_path_shortcuts_for_inode(entry.ino);
         Ok(())
     }
 
@@ -2818,6 +3034,8 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
+        self.invalidate_path_shortcuts_for_inode(entry_val.ino);
         Ok(entry_val)
     }
     // --- File Blocks -----------------------------------------------------
@@ -3706,6 +3924,12 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
+        self.invalidate_path_shortcuts_for_lookup(new_parent, new_name);
+        self.invalidate_path_shortcuts_for_inode(src_entry.ino);
+        if let Some(ino) = displaced_ino {
+            self.invalidate_path_shortcuts_for_inode(ino);
+        }
         Ok(RenameAtomicResult {
             moved_ino: src_entry.ino,
             displaced_ino,
@@ -3777,6 +4001,8 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(new_parent, new_name);
+        self.invalidate_path_shortcuts_for_inode(ino);
         Ok(result)
     }
 
@@ -4046,6 +4272,7 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
         Ok(result_attr)
     }
 
@@ -4170,6 +4397,7 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
         Ok(result_attr)
     }
 
@@ -4289,6 +4517,7 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
         Ok(result_attr)
     }
 
@@ -4380,6 +4609,8 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
+        self.invalidate_path_shortcuts_for_inode(entry.ino);
         Ok(result_attr)
     }
 
@@ -4427,6 +4658,8 @@ impl MetaEngine for RedbMetaEngine {
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.invalidate_path_shortcuts_for_lookup(parent, name);
+        self.invalidate_path_shortcuts_for_inode(entry.ino);
         Ok(())
     }
 }
@@ -4505,6 +4738,67 @@ mod tests {
         let entries = engine.readdir(ROOT_INO).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, b"subdir");
+    }
+
+    #[test]
+    fn test_resolve_path_uses_shortcut_cache_on_repeat() {
+        let engine = temp_engine();
+        let mut parent = ROOT_INO;
+        for name in [b"a", b"b", b"c", b"d"] {
+            parent = engine.create_dir(parent, name, 0, 0, 0o755).unwrap().ino;
+        }
+        let leaf = engine
+            .create_file(parent, b"leaf.txt", 0, 0, 0o644)
+            .unwrap();
+        let components: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"leaf.txt"];
+
+        let first = engine.resolve_path(&components).unwrap();
+        let (hits_after_first, misses_after_first, entries_after_first) =
+            engine.path_shortcut_cache_stats();
+        let second = engine.resolve_path(&components).unwrap();
+        let (hits_after_second, misses_after_second, entries_after_second) =
+            engine.path_shortcut_cache_stats();
+
+        assert_eq!(first.ino, leaf.ino);
+        assert_eq!(second.ino, leaf.ino);
+        assert_eq!(hits_after_first, 0);
+        assert_eq!(misses_after_first, 1);
+        assert!(entries_after_first >= components.len());
+        assert_eq!(hits_after_second, 1);
+        assert_eq!(misses_after_second, 1);
+        assert_eq!(entries_after_second, entries_after_first);
+    }
+
+    #[test]
+    fn test_rename_invalidates_cached_subtree_shortcuts() {
+        let engine = temp_engine();
+        let top = engine.create_dir(ROOT_INO, b"top", 0, 0, 0o755).unwrap();
+        let nested = engine.create_dir(top.ino, b"nested", 0, 0, 0o755).unwrap();
+        let leaf = engine
+            .create_file(nested.ino, b"leaf.txt", 0, 0, 0o644)
+            .unwrap();
+        let old_components: [&[u8]; 3] = [b"top", b"nested", b"leaf.txt"];
+        let new_components: [&[u8]; 3] = [b"renamed", b"nested", b"leaf.txt"];
+
+        let resolved = engine.resolve_path(&old_components).unwrap();
+        let (_, _, entries_before_rename) = engine.path_shortcut_cache_stats();
+        assert_eq!(resolved.ino, leaf.ino);
+        assert!(entries_before_rename >= old_components.len());
+
+        engine
+            .rename_atomic(ROOT_INO, b"top", ROOT_INO, b"renamed")
+            .unwrap();
+
+        let (_, _, entries_after_rename) = engine.path_shortcut_cache_stats();
+        assert_eq!(entries_after_rename, 0);
+        assert!(engine.resolve_path(&old_components).is_err());
+
+        let renamed = engine.resolve_path(&new_components).unwrap();
+        let (hits, misses, entries_after_rebuild) = engine.path_shortcut_cache_stats();
+        assert_eq!(renamed.ino, leaf.ino);
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 3);
+        assert!(entries_after_rebuild >= new_components.len());
     }
 
     #[test]

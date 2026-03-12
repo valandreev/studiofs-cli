@@ -144,32 +144,26 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
         return vfs.getattr(ROOT_INO).map_err(vfs_to_winfsp_err);
     }
 
-    let mut ino_stack: Vec<u64> = vec![ROOT_INO];
-
+    let mut normalized = Vec::new();
     for component in s.split('\\') {
         if component.is_empty() || component == "." {
             continue;
         }
         if component == ".." {
-            if ino_stack.len() > 1 {
-                ino_stack.pop();
+            if !normalized.is_empty() {
+                normalized.pop();
             }
             continue;
         }
-        // Strip trailing dots and spaces (Win32 path normalisation)
         let component = component.trim_end_matches(['.', ' ']);
         if component.is_empty() {
             continue;
         }
-        let current_ino = *ino_stack.last().unwrap();
-        let attr = vfs
-            .lookup(current_ino, component.as_bytes())
-            .map_err(vfs_to_winfsp_err)?;
-        ino_stack.push(attr.ino);
+        normalized.push(component.as_bytes().to_vec());
     }
-
-    let final_ino = *ino_stack.last().unwrap();
-    vfs.getattr(final_ino).map_err(vfs_to_winfsp_err)
+    let components: Vec<&[u8]> = normalized.iter().map(Vec::as_slice).collect();
+    vfs.resolve_path_components(&components)
+        .map_err(vfs_to_winfsp_err)
 }
 
 /// Resolve the parent directory inode for a given path.
@@ -200,14 +194,17 @@ fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u
     }
 
     let name = components.last().unwrap().as_bytes().to_vec();
-    let mut parent_ino = ROOT_INO;
-
-    for component in &components[..components.len() - 1] {
-        let attr = vfs
-            .lookup(parent_ino, component.as_bytes())
-            .map_err(vfs_to_winfsp_err)?;
-        parent_ino = attr.ino;
-    }
+    let parent_components: Vec<&[u8]> = components[..components.len() - 1]
+        .iter()
+        .map(|component| component.as_bytes())
+        .collect();
+    let parent_ino = if parent_components.is_empty() {
+        ROOT_INO
+    } else {
+        vfs.resolve_path_components(&parent_components)
+            .map_err(vfs_to_winfsp_err)?
+            .ino
+    };
 
     Ok((parent_ino, name))
 }

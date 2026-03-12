@@ -1472,6 +1472,10 @@ impl MetaEngine for PgMetaEngine {
         self.local.lookup(parent, name)
     }
 
+    fn resolve_path(&self, components: &[&[u8]]) -> MetaResult<InodeAttr> {
+        self.local.resolve_path(components)
+    }
+
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
         self.local.readdir(parent)
     }

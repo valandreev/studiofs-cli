@@ -60,6 +60,30 @@ Serving rules are:
 - `readdir`: merged `overlay over base`
 - `readlink` / `getxattr` / `listxattrs`: merged `overlay over base`
 
+### Path Shortcut Cache
+
+`RedbMetaEngine` also maintains an in-RAM path shortcut cache for absolute
+full-path resolution.
+
+Current behavior:
+- cache key: normalized absolute path from root
+- cache value: resolved inode plus ancestor lineage for invalidation
+- lookup flow for full-path resolution:
+  - check path shortcut cache first
+  - on miss, walk component-by-component through merged `lookup`
+  - populate shortcut entries for each resolved prefix
+- repeated deep-path resolution is therefore O(1) after the first hit
+
+Invalidation rules:
+- `rename`, `unlink`, `rmdir`, `remove_entry`, and replica-applied namespace
+  updates invalidate exact `(parent, name)` shortcut entries
+- directory moves/removals also invalidate any cached shortcut whose recorded
+  lineage contains the moved/removed inode
+- snapshot import clears the shortcut cache entirely
+
+This keeps shortcut hits cheap without allowing stale descendants to survive a
+parent rename such as `/a/b -> /a/x`.
+
 ### Flush to PostgreSQL
 
 1. Read the pending local event range from the local event log.
@@ -392,6 +416,11 @@ Destination side:
 - update moved inode attr in `inodes` when parent changes
 - update overwritten inode attr in `inodes` if `nlink` drops but inode
   survives locally
+- invalidate cached full-path shortcuts for:
+  - the source `(parent, name)`
+  - the destination `(new_parent, new_name)`
+  - the moved subtree rooted at the renamed inode
+  - any displaced destination inode subtree
 
 ### `truncate` / `setattr(size)`
 

@@ -101,10 +101,10 @@ To ensure regression names in this document do not drift from code:
 pwsh -File tools/check-doc-test-names.ps1
 ```
 
-PowerShell one-liner with `.env` + proxy cleanup (recommended for infra tests):
+PowerShell one-liner with `.env` (recommended for infra tests):
 
 ```powershell
-Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^\s*[^#].+=' } | ForEach-Object { $k,$v = $_.Split('=',2); Set-Item -Path "Env:$k" -Value $v }; Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY -ErrorAction SilentlyContinue; $env:NO_PROXY='localhost,127.0.0.1,::1'; cargo test --workspace --all-targets -- --nocapture; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
+Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^\s*[^#].+=' } | ForEach-Object { $k,$v = $_.Split('=',2); Set-Item -Path "Env:$k" -Value $v }; cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
 ## Troubleshooting

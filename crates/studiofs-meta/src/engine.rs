@@ -172,6 +172,24 @@ pub trait MetaEngine: Send + Sync {
     /// Look up a child entry by name in a parent directory.
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
 
+    /// Resolve an absolute path from root by walking each component.
+    ///
+    /// Engines may override this to provide a full-path shortcut cache.
+    fn resolve_path(&self, components: &[&[u8]]) -> MetaResult<InodeAttr> {
+        if components.is_empty() {
+            return self.get_attr(ROOT_INO);
+        }
+
+        let mut current = ROOT_INO;
+        let mut attr = self.get_attr(ROOT_INO)?;
+        for component in components {
+            let entry = self.lookup(current, component)?;
+            attr = self.get_attr(entry.ino)?;
+            current = attr.ino;
+        }
+        Ok(attr)
+    }
+
     /// List all entries in a directory.
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>>;
 
