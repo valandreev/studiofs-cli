@@ -58,7 +58,7 @@
 2. **Lease System:** Janitor перед выходом в S3 **обязан** получить распределенный lock в Postgres (через `pg_advisory_lock` или отдельную маленькую таблицу `leases`), синхронизировать все снапшоты (стянуть из PG свежий pin-set) и только потом чистить S3.
 3. *Оффлайн Janitor в S3 не ходит*, он только копит `pending_deletions` локально. Это гарантирует безопасность.
 
-### 4. Этап: Format Version & Debug Tools (done)
+### 4. Этап: Format Version & Debug Tools
 То, что вы упомянули как "нужно сделать сразу": **[SFS-21]**
 * Добавляем поле `format_version` в [FormatInfo](file:///e:/dev/studiofs-cli/crates/studiofs-meta/src/schema.rs#386-410) (и в `Redb`, и в `PG`).
 * Пишем утилиты `dump` / `load` для дампа/восстановления metadata через PostgreSQL (source of truth) в JSON/Binary.
@@ -66,7 +66,7 @@
 ---
 
 ## Резюме: Порядок Работы
-1. **Schema Hooks [SFS-21]:** Добавление `format_version` и CLI для dump/load (`studiofs dump`, `studiofs load`).
+1. **Schema Hooks [SFS-21]:** Добавление `format_version` и CLI для dump/load (`studiofs dump`, `studiofs load`). (done)
 2. **Apple M1/macOS Hygiene (SFS-8, 10, 11, 12):**
    * Вырезаем macOS системные папки (`.Spotlight-V100` и т.д.) и `.DS_Store` на уровне VFS-фильтра.
    * Форсируем трансляцию Resource Forks в xattr.
