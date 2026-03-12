@@ -1490,6 +1490,10 @@ impl MetaEngine for PgMetaEngine {
         self.local.get_attr(ino)
     }
 
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        self.local.get_attrs_batch(inos)
+    }
+
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
         self.mutate(|local| local.set_attr(attr))
     }
