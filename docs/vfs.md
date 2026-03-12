@@ -305,14 +305,24 @@ both full-path and component-based resolution.
 - positive entries: `(parent_ino, name) -> child_ino`
 - negative entries: `(parent_ino, name) -> ENOENT`
 
-Cache updates are deterministic:
+Each cache entry also stores namespace validation tokens:
+- `namespace_epoch` (global namespace epoch)
+- `parent_generation` (per-directory generation for the parent inode)
+
+On cache hit, tokens are validated against current runtime values. If tokens
+don't match, the entry is lazily treated as stale and reloaded from metadata.
+
+Namespace mutation updates are deterministic:
 - on create/mkdir/symlink/link: insert positive entry
 - on unlink/rmdir: insert negative entry
 - on rename: source entry becomes negative, destination becomes positive
-- on metadata version changes after remote sync: cache is cleared
+- parent directory generation is bumped only for affected parent directories
+- broad remote namespace apply events bump global namespace epoch
 
 This removes repeated metadata lookups for hot path components while preserving
 namespace correctness across local mutations and remote namespace apply events.
+Non-namespace metadata mutations (for example `setattr`) do not bump namespace
+tokens and therefore do not invalidate dentry/path namespace cache entries.
 
 Path normalization is style-aware:
 - `NamespacePathStyle::Posix`: `/`, `.`, `..`

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
+const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
@@ -34,6 +35,7 @@ pub struct PgMetaEngine {
     volume_id: i64,
     client_id: String,
     local_version: AtomicI64,
+    namespace_version: AtomicI64,
     flushed_event_seq: AtomicU64,
     replication_lock: Mutex<()>,
     poll_interval: Duration,
@@ -126,6 +128,11 @@ impl PgMetaEngine {
         Ok(version.min(i64::MAX as u64) as i64)
     }
 
+    fn load_persisted_namespace_version(local: &RedbMetaEngine) -> MetaResult<i64> {
+        let version = local.get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)?;
+        Ok(version.min(i64::MAX as u64) as i64)
+    }
+
     fn persist_local_version(&self, version: i64) -> MetaResult<()> {
         if version < 0 {
             return Ok(());
@@ -133,6 +140,16 @@ impl PgMetaEngine {
         self.local
             .set_counter(LOCAL_PG_VERSION_COUNTER, version as u64)?;
         self.local_version.store(version, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn persist_namespace_version(&self, version: i64) -> MetaResult<()> {
+        if version < 0 {
+            return Ok(());
+        }
+        self.local
+            .set_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER, version as u64)?;
+        self.namespace_version.store(version, Ordering::SeqCst);
         Ok(())
     }
 
@@ -400,6 +417,7 @@ impl PgMetaEngine {
 
         let client_slot = Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?;
         let restored_local_version = Self::load_persisted_local_version(&local)?;
+        let restored_namespace_version = Self::load_persisted_namespace_version(&local)?;
         let restored_flushed_event_seq = Self::load_persisted_flushed_event_seq(&local)?;
         let restored_flushed_event_seq =
             if restored_flushed_event_seq == 0 && !Self::has_any_local_overlay_mutation(&local)? {
@@ -413,6 +431,7 @@ impl PgMetaEngine {
             volume_id: pg.volume_id,
             client_id: format!("client-slot:{client_slot}"),
             local_version: AtomicI64::new(restored_local_version),
+            namespace_version: AtomicI64::new(restored_namespace_version),
             flushed_event_seq: AtomicU64::new(restored_flushed_event_seq),
             replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(poll_secs),
@@ -1139,6 +1158,7 @@ impl PgMetaEngine {
         let mut overlay = self.local_overlay_conflicts()?;
         let mut applied_any = false;
         let mut max_version = last_seq;
+        let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
         let mut idx = 0;
         while idx < rows.len() {
             let (batch_version, next_idx, batch_events, is_self_batch) =
@@ -1159,11 +1179,17 @@ impl PgMetaEngine {
                     overlay.clone()
                 };
                 applied_any |= self.apply_foreign_batch(&batch_events, &effective_overlay)?;
+                if batch_events.iter().any(MetaEvent::is_namespace_mutation) {
+                    max_namespace_version = max_namespace_version.max(batch_version);
+                }
             }
             max_version = batch_version;
             overlay = self.local_overlay_conflicts()?;
         }
         self.persist_local_version(max_version)?;
+        if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
+            self.persist_namespace_version(max_namespace_version)?;
+        }
         Ok(applied_any)
     }
 
@@ -1413,6 +1439,10 @@ impl MetaEngine for PgMetaEngine {
 
     fn metadata_version_token(&self) -> Option<String> {
         Some(self.local_version.load(Ordering::SeqCst).to_string())
+    }
+
+    fn namespace_version_token(&self) -> Option<String> {
+        Some(self.namespace_version.load(Ordering::SeqCst).to_string())
     }
 
     fn replication_backlog(&self) -> crate::engine::MetadataReplicationBacklog {
@@ -1828,6 +1858,7 @@ mod tests {
             volume_id: 1,
             client_id: "unit-test".to_string(),
             local_version: AtomicI64::new(0),
+            namespace_version: AtomicI64::new(0),
             flushed_event_seq: AtomicU64::new(flushed_event_seq),
             replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(60),

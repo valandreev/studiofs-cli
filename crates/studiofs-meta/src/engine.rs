@@ -125,6 +125,15 @@ pub trait MetaEngine: Send + Sync {
         None
     }
 
+    /// Best-effort namespace-only version token for dentry/path invalidation.
+    ///
+    /// This token should advance only for namespace mutations (add/remove/rename
+    /// directory entries). By default it falls back to `metadata_version_token()`
+    /// for engines that don't expose finer-grained signals yet.
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
+
     /// Best-effort count of local metadata mutations not yet durably pushed to
     /// the shared remote metadata source.
     fn replication_backlog(&self) -> MetadataReplicationBacklog {
