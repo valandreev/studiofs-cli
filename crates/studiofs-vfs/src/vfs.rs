@@ -2013,16 +2013,24 @@ impl StudioVfs {
     }
 
     fn bump_namespace_epoch(&self) {
-        self.state.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .namespace_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if current == u64::MAX {
+                    warn!("namespace_epoch saturated at u64::MAX");
+                }
+                Some(current.saturating_add(1))
+            })
+            .ok();
     }
 
     fn bump_directory_generation(&self, ino: Ino) {
         let mut generations = self.state.directory_generations.lock();
-        let next = generations
-            .get(&ino)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let current = generations.get(&ino).copied().unwrap_or(0);
+        let next = current.saturating_add(1);
+        if current == u64::MAX {
+            warn!(ino, "directory generation saturated at u64::MAX");
+        }
         generations.insert(ino, next);
     }
 
@@ -2034,11 +2042,11 @@ impl StudioVfs {
             if !seen.insert(parent) {
                 continue;
             }
-            let next = generations
-                .get(&parent)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+            let current = generations.get(&parent).copied().unwrap_or(0);
+            let next = current.saturating_add(1);
+            if current == u64::MAX {
+                warn!(parent, "directory generation saturated at u64::MAX");
+            }
             generations.insert(parent, next);
         }
     }
@@ -3535,6 +3543,7 @@ impl StudioVfs {
 
     fn clear_inode_incarnation(&self, ino: Ino) {
         self.state.inode_incarnations.lock().remove(&ino);
+        self.state.directory_generations.lock().remove(&ino);
     }
 
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
@@ -7674,6 +7683,49 @@ mod tests {
             },
         )
         .expect("setattr");
+
+        let after_epoch = vfs.state.namespace_epoch.load(Ordering::SeqCst);
+        let after_root_generation = vfs
+            .state
+            .directory_generations
+            .lock()
+            .get(&ROOT_INO)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(before_epoch, after_epoch);
+        assert_eq!(before_root_generation, after_root_generation);
+
+        let cache = vfs.state.dentry_cache.lock();
+        assert_eq!(
+            cache.entries.get(&key).map(|entry| entry.value),
+            Some(DentryCacheValue::Positive(created.ino))
+        );
+    }
+
+    #[test]
+    fn write_does_not_bump_namespace_generations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-no-namespace-invalidate");
+        let created = vfs
+            .create(ROOT_INO, b"write.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let key = DentryCacheKey::new(ROOT_INO, b"write.txt");
+
+        let _ = vfs
+            .lookup(ROOT_INO, b"write.txt")
+            .expect("prime dentry cache");
+        let before_epoch = vfs.state.namespace_epoch.load(Ordering::SeqCst);
+        let before_root_generation = vfs
+            .state
+            .directory_generations
+            .lock()
+            .get(&ROOT_INO)
+            .copied()
+            .unwrap_or(0);
+
+        rt.block_on(async {
+            vfs.write(created.ino, 0, b"payload").await.expect("write");
+        });
 
         let after_epoch = vfs.state.namespace_epoch.load(Ordering::SeqCst);
         let after_root_generation = vfs
