@@ -25,6 +25,7 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
     Ok(num * multiplier)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
     mount_point: &str,

@@ -166,6 +166,12 @@ pub struct LruTracker {
     shards: Vec<Mutex<LruShard>>,
 }
 
+impl Default for LruTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LruTracker {
     /// Largest whole-second duration that can be safely subtracted from `now`.
     fn max_subtractable_secs(now: Instant) -> u64 {
@@ -259,7 +265,7 @@ impl LruTracker {
         self.shards[shard_idx]
             .lock()
             .get(object_id)
-            .map_or(false, |e| e.pinned)
+            .is_some_and(|e| e.pinned)
     }
 
     /// Unpin an entry (allow eviction).
@@ -359,6 +365,11 @@ impl LruTracker {
     /// Total number of tracked entries.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+
+    /// Returns true when tracker has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.lock().len() == 0)
     }
 
     /// Load LRU state from a persisted checkpoint.

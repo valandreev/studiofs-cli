@@ -177,7 +177,7 @@ fn insert_pg_volume(dsn: &str, name: &str) -> i64 {
         let row = client
             .query_one(
                 "INSERT INTO volumes (name, uuid, block_size) VALUES ($1, $2, $3) RETURNING vol",
-                &[&name, &uuid, &((8 * 1024 * 1024) as i32)],
+                &[&name, &uuid, &(8 * 1024 * 1024)],
             )
             .await
             .expect("insert volume");
