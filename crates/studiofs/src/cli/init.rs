@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PostgresConfig,
-    RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend,
+    MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -501,6 +501,7 @@ pub fn run(
 
     // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: volume_uuid,
         endpoint: data_endpoint.to_string(),

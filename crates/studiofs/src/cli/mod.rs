@@ -2,6 +2,7 @@
 
 pub mod destroy;
 pub mod discovery;
+pub mod dump_load;
 pub mod init;
 pub mod janitor;
 pub mod mount;

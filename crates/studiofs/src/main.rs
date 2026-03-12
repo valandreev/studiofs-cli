@@ -405,6 +405,26 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         local: bool,
     },
+    /// Dump metadata manifest from PostgreSQL (source of truth)
+    Dump {
+        /// Disk/volume name
+        name: String,
+
+        /// Output dump path (JSON)
+        #[arg(long = "path-to-dump")]
+        path_to_dump: PathBuf,
+    },
+
+    /// Load metadata manifest into PostgreSQL
+    Load {
+        /// Input dump path (JSON)
+        #[arg(long = "path-to-dump")]
+        path_to_dump: PathBuf,
+
+        /// PostgreSQL address/DSN
+        #[arg(long = "postgresql-adress", alias = "postgresql-address")]
+        postgresql_adress: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -511,6 +531,16 @@ fn main() -> anyhow::Result<()> {
                 skip_newer_minutes,
                 max_deletes,
             )?;
+        }
+        Commands::Dump { name, path_to_dump } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::dump_load::dump(&name, &meta_dir, &path_to_dump)?;
+        }
+        Commands::Load {
+            path_to_dump,
+            postgresql_adress,
+        } => {
+            cli::dump_load::load(&path_to_dump, &postgresql_adress)?;
         }
     }
 

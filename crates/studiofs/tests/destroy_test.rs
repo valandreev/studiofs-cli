@@ -14,8 +14,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
-    ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig,
+    PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
 };
 use uuid::Uuid;
 
@@ -236,6 +236,7 @@ fn create_local_metadata(
     meta.init_root(0, 0).expect("init root inode");
 
     let format_info = FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: Uuid::new_v4().to_string(),
         endpoint: env.minio_endpoint.clone(),
@@ -270,6 +271,7 @@ fn create_local_metadata_with_bad_s3_secret(
     meta.init_root(0, 0).expect("init root inode");
 
     let format_info = FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: Uuid::new_v4().to_string(),
         endpoint: env.minio_endpoint.clone(),

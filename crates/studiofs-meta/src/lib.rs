@@ -23,17 +23,33 @@ pub use pg_engine::PgMetaEngine;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;
 
+fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
+    if info.format_version != CURRENT_FORMAT_VERSION {
+        return Err(MetaError::UnsupportedFormatVersion {
+            found: info.format_version,
+            expected: CURRENT_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// Open metadata engine based on format settings.
 pub fn open_meta_engine(path: impl AsRef<Path>) -> MetaResult<Arc<dyn MetaEngine>> {
     let path = path.as_ref();
     let redb = RedbMetaEngine::open(path)?;
     match redb.get_format_info() {
         Ok(info) if info.metadata.backend == MetadataBackend::Postgres => {
+            ensure_supported_format_version(&info)?;
             // Redb holds an exclusive process-local open lock. Release probe handle first.
             drop(redb);
             let pg = PgMetaEngine::open(path)?;
+            ensure_supported_format_version(&pg.get_format_info()?)?;
             Ok(pg)
         }
-        _ => Ok(Arc::new(redb)),
+        Ok(info) => {
+            ensure_supported_format_version(&info)?;
+            Ok(Arc::new(redb))
+        }
+        Err(_) => Ok(Arc::new(redb)),
     }
 }

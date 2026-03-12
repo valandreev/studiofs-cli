@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use studiofs_data::store::DataStoreConfig;
 use studiofs_fuse::StudioFuseFs;
-use studiofs_meta::{FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine};
+use studiofs_meta::{
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
+};
 use studiofs_vfs::StudioVfs;
 
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("fuse-test-{volume_suffix}-{}", std::process::id());
     FormatInfo {
+        format_version: CURRENT_FORMAT_VERSION,
         name: volume_name.clone(),
         uuid: format!("fuse-test-uuid-{volume_suffix}"),
         endpoint: "http://127.0.0.1:9000".into(),

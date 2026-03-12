@@ -1949,6 +1949,7 @@ mod tests {
 
     fn format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {
         FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
             name: name.to_string(),
             uuid: uuid.to_string(),
             endpoint: "http://127.0.0.1:9000".to_string(),

@@ -92,6 +92,37 @@ Notes:
 - `destroy` removes StudioFS local metadata files for the volume.
 - Custom local data cache directories are not auto-detected; remove them manually after destroy (the command prints the volume UUID for this).
 
+### `dump`
+
+Creates a diagnostic dump from PostgreSQL metadata for a volume.
+
+```bash
+studiofs dump <name> --path-to-dump <dump.json>
+```
+
+What it does:
+- opens local metadata for the volume,
+- forces metadata flush/sync (`flush_metadata` + `sync_metadata`),
+- exports the dump from PostgreSQL (`volumes`, `metadata_state`, `counters`, `event_log`).
+
+Note:
+- PostgreSQL is treated as source of truth for dump export.
+
+### `load`
+
+Loads a dump into PostgreSQL.
+
+```bash
+studiofs load --path-to-dump <dump.json> --postgresql-adress <postgres-server-dsn>
+```
+
+Alias:
+- `--postgresql-address` is supported as alias for `--postgresql-adress`.
+
+What it does:
+- restores/updates target volume record in `volumes` (matched by UUID from dump),
+- replaces target volume rows in `metadata_state`, `counters`, `event_log`.
+
 ## Multi-Client Workflow
 
 Client A:

@@ -4446,6 +4446,7 @@ mod tests {
     fn test_format_info_roundtrip() {
         let engine = temp_engine();
         let info = FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
             name: "test-vol".into(),
             uuid: "abc-123".into(),
             endpoint: "http://localhost:9000".into(),
