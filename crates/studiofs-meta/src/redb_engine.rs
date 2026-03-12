@@ -2643,12 +2643,16 @@ impl MetaEngine for RedbMetaEngine {
         let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
         let mut attrs = Vec::with_capacity(inos.len());
         for &ino in inos {
-            attrs.push(Self::resolve_attr_in_read_snapshot(
+            match Self::resolve_attr_in_read_snapshot(
                 &txn,
                 ino,
                 &overlay_block_inodes,
                 &overlay_attr_inodes,
-            )?);
+            ) {
+                Ok(attr) => attrs.push(attr),
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            }
         }
         Ok(attrs)
     }
@@ -4558,6 +4562,22 @@ mod tests {
         assert_eq!(attrs.len(), 2);
         assert_eq!(attrs[0].ino, b.ino);
         assert_eq!(attrs[1].ino, a.ino);
+    }
+
+    #[test]
+    fn test_get_attrs_batch_skips_missing_inodes() {
+        let engine = temp_engine();
+        let kept = engine
+            .create_file(ROOT_INO, b"kept.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let removed = engine
+            .create_file(ROOT_INO, b"removed.txt", 1000, 1000, 0o644)
+            .unwrap();
+        engine.unlink(ROOT_INO, b"removed.txt").unwrap();
+
+        let attrs = engine.get_attrs_batch(&[removed.ino, kept.ino]).unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].ino, kept.ino);
     }
 
     #[test]

@@ -5665,12 +5665,12 @@ impl StudioVfs {
         if !file_children.is_empty() {
             self.dir_prefetch.on_readdir(ino, file_children);
         }
-        self.hydrate_readdir_attr_cache(&entries);
+        self.schedule_readdir_attr_hydration(&entries);
 
         Ok(entries)
     }
 
-    fn hydrate_readdir_attr_cache(&self, entries: &[DirEntry]) {
+    fn schedule_readdir_attr_hydration(&self, entries: &[DirEntry]) {
         if entries.is_empty()
             || self.readdir_attr_batch_chunk == 0
             || self.readdir_attr_batch_max_inodes == 0
@@ -5689,9 +5689,27 @@ impl StudioVfs {
             return;
         }
 
-        let now = Instant::now();
-        for chunk in inodes.chunks(self.readdir_attr_batch_chunk) {
-            let attrs = match self.meta.get_attrs_batch(chunk) {
+        let meta = self.meta.clone();
+        let state = self.state.clone();
+        let chunk_size = self.readdir_attr_batch_chunk;
+        let hydrate = move || {
+            Self::hydrate_readdir_attr_cache_batches(meta, state, inodes, chunk_size);
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn_blocking(hydrate));
+        } else {
+            drop(std::thread::spawn(hydrate));
+        }
+    }
+
+    fn hydrate_readdir_attr_cache_batches(
+        meta: Arc<dyn MetaEngine>,
+        state: Arc<VfsState>,
+        inodes: Vec<Ino>,
+        chunk_size: usize,
+    ) {
+        for chunk in inodes.chunks(chunk_size.max(1)) {
+            let attrs = match meta.get_attrs_batch(chunk) {
                 Ok(attrs) => attrs,
                 Err(err) => {
                     debug!(
@@ -5699,18 +5717,18 @@ impl StudioVfs {
                         error = %err,
                         "readdir attr hydration batch failed"
                     );
-                    break;
+                    continue;
                 }
             };
 
+            let now = Instant::now();
+            let dirty_attrs = state.dirty_attrs.lock();
+            let mut attr_cache = state.attr_read_cache.lock();
             for attr in attrs {
-                if self.state.dirty_attrs.lock().contains_key(&attr.ino) {
+                if dirty_attrs.contains_key(&attr.ino) {
                     continue;
                 }
-                self.state
-                    .attr_read_cache
-                    .lock()
-                    .put(attr.ino, attr, ATTR_CACHE_TTL, now);
+                attr_cache.put(attr.ino, attr, ATTR_CACHE_TTL, now);
             }
         }
     }
@@ -8851,12 +8869,21 @@ mod tests {
             "test file should be visible in root readdir"
         );
 
-        let cached_after_readdir = vfs
-            .state
-            .attr_read_cache
-            .lock()
-            .entries
-            .contains_key(&created.ino);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut cached_after_readdir = false;
+        while Instant::now() < deadline {
+            if vfs
+                .state
+                .attr_read_cache
+                .lock()
+                .entries
+                .contains_key(&created.ino)
+            {
+                cached_after_readdir = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             cached_after_readdir,
             "readdir should hydrate attr cache for listed children"
