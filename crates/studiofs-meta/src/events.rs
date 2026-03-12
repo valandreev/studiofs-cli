@@ -32,11 +32,11 @@ pub enum MetaEvent {
         new_parent: u64,
         new_name: Vec<u8>,
         entry: DirEntryValue,
-        displaced_set_attr: Option<InodeAttr>,
+        displaced_set_attr: Box<Option<InodeAttr>>,
         displaced_remove_attr_ino: Option<u64>,
-        moved_dir_attr: Option<InodeAttr>,
-        old_parent_attr: Option<InodeAttr>,
-        new_parent_attr: Option<InodeAttr>,
+        moved_dir_attr: Box<Option<InodeAttr>>,
+        old_parent_attr: Box<Option<InodeAttr>>,
+        new_parent_attr: Box<Option<InodeAttr>>,
     },
 
     // ─── File Block Operations ───────────────────────────────────────────────

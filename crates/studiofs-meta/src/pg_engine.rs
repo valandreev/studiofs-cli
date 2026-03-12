@@ -637,19 +637,19 @@ impl PgMetaEngine {
                         .dentry_keys
                         .insert(Self::dentry_key(*new_parent, new_name));
                     overlay.attr_inodes.insert(entry.ino);
-                    if let Some(attr) = displaced_set_attr {
+                    if let Some(attr) = displaced_set_attr.as_ref() {
                         overlay.attr_inodes.insert(attr.ino);
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
                         overlay.attr_inodes.insert(*ino);
                     }
-                    if let Some(attr) = moved_dir_attr {
+                    if let Some(attr) = moved_dir_attr.as_ref() {
                         overlay.attr_inodes.insert(attr.ino);
                     }
-                    if let Some(attr) = old_parent_attr {
+                    if let Some(attr) = old_parent_attr.as_ref() {
                         overlay.attr_inodes.insert(attr.ino);
                     }
-                    if let Some(attr) = new_parent_attr {
+                    if let Some(attr) = new_parent_attr.as_ref() {
                         overlay.attr_inodes.insert(attr.ino);
                     }
                 }
@@ -1965,7 +1965,6 @@ mod tests {
                     url: dsn.to_string(),
                     volume_id,
                 }),
-                ..MetadataConfig::default()
             },
             block_size: DEFAULT_BLOCK_SIZE,
         }

@@ -235,7 +235,7 @@ impl L2DiskCache {
             Self::write_block_file(&path, &tmp_path, &owned)
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+        .map_err(io::Error::other)??;
 
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
         Ok(())
@@ -269,7 +269,7 @@ impl L2DiskCache {
                     Ok(())
                 }
                 Ok(Err(e)) => Err(e),
-                Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+                Err(e) => Err(io::Error::other(e)),
             };
             results.push((id, res));
         }

@@ -1224,7 +1224,7 @@ impl RedbMetaEngine {
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.insert(k.value(), v.value().to_vec());
             }
-            snapshot.symlinks.extend(merged.into_iter());
+            snapshot.symlinks.extend(merged);
         }
         {
             let base = txn
@@ -1255,7 +1255,7 @@ impl RedbMetaEngine {
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.insert(k.value().to_vec(), v.value().to_vec());
             }
-            snapshot.xattrs.extend(merged.into_iter());
+            snapshot.xattrs.extend(merged);
         }
         {
             let table = txn
@@ -2196,7 +2196,7 @@ impl RedbMetaEngine {
                     let mut inodes = txn
                         .open_table(BASE_INODES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    if let Some(attr) = displaced_set_attr {
+                    if let Some(attr) = displaced_set_attr.as_ref() {
                         let data = encode(attr)?;
                         inodes
                             .insert(attr.ino, data.as_slice())
@@ -2205,19 +2205,19 @@ impl RedbMetaEngine {
                     if let Some(ino) = displaced_remove_attr_ino {
                         let _ = inodes.remove(*ino);
                     }
-                    if let Some(attr) = moved_dir_attr {
+                    if let Some(attr) = moved_dir_attr.as_ref() {
                         let data = encode(attr)?;
                         inodes
                             .insert(attr.ino, data.as_slice())
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
-                    if let Some(attr) = old_parent_attr {
+                    if let Some(attr) = old_parent_attr.as_ref() {
                         let data = encode(attr)?;
                         inodes
                             .insert(attr.ino, data.as_slice())
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
-                    if let Some(attr) = new_parent_attr {
+                    if let Some(attr) = new_parent_attr.as_ref() {
                         let data = encode(attr)?;
                         inodes
                             .insert(attr.ino, data.as_slice())
@@ -2343,19 +2343,19 @@ impl RedbMetaEngine {
                     Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
                     Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
 
-                    if let Some(attr) = displaced_set_attr {
+                    if let Some(attr) = displaced_set_attr.as_ref() {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
                         Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     }
-                    if let Some(attr) = moved_dir_attr {
+                    if let Some(attr) = moved_dir_attr.as_ref() {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
                     }
-                    if let Some(attr) = old_parent_attr {
+                    if let Some(attr) = old_parent_attr.as_ref() {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
                     }
-                    if let Some(attr) = new_parent_attr {
+                    if let Some(attr) = new_parent_attr.as_ref() {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
                     }
                 }
@@ -3696,11 +3696,11 @@ impl MetaEngine for RedbMetaEngine {
                     new_parent,
                     new_name: new_name.to_vec(),
                     entry: src_entry.clone(),
-                    displaced_set_attr,
+                    displaced_set_attr: Box::new(displaced_set_attr),
                     displaced_remove_attr_ino,
-                    moved_dir_attr,
-                    old_parent_attr,
-                    new_parent_attr,
+                    moved_dir_attr: Box::new(moved_dir_attr),
+                    old_parent_attr: Box::new(old_parent_attr),
+                    new_parent_attr: Box::new(new_parent_attr),
                 },
             )?;
         }
