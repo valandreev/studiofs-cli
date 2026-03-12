@@ -436,6 +436,12 @@ struct IgnoredFile {
     name: Vec<u8>,
 }
 
+#[derive(Debug, Default)]
+struct IgnoredFileRegistry {
+    by_ino: HashMap<Ino, IgnoredFile>,
+    by_name: HashMap<(Ino, Vec<u8>), Ino>,
+}
+
 // =============================================================================
 // File Locking (flock)
 // =============================================================================
@@ -1092,9 +1098,7 @@ struct VfsState {
     dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Ephemeral macOS metadata files that are intentionally ignored and never
     /// persisted to the metadata store or object storage.
-    ignored_files: Mutex<std::collections::HashMap<Ino, IgnoredFile>>,
-    /// Reverse index for ignored file path lookups by `(parent, name)`.
-    ignored_file_names: Mutex<std::collections::HashMap<(Ino, Vec<u8>), Ino>>,
+    ignored_files: Mutex<IgnoredFileRegistry>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
     attr_read_cache: Mutex<std::collections::HashMap<Ino, (InodeAttr, Instant)>>,
     /// Dirty blocks accepted by `flush()` that have not yet been written to
@@ -1287,14 +1291,16 @@ impl StudioVfs {
         self.state
             .ignored_files
             .lock()
+            .by_ino
             .get(&ino)
             .map(|ignored| ignored.attr.clone())
     }
 
     fn ignored_file_lookup(&self, parent: Ino, name: &[u8]) -> Option<IgnoredFile> {
         let key = (parent, name.to_vec());
-        let ino = self.state.ignored_file_names.lock().get(&key).copied()?;
-        self.state.ignored_files.lock().get(&ino).cloned()
+        let registry = self.state.ignored_files.lock();
+        let ino = registry.by_name.get(&key).copied()?;
+        registry.by_ino.get(&ino).cloned()
     }
 
     fn create_ignored_file(
@@ -1305,8 +1311,12 @@ impl StudioVfs {
         gid: u32,
         mode: u16,
     ) -> InodeAttr {
-        if let Some(existing) = self.ignored_file_lookup(parent, name) {
-            return existing.attr;
+        let mut registry = self.state.ignored_files.lock();
+        let key = (parent, name.to_vec());
+        if let Some(ino) = registry.by_name.get(&key).copied()
+            && let Some(existing) = registry.by_ino.get(&ino)
+        {
+            return existing.attr.clone();
         }
 
         let ino = self.state.next_ignored_ino.fetch_add(1, Ordering::Relaxed);
@@ -1314,13 +1324,10 @@ impl StudioVfs {
         let ignored = IgnoredFile {
             attr: attr.clone(),
             parent,
-            name: name.to_vec(),
+            name: key.1.clone(),
         };
-        self.state.ignored_files.lock().insert(ino, ignored.clone());
-        self.state
-            .ignored_file_names
-            .lock()
-            .insert((parent, ignored.name.clone()), ino);
+        registry.by_name.insert(key, ino);
+        registry.by_ino.insert(ino, ignored);
         attr
     }
 
@@ -1328,34 +1335,33 @@ impl StudioVfs {
     where
         F: FnOnce(&mut InodeAttr),
     {
-        let mut ignored_files = self.state.ignored_files.lock();
-        let ignored = ignored_files.get_mut(&ino)?;
+        let mut registry = self.state.ignored_files.lock();
+        let ignored = registry.by_ino.get_mut(&ino)?;
         update(&mut ignored.attr);
         Some(ignored.attr.clone())
     }
 
     fn unlink_ignored_file(&self, parent: Ino, name: &[u8]) -> bool {
         let key = (parent, name.to_vec());
-        let Some(ino) = self.state.ignored_file_names.lock().remove(&key) else {
+        let mut registry = self.state.ignored_files.lock();
+        let Some(ino) = registry.by_name.remove(&key) else {
             return false;
         };
 
         if self.handle_table.open_count(ino) > 0 {
             self.handle_table.mark_orphan(ino);
         } else {
-            self.state.ignored_files.lock().remove(&ino);
+            registry.by_ino.remove(&ino);
         }
         true
     }
 
     fn release_ignored_file(&self, ino: Ino) -> bool {
-        let Some(ignored) = self.state.ignored_files.lock().remove(&ino) else {
+        let mut registry = self.state.ignored_files.lock();
+        let Some(ignored) = registry.by_ino.remove(&ino) else {
             return false;
         };
-        self.state
-            .ignored_file_names
-            .lock()
-            .remove(&(ignored.parent, ignored.name));
+        registry.by_name.remove(&(ignored.parent, ignored.name));
         true
     }
 
@@ -1834,8 +1840,7 @@ impl StudioVfs {
                     live_extent_records: Mutex::new(std::collections::HashMap::new()),
                     uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
-                    ignored_files: Mutex::new(std::collections::HashMap::new()),
-                    ignored_file_names: Mutex::new(std::collections::HashMap::new()),
+                    ignored_files: Mutex::new(IgnoredFileRegistry::default()),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
@@ -4528,6 +4533,12 @@ impl StudioVfs {
             return Ok(());
         }
         validate_name(new_name)?;
+        if is_ignored_macos_metadata_name(new_name) {
+            if self.unlink_ignored_file(parent, name) {
+                return Ok(());
+            }
+            return self.unlink(parent, name);
+        }
         let rename_result = self
             .meta
             .rename_atomic(parent, name, new_parent, new_name)?;

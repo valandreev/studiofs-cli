@@ -6145,6 +6145,56 @@ async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() 
     assert!(vfs.readdir(1).unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn rename_should_drop_blocked_macos_metadata_target_without_persisting_it() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "rename-ignore-ds-store");
+
+    let attr = vfs.create(1, b"normal.txt", 1000, 1000, 0o644).unwrap();
+    vfs.write(attr.ino, 0, b"payload").await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    vfs.rename(1, b"normal.txt", 1, b".DS_Store").unwrap();
+
+    assert!(vfs.lookup(1, b"normal.txt").is_err());
+    assert!(vfs.lookup(1, b".DS_Store").is_err());
+    assert!(vfs.meta().lookup(1, b".DS_Store").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
+    ensure_bucket().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "ignore-concurrent-create");
+
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let inos = Arc::new(Mutex::new(Vec::new()));
+    let mut tasks = Vec::new();
+
+    for _ in 0..8 {
+        let vfs = vfs.clone();
+        let barrier = barrier.clone();
+        let inos = inos.clone();
+        tasks.push(thread::spawn(move || {
+            barrier.wait();
+            let attr = vfs.create(1, b".DS_Store", 1000, 1000, 0o644).unwrap();
+            inos.lock().push(attr.ino);
+        }));
+    }
+
+    for task in tasks {
+        task.join().unwrap();
+    }
+
+    let inos = inos.lock().clone();
+    assert!(!inos.is_empty());
+    let unique: std::collections::HashSet<_> = inos.into_iter().collect();
+    assert_eq!(unique.len(), 1);
+}
+
 // ─── 9.3 Rename & Unlink Edge Cases ────────────────────────────────────────
 
 /// Rename a file across directories.
