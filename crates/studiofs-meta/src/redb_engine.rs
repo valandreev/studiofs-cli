@@ -318,6 +318,21 @@ impl RedbMetaEngine {
             .transpose()
     }
 
+    fn get_attr_from_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u64, &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeAttr>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|entry| decode(entry.value()))
+            .transpose()
+    }
+
     fn local_overlay_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
         let mut overlay = HashSet::new();
 
@@ -513,6 +528,20 @@ impl RedbMetaEngine {
             .is_some())
     }
 
+    fn has_u64_marker_in_write(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u64, u8>,
+        key: u64,
+    ) -> MetaResult<bool> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
     fn lookup_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
@@ -531,6 +560,171 @@ impl RedbMetaEngine {
         }
 
         Ok(None)
+    }
+
+    fn get_attr_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<InodeAttr> {
+        if Self::has_u64_marker_in_write(txn, INODE_TOMBSTONES_TABLE, ino)? {
+            return Err(MetaError::InodeNotFound(ino));
+        }
+        if let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? {
+            return Ok(attr);
+        }
+        if let Some(attr) = Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)? {
+            return Ok(attr);
+        }
+        Err(MetaError::InodeNotFound(ino))
+    }
+
+    fn readdir_from_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        parent: Ino,
+    ) -> MetaResult<Vec<DirEntry>> {
+        let prefix = dentry_prefix(parent);
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut entries = Vec::new();
+        let range_start = prefix.as_slice();
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+
+        let iter = table
+            .range(range_start..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for result in iter {
+            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value();
+            let (decoded_parent, name) = decode_dentry_key(key_bytes);
+            if decoded_parent != parent {
+                break;
+            }
+            let entry_val: DirEntryValue = decode(value.value())?;
+            entries.push(DirEntry {
+                name: name.to_vec(),
+                ino: entry_val.ino,
+                kind: entry_val.kind,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    fn local_overlay_dentries_in_write_txn(
+        txn: &redb::WriteTransaction,
+    ) -> MetaResult<HashSet<Vec<u8>>> {
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut overlay = HashSet::new();
+
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value().to_vec();
+            match base
+                .get(key_bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_value) if base_value.value() == value.value() => {}
+                _ => {
+                    overlay.insert(key_bytes);
+                }
+            }
+        }
+
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(key.value().to_vec());
+        }
+
+        Ok(overlay)
+    }
+
+    fn readdir_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+    ) -> MetaResult<Vec<DirEntry>> {
+        let overlay_dentries = Self::local_overlay_dentries_in_write_txn(txn)?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut merged = std::collections::BTreeMap::<Vec<u8>, DirEntry>::new();
+        for entry in Self::readdir_from_write_table(txn, BASE_DENTRIES_TABLE, parent)? {
+            merged.insert(entry.name.clone(), entry);
+        }
+
+        let prefix = dentry_prefix(parent);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        for row in tombstones
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_parent, name) = decode_dentry_key(key.value());
+            if decoded_parent != parent {
+                break;
+            }
+            merged.remove(name);
+        }
+
+        for entry in Self::readdir_from_write_table(txn, DENTRIES_TABLE, parent)? {
+            let key = encode_dentry_key(parent, &entry.name);
+            if overlay_dentries.contains(&key) {
+                merged.insert(entry.name.clone(), entry);
+            }
+        }
+
+        let base_names: std::collections::HashSet<Vec<u8>> =
+            Self::readdir_from_write_table(txn, BASE_DENTRIES_TABLE, parent)?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        for key in overlay_dentries {
+            let (overlay_parent, overlay_name) = decode_dentry_key(&key);
+            if overlay_parent != parent {
+                continue;
+            }
+            if !base_names.contains(overlay_name)
+                && let Some(entry) =
+                    Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, overlay_name)?
+            {
+                merged.insert(
+                    overlay_name.to_vec(),
+                    DirEntry {
+                        name: overlay_name.to_vec(),
+                        ino: entry.ino,
+                        kind: entry.kind,
+                    },
+                );
+            }
+            if base_names.contains(overlay_name)
+                && Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, overlay_name)?.is_none()
+            {
+                merged.remove(overlay_name);
+            }
+        }
+
+        Ok(merged.into_values().collect())
     }
 
     fn readdir_from_table(
@@ -3681,29 +3875,29 @@ impl MetaEngine for RedbMetaEngine {
         let dst_entry_opt = Self::lookup_merged_in_write_txn(&txn, new_parent, new_name)?;
         if let Some(dst_entry) = &dst_entry_opt
             && dst_entry.kind == FileType::Directory
-            && !self.readdir(dst_entry.ino)?.is_empty()
+            && !Self::readdir_merged_in_write_txn(&txn, dst_entry.ino)?.is_empty()
         {
             return Err(MetaError::DirNotEmpty(dst_entry.ino));
         }
 
         let moved_dir_seed = if src_entry.kind == FileType::Directory {
-            Some(self.get_attr(src_entry.ino)?)
+            Some(Self::get_attr_merged_in_write_txn(&txn, src_entry.ino)?)
         } else {
             None
         };
         let old_parent_seed = if src_entry.kind == FileType::Directory && parent != new_parent {
-            Some(self.get_attr(parent)?)
+            Some(Self::get_attr_merged_in_write_txn(&txn, parent)?)
         } else {
             None
         };
         let new_parent_seed = if src_entry.kind == FileType::Directory && parent != new_parent {
-            Some(self.get_attr(new_parent)?)
+            Some(Self::get_attr_merged_in_write_txn(&txn, new_parent)?)
         } else {
             None
         };
         let displaced_attr_seed = match &dst_entry_opt {
             Some(dst_entry) if dst_entry.kind != FileType::Directory => {
-                Some(self.get_attr(dst_entry.ino)?)
+                Some(Self::get_attr_merged_in_write_txn(&txn, dst_entry.ino)?)
             }
             _ => None,
         };
