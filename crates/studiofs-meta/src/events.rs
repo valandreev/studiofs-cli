@@ -114,6 +114,13 @@ impl MetaEvent {
         }
     }
 
+    pub fn is_namespace_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::AddEntry { .. } | Self::RemoveEntry { .. } | Self::RenameEntry { .. }
+        )
+    }
+
     /// Returns the primary Inode associated with this event, if applicable.
     /// This is useful for partitioning or logical clocks.
     pub fn primary_ino(&self) -> Option<u64> {
