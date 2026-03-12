@@ -425,6 +425,9 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
 const DEFAULT_DENTRY_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const DENTRY_CACHE_PROTECTED_PERCENT: usize = 80;
+const DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER: usize = 2;
+const DENTRY_CACHE_ORDER_COMPACT_SLACK: usize = 64;
+const DENTRY_CACHE_INDEX_NODE_OVERHEAD: usize = 32;
 const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
 const INGRESS_RECORD_PUT: u8 = 1;
@@ -588,14 +591,14 @@ struct IgnoredEntryRegistry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DentryCacheKey {
     parent: Ino,
-    name: Vec<u8>,
+    name: Arc<[u8]>,
 }
 
 impl DentryCacheKey {
     fn new(parent: Ino, name: &[u8]) -> Self {
         Self {
             parent,
-            name: name.to_vec(),
+            name: Arc::from(name),
         }
     }
 }
@@ -693,12 +696,11 @@ impl DentryCache {
         }
     }
 
-    fn estimate_entry_charge(parent: Ino, name: &[u8]) -> usize {
+    fn estimate_entry_charge(name: &[u8]) -> usize {
         std::mem::size_of::<DentryCacheKey>()
             .saturating_add(std::mem::size_of::<DentryCacheEntry>())
-            .saturating_add(std::mem::size_of::<Ino>())
             .saturating_add(name.len())
-            .saturating_add(std::mem::size_of_val(&parent))
+            .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD * 2)
     }
 
     fn is_enabled(&self) -> bool {
@@ -762,10 +764,11 @@ impl DentryCache {
                 DentryCacheSegment::Probationary => self.probationary_order.push_back((key, stamp)),
                 DentryCacheSegment::Protected => self.protected_order.push_back((key, stamp)),
             }
+            self.maybe_compact_orders();
             return;
         }
 
-        let charge = Self::estimate_entry_charge(parent, name);
+        let charge = Self::estimate_entry_charge(name);
         if charge > self.byte_budget {
             return;
         }
@@ -785,6 +788,7 @@ impl DentryCache {
             .insert(key.clone());
         self.probationary_order.push_back((key, stamp));
         self.used_bytes = self.used_bytes.saturating_add(charge);
+        self.maybe_compact_orders();
         self.enforce_limits();
     }
 
@@ -818,6 +822,7 @@ impl DentryCache {
             entry.stamp = stamp;
             self.protected_order.push_back((key.clone(), stamp));
         }
+        self.maybe_compact_orders();
     }
 
     fn promote_to_protected(&mut self, key: &DentryCacheKey) {
@@ -831,6 +836,7 @@ impl DentryCache {
             entry.stamp = stamp;
             self.protected_order.push_back((key.clone(), stamp));
         }
+        self.maybe_compact_orders();
         self.enforce_protected_budget();
     }
 
@@ -877,6 +883,42 @@ impl DentryCache {
     fn evict_one(&mut self) -> bool {
         self.evict_one_from(DentryCacheSegment::Probationary)
             || self.evict_one_from(DentryCacheSegment::Protected)
+    }
+
+    fn maybe_compact_orders(&mut self) {
+        let probationary_live = self.entries.len().saturating_sub(self.protected_entries);
+        let probationary_limit = probationary_live
+            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
+            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
+        if self.probationary_order.len() > probationary_limit {
+            self.compact_order(DentryCacheSegment::Probationary);
+        }
+
+        let protected_limit = self
+            .protected_entries
+            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
+            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
+        if self.protected_order.len() > protected_limit {
+            self.compact_order(DentryCacheSegment::Protected);
+        }
+    }
+
+    fn compact_order(&mut self, segment: DentryCacheSegment) {
+        let mut live: Vec<(u64, DentryCacheKey)> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (entry.segment == segment).then_some((entry.stamp, key.clone()))
+            })
+            .collect();
+        live.sort_unstable_by_key(|(stamp, _)| *stamp);
+
+        let order = match segment {
+            DentryCacheSegment::Probationary => &mut self.probationary_order,
+            DentryCacheSegment::Protected => &mut self.protected_order,
+        };
+        order.clear();
+        order.extend(live.into_iter().map(|(stamp, key)| (key, stamp)));
     }
 
     fn evict_one_from(&mut self, segment: DentryCacheSegment) -> bool {
@@ -7345,7 +7387,7 @@ mod tests {
 
     #[test]
     fn dentry_cache_is_bounded_and_supports_negative_entries() {
-        let single_charge = DentryCache::estimate_entry_charge(ROOT_INO, b"a");
+        let single_charge = DentryCache::estimate_entry_charge(b"a");
         let mut cache = DentryCache::new(2, single_charge * 4);
 
         cache.put(ROOT_INO, b"a", DentryCacheValue::Positive(11));
@@ -7369,7 +7411,7 @@ mod tests {
 
     #[test]
     fn dentry_cache_enforces_byte_budget_under_scan() {
-        let charge = DentryCache::estimate_entry_charge(ROOT_INO, b"k0000");
+        let charge = DentryCache::estimate_entry_charge(b"k0000");
         let mut cache = DentryCache::new(1024, charge * 32);
 
         for i in 0..2000usize {
@@ -7388,7 +7430,7 @@ mod tests {
 
     #[test]
     fn dentry_cache_tracks_hits_misses_and_negative_ratio() {
-        let charge = DentryCache::estimate_entry_charge(ROOT_INO, b"a");
+        let charge = DentryCache::estimate_entry_charge(b"a");
         let mut cache = DentryCache::new(1, charge * 8);
 
         assert_eq!(cache.get(ROOT_INO, b"missing"), None);
@@ -7402,6 +7444,35 @@ mod tests {
         assert_eq!(metrics.negative_hits, 1);
         assert_eq!(metrics.evictions, 1);
         assert!((metrics.negative_hit_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dentry_cache_compacts_lazy_orders_without_budget_pressure() {
+        let charge = DentryCache::estimate_entry_charge(b"hot");
+        let mut cache = DentryCache::new(8, charge * 128);
+        cache.put(ROOT_INO, b"hot", DentryCacheValue::Positive(1));
+
+        for _ in 0..5000 {
+            assert_eq!(
+                cache.get(ROOT_INO, b"hot"),
+                Some(DentryCacheValue::Positive(1))
+            );
+        }
+
+        assert!(
+            cache.protected_order.len() <= DENTRY_CACHE_ORDER_COMPACT_SLACK + 2,
+            "protected lazy queue should stay compact under steady-state hits"
+        );
+    }
+
+    #[test]
+    fn dentry_cache_key_clone_is_refcounted() {
+        let key = DentryCacheKey::new(ROOT_INO, b"shared-name");
+        let cloned = key.clone();
+        assert!(
+            Arc::ptr_eq(&key.name, &cloned.name),
+            "key clone should not duplicate name bytes"
+        );
     }
 
     #[test]
