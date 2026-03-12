@@ -1,6 +1,6 @@
 //! Integration tests for `studiofs dump` / `studiofs load`.
 //!
-//! Requires MinIO + PostgreSQL test env (ignored by default).
+//! Requires RustFS/S3 + PostgreSQL test env (ignored by default).
 
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -13,11 +13,11 @@ use studiofs_meta::{BlockRef, ROOT_INO, ensure_studiofs_database, open_meta_engi
 use uuid::Uuid;
 
 struct TestEnv {
-    minio_endpoint: String,
-    minio_bucket: String,
-    minio_access_key: String,
-    minio_secret_key: String,
-    minio_region: String,
+    s3_endpoint: String,
+    s3_bucket: String,
+    s3_access_key: String,
+    s3_secret_key: String,
+    s3_region: String,
 }
 
 fn workspace_root() -> &'static Path {
@@ -60,11 +60,11 @@ fn env_or_dotenv(key: &str, default: Option<&str>) -> Option<String> {
 
 fn load_test_env() -> Option<TestEnv> {
     Some(TestEnv {
-        minio_endpoint: env_or_dotenv("STUDIOFS_MINIO_ENDPOINT", Some("http://127.0.0.1:9000"))?,
-        minio_bucket: env_or_dotenv("STUDIOFS_MINIO_BUCKET", Some("studiofs-test"))?,
-        minio_access_key: env_or_dotenv("STUDIOFS_MINIO_ACCESS_KEY", Some("minioadmin"))?,
-        minio_secret_key: env_or_dotenv("STUDIOFS_MINIO_SECRET_KEY", Some("minioadmin"))?,
-        minio_region: env_or_dotenv("STUDIOFS_MINIO_REGION", Some("us-east-1"))?,
+        s3_endpoint: env_or_dotenv("STUDIOFS_S3_ENDPOINT", Some("http://127.0.0.1:9000"))?,
+        s3_bucket: env_or_dotenv("STUDIOFS_S3_BUCKET", Some("studiofs-test"))?,
+        s3_access_key: env_or_dotenv("STUDIOFS_S3_ACCESS_KEY", Some("studiofs"))?,
+        s3_secret_key: env_or_dotenv("STUDIOFS_S3_SECRET_KEY", Some("studiofs123"))?,
+        s3_region: env_or_dotenv("STUDIOFS_S3_REGION", Some("us-east-1"))?,
     })
 }
 
@@ -227,15 +227,15 @@ fn dump_load_restores_volume_and_discovery_reads_data() {
             "init",
             &disk_name,
             "--endpoint",
-            &env.minio_endpoint,
+            &env.s3_endpoint,
             "--bucket",
-            &env.minio_bucket,
+            &env.s3_bucket,
             "--access-key",
-            &env.minio_access_key,
+            &env.s3_access_key,
             "--secret-key",
-            &env.minio_secret_key,
+            &env.s3_secret_key,
             "--region",
-            &env.minio_region,
+            &env.s3_region,
             "--meta",
             &raw_pg,
         ],
@@ -309,15 +309,15 @@ fn dump_load_restores_target_volume_without_breaking_other_volumes() {
             "init",
             &target,
             "--endpoint",
-            &env.minio_endpoint,
+            &env.s3_endpoint,
             "--bucket",
-            &env.minio_bucket,
+            &env.s3_bucket,
             "--access-key",
-            &env.minio_access_key,
+            &env.s3_access_key,
             "--secret-key",
-            &env.minio_secret_key,
+            &env.s3_secret_key,
             "--region",
-            &env.minio_region,
+            &env.s3_region,
             "--meta",
             &raw_pg,
         ],
@@ -346,15 +346,15 @@ fn dump_load_restores_target_volume_without_breaking_other_volumes() {
                 "init",
                 disk,
                 "--endpoint",
-                &env.minio_endpoint,
+                &env.s3_endpoint,
                 "--bucket",
-                &env.minio_bucket,
+                &env.s3_bucket,
                 "--access-key",
-                &env.minio_access_key,
+                &env.s3_access_key,
                 "--secret-key",
-                &env.minio_secret_key,
+                &env.s3_secret_key,
                 "--region",
-                &env.minio_region,
+                &env.s3_region,
                 "--meta",
                 &raw_pg,
             ],

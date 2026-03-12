@@ -127,7 +127,7 @@ What it does:
 
 Client A:
 ```bash
-studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key minioadmin --secret-key minioadmin --meta postgres://studiofs:studiofs@127.0.0.1:5432
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta postgres://studiofs:studiofs@127.0.0.1:5432
 studiofs mount projectfs Z:
 ```
 
@@ -188,10 +188,13 @@ Metadata cache observability is emitted through the existing periodic `upload pi
 
 ### Testing
 
+Primary local development and infra-backed tests use RustFS as the
+S3-compatible backend.
+
 | Variable | Default | Description |
 |---|---|---|
-| `STUDIOFS_MINIO_ENDPOINT` | `http://127.0.0.1:9000` | Test S3 endpoint |
-| `STUDIOFS_MINIO_ACCESS_KEY` | `minioadmin` | Test access key |
-| `STUDIOFS_MINIO_SECRET_KEY` | `minioadmin` | Test secret key |
-| `STUDIOFS_MINIO_BUCKET` | `studiofs-test` | Test bucket |
+| `STUDIOFS_S3_ENDPOINT` | `http://127.0.0.1:9000` | Test S3 endpoint |
+| `STUDIOFS_S3_ACCESS_KEY` | `studiofs` | Test access key |
+| `STUDIOFS_S3_SECRET_KEY` | `studiofs123` | Test secret key |
+| `STUDIOFS_S3_BUCKET` | `studiofs-test` | Test bucket |
 | `STUDIOFS_TEST_PG_DSN` | none | PostgreSQL server DSN for ignored PG tests; StudioFS uses DB `studiofs` |

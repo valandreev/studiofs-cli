@@ -87,9 +87,9 @@ Supported S3 backends:
   AWS S3, MinIO, Google Cloud Storage, Wasabi, Backblaze B2, and any S3-compatible service.")]
 #[command(after_help = "\
 EXAMPLES:
-  Initialize a new volume with MinIO + PostgreSQL:
+  Initialize a new volume with RustFS + PostgreSQL:
     studiofs init myvolume --endpoint http://127.0.0.1:9000 \\
-      --bucket mybucket --access-key minioadmin --secret-key minioadmin \\
+      --bucket mybucket --access-key studiofs --secret-key studiofs123 \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
   Discover the same volume on another machine/client:
@@ -175,14 +175,14 @@ EXAMPLES:
       --bucket my-bucket --access-key AKIA... --secret-key wJal... \\
       --region us-east-1 --meta postgres://user:pass@db:5432
 
-  MinIO (local) + PostgreSQL:
+  RustFS (local) + PostgreSQL:
     studiofs init dev --endpoint http://127.0.0.1:9000 \\
-      --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
+      --bucket test-bucket --access-key studiofs --secret-key studiofs123 \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
   Custom block size (16 MiB instead of default 8 MiB):
     studiofs init custom --endpoint http://127.0.0.1:9000 \\
-      --bucket test-bucket --access-key minioadmin --secret-key minioadmin \\
+      --bucket test-bucket --access-key studiofs --secret-key studiofs123 \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432 \\
       --block-size 16MB
 
@@ -214,7 +214,7 @@ RUNTIME POLICY:
         #[arg(long)]
         secret_key: String,
 
-        /// S3 region (defaults to us-east-1 for MinIO compatibility)
+        /// S3 region (defaults to us-east-1 for local S3-compatible services)
         #[arg(long, default_value = "")]
         region: String,
 

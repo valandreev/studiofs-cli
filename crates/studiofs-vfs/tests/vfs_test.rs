@@ -7,7 +7,7 @@
 //! - Crash recovery via journaling
 //!
 //! Prerequisites:
-//!   minio server C:\minio --console-address ":9001"
+//!   rustfs server
 //!
 //! Run with:
 //!   cargo test -p studiofs-vfs --test vfs_test -- --ignored
@@ -53,10 +53,10 @@ use uuid::Uuid;
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
     load_test_env();
-    let endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
-    let bucket = test_env_var("STUDIOFS_MINIO_BUCKET", "studiofs-test");
-    let access_key = test_env_var("STUDIOFS_MINIO_ACCESS_KEY", "minioadmin");
-    let secret_key = test_env_var("STUDIOFS_MINIO_SECRET_KEY", "minioadmin");
+    let endpoint = test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
+    let bucket = test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test");
+    let access_key = test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+    let secret_key = test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let run_id = RUN_ID.get_or_init(|| {
         let ts = SystemTime::now()
@@ -144,39 +144,35 @@ fn acquire_test_env_lock() -> ReentrantMutexGuard<'static, ()> {
     test_env_lock().lock()
 }
 
-struct TestMinioEnv {
+struct TestS3Env {
     endpoint: String,
     bucket: String,
     access_key: String,
     secret_key: String,
 }
 
-fn test_online_minio_env() -> &'static TestMinioEnv {
-    static ENV: OnceLock<TestMinioEnv> = OnceLock::new();
+fn test_online_s3_env() -> &'static TestS3Env {
+    static ENV: OnceLock<TestS3Env> = OnceLock::new();
     ENV.get_or_init(|| {
         load_test_env();
 
-        TestMinioEnv {
-            endpoint: workspace_dotenv_var("STUDIOFS_MINIO_ENDPOINT")
-                .unwrap_or_else(|| "http://127.0.0.1:9000".to_string()),
-            bucket: workspace_dotenv_var("STUDIOFS_MINIO_BUCKET")
-                .unwrap_or_else(|| "studiofs-test".to_string()),
-            access_key: workspace_dotenv_var("STUDIOFS_MINIO_ACCESS_KEY")
-                .unwrap_or_else(|| "minioadmin".to_string()),
-            secret_key: workspace_dotenv_var("STUDIOFS_MINIO_SECRET_KEY")
-                .unwrap_or_else(|| "minioadmin".to_string()),
+        TestS3Env {
+            endpoint: test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            bucket: test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test"),
+            access_key: test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
+            secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
         }
     })
 }
 
-fn apply_test_online_minio_env() {
+fn apply_test_online_s3_env() {
     let _env_lock = acquire_test_env_lock();
-    let env = test_online_minio_env();
+    let env = test_online_s3_env();
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &env.endpoint);
-        std::env::set_var("STUDIOFS_MINIO_BUCKET", &env.bucket);
-        std::env::set_var("STUDIOFS_MINIO_ACCESS_KEY", &env.access_key);
-        std::env::set_var("STUDIOFS_MINIO_SECRET_KEY", &env.secret_key);
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", &env.endpoint);
+        std::env::set_var("STUDIOFS_S3_BUCKET", &env.bucket);
+        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
+        std::env::set_var("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
     }
 }
 
@@ -186,7 +182,7 @@ fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> Format
     info
 }
 
-/// Create a fresh VFS instance backed by a temporary redb and MinIO.
+/// Create a fresh VFS instance backed by a temporary redb and S3-compatible storage.
 fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
 
@@ -496,10 +492,10 @@ async fn ensure_bucket() {
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
-    let endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
-    let bucket = test_env_var("STUDIOFS_MINIO_BUCKET", "studiofs-test");
-    let access_key = test_env_var("STUDIOFS_MINIO_ACCESS_KEY", "minioadmin");
-    let secret_key = test_env_var("STUDIOFS_MINIO_SECRET_KEY", "minioadmin");
+    let endpoint = test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
+    let bucket = test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test");
+    let access_key = test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+    let secret_key = test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
 
     let builder = S3::default()
         .endpoint(&endpoint)
@@ -1265,7 +1261,7 @@ fn test_crash_recovery_replays_pending_journal() {
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
-    let online_endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let online_endpoint = test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
     let online_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     meta.set_format_info(&online_info).unwrap();
 
@@ -1493,14 +1489,14 @@ fn writer_reads_full_file_before_any_remote_commit() {
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_endpoint = EnvRestore::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
 
     unsafe {
         // Keep writes local-only: acceptance into cache + WAL, no slab drain.
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1637,12 +1633,12 @@ fn remote_clients_see_uploading_marker_without_precise_progress() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     }
 
     let writer_tmp = tempfile::tempdir().unwrap();
@@ -1692,12 +1688,12 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     }
 
     let writer_tmp = tempfile::tempdir().unwrap();
@@ -1752,13 +1748,13 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
 fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
-    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
-    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
-    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    apply_test_online_minio_env();
+    apply_test_online_s3_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
@@ -1859,7 +1855,7 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
 fn remote_clients_keep_previous_committed_version_during_update() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -1917,7 +1913,7 @@ fn remote_clients_keep_previous_committed_version_during_update() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -1958,16 +1954,16 @@ fn remote_clients_keep_previous_committed_version_during_update() {
 fn atomic_switch_to_new_incarnation_after_full_commit() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
-    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
-    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
-    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    apply_test_online_minio_env();
+    apply_test_online_s3_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
@@ -2109,7 +2105,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = EnvRestore::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     let _restore_fetch_attempts = EnvRestore::capture("STUDIOFS_FETCH_MAX_ATTEMPTS");
     let _restore_fetch_timeout = EnvRestore::capture("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS");
@@ -2132,7 +2128,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
     let mut ino = 0u64;
     let mut baseline_object_id = 0u64;
     let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
-    let online_endpoint = test_env_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:9000");
+    let online_endpoint = test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
     let mut format_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     let data_config_online = DataStoreConfig::from(&format_info);
 
@@ -2182,7 +2178,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
 
     unsafe {
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
     }
 
@@ -2538,14 +2534,14 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
 fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -2613,14 +2609,14 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
 fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -2803,7 +2799,7 @@ fn single_inode_never_has_two_pending_incarnations() {
 fn large_file_unlink_cancels_pending_uploads() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -2813,7 +2809,7 @@ fn large_file_unlink_cancels_pending_uploads() {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2879,7 +2875,7 @@ fn large_file_unlink_cancels_pending_uploads() {
 fn large_file_partial_overwrite_reuploads_only_touched_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -2936,7 +2932,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -2991,7 +2987,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
 fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -3049,7 +3045,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -3100,7 +3096,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", &online_info.endpoint);
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", &online_info.endpoint);
     }
     meta.set_format_info(&online_info).unwrap();
 
@@ -3146,7 +3142,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
 fn large_file_rename_does_not_restart_or_duplicate_uploads() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -3156,7 +3152,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3225,7 +3221,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn rename_into_trashes_evicts_local_cache_blocks() {
-    apply_test_online_minio_env();
+    apply_test_online_s3_env();
     ensure_bucket().await;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3288,7 +3284,7 @@ async fn rename_into_trashes_evicts_local_cache_blocks() {
 fn update_manifest_reuses_untouched_committed_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -3342,7 +3338,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -3399,7 +3395,7 @@ fn restart_replays_only_live_pending_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -3407,7 +3403,7 @@ fn restart_replays_only_live_pending_extents() {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -3614,14 +3610,14 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
 fn offline_s3_does_not_break_local_read_after_write() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -3689,16 +3685,16 @@ fn offline_s3_does_not_break_local_read_after_write() {
 fn upload_completion_batching_does_not_change_visibility_contract() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
-    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_MINIO_BUCKET");
-    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_MINIO_ACCESS_KEY");
-    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_MINIO_SECRET_KEY");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    apply_test_online_minio_env();
+    apply_test_online_s3_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
@@ -3749,7 +3745,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -3795,7 +3791,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
     }
 
     unsafe {
-        apply_test_online_minio_env();
+        apply_test_online_s3_env();
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
     }
@@ -3878,7 +3874,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
 fn slow_s3_does_not_stall_local_reads_and_writes() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -3890,7 +3886,7 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "128MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -3976,7 +3972,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -4001,7 +3997,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
         std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -4064,7 +4060,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", tight_spill_bytes.to_string());
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -4201,7 +4197,7 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
 fn recovery_after_offline_s3_preserves_local_accepted_view() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -4256,7 +4252,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
     };
 
     unsafe {
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
     }
     meta.set_format_info(&offline_info).unwrap();
 
@@ -4338,7 +4334,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
 fn twenty_four_hour_soak_no_global_fs_stall() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
@@ -4349,7 +4345,7 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "256MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -6955,14 +6951,14 @@ async fn test_flock_shared_then_exclusive_conflict() {
 async fn shutdown_with_pending_uploads_completes_within_bound() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -7001,14 +6997,14 @@ async fn shutdown_with_pending_uploads_completes_within_bound() {
 async fn ctrl_c_during_small_file_churn_does_not_hang() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -7058,14 +7054,14 @@ async fn ctrl_c_during_small_file_churn_does_not_hang() {
 async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -7111,14 +7107,14 @@ async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
 async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
@@ -7171,14 +7167,14 @@ async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
 async fn pending_upload_helpers_use_live_index_without_directory_scan() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_MINIO_ENDPOINT");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_MINIO_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");

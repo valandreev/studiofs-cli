@@ -30,13 +30,16 @@ cp .env.example .env
 ```
 
 Recommended `.env` values:
-- `STUDIOFS_MINIO_ENDPOINT`
-- `STUDIOFS_MINIO_ACCESS_KEY`
-- `STUDIOFS_MINIO_SECRET_KEY`
-- `STUDIOFS_MINIO_BUCKET`
+- `STUDIOFS_S3_ENDPOINT`
+- `STUDIOFS_S3_ACCESS_KEY`
+- `STUDIOFS_S3_SECRET_KEY`
+- `STUDIOFS_S3_BUCKET`
 - `STUDIOFS_TEST_PG_DSN`
 
 `.env` is gitignored and must not be committed.
+
+Local development and infra-backed testing use RustFS as the default
+S3-compatible backend.
 
 ## Build
 
@@ -64,7 +67,7 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
-On Windows/PowerShell, clear proxy env before infra tests when MinIO/PG are
+On Windows/PowerShell, clear proxy env before infra tests when RustFS/S3 and PostgreSQL are
 directly reachable in LAN/VPN:
 
 ```powershell

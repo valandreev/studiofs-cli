@@ -86,7 +86,7 @@ impl DataStore {
         if !config.region.is_empty() {
             builder = builder.region(&config.region);
         } else {
-            // For MinIO and other S3-compatible services
+            // For local S3-compatible services
             builder = builder.region("us-east-1");
         }
 

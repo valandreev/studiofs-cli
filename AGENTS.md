@@ -14,7 +14,7 @@ Documentation lives in `docs/` (architecture, config, tests, development). Integ
 ## Build, Test, and Development Commands
 - `cargo build --release`: production build for all workspace crates.
 - `cargo test --workspace --all-targets -- --nocapture`: fast local suite.
-- `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1`: integration/infra-heavy suite (MinIO/PostgreSQL).
+- `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1`: integration/infra-heavy suite (RustFS/S3 + PostgreSQL).
 - `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1`: Postgres-focused regression run.
 - `cargo run -p studiofs -- --help`: inspect CLI usage locally.
 - `cp .env.example .env` (or PowerShell equivalent): seed local test/runtime config.
@@ -35,7 +35,7 @@ Current history favors short, direct subjects (for example: `io path overhaul`, 
 - what changed and why
 - crates/docs touched
 - exact test commands run
-- infra assumptions (MinIO/PostgreSQL, env vars)
+- infra assumptions (RustFS/S3 + PostgreSQL, env vars)
 
 ## Security & Configuration Tips
 Never commit `.env` or real credentials. Use `.env.example` defaults for local development, and sanitize endpoints/keys in logs or shared repro steps.

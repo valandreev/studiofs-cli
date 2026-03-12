@@ -3,7 +3,7 @@
 //! Run fast-only tests:
 //!   cargo test -p studiofs --test destroy_test
 //!
-//! Run infra-backed tests (MinIO + PostgreSQL):
+//! Run infra-backed tests (RustFS/S3 + PostgreSQL):
 //!   cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1
 
 use bytes::Bytes;
@@ -20,11 +20,11 @@ use studiofs_meta::{
 use uuid::Uuid;
 
 struct TestEnv {
-    minio_endpoint: String,
-    minio_bucket: String,
-    minio_access_key: String,
-    minio_secret_key: String,
-    minio_region: String,
+    s3_endpoint: String,
+    s3_bucket: String,
+    s3_access_key: String,
+    s3_secret_key: String,
+    s3_region: String,
 }
 
 struct InfraFixture {
@@ -79,16 +79,16 @@ fn env_or_dotenv(key: &str, default: Option<&str>) -> Option<String> {
 fn load_test_env() -> &'static TestEnv {
     static ENV: OnceLock<TestEnv> = OnceLock::new();
     ENV.get_or_init(|| TestEnv {
-        minio_endpoint: env_or_dotenv("STUDIOFS_MINIO_ENDPOINT", Some("http://127.0.0.1:9000"))
-            .expect("resolve STUDIOFS_MINIO_ENDPOINT"),
-        minio_bucket: env_or_dotenv("STUDIOFS_MINIO_BUCKET", Some("studiofs-test"))
-            .expect("resolve STUDIOFS_MINIO_BUCKET"),
-        minio_access_key: env_or_dotenv("STUDIOFS_MINIO_ACCESS_KEY", Some("minioadmin"))
-            .expect("resolve STUDIOFS_MINIO_ACCESS_KEY"),
-        minio_secret_key: env_or_dotenv("STUDIOFS_MINIO_SECRET_KEY", Some("minioadmin"))
-            .expect("resolve STUDIOFS_MINIO_SECRET_KEY"),
-        minio_region: env_or_dotenv("STUDIOFS_MINIO_REGION", Some("us-east-1"))
-            .expect("resolve STUDIOFS_MINIO_REGION"),
+        s3_endpoint: env_or_dotenv("STUDIOFS_S3_ENDPOINT", Some("http://127.0.0.1:9000"))
+            .expect("resolve STUDIOFS_S3_ENDPOINT"),
+        s3_bucket: env_or_dotenv("STUDIOFS_S3_BUCKET", Some("studiofs-test"))
+            .expect("resolve STUDIOFS_S3_BUCKET"),
+        s3_access_key: env_or_dotenv("STUDIOFS_S3_ACCESS_KEY", Some("studiofs"))
+            .expect("resolve STUDIOFS_S3_ACCESS_KEY"),
+        s3_secret_key: env_or_dotenv("STUDIOFS_S3_SECRET_KEY", Some("studiofs123"))
+            .expect("resolve STUDIOFS_S3_SECRET_KEY"),
+        s3_region: env_or_dotenv("STUDIOFS_S3_REGION", Some("us-east-1"))
+            .expect("resolve STUDIOFS_S3_REGION"),
     })
 }
 
@@ -209,11 +209,11 @@ fn pg_volume_exists(dsn: &str, volume_id: i64) -> bool {
 
 fn make_datastore(env: &TestEnv, name: &str) -> DataStore {
     let cfg = DataStoreConfig {
-        endpoint: env.minio_endpoint.clone(),
-        bucket: env.minio_bucket.clone(),
-        access_key: env.minio_access_key.clone(),
-        secret_key: env.minio_secret_key.clone(),
-        region: env.minio_region.clone(),
+        endpoint: env.s3_endpoint.clone(),
+        bucket: env.s3_bucket.clone(),
+        access_key: env.s3_access_key.clone(),
+        secret_key: env.s3_secret_key.clone(),
+        region: env.s3_region.clone(),
         volume_name: name.to_string(),
     };
     DataStore::new(&cfg).expect("create datastore")
@@ -239,11 +239,11 @@ fn create_local_metadata(
         format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: Uuid::new_v4().to_string(),
-        endpoint: env.minio_endpoint.clone(),
-        bucket: env.minio_bucket.clone(),
-        access_key: env.minio_access_key.clone(),
-        secret_key: env.minio_secret_key.clone(),
-        region: env.minio_region.clone(),
+        endpoint: env.s3_endpoint.clone(),
+        bucket: env.s3_bucket.clone(),
+        access_key: env.s3_access_key.clone(),
+        secret_key: env.s3_secret_key.clone(),
+        region: env.s3_region.clone(),
         data_prefix: format!("{name}/objects/"),
         metadata: MetadataConfig {
             backend: MetadataBackend::Postgres,
@@ -274,11 +274,11 @@ fn create_local_metadata_with_bad_s3_secret(
         format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: Uuid::new_v4().to_string(),
-        endpoint: env.minio_endpoint.clone(),
-        bucket: env.minio_bucket.clone(),
-        access_key: env.minio_access_key.clone(),
+        endpoint: env.s3_endpoint.clone(),
+        bucket: env.s3_bucket.clone(),
+        access_key: env.s3_access_key.clone(),
         secret_key: "bad-secret-for-permission-test".to_string(),
-        region: env.minio_region.clone(),
+        region: env.s3_region.clone(),
         data_prefix: format!("{name}/objects/"),
         metadata: MetadataConfig {
             backend: MetadataBackend::Postgres,
@@ -328,11 +328,11 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
         pg_dsn: studio_dsn,
         pg_volume_id,
         env: TestEnv {
-            minio_endpoint: env.minio_endpoint.clone(),
-            minio_bucket: env.minio_bucket.clone(),
-            minio_access_key: env.minio_access_key.clone(),
-            minio_secret_key: env.minio_secret_key.clone(),
-            minio_region: env.minio_region.clone(),
+            s3_endpoint: env.s3_endpoint.clone(),
+            s3_bucket: env.s3_bucket.clone(),
+            s3_access_key: env.s3_access_key.clone(),
+            s3_secret_key: env.s3_secret_key.clone(),
+            s3_region: env.s3_region.clone(),
         },
     })
 }
@@ -357,7 +357,7 @@ fn destroy_fails_for_missing_volume_name() {
 #[ignore]
 fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
     let Some(fixture) = build_infra_fixture("destroy-bad-creds") else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/MinIO env not ready");
+        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
         return;
     };
 
@@ -400,7 +400,7 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
 #[ignore]
 fn destroy_local_only_removes_local_state_and_keeps_remote() {
     let Some(fixture) = build_infra_fixture("destroy-local-only") else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/MinIO env not ready");
+        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
         return;
     };
 
@@ -446,7 +446,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
 #[ignore]
 fn destroy_full_removes_local_s3_and_postgres_state() {
     let Some(fixture) = build_infra_fixture("destroy-full") else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/MinIO env not ready");
+        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
         return;
     };
 

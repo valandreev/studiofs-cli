@@ -2,14 +2,14 @@
 
 ## 1. Create a New Virtual Volume (Init)
 
-Initialize a volume using a local MinIO and PostgreSQL for metadata:
+Initialize a volume using local RustFS and PostgreSQL for metadata:
 
 ```bash
 studiofs init myvolume \
   --endpoint http://127.0.0.1:9000 \
   --bucket mybucket \
-  --access-key minioadmin \
-  --secret-key minioadmin \
+  --access-key studiofs \
+  --secret-key studiofs123 \
   --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ```
 

@@ -3,23 +3,25 @@
 ## Test Layers
 
 1. Fast local/unit tests (default).
-2. Ignored integration tests with MinIO + PostgreSQL.
+2. Ignored integration tests with RustFS/S3 + PostgreSQL.
 
 ## Prerequisites
 
 - Rust toolchain
-- MinIO (for data integration tests)
+- RustFS or another S3-compatible backend (for data integration tests)
 - PostgreSQL (for metadata PG integration tests)
 - Optional `.env` in repo root
 
 Example `.env` keys:
-- `STUDIOFS_MINIO_ENDPOINT=http://127.0.0.1:9000`
-- `STUDIOFS_MINIO_ACCESS_KEY=minioadmin`
-- `STUDIOFS_MINIO_SECRET_KEY=minioadmin`
-- `STUDIOFS_MINIO_BUCKET=studiofs-test`
+- `STUDIOFS_S3_ENDPOINT=http://127.0.0.1:9000`
+- `STUDIOFS_S3_ACCESS_KEY=studiofs`
+- `STUDIOFS_S3_SECRET_KEY=studiofs123`
+- `STUDIOFS_S3_BUCKET=studiofs-test`
 - `STUDIOFS_TEST_PG_DSN=host=... port=5432 user=... password=... sslmode=disable`
 
 StudioFS will use PostgreSQL database `studiofs` automatically.
+Local development and infra validation should target RustFS on the
+S3-compatible side unless a test explicitly checks another provider.
 
 ## Command Matrix
 
@@ -124,11 +126,11 @@ Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^
   suite uses background poll/flush timing and is intentionally validated in
   single-threaded mode.
 
-### MinIO failures
+### S3 backend failures
 - Validate endpoint/credentials/bucket.
 - Ensure bucket permissions include create/read/write/delete.
 - If process-level `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` is set, clear them for test runs.
-- Keep `NO_PROXY` including `localhost,127.0.0.1,::1` (and your direct MinIO host if needed).
+- Keep `NO_PROXY` including `localhost,127.0.0.1,::1` (and your direct RustFS/S3 host if needed).
 
 ### Windows lock issues
 - Close processes that hold files in `target/`.

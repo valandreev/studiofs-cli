@@ -1,7 +1,7 @@
-//! Integration tests for DataStore against a live MinIO instance.
+//! Integration tests for DataStore against a live S3-compatible instance.
 //!
 //! Prerequisites:
-//!   minio server C:\minio --console-address ":9001"
+//!   rustfs server
 //!
 //! Run with:
 //!   cargo test -p studiofs-data --test integration_test -- --ignored
@@ -28,17 +28,21 @@ fn load_test_env() {
     });
 }
 
-/// MinIO default credentials and endpoint.
+fn test_env_var(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.into())
+}
+
+/// Default S3-compatible test credentials and endpoint.
 fn test_config() -> DataStoreConfig {
     load_test_env();
     DataStoreConfig {
-        endpoint: std::env::var("STUDIOFS_MINIO_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
-        bucket: std::env::var("STUDIOFS_MINIO_BUCKET").unwrap_or_else(|_| "studiofs-test".into()),
-        access_key: std::env::var("STUDIOFS_MINIO_ACCESS_KEY")
-            .unwrap_or_else(|_| "minioadmin".into()),
-        secret_key: std::env::var("STUDIOFS_MINIO_SECRET_KEY")
-            .unwrap_or_else(|_| "minioadmin".into()),
+        endpoint: test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000"),
+        bucket: test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test"),
+        access_key: test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
+        secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
         region: "us-east-1".into(),
         volume_name: "integration-test".into(),
     }

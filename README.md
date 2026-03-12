@@ -61,8 +61,8 @@ Initialize a new volume:
 studiofs init myvolume \
   --endpoint http://127.0.0.1:9000 \
   --bucket studiofs-test \
-  --access-key minioadmin \
-  --secret-key minioadmin \
+  --access-key studiofs \
+  --secret-key studiofs123 \
   --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ```
 
@@ -124,6 +124,9 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
+Local development and infra-backed tests use RustFS as the default
+S3-compatible backend together with PostgreSQL.
+
 Local setup usually starts with:
 
 ```bash
@@ -131,10 +134,10 @@ cp .env.example .env
 ```
 
 Useful test/runtime variables include:
-- `STUDIOFS_MINIO_ENDPOINT`
-- `STUDIOFS_MINIO_ACCESS_KEY`
-- `STUDIOFS_MINIO_SECRET_KEY`
-- `STUDIOFS_MINIO_BUCKET`
+- `STUDIOFS_S3_ENDPOINT`
+- `STUDIOFS_S3_ACCESS_KEY`
+- `STUDIOFS_S3_SECRET_KEY`
+- `STUDIOFS_S3_BUCKET`
 - `STUDIOFS_TEST_PG_DSN`
 
 ## Documentation
