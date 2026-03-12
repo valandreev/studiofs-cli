@@ -312,6 +312,19 @@ Each cache entry also stores namespace validation tokens:
 On cache hit, tokens are validated against current runtime values. If tokens
 don't match, the entry is lazily treated as stale and reloaded from metadata.
 
+`resolve_path`/`resolve_parent` additionally use a bounded full-path shortcut
+cache keyed by normalized path components + path style:
+- positive entries: `(<style>, <normalized path>) -> child_ino`
+- negative entries: `(<style>, <normalized path>) -> (parent_ino, missing_name)`
+
+Full-path entries carry:
+- `namespace_epoch`
+- a compact list of `(parent_ino, parent_generation)` tokens for each parent hop
+
+On hit, every recorded parent generation is revalidated against current VFS
+generation state. Any mismatch lazily invalidates the shortcut and forces
+component walk through `lookup_component`.
+
 Namespace mutation updates are deterministic:
 - on create/mkdir/symlink/link: insert positive entry
 - on unlink/rmdir: insert negative entry

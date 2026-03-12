@@ -135,8 +135,10 @@ ENV TUNING:
   STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
   STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY  Upload slot cost when reads active (default: 4).
   STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 250).
-  STUDIOFS_DENTRY_CACHE_CAPACITY    Metadata dentry cache entry budget (default: 65536).
-  STUDIOFS_DENTRY_CACHE_BYTES       Metadata dentry cache byte budget (default: 64MB).
+  STUDIOFS_DENTRY_CACHE_CAPACITY    VFS dentry cache entry budget (default: 65536).
+  STUDIOFS_DENTRY_CACHE_BYTES       VFS dentry cache byte budget (default: 64MB).
+  STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY  VFS full-path shortcut cache entry budget (default: 16384).
+  STUDIOFS_PATH_SHORTCUT_CACHE_BYTES     VFS full-path shortcut cache byte budget (default: 16MB).
   STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS  Wait uploads on unmount (default: 0, resume next mount).
 
   Enable debug logging:

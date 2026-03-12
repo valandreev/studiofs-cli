@@ -69,6 +69,11 @@ The current architecture relies on these focused regressions:
   - `namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths`
   - `namespace_resolver_windows_and_posix_match_on_same_namespace_entry`
   - `namespace_resolver_windows_parent_normalization_matches_winfsp_semantics`
+- path shortcut cache:
+  - `path_shortcut_cache_is_bounded_and_supports_negative_entries`
+  - `path_shortcut_cache_rejects_stale_parent_generations`
+  - `namespace_resolver_path_shortcut_hits_and_renames_invalidate`
+  - `namespace_resolver_path_shortcut_invalidation_on_delete_subtree`
 - namespace cache invalidation tokens:
   - `dentry_cache_rejects_stale_namespace_tokens_lazily`
   - `setattr_does_not_bump_namespace_generations`

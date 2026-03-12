@@ -155,6 +155,8 @@ studiofs mount projectfs Y:
 | `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
 | `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
+| `STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY` | `16384` | Max number of full-path shortcut cache entries in `NamespaceResolver` |
+| `STUDIOFS_PATH_SHORTCUT_CACHE_BYTES` | `16MB` | Max in-memory bytes for full-path shortcut cache entries |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |
@@ -184,7 +186,7 @@ studiofs mount projectfs Y:
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Shutdown upload drain max wait |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
-Metadata cache observability is emitted through the existing periodic `upload pipeline` / `upload pipeline counters` log events and includes dentry cache hits, misses, evictions, occupancy, and negative-hit ratio.
+Metadata cache observability is emitted through the existing periodic `upload pipeline` / `upload pipeline counters` log events and includes dentry cache and full-path shortcut cache hits, misses, evictions, occupancy, and negative-hit ratio.
 
 ### Testing
 
