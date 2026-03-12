@@ -38,7 +38,7 @@ use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -422,6 +422,7 @@ const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 10;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
+const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
 const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
 const INGRESS_RECORD_PUT: u8 = 1;
@@ -580,6 +581,149 @@ struct IgnoredEntry {
 struct IgnoredEntryRegistry {
     by_ino: HashMap<Ino, IgnoredEntry>,
     by_name: HashMap<(Ino, Vec<u8>), Ino>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DentryCacheKey {
+    parent: Ino,
+    name: Vec<u8>,
+}
+
+impl DentryCacheKey {
+    fn new(parent: Ino, name: &[u8]) -> Self {
+        Self {
+            parent,
+            name: name.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DentryCacheValue {
+    Positive(Ino),
+    Negative,
+}
+
+#[derive(Debug, Clone)]
+struct DentryCacheEntry {
+    value: DentryCacheValue,
+    stamp: u64,
+}
+
+#[derive(Debug)]
+struct DentryCache {
+    capacity: usize,
+    next_stamp: u64,
+    entries: HashMap<DentryCacheKey, DentryCacheEntry>,
+    order: VecDeque<(DentryCacheKey, u64)>,
+    parent_index: HashMap<Ino, HashSet<DentryCacheKey>>,
+}
+
+impl DentryCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_stamp: 1,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            parent_index: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, parent: Ino, name: &[u8]) -> Option<DentryCacheValue> {
+        if self.capacity == 0 {
+            return None;
+        }
+        let key = DentryCacheKey::new(parent, name);
+        let value = self.entries.get(&key)?.value;
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.saturating_add(1);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.stamp = stamp;
+        }
+        self.order.push_back((key, stamp));
+        Some(value)
+    }
+
+    fn put(&mut self, parent: Ino, name: &[u8], value: DentryCacheValue) {
+        if self.capacity == 0 {
+            return;
+        }
+        let key = DentryCacheKey::new(parent, name);
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.saturating_add(1);
+
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.value = value;
+            entry.stamp = stamp;
+            self.order.push_back((key, stamp));
+            return;
+        }
+
+        while self.entries.len() >= self.capacity {
+            if !self.evict_one() {
+                break;
+            }
+        }
+
+        self.entries
+            .insert(key.clone(), DentryCacheEntry { value, stamp });
+        self.parent_index
+            .entry(parent)
+            .or_default()
+            .insert(key.clone());
+        self.order.push_back((key, stamp));
+    }
+
+    fn invalidate(&mut self, parent: Ino, name: &[u8]) {
+        let key = DentryCacheKey::new(parent, name);
+        if self.entries.remove(&key).is_some()
+            && let Some(keys) = self.parent_index.get_mut(&parent)
+        {
+            keys.remove(&key);
+            let empty = keys.is_empty();
+            if empty {
+                self.parent_index.remove(&parent);
+            }
+        }
+    }
+
+    fn invalidate_parent(&mut self, parent: Ino) {
+        let Some(keys) = self.parent_index.remove(&parent) else {
+            return;
+        };
+        for key in keys {
+            self.entries.remove(&key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.parent_index.clear();
+    }
+
+    fn evict_one(&mut self) -> bool {
+        while let Some((key, stamp)) = self.order.pop_front() {
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if entry.stamp != stamp {
+                continue;
+            }
+            let parent = key.parent;
+            self.entries.remove(&key);
+            if let Some(keys) = self.parent_index.get_mut(&parent) {
+                keys.remove(&key);
+                let empty = keys.is_empty();
+                if empty {
+                    self.parent_index.remove(&parent);
+                }
+            }
+            return true;
+        }
+        false
+    }
 }
 
 // =============================================================================
@@ -1239,6 +1383,8 @@ struct VfsState {
     /// Ephemeral macOS metadata files that are intentionally ignored and never
     /// persisted to the metadata store or object storage.
     ignored_entries: Mutex<IgnoredEntryRegistry>,
+    /// Bounded dentry cache keyed by `(parent_ino, name) -> child_ino|ENOENT`.
+    dentry_cache: Mutex<DentryCache>,
     /// Read-through attribute cache with TTL: inode -> (attr, timestamp)
     attr_read_cache: Mutex<std::collections::HashMap<Ino, (InodeAttr, Instant)>>,
     /// Dirty blocks accepted by `flush()` that have not yet been written to
@@ -1578,6 +1724,36 @@ impl StudioVfs {
         self.is_blocked_root_metadata_path(parent, name) || self.ignored_dir_attr(parent).is_some()
     }
 
+    fn dentry_cache_lookup(&self, parent: Ino, name: &[u8]) -> Option<DentryCacheValue> {
+        self.state.dentry_cache.lock().get(parent, name)
+    }
+
+    fn dentry_cache_insert_positive(&self, parent: Ino, name: &[u8], child: Ino) {
+        self.state
+            .dentry_cache
+            .lock()
+            .put(parent, name, DentryCacheValue::Positive(child));
+    }
+
+    fn dentry_cache_insert_negative(&self, parent: Ino, name: &[u8]) {
+        self.state
+            .dentry_cache
+            .lock()
+            .put(parent, name, DentryCacheValue::Negative);
+    }
+
+    fn dentry_cache_invalidate(&self, parent: Ino, name: &[u8]) {
+        self.state.dentry_cache.lock().invalidate(parent, name);
+    }
+
+    fn dentry_cache_invalidate_parent(&self, parent: Ino) {
+        self.state.dentry_cache.lock().invalidate_parent(parent);
+    }
+
+    fn dentry_cache_clear(&self) {
+        self.state.dentry_cache.lock().clear();
+    }
+
     fn restore_live_extents_from_pending_uploads(&self) {
         let pending = self.block_cache.snapshot_pending_uploads();
         if pending.is_empty() {
@@ -1759,6 +1935,10 @@ impl StudioVfs {
                 .and_then(|v| parse_size_bytes_env(&v))
                 .filter(|v| *v > 0)
                 .unwrap_or(12 * 1024 * 1024 * 1024);
+            let dentry_cache_capacity = std::env::var("STUDIOFS_DENTRY_CACHE_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_DENTRY_CACHE_CAPACITY);
             let max_spill_bytes = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
                 .ok()
                 .and_then(|v| parse_size_bytes_env(&v))
@@ -2038,6 +2218,7 @@ impl StudioVfs {
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 max_dirty_bytes,
                 max_spill_bytes,
+                dentry_cache_capacity,
                 "upload pipeline v2 enabled"
             );
 
@@ -2054,6 +2235,7 @@ impl StudioVfs {
                     uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
                     dirty_attrs: Mutex::new(std::collections::HashMap::new()),
                     ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
+                    dentry_cache: Mutex::new(DentryCache::new(dentry_cache_capacity)),
                     attr_read_cache: Mutex::new(std::collections::HashMap::new()),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
@@ -2370,6 +2552,7 @@ impl StudioVfs {
             let mut to_invalidate = last_snapshot.clone();
             to_invalidate.extend(current_snapshot.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate);
+            self.dentry_cache_clear();
             last_snapshot = current_snapshot;
         }
     }
@@ -4121,7 +4304,30 @@ impl StudioVfs {
         if self.ignored_dir_attr(parent).is_some() {
             return Err(Self::ignored_entry_not_found(parent, name));
         }
-        let entry = self.meta.lookup(parent, name)?;
+        if let Some(cached) = self.dentry_cache_lookup(parent, name) {
+            match cached {
+                DentryCacheValue::Positive(child_ino) => match self.meta.get_attr(child_ino) {
+                    Ok(attr) => return Ok(attr),
+                    Err(MetaError::InodeNotFound(_)) => {
+                        self.dentry_cache_invalidate(parent, name);
+                    }
+                    Err(err) => return Err(VfsError::Meta(err)),
+                },
+                DentryCacheValue::Negative => {
+                    return Err(Self::ignored_entry_not_found(parent, name));
+                }
+            }
+        }
+
+        let entry = match self.meta.lookup(parent, name) {
+            Ok(entry) => entry,
+            Err(MetaError::EntryNotFound { .. }) => {
+                self.dentry_cache_insert_negative(parent, name);
+                return Err(Self::ignored_entry_not_found(parent, name));
+            }
+            Err(err) => return Err(VfsError::Meta(err)),
+        };
+        self.dentry_cache_insert_positive(parent, name, entry.ino);
         Ok(self.meta.get_attr(entry.ino)?)
     }
 
@@ -4510,6 +4716,7 @@ impl StudioVfs {
                 .unwrap_or(ignored));
         }
         let attr = self.meta.link(ino, new_parent, new_name)?;
+        self.dentry_cache_insert_positive(new_parent, new_name, ino);
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(&ino);
         self.state.dirty_attrs.lock().remove(&ino);
@@ -4552,6 +4759,7 @@ impl StudioVfs {
                 upload_state: VfsUploadState::Uploading,
             },
         );
+        self.dentry_cache_insert_positive(parent, name, attr.ino);
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
@@ -4581,6 +4789,7 @@ impl StudioVfs {
         let attr = self
             .meta
             .create_dir(parent, name, uid, gid, mode & 0o7777)?;
+        self.dentry_cache_insert_positive(parent, name, attr.ino);
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
@@ -4601,6 +4810,7 @@ impl StudioVfs {
             return Ok(self.create_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink));
         }
         let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
+        self.dentry_cache_insert_positive(parent, name, attr.ino);
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
         Ok(attr)
@@ -4762,6 +4972,7 @@ impl StudioVfs {
 
             self.state.attr_read_cache.lock().remove(&attr.ino);
         }
+        self.dentry_cache_insert_negative(parent, name);
 
         self.meta.request_eager_flush();
         Ok(())
@@ -4773,6 +4984,7 @@ impl StudioVfs {
             return Ok(());
         }
         self.meta.rmdir(parent, name)?;
+        self.dentry_cache_insert_negative(parent, name);
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(&parent);
         self.meta.request_eager_flush();
@@ -4810,6 +5022,7 @@ impl StudioVfs {
                 );
             }
             self.unlink_ignored_subtree(parent, name);
+            self.dentry_cache_insert_negative(parent, name);
             return Ok(());
         }
         if target_is_ignored {
@@ -4843,6 +5056,8 @@ impl StudioVfs {
         let rename_result = self
             .meta
             .rename_atomic(parent, name, new_parent, new_name)?;
+        self.dentry_cache_insert_negative(parent, name);
+        self.dentry_cache_insert_positive(new_parent, new_name, rename_result.moved_ino);
         let moved_attr = self.meta.get_attr(rename_result.moved_ino)?;
         let moved_into_trash = moved_attr.kind == FileType::RegularFile
             && self.directory_has_probable_trash_ancestor(new_parent)?;
@@ -4880,6 +5095,7 @@ impl StudioVfs {
             self.state.dirty_attrs.lock().remove(&ino);
             self.state.attr_read_cache.lock().remove(&ino);
             self.clear_inode_incarnation(ino);
+            self.dentry_cache_invalidate_parent(ino);
         }
 
         if moved_into_trash {
@@ -6895,6 +7111,69 @@ mod tests {
             validate_name(b"file*name"),
             Err(VfsError::InvalidName(_))
         ));
+    }
+
+    #[test]
+    fn dentry_cache_is_bounded_and_supports_negative_entries() {
+        let mut cache = DentryCache::new(2);
+
+        cache.put(ROOT_INO, b"a", DentryCacheValue::Positive(11));
+        cache.put(ROOT_INO, b"b", DentryCacheValue::Negative);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(
+            cache.get(ROOT_INO, b"a"),
+            Some(DentryCacheValue::Positive(11))
+        );
+        assert_eq!(cache.get(ROOT_INO, b"b"), Some(DentryCacheValue::Negative));
+
+        cache.put(ROOT_INO, b"c", DentryCacheValue::Positive(33));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.get(ROOT_INO, b"a"), None);
+        assert_eq!(cache.get(ROOT_INO, b"b"), Some(DentryCacheValue::Negative));
+        assert_eq!(
+            cache.get(ROOT_INO, b"c"),
+            Some(DentryCacheValue::Positive(33))
+        );
+    }
+
+    #[test]
+    fn namespace_mutations_update_dentry_cache_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "dentry-cache-hooks");
+        let key = DentryCacheKey::new(ROOT_INO, b"cache-test.txt");
+
+        assert!(
+            vfs.lookup(ROOT_INO, b"cache-test.txt").is_err(),
+            "initial lookup should miss"
+        );
+        {
+            let cache = vfs.state.dentry_cache.lock();
+            assert_eq!(
+                cache.entries.get(&key).map(|entry| entry.value),
+                Some(DentryCacheValue::Negative)
+            );
+        }
+
+        let created = vfs
+            .create(ROOT_INO, b"cache-test.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        {
+            let cache = vfs.state.dentry_cache.lock();
+            assert_eq!(
+                cache.entries.get(&key).map(|entry| entry.value),
+                Some(DentryCacheValue::Positive(created.ino))
+            );
+        }
+
+        vfs.unlink(ROOT_INO, b"cache-test.txt")
+            .expect("unlink file");
+        {
+            let cache = vfs.state.dentry_cache.lock();
+            assert_eq!(
+                cache.entries.get(&key).map(|entry| entry.value),
+                Some(DentryCacheValue::Negative)
+            );
+        }
     }
 
     #[test]

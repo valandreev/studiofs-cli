@@ -300,6 +300,20 @@ through VFS lookup/readdir/getattr behavior, so runtime rules (ignored entries,
 blocked root metadata names, and local-only ignored subtrees) are identical for
 both full-path and component-based resolution.
 
+`lookup_component` uses a bounded in-memory dentry cache keyed by
+`(parent_ino, name)`:
+- positive entries: `(parent_ino, name) -> child_ino`
+- negative entries: `(parent_ino, name) -> ENOENT`
+
+Cache updates are deterministic:
+- on create/mkdir/symlink/link: insert positive entry
+- on unlink/rmdir: insert negative entry
+- on rename: source entry becomes negative, destination becomes positive
+- on metadata version changes after remote sync: cache is cleared
+
+This removes repeated metadata lookups for hot path components while preserving
+namespace correctness across local mutations and remote namespace apply events.
+
 Path normalization is style-aware:
 - `NamespacePathStyle::Posix`: `/`, `.`, `..`
 - `NamespacePathStyle::Windows`: `\`, `.`, `..`, trailing `.`/space trimming
