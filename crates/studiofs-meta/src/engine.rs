@@ -64,6 +64,14 @@ pub enum MetaError {
 
     #[error("unsupported format version: found {found}, expected {expected}")]
     UnsupportedFormatVersion { found: u16, expected: u16 },
+
+    #[error("access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}")]
+    AccessDenied {
+        ino: Ino,
+        principal: String,
+        required: AccessLevel,
+        actual: AccessLevel,
+    },
 }
 
 pub type MetaResult<T> = Result<T, MetaError>;
@@ -408,6 +416,17 @@ pub trait MetaEngine: Send + Sync {
 
     /// List all extended attribute names for an inode.
     fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
+
+    // ─── Access Control (ACL) ────────────────────────────────────────────
+
+    /// Set (create/update) explicit ACL rule for `(ino, principal)`.
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()>;
+
+    /// Remove explicit ACL rule for `(ino, principal)`.
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()>;
+
+    /// Get explicit ACL rule for `(ino, principal)`, if present.
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>>;
 
     /// Create a symlink: allocate inode, store target, add dentry.
     fn create_symlink(

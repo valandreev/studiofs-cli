@@ -27,7 +27,7 @@ use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig,
     PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
-    types::{BlockFlags, BlockRef, UploadState},
+    types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
     KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState,
@@ -7595,4 +7595,62 @@ async fn test_rename_directory_with_children() {
     assert_eq!(found_child.ino, child.ino);
     let data = vfs.read(child.ino, 0, 100).await.unwrap();
     assert_eq!(&data[..], b"child data");
+}
+
+#[tokio::test]
+async fn acl_no_access_hides_directory_from_lookup_and_readdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "acl-hide");
+
+    let secret_dir = vfs.mkdir(1, b"secret", 0, 0, 0o755).unwrap();
+    let secret_file = vfs.create(secret_dir.ino, b"flag.txt", 0, 0, 0o644).unwrap();
+    vfs.write(secret_file.ino, 0, b"top-secret").await.unwrap();
+    vfs.flush(secret_file.ino).await.unwrap();
+
+    vfs.set_acl_rule(secret_dir.ino, "*", AccessLevel::NoAccess)
+        .unwrap();
+
+    let root_entries = vfs.readdir(1).unwrap();
+    assert!(!root_entries.iter().any(|e| e.name == b"secret"));
+    assert!(vfs.lookup(1, b"secret").is_err());
+}
+
+#[tokio::test]
+async fn acl_read_only_denies_writes_but_allows_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "acl-ro");
+
+    let file = vfs.create(1, b"ro.txt", 0, 0, 0o644).unwrap();
+    vfs.write(file.ino, 0, b"hello").await.unwrap();
+    vfs.flush(file.ino).await.unwrap();
+
+    vfs.set_acl_rule(file.ino, "*", AccessLevel::ReadOnly)
+        .unwrap();
+
+    let data = vfs.read(file.ino, 0, 5).await.unwrap();
+    assert_eq!(&data[..], b"hello");
+
+    let write_err = vfs.write(file.ino, 0, b"X").await.unwrap_err();
+    assert!(matches!(
+        write_err,
+        VfsError::Meta(studiofs_meta::MetaError::AccessDenied { .. })
+    ));
+}
+
+#[tokio::test]
+async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
+    let _restore_principal = ScopedEnvVar::capture("STUDIOFS_PRINCIPAL");
+    unsafe {
+        std::env::set_var("STUDIOFS_PRINCIPAL", "alice");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "acl-wildcard-fallback");
+
+    let secret_dir = vfs.mkdir(1, b"secret", 0, 0, 0o755).unwrap();
+    vfs.set_acl_rule(secret_dir.ino, "*", AccessLevel::NoAccess)
+        .unwrap();
+
+    let root_entries = vfs.readdir(1).unwrap();
+    assert!(!root_entries.iter().any(|e| e.name == b"secret"));
 }

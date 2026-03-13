@@ -52,6 +52,7 @@ studiofs mount <name> <mount-point> \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
+  [--principal <name>] \
   [--foreground] \
   [--detach | -d]
 ```
@@ -62,6 +63,7 @@ Notes:
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
+- `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 
 ### `umount`
 
@@ -151,6 +153,7 @@ studiofs mount projectfs Y:
 | `STUDIOFS_PG_FLUSH_INTERVAL_SECS` | `60` | Max interval before the client flushes accumulated local PG metadata events |
 | `STUDIOFS_PG_FLUSH_OPS_THRESHOLD` | `500` | Client-side PG metadata flush op batch threshold |
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
+| `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
 | `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
@@ -159,6 +162,7 @@ studiofs mount projectfs Y:
 | `STUDIOFS_PATH_SHORTCUT_CACHE_BYTES` | `16MB` | Max in-memory bytes for full-path shortcut cache entries |
 | `STUDIOFS_ATTR_READ_CACHE_CAPACITY` | `65536` | Max number of inode attribute read-through cache entries |
 | `STUDIOFS_ATTR_READ_CACHE_BYTES` | `32MB` | Max in-memory bytes for attribute read-through cache entries |
+| `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY` | `65536` | Max number of cached effective ACL entries before ACL cache reset |
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |

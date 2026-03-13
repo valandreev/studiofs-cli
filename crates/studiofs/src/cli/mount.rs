@@ -33,6 +33,7 @@ pub fn run(
     cache_dir: Option<&Path>,
     cache_size: &str,
     memory_limit: &str,
+    principal: Option<&str>,
     foreground: bool,
     detach: bool,
 ) -> anyhow::Result<()> {
@@ -42,6 +43,14 @@ pub fn run(
     }
 
     let run_in_foreground = foreground || !detach;
+
+    if let Some(principal) = principal {
+        // SAFETY: this happens before Tokio runtime creation, so no runtime
+        // worker threads are alive to race on process environment access.
+        unsafe {
+            std::env::set_var("STUDIOFS_PRINCIPAL", principal);
+        }
+    }
 
     // ── Guard against double-mount ──────────────────────────────────────────
     // Note: when launched via `mount -d`, the parent pre-writes the PID file

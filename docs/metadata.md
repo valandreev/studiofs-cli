@@ -99,11 +99,29 @@ Operational note:
 This avoids replaying a client's own changes and avoids clobbering local staged
 writes with foreign state, while still advancing the remote-visible base view.
 
+## ACL Roles (Local-First)
+
+StudioFS supports per-inode ACL rules for principals with three access levels:
+- `no_access`
+- `ro`
+- `rw`
+
+Rules are stored locally first and replicated to PostgreSQL eventually.
+
+Effective ACL is evaluated in VFS by walking parent directories upward:
+- first matching rule on the path wins
+- per inode, principal lookup checks explicit principal first, then wildcard `*`
+- if no rule is found, effective access is `rw`
+
+ACL updates are appended to the metadata event log and participate in the same
+flush/pull replication flow as other metadata events.
+
 ## PostgreSQL Tables
 
 - `volumes`
 - `event_log`
 - `metadata_state`
+- `acl_rules`
 
 `event_log` is the runtime delta stream. `metadata_state` stores:
 - the monotonic `version`
@@ -278,6 +296,14 @@ Still single-copy:
 - `pending_deletions`
 - `event_log`
 - `counters`
+
+ACL metadata follows the same base+overlay split:
+- `base_acl_rules`
+  - remote-visible ACL state applied from checkpoint/foreign PG batches
+- `acl_rules`
+  - local overlay ACL rules
+- `acl_rule_tombstones`
+  - local hides/removals for base ACL keys
 
 ## Overlay Records
 

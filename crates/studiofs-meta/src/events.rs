@@ -84,6 +84,16 @@ pub enum MetaEvent {
     /// Remove an extended attribute.
     RemoveXattr { ino: u64, name: Vec<u8> },
 
+    /// Set ACL rule for `(ino, principal)`.
+    SetAclRule {
+        ino: u64,
+        principal: String,
+        access_level: crate::types::AccessLevel,
+    },
+
+    /// Remove ACL rule for `(ino, principal)`.
+    RemoveAclRule { ino: u64, principal: String },
+
     // ─── Garbage Collection ──────────────────────────────────────────────────
     /// Mark an object for garbage collection.
     AddPendingDeletion { object_id: u64, timestamp: i64 },
@@ -109,6 +119,8 @@ impl MetaEvent {
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",
+            Self::SetAclRule { .. } => "set_acl_rule",
+            Self::RemoveAclRule { .. } => "remove_acl_rule",
             Self::AddPendingDeletion { .. } => "add_pending_deletion",
             Self::RemovePendingDeletion { .. } => "remove_pending_deletion",
         }
@@ -139,6 +151,8 @@ impl MetaEvent {
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),
             Self::SetXattr { ino, .. } => Some(*ino),
             Self::RemoveXattr { ino, .. } => Some(*ino),
+            Self::SetAclRule { ino, .. } => Some(*ino),
+            Self::RemoveAclRule { ino, .. } => Some(*ino),
             Self::AddPendingDeletion { .. } => None,
             Self::RemovePendingDeletion { .. } => None,
         }

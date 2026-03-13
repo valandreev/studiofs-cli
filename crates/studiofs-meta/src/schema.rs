@@ -62,6 +62,39 @@ pub enum UploadState {
     Ready = 3,
 }
 
+/// Coarse ACL access level used for local-first authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLevel {
+    /// Hide entry completely (lookup/readdir should behave as not found).
+    NoAccess = 0,
+    /// Read-only access.
+    ReadOnly = 1,
+    /// Read-write access.
+    #[default]
+    ReadWrite = 2,
+}
+
+impl AccessLevel {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::NoAccess),
+            1 => Some(Self::ReadOnly),
+            2 => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+}
+
+/// ACL rule persisted in metadata and replicated through the event log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclRule {
+    pub ino: Ino,
+    pub principal: String,
+    pub access_level: AccessLevel,
+}
+
 /// Inode attributes - stored in ATTRIBUTES table.
 ///
 /// Key design: timestamps stored as nanoseconds since Unix epoch,

@@ -21,6 +21,25 @@ Holds all runtime state:
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Open files, dirty buffers, backpressure |
 
+### ACL Enforcement
+
+VFS enforces effective ACL roles per principal:
+- `no_access` hides entries from `lookup`/`readdir`
+- `ro` allows reads and metadata reads, denies mutating operations
+- `rw` allows full access
+
+Rules are inherited along the parent chain and resolved by first match from the
+inode toward root; no match defaults to `rw`.
+For each inode on that walk, principal resolution is:
+- explicit rule for current principal (for example `alice`)
+- fallback wildcard rule `*`
+
+To avoid hot-path overhead during deep directory listings, VFS caches effective
+ACLs in RAM on inode entries and invalidates this cache using an ACL epoch when
+rules change and a dedicated ACL namespace epoch for move/rename topology updates.
+The cache is bounded by `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY` and resets when
+the capacity limit is reached.
+
 ### VfsConfig
 
 | Field | Default | Description |
@@ -33,6 +52,11 @@ Holds all runtime state:
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Max prefetch depth |
 | `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
+
+Runtime principal selection:
+- `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on
+  the mounted client.
+- `studiofs mount --principal <name>` overrides `STUDIOFS_PRINCIPAL` for that mount.
 
 ## Write Path
 

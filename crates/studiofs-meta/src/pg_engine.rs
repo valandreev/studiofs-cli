@@ -76,6 +76,7 @@ struct OverlayConflictSets {
     symlink_inodes: HashSet<Ino>,
     xattr_inodes: HashSet<Ino>,
     xattr_keys: HashSet<Vec<u8>>,
+    acl_keys: HashSet<Vec<u8>>,
 }
 
 struct RecentFlush {
@@ -562,6 +563,11 @@ impl PgMetaEngine {
                     || overlay.attr_inodes.contains(ino)
                     || overlay.xattr_keys.contains(&Self::xattr_key(*ino, name))
             }
+            MetaEvent::SetAclRule { ino, principal, .. }
+            | MetaEvent::RemoveAclRule { ino, principal } => {
+                overlay.attr_inodes.contains(ino)
+                    || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
+            }
             MetaEvent::SetFileBlocksBatch { blocks } => blocks
                 .iter()
                 .any(|(ino, _, _)| overlay.block_inodes.contains(ino)),
@@ -585,6 +591,8 @@ impl PgMetaEngine {
             | MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
+            | MetaEvent::SetAclRule { .. }
+            | MetaEvent::RemoveAclRule { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. } => true,
             MetaEvent::SetAttr { .. }
@@ -600,6 +608,14 @@ impl PgMetaEngine {
         let mut key = Vec::with_capacity(8 + name.len());
         key.extend_from_slice(&ino.to_le_bytes());
         key.extend_from_slice(name);
+        key
+    }
+
+    fn acl_key(ino: Ino, principal: &str) -> Vec<u8> {
+        let principal = principal.as_bytes();
+        let mut key = Vec::with_capacity(8 + principal.len());
+        key.extend_from_slice(&ino.to_le_bytes());
+        key.extend_from_slice(principal);
         key
     }
 
@@ -692,6 +708,11 @@ impl PgMetaEngine {
                     overlay.xattr_inodes.insert(*ino);
                     overlay.xattr_keys.insert(Self::xattr_key(*ino, name));
                 }
+                MetaEvent::SetAclRule { ino, principal, .. }
+                | MetaEvent::RemoveAclRule { ino, principal } => {
+                    overlay.attr_inodes.insert(*ino);
+                    overlay.acl_keys.insert(Self::acl_key(*ino, principal));
+                }
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
             }
         }
@@ -715,6 +736,7 @@ impl PgMetaEngine {
             .xattr_inodes
             .extend(extra.xattr_inodes.iter().copied());
         merged.xattr_keys.extend(extra.xattr_keys.iter().cloned());
+        merged.acl_keys.extend(extra.acl_keys.iter().cloned());
         merged
     }
 
@@ -762,6 +784,11 @@ impl PgMetaEngine {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
                     || overlay.xattr_keys.contains(&Self::xattr_key(*ino, name))
+            }
+            MetaEvent::SetAclRule { ino, principal, .. }
+            | MetaEvent::RemoveAclRule { ino, principal } => {
+                overlay.attr_inodes.contains(ino)
+                    || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
             MetaEvent::SetFileBlock { .. }
             | MetaEvent::RemoveFileBlock { .. }
@@ -1055,6 +1082,46 @@ impl PgMetaEngine {
                                 "postgres event_log batch insert failed: {e}"
                             ))
                         })?;
+                    }
+
+                    for event in &events_vec {
+                        match event {
+                            MetaEvent::SetAclRule {
+                                ino,
+                                principal,
+                                access_level,
+                            } => {
+                                tx.execute(
+                                    r#"
+                                    INSERT INTO acl_rules (vol, ino, principal, access_level, updated_at)
+                                    VALUES ($1, $2, $3, $4, now())
+                                    ON CONFLICT (vol, ino, principal) DO UPDATE
+                                    SET access_level = EXCLUDED.access_level,
+                                        updated_at = now()
+                                    "#,
+                                    &[&volume_id, &(*ino as i64), principal, &(*access_level as i16)],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    MetaError::Storage(format!(
+                                        "postgres acl_rules upsert failed: {e}"
+                                    ))
+                                })?;
+                            }
+                            MetaEvent::RemoveAclRule { ino, principal } => {
+                                tx.execute(
+                                    "DELETE FROM acl_rules WHERE vol=$1 AND ino=$2 AND principal=$3",
+                                    &[&volume_id, &(*ino as i64), principal],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    MetaError::Storage(format!(
+                                        "postgres acl_rules delete failed: {e}"
+                                    ))
+                                })?;
+                            }
+                            _ => {}
+                        }
                     }
 
                     let channel = format!("studiofs_vol_{volume_id}");
@@ -1670,6 +1737,18 @@ impl MetaEngine for PgMetaEngine {
         self.local.list_xattrs(ino)
     }
 
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
+        self.mutate(|local| local.set_acl_rule(ino, principal, access_level))
+    }
+
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
+        self.mutate(|local| local.remove_acl_rule(ino, principal))
+    }
+
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
+        self.local.get_acl_rule(ino, principal)
+    }
+
     fn create_symlink(
         &self,
         parent: Ino,
@@ -1923,6 +2002,14 @@ mod tests {
                     version BIGINT NOT NULL,
                     snapshot BYTEA NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                CREATE TABLE IF NOT EXISTS acl_rules (
+                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                    ino BIGINT NOT NULL,
+                    principal TEXT NOT NULL,
+                    access_level SMALLINT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (vol, ino, principal)
                 );
                 ALTER TABLE event_log
                     ADD COLUMN IF NOT EXISTS batch_version BIGINT;
