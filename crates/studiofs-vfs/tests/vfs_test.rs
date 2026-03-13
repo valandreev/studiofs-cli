@@ -2094,8 +2094,6 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
 
 #[test]
 fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
-    type EnvRestore = ScopedEnvVar;
-
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
         std::fs::read_dir(dir)
@@ -2105,12 +2103,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .count()
     }
 
-    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
-    let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_fetch_attempts = EnvRestore::capture("STUDIOFS_FETCH_MAX_ATTEMPTS");
-    let _restore_fetch_timeout = EnvRestore::capture("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS");
+    let _env = ScopedTestEnv::new();
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2137,8 +2130,18 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
         std::env::set_var("STUDIOFS_FETCH_MAX_ATTEMPTS", "1");
         std::env::set_var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS", "2");
+        std::env::set_var("STUDIOFS_UPLOAD_MAX_ATTEMPTS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "2");
+        // Keep checkpointing out of the critical path so this test validates
+        // spill replay, not periodic checkpoint timing.
+        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS", "86400");
+        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES", "1GB");
+        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS", "1000000");
+        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG", "1000000");
+        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS", "1000000");
     }
 
     {
@@ -2174,6 +2177,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 wait_until_exists(&ds, &key, Duration::from_secs(15)).await,
                 "baseline object should exist before replacement spill replay test"
             );
+            vfs.shutdown(Duration::from_secs(15)).await;
         });
         rt.shutdown_background();
     }
@@ -2242,7 +2246,10 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             assert_eq!(
                 read.as_ref(),
                 replacement_payload.as_slice(),
-                "read after restart with offline endpoint should use recovered spill overlay"
+                "read after restart with offline endpoint should use recovered spill overlay; ingress={:?} segments={} meta_blocks={:?}",
+                vfs.ingress_stats(),
+                segment_file_count(&spill_dir),
+                vfs.meta().get_file_blocks(ino).ok(),
             );
         });
         rt.shutdown_background();

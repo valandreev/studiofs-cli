@@ -2449,6 +2449,7 @@ fn recover_spill_dir(spill_dir: &std::path::Path) -> VfsResult<RecoveredSpillSta
         next_seq = next_seq.max(checkpoint.next_seq);
         resume_after = Some((checkpoint.covered_segment_id, checkpoint.covered_offset));
         for entry in checkpoint.entries {
+            next_seq = next_seq.max(entry.seq.saturating_add(1));
             recovered.insert(
                 (entry.ino, entry.block_index),
                 RecoveredIngressRecord {
@@ -2466,6 +2467,7 @@ fn recover_spill_dir(spill_dir: &std::path::Path) -> VfsResult<RecoveredSpillSta
     let mut total_bytes = 0usize;
     let mut spill_entries = RecoveredSpillMap::new();
     for (key, record) in recovered {
+        next_seq = next_seq.max(record.seq.saturating_add(1));
         let spill = SpillEntry {
             seq: record.seq,
             path: record.path,
@@ -9641,6 +9643,46 @@ mod tests {
         assert_eq!(total_bytes, "payload".len());
         assert_eq!(next_seq, 10);
         assert_eq!(active_segment_id, 3);
+    }
+
+    #[test]
+    fn test_recover_spill_dir_uses_checkpoint_entry_seq_when_head_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill_dir = dir.path();
+        let segment_dir = spill_dir.join("segments");
+        let checkpoint_dir = spill_dir.join("checkpoints");
+
+        let offset = append_ingress_record(
+            &segment_dir,
+            2,
+            (42, 7),
+            9,
+            100,
+            INGRESS_RECORD_PUT,
+            b"payload",
+        )
+        .unwrap();
+        let mut ingress_live = IngressLiveIndex::default();
+        ingress_live.insert(
+            (42, 7),
+            SpillEntry {
+                seq: 9,
+                path: ingress_segment_path(&segment_dir, 2),
+                offset,
+                len: "payload".len(),
+                created_unix_ms: 100,
+            },
+        );
+        // Intentionally stale next_seq to simulate an inconsistent checkpoint head.
+        write_ingress_checkpoint(&checkpoint_dir, &ingress_live, &segment_dir, 2, 2).unwrap();
+
+        let (recovered, total_bytes, next_seq, active_segment_id) =
+            recover_spill_dir(spill_dir).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(total_bytes, "payload".len());
+        assert_eq!(next_seq, 10);
+        assert_eq!(active_segment_id, 2);
     }
 
     #[test]
