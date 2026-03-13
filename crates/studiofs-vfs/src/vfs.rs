@@ -4251,7 +4251,7 @@ impl StudioVfs {
         pending_uploads != 0 || pending_metadata_ops != 0
     }
 
-    fn format_upload_pipeline_pending_volume(pending_upload_bytes: u64) -> String {
+    fn format_upload_pipeline_pending_uploads(pending_upload_bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = 1024 * KB;
         const GB: u64 = 1024 * MB;
@@ -8106,12 +8106,10 @@ impl StudioVfs {
                 pending_metadata_ops,
                 upload_pipeline_summary_was_active,
             ) {
-                let pending_upload_volume =
-                    Self::format_upload_pipeline_pending_volume(pending_upload_bytes);
+                let pending_uploads =
+                    Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
                 info!(
-                    pending_uploads = pending,
-                    pending_upload_bytes,
-                    pending_upload_volume = %pending_upload_volume,
+                    pending_uploads = %pending_uploads,
                     pending_metadata_ops,
                     "upload pipeline"
                 );
@@ -8921,18 +8919,18 @@ mod tests {
     }
 
     #[test]
-    fn upload_pipeline_summary_formats_pending_volume() {
-        assert_eq!(StudioVfs::format_upload_pipeline_pending_volume(0), "0");
+    fn upload_pipeline_summary_formats_pending_uploads() {
+        assert_eq!(StudioVfs::format_upload_pipeline_pending_uploads(0), "0");
         assert_eq!(
-            StudioVfs::format_upload_pipeline_pending_volume(512),
+            StudioVfs::format_upload_pipeline_pending_uploads(512),
             "512B"
         );
         assert_eq!(
-            StudioVfs::format_upload_pipeline_pending_volume(12 * 1024),
+            StudioVfs::format_upload_pipeline_pending_uploads(12 * 1024),
             "12KB"
         );
         assert_eq!(
-            StudioVfs::format_upload_pipeline_pending_volume(1904 * 1024 * 1024),
+            StudioVfs::format_upload_pipeline_pending_uploads(1904 * 1024 * 1024),
             "1.9GB"
         );
     }
