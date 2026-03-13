@@ -87,8 +87,8 @@ struct RecentFlush {
 }
 
 struct PgJanitorLock {
-    runtime: tokio::runtime::Runtime,
-    client: tokio_postgres::Client,
+    _runtime: tokio::runtime::Runtime,
+    _client: tokio_postgres::Client,
     connection_task: tokio::task::JoinHandle<()>,
 }
 
@@ -278,7 +278,8 @@ impl PgMetaEngine {
         }
 
         let lock_key = self.janitor_lock_key();
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
@@ -319,8 +320,8 @@ impl PgMetaEngine {
         }
 
         *state = Some(PgJanitorLock {
-            runtime,
-            client,
+            _runtime: runtime,
+            _client: client,
             connection_task,
         });
         Ok(true)
@@ -334,33 +335,7 @@ impl PgMetaEngine {
         let Some(lock) = state.take() else {
             return Ok(());
         };
-
-        let lock_key = self.janitor_lock_key();
-        let unlocked = lock
-            .runtime
-            .block_on(async {
-                tokio::time::timeout(
-                    self.command_timeout,
-                    lock.client
-                        .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key]),
-                )
-                .await
-            })
-            .map_err(|_| Self::pg_timeout_error("janitor lock release", self.command_timeout))?
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres janitor lock release failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?
-            .get::<usize, bool>(0);
         lock.connection_task.abort();
-
-        if !unlocked {
-            return Err(MetaError::Storage(
-                "postgres janitor lock release reported false".to_string(),
-            ));
-        }
         Ok(())
     }
 
@@ -1702,12 +1677,6 @@ impl PgMetaEngine {
         let after_seq = self.local.get_counter("nextEventSeq")?;
         self.mark_pending_after_mutation(before_seq, after_seq);
         Ok(result)
-    }
-}
-
-impl Drop for PgMetaEngine {
-    fn drop(&mut self) {
-        let _ = self.release_pg_janitor_lock();
     }
 }
 

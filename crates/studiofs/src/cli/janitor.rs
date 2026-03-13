@@ -208,7 +208,9 @@ pub fn run(
 
             Ok((stats, referenced, global_snapshot_pins))
         })();
-        engine.release_global_janitor_lock()?;
+        if let Err(e) = engine.release_global_janitor_lock() {
+            eprintln!("Warning: failed to release PG janitor lock: {}", e);
+        }
         let (stats, referenced, global_snapshot_pins) = cycle_result?;
 
         println!("Janitor cycle done:");
