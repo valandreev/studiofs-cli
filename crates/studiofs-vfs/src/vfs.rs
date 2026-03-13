@@ -5639,7 +5639,10 @@ impl StudioVfs {
         }
 
         let meta = self.meta.clone();
-        let attr = run_meta(meta, move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino)).await?;
+        let attr = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            engine.get_attr(ino)
+        })
+        .await?;
         self.state
             .attr_read_cache
             .lock()
@@ -5656,7 +5659,8 @@ impl StudioVfs {
 
     async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_async_unchecked(ino).await?;
-        self.enforce_access_async(ino, AccessLevel::ReadOnly).await?;
+        self.enforce_access_async(ino, AccessLevel::ReadOnly)
+            .await?;
         Ok(attr)
     }
 
@@ -6008,14 +6012,12 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
-        let required_access = if trunc
-            || flags.contains(OpenFlags::WRONLY)
-            || flags.contains(OpenFlags::RDWR)
-        {
-            AccessLevel::ReadWrite
-        } else {
-            AccessLevel::ReadOnly
-        };
+        let required_access =
+            if trunc || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR) {
+                AccessLevel::ReadWrite
+            } else {
+                AccessLevel::ReadOnly
+            };
         self.enforce_access(ino, required_access)?;
         if self.ignored_entry_attr(ino).is_some() {
             let fh = self.handle_table.open(ino, flags);
@@ -8216,6 +8218,41 @@ impl StudioVfs {
                 break;
             }
 
+            let meta = self.meta.clone();
+            let lock_acquired = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.try_acquire_global_janitor_lock()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "background GC skipped: janitor PG lock check failed");
+                    continue;
+                }
+            };
+            if !lock_acquired {
+                debug!("background GC skipped: janitor PG lock not acquired");
+                continue;
+            }
+
+            let meta = self.meta.clone();
+            let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.get_global_snapshot_pins()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
+                    warn!(error = %e, "background GC skipped: snapshot pin query failed");
+                    continue;
+                }
+            };
+
             // Get current timestamp
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -8232,6 +8269,11 @@ impl StudioVfs {
                 Ok(pending) => {
                     let mut deleted_count = 0;
                     for (object_id, timestamp) in pending {
+                        if global_snapshot_pins.contains(&object_id) {
+                            debug!("skipping object {} - pinned by snapshot", object_id);
+                            continue;
+                        }
+
                         // Check if grace period has passed
                         if now - timestamp < grace_period {
                             debug!("skipping object {} - still in grace period", object_id);
@@ -8269,8 +8311,22 @@ impl StudioVfs {
                     }
                 }
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     error!("failed to get pending deletions: {}", e);
                 }
+            }
+
+            let meta = self.meta.clone();
+            if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.release_global_janitor_lock()
+            })
+            .await
+            {
+                warn!(error = %e, "background GC failed to release janitor PG lock");
             }
         }
     }
@@ -8310,6 +8366,41 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
+            let lock_acquired = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.try_acquire_global_janitor_lock()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor cycle skipped: PG lock check failed");
+                    continue;
+                }
+            };
+            if !lock_acquired {
+                debug!(cycle, "janitor cycle skipped: PG lock not acquired");
+                continue;
+            }
+
+            let meta = self.meta.clone();
+            let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.get_global_snapshot_pins()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
+                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot pin query failed");
+                    continue;
+                }
+            };
+
+            let meta = self.meta.clone();
             let referenced = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.get_referenced_object_ids()
             })
@@ -8317,6 +8408,11 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     warn!(cycle, error = %e, "janitor cycle failed: get_referenced_object_ids");
                     continue;
                 }
@@ -8344,6 +8440,11 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     warn!(
                         cycle,
                         prefix = self.data_prefix,
@@ -8382,6 +8483,9 @@ impl StudioVfs {
                     }
                 };
                 if referenced.contains(&object_id) {
+                    continue;
+                }
+                if global_snapshot_pins.contains(&object_id) {
                     continue;
                 }
                 orphan_candidates = orphan_candidates.saturating_add(1);
@@ -8425,6 +8529,7 @@ impl StudioVfs {
                 cycle,
                 scanned,
                 referenced = referenced.len(),
+                snapshot_pins = global_snapshot_pins.len(),
                 orphan_candidates,
                 deleted,
                 skipped_young,
@@ -8434,6 +8539,15 @@ impl StudioVfs {
                 delete_errors,
                 "janitor cycle complete"
             );
+
+            let meta = self.meta.clone();
+            if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.release_global_janitor_lock()
+            })
+            .await
+            {
+                warn!(cycle, error = %e, "janitor cycle failed to release PG lock");
+            }
         }
     }
 

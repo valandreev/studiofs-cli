@@ -140,6 +140,11 @@ Behavior:
 - `create` is immediate and local-first (state starts as `pending`).
 - background PG replication publishes snapshot metadata and pinned object ids.
 - replicated snapshots transition to `synced` and become discoverable on peers.
+- if PostgreSQL is unavailable at snapshot creation time, the snapshot remains a
+  local-only administrative artifact until the owning client reconciles and
+  publishes it later.
+- janitor protection is cluster-wide only for snapshots that are already
+  published through PostgreSQL.
 
 ## Multi-Client Workflow
 

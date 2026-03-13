@@ -136,6 +136,15 @@ flush/pull replication flow as other metadata events.
 - pinned object ids
 - serialized snapshot payload used for read-only snapshot mounts
 
+Current operational contract:
+- `pending` means the snapshot exists in local metadata but is not yet guaranteed
+  to be cluster-protected.
+- cluster-wide protection begins only after snapshot metadata is published
+  through PostgreSQL and visible to janitor / peer clients.
+- if PostgreSQL is unavailable, snapshot creation may still succeed locally, but
+  that snapshot is treated as a local-only administrative artifact until a
+  later reconcile/publish step completes.
+
 ## Consistency
 
 - local operations are synchronous and immediate for the current client
@@ -307,6 +316,15 @@ Still single-copy:
 - `pending_deletions`
 - `event_log`
 - `counters`
+
+Janitor policy:
+- the janitor must consult PostgreSQL before deleting remote objects for
+  PostgreSQL-backed volumes.
+- snapshot pins published through PostgreSQL protect matching object ids from
+  deletion.
+- local-only pending snapshots created while PostgreSQL is down are not yet part
+  of the cluster protection contract; they require a later reconcile/publish
+  step to become globally protected.
 
 ACL metadata follows the same base+overlay split:
 - `base_acl_rules`
