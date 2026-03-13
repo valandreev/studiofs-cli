@@ -403,6 +403,15 @@ impl BlockCache {
         self.upload_queue.snapshot_pending()
     }
 
+    /// Total cached bytes currently waiting in the upload queue.
+    pub fn pending_upload_bytes(&self) -> u64 {
+        self.upload_queue
+            .snapshot_pending()
+            .into_iter()
+            .filter_map(|op| self.lru.size(op.object_id).map(u64::from))
+            .sum()
+    }
+
     pub async fn flush_upload_journal(&self) {
         self.upload_queue.flush_journal().await;
     }
@@ -796,6 +805,19 @@ mod tests {
         cache.complete_upload(&op);
         // Block stays in cache after upload (R5).
         assert!(cache.contains(100));
+    }
+
+    #[tokio::test]
+    async fn pending_upload_bytes_sums_cached_pending_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _rx) = BlockCache::open(test_config(dir.path())).unwrap();
+
+        cache.put(100, Bytes::from(vec![1u8; 5])).await.unwrap();
+        cache.put(200, Bytes::from(vec![2u8; 7])).await.unwrap();
+        cache.submit_upload(1, 0, 100, 0);
+        cache.submit_upload(1, 5, 200, 0);
+
+        assert_eq!(cache.pending_upload_bytes(), 12);
     }
 
     #[tokio::test]

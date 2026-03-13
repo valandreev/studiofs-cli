@@ -4236,6 +4236,39 @@ impl StudioVfs {
             && ingress.checkpoint_pending_mutations == 0
     }
 
+    fn should_log_upload_pipeline_summary(
+        pending_uploads: usize,
+        pending_metadata_ops: u32,
+        was_active: bool,
+    ) -> bool {
+        Self::upload_pipeline_summary_is_active(pending_uploads, pending_metadata_ops) || was_active
+    }
+
+    fn upload_pipeline_summary_is_active(
+        pending_uploads: usize,
+        pending_metadata_ops: u32,
+    ) -> bool {
+        pending_uploads != 0 || pending_metadata_ops != 0
+    }
+
+    fn format_upload_pipeline_pending_uploads(pending_upload_bytes: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = 1024 * KB;
+        const GB: u64 = 1024 * MB;
+
+        if pending_upload_bytes == 0 {
+            "0".to_string()
+        } else if pending_upload_bytes >= GB {
+            format!("{:.1}GB", pending_upload_bytes as f64 / GB as f64)
+        } else if pending_upload_bytes >= MB {
+            format!("{}MB", pending_upload_bytes / MB)
+        } else if pending_upload_bytes >= KB {
+            format!("{}KB", pending_upload_bytes / KB)
+        } else {
+            format!("{pending_upload_bytes}B")
+        }
+    }
+
     fn ingress_checkpoint_due(&self, timer_fired: bool) -> bool {
         let pending_bytes = self
             .state
@@ -8050,6 +8083,7 @@ impl StudioVfs {
     }
 
     async fn background_upload_stats(self: Arc<Self>) {
+        let mut upload_pipeline_summary_was_active = false;
         loop {
             tokio::select! {
                 _ = self.state.shutdown_notify.notified() => break,
@@ -8059,17 +8093,28 @@ impl StudioVfs {
                 break;
             }
             let pending = self.block_cache.pending_upload_count();
+            let pending_upload_bytes = self.block_cache.pending_upload_bytes();
             let metadata_backlog = self.meta.replication_backlog();
+            let pending_metadata_ops = metadata_backlog.total_ops();
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
-            info!(
-                pending_uploads = pending,
-                pending_metadata_ops = metadata_backlog.total_ops(),
-                "upload pipeline"
-            );
+            if Self::should_log_upload_pipeline_summary(
+                pending,
+                pending_metadata_ops,
+                upload_pipeline_summary_was_active,
+            ) {
+                let pending_uploads =
+                    Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
+                info!(
+                    pending_uploads = %pending_uploads,
+                    pending_metadata_ops, "upload pipeline"
+                );
+            }
+            upload_pipeline_summary_was_active =
+                Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
             debug!(
                 dentry_cache_entries = dentry_cache.occupancy_entries,
                 dentry_cache_bytes = dentry_cache.occupancy_bytes,
@@ -8856,6 +8901,37 @@ mod tests {
         assert_eq!(block_index_from_offset(1, block_size), 0);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024, block_size), 1);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024 + 1, block_size), 1);
+    }
+
+    #[test]
+    fn upload_pipeline_summary_logs_only_when_pending_work_exists() {
+        assert!(!StudioVfs::should_log_upload_pipeline_summary(0, 0, false));
+        assert!(StudioVfs::should_log_upload_pipeline_summary(1, 0, false));
+        assert!(StudioVfs::should_log_upload_pipeline_summary(0, 1, false));
+    }
+
+    #[test]
+    fn upload_pipeline_summary_logs_one_final_idle_line_after_activity() {
+        assert!(StudioVfs::should_log_upload_pipeline_summary(256, 0, false));
+        assert!(StudioVfs::should_log_upload_pipeline_summary(0, 0, true));
+        assert!(!StudioVfs::should_log_upload_pipeline_summary(0, 0, false));
+    }
+
+    #[test]
+    fn upload_pipeline_summary_formats_pending_upload_bytes() {
+        assert_eq!(StudioVfs::format_upload_pipeline_pending_uploads(0), "0");
+        assert_eq!(
+            StudioVfs::format_upload_pipeline_pending_uploads(512),
+            "512B"
+        );
+        assert_eq!(
+            StudioVfs::format_upload_pipeline_pending_uploads(12 * 1024),
+            "12KB"
+        );
+        assert_eq!(
+            StudioVfs::format_upload_pipeline_pending_uploads(1904 * 1024 * 1024),
+            "1.9GB"
+        );
     }
 
     #[test]
