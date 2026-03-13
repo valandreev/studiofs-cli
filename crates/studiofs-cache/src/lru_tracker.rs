@@ -251,12 +251,6 @@ impl LruTracker {
             .map(|e| e.location)
     }
 
-    /// Get the cached size of an entry in bytes.
-    pub fn size(&self, object_id: ObjectId) -> Option<u32> {
-        let shard_idx = (object_id as usize) % SHARD_COUNT;
-        self.shards[shard_idx].lock().get(object_id).map(|e| e.size)
-    }
-
     /// Pin an entry (prevent eviction).
     pub fn pin(&self, object_id: ObjectId) {
         let shard_idx = (object_id as usize) % SHARD_COUNT;
@@ -511,15 +505,6 @@ mod tests {
         let r = lru.remove(5);
         assert_eq!(r, Some((500, BlockLocation::MemoryAndDisk)));
         assert!(!lru.contains(5));
-    }
-
-    #[test]
-    fn size_returns_cached_entry_size() {
-        let lru = LruTracker::new();
-        lru.insert(5, 500, BlockLocation::MemoryAndDisk, false);
-
-        assert_eq!(lru.size(5), Some(500));
-        assert_eq!(lru.size(6), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! `studiofs mount` — mount a filesystem volume.
 
-use chrono::Local;
+use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
@@ -216,8 +216,8 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
 
     let logs_dir = super::utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
-    let today = Local::now().format("%Y-%m-%d");
-    let log_path = logs_dir.join(format!("{log_stem}-{today}.log"));
+    let today = Utc::now().format("%Y-%m-%d");
+    let log_path = logs_dir.join(format!("{log_stem}.log.{today}"));
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
