@@ -2518,6 +2518,8 @@ struct VfsState {
     effective_acl_cache: Mutex<std::collections::HashMap<Ino, EffectiveAclCacheEntry>>,
     /// Monotonic ACL epoch for local ACL rule mutations.
     acl_epoch: AtomicU64,
+    /// Namespace epoch relevant only to ACL inheritance validity (for moves).
+    acl_namespace_epoch: AtomicU64,
     /// Dirty blocks accepted by `flush()` that have not yet been written to
     /// disk by the background flusher.  Reads must consult this buffer
     /// BEFORE falling through to the block cache or S3.
@@ -2624,8 +2626,8 @@ struct JanitorLease {
 #[derive(Debug, Clone, Copy)]
 struct EffectiveAclCacheEntry {
     access_level: AccessLevel,
-    namespace_epoch: u64,
     acl_epoch: u64,
+    acl_namespace_epoch: u64,
 }
 
 // =============================================================================
@@ -2928,21 +2930,49 @@ impl StudioVfs {
             .ok();
     }
 
-    fn access_satisfies(actual: AccessLevel, required: AccessLevel) -> bool {
-        match (actual, required) {
-            (AccessLevel::ReadWrite, _) => true,
-            (AccessLevel::ReadOnly, AccessLevel::ReadOnly) => true,
-            (AccessLevel::NoAccess, AccessLevel::NoAccess) => true,
-            _ => false,
+    fn bump_acl_namespace_epoch(&self) {
+        self.state
+            .acl_namespace_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(1))
+            })
+            .ok();
+    }
+
+    fn acl_rule_for_inode(&self, ino: Ino) -> VfsResult<Option<AccessLevel>> {
+        if let Some(level) = self.meta.get_acl_rule(ino, &self.acl_principal)? {
+            return Ok(Some(level));
         }
+        if self.acl_principal != "*" {
+            return Ok(self.meta.get_acl_rule(ino, "*")?);
+        }
+        Ok(None)
+    }
+
+    fn acl_rule_for_inode_meta(
+        meta: &dyn MetaEngine,
+        principal: &str,
+        ino: Ino,
+    ) -> MetaResult<Option<AccessLevel>> {
+        if let Some(level) = meta.get_acl_rule(ino, principal)? {
+            return Ok(Some(level));
+        }
+        if principal != "*" {
+            return meta.get_acl_rule(ino, "*");
+        }
+        Ok(None)
+    }
+
+    fn access_satisfies(actual: AccessLevel, required: AccessLevel) -> bool {
+        (actual as u8) >= (required as u8)
     }
 
     fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
-        let namespace_epoch = self.state.namespace_epoch.load(Ordering::Acquire);
         let acl_epoch = self.state.acl_epoch.load(Ordering::Acquire);
+        let acl_namespace_epoch = self.state.acl_namespace_epoch.load(Ordering::Acquire);
         if let Some(entry) = self.state.effective_acl_cache.lock().get(&ino).copied()
-            && entry.namespace_epoch == namespace_epoch
             && entry.acl_epoch == acl_epoch
+            && entry.acl_namespace_epoch == acl_namespace_epoch
         {
             return Ok(entry.access_level);
         }
@@ -2953,7 +2983,7 @@ impl StudioVfs {
             if depth >= 4096 {
                 break AccessLevel::ReadWrite;
             }
-            if let Some(level) = self.meta.get_acl_rule(current, &self.acl_principal)? {
+            if let Some(level) = self.acl_rule_for_inode(current)? {
                 break level;
             }
 
@@ -2969,15 +2999,59 @@ impl StudioVfs {
             ino,
             EffectiveAclCacheEntry {
                 access_level,
-                namespace_epoch,
                 acl_epoch,
+                acl_namespace_epoch,
             },
         );
         Ok(access_level)
     }
 
+    fn effective_access_level_meta(
+        meta: &dyn MetaEngine,
+        principal: &str,
+        ino: Ino,
+    ) -> MetaResult<AccessLevel> {
+        let mut current = ino;
+        let mut depth = 0usize;
+        loop {
+            if depth >= 4096 {
+                return Ok(AccessLevel::ReadWrite);
+            }
+            if let Some(level) = Self::acl_rule_for_inode_meta(meta, principal, current)? {
+                return Ok(level);
+            }
+            let attr = meta.get_attr(current)?;
+            if current == ROOT_INO || attr.parent == 0 || attr.parent == current {
+                return Ok(AccessLevel::ReadWrite);
+            }
+            current = attr.parent;
+            depth += 1;
+        }
+    }
+
     fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
         let actual = self.effective_access_level(ino)?;
+        if Self::access_satisfies(actual, required) {
+            return Ok(());
+        }
+        if actual == AccessLevel::NoAccess {
+            return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
+        }
+        Err(VfsError::Meta(MetaError::AccessDenied {
+            ino,
+            principal: self.acl_principal.clone(),
+            required,
+            actual,
+        }))
+    }
+
+    async fn enforce_access_async(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
+        let meta = self.meta.clone();
+        let principal = self.acl_principal.clone();
+        let actual = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            Self::effective_access_level_meta(engine.as_ref(), &principal, ino)
+        })
+        .await?;
         if Self::access_satisfies(actual, required) {
             return Ok(());
         }
@@ -3664,6 +3738,7 @@ impl StudioVfs {
                     )),
                     effective_acl_cache: Mutex::new(std::collections::HashMap::new()),
                     acl_epoch: AtomicU64::new(0),
+                    acl_namespace_epoch: AtomicU64::new(0),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
                         entries: recovered_spill,
@@ -3982,6 +4057,7 @@ impl StudioVfs {
             to_invalidate.extend(current_snapshot.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate);
             self.bump_namespace_epoch();
+            self.bump_acl_namespace_epoch();
             last_snapshot = current_snapshot;
         }
     }
@@ -5535,7 +5611,7 @@ impl StudioVfs {
 
     async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_async_unchecked(ino).await?;
-        self.enforce_access(ino, AccessLevel::ReadOnly)?;
+        self.enforce_access_async(ino, AccessLevel::ReadOnly).await?;
         Ok(attr)
     }
 
@@ -5771,8 +5847,8 @@ impl StudioVfs {
 
     /// Read directory entries.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
-        let effective = self.effective_access_level(ino)?;
-        if effective == AccessLevel::NoAccess {
+        let parent_effective = self.effective_access_level(ino)?;
+        if parent_effective == AccessLevel::NoAccess {
             return Ok(Vec::new());
         }
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
@@ -5784,12 +5860,32 @@ impl StudioVfs {
         if ino == ROOT_INO {
             entries.retain(|entry| !is_blocked_root_macos_metadata_dir(&entry.name));
         }
-        entries.retain(|entry| {
-            !matches!(
-                self.effective_access_level(entry.ino),
-                Ok(AccessLevel::NoAccess) | Err(_)
-            )
+
+        let acl_epoch = self.state.acl_epoch.load(Ordering::Acquire);
+        let acl_namespace_epoch = self.state.acl_namespace_epoch.load(Ordering::Acquire);
+        let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
+        entries.retain(|entry| match self.acl_rule_for_inode(entry.ino) {
+            Ok(Some(level)) => {
+                cache_updates.push((entry.ino, level));
+                level != AccessLevel::NoAccess
+            }
+            Ok(None) => {
+                cache_updates.push((entry.ino, parent_effective));
+                parent_effective != AccessLevel::NoAccess
+            }
+            Err(_) => false,
         });
+        let mut acl_cache = self.state.effective_acl_cache.lock();
+        for (entry_ino, level) in cache_updates {
+            acl_cache.insert(
+                entry_ino,
+                EffectiveAclCacheEntry {
+                    access_level: level,
+                    acl_epoch,
+                    acl_namespace_epoch,
+                },
+            );
+        }
 
         // Feed the directory prefetch tracker with regular-file children.
         let file_children: Vec<Ino> = entries
@@ -6242,6 +6338,7 @@ impl StudioVfs {
         }
         let attr = self.meta.link(ino, new_parent, new_name)?;
         self.bump_namespace_for_parents([new_parent]);
+        self.bump_acl_namespace_epoch();
         self.dentry_cache_insert_positive(new_parent, new_name, ino);
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(ino);
@@ -6577,6 +6674,7 @@ impl StudioVfs {
             }
             self.unlink_ignored_subtree(parent, name);
             self.bump_namespace_for_parents([parent, new_parent]);
+            self.bump_acl_namespace_epoch();
             self.dentry_cache_insert_negative(parent, name);
             return Ok(());
         }
@@ -6613,6 +6711,7 @@ impl StudioVfs {
             .meta
             .rename_atomic(parent, name, new_parent, new_name)?;
         self.bump_namespace_for_parents([parent, new_parent]);
+        self.bump_acl_namespace_epoch();
         self.dentry_cache_insert_negative(parent, name);
         self.dentry_cache_insert_positive(new_parent, new_name, rename_result.moved_ino);
         let moved_attr = self.meta.get_attr(rename_result.moved_ino)?;

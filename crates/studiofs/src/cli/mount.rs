@@ -33,6 +33,7 @@ pub fn run(
     cache_dir: Option<&Path>,
     cache_size: &str,
     memory_limit: &str,
+    principal: Option<&str>,
     foreground: bool,
     detach: bool,
 ) -> anyhow::Result<()> {
@@ -98,6 +99,12 @@ pub fn run(
     let _guard = rt.enter();
 
     // Create VFS.
+    if let Some(principal) = principal {
+        unsafe {
+            std::env::set_var("STUDIOFS_PRINCIPAL", principal);
+        }
+    }
+
     let vfs = StudioVfs::new(
         meta.clone(),
         &data_config,

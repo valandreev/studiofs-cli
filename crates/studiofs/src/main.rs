@@ -306,6 +306,11 @@ RUNTIME PG POLICY:
     STUDIOFS_PG_FLUSH_OPS_THRESHOLD
     STUDIOFS_PG_FLUSH_IDLE_MS
     STUDIOFS_PG_SYNC_POLL_SECS
+
+ACL PRINCIPAL:
+  By default, the mount uses STUDIOFS_PRINCIPAL (or '*' when unset).
+  You can override it per mount with:
+    --principal alice
 ")]
     Mount {
         /// Volume name (must be initialized first via `studiofs init`)
@@ -325,6 +330,10 @@ RUNTIME PG POLICY:
         /// Maximum in-memory cache size (e.g. 1GB, 512MB, 4GB)
         #[arg(long, default_value = "2GB")]
         memory_limit: String,
+
+        /// Principal identity used for ACL checks in this mount instance.
+        #[arg(long)]
+        principal: Option<String>,
 
         /// Run in foreground (keep terminal attached, default behavior)
         #[arg(long, conflicts_with = "detach")]
@@ -491,6 +500,7 @@ fn main() -> anyhow::Result<()> {
             cache_dir,
             cache_size,
             memory_limit,
+            principal,
             foreground,
             detach,
         } => {
@@ -502,6 +512,7 @@ fn main() -> anyhow::Result<()> {
                 cache_dir.as_deref(),
                 &cache_size,
                 &memory_limit,
+                principal.as_deref(),
                 foreground,
                 detach,
             )?;
@@ -646,6 +657,17 @@ mod tests {
                 assert!(detach);
                 assert_eq!(memory_limit, "4GB");
                 assert_eq!(cache_size, "200GB");
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_principal_option_parses() {
+        let cli = parse(&["mount", "vol", "Z:", "--principal", "alice"]).unwrap();
+        match cli.command {
+            Commands::Mount { principal, .. } => {
+                assert_eq!(principal.as_deref(), Some("alice"));
             }
             other => panic!("expected Mount, got {other:?}"),
         }

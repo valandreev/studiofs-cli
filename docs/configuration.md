@@ -52,6 +52,7 @@ studiofs mount <name> <mount-point> \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
+  [--principal <name>] \
   [--foreground] \
   [--detach | -d]
 ```
@@ -62,6 +63,7 @@ Notes:
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
+- `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 
 ### `umount`
 

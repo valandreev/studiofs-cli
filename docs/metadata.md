@@ -110,6 +110,7 @@ Rules are stored locally first and replicated to PostgreSQL eventually.
 
 Effective ACL is evaluated in VFS by walking parent directories upward:
 - first matching rule on the path wins
+- per inode, principal lookup checks explicit principal first, then wildcard `*`
 - if no rule is found, effective access is `rw`
 
 ACL updates are appended to the metadata event log and participate in the same

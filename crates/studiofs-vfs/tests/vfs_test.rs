@@ -7636,3 +7636,21 @@ async fn acl_read_only_denies_writes_but_allows_reads() {
         VfsError::Meta(studiofs_meta::MetaError::AccessDenied { .. })
     ));
 }
+
+#[tokio::test]
+async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
+    let _restore_principal = ScopedEnvVar::capture("STUDIOFS_PRINCIPAL");
+    unsafe {
+        std::env::set_var("STUDIOFS_PRINCIPAL", "alice");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "acl-wildcard-fallback");
+
+    let secret_dir = vfs.mkdir(1, b"secret", 0, 0, 0o755).unwrap();
+    vfs.set_acl_rule(secret_dir.ino, "*", AccessLevel::NoAccess)
+        .unwrap();
+
+    let root_entries = vfs.readdir(1).unwrap();
+    assert!(!root_entries.iter().any(|e| e.name == b"secret"));
+}

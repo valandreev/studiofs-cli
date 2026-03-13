@@ -30,10 +30,13 @@ VFS enforces effective ACL roles per principal:
 
 Rules are inherited along the parent chain and resolved by first match from the
 inode toward root; no match defaults to `rw`.
+For each inode on that walk, principal resolution is:
+- explicit rule for current principal (for example `alice`)
+- fallback wildcard rule `*`
 
 To avoid hot-path overhead during deep directory listings, VFS caches effective
 ACLs in RAM on inode entries and invalidates this cache using an ACL epoch when
-rules change.
+rules change and a dedicated ACL namespace epoch for move/rename topology updates.
 
 ### VfsConfig
 
@@ -51,6 +54,7 @@ rules change.
 Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on
   the mounted client.
+- `studiofs mount --principal <name>` overrides `STUDIOFS_PRINCIPAL` for that mount.
 
 ## Write Path
 
