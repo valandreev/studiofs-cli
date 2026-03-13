@@ -491,6 +491,7 @@ const DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY: usize = 16_384;
 const DEFAULT_PATH_SHORTCUT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_ATTR_READ_CACHE_CAPACITY: usize = 65_536;
 const DEFAULT_ATTR_READ_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY: usize = 65_536;
 const METADATA_CACHE_PROTECTED_PERCENT: usize = 80;
 const DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER: usize = 2;
 const DENTRY_CACHE_ORDER_COMPACT_SLACK: usize = 64;
@@ -2650,6 +2651,8 @@ pub struct StudioVfs {
     state: Arc<VfsState>,
     /// Principal used for ACL evaluation in this mounted VFS instance.
     acl_principal: String,
+    /// Max number of entries in effective ACL cache.
+    effective_acl_cache_capacity: usize,
     // --- Upload Control ---
     /// Adaptive upload scheduler (AIMD + retries).
     upload_scheduler: Arc<crate::upload::UploadScheduler>,
@@ -2967,14 +2970,40 @@ impl StudioVfs {
         (actual as u8) >= (required as u8)
     }
 
-    fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
+    fn effective_access_level_cached(&self, ino: Ino) -> Option<AccessLevel> {
         let acl_epoch = self.state.acl_epoch.load(Ordering::Acquire);
         let acl_namespace_epoch = self.state.acl_namespace_epoch.load(Ordering::Acquire);
-        if let Some(entry) = self.state.effective_acl_cache.lock().get(&ino).copied()
-            && entry.acl_epoch == acl_epoch
-            && entry.acl_namespace_epoch == acl_namespace_epoch
-        {
-            return Ok(entry.access_level);
+        self.state
+            .effective_acl_cache
+            .lock()
+            .get(&ino)
+            .copied()
+            .filter(|entry| {
+                entry.acl_epoch == acl_epoch && entry.acl_namespace_epoch == acl_namespace_epoch
+            })
+            .map(|entry| entry.access_level)
+    }
+
+    fn effective_access_level_cache_insert(&self, ino: Ino, access_level: AccessLevel) {
+        let acl_epoch = self.state.acl_epoch.load(Ordering::Acquire);
+        let acl_namespace_epoch = self.state.acl_namespace_epoch.load(Ordering::Acquire);
+        let mut cache = self.state.effective_acl_cache.lock();
+        if cache.len() >= self.effective_acl_cache_capacity {
+            cache.clear();
+        }
+        cache.insert(
+            ino,
+            EffectiveAclCacheEntry {
+                access_level,
+                acl_epoch,
+                acl_namespace_epoch,
+            },
+        );
+    }
+
+    fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
+        if let Some(access_level) = self.effective_access_level_cached(ino) {
+            return Ok(access_level);
         }
 
         let mut current = ino;
@@ -2995,14 +3024,7 @@ impl StudioVfs {
             depth += 1;
         };
 
-        self.state.effective_acl_cache.lock().insert(
-            ino,
-            EffectiveAclCacheEntry {
-                access_level,
-                acl_epoch,
-                acl_namespace_epoch,
-            },
-        );
+        self.effective_access_level_cache_insert(ino, access_level);
         Ok(access_level)
     }
 
@@ -3046,12 +3068,28 @@ impl StudioVfs {
     }
 
     async fn enforce_access_async(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
+        if let Some(actual) = self.effective_access_level_cached(ino) {
+            if Self::access_satisfies(actual, required) {
+                return Ok(());
+            }
+            if actual == AccessLevel::NoAccess {
+                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
+            }
+            return Err(VfsError::Meta(MetaError::AccessDenied {
+                ino,
+                principal: self.acl_principal.clone(),
+                required,
+                actual,
+            }));
+        }
+
         let meta = self.meta.clone();
         let principal = self.acl_principal.clone();
         let actual = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
             Self::effective_access_level_meta(engine.as_ref(), &principal, ino)
         })
         .await?;
+        self.effective_access_level_cache_insert(ino, actual);
         if Self::access_satisfies(actual, required) {
             return Ok(());
         }
@@ -3414,6 +3452,12 @@ impl StudioVfs {
                 .and_then(|v| parse_size_bytes_env(&v))
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_ATTR_READ_CACHE_BYTES);
+            let effective_acl_cache_capacity =
+                std::env::var("STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY);
             let max_spill_bytes = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
                 .ok()
                 .and_then(|v| parse_size_bytes_env(&v))
@@ -3715,6 +3759,7 @@ impl StudioVfs {
                 block_size,
                 data_prefix,
                 acl_principal,
+                effective_acl_cache_capacity,
                 state: Arc::new(VfsState {
                     pending_blocks: Mutex::new(std::collections::HashMap::new()),
                     inode_incarnations: Mutex::new(std::collections::HashMap::new()),
@@ -5861,8 +5906,6 @@ impl StudioVfs {
             entries.retain(|entry| !is_blocked_root_macos_metadata_dir(&entry.name));
         }
 
-        let acl_epoch = self.state.acl_epoch.load(Ordering::Acquire);
-        let acl_namespace_epoch = self.state.acl_namespace_epoch.load(Ordering::Acquire);
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
         entries.retain(|entry| match self.acl_rule_for_inode(entry.ino) {
             Ok(Some(level)) => {
@@ -5875,16 +5918,8 @@ impl StudioVfs {
             }
             Err(_) => false,
         });
-        let mut acl_cache = self.state.effective_acl_cache.lock();
         for (entry_ino, level) in cache_updates {
-            acl_cache.insert(
-                entry_ino,
-                EffectiveAclCacheEntry {
-                    access_level: level,
-                    acl_epoch,
-                    acl_namespace_epoch,
-                },
-            );
+            self.effective_access_level_cache_insert(entry_ino, level);
         }
 
         // Feed the directory prefetch tracker with regular-file children.

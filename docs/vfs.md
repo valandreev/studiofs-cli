@@ -37,6 +37,8 @@ For each inode on that walk, principal resolution is:
 To avoid hot-path overhead during deep directory listings, VFS caches effective
 ACLs in RAM on inode entries and invalidates this cache using an ACL epoch when
 rules change and a dedicated ACL namespace epoch for move/rename topology updates.
+The cache is bounded by `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY` and resets when
+the capacity limit is reached.
 
 ### VfsConfig
 

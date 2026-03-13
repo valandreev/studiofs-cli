@@ -162,6 +162,7 @@ studiofs mount projectfs Y:
 | `STUDIOFS_PATH_SHORTCUT_CACHE_BYTES` | `16MB` | Max in-memory bytes for full-path shortcut cache entries |
 | `STUDIOFS_ATTR_READ_CACHE_CAPACITY` | `65536` | Max number of inode attribute read-through cache entries |
 | `STUDIOFS_ATTR_READ_CACHE_BYTES` | `32MB` | Max in-memory bytes for attribute read-through cache entries |
+| `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY` | `65536` | Max number of cached effective ACL entries before ACL cache reset |
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |

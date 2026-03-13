@@ -44,6 +44,14 @@ pub fn run(
 
     let run_in_foreground = foreground || !detach;
 
+    if let Some(principal) = principal {
+        // SAFETY: this happens before Tokio runtime creation, so no runtime
+        // worker threads are alive to race on process environment access.
+        unsafe {
+            std::env::set_var("STUDIOFS_PRINCIPAL", principal);
+        }
+    }
+
     // ── Guard against double-mount ──────────────────────────────────────────
     // Note: when launched via `mount -d`, the parent pre-writes the PID file
     // with the child's PID before the child starts.  The child must therefore
@@ -99,12 +107,6 @@ pub fn run(
     let _guard = rt.enter();
 
     // Create VFS.
-    if let Some(principal) = principal {
-        unsafe {
-            std::env::set_var("STUDIOFS_PRINCIPAL", principal);
-        }
-    }
-
     let vfs = StudioVfs::new(
         meta.clone(),
         &data_config,
