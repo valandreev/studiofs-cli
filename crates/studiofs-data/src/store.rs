@@ -174,7 +174,7 @@ impl DataStore {
                 .finish()
         };
 
-        info!(
+        debug!(
             profile = ?profile,
             meta_timeout_s,
             io_timeout_s,

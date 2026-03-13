@@ -26,6 +26,8 @@ studiofs init <name> \
 Important:
 - PostgreSQL metadata backend is required.
 - StudioFS always uses database `studiofs` and will create it during `init` when permissions allow.
+- `init` validates data bucket access (connect/read/write/delete where needed) and PostgreSQL connectivity before creating local metadata.
+- `init` no longer performs conditional-write CAS checks (`If-Match` / `If-None-Match`) during initialization.
 
 ### `discover`
 
@@ -215,7 +217,7 @@ studiofs mount projectfs Y:
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Shutdown upload drain max wait |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
-Metadata cache observability is emitted through the existing periodic `upload pipeline` / `upload pipeline counters` log events and includes dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution. Dentry/path shortcut logs also include negative-hit ratio.
+Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution. Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0`, `pending_upload_bytes=0`, and `pending_metadata_ops=0` after the pipeline fully drains. It keeps `pending_uploads` as a numeric block count, reports an approximate queued upload size in `pending_upload_bytes` (`pending_uploads * block_size`), and adds a human-readable `pending_upload_volume` field (`1904MB`, `1.9GB`) for console readability.
 
 ### Testing
 

@@ -2,9 +2,8 @@
 //!
 //! Bucket creation is automatic: if the target bucket does not exist the
 //! command will attempt to create it (AWS SigV4 signed CreateBucket).
-//! A compatibility pre-flight check is run on every storage backend before
-//! any local state is written.  On failure the command is aborted and any
-//! buckets that were created during this run are deleted.
+//! The command validates basic storage connectivity and PostgreSQL availability
+//! before writing local metadata state.
 
 use std::io::Write;
 use std::path::Path;
@@ -119,27 +118,6 @@ fn ensure_bucket_accessible(
     })?;
     println!("OK (created)");
     Ok(true)
-}
-
-/// Delete a bucket during abort cleanup (best-effort, errors are logged only).
-fn cleanup_delete_bucket(
-    rt: &tokio::runtime::Runtime,
-    label: &str,
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-) {
-    use super::test::bucket_delete_call;
-    print!("    Deleting {label} bucket '{bucket}'... ");
-    std::io::stdout().flush().ok();
-    match rt.block_on(bucket_delete_call(
-        endpoint, bucket, access_key, secret_key, region,
-    )) {
-        Ok(()) => println!("OK"),
-        Err(e) => println!("WARN — {e}"),
-    }
 }
 
 fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
@@ -410,7 +388,7 @@ pub fn run(
     // ── 1. Ensure buckets are accessible (create if missing) ─────────────────
     println!("Checking storage backends...");
     println!();
-    let data_bucket_created = ensure_bucket_accessible(
+    ensure_bucket_accessible(
         &rt,
         "data",
         data_endpoint,
@@ -419,8 +397,6 @@ pub fn run(
         data_secret_key,
         eff_data_region,
     )?;
-
-    let meta_bucket_created = false;
     println!();
 
     println!("Checking PostgreSQL backend...");
@@ -434,55 +410,7 @@ pub fn run(
         ));
     }
 
-    // ── 2. Compatibility pre-flight check ─────────────────────────────────────
-    println!("Running compatibility pre-flight check...");
-    println!();
-
-    println!("  [Data store: {data_endpoint} / {data_bucket}]");
-    let data_compat = super::test::run_compat_on_bucket(
-        data_endpoint,
-        data_bucket,
-        data_access_key,
-        data_secret_key,
-        eff_data_region,
-        &rt,
-    )?;
-
-    // ── 3. Evaluate compat results ────────────────────────────────────────────
-    let data_ok = data_compat.suitable_for_data();
-    let meta_ok = true;
-
-    if !data_ok || !meta_ok {
-        // Print full reports so the user sees exactly what failed.
-        data_compat.print_report();
-
-        // Cleanup: delete buckets we created during this run.
-        println!("Compatibility check FAILED — cleaning up...");
-        if data_bucket_created {
-            cleanup_delete_bucket(
-                &rt,
-                "data",
-                data_endpoint,
-                data_bucket,
-                data_access_key,
-                data_secret_key,
-                eff_data_region,
-            );
-        }
-        let _ = meta_bucket_created;
-
-        // Collect failure details for the error message.
-        let failures: Vec<String> = data_compat.failure_summary();
-        let detail = failures.join("\n  ");
-        return Err(anyhow::anyhow!(
-            "Storage compatibility check failed — this backend is not suitable for StudioFS:\n  {detail}"
-        ));
-    }
-
-    println!("✓ Compatibility check passed.");
-    println!();
-
-    // ── 4. Check if metadata directory already exists ────────────────────────
+    // ── 2. Check if metadata directory already exists ────────────────────────
     if meta_dir.exists() {
         println!("! Metadata directory already exists: {:?}", meta_dir);
         print!("  Do you want to CLEAR it and start fresh? [y/N]: ");
@@ -500,7 +428,7 @@ pub fn run(
         }
     }
 
-    // ── 5. Create metadata directory and initialize local DB ─────────────────
+    // ── 3. Create metadata directory and initialize local DB ─────────────────
     std::fs::create_dir_all(meta_dir)?;
 
     let db_path = meta_dir.join(format!("{name}.db"));

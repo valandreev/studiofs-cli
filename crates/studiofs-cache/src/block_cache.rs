@@ -136,7 +136,7 @@ impl BlockCache {
                     lru.insert(id, size, BlockLocation::DiskOnly, false);
                 }
             }
-            info!(
+            debug!(
                 checkpoint_valid = lru.len(),
                 disk_blocks = on_disk.len(),
                 "loaded LRU checkpoint"
@@ -147,7 +147,7 @@ impl BlockCache {
                 lru.insert(id, size, BlockLocation::DiskOnly, false);
             }
             if !on_disk.is_empty() {
-                info!(
+                debug!(
                     blocks = on_disk.len(),
                     "rebuilt LRU from disk scan (no checkpoint)"
                 );

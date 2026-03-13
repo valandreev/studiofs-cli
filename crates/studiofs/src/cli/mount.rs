@@ -1,12 +1,13 @@
 //! `studiofs mount` — mount a filesystem volume.
 
+use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::StudioVfs;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
@@ -41,7 +42,7 @@ pub fn run(
 ) -> anyhow::Result<()> {
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
     if detach {
-        return spawn_daemon(name, mount_point);
+        return spawn_daemon(name, mount_point, meta_dir);
     }
 
     let run_in_foreground = foreground || !detach;
@@ -72,7 +73,7 @@ pub fn run(
     }
 
     let db_path = meta_dir.join(format!("{name}.db"));
-    info!("opening volume {name:?} from {db_path:?}");
+    debug!("opening volume {name:?} from {db_path:?}");
     let live_meta = open_meta_engine(&db_path)?;
     let mut format_info = live_meta.get_format_info()?;
     let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
@@ -106,8 +107,8 @@ pub fn run(
     };
 
     info!(
-        "volume: {} ({}), endpoint: {}, bucket: {}",
-        format_info.name, format_info.uuid, format_info.endpoint, format_info.bucket
+        "mounting volume '{}' (storage: endpoint={}, bucket={})",
+        format_info.name, format_info.endpoint, format_info.bucket
     );
 
     // Set up data store config (StudioVfs creates Read + Write connections directly)
@@ -148,6 +149,10 @@ pub fn run(
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
+    println!(
+        "  Storage:      {} / {}",
+        format_info.endpoint, format_info.bucket
+    );
     println!("  Invalidation: PostgreSQL sync");
     if let Some(snapshot_id) = snapshot_id {
         println!("  Snapshot:     {} (read-only)", snapshot_id);
@@ -201,32 +206,27 @@ pub fn run(
 // ─── Daemon spawn ────────────────────────────────────────────────────────────
 
 /// Re-execute the current process without `-d`/`--detach`, detached from the
-/// terminal.  Stdout/stderr are redirected to a log file under `~/.studiofs/logs/`.
-fn spawn_daemon(name: &str, mount_point: &str) -> anyhow::Result<()> {
+/// terminal. The child enables daily-rotated tracing logs under `~/.studiofs/logs/`.
+fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
     // Reconstruct args, stripping the detach flag
     let args: Vec<String> = std::env::args()
         .skip(1) // skip program name
         .filter(|a| a != "-d" && a != "--detach")
         .collect();
 
-    // Prepare log file
     let logs_dir = super::utils::get_logs_dir()?;
-    let log_path = logs_dir.join(format!(
-        "{}.log",
-        super::utils::sanitize_mount_point(mount_point)
-    ));
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log_file_err = log_file.try_clone()?;
+    let log_stem = daemon_log_stem(name, meta_dir)?;
+    let today = Utc::now().format("%Y-%m-%d");
+    let log_path = logs_dir.join(format!("{log_stem}.log.{today}"));
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(&args)
+        .env("STUDIOFS_DAEMON_LOG_STEM", &log_stem)
+        .env("STUDIOFS_DAEMON_LOG_DIR", &logs_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(log_file)
-        .stderr(log_file_err);
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
@@ -264,6 +264,35 @@ fn spawn_daemon(name: &str, mount_point: &str) -> anyhow::Result<()> {
     println!("  To unmount: studiofs umount \"{}\"", mount_point);
 
     Ok(())
+}
+
+fn daemon_log_stem(name: &str, meta_dir: &Path) -> anyhow::Result<String> {
+    let db_path = meta_dir.join(format!("{name}.db"));
+    let meta = open_meta_engine(&db_path)?;
+    let format_info = meta.get_format_info()?;
+    Ok(format!(
+        "{}-{}",
+        sanitize_log_component(name),
+        format_info.uuid
+    ))
+}
+
+fn sanitize_log_component(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "volume".to_string()
+    } else {
+        sanitized
+    }
 }
 
 #[cfg(test)]
