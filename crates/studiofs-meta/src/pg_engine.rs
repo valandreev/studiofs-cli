@@ -19,6 +19,7 @@ const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
 /// PostgreSQL-backed metadata engine.
 ///
@@ -254,6 +255,97 @@ impl PgMetaEngine {
             Ok(result) => result,
             Err(err) => Err(err),
         }
+    }
+
+    fn janitor_lock_key(&self) -> i64 {
+        self.volume_id.wrapping_mul(1_000_003) ^ PG_JANITOR_LOCK_SALT
+    }
+
+    fn try_acquire_pg_janitor_lock(&self) -> MetaResult<bool> {
+        let lock_key = self.janitor_lock_key();
+        let postgres_url = self.postgres_url.clone();
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "janitor lock acquire",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres janitor tx failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    let acquired = tx
+                        .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&lock_key])
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres janitor lock acquire failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?
+                        .get::<usize, bool>(0);
+                    tx.rollback().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres janitor tx rollback failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    Ok(acquired)
+                },
+            )
+            .await
+        })
+    }
+
+    fn load_pg_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let rows = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "janitor snapshot pin query",
+                move |client| async move {
+                    client
+                        .query(
+                            "SELECT pinned_object_ids FROM snapshots WHERE vol = $1",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres janitor snapshot pin query failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })
+                },
+            )
+            .await
+        })?;
+
+        let mut pins = HashSet::new();
+        for row in rows {
+            let raw_ids: Vec<i64> = row.get(0);
+            for object_id in raw_ids {
+                let object_id = u64::try_from(object_id).map_err(|_| {
+                    MetaError::Storage(format!(
+                        "snapshot pinned object id must be non-negative: {object_id}"
+                    ))
+                })?;
+                pins.insert(object_id);
+            }
+        }
+        Ok(pins)
     }
 
     fn reserve_global_client_slot(postgres_url: &str, volume_id: i64) -> MetaResult<u64> {
@@ -1740,6 +1832,14 @@ impl MetaEngine for PgMetaEngine {
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         self.local.get_referenced_object_ids()
+    }
+
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        self.try_acquire_pg_janitor_lock()
+    }
+
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        self.load_pg_global_snapshot_pins()
     }
 
     fn create_file(
@@ -4829,5 +4929,109 @@ mod tests {
             .import_snapshot(&snap_state)
             .expect("import payload");
         assert!(mount_engine.lookup(ROOT_INO, b"snap-peer.txt").is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_janitor_lock_is_exclusive() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-janitor-lock");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let lock_key = a.janitor_lock_key();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dsn_for_holder = dsn.clone();
+
+        let holder = std::thread::spawn(move || {
+            run_async(async move {
+                let (mut client, connection) =
+                    tokio_postgres::connect(&dsn_for_holder, tokio_postgres::NoTls)
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
+                        })?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let tx = client.transaction().await.map_err(|e| {
+                    MetaError::Storage(format!("postgres begin tx failed: {}", pg_err(e)))
+                })?;
+                tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!("postgres lock hold failed: {}", pg_err(e)))
+                    })?;
+                ready_tx.send(()).expect("signal ready");
+                release_rx.recv().expect("wait release");
+                tx.rollback().await.map_err(|e| {
+                    MetaError::Storage(format!("postgres rollback failed: {}", pg_err(e)))
+                })?;
+                conn_task.abort();
+                Ok::<(), MetaError>(())
+            })
+            .expect("holder transaction");
+        });
+
+        ready_rx.recv().expect("holder ready");
+        assert!(
+            !a.try_acquire_global_janitor_lock()
+                .expect("janitor lock probe while contested"),
+            "janitor should skip when another client already holds the PG lock"
+        );
+        release_tx.send(()).expect("release holder");
+        holder.join().expect("holder join");
+
+        assert!(
+            a.try_acquire_global_janitor_lock()
+                .expect("janitor lock probe after release"),
+            "janitor should proceed once the PG lock is free again"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_janitor_reads_snapshot_pins_from_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-janitor-snapshot-pins");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"snap-gc.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(55_001, 64))
+            .expect("set block");
+        let _snapshot = a.create_snapshot(ROOT_INO).expect("create snapshot");
+        a.flush_metadata().expect("flush snapshot");
+
+        let pins = b
+            .get_global_snapshot_pins()
+            .expect("query snapshot pins from postgres");
+        assert!(
+            pins.contains(&55_001),
+            "janitor must see cross-client snapshot pins from postgres"
+        );
     }
 }

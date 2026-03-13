@@ -52,7 +52,8 @@ Key points:
 - Append-only ingress and crash recovery for accepted local writes
 - Cross-platform mounts: WinFSP on Windows, FUSE on Linux/macOS
 - Background upload, janitor, and metadata sync workers
-- Instant local snapshots with eventual PostgreSQL replication
+- Instant local snapshots with eventual PostgreSQL replication; cluster-wide
+  snapshot protection begins after PostgreSQL publication
 - Historical snapshot mounts as read-only views
 
 ## Quick Start

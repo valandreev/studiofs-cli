@@ -329,6 +329,28 @@ pub trait MetaEngine: Send + Sync {
         ))
     }
 
+    /// Try to acquire the global janitor lease before contacting remote object storage.
+    ///
+    /// Local-only engines may allow the janitor to proceed immediately. Distributed
+    /// engines should return `Ok(false)` when another client already holds the lease.
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        Ok(true)
+    }
+
+    /// Release the global janitor lease, if one was acquired.
+    fn release_global_janitor_lock(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        let mut pins = HashSet::new();
+        for snapshot in self.list_snapshots()? {
+            pins.extend(snapshot.pinned_object_ids);
+        }
+        Ok(pins)
+    }
+
     // ─── High-Level Operations ───────────────────────────────────────────
 
     /// Create a new file: allocate inode, set attrs, add dentry.

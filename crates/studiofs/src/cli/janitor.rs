@@ -7,8 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use opendal::services::S3;
 use opendal::{EntryMode, Operator};
 use studiofs_data::object::parse_object_id_from_key;
-use studiofs_meta::types::{BlockRef, MetadataSnapshot};
-use studiofs_meta::{MetaEngine, RedbMetaEngine};
+use studiofs_meta::open_meta_engine;
 
 #[derive(Debug, Default)]
 struct JanitorStats {
@@ -35,35 +34,11 @@ fn normalize_prefix(format_info: &studiofs_meta::FormatInfo) -> String {
     }
 }
 
-fn collect_referenced_objects(snapshot: &studiofs_meta::redb_engine::RedbSnapshot) -> HashSet<u64> {
-    let mut refs = HashSet::new();
-    for (_k, v) in &snapshot.file_blocks {
-        if let Ok(br) = postcard::from_bytes::<BlockRef>(v) {
-            refs.insert(br.object_id);
-        }
-    }
-    for (_id, raw) in &snapshot.snapshots {
-        if let Ok(meta_snapshot) = postcard::from_bytes::<MetadataSnapshot>(raw) {
-            refs.extend(meta_snapshot.pinned_object_ids);
-        }
-    }
-    refs
-}
-
-fn collect_pending_deletions(
-    snapshot: &studiofs_meta::redb_engine::RedbSnapshot,
-) -> HashMap<u64, i64> {
-    let mut pending = HashMap::new();
-    for (object_id, ts) in &snapshot.pending_deletions {
-        pending.insert(*object_id, *ts);
-    }
-    pending
-}
-
 async fn run_one_cycle(
     op: &Operator,
     prefix: &str,
     referenced: &HashSet<u64>,
+    global_snapshot_pins: &HashSet<u64>,
     pending: &HashMap<u64, i64>,
     dry_run: bool,
     skip_newer_than_secs: u64,
@@ -91,6 +66,10 @@ async fn run_one_cycle(
         };
 
         if referenced.contains(&object_id) {
+            stats.referenced_files = stats.referenced_files.saturating_add(1);
+            continue;
+        }
+        if global_snapshot_pins.contains(&object_id) {
             stats.referenced_files = stats.referenced_files.saturating_add(1);
             continue;
         }
@@ -167,13 +146,10 @@ pub fn run(
         ));
     }
 
-    let redb = RedbMetaEngine::open(&db_path)?;
-    let format_info = redb.get_format_info()?;
-    let snapshot = redb.export_snapshot()?;
+    let engine = open_meta_engine(&db_path)?;
+    let format_info = engine.get_format_info()?;
 
     let prefix = normalize_prefix(&format_info);
-    let referenced = collect_referenced_objects(&snapshot);
-    let pending = collect_pending_deletions(&snapshot);
 
     let mut builder = S3::default()
         .endpoint(&format_info.endpoint)
@@ -200,16 +176,29 @@ pub fn run(
     println!("  Prefix:    {}", prefix);
     println!("  Grace:     {} minutes", skip_newer_minutes);
     println!("  Max delete: {}", max_deletes);
-    println!(
-        "  Referenced objects in metadata snapshot: {}",
-        referenced.len()
-    );
 
     loop {
+        let lock_acquired = engine.try_acquire_global_janitor_lock()?;
+        if !lock_acquired {
+            println!("Janitor cycle skipped: PG janitor lock not acquired");
+            if !loop_mode {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(
+                interval_minutes.max(1).saturating_mul(60),
+            ));
+            continue;
+        }
+
+        let global_snapshot_pins = engine.get_global_snapshot_pins()?;
+        let referenced = engine.get_referenced_object_ids()?;
+        let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
+
         let stats = rt.block_on(run_one_cycle(
             &op,
             &prefix,
             &referenced,
+            &global_snapshot_pins,
             &pending,
             dry_run,
             skip_secs,
@@ -218,6 +207,7 @@ pub fn run(
 
         println!("Janitor cycle done:");
         println!("  scanned:              {}", stats.scanned_files);
+        println!("  metadata refs:        {}", referenced.len());
         println!("  referenced:           {}", stats.referenced_files);
         println!("  orphan candidates:    {}", stats.orphan_candidates);
         println!("  skipped young:        {}", stats.skipped_young);
@@ -229,6 +219,7 @@ pub fn run(
             stats.deleted
         );
         println!("  delete errors:        {}", stats.delete_errors);
+        println!("  snapshot pins:        {}", global_snapshot_pins.len());
 
         if !loop_mode {
             break;
