@@ -151,6 +151,7 @@ studiofs mount projectfs Y:
 | `STUDIOFS_PG_FLUSH_INTERVAL_SECS` | `60` | Max interval before the client flushes accumulated local PG metadata events |
 | `STUDIOFS_PG_FLUSH_OPS_THRESHOLD` | `500` | Client-side PG metadata flush op batch threshold |
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
+| `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
 | `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |

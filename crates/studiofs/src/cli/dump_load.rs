@@ -75,6 +75,15 @@ async fn ensure_pg_schema(client: &tokio_postgres::Client) -> anyhow::Result<()>
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
 
+                CREATE TABLE IF NOT EXISTS acl_rules (
+                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                    ino BIGINT NOT NULL,
+                    principal TEXT NOT NULL,
+                    access_level SMALLINT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (vol, ino, principal)
+                );
+
                 ALTER TABLE event_log
                     ADD COLUMN IF NOT EXISTS batch_version BIGINT;
                 UPDATE event_log

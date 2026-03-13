@@ -68,6 +68,16 @@ const BASE_XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("b
 /// Local tombstones hiding remote-visible base xattrs.
 const XATTR_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("xattr_tombstones");
 
+/// ACL rules: (ino(8) + principal_bytes) -> access level (u8).
+const ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("acl_rules");
+
+/// Remote-visible base ACL rules imported from checkpoint + foreign apply.
+const BASE_ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("base_acl_rules");
+
+/// Local tombstones hiding remote-visible base ACL rules.
+const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("acl_rule_tombstones");
+
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
@@ -83,6 +93,7 @@ pub struct RedbSnapshot {
     pub pending_deletions: Vec<(u64, i64)>,
     pub symlinks: Vec<(u64, Vec<u8>)>,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub acl_rules: Vec<(Vec<u8>, u8)>,
     pub event_log: Vec<(u64, Vec<u8>)>,
 }
 
@@ -145,6 +156,18 @@ fn xattr_name_from_key(key: &[u8]) -> &[u8] {
     &key[8..]
 }
 
+fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
+    let principal_bytes = principal.as_bytes();
+    let mut key = Vec::with_capacity(8 + principal_bytes.len());
+    key.extend_from_slice(&ino.to_le_bytes());
+    key.extend_from_slice(principal_bytes);
+    key
+}
+
+fn acl_rule_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
 // ─── Postcard helpers ────────────────────────────────────────────────────────
 
 fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
@@ -190,6 +213,9 @@ impl RedbMetaEngine {
             let _ = txn.open_table(XATTRS_TABLE);
             let _ = txn.open_table(BASE_XATTRS_TABLE);
             let _ = txn.open_table(XATTR_TOMBSTONES_TABLE);
+            let _ = txn.open_table(ACL_RULES_TABLE);
+            let _ = txn.open_table(BASE_ACL_RULES_TABLE);
+            let _ = txn.open_table(ACL_RULE_TOMBSTONES_TABLE);
             let _ = txn.open_table(EVENT_LOG_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1301,6 +1327,65 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
 
+        let acl_keys = {
+            let table = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = acl_rule_prefix(ino);
+            let range = table
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut keys = Vec::new();
+            for item in range {
+                let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = k.value();
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+                keys.push(key_bytes.to_vec());
+            }
+            keys
+        };
+        if !acl_keys.is_empty() {
+            let mut table = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for key in &acl_keys {
+                let _ = table.remove(key.as_slice());
+            }
+            drop(table);
+        }
+
+        let base_acl_keys = {
+            let table = txn
+                .open_table(BASE_ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = acl_rule_prefix(ino);
+            let range = table
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut keys = Vec::new();
+            for item in range {
+                let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = k.value();
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+                keys.push(key_bytes.to_vec());
+            }
+            keys
+        };
+        if !base_acl_keys.is_empty() {
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for key in base_acl_keys {
+                tombstones
+                    .insert(key.as_slice(), 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1587,6 +1672,37 @@ impl RedbMetaEngine {
             snapshot.xattrs.extend(merged);
         }
         {
+            let base = txn
+                .open_table(BASE_ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let overlay = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut merged = std::collections::BTreeMap::<Vec<u8>, u8>::new();
+            for row in base.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                merged.insert(k.value().to_vec(), v.value());
+            }
+            for row in tombstones
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, _v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                merged.remove(k.value());
+            }
+            for row in overlay
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                merged.insert(k.value().to_vec(), v.value());
+            }
+            snapshot.acl_rules.extend(merged);
+        }
+        {
             let table = txn
                 .open_table(EVENT_LOG_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1803,6 +1919,48 @@ impl RedbMetaEngine {
             .collect())
     }
 
+    pub fn local_overlay_acl_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = txn
+            .open_table(ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(ACL_RULE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut overlay = HashSet::new();
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, current_value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value().to_vec();
+            match base
+                .get(key_bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_value) if base_value.value() == current_value.value() => {}
+                _ => {
+                    overlay.insert(key_bytes);
+                }
+            }
+        }
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(key.value().to_vec());
+        }
+        Ok(overlay)
+    }
+
     /// Returns true if local metadata still contains overlay state that is not
     /// yet remote-visible in the base view.
     pub fn has_local_overlay_state(&self) -> MetaResult<bool> {
@@ -1841,6 +1999,13 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
                 .next()
+                .is_some()
+            || txn
+                .open_table(BASE_ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
                 .is_some();
 
         if !has_base_metadata {
@@ -1850,7 +2015,8 @@ impl RedbMetaEngine {
         Ok(!self.local_overlay_attr_inodes()?.is_empty()
             || !self.local_overlay_dentries()?.is_empty()
             || !self.local_overlay_symlink_inodes()?.is_empty()
-            || !self.local_overlay_xattr_keys()?.is_empty())
+            || !self.local_overlay_xattr_keys()?.is_empty()
+            || !self.local_overlay_acl_keys()?.is_empty())
     }
 
     /// Replace redb state with a provided snapshot.
@@ -2138,6 +2304,50 @@ impl RedbMetaEngine {
         }
         {
             let mut table = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_slice());
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(BASE_ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_slice());
+            }
+            for (k, v) in &snapshot.acl_rules {
+                table
+                    .insert(k.as_slice(), *v)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_slice());
+            }
+        }
+        {
+            let mut table = txn
                 .open_table(EVENT_LOG_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let keys: Vec<u64> = table
@@ -2319,6 +2529,26 @@ impl RedbMetaEngine {
                     let key = encode_xattr_key(*ino, name);
                     let _ = table.remove(key.as_slice());
                 }
+                crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal,
+                    access_level,
+                } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    table
+                        .insert(key.as_slice(), *access_level as u8)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAclRule { ino, principal } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = table.remove(key.as_slice());
+                }
                 crate::events::MetaEvent::AddPendingDeletion {
                     object_id,
                     timestamp,
@@ -2400,6 +2630,27 @@ impl RedbMetaEngine {
                     };
                     for key in keys_to_remove {
                         let _ = xattrs.remove(key.as_slice());
+                    }
+
+                    let mut acl = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let prefix = acl_rule_prefix(*ino);
+                    let keys_to_remove: Vec<Vec<u8>> = {
+                        let range = acl
+                            .range(prefix.as_ref()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        range
+                            .take_while(|r| {
+                                r.as_ref()
+                                    .map(|(k, _)| k.value().starts_with(&prefix))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                            .collect()
+                    };
+                    for key in keys_to_remove {
+                        let _ = acl.remove(key.as_slice());
                     }
                 }
                 crate::events::MetaEvent::AddEntry {
@@ -2516,6 +2767,26 @@ impl RedbMetaEngine {
                     let key = encode_xattr_key(*ino, name);
                     let _ = table.remove(key.as_slice());
                 }
+                crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal,
+                    access_level,
+                } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    table
+                        .insert(key.as_slice(), *access_level as u8)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAclRule { ino, principal } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = table.remove(key.as_slice());
+                }
                 crate::events::MetaEvent::SetFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
@@ -2567,6 +2838,27 @@ impl RedbMetaEngine {
                     for key in base_keys {
                         let name = xattr_name_from_key(&key).to_vec();
                         Self::remove_xattr_mirror_in_txn(&txn, *ino, &name)?;
+                    }
+
+                    let prefix = acl_rule_prefix(*ino);
+                    let mut acl_rules = txn
+                        .open_table(ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let acl_rule_keys: Vec<Vec<u8>> = {
+                        let range = acl_rules
+                            .range(prefix.as_ref()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        range
+                            .take_while(|r| {
+                                r.as_ref()
+                                    .map(|(k, _)| k.value().starts_with(&prefix))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                            .collect()
+                    };
+                    for key in acl_rule_keys {
+                        let _ = acl_rules.remove(key.as_slice());
                     }
                 }
                 crate::events::MetaEvent::AddEntry {
@@ -2635,6 +2927,36 @@ impl RedbMetaEngine {
                 }
                 crate::events::MetaEvent::RemoveXattr { ino, name } => {
                     Self::remove_xattr_mirror_in_txn(&txn, *ino, name)?;
+                }
+                crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal,
+                    access_level,
+                } => {
+                    let mut rules = txn
+                        .open_table(ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let mut tombstones = txn
+                        .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = tombstones.remove(key.as_slice());
+                    rules
+                        .insert(key.as_slice(), *access_level as u8)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAclRule { ino, principal } => {
+                    let mut rules = txn
+                        .open_table(ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let mut tombstones = txn
+                        .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = rules.remove(key.as_slice());
+                    tombstones
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::SetFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
@@ -4208,6 +4530,102 @@ impl MetaEngine for RedbMetaEngine {
         }
 
         Ok(names.into_iter().collect())
+    }
+
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
+        let _ = self.get_attr(ino)?;
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut rules = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            rules
+                .insert(key.as_slice(), access_level as u8)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = tombstones.remove(key.as_slice());
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal: principal.to_string(),
+                    access_level,
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut rules = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = rules.remove(key.as_slice());
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones
+                .insert(key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveAclRule {
+                    ino,
+                    principal: principal.to_string(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if Self::has_slice_marker(&txn, ACL_RULE_TOMBSTONES_TABLE, key.as_slice())? {
+            return Ok(None);
+        }
+        let rules = txn
+            .open_table(ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(value) = rules
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            return AccessLevel::from_u8(value.value())
+                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
+                .map(Some);
+        }
+        let base = txn
+            .open_table(BASE_ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match base
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(value) => AccessLevel::from_u8(value.value())
+                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     // --- High-Level Operations (ACID Atomicity) --------------------------
@@ -6285,5 +6703,47 @@ mod tests {
         // Decrementing an unset counter (defaults to 0) saturates at 0
         let v = engine.decr_counter("noexist", 42).unwrap();
         assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_acl_rule_set_get_remove_roundtrip() {
+        let engine = temp_engine();
+        let secret = engine.create_dir(ROOT_INO, b"secret", 0, 0, 0o755).unwrap();
+
+        assert_eq!(engine.get_acl_rule(secret.ino, "alice").unwrap(), None);
+        engine
+            .set_acl_rule(secret.ino, "alice", AccessLevel::ReadOnly)
+            .unwrap();
+        assert_eq!(
+            engine.get_acl_rule(secret.ino, "alice").unwrap(),
+            Some(AccessLevel::ReadOnly)
+        );
+
+        engine
+            .set_acl_rule(secret.ino, "alice", AccessLevel::NoAccess)
+            .unwrap();
+        assert_eq!(
+            engine.get_acl_rule(secret.ino, "alice").unwrap(),
+            Some(AccessLevel::NoAccess)
+        );
+
+        engine.remove_acl_rule(secret.ino, "alice").unwrap();
+        assert_eq!(engine.get_acl_rule(secret.ino, "alice").unwrap(), None);
+    }
+
+    #[test]
+    fn test_acl_rules_cascade_on_remove_attr() {
+        let engine = temp_engine();
+        let dir = engine.create_dir(ROOT_INO, b"secret", 0, 0, 0o755).unwrap();
+        engine
+            .set_acl_rule(dir.ino, "bob", AccessLevel::ReadWrite)
+            .unwrap();
+        assert_eq!(
+            engine.get_acl_rule(dir.ino, "bob").unwrap(),
+            Some(AccessLevel::ReadWrite)
+        );
+
+        engine.rmdir(ROOT_INO, b"secret").unwrap();
+        assert_eq!(engine.get_acl_rule(dir.ino, "bob").unwrap(), None);
     }
 }
