@@ -7196,7 +7196,12 @@ impl StudioVfs {
 
         // Keep flush non-blocking for interactive UX: move data to dirty buffer
         // and commit attrs; background flusher materializes block refs asynchronously.
-        let dirty_attr = { self.state.dirty_attrs.lock().remove(&ino) };
+        //
+        // Important ordering: DO NOT remove dirty_attrs before set_attr().
+        // Materializer derives upload content_epoch from dirty_attrs first and
+        // falls back to metadata only when absent. Removing first can create a
+        // race where early blocks are materialized with stale metadata epoch.
+        let dirty_attr = { self.state.dirty_attrs.lock().get(&ino).cloned() };
         if let Some(attr) = dirty_attr {
             let attr_for_meta = attr.clone();
             let meta = self.meta.clone();
@@ -7206,6 +7211,15 @@ impl StudioVfs {
             .await?;
             self.state.attr_read_cache.lock().remove(ino);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+            let mut dirty_attrs = self.state.dirty_attrs.lock();
+            if let Some(current) = dirty_attrs.get(&ino)
+                && current.content_epoch == attr.content_epoch
+                && current.size == attr.size
+                && current.mtime == attr.mtime
+                && current.ctime == attr.ctime
+            {
+                dirty_attrs.remove(&ino);
+            }
         }
 
         Ok(())
@@ -7318,7 +7332,7 @@ impl StudioVfs {
             });
         }
 
-        let mut fair = FairInodeScheduler::default();
+        let mut fair: FairInodeScheduler<PendingUpload> = FairInodeScheduler::default();
         let mut inbound_closed = false;
         loop {
             if self.uploader_shutdown_requested() || (inbound_closed && fair.is_empty()) {
@@ -7332,6 +7346,14 @@ impl StudioVfs {
                     match permit {
                         Ok(permit) => {
                             if let Some(op) = fair.pop() {
+                                debug!(
+                                    ino = op.ino,
+                                    object_id = op.object_id,
+                                    offset = op.offset,
+                                    content_epoch = op.content_epoch,
+                                    retry_count = op.retry_count,
+                                    "uploader dispatch op"
+                                );
                                 permit.send(op);
                             }
                         }
@@ -7384,6 +7406,15 @@ impl StudioVfs {
     /// If the owning inode has been deleted, the upload is cancelled immediately
     /// (no S3 write) and the block is evicted from cache.
     async fn process_upload(&self, op: PendingUpload) -> VfsResult<()> {
+        let block_index = block_index_from_offset(op.offset, self.block_size);
+        debug!(
+            ino = op.ino,
+            object_id = op.object_id,
+            offset = op.offset,
+            content_epoch = op.content_epoch,
+            retry_count = op.retry_count,
+            "process_upload start"
+        );
         if self.uploader_shutdown_requested() {
             return Ok(());
         }
@@ -7424,12 +7455,16 @@ impl StudioVfs {
             );
             self.block_cache.cancel_upload(&op, true);
             self.state.pending_evictions.lock().remove(&op.object_id);
+            debug!(
+                ino = op.ino,
+                object_id = op.object_id,
+                "process_upload canceled: inode deleted or missing"
+            );
             return Ok(());
         }
 
         // Coalescing: if this file block has already been replaced in metadata
         // with a newer object_id, skip uploading this stale one.
-        let block_index = block_index_from_offset(op.offset, self.block_size);
         if let Some(attr) = attr.as_ref()
             && attr.content_epoch != op.content_epoch
         {
@@ -7446,6 +7481,14 @@ impl StudioVfs {
             );
             self.block_cache.cancel_upload(&op, false);
             self.state.pending_evictions.lock().remove(&op.object_id);
+            debug!(
+                ino = op.ino,
+                object_id = op.object_id,
+                block_index,
+                queued_epoch = op.content_epoch,
+                current_epoch = attr.content_epoch,
+                "process_upload canceled: stale content epoch"
+            );
             return Ok(());
         }
         if let Ok(Some(current)) = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
@@ -7466,6 +7509,13 @@ impl StudioVfs {
             );
             self.block_cache.cancel_upload(&op, false);
             self.state.pending_evictions.lock().remove(&op.object_id);
+            debug!(
+                ino = op.ino,
+                object_id = op.object_id,
+                block_index,
+                current_object_id = current.object_id,
+                "process_upload canceled: stale superseded block"
+            );
             return Ok(());
         }
 
@@ -7597,6 +7647,12 @@ impl StudioVfs {
                 .put(&key, object_bytes)
                 .await
                 .map_err(|e| VfsError::Other(e.to_string()))?;
+            debug!(
+                ino = op.ino,
+                object_id = op.object_id,
+                block_index,
+                "process_upload put completed"
+            );
         }
 
         let current = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
@@ -7621,6 +7677,12 @@ impl StudioVfs {
             {
                 commit::CommitCoordinator::finish_extent_upload(self, &op, block_index).await?;
                 self.block_cache.complete_upload(&op);
+                debug!(
+                    ino = op.ino,
+                    object_id = op.object_id,
+                    block_index,
+                    "process_upload complete_upload on current block"
+                );
             }
             _ => {
                 run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
@@ -7634,6 +7696,12 @@ impl StudioVfs {
                     "upload completed for stale block, marked for deletion"
                 );
                 self.block_cache.complete_upload(&op);
+                debug!(
+                    ino = op.ino,
+                    object_id = op.object_id,
+                    block_index,
+                    "process_upload complete_upload on stale block"
+                );
             }
         }
 

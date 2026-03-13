@@ -8,3 +8,5 @@ docs/logs/*.*
 /tools/fstest/results/*
 /tools/fstest/__pycache__
 /tools/fstest/results-new
+.antigravityrules
+tmp/
