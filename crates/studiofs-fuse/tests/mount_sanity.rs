@@ -72,3 +72,38 @@ fn fuse_session_mount_and_drop_smoke() {
     let session = fuser::Session::new(fs, mount_dir.path(), &options).expect("create FUSE session");
     drop(session);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_resource_fork_roundtrip_uses_native_xattr_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let vfs = make_test_vfs(&tmp, "macos_resource_fork_xattr", &rt);
+
+    let file = vfs
+        .create(1, b"fork.bin", 0, 0, 0o644)
+        .expect("create file for resource fork");
+    let fork_name = b"com.apple.ResourceFork";
+    let fork_value = vec![0, 1, 2, 3, b'R', b'S', b'R', b'C'];
+
+    vfs.set_xattr(file.ino, fork_name, &fork_value, 0)
+        .expect("set resource fork xattr");
+
+    let got = vfs
+        .get_xattr(file.ino, fork_name)
+        .expect("get resource fork xattr");
+    assert_eq!(got, Some(fork_value.clone()));
+
+    let names = vfs.list_xattrs(file.ino).expect("list xattrs");
+    assert!(
+        names.iter().any(|name| name.as_slice() == fork_name),
+        "resource fork key should be visible in native xattr listing"
+    );
+
+    vfs.remove_xattr(file.ino, fork_name)
+        .expect("remove resource fork xattr");
+    let after_remove = vfs
+        .get_xattr(file.ino, fork_name)
+        .expect("get xattr after remove");
+    assert_eq!(after_remove, None);
+}

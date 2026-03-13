@@ -1310,6 +1310,15 @@ fn test_crash_recovery_replays_pending_journal() {
 fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
     type EnvRestore = ScopedEnvVar;
 
+    // Keep S3 settings stable for this long-running crash/restart scenario.
+    // Other tests intentionally toggle endpoint reachability; pinning online
+    // values here avoids inheriting a stale offline endpoint.
+    let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = EnvRestore::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = EnvRestore::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = EnvRestore::capture("STUDIOFS_S3_SECRET_KEY");
+    apply_test_online_s3_env();
+
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
         std::fs::read_dir(dir)

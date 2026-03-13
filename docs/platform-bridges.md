@@ -123,8 +123,12 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground)
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
 | `allow_other` | Yes |
-| macOS: `noappledouble` | Suppress `._*` files |
 | macOS: `volname` | `"StudioFS"` |
+
+On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
+`removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
+and resource-fork writes stay in xattrs rather than relying on AppleDouble
+fallback.
 
 ### macOS Trash behavior
 
