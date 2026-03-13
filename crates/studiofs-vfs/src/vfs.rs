@@ -5885,7 +5885,7 @@ impl StudioVfs {
         };
         self.dentry_cache_insert_positive(parent, name, entry.ino);
         self.enforce_access(entry.ino, AccessLevel::ReadOnly)?;
-        Ok(self.getattr_unchecked(entry.ino)?)
+        self.getattr_unchecked(entry.ino)
     }
 
     /// Lookup an entry in a directory.

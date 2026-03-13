@@ -10,8 +10,8 @@ use fuser::{
     ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
     Request,
 };
-use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 use studiofs_meta::FileType;
+use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};
 use tokio::runtime::Runtime;

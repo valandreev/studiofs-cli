@@ -7603,7 +7603,9 @@ async fn acl_no_access_hides_directory_from_lookup_and_readdir() {
     let vfs = make_vfs(&tmp, "acl-hide");
 
     let secret_dir = vfs.mkdir(1, b"secret", 0, 0, 0o755).unwrap();
-    let secret_file = vfs.create(secret_dir.ino, b"flag.txt", 0, 0, 0o644).unwrap();
+    let secret_file = vfs
+        .create(secret_dir.ino, b"flag.txt", 0, 0, 0o644)
+        .unwrap();
     vfs.write(secret_file.ino, 0, b"top-secret").await.unwrap();
     vfs.flush(secret_file.ino).await.unwrap();
 

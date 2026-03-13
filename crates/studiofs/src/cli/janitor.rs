@@ -21,6 +21,17 @@ struct JanitorStats {
     delete_errors: u64,
 }
 
+struct JanitorCycleContext<'a> {
+    op: &'a Operator,
+    prefix: &'a str,
+    referenced: &'a HashSet<u64>,
+    global_snapshot_pins: &'a HashSet<u64>,
+    pending: &'a HashMap<u64, i64>,
+    dry_run: bool,
+    skip_newer_than_secs: u64,
+    max_deletes: u64,
+}
+
 fn normalize_prefix(format_info: &studiofs_meta::FormatInfo) -> String {
     let raw = if format_info.data_prefix.trim().is_empty() {
         format!("{}/objects/", format_info.name)
@@ -34,16 +45,7 @@ fn normalize_prefix(format_info: &studiofs_meta::FormatInfo) -> String {
     }
 }
 
-async fn run_one_cycle(
-    op: &Operator,
-    prefix: &str,
-    referenced: &HashSet<u64>,
-    global_snapshot_pins: &HashSet<u64>,
-    pending: &HashMap<u64, i64>,
-    dry_run: bool,
-    skip_newer_than_secs: u64,
-    max_deletes: u64,
-) -> anyhow::Result<JanitorStats> {
+async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorStats> {
     let mut stats = JanitorStats::default();
     let now = SystemTime::now();
     let now_unix = now
@@ -51,7 +53,7 @@ async fn run_one_cycle(
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs() as i64;
 
-    let entries = op.list_with(prefix).recursive(true).await?;
+    let entries = ctx.op.list_with(ctx.prefix).recursive(true).await?;
     for entry in entries {
         if entry.metadata().mode() != EntryMode::FILE {
             continue;
@@ -65,29 +67,29 @@ async fn run_one_cycle(
             Err(_) => continue,
         };
 
-        if referenced.contains(&object_id) {
+        if ctx.referenced.contains(&object_id) {
             stats.referenced_files = stats.referenced_files.saturating_add(1);
             continue;
         }
-        if global_snapshot_pins.contains(&object_id) {
+        if ctx.global_snapshot_pins.contains(&object_id) {
             stats.referenced_files = stats.referenced_files.saturating_add(1);
             continue;
         }
         stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
 
-        if stats.deleted >= max_deletes {
+        if stats.deleted >= ctx.max_deletes {
             stats.skipped_cap = stats.skipped_cap.saturating_add(1);
             continue;
         }
 
-        if let Some(pending_ts) = pending.get(&object_id) {
+        if let Some(pending_ts) = ctx.pending.get(&object_id) {
             let age_secs = now_unix.saturating_sub(*pending_ts) as u64;
-            if age_secs < skip_newer_than_secs {
+            if age_secs < ctx.skip_newer_than_secs {
                 stats.skipped_young = stats.skipped_young.saturating_add(1);
                 continue;
             }
         } else {
-            let meta = match op.stat(&path).await {
+            let meta = match ctx.op.stat(&path).await {
                 Ok(m) => m,
                 Err(_) => {
                     stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
@@ -103,18 +105,18 @@ async fn run_one_cycle(
                 .duration_since(last_modified_st)
                 .unwrap_or_else(|_| Duration::from_secs(0))
                 .as_secs();
-            if age_secs < skip_newer_than_secs {
+            if age_secs < ctx.skip_newer_than_secs {
                 stats.skipped_young = stats.skipped_young.saturating_add(1);
                 continue;
             }
         }
 
-        if dry_run {
+        if ctx.dry_run {
             stats.deleted = stats.deleted.saturating_add(1);
             continue;
         }
 
-        match op.delete(&path).await {
+        match ctx.op.delete(&path).await {
             Ok(_) => {
                 stats.deleted = stats.deleted.saturating_add(1);
             }
@@ -195,16 +197,16 @@ pub fn run(
             let referenced = engine.get_referenced_object_ids()?;
             let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
 
-            let stats = rt.block_on(run_one_cycle(
-                &op,
-                &prefix,
-                &referenced,
-                &global_snapshot_pins,
-                &pending,
+            let stats = rt.block_on(run_one_cycle(JanitorCycleContext {
+                op: &op,
+                prefix: &prefix,
+                referenced: &referenced,
+                global_snapshot_pins: &global_snapshot_pins,
+                pending: &pending,
                 dry_run,
-                skip_secs,
-                max_deletes.max(1),
-            ))?;
+                skip_newer_than_secs: skip_secs,
+                max_deletes: max_deletes.max(1),
+            }))?;
 
             Ok((stats, referenced, global_snapshot_pins))
         })();
