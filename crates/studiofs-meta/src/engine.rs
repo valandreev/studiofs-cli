@@ -68,6 +68,11 @@ pub enum MetaError {
 
 pub type MetaResult<T> = Result<T, MetaError>;
 
+/// `setxattr` flag: create attribute, fail if key already exists.
+pub const XATTR_CREATE_FLAG: u32 = 1;
+/// `setxattr` flag: replace attribute, fail if key does not exist.
+pub const XATTR_REPLACE_FLAG: u32 = 2;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetadataReplicationBacklog {
     pub pending_ops: u32,
@@ -393,7 +398,9 @@ pub trait MetaEngine: Send + Sync {
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
 
     /// Set an extended attribute.
-    /// Flags: 1 = XATTR_CREATE (fail if exists), 2 = XATTR_REPLACE (fail if not exists).
+    /// Flags:
+    /// - `XATTR_CREATE_FLAG`: fail if key exists
+    /// - `XATTR_REPLACE_FLAG`: fail if key is missing
     fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>;
 
     /// Remove an extended attribute.

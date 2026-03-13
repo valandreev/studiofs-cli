@@ -10,6 +10,7 @@ use fuser::{
     ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
     Request,
 };
+use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 use studiofs_meta::FileType;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};
@@ -42,12 +43,14 @@ fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> 
 
 #[cfg(target_os = "macos")]
 fn normalize_macos_xattr_flags(flags: i32) -> u32 {
+    const MACOS_XATTR_CREATE: i32 = 0x0002;
+    const MACOS_XATTR_REPLACE: i32 = 0x0004;
     let mut normalized = 0;
-    if flags & 0x0002 != 0 {
-        normalized |= 1; // XATTR_CREATE -> VFS create-if-missing flag
+    if flags & MACOS_XATTR_CREATE != 0 {
+        normalized |= XATTR_CREATE_FLAG;
     }
-    if flags & 0x0004 != 0 {
-        normalized |= 2; // XATTR_REPLACE -> VFS replace-only flag
+    if flags & MACOS_XATTR_REPLACE != 0 {
+        normalized |= XATTR_REPLACE_FLAG;
     }
     normalized
 }
@@ -1176,9 +1179,12 @@ mod tests {
         // macOS passes XATTR_CREATE=0x0002 and XATTR_REPLACE=0x0004.
         // StudioVfs expects CREATE=1 and REPLACE=2.
         assert_eq!(normalize_macos_xattr_flags(0), 0);
-        assert_eq!(normalize_macos_xattr_flags(0x0002), 1);
-        assert_eq!(normalize_macos_xattr_flags(0x0004), 2);
-        assert_eq!(normalize_macos_xattr_flags(0x0002 | 0x0004), 3);
+        assert_eq!(normalize_macos_xattr_flags(0x0002), XATTR_CREATE_FLAG);
+        assert_eq!(normalize_macos_xattr_flags(0x0004), XATTR_REPLACE_FLAG);
+        assert_eq!(
+            normalize_macos_xattr_flags(0x0002 | 0x0004),
+            XATTR_CREATE_FLAG | XATTR_REPLACE_FLAG
+        );
         assert_eq!(normalize_macos_xattr_flags(0x0010), 0);
     }
 }

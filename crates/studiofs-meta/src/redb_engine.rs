@@ -4134,15 +4134,13 @@ impl MetaEngine for RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
-            // XATTR_CREATE (1): fail if exists
-            if flags & 1 != 0 && current.is_some() {
+            if flags & XATTR_CREATE_FLAG != 0 && current.is_some() {
                 return Err(MetaError::EntryExists {
                     parent: ino,
                     name: String::from_utf8_lossy(name).to_string(),
                 });
             }
-            // XATTR_REPLACE (2): fail if not exists
-            if flags & 2 != 0 && current.is_none() {
+            if flags & XATTR_REPLACE_FLAG != 0 && current.is_none() {
                 return Err(MetaError::EntryNotFound {
                     parent: ino,
                     name: String::from_utf8_lossy(name).to_string(),
