@@ -3724,7 +3724,7 @@ impl StudioVfs {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(DEFAULT_UPLOAD_USER_IDLE_GRACE_MS),
             );
-            info!(
+            debug!(
                 writeback = true,
                 upload_delay_ms = upload_delay.as_millis() as u64,
                 requeue_base_ms = upload_requeue_base.as_millis() as u64,

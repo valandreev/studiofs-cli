@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use studiofs_data::store::{DataError, DataStore};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Lock-free counters for upload observability.
 pub struct UploadMetrics {
@@ -101,7 +101,7 @@ impl UploadScheduler {
         let retry_base_ms = env_u64("STUDIOFS_UPLOAD_RETRY_BASE_MS", 200);
         let retry_max_ms = env_u64("STUDIOFS_UPLOAD_RETRY_MAX_MS", 5_000).max(retry_base_ms);
 
-        info!(
+        debug!(
             initial_window = aimd_config.initial_window,
             max_window = aimd_config.max_window,
             max_attempts,

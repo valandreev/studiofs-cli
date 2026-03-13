@@ -6,7 +6,7 @@ use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::StudioVfs;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
@@ -72,7 +72,7 @@ pub fn run(
     }
 
     let db_path = meta_dir.join(format!("{name}.db"));
-    info!("opening volume {name:?} from {db_path:?}");
+    debug!("opening volume {name:?} from {db_path:?}");
     let live_meta = open_meta_engine(&db_path)?;
     let mut format_info = live_meta.get_format_info()?;
     let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
@@ -106,8 +106,8 @@ pub fn run(
     };
 
     info!(
-        "volume: {} ({}), endpoint: {}, bucket: {}",
-        format_info.name, format_info.uuid, format_info.endpoint, format_info.bucket
+        "mounting volume '{}' (storage: endpoint={}, bucket={})",
+        format_info.name, format_info.endpoint, format_info.bucket
     );
 
     // Set up data store config (StudioVfs creates Read + Write connections directly)
@@ -148,6 +148,10 @@ pub fn run(
     println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
+    println!(
+        "  Storage:      {} / {}",
+        format_info.endpoint, format_info.bucket
+    );
     println!("  Invalidation: PostgreSQL sync");
     if let Some(snapshot_id) = snapshot_id {
         println!("  Snapshot:     {} (read-only)", snapshot_id);

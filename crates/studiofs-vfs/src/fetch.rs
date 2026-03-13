@@ -194,7 +194,7 @@ impl FetchScheduler {
             DEFAULT_PREFETCH_ACQUIRE_WAIT_MS,
         );
 
-        info!(
+        debug!(
             initial_window = aimd_config.initial_window,
             max_window = aimd_config.max_window,
             max_fetch_attempts,
