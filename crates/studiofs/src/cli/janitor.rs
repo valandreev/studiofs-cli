@@ -190,20 +190,26 @@ pub fn run(
             continue;
         }
 
-        let global_snapshot_pins = engine.get_global_snapshot_pins()?;
-        let referenced = engine.get_referenced_object_ids()?;
-        let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
+        let cycle_result = (|| -> anyhow::Result<(JanitorStats, HashSet<u64>, HashSet<u64>)> {
+            let global_snapshot_pins = engine.get_global_snapshot_pins()?;
+            let referenced = engine.get_referenced_object_ids()?;
+            let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
 
-        let stats = rt.block_on(run_one_cycle(
-            &op,
-            &prefix,
-            &referenced,
-            &global_snapshot_pins,
-            &pending,
-            dry_run,
-            skip_secs,
-            max_deletes.max(1),
-        ))?;
+            let stats = rt.block_on(run_one_cycle(
+                &op,
+                &prefix,
+                &referenced,
+                &global_snapshot_pins,
+                &pending,
+                dry_run,
+                skip_secs,
+                max_deletes.max(1),
+            ))?;
+
+            Ok((stats, referenced, global_snapshot_pins))
+        })();
+        engine.release_global_janitor_lock()?;
+        let (stats, referenced, global_snapshot_pins) = cycle_result?;
 
         println!("Janitor cycle done:");
         println!("  scanned:              {}", stats.scanned_files);

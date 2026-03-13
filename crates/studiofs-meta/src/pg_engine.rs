@@ -47,6 +47,7 @@ pub struct PgMetaEngine {
     command_timeout: Duration,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
+    janitor_lock: Mutex<Option<PgJanitorLock>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -83,6 +84,12 @@ struct OverlayConflictSets {
 struct RecentFlush {
     batch_version: i64,
     overlay: OverlayConflictSets,
+}
+
+struct PgJanitorLock {
+    runtime: tokio::runtime::Runtime,
+    client: tokio_postgres::Client,
+    connection_task: tokio::task::JoinHandle<()>,
 }
 
 impl PgMetaEngine {
@@ -262,46 +269,99 @@ impl PgMetaEngine {
     }
 
     fn try_acquire_pg_janitor_lock(&self) -> MetaResult<bool> {
-        let lock_key = self.janitor_lock_key();
-        let postgres_url = self.postgres_url.clone();
-        let connect_timeout = self.connect_timeout;
-        let command_timeout = self.command_timeout;
+        let mut state = self
+            .janitor_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg janitor lock state poisoned".to_string()))?;
+        if state.is_some() {
+            return Ok(false);
+        }
 
-        self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
-                command_timeout,
-                "janitor lock acquire",
-                move |client| async move {
-                    let mut client = client;
-                    let tx = client.transaction().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres janitor tx failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-                    let acquired = tx
-                        .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&lock_key])
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres janitor lock acquire failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })?
-                        .get::<usize, bool>(0);
-                    tx.rollback().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres janitor tx rollback failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-                    Ok(acquired)
-                },
-            )
-            .await
-        })
+        let lock_key = self.janitor_lock_key();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
+        let connect = tokio_postgres::connect(&self.postgres_url, tokio_postgres::NoTls);
+        let (client, connection) = runtime
+            .block_on(async { tokio::time::timeout(self.connect_timeout, connect).await })
+            .map_err(|_| Self::pg_timeout_error("janitor lock connect", self.connect_timeout))?
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres connect failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?;
+
+        let connection_task = runtime.spawn(async move {
+            let _ = connection.await;
+        });
+        let acquired = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    self.command_timeout,
+                    client.query_one("SELECT pg_try_advisory_lock($1)", &[&lock_key]),
+                )
+                .await
+            })
+            .map_err(|_| Self::pg_timeout_error("janitor lock acquire", self.command_timeout))?
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres janitor lock acquire failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?
+            .get::<usize, bool>(0);
+
+        if !acquired {
+            connection_task.abort();
+            return Ok(false);
+        }
+
+        *state = Some(PgJanitorLock {
+            runtime,
+            client,
+            connection_task,
+        });
+        Ok(true)
+    }
+
+    fn release_pg_janitor_lock(&self) -> MetaResult<()> {
+        let mut state = self
+            .janitor_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg janitor lock state poisoned".to_string()))?;
+        let Some(lock) = state.take() else {
+            return Ok(());
+        };
+
+        let lock_key = self.janitor_lock_key();
+        let unlocked = lock
+            .runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    self.command_timeout,
+                    lock.client
+                        .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key]),
+                )
+                .await
+            })
+            .map_err(|_| Self::pg_timeout_error("janitor lock release", self.command_timeout))?
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres janitor lock release failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?
+            .get::<usize, bool>(0);
+        lock.connection_task.abort();
+
+        if !unlocked {
+            return Err(MetaError::Storage(
+                "postgres janitor lock release reported false".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn load_pg_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
@@ -535,6 +595,7 @@ impl PgMetaEngine {
             command_timeout,
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
+            janitor_lock: Mutex::new(None),
         });
 
         // Bootstrap from the last checkpoint if present, then catch up from
@@ -1644,6 +1705,12 @@ impl PgMetaEngine {
     }
 }
 
+impl Drop for PgMetaEngine {
+    fn drop(&mut self) {
+        let _ = self.release_pg_janitor_lock();
+    }
+}
+
 impl MetaEngine for PgMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
         let _guard = self
@@ -1836,6 +1903,10 @@ impl MetaEngine for PgMetaEngine {
 
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
         self.try_acquire_pg_janitor_lock()
+    }
+
+    fn release_global_janitor_lock(&self) -> MetaResult<()> {
+        self.release_pg_janitor_lock()
     }
 
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
@@ -2147,6 +2218,7 @@ mod tests {
             command_timeout: Duration::from_millis(50),
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
+            janitor_lock: Mutex::new(None),
         };
 
         (dir, engine)
@@ -4948,55 +5020,28 @@ mod tests {
         seed_local(&db_b, &info);
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
-        let lock_key = a.janitor_lock_key();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let dsn_for_holder = dsn.clone();
-
-        let holder = std::thread::spawn(move || {
-            run_async(async move {
-                let (mut client, connection) =
-                    tokio_postgres::connect(&dsn_for_holder, tokio_postgres::NoTls)
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
-                        })?;
-                let conn_task = tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-                let tx = client.transaction().await.map_err(|e| {
-                    MetaError::Storage(format!("postgres begin tx failed: {}", pg_err(e)))
-                })?;
-                tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
-                    .await
-                    .map_err(|e| {
-                        MetaError::Storage(format!("postgres lock hold failed: {}", pg_err(e)))
-                    })?;
-                ready_tx.send(()).expect("signal ready");
-                release_rx.recv().expect("wait release");
-                tx.rollback().await.map_err(|e| {
-                    MetaError::Storage(format!("postgres rollback failed: {}", pg_err(e)))
-                })?;
-                conn_task.abort();
-                Ok::<(), MetaError>(())
-            })
-            .expect("holder transaction");
-        });
-
-        ready_rx.recv().expect("holder ready");
-        assert!(
-            !a.try_acquire_global_janitor_lock()
-                .expect("janitor lock probe while contested"),
-            "janitor should skip when another client already holds the PG lock"
-        );
-        release_tx.send(()).expect("release holder");
-        holder.join().expect("holder join");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
 
         assert!(
             a.try_acquire_global_janitor_lock()
-                .expect("janitor lock probe after release"),
+                .expect("janitor lock acquire on a"),
+            "first janitor should acquire the PG lock"
+        );
+        assert!(
+            !b.try_acquire_global_janitor_lock()
+                .expect("janitor lock probe on b while a holds it"),
+            "janitor should skip when another client already holds the PG lock"
+        );
+        a.release_global_janitor_lock()
+            .expect("janitor lock release on a");
+
+        assert!(
+            b.try_acquire_global_janitor_lock()
+                .expect("janitor lock acquire on b after release"),
             "janitor should proceed once the PG lock is free again"
         );
+        b.release_global_janitor_lock()
+            .expect("janitor lock release on b");
     }
 
     #[test]

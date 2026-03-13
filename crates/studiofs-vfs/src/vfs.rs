@@ -8243,6 +8243,11 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     warn!(error = %e, "background GC skipped: snapshot pin query failed");
                     continue;
                 }
@@ -8306,8 +8311,22 @@ impl StudioVfs {
                     }
                 }
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     error!("failed to get pending deletions: {}", e);
                 }
+            }
+
+            let meta = self.meta.clone();
+            if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.release_global_janitor_lock()
+            })
+            .await
+            {
+                warn!(error = %e, "background GC failed to release janitor PG lock");
             }
         }
     }
@@ -8371,6 +8390,11 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     warn!(cycle, error = %e, "janitor cycle skipped: snapshot pin query failed");
                     continue;
                 }
@@ -8384,6 +8408,11 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     warn!(cycle, error = %e, "janitor cycle failed: get_referenced_object_ids");
                     continue;
                 }
@@ -8411,6 +8440,11 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
                     warn!(
                         cycle,
                         prefix = self.data_prefix,
@@ -8505,6 +8539,15 @@ impl StudioVfs {
                 delete_errors,
                 "janitor cycle complete"
             );
+
+            let meta = self.meta.clone();
+            if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.release_global_janitor_lock()
+            })
+            .await
+            {
+                warn!(cycle, error = %e, "janitor cycle failed to release PG lock");
+            }
         }
     }
 
