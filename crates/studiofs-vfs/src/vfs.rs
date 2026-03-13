@@ -8068,13 +8068,16 @@ impl StudioVfs {
             info!(
                 pending_uploads = pending,
                 pending_metadata_ops = metadata_backlog.total_ops(),
+                "upload pipeline"
+            );
+            debug!(
                 dentry_cache_entries = dentry_cache.occupancy_entries,
                 dentry_cache_bytes = dentry_cache.occupancy_bytes,
                 path_shortcut_cache_entries = path_shortcut_cache.occupancy_entries,
                 path_shortcut_cache_bytes = path_shortcut_cache.occupancy_bytes,
                 attr_read_cache_entries = attr_read_cache.occupancy_entries,
                 attr_read_cache_bytes = attr_read_cache.occupancy_bytes,
-                "upload pipeline"
+                "upload pipeline caches"
             );
             if !self.upload_pipeline_is_idle(pending, &ingress) {
                 debug!(
