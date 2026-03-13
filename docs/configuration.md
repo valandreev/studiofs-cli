@@ -26,6 +26,8 @@ studiofs init <name> \
 Important:
 - PostgreSQL metadata backend is required.
 - StudioFS always uses database `studiofs` and will create it during `init` when permissions allow.
+- `init` validates data bucket access (connect/read/write/delete where needed) and PostgreSQL connectivity before creating local metadata.
+- `init` no longer performs conditional-write CAS checks (`If-Match` / `If-None-Match`) during initialization.
 
 ### `discover`
 

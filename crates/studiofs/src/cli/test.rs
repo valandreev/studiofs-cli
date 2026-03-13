@@ -1,5 +1,5 @@
-//! `studiofs test` — validate S3-compatible storage for StudioFS compatibility.
-//! Internal S3 compatibility probes used by `studiofs init`.
+//! S3 compatibility probes for StudioFS diagnostics.
+//! Internal S3 compatibility probes used by CLI diagnostics.
 
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
@@ -7,7 +7,6 @@ use hmac::{Hmac, Mac};
 use opendal::{
     Operator,
     layers::{RetryLayer, TimeoutLayer},
-    options::WriteOptions,
     services::S3,
 };
 use sha2::{Digest, Sha256};
@@ -32,7 +31,6 @@ const LARGE_SIZE: usize = 4 * 1024 * 1024;
 enum Category {
     Connectivity,
     Data,
-    Metadata,
 }
 
 impl Category {
@@ -40,7 +38,6 @@ impl Category {
         match self {
             Category::Connectivity => "connectivity",
             Category::Data => "data",
-            Category::Metadata => "metadata",
         }
     }
 }
@@ -71,17 +68,15 @@ struct TestCase {
     duration: Duration,
 }
 
-// ── Programmatic compatibility check API (used by `studiofs init`) ───────────
+// ── Programmatic compatibility check API (used by CLI diagnostics/tests) ─────
 
 /// Result of a programmatic compatibility pre-flight run.
 ///
 /// Each category reports whether ALL tests in that group passed.
-/// `suitable_for_data()` and `suitable_for_metadata()` encode the specific
-/// requirements for each use-case.
+/// `suitable_for_data()` encodes the bucket requirements for file data paths.
 pub(crate) struct CompatResult {
     pub connectivity_ok: bool,
     pub data_ok: bool,
-    pub meta_ok: bool,
     cases: Vec<TestCase>,
 }
 
@@ -89,7 +84,7 @@ impl CompatResult {
     /// All tests passed.
     #[allow(dead_code)]
     pub fn all_ok(&self) -> bool {
-        self.connectivity_ok && self.data_ok && self.meta_ok
+        self.connectivity_ok && self.data_ok
     }
 
     /// The bucket can serve as the **data** store (block I/O).
@@ -139,7 +134,6 @@ pub(crate) fn run_compat_on_bucket(
 
     rt.block_on(run_connectivity(&op, &prefix, &mut cases));
     rt.block_on(run_data_tests(&op, &prefix, &mut cases));
-    rt.block_on(run_metadata_tests(&op, &prefix, &mut cases));
 
     // Clean up temp objects regardless of result.
     rt.block_on(async {
@@ -160,7 +154,6 @@ fn compat_result_from_cases(cases: Vec<TestCase>) -> CompatResult {
     CompatResult {
         connectivity_ok: all_pass("connectivity"),
         data_ok: all_pass("data"),
-        meta_ok: all_pass("metadata"),
         cases,
     }
 }
@@ -354,192 +347,6 @@ async fn run_data_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
     }
 }
 
-// ── Metadata suite ────────────────────────────────────────────────────────────
-
-async fn run_metadata_tests(op: &Operator, prefix: &str, out: &mut Vec<TestCase>) {
-    println!("  ── Metadata (conditional writes / CAS) ──────────────────────────────────");
-
-    let manifest_key = format!("{prefix}/meta/manifest.json");
-    let counter_key = format!("{prefix}/meta/counter");
-
-    // --- Test 1: basic PUT of a metadata object ---
-    {
-        let k = manifest_key.clone();
-        let op2 = op.clone();
-        timed_test(
-            out,
-            Category::Metadata,
-            "PUT metadata object",
-            Some("basic write — manifest, counter, etc."),
-            async move {
-                let payload = Bytes::from(b"{\"version\":1,\"seq\":0}\n".to_vec());
-                op2.write(&k, payload)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| anyhow!("{e}"))
-            },
-        )
-        .await;
-    }
-
-    // --- Test 2: GET + ETag availability ---
-    let etag_for_cas: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    {
-        let k = manifest_key.clone();
-        let op2 = op.clone();
-        let etag_store = etag_for_cas.clone();
-        timed_test(
-            out,
-            Category::Metadata,
-            "GET + ETag (backend returns ETag)",
-            Some("required for CAS/conditional writes"),
-            async move {
-                let meta = op2.stat(&k).await.map_err(|e| anyhow!("{e}"))?;
-                match meta.etag() {
-                    Some(etag) if !etag.is_empty() => {
-                        *etag_store.lock().await = Some(etag.to_string());
-                        Ok(())
-                    }
-                    Some(_) | None => Err(anyhow!(
-                        "ETag not returned — backend does not support ETags."
-                    )),
-                }
-            },
-        )
-        .await;
-    }
-
-    // --- Test 3: conditional PUT with correct If-Match (CAS update) ---
-    let etag_after_cas: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    {
-        let k = manifest_key.clone();
-        let op2 = op.clone();
-        let etag_in = etag_for_cas.clone();
-        let etag_out = etag_after_cas.clone();
-        timed_test(
-            out,
-            Category::Metadata,
-            "conditional PUT If-Match: <correct-etag> (CAS update)",
-            Some("conditional metadata update safety check"),
-            async move {
-                let etag = {
-                    let g = etag_in.lock().await;
-                    g.clone()
-                };
-                let etag = etag.ok_or_else(|| {
-                    anyhow!("skipped — preceding ETag test failed; cannot test CAS update")
-                })?;
-
-                let opts = WriteOptions {
-                    if_match: Some(etag),
-                    ..WriteOptions::default()
-                };
-
-                let new_payload = Bytes::from(b"{\"version\":1,\"seq\":1}\n".to_vec());
-                op2.write_options(&k, new_payload, opts)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| anyhow!("conditional PUT failed: {e}"))?;
-
-                // Record new ETag for the next test
-                let new_meta = op2.stat(&k).await.map_err(|e| anyhow!("{e}"))?;
-                *etag_out.lock().await = new_meta.etag().map(|s| s.to_string());
-
-                Ok(())
-            },
-        )
-        .await;
-    }
-
-    // --- Test 4: conditional PUT with WRONG If-Match must be REJECTED ---
-    {
-        let k = manifest_key.clone();
-        let op2 = op.clone();
-        timed_test(
-            out,
-            Category::Metadata,
-            "conditional PUT If-Match: <wrong-etag> → must reject (412)",
-            Some("prevents lost-update races; must return 412 PreconditionFailed"),
-            async move {
-                let opts = WriteOptions {
-                    if_match: Some("wrong-etag-aabbccdd".to_string()),
-                    ..WriteOptions::default()
-                };
-
-                let payload = Bytes::from(b"{\"version\":1,\"seq\":99}\n".to_vec());
-                match op2.write_options(&k, payload, opts).await {
-                    Err(e) if is_condition_error(&e) => Ok(()), // correct rejection
-                    Err(e) => Err(anyhow!(
-                        "unexpected error (expected 412 ConditionNotMatch): {e}"
-                    )),
-                    Ok(_) => Err(anyhow!(
-                        "backend ACCEPTED a write with an invalid ETag — \
-                         conditional writes are NOT enforced. \
-                         The metadata engine cannot safely share state across clients."
-                    )),
-                }
-            },
-        )
-        .await;
-    }
-
-    // --- Test 5: If-None-Match: * on non-existent key must SUCCEED (first-writer-wins) ---
-    {
-        let k = counter_key.clone();
-        let op2 = op.clone();
-        timed_test(
-            out,
-            Category::Metadata,
-            "conditional PUT If-None-Match: * on new key → must succeed",
-            Some("used when writing the inode/block counter for the first time"),
-            async move {
-                let opts = WriteOptions {
-                    if_not_exists: true,
-                    ..WriteOptions::default()
-                };
-
-                let payload = Bytes::from(b"1000\n".to_vec());
-                op2.write_options(&k, payload, opts)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| anyhow!("write_options if_not_exists on new key failed: {e}"))
-            },
-        )
-        .await;
-    }
-
-    // --- Test 6: If-None-Match: * on EXISTING key must be REJECTED ---
-    {
-        let k = counter_key.clone();
-        let op2 = op.clone();
-        timed_test(
-            out,
-            Category::Metadata,
-            "conditional PUT If-None-Match: * on existing key → must reject (412)",
-            Some("first-writer-wins gate; must prevent double-initialisation"),
-            async move {
-                let opts = WriteOptions {
-                    if_not_exists: true,
-                    ..WriteOptions::default()
-                };
-
-                let payload = Bytes::from(b"9999\n".to_vec());
-                match op2.write_options(&k, payload, opts).await {
-                    Err(e) if is_condition_error(&e) => Ok(()), // correct rejection
-                    Err(e) => Err(anyhow!("unexpected error (expected 412): {e}")),
-                    Ok(_) => Err(anyhow!(
-                        "backend ACCEPTED if_not_exists on an existing key — \
-                         the first-writer-wins guarantee is broken."
-                    )),
-                }
-            },
-        )
-        .await;
-    }
-}
-
 // ── Report ────────────────────────────────────────────────────────────────────
 
 fn print_report(cases: &[TestCase]) {
@@ -590,8 +397,6 @@ fn print_report(cases: &[TestCase]) {
         .map(|(p, t)| p == t)
         .unwrap_or(false);
     let data_ok = by_cat.get("data").map(|(p, t)| p == t).unwrap_or(false);
-    let meta_ok = by_cat.get("metadata").map(|(p, t)| p == t).unwrap_or(false);
-
     println!();
     println!("  ── Verdict ───────────────────────────────────────────────────────────────");
     println!(
@@ -606,28 +411,13 @@ fn print_report(cases: &[TestCase]) {
             "NOT suitable for file data — check failures above"
         )
     );
-    println!(
-        "  Metadata (CAS)     : {}",
-        verdict_str(
-            meta_ok,
-            "suitable for metadata",
-            "NOT suitable for metadata — conditional writes broken or unsupported"
-        )
-    );
     println!();
 
-    let overall = connectivity_ok && data_ok && meta_ok;
+    let overall = connectivity_ok && data_ok;
     if overall {
         println!("  OVERALL VERDICT: ✓  This backend is suitable for StudioFS.");
     } else {
         println!("  OVERALL VERDICT: ✗  This backend is NOT fully compatible with StudioFS.");
-        if !meta_ok {
-            println!();
-            println!("  IMPORTANT: Metadata writes rely on conditional");
-            println!("  updates (If-Match / If-None-Match) for safe concurrent access. If your");
-            println!("  backend does not support them, consider using a separate metadata");
-            println!("  backend that does (e.g. MinIO ≥ RELEASE.2024-*, RustFS, AWS S3).");
-        }
     }
     println!();
 }
@@ -688,18 +478,6 @@ fn sha256(data: &Bytes) -> String {
 
 fn is_not_found(e: &opendal::Error) -> bool {
     e.kind() == opendal::ErrorKind::NotFound
-}
-
-fn is_condition_error(e: &opendal::Error) -> bool {
-    let s = e.to_string();
-    s.contains("ConditionNotMatch")
-        || s.contains("412")
-        || s.contains("PreconditionFailed")
-        || s.contains("condition")
-        || s.contains("Condition")
-        || s.contains("If-Match")
-        || s.contains("if_not_exists")
-        || e.kind() == opendal::ErrorKind::ConditionNotMatch
 }
 
 fn build_op(
