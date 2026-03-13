@@ -151,10 +151,9 @@ pub fn mount_and_serve(
     // macOS-specific options:
     //  volname – display name in Finder
     //
-    // Do not use `noappledouble` or `noapplexattr`: macOS copy flows rely on
-    // AppleDouble/xattr fallback semantics for Finder metadata and resource
-    // forks. We return `ENOTSUP` for `com.apple.*` xattrs so macFUSE can handle
-    // those through AppleDouble while keeping non-Apple xattrs in StudioFS.
+    // Do not use `noappledouble` or `noapplexattr`: StudioFS accepts native
+    // macOS xattrs (including resource forks) via FUSE xattr callbacks, and
+    // these options would interfere with expected metadata behavior.
     // Watch for Ctrl+C / SIGTERM and trigger a clean unmount.
     spawn_signal_watcher(mount_point);
 

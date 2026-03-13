@@ -10,6 +10,7 @@ use fuser::{
     ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
     Request,
 };
+use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 use studiofs_meta::FileType;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};
@@ -24,11 +25,6 @@ fn os_str_bytes(name: &OsStr) -> &[u8] {
 
 fn debug_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
-}
-
-#[cfg(target_os = "macos")]
-fn is_kernel_managed_macos_xattr(key: &[u8]) -> bool {
-    key.starts_with(b"com.apple.")
 }
 
 #[cfg(target_os = "macos")]
@@ -47,12 +43,14 @@ fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> 
 
 #[cfg(target_os = "macos")]
 fn normalize_macos_xattr_flags(flags: i32) -> u32 {
+    const MACOS_XATTR_CREATE: i32 = 0x0002;
+    const MACOS_XATTR_REPLACE: i32 = 0x0004;
     let mut normalized = 0;
-    if flags & 0x0002 != 0 {
-        normalized |= 1; // XATTR_CREATE -> VFS create-if-missing flag
+    if flags & MACOS_XATTR_CREATE != 0 {
+        normalized |= XATTR_CREATE_FLAG;
     }
-    if flags & 0x0004 != 0 {
-        normalized |= 2; // XATTR_REPLACE -> VFS replace-only flag
+    if flags & MACOS_XATTR_REPLACE != 0 {
+        normalized |= XATTR_REPLACE_FLAG;
     }
     normalized
 }
@@ -834,11 +832,6 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyXattr,
     ) {
         let key = name.as_encoded_bytes();
-        #[cfg(target_os = "macos")]
-        if is_kernel_managed_macos_xattr(key) {
-            reply.error(libc::ENOTSUP);
-            return;
-        }
 
         match self.vfs.get_xattr(ino, key) {
             Ok(Some(val)) => {
@@ -880,11 +873,6 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEmpty,
     ) {
         let key = name.as_encoded_bytes();
-        #[cfg(target_os = "macos")]
-        if is_kernel_managed_macos_xattr(key) {
-            reply.error(libc::ENOTSUP);
-            return;
-        }
 
         #[cfg(target_os = "macos")]
         let normalized_flags = normalize_macos_xattr_flags(flags);
@@ -937,11 +925,6 @@ impl Filesystem for StudioFuseFs {
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         let key = name.as_encoded_bytes();
-        #[cfg(target_os = "macos")]
-        if is_kernel_managed_macos_xattr(key) {
-            reply.error(libc::ENOTSUP);
-            return;
-        }
 
         match self.vfs.remove_xattr(ino, key) {
             Ok(()) => reply.ok(),
@@ -960,12 +943,6 @@ impl Filesystem for StudioFuseFs {
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
         match self.vfs.list_xattrs(ino) {
             Ok(names) => {
-                #[cfg(target_os = "macos")]
-                let names: Vec<Vec<u8>> = names
-                    .into_iter()
-                    .filter(|name| !is_kernel_managed_macos_xattr(name))
-                    .collect();
-
                 // xattr list format: null-terminated name strings concatenated
                 let data: Vec<u8> = names
                     .iter()
@@ -1119,7 +1096,7 @@ mod tests {
     };
 
     #[cfg(target_os = "macos")]
-    use super::{is_kernel_managed_macos_xattr, merge_xattr_write};
+    use super::{merge_xattr_write, normalize_macos_xattr_flags};
     use studiofs_meta::MetaError;
     use studiofs_vfs::{OpenFlags, VfsError};
 
@@ -1184,14 +1161,6 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn kernel_managed_macos_xattr_matches_com_apple_prefix() {
-        assert!(is_kernel_managed_macos_xattr(b"com.apple.FinderInfo"));
-        assert!(is_kernel_managed_macos_xattr(b"com.apple.quarantine"));
-        assert!(!is_kernel_managed_macos_xattr(b"user.color"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
     fn merge_xattr_write_overwrites_from_offset() {
         let merged = merge_xattr_write(Some(b"abcdef".to_vec()), 2, b"ZZ");
         assert_eq!(merged, b"abZZef");
@@ -1202,5 +1171,20 @@ mod tests {
     fn merge_xattr_write_zero_fills_gap() {
         let merged = merge_xattr_write(None, 3, b"xy");
         assert_eq!(merged, vec![0, 0, 0, b'x', b'y']);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normalize_macos_xattr_flags_maps_create_and_replace_bits() {
+        // macOS passes XATTR_CREATE=0x0002 and XATTR_REPLACE=0x0004.
+        // StudioVfs expects CREATE=1 and REPLACE=2.
+        assert_eq!(normalize_macos_xattr_flags(0), 0);
+        assert_eq!(normalize_macos_xattr_flags(0x0002), XATTR_CREATE_FLAG);
+        assert_eq!(normalize_macos_xattr_flags(0x0004), XATTR_REPLACE_FLAG);
+        assert_eq!(
+            normalize_macos_xattr_flags(0x0002 | 0x0004),
+            XATTR_CREATE_FLAG | XATTR_REPLACE_FLAG
+        );
+        assert_eq!(normalize_macos_xattr_flags(0x0010), 0);
     }
 }
