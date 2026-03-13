@@ -65,7 +65,9 @@ pub enum MetaError {
     #[error("unsupported format version: found {found}, expected {expected}")]
     UnsupportedFormatVersion { found: u16, expected: u16 },
 
-    #[error("access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}")]
+    #[error(
+        "access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}"
+    )]
     AccessDenied {
         ino: Ino,
         principal: String,
@@ -437,4 +439,23 @@ pub trait MetaEngine: Send + Sync {
         uid: u32,
         gid: u32,
     ) -> MetaResult<InodeAttr>;
+
+    // ─── Snapshots ────────────────────────────────────────────────────────
+
+    /// Create an immutable snapshot rooted at `root_ino`.
+    fn create_snapshot(&self, _root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        Err(MetaError::Storage(
+            "create_snapshot not implemented".to_string(),
+        ))
+    }
+
+    /// List known snapshots.
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        Ok(Vec::new())
+    }
+
+    /// Look up snapshot by id.
+    fn get_snapshot(&self, _snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        Ok(None)
+    }
 }

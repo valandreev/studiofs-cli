@@ -10,4 +10,4 @@ Current plans for project development:
 - Warmup/pin files and directories in local cache
 - Automatic metadata backup
 - Cross-platform links for files and directories
-- Snapshots
+- Snapshot UX improvements (diff/browse tooling, retention policies)

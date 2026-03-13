@@ -101,6 +101,7 @@ fn winfsp_mount_unmount_smoke() {
             &mount_point,
             "StudioFS-Test",
             true,
+            false,
             Some(&event_for_thread),
         )
         .map_err(|e| e.to_string())

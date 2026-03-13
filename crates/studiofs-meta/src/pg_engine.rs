@@ -516,6 +516,11 @@ impl PgMetaEngine {
                 | MetaEvent::SetFileBlocksBatch { .. }
                 | MetaEvent::CommitFileBlock { .. } => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+                MetaEvent::CreateSnapshot { snapshot } => {
+                    let mut synced = snapshot.clone();
+                    synced.state = SnapshotState::Synced;
+                    out.push(MetaEvent::CreateSnapshot { snapshot: synced });
+                }
                 MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                     let mut remote_attr = attr.clone();
                     remote_attr.size = remote_attr.committed_size;
@@ -576,7 +581,9 @@ impl PgMetaEngine {
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. } => false,
+            | MetaEvent::RemovePendingDeletion { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => false,
         };
         Ok(conflict)
     }
@@ -594,7 +601,9 @@ impl PgMetaEngine {
             | MetaEvent::SetAclRule { .. }
             | MetaEvent::RemoveAclRule { .. }
             | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. } => true,
+            | MetaEvent::RemovePendingDeletion { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => true,
             MetaEvent::SetAttr { .. }
             | MetaEvent::SetFileBlock { .. }
             | MetaEvent::SetFileBlocksBatch { .. }
@@ -713,7 +722,10 @@ impl PgMetaEngine {
                     overlay.attr_inodes.insert(*ino);
                     overlay.acl_keys.insert(Self::acl_key(*ino, principal));
                 }
-                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+                MetaEvent::AddPendingDeletion { .. }
+                | MetaEvent::RemovePendingDeletion { .. }
+                | MetaEvent::CreateSnapshot { .. }
+                | MetaEvent::UpdateSnapshotState { .. } => {}
             }
         }
         overlay
@@ -797,7 +809,9 @@ impl PgMetaEngine {
             | MetaEvent::CommitFileBlock { .. }
             | MetaEvent::PublishFileManifest { .. }
             | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. } => false,
+            | MetaEvent::RemovePendingDeletion { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => false,
         }
     }
 
@@ -1117,6 +1131,73 @@ impl PgMetaEngine {
                                 .map_err(|e| {
                                     MetaError::Storage(format!(
                                         "postgres acl_rules delete failed: {e}"
+                                    ))
+                                })?;
+                            }
+                            MetaEvent::CreateSnapshot { snapshot } => {
+                                let pinned: Vec<i64> = snapshot
+                                    .pinned_object_ids
+                                    .iter()
+                                    .map(|id| {
+                                        i64::try_from(*id).map_err(|_| {
+                                            MetaError::Storage(format!(
+                                                "snapshot pinned object id overflow: {id}"
+                                            ))
+                                        })
+                                    })
+                                    .collect::<MetaResult<Vec<_>>>()?;
+                                tx.execute(
+                                    r#"
+                                    INSERT INTO snapshots (
+                                        vol,
+                                        id,
+                                        root_ino,
+                                        created_at,
+                                        state,
+                                        pinned_object_ids,
+                                        snapshot_payload,
+                                        updated_at
+                                    )
+                                    VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                                    ON CONFLICT (vol, id) DO UPDATE
+                                    SET root_ino = EXCLUDED.root_ino,
+                                        created_at = EXCLUDED.created_at,
+                                        state = EXCLUDED.state,
+                                        pinned_object_ids = EXCLUDED.pinned_object_ids,
+                                        snapshot_payload = EXCLUDED.snapshot_payload,
+                                        updated_at = now()
+                                    "#,
+                                    &[
+                                        &volume_id,
+                                        &snapshot.id,
+                                        &(snapshot.root_ino as i64),
+                                        &snapshot.created_at,
+                                        &(snapshot.state as i16),
+                                        &pinned,
+                                        &snapshot.snapshot_payload,
+                                    ],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    MetaError::Storage(format!(
+                                        "postgres snapshots upsert failed: {e}"
+                                    ))
+                                })?;
+                            }
+                            MetaEvent::UpdateSnapshotState { id, state } => {
+                                tx.execute(
+                                    r#"
+                                    UPDATE snapshots
+                                    SET state = $3,
+                                        updated_at = now()
+                                    WHERE vol = $1 AND id = $2
+                                    "#,
+                                    &[&volume_id, id, &(*state as i16)],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    MetaError::Storage(format!(
+                                        "postgres snapshots state update failed: {e}"
                                     ))
                                 })?;
                             }
@@ -1749,6 +1830,20 @@ impl MetaEngine for PgMetaEngine {
         self.local.get_acl_rule(ino, principal)
     }
 
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        self.mutate(|local| local.create_snapshot(root_ino))
+    }
+
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        let _ = self.sync_metadata();
+        self.local.list_snapshots()
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        let _ = self.sync_metadata();
+        self.local.get_snapshot(snapshot_id)
+    }
+
     fn create_symlink(
         &self,
         parent: Ino,
@@ -2010,6 +2105,17 @@ mod tests {
                     access_level SMALLINT NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (vol, ino, principal)
+                );
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    root_ino BIGINT NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    state SMALLINT NOT NULL,
+                    pinned_object_ids BIGINT[] NOT NULL DEFAULT '{}',
+                    snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (vol, id)
                 );
                 ALTER TABLE event_log
                     ADD COLUMN IF NOT EXISTS batch_version BIGINT;
@@ -4661,5 +4767,67 @@ mod tests {
 
         let avg = delays.iter().sum::<u64>() / delays.len() as u64;
         assert!(avg < 5000, "avg visibility delay should stay bounded");
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_snapshot_eventually_visible_and_mountable_on_peer() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-snapshot-visibility");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let file = a
+            .create_file(ROOT_INO, b"snap-peer.txt", 0, 0, 0o644)
+            .expect("create file on a");
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(44_001, 64))
+            .expect("set block");
+
+        let created = a.create_snapshot(ROOT_INO).expect("create snapshot");
+        a.flush_metadata().expect("flush snapshot");
+
+        let visible = wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            b.get_snapshot(&created.id)
+                .ok()
+                .flatten()
+                .map(|s| s.state == SnapshotState::Synced)
+                .unwrap_or(false)
+        });
+        assert!(visible, "snapshot should become visible on peer");
+
+        let peer_snapshot = b
+            .get_snapshot(&created.id)
+            .expect("snapshot query")
+            .expect("snapshot exists on peer");
+        assert!(peer_snapshot.pinned_object_ids.contains(&44_001));
+        assert!(!peer_snapshot.snapshot_payload.is_empty());
+
+        let mount_dir = tempdir().expect("mount tempdir");
+        let mount_db = mount_dir.path().join("snapshot-mount.redb");
+        let mount_engine = RedbMetaEngine::open(&mount_db).expect("open mount redb");
+        let mut mount_info = info.clone();
+        mount_info.metadata.backend = MetadataBackend::RedbLocal;
+        mount_info.metadata.postgres = None;
+        mount_engine
+            .set_format_info(&mount_info)
+            .expect("set mount format");
+        let snap_state: RedbSnapshot =
+            serde_json::from_slice(&peer_snapshot.snapshot_payload).expect("decode payload");
+        mount_engine
+            .import_snapshot(&snap_state)
+            .expect("import payload");
+        assert!(mount_engine.lookup(ROOT_INO, b"snap-peer.txt").is_ok());
     }
 }

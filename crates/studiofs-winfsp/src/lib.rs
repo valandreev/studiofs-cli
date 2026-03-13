@@ -73,6 +73,7 @@ pub fn mount_and_serve(
     mount_point: &str,
     volume_label: &str,
     _foreground: bool,
+    read_only: bool,
     shutdown_event_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use studiofs_meta::Ino;
@@ -86,7 +87,7 @@ pub fn mount_and_serve(
     volume_params.persistent_acls(true);
     volume_params.reparse_points(true);
     volume_params.named_streams(false);
-    volume_params.read_only_volume(false);
+    volume_params.read_only_volume(read_only);
     volume_params.post_cleanup_when_modified_only(true);
     // Allow kernel-mode opens — required for shell extensions (7-zip, etc.)
     volume_params.allow_open_in_kernel_mode(true);
