@@ -122,10 +122,19 @@ flush/pull replication flow as other metadata events.
 - `event_log`
 - `metadata_state`
 - `acl_rules`
+- `snapshots`
 
 `event_log` is the runtime delta stream. `metadata_state` stores:
 - the monotonic `version`
 - the latest remote-visible checkpoint snapshot
+
+`snapshots` stores immutable historical views:
+- `id` (UUID)
+- `root_ino`
+- `created_at`
+- `state` (`pending`, `synced`, `failed`)
+- pinned object ids
+- serialized snapshot payload used for read-only snapshot mounts
 
 ## Consistency
 
@@ -200,6 +209,8 @@ The shared PostgreSQL schema uses:
   - append-only remote-visible metadata deltas
 - `metadata_state`
   - per-volume checkpoint snapshot plus monotonic `version`
+- `snapshots`
+  - immutable historical views (definition + pinned object ids + payload)
 
 Important cursor rule:
 - runtime pull follows `batch_version`, not `seq_id`

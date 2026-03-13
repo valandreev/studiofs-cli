@@ -1,4 +1,4 @@
-use crate::types::{BlockRef, DirEntryValue, InodeAttr};
+use crate::types::{BlockRef, DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
 use serde::{Deserialize, Serialize};
 
 /// Represents a single mutation to the metadata state.
@@ -100,6 +100,13 @@ pub enum MetaEvent {
 
     /// Remove an object from pending deletions (GC complete).
     RemovePendingDeletion { object_id: u64 },
+
+    // ─── Snapshots ───────────────────────────────────────────────────────────
+    /// Create or update snapshot definition.
+    CreateSnapshot { snapshot: MetadataSnapshot },
+
+    /// Update snapshot replication state.
+    UpdateSnapshotState { id: String, state: SnapshotState },
 }
 
 impl MetaEvent {
@@ -123,6 +130,8 @@ impl MetaEvent {
             Self::RemoveAclRule { .. } => "remove_acl_rule",
             Self::AddPendingDeletion { .. } => "add_pending_deletion",
             Self::RemovePendingDeletion { .. } => "remove_pending_deletion",
+            Self::CreateSnapshot { .. } => "create_snapshot",
+            Self::UpdateSnapshotState { .. } => "update_snapshot_state",
         }
     }
 
@@ -155,6 +164,8 @@ impl MetaEvent {
             Self::RemoveAclRule { ino, .. } => Some(*ino),
             Self::AddPendingDeletion { .. } => None,
             Self::RemovePendingDeletion { .. } => None,
+            Self::CreateSnapshot { snapshot } => Some(snapshot.root_ino),
+            Self::UpdateSnapshotState { .. } => None,
         }
     }
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use opendal::services::S3;
 use opendal::{EntryMode, Operator};
 use studiofs_data::object::parse_object_id_from_key;
-use studiofs_meta::types::BlockRef;
+use studiofs_meta::types::{BlockRef, MetadataSnapshot};
 use studiofs_meta::{MetaEngine, RedbMetaEngine};
 
 #[derive(Debug, Default)]
@@ -40,6 +40,11 @@ fn collect_referenced_objects(snapshot: &studiofs_meta::redb_engine::RedbSnapsho
     for (_k, v) in &snapshot.file_blocks {
         if let Ok(br) = postcard::from_bytes::<BlockRef>(v) {
             refs.insert(br.object_id);
+        }
+    }
+    for (_id, raw) in &snapshot.snapshots {
+        if let Ok(meta_snapshot) = postcard::from_bytes::<MetadataSnapshot>(raw) {
+            refs.extend(meta_snapshot.pinned_object_ids);
         }
     }
     refs

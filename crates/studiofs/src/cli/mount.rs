@@ -3,7 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
-use studiofs_meta::open_meta_engine;
+use studiofs_meta::redb_engine::RedbSnapshot;
+use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::StudioVfs;
 use tracing::info;
 
@@ -36,6 +37,7 @@ pub fn run(
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
+    snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
     if detach {
@@ -71,10 +73,37 @@ pub fn run(
 
     let db_path = meta_dir.join(format!("{name}.db"));
     info!("opening volume {name:?} from {db_path:?}");
+    let live_meta = open_meta_engine(&db_path)?;
+    let mut format_info = live_meta.get_format_info()?;
+    let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
+        let snapshot = live_meta
+            .get_snapshot(snapshot_id)?
+            .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
+        if snapshot.snapshot_payload.is_empty() {
+            anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
+        }
+        let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot.snapshot_payload)
+            .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
 
-    // Open metadata engine configured for this volume.
-    let meta = open_meta_engine(&db_path)?;
-    let format_info = meta.get_format_info()?;
+        let snapshot_dir = meta_dir.join("snapshots");
+        std::fs::create_dir_all(&snapshot_dir)?;
+        let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
+        if snapshot_db_path.exists() {
+            let _ = std::fs::remove_file(&snapshot_db_path);
+        }
+        let snapshot_engine = RedbMetaEngine::open(&snapshot_db_path)?;
+        format_info.metadata.backend = MetadataBackend::RedbLocal;
+        format_info.metadata.postgres = None;
+        snapshot_engine.set_format_info(&format_info)?;
+        snapshot_engine.import_snapshot(&snapshot_state)?;
+
+        (
+            Arc::new(snapshot_engine) as Arc<dyn studiofs_meta::MetaEngine>,
+            true,
+        )
+    } else {
+        (live_meta, false)
+    };
 
     info!(
         "volume: {} ({}), endpoint: {}, bucket: {}",
@@ -120,6 +149,9 @@ pub fn run(
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
     println!("  Invalidation: PostgreSQL sync");
+    if let Some(snapshot_id) = snapshot_id {
+        println!("  Snapshot:     {} (read-only)", snapshot_id);
+    }
 
     // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
 
@@ -138,6 +170,7 @@ pub fn run(
             mount_point,
             &format_info.name,
             run_in_foreground,
+            read_only_mount,
             Some(&event_name),
         )
         .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
@@ -149,8 +182,15 @@ pub fn run(
     #[cfg(unix)]
     {
         info!("starting FUSE mount at {mount_point}");
-        studiofs_fuse::mount_and_serve(vfs, rt, mount_point, &format_info.name, run_in_foreground)
-            .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
+        studiofs_fuse::mount_and_serve(
+            vfs,
+            rt,
+            mount_point,
+            &format_info.name,
+            run_in_foreground,
+            read_only_mount,
+        )
+        .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
         // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
         // PID file is cleaned up by the umount command or overwritten on next mount.
     }

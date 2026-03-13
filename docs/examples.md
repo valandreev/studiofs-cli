@@ -72,3 +72,23 @@ Run actual cleanup (delete up to 500 old objects):
 ```bash
 studiofs janitor myvolume --max-deletes 500
 ```
+
+## 6. Create and List Snapshots
+
+Create an instant local snapshot (root inode by default):
+
+```bash
+studiofs snapshot myvolume create
+```
+
+List snapshots:
+
+```bash
+studiofs snapshot myvolume list
+```
+
+## 7. Mount a Historical Snapshot as Read-Only
+
+```bash
+studiofs mount myvolume Z: --snapshot-id <snapshot-uuid>
+```

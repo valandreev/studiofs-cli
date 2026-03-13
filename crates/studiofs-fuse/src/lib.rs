@@ -40,6 +40,7 @@ fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
 fn build_mount_options(
     volume_name: &str,
     foreground: bool,
+    read_only: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     validate_volume_name(volume_name)?;
     let mut options = vec![
@@ -53,6 +54,9 @@ fn build_mount_options(
     }
     if foreground {
         options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    }
+    if read_only {
+        options.push(fuser::MountOption::RO);
     }
     Ok(options)
 }
@@ -137,6 +141,7 @@ pub fn mount_and_serve(
     mount_point: &str,
     volume_name: &str,
     foreground: bool,
+    read_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Keep a reference for shutdown() after the FUSE session ends
     // (vfs is moved into StudioFuseFs below).
@@ -147,7 +152,7 @@ pub fn mount_and_serve(
     // root inode stored with uid=0/gid=0 (historic default), so the kernel
     // would see the mounting user as "other" (r-x only) and block writes.
     // Instead we implement access() -> ok() so the FUSE daemon decides.
-    let options = build_mount_options(volume_name, foreground)?;
+    let options = build_mount_options(volume_name, foreground, read_only)?;
     // macOS-specific options:
     //  volname – display name in Finder
     //
@@ -202,7 +207,7 @@ mod tests {
 
     #[test]
     fn build_mount_options_sets_core_fuse_flags() {
-        let options = build_mount_options("studiofs", false).expect("options");
+        let options = build_mount_options("studiofs", false, false).expect("options");
         assert!(
             options
                 .iter()
@@ -225,7 +230,7 @@ mod tests {
 
     #[test]
     fn build_mount_options_includes_foreground_when_requested() {
-        let options = build_mount_options("studiofs", true).expect("options");
+        let options = build_mount_options("studiofs", true, false).expect("options");
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
@@ -234,7 +239,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn build_mount_options_sets_macos_volume_name() {
-        let options = build_mount_options("studiofs-mac", false).expect("options");
+        let options = build_mount_options("studiofs-mac", false, false).expect("options");
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "volname=studiofs-mac")
         ));

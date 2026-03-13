@@ -53,6 +53,7 @@ studiofs mount <name> <mount-point> \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
   [--principal <name>] \
+  [--snapshot-id <uuid>] \
   [--foreground] \
   [--detach | -d]
 ```
@@ -64,6 +65,7 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
+- `--snapshot-id` mounts the selected snapshot as a read-only historical view.
 
 ### `umount`
 
@@ -123,7 +125,21 @@ Alias:
 
 What it does:
 - restores/updates target volume record in `volumes` (matched by UUID from dump),
-- replaces target volume rows in `metadata_state`, `counters`, `event_log`.
+- replaces target volume rows in `metadata_state`, `counters`, `event_log`, `snapshots`.
+
+### `snapshot`
+
+Create or list immutable snapshots.
+
+```bash
+studiofs snapshot <name> create [--root-ino <ino>]
+studiofs snapshot <name> list
+```
+
+Behavior:
+- `create` is immediate and local-first (state starts as `pending`).
+- background PG replication publishes snapshot metadata and pinned object ids.
+- replicated snapshots transition to `synced` and become discoverable on peers.
 
 ## Multi-Client Workflow
 

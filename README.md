@@ -52,6 +52,8 @@ Key points:
 - Append-only ingress and crash recovery for accepted local writes
 - Cross-platform mounts: WinFSP on Windows, FUSE on Linux/macOS
 - Background upload, janitor, and metadata sync workers
+- Instant local snapshots with eventual PostgreSQL replication
+- Historical snapshot mounts as read-only views
 
 ## Quick Start
 
@@ -92,6 +94,7 @@ studiofs mount myvolume Y:
 | `janitor` | Scan and clean orphaned remote objects |
 | `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
 | `load` | Import a metadata dump into PostgreSQL |
+| `snapshot` | Create/list immutable metadata snapshots |
 | `destroy` | Remove a volume locally or locally + remotely |
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.

@@ -265,6 +265,18 @@ fn init_postgres_schema_and_volume(
                 PRIMARY KEY (vol, ino, principal)
             );
 
+            CREATE TABLE IF NOT EXISTS snapshots (
+                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                id TEXT NOT NULL,
+                root_ino BIGINT NOT NULL,
+                created_at BIGINT NOT NULL,
+                state SMALLINT NOT NULL,
+                pinned_object_ids BIGINT[] NOT NULL DEFAULT '{}',
+                snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (vol, id)
+            );
+
             ALTER TABLE event_log
                 ADD COLUMN IF NOT EXISTS batch_version BIGINT;
             UPDATE event_log

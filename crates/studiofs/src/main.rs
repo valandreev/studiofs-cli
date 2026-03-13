@@ -344,6 +344,10 @@ ACL PRINCIPAL:
         /// Use `studiofs umount <mount_point>` to stop.
         #[arg(short = 'd', long, conflicts_with = "foreground")]
         detach: bool,
+
+        /// Mount a historical snapshot id as read-only.
+        #[arg(long)]
+        snapshot_id: Option<String>,
     },
 
     /// Unmount a previously mounted filesystem volume
@@ -438,6 +442,26 @@ WARNING: This action is irreversible.")]
         #[arg(long = "postgresql-adress", alias = "postgresql-address")]
         postgresql_adress: String,
     },
+
+    /// Create or list immutable metadata snapshots
+    Snapshot {
+        /// Volume name
+        name: String,
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotAction {
+    /// Create a new snapshot
+    Create {
+        /// Optional custom root inode (default: root inode)
+        #[arg(long)]
+        root_ino: Option<u64>,
+    },
+    /// List known snapshots
+    List,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -503,6 +527,7 @@ fn main() -> anyhow::Result<()> {
             principal,
             foreground,
             detach,
+            snapshot_id,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::mount::run(
@@ -515,6 +540,7 @@ fn main() -> anyhow::Result<()> {
                 principal.as_deref(),
                 foreground,
                 detach,
+                snapshot_id.as_deref(),
             )?;
         }
         Commands::Umount { mount_point } => {
@@ -556,6 +582,15 @@ fn main() -> anyhow::Result<()> {
             postgresql_adress,
         } => {
             cli::dump_load::load(&path_to_dump, &postgresql_adress)?;
+        }
+        Commands::Snapshot { name, action } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            match action {
+                SnapshotAction::Create { root_ino } => {
+                    cli::snapshot::create(&name, &meta_dir, root_ino)?
+                }
+                SnapshotAction::List => cli::snapshot::list(&name, &meta_dir)?,
+            }
         }
     }
 

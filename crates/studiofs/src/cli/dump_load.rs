@@ -29,6 +29,16 @@ struct DumpEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct DumpSnapshot {
+    id: String,
+    root_ino: i64,
+    created_at: i64,
+    state: i16,
+    pinned_object_ids: Vec<i64>,
+    snapshot_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetadataDump {
     dump_version: u16,
     volume: DumpVolume,
@@ -36,6 +46,8 @@ struct MetadataDump {
     metadata_state_snapshot: Vec<u8>,
     counters: Vec<DumpCounter>,
     event_log: Vec<DumpEvent>,
+    #[serde(default)]
+    snapshots: Vec<DumpSnapshot>,
 }
 
 async fn ensure_pg_schema(client: &tokio_postgres::Client) -> anyhow::Result<()> {
@@ -82,6 +94,18 @@ async fn ensure_pg_schema(client: &tokio_postgres::Client) -> anyhow::Result<()>
                     access_level SMALLINT NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (vol, ino, principal)
+                );
+
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    root_ino BIGINT NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    state SMALLINT NOT NULL,
+                    pinned_object_ids BIGINT[] NOT NULL DEFAULT '{}',
+                    snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (vol, id)
                 );
 
                 ALTER TABLE event_log
@@ -196,6 +220,30 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> anyhow::Result<()> {
             })
             .collect();
 
+        let snapshot_rows = client
+            .query(
+                r#"
+                SELECT id, root_ino, created_at, state, pinned_object_ids, snapshot_payload
+                FROM snapshots
+                WHERE vol = $1
+                ORDER BY created_at DESC, id ASC
+                "#,
+                &[&volume.vol],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to query snapshots: {e}"))?;
+        let snapshots = snapshot_rows
+            .into_iter()
+            .map(|r| DumpSnapshot {
+                id: r.get(0),
+                root_ino: r.get(1),
+                created_at: r.get(2),
+                state: r.get(3),
+                pinned_object_ids: r.get(4),
+                snapshot_payload: r.get(5),
+            })
+            .collect();
+
         conn_task.abort();
         Ok::<MetadataDump, anyhow::Error>(MetadataDump {
             dump_version: 1,
@@ -204,6 +252,7 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> anyhow::Result<()> {
             metadata_state_snapshot: state_snapshot,
             counters,
             event_log,
+            snapshots,
         })
     })?;
 
@@ -279,6 +328,9 @@ pub fn load(input: &Path, postgres_address: &str) -> anyhow::Result<()> {
         tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
             .await
             .map_err(|e| anyhow::anyhow!("clear metadata_state failed: {e}"))?;
+        tx.execute("DELETE FROM snapshots WHERE vol = $1", &[&target_vol])
+            .await
+            .map_err(|e| anyhow::anyhow!("clear snapshots failed: {e}"))?;
 
         tx.execute(
             "INSERT INTO metadata_state (vol, version, snapshot) VALUES ($1, $2, $3)",
@@ -317,6 +369,34 @@ pub fn load(input: &Path, postgres_address: &str) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("insert event_log row failed: {e}"))?;
+        }
+
+        for snapshot in &dump.snapshots {
+            tx.execute(
+                r#"
+                INSERT INTO snapshots (
+                    vol,
+                    id,
+                    root_ino,
+                    created_at,
+                    state,
+                    pinned_object_ids,
+                    snapshot_payload
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "#,
+                &[
+                    &target_vol,
+                    &snapshot.id,
+                    &snapshot.root_ino,
+                    &snapshot.created_at,
+                    &snapshot.state,
+                    &snapshot.pinned_object_ids,
+                    &snapshot.snapshot_payload,
+                ],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("insert snapshots row failed: {e}"))?;
         }
 
         tx.commit()

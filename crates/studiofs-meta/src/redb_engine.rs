@@ -81,6 +81,9 @@ const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
+/// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
+const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct RedbSnapshot {
@@ -95,6 +98,7 @@ pub struct RedbSnapshot {
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
     pub acl_rules: Vec<(Vec<u8>, u8)>,
     pub event_log: Vec<(u64, Vec<u8>)>,
+    pub snapshots: Vec<(String, Vec<u8>)>,
 }
 
 // ─── Key Encoding Helpers ────────────────────────────────────────────────────
@@ -217,6 +221,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(BASE_ACL_RULES_TABLE);
             let _ = txn.open_table(ACL_RULE_TOMBSTONES_TABLE);
             let _ = txn.open_table(EVENT_LOG_TABLE);
+            let _ = txn.open_table(SNAPSHOTS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -1714,6 +1719,20 @@ impl RedbMetaEngine {
                 snapshot.event_log.push((k.value(), v.value().to_vec()));
             }
         }
+        {
+            let table = txn
+                .open_table(SNAPSHOTS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .snapshots
+                    .push((k.value().to_string(), v.value().to_vec()));
+            }
+        }
 
         Ok(snapshot)
     }
@@ -1757,6 +1776,12 @@ impl RedbMetaEngine {
                 .counters
                 .push((counters::USED_SPACE.to_string(), committed_used_space));
         }
+
+        snapshot.snapshots.retain(|(_id, raw)| {
+            decode::<MetadataSnapshot>(raw)
+                .map(|snapshot| snapshot.state == SnapshotState::Synced)
+                .unwrap_or(false)
+        });
 
         Ok(snapshot)
     }
@@ -2364,6 +2389,24 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
+        {
+            let mut table = txn
+                .open_table(SNAPSHOTS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<String> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key.as_str());
+            }
+            for (k, v) in &snapshot.snapshots {
+                table
+                    .insert(k.as_str(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2565,6 +2608,32 @@ impl RedbMetaEngine {
                         .open_table(PENDING_DELETIONS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = table.remove(*object_id);
+                }
+                crate::events::MetaEvent::CreateSnapshot { snapshot } => {
+                    let mut table = txn
+                        .open_table(SNAPSHOTS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let bytes = encode(snapshot)?;
+                    table
+                        .insert(snapshot.id.as_str(), bytes.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::UpdateSnapshotState { id, state } => {
+                    let mut table = txn
+                        .open_table(SNAPSHOTS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let existing_bytes = table
+                        .get(id.as_str())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|existing| existing.value().to_vec());
+                    if let Some(existing_bytes) = existing_bytes {
+                        let mut snapshot: MetadataSnapshot = decode(existing_bytes.as_slice())?;
+                        snapshot.state = *state;
+                        let bytes = encode(&snapshot)?;
+                        table
+                            .insert(id.as_str(), bytes.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
                 }
             }
         }
@@ -2794,7 +2863,9 @@ impl RedbMetaEngine {
                 | crate::events::MetaEvent::CommitFileBlock { .. }
                 | crate::events::MetaEvent::PublishFileManifest { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
-                | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
+                | crate::events::MetaEvent::RemovePendingDeletion { .. }
+                | crate::events::MetaEvent::CreateSnapshot { .. }
+                | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
             }
         }
 
@@ -2965,7 +3036,9 @@ impl RedbMetaEngine {
                 | crate::events::MetaEvent::CommitFileBlock { .. }
                 | crate::events::MetaEvent::PublishFileManifest { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
-                | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
+                | crate::events::MetaEvent::RemovePendingDeletion { .. }
+                | crate::events::MetaEvent::CreateSnapshot { .. }
+                | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
             }
         }
 
@@ -3010,6 +3083,36 @@ impl RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    fn collect_snapshot_pinned_object_ids(&self, root_ino: Ino) -> MetaResult<Vec<u64>> {
+        let mut pinned = HashSet::new();
+        let mut stack = vec![root_ino];
+        let mut visited = HashSet::new();
+
+        while let Some(ino) = stack.pop() {
+            if !visited.insert(ino) {
+                continue;
+            }
+            let attr = self.get_attr(ino)?;
+            match attr.kind {
+                FileType::RegularFile => {
+                    for (_index, block) in self.get_file_blocks(ino)? {
+                        pinned.insert(block.object_id);
+                    }
+                }
+                FileType::Directory => {
+                    for entry in self.readdir(ino)? {
+                        stack.push(entry.ino);
+                    }
+                }
+                FileType::Symlink => {}
+            }
+        }
+
+        let mut out: Vec<u64> = pinned.into_iter().collect();
+        out.sort_unstable();
+        Ok(out)
     }
 }
 
@@ -4387,6 +4490,9 @@ impl MetaEngine for RedbMetaEngine {
         let committed = txn
             .open_table(COMMITTED_FILE_BLOCKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let snapshots = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut refs = HashSet::new();
         for item in table
             .iter()
@@ -4403,6 +4509,14 @@ impl MetaEngine for RedbMetaEngine {
             let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
             let block: BlockRef = decode(v.value())?;
             refs.insert(block.object_id);
+        }
+        for item in snapshots
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let snapshot: MetadataSnapshot = decode(v.value())?;
+            refs.extend(snapshot.pinned_object_ids);
         }
         Ok(refs)
     }
@@ -5119,6 +5233,93 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
+
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        let root_attr = self.get_attr(root_ino)?;
+        if root_attr.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(root_ino));
+        }
+
+        let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
+        let snapshot_payload = serde_json::to_vec(&self.export_snapshot()?)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+
+        let snapshot = MetadataSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            root_ino,
+            created_at: InodeAttr::now_nanos(),
+            state: SnapshotState::Pending,
+            pinned_object_ids,
+            snapshot_payload,
+        };
+
+        let bytes = encode(&snapshot)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(SNAPSHOTS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(snapshot.id.as_str(), bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::CreateSnapshot {
+                    snapshot: snapshot.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(snapshot)
+    }
+
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut snapshots = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_id, raw) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let snapshot: MetadataSnapshot = decode(raw.value())?;
+            snapshots.push(snapshot);
+        }
+        snapshots.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(snapshots)
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let Some(raw) = table
+            .get(snapshot_id)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let snapshot: MetadataSnapshot = decode(raw.value())?;
+        Ok(Some(snapshot))
+    }
 }
 
 #[cfg(test)]
@@ -5155,6 +5356,37 @@ mod tests {
         let loaded = engine.get_format_info().unwrap();
         assert_eq!(loaded.name, "test-vol");
         assert_eq!(loaded.endpoint, "http://localhost:9000");
+    }
+
+    #[test]
+    fn test_snapshot_pins_objects_and_is_listed() {
+        let engine = temp_engine();
+        let file = engine
+            .create_file(ROOT_INO, b"snap.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let block = BlockRef::new_partial(9_001, 128);
+        engine.set_file_block(file.ino, 0, &block).unwrap();
+
+        let snapshot = engine.create_snapshot(ROOT_INO).unwrap();
+        assert_eq!(snapshot.root_ino, ROOT_INO);
+        assert_eq!(snapshot.state, SnapshotState::Pending);
+        assert!(snapshot.pinned_object_ids.contains(&9_001));
+        assert!(!snapshot.snapshot_payload.is_empty());
+
+        let listed = engine.list_snapshots().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, snapshot.id);
+        assert_eq!(
+            engine.get_snapshot(&snapshot.id).unwrap().unwrap().id,
+            snapshot.id
+        );
+
+        engine.unlink(ROOT_INO, b"snap.txt").unwrap();
+        let refs = engine.get_referenced_object_ids().unwrap();
+        assert!(
+            refs.contains(&9_001),
+            "snapshot pins should keep object ids referenced"
+        );
     }
 
     #[test]
