@@ -1,9 +1,129 @@
 //! StudioFS CLI — FUSE mount tool for S3-backed virtual filesystems.
 
+use chrono::{Duration, Local, NaiveDate};
 use clap::{Parser, Subcommand};
+use std::fs::{self, File};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::writer::MakeWriter;
 
 mod cli;
+
+const DAEMON_LOG_RETENTION_DAYS: i64 = 30;
+
+#[derive(Clone)]
+struct DaemonDailyLogWriter {
+    state: Arc<Mutex<DaemonDailyLogState>>,
+}
+
+struct DaemonDailyLogState {
+    logs_dir: PathBuf,
+    stem: String,
+    current_date: NaiveDate,
+    file: File,
+}
+
+impl DaemonDailyLogWriter {
+    fn new(logs_dir: PathBuf, stem: String) -> anyhow::Result<Self> {
+        fs::create_dir_all(&logs_dir)?;
+        let current_date = Local::now().date_naive();
+        prune_old_daemon_logs(&logs_dir, &stem, current_date)?;
+        let file = open_daemon_log_file(&logs_dir, &stem, current_date)?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(DaemonDailyLogState {
+                logs_dir,
+                stem,
+                current_date,
+                file,
+            })),
+        })
+    }
+}
+
+struct DaemonLogGuardWriter {
+    state: Arc<Mutex<DaemonDailyLogState>>,
+}
+
+impl std::io::Write for DaemonLogGuardWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("daemon log mutex poisoned"))?;
+        let today = Local::now().date_naive();
+        if today != state.current_date {
+            state.file = open_daemon_log_file(&state.logs_dir, &state.stem, today)?;
+            state.current_date = today;
+            let _ = prune_old_daemon_logs(&state.logs_dir, &state.stem, today);
+        }
+        state.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("daemon log mutex poisoned"))?;
+        state.file.flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for DaemonDailyLogWriter {
+    type Writer = DaemonLogGuardWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DaemonLogGuardWriter {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+fn open_daemon_log_file(
+    logs_dir: &std::path::Path,
+    stem: &str,
+    date: NaiveDate,
+) -> std::io::Result<File> {
+    let path = logs_dir.join(format!("{}-{}.log", stem, date.format("%Y-%m-%d")));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+fn prune_old_daemon_logs(
+    logs_dir: &std::path::Path,
+    stem: &str,
+    today: NaiveDate,
+) -> std::io::Result<()> {
+    let cutoff = today - Duration::days(DAEMON_LOG_RETENTION_DAYS);
+    for entry in fs::read_dir(logs_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(file_date) = parse_daemon_log_date(file_name, stem) else {
+            continue;
+        };
+        if file_date < cutoff {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn parse_daemon_log_date(file_name: &str, stem: &str) -> Option<NaiveDate> {
+    let prefix = format!("{stem}-");
+    let suffix = ".log";
+    if !file_name.starts_with(&prefix) || !file_name.ends_with(suffix) {
+        return None;
+    }
+    let date_part = &file_name[prefix.len()..file_name.len() - suffix.len()];
+    NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
+}
 
 /// On Windows, locate WinFSP via the registry and pre-load `winfsp-x64.dll`
 /// so that the delay-load resolver can find it.
@@ -475,10 +595,23 @@ fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    if let (Ok(stem), Ok(logs_dir)) = (
+        std::env::var("STUDIOFS_DAEMON_LOG_STEM"),
+        std::env::var("STUDIOFS_DAEMON_LOG_DIR"),
+    ) {
+        let writer = DaemonDailyLogWriter::new(PathBuf::from(logs_dir), stem)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(writer)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 
     match cli.command {
         Commands::Init {

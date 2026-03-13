@@ -1,5 +1,6 @@
 //! `studiofs mount` — mount a filesystem volume.
 
+use chrono::Local;
 use std::path::Path;
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
@@ -41,7 +42,7 @@ pub fn run(
 ) -> anyhow::Result<()> {
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
     if detach {
-        return spawn_daemon(name, mount_point);
+        return spawn_daemon(name, mount_point, meta_dir);
     }
 
     let run_in_foreground = foreground || !detach;
@@ -205,32 +206,27 @@ pub fn run(
 // ─── Daemon spawn ────────────────────────────────────────────────────────────
 
 /// Re-execute the current process without `-d`/`--detach`, detached from the
-/// terminal.  Stdout/stderr are redirected to a log file under `~/.studiofs/logs/`.
-fn spawn_daemon(name: &str, mount_point: &str) -> anyhow::Result<()> {
+/// terminal. The child enables daily-rotated tracing logs under `~/.studiofs/logs/`.
+fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
     // Reconstruct args, stripping the detach flag
     let args: Vec<String> = std::env::args()
         .skip(1) // skip program name
         .filter(|a| a != "-d" && a != "--detach")
         .collect();
 
-    // Prepare log file
     let logs_dir = super::utils::get_logs_dir()?;
-    let log_path = logs_dir.join(format!(
-        "{}.log",
-        super::utils::sanitize_mount_point(mount_point)
-    ));
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log_file_err = log_file.try_clone()?;
+    let log_stem = daemon_log_stem(name, meta_dir)?;
+    let today = Local::now().format("%Y-%m-%d");
+    let log_path = logs_dir.join(format!("{log_stem}-{today}.log"));
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(&args)
+        .env("STUDIOFS_DAEMON_LOG_STEM", &log_stem)
+        .env("STUDIOFS_DAEMON_LOG_DIR", &logs_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(log_file)
-        .stderr(log_file_err);
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
@@ -268,6 +264,35 @@ fn spawn_daemon(name: &str, mount_point: &str) -> anyhow::Result<()> {
     println!("  To unmount: studiofs umount \"{}\"", mount_point);
 
     Ok(())
+}
+
+fn daemon_log_stem(name: &str, meta_dir: &Path) -> anyhow::Result<String> {
+    let db_path = meta_dir.join(format!("{name}.db"));
+    let meta = open_meta_engine(&db_path)?;
+    let format_info = meta.get_format_info()?;
+    Ok(format!(
+        "{}-{}",
+        sanitize_log_component(name),
+        format_info.uuid
+    ))
+}
+
+fn sanitize_log_component(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "volume".to_string()
+    } else {
+        sanitized
+    }
 }
 
 #[cfg(test)]
