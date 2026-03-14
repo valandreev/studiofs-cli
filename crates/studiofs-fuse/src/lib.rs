@@ -52,6 +52,7 @@ fn build_mount_options(
     {
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
     }
+    #[cfg(target_os = "macos")]
     if foreground {
         options.push(fuser::MountOption::CUSTOM("foreground".into()));
     }
@@ -228,10 +229,22 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn build_mount_options_includes_foreground_when_requested() {
         let options = build_mount_options("studiofs", true, false).expect("options");
         assert!(options.iter().any(
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn build_mount_options_foreground_not_added_on_linux() {
+        // On Linux, fusermount3 does not accept 'foreground' as a mount option.
+        // fuser keeps the process in the foreground via session.run() itself.
+        let options = build_mount_options("studiofs", true, false).expect("options");
+        assert!(!options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
     }
