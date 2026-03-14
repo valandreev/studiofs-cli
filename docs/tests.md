@@ -78,8 +78,8 @@ The current architecture relies on these focused regressions:
   - `test_repeated_pending_and_deferred_cycles_do_not_accumulate_undo_logs`
 - janitor runtime recovery:
   - `test_background_janitor_recovers_pending_create_intent_runtime`
-  - `test_background_janitor_recovers_deferred_delete_undo_runtime`
-  - `test_background_janitor_recovers_mixed_undo_runtime`
+  - `test_background_janitor_does_not_recover_deferred_delete_undo_runtime`
+  - `test_background_janitor_recovers_only_pending_create_in_mixed_runtime`
 - namespace resolver parity:
   - `namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths`
   - `namespace_resolver_windows_and_posix_match_on_same_namespace_entry`

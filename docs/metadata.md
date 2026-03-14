@@ -561,7 +561,9 @@ without the field remain decodable.
   - heals dangling pending-create dentries
   - replays deferred-delete cleanup (blocks/attrs/deferred records)
   - returns touched parent inodes for namespace cache invalidation
-- Runtime janitor calls `recover_undo_logs()` and then runs object janitor pass.
+- `recover_undo_logs()` is intended for startup/crash recovery.
+- Runtime janitor replays only pending-create intents (`recover_pending_creates()`)
+  and does not finalize deferred-delete records for still-open unlinked files.
 
 ### Self-healing expectations
 

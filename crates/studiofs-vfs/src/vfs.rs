@@ -3885,7 +3885,6 @@ impl StudioVfs {
             });
 
             vfs.restore_live_extents_from_pending_uploads();
-            vfs.recover_deferred_deletes_on_startup();
 
             // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
             let vfs_for_prefetch = vfs.clone();
@@ -4045,76 +4044,6 @@ impl StudioVfs {
         let mut cache = self.state.attr_read_cache.lock();
         for ino in inodes {
             cache.remove(ino);
-        }
-    }
-
-    fn replay_deferred_deletes_once(&self) -> u64 {
-        let records = match self.meta.list_deferred_deletes() {
-            Ok(records) => records,
-            Err(err) => {
-                warn!(error = %err, "deferred-delete replay skipped");
-                return 0;
-            }
-        };
-        if records.is_empty() {
-            return 0;
-        }
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let mut recovered = 0u64;
-        for record in records {
-            let ino = record.ino;
-            let blocks = match self.meta.get_file_blocks(ino) {
-                Ok(blocks) => blocks,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => {
-                    warn!(ino, error = %err, "startup deferred-delete recovery: get_file_blocks failed");
-                    continue;
-                }
-            };
-            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-            let removed_ids = match self.meta.remove_file_blocks(ino) {
-                Ok(ids) => ids,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => {
-                    warn!(ino, error = %err, "startup deferred-delete recovery: remove_file_blocks failed");
-                    continue;
-                }
-            };
-
-            for object_id in removed_ids {
-                let _ = self.meta.add_pending_deletion(object_id, timestamp);
-            }
-            if total_bytes > 0 {
-                let _ = self
-                    .meta
-                    .decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes);
-            }
-            let _ = self.meta.remove_attr(ino);
-            let _ = self.meta.remove_deferred_delete(ino);
-
-            self.state
-                .pending_blocks
-                .lock()
-                .retain(|(pending_ino, _), _| *pending_ino != ino);
-            self.clear_inode_incarnation(ino);
-            self.state.dirty_attrs.lock().remove(&ino);
-            self.state.attr_read_cache.lock().remove(ino);
-            let _ = self.handle_table.take_orphan(ino);
-            self.dentry_cache_invalidate(record.parent, &record.name);
-            self.bump_namespace_for_parents([record.parent]);
-            recovered = recovered.saturating_add(1);
-        }
-        recovered
-    }
-
-    fn recover_deferred_deletes_on_startup(&self) {
-        let recovered = self.replay_deferred_deletes_once();
-        if recovered > 0 {
-            info!(recovered, "startup deferred-delete recovery completed");
         }
     }
 
@@ -6115,19 +6044,6 @@ impl StudioVfs {
         if ino == ROOT_INO {
             entries.retain(|entry| !is_blocked_root_macos_metadata_dir(&entry.name));
         }
-        entries.retain(|entry| {
-            if entry.kind == FileType::Directory {
-                return true;
-            }
-            match self.meta.get_attr(entry.ino) {
-                Ok(_) => true,
-                Err(MetaError::InodeNotFound(_)) => {
-                    self.heal_orphaned_dentry(ino, &entry.name, Some(entry.ino));
-                    false
-                }
-                Err(_) => true,
-            }
-        });
 
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
         entries.retain(|entry| match self.acl_rule_for_inode(entry.ino) {
@@ -8681,56 +8597,14 @@ impl StudioVfs {
                 };
 
             let meta = self.meta.clone();
-            let healed_parents = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                let mut healed_parents: HashSet<Ino> = HashSet::new();
-                let mut stack = vec![ROOT_INO];
-                while let Some(parent) = stack.pop() {
-                    let entries = match engine.readdir(parent) {
-                        Ok(entries) => entries,
-                        Err(_) => continue,
-                    };
-                    for entry in entries {
-                        match engine.get_attr(entry.ino) {
-                            Ok(attr) => {
-                                if attr.kind == FileType::Directory {
-                                    stack.push(entry.ino);
-                                }
-                            }
-                            Err(MetaError::InodeNotFound(_)) => {
-                                if engine.remove_entry(parent, &entry.name).is_ok() {
-                                    healed_parents.insert(parent);
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
-                Ok(healed_parents)
-            })
-            .await
-            {
-                Ok(parents) => parents,
-                Err(e) => {
-                    warn!(cycle, error = %e, "janitor: failed namespace integrity scan");
-                    HashSet::new()
-                }
-            };
-            for parent in healed_parents.iter().copied() {
-                self.dentry_cache_invalidate_parent(parent);
-            }
-            if !healed_parents.is_empty() {
-                self.bump_namespace_for_parents(healed_parents.iter().copied());
-            }
-
-            let meta = self.meta.clone();
             let recovered_undo_parents = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.recover_undo_logs()
+                engine.recover_pending_creates()
             })
             .await
             {
                 Ok(parents) => parents,
                 Err(e) => {
-                    warn!(cycle, error = %e, "janitor: undo-log replay failed");
+                    warn!(cycle, error = %e, "janitor: pending-create replay failed");
                     Vec::new()
                 }
             };
@@ -8875,7 +8749,6 @@ impl StudioVfs {
                 undo_replaying,
                 undo_completed,
                 deleted,
-                healed_dentries = healed_parents.len(),
                 skipped_young,
                 skipped_unknown_age,
                 skipped_cap,

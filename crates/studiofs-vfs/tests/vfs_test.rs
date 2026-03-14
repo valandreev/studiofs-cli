@@ -1292,7 +1292,7 @@ async fn test_background_janitor_recovers_pending_create_intent_runtime() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn test_background_janitor_recovers_deferred_delete_undo_runtime() {
+async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime() {
     ensure_bucket().await;
 
     type EnvRestore = ScopedEnvVar;
@@ -1335,14 +1335,14 @@ async fn test_background_janitor_recovers_deferred_delete_undo_runtime() {
 
     assert!(
         wait_until(Duration::from_secs(25), || {
-            vfs.meta().get_attr(ino).is_err()
-                && !vfs
+            vfs.meta().get_attr(ino).is_ok()
+                && vfs
                     .meta()
                     .list_deferred_deletes()
                     .unwrap()
                     .iter()
                     .any(|record| record.ino == ino)
-                && !vfs
+                && vfs
                     .meta()
                     .list_undo_logs()
                     .unwrap()
@@ -1350,13 +1350,13 @@ async fn test_background_janitor_recovers_deferred_delete_undo_runtime() {
                     .any(|record| record.kind == UndoLogKind::DeferredDelete && record.ino == ino)
         })
         .await,
-        "background janitor should replay deferred-delete undo records without restart"
+        "runtime janitor must not finalize deferred-delete undo records for open-unlink files"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn test_background_janitor_recovers_mixed_undo_runtime() {
+async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime() {
     ensure_bucket().await;
 
     type EnvRestore = ScopedEnvVar;
@@ -1425,32 +1425,30 @@ async fn test_background_janitor_recovers_mixed_undo_runtime() {
     assert!(
         wait_until(Duration::from_secs(25), || {
             vfs.meta().lookup(ROOT_INO, pending_name).is_err()
-                && vfs.meta().get_attr(deferred_ino).is_err()
+                && vfs.meta().get_attr(deferred_ino).is_ok()
                 && !vfs
                     .meta()
                     .list_pending_creates()
                     .unwrap()
                     .iter()
                     .any(|record| record.ino == pending_ino)
-                && !vfs
+                && vfs
                     .meta()
                     .list_deferred_deletes()
                     .unwrap()
                     .iter()
                     .any(|record| record.ino == deferred_ino)
-                && !vfs
+                && vfs
                     .meta()
                     .list_undo_logs()
                     .unwrap()
                     .iter()
                     .any(|record| {
-                        (record.kind == UndoLogKind::PendingCreate && record.ino == pending_ino)
-                            || (record.kind == UndoLogKind::DeferredDelete
-                                && record.ino == deferred_ino)
+                        record.kind == UndoLogKind::DeferredDelete && record.ino == deferred_ino
                     })
         })
         .await,
-        "background janitor should recover mixed pending/deferred undo records in one runtime pass"
+        "runtime janitor should recover pending-create intents but leave deferred-delete undo for startup/crash recovery"
     );
 }
 
