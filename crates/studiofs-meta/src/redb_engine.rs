@@ -50,6 +50,17 @@ const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
 const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
     TableDefinition::new("pending_deletions");
 
+/// Pending create intents: ino -> CreateIntent (postcard)
+const PENDING_CREATES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_creates");
+
+/// Deferred deletes (open-unlink orphans): ino -> DeferredDeleteRecord (postcard)
+const DEFERRED_DELETES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("deferred_deletes");
+
+/// Generic undo-log records: op_id -> UndoLogRecord (postcard)
+const UNDO_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("undo_log");
+const NEXT_UNDO_OP_ID_COUNTER: &str = "next_undo_op_id";
+
 /// Symlink targets: ino (u64) -> target path (&[u8])
 const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlinks");
 
@@ -369,6 +380,9 @@ impl RedbMetaEngine {
             let _ = txn.open_table(FILE_BLOCKS_TABLE);
             let _ = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE);
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
+            let _ = txn.open_table(PENDING_CREATES_TABLE);
+            let _ = txn.open_table(DEFERRED_DELETES_TABLE);
+            let _ = txn.open_table(UNDO_LOG_TABLE);
             let _ = txn.open_table(SYMLINKS_TABLE);
             let _ = txn.open_table(BASE_SYMLINKS_TABLE);
             let _ = txn.open_table(SYMLINK_TOMBSTONES_TABLE);
@@ -385,7 +399,9 @@ impl RedbMetaEngine {
         }
 
         debug!("opened metadata database at {:?}", path.as_ref());
-        Ok(Self { db: Arc::new(db) })
+        let engine = Self { db: Arc::new(db) };
+        let _ = engine.recover_undo_logs()?;
+        Ok(engine)
     }
 
     /// Initialize a fresh filesystem with root inode.
@@ -4453,6 +4469,64 @@ impl MetaEngine for RedbMetaEngine {
         Ok(deletions)
     }
 
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let encoded = encode(record)?;
+            table
+                .insert(record.ino, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = table
+                .remove(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::DeferredDelete, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(DEFERRED_DELETES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
     // --- Atomic Rename ---------------------------------------------------
 
     fn rename_atomic(
@@ -4696,6 +4770,128 @@ impl MetaEngine for RedbMetaEngine {
         Ok(refs)
     }
 
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
+        self.recover_pending_create_intents()
+    }
+
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
+        let mut touched_parents: HashSet<Ino> =
+            self.recover_pending_create_intents()?.into_iter().collect();
+
+        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
+            .list_deferred_deletes()?
+            .into_iter()
+            .map(|record| (record.ino, record))
+            .collect();
+        let undo_logs = self.list_undo_logs()?;
+        if !undo_logs.is_empty() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for record in undo_logs {
+                if record.kind != UndoLogKind::DeferredDelete {
+                    continue;
+                }
+                if record.phase == UndoLogPhase::Completed {
+                    continue;
+                }
+                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
+                    continue;
+                };
+                self.set_undo_log_phase_for(record.kind.clone(), record.ino, UndoLogPhase::Replaying)?;
+
+                let blocks = match self.get_file_blocks(record.ino) {
+                    Ok(blocks) => blocks,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+                let removed_ids = match self.remove_file_blocks(record.ino) {
+                    Ok(ids) => ids,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                for object_id in removed_ids {
+                    self.add_pending_deletion(object_id, timestamp)?;
+                }
+                if total_bytes > 0 {
+                    let _ = self.decr_counter(counters::USED_SPACE, total_bytes)?;
+                }
+                match self.remove_attr(record.ino) {
+                    Ok(()) => {}
+                    Err(MetaError::InodeNotFound(_)) => {}
+                    Err(err) => return Err(err),
+                }
+                self.remove_deferred_delete(record.ino)?;
+                touched_parents.insert(deferred.parent);
+            }
+        }
+
+        self.cleanup_stale_undo_logs()?;
+        Ok(touched_parents.into_iter().collect())
+    }
+
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
+        self.add_pending_create_intent(record)
+    }
+
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
+        self.remove_pending_create_intent(ino)?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        self.list_pending_create_intents()
+    }
+
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::append_undo_log_in_txn(&txn, record)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_undo_logs_for_in_txn(&txn, kind, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(v.value())?);
+        }
+        Ok(out)
+    }
+
     // --- Symlinks --------------------------------------------------------
 
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
@@ -4927,23 +5123,37 @@ impl MetaEngine for RedbMetaEngine {
         gid: u32,
         mode: u16,
     ) -> MetaResult<InodeAttr> {
-        let parent_attr = self.get_attr(parent)?;
-        if parent_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(parent));
-        }
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
+        let ino = self.next_inode()?;
+        let intent = PendingCreateRecord {
+            ino,
+            parent,
+            name: name.to_vec(),
+            kind: FileType::RegularFile,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        };
+        self.add_pending_create(&intent)?;
 
+        let create_result = (|| -> MetaResult<InodeAttr> {
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let result_attr;
         {
+            let parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+            if parent_attr.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(parent));
+            }
+            if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+                return Err(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
             let mut dentries = txn
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -4955,17 +5165,6 @@ impl MetaEngine for RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let dentry_key = encode_dentry_key(parent, name);
-
-            let ino = match counters
-                .get(counters::NEXT_INODE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 2,
-            };
-            counters
-                .insert(counters::NEXT_INODE, ino + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let total_inodes = match counters
                 .get(counters::TOTAL_INODES)
@@ -5026,6 +5225,18 @@ impl MetaEngine for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(result_attr)
+        })();
+
+        match create_result {
+            Ok(attr) => {
+                self.remove_pending_create(ino)?;
+                Ok(attr)
+            }
+            Err(err) => {
+                let _ = self.remove_pending_create(ino);
+                Err(err)
+            }
+        }
     }
 
     fn create_dir(
@@ -5036,23 +5247,37 @@ impl MetaEngine for RedbMetaEngine {
         gid: u32,
         mode: u16,
     ) -> MetaResult<InodeAttr> {
-        let mut parent_attr = self.get_attr(parent)?;
-        if parent_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(parent));
-        }
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
+        let ino = self.next_inode()?;
+        let intent = PendingCreateRecord {
+            ino,
+            parent,
+            name: name.to_vec(),
+            kind: FileType::Directory,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        };
+        self.add_pending_create(&intent)?;
 
+        let create_result = (|| -> MetaResult<InodeAttr> {
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let result_attr;
         {
+            let mut parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+            if parent_attr.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(parent));
+            }
+            if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+                return Err(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
             let mut dentries = txn
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -5064,17 +5289,6 @@ impl MetaEngine for RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let dentry_key = encode_dentry_key(parent, name);
-
-            let ino = match counters
-                .get(counters::NEXT_INODE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 2,
-            };
-            counters
-                .insert(counters::NEXT_INODE, ino + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let total_inodes = match counters
                 .get(counters::TOTAL_INODES)
@@ -5150,6 +5364,18 @@ impl MetaEngine for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(result_attr)
+        })();
+
+        match create_result {
+            Ok(attr) => {
+                self.remove_pending_create(ino)?;
+                Ok(attr)
+            }
+            Err(err) => {
+                let _ = self.remove_pending_create(ino);
+                Err(err)
+            }
+        }
     }
 
     fn create_symlink(
@@ -5160,23 +5386,37 @@ impl MetaEngine for RedbMetaEngine {
         uid: u32,
         gid: u32,
     ) -> MetaResult<InodeAttr> {
-        let parent_attr = self.get_attr(parent)?;
-        if parent_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(parent));
-        }
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
+        let ino = self.next_inode()?;
+        let intent = PendingCreateRecord {
+            ino,
+            parent,
+            name: name.to_vec(),
+            kind: FileType::Symlink,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        };
+        self.add_pending_create(&intent)?;
 
+        let create_result = (|| -> MetaResult<InodeAttr> {
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let result_attr;
         {
+            let parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+            if parent_attr.kind != FileType::Directory {
+                return Err(MetaError::NotADirectory(parent));
+            }
+            if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+                return Err(MetaError::EntryExists {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
             let mut dentries = txn
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -5188,17 +5428,6 @@ impl MetaEngine for RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let dentry_key = encode_dentry_key(parent, name);
-
-            let ino = match counters
-                .get(counters::NEXT_INODE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 2,
-            };
-            counters
-                .insert(counters::NEXT_INODE, ino + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let total_inodes = match counters
                 .get(counters::TOTAL_INODES)
@@ -5269,6 +5498,18 @@ impl MetaEngine for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(result_attr)
+        })();
+
+        match create_result {
+            Ok(attr) => {
+                self.remove_pending_create(ino)?;
+                Ok(attr)
+            }
+            Err(err) => {
+                let _ = self.remove_pending_create(ino);
+                Err(err)
+            }
+        }
     }
 
     fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
@@ -5357,6 +5598,90 @@ impl MetaEngine for RedbMetaEngine {
                 )?;
             }
         }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(result_attr)
+    }
+
+    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let result_attr;
+        {
+            let entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or(
+                MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                },
+            )?;
+            if entry.kind == FileType::Directory {
+                return Err(MetaError::IsADirectory(entry.ino));
+            }
+
+            let mut attr = Self::get_attr_merged_in_write_txn(&txn, entry.ino)?;
+            attr.nlink = attr.nlink.saturating_sub(1);
+            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+
+            let mut parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+            parent_attr.touch_mtime();
+            Self::set_inode_overlay_in_txn(&txn, &parent_attr)?;
+
+            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
+
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let record = DeferredDeleteRecord {
+                ino: entry.ino,
+                parent,
+                name: name.to_vec(),
+                created_at,
+            };
+            let mut deferred = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let encoded = encode(&record)?;
+            deferred
+                .insert(entry.ino, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let undo = UndoLogRecord {
+                op_id: Self::next_undo_op_id_in_txn(&txn)?,
+                kind: UndoLogKind::DeferredDelete,
+                phase: UndoLogPhase::Started,
+                ino: entry.ino,
+                parent,
+                name: name.to_vec(),
+                created_at,
+            };
+            Self::append_undo_log_in_txn(&txn, &undo)?;
+
+            result_attr = attr.clone();
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveEntry {
+                    parent,
+                    name: name.to_vec(),
+                },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr {
+                    attr: result_attr.clone(),
+                },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr {
+                    attr: parent_attr.clone(),
+                },
+            )?;
+        }
+
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(result_attr)
@@ -5494,6 +5819,286 @@ impl MetaEngine for RedbMetaEngine {
         };
         let snapshot: MetadataSnapshot = decode(raw.value())?;
         Ok(Some(snapshot))
+    }
+}
+
+impl RedbMetaEngine {
+    fn next_undo_op_id_in_txn(txn: &redb::WriteTransaction) -> MetaResult<u64> {
+        let mut counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = match counters
+            .get(NEXT_UNDO_OP_ID_COUNTER)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => v.value(),
+            None => 1,
+        };
+        let next = current.saturating_add(1);
+        counters
+            .insert(NEXT_UNDO_OP_ID_COUNTER, next)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(current)
+    }
+
+    fn append_undo_log_in_txn(
+        txn: &redb::WriteTransaction,
+        record: &UndoLogRecord,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let encoded = encode(record)?;
+        table
+            .insert(record.op_id, encoded.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_undo_logs_for_in_txn(
+        txn: &redb::WriteTransaction,
+        kind: UndoLogKind,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        Self::set_undo_log_phase_for_in_txn(txn, kind, ino, UndoLogPhase::Completed)?;
+        Ok(())
+    }
+
+    fn set_undo_log_phase_for(
+        &self,
+        kind: UndoLogKind,
+        ino: Ino,
+        phase: UndoLogPhase,
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::set_undo_log_phase_for_in_txn(&txn, kind, ino, phase)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn set_undo_log_phase_for_in_txn(
+        txn: &redb::WriteTransaction,
+        kind: UndoLogKind,
+        ino: Ino,
+        phase: UndoLogPhase,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut updates: Vec<(u64, UndoLogRecord)> = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut record: UndoLogRecord = decode(v.value())?;
+            if record.kind == kind && record.ino == ino {
+                record.phase = phase;
+                updates.push((k.value(), record));
+            }
+        }
+        for (key, record) in updates {
+            let encoded = encode(&record)?;
+            table
+                .insert(key, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn add_pending_create_intent(&self, intent: &PendingCreateRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_CREATES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let encoded = encode(intent)?;
+            table
+                .insert(intent.ino, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let undo = UndoLogRecord {
+                op_id: Self::next_undo_op_id_in_txn(&txn)?,
+                kind: UndoLogKind::PendingCreate,
+                phase: UndoLogPhase::Started,
+                ino: intent.ino,
+                parent: intent.parent,
+                name: intent.name.clone(),
+                created_at: intent.created_at,
+            };
+            Self::append_undo_log_in_txn(&txn, &undo)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_pending_create_intent(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_CREATES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = table
+                .remove(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::PendingCreate, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_pending_create_intents(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(PENDING_CREATES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(v.value())?);
+        }
+        Ok(out)
+    }
+
+    fn recover_pending_create_intents(&self) -> MetaResult<Vec<Ino>> {
+        let intents = self.list_pending_create_intents()?;
+        if intents.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut healed = 0u64;
+        let mut touched_parents: HashSet<Ino> = HashSet::new();
+        for intent in intents {
+            Self::set_undo_log_phase_for_in_txn(
+                &txn,
+                UndoLogKind::PendingCreate,
+                intent.ino,
+                UndoLogPhase::Replaying,
+            )?;
+            let entry = Self::lookup_merged_in_write_txn(&txn, intent.parent, &intent.name)?;
+            let inode_exists = Self::get_attr_merged_in_write_txn(&txn, intent.ino).is_ok();
+
+            if let Some(entry) = entry
+                && entry.ino == intent.ino
+                && !inode_exists
+            {
+                Self::remove_dentry_overlay_in_txn(&txn, intent.parent, &intent.name)?;
+                healed = healed.saturating_add(1);
+                touched_parents.insert(intent.parent);
+            }
+
+            let mut table = txn
+                .open_table(PENDING_CREATES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = table
+                .remove(intent.ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::PendingCreate, intent.ino)?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if healed > 0 {
+            debug!(healed, "recovered pending create intents");
+        }
+        Ok(touched_parents.into_iter().collect())
+    }
+
+    fn cleanup_stale_undo_logs(&self) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let undo_entries: Vec<(u64, UndoLogRecord)> = {
+            let undo = txn
+                .open_table(UNDO_LOG_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut entries = Vec::new();
+            for row in undo
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let rec: UndoLogRecord = decode(v.value())?;
+                entries.push((k.value(), rec));
+            }
+            entries
+        };
+
+        if undo_entries.is_empty() {
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(());
+        }
+
+        let mut stale_op_ids = Vec::new();
+        {
+            let pending = txn
+                .open_table(PENDING_CREATES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let deferred = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (op_id, rec) in &undo_entries {
+                if rec.phase == UndoLogPhase::Completed {
+                    stale_op_ids.push(*op_id);
+                    continue;
+                }
+                let is_live = match rec.kind {
+                    UndoLogKind::PendingCreate => pending
+                        .get(rec.ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .is_some(),
+                    UndoLogKind::DeferredDelete => deferred
+                        .get(rec.ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .is_some(),
+                };
+                if !is_live {
+                    stale_op_ids.push(*op_id);
+                }
+            }
+        }
+
+        if !stale_op_ids.is_empty() {
+            let mut undo = txn
+                .open_table(UNDO_LOG_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for op_id in stale_op_ids {
+                let _ = undo
+                    .remove(op_id)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -5647,6 +6252,463 @@ mod tests {
 
         assert!(engine.lookup(ROOT_INO, b"to_delete.txt").is_err());
         assert!(engine.get_attr(attr.ino).is_err());
+    }
+
+    #[test]
+    fn test_unlink_open_handle_keeps_inode_and_decrements_nlink() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"open-unlink.txt", 1000, 1000, 0o644)
+            .unwrap();
+
+        let result = engine.unlink_open_handle(ROOT_INO, b"open-unlink.txt").unwrap();
+
+        assert_eq!(result.ino, attr.ino);
+        assert_eq!(result.nlink, 0);
+        assert!(engine.lookup(ROOT_INO, b"open-unlink.txt").is_err());
+        let persisted = engine.get_attr(attr.ino).unwrap();
+        assert_eq!(persisted.nlink, 0);
+        let deferred = engine.list_deferred_deletes().unwrap();
+        assert!(deferred.iter().any(|record| record.ino == attr.ino));
+        engine.remove_deferred_delete(attr.ino).unwrap();
+        let deferred_after = engine.list_deferred_deletes().unwrap();
+        assert!(!deferred_after.iter().any(|record| record.ino == attr.ino));
+    }
+
+    #[test]
+    fn test_recover_pending_create_intent_removes_dangling_dentry() {
+        let engine = temp_engine();
+        let ino = engine.next_inode().unwrap();
+        let intent = PendingCreateRecord {
+            ino,
+            parent: ROOT_INO,
+            name: b"ghost-create.txt".to_vec(),
+            kind: FileType::RegularFile,
+            created_at: 0,
+        };
+        engine.add_pending_create(&intent).unwrap();
+        engine
+            .add_entry(
+                ROOT_INO,
+                b"ghost-create.txt",
+                &DirEntryValue {
+                    ino,
+                    kind: FileType::RegularFile,
+                },
+            )
+            .unwrap();
+
+        assert!(engine.lookup(ROOT_INO, b"ghost-create.txt").is_ok());
+        assert!(engine.get_attr(ino).is_err());
+
+        engine.recover_pending_create_intents().unwrap();
+
+        assert!(engine.lookup(ROOT_INO, b"ghost-create.txt").is_err());
+        assert!(engine.list_pending_creates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_recover_undo_logs_replays_deferred_delete() {
+        let engine = temp_engine();
+        let parent = ROOT_INO;
+        let name = b"orphaned-open-unlink.txt";
+
+        let attr = engine.create_file(parent, name, 1000, 1000, 0o644).unwrap();
+        let unlinked = engine.unlink_open_handle(parent, name).unwrap();
+        assert_eq!(unlinked.ino, attr.ino);
+
+        let deferred_before = engine.list_deferred_deletes().unwrap();
+        assert!(deferred_before.iter().any(|r| r.ino == attr.ino));
+        let undo_before = engine.list_undo_logs().unwrap();
+        assert!(
+            undo_before
+                .iter()
+                .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == attr.ino)
+        );
+        assert!(engine.get_attr(attr.ino).is_ok());
+
+        let touched = engine.recover_undo_logs().unwrap();
+        assert!(touched.contains(&parent));
+
+        assert!(matches!(
+            engine.get_attr(attr.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+        let deferred_after = engine.list_deferred_deletes().unwrap();
+        assert!(!deferred_after.iter().any(|r| r.ino == attr.ino));
+        let undo_after = engine.list_undo_logs().unwrap();
+        assert!(!undo_after
+            .iter()
+            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == attr.ino));
+    }
+
+    #[test]
+    fn test_recover_undo_logs_cleans_stale_deferred_undo_record() {
+        let engine = temp_engine();
+
+        let stale = UndoLogRecord {
+            op_id: 9_999_001,
+            kind: UndoLogKind::DeferredDelete,
+            phase: UndoLogPhase::Started,
+            ino: 424_242,
+            parent: ROOT_INO,
+            name: b"stale-deferred-undo.txt".to_vec(),
+            created_at: 0,
+        };
+        engine.append_undo_log(&stale).unwrap();
+        assert!(engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.op_id == stale.op_id));
+
+        let touched = engine.recover_undo_logs().unwrap();
+        assert!(touched.is_empty());
+        assert!(!engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.op_id == stale.op_id));
+    }
+
+    #[test]
+    fn test_recover_undo_logs_replays_pending_and_deferred_mixed() {
+        let engine = temp_engine();
+
+        let pending_ino = engine.next_inode().unwrap();
+        let pending_name = b"mixed-pending-create.txt";
+        let intent = PendingCreateRecord {
+            ino: pending_ino,
+            parent: ROOT_INO,
+            name: pending_name.to_vec(),
+            kind: FileType::RegularFile,
+            created_at: 0,
+        };
+        engine.add_pending_create(&intent).unwrap();
+        engine
+            .add_entry(
+                ROOT_INO,
+                pending_name,
+                &DirEntryValue {
+                    ino: pending_ino,
+                    kind: FileType::RegularFile,
+                },
+            )
+            .unwrap();
+        assert!(engine.lookup(ROOT_INO, pending_name).is_ok());
+        assert!(engine.get_attr(pending_ino).is_err());
+
+        let deferred_name = b"mixed-deferred-delete.txt";
+        let deferred_attr = engine
+            .create_file(ROOT_INO, deferred_name, 1000, 1000, 0o644)
+            .unwrap();
+        engine
+            .unlink_open_handle(ROOT_INO, deferred_name)
+            .unwrap();
+        assert!(engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == deferred_attr.ino));
+
+        let touched = engine.recover_undo_logs().unwrap();
+        assert!(touched.contains(&ROOT_INO));
+
+        assert!(engine.lookup(ROOT_INO, pending_name).is_err());
+        assert!(engine.list_pending_creates().unwrap().is_empty());
+        assert!(matches!(
+            engine.get_attr(deferred_attr.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+        assert!(!engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == deferred_attr.ino));
+        assert!(engine.list_undo_logs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_recover_undo_logs_replays_deferred_from_replaying_phase() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"replaying-phase.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        engine
+            .unlink_open_handle(ROOT_INO, b"replaying-phase.txt")
+            .unwrap();
+        assert!(engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == ino));
+
+        engine
+            .remove_undo_logs_for(UndoLogKind::DeferredDelete, ino)
+            .unwrap();
+        let replaying = UndoLogRecord {
+            op_id: 9_999_111,
+            kind: UndoLogKind::DeferredDelete,
+            phase: UndoLogPhase::Replaying,
+            ino,
+            parent: ROOT_INO,
+            name: b"replaying-phase.txt".to_vec(),
+            created_at: 0,
+        };
+        engine.append_undo_log(&replaying).unwrap();
+
+        let touched = engine.recover_undo_logs().unwrap();
+        assert!(touched.contains(&ROOT_INO));
+        assert!(matches!(engine.get_attr(ino), Err(MetaError::InodeNotFound(_))));
+        assert!(!engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == ino));
+        assert!(!engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == ino));
+    }
+
+    #[test]
+    fn test_recover_undo_logs_replays_pending_from_replaying_phase() {
+        let engine = temp_engine();
+
+        let ino = engine.next_inode().unwrap();
+        let name = b"pending-replaying-phase.txt";
+        let intent = PendingCreateRecord {
+            ino,
+            parent: ROOT_INO,
+            name: name.to_vec(),
+            kind: FileType::RegularFile,
+            created_at: 0,
+        };
+        engine.add_pending_create(&intent).unwrap();
+        engine
+            .add_entry(
+                ROOT_INO,
+                name,
+                &DirEntryValue {
+                    ino,
+                    kind: FileType::RegularFile,
+                },
+            )
+            .unwrap();
+        assert!(engine.lookup(ROOT_INO, name).is_ok());
+        assert!(engine.get_attr(ino).is_err());
+
+        engine
+            .remove_undo_logs_for(UndoLogKind::PendingCreate, ino)
+            .unwrap();
+        let replaying = UndoLogRecord {
+            op_id: 9_999_121,
+            kind: UndoLogKind::PendingCreate,
+            phase: UndoLogPhase::Replaying,
+            ino,
+            parent: ROOT_INO,
+            name: name.to_vec(),
+            created_at: 0,
+        };
+        engine.append_undo_log(&replaying).unwrap();
+
+        let touched = engine.recover_undo_logs().unwrap();
+        assert!(touched.contains(&ROOT_INO));
+        assert!(engine.lookup(ROOT_INO, name).is_err());
+        assert!(engine.list_pending_creates().unwrap().is_empty());
+        assert!(!engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino));
+    }
+
+    #[test]
+    fn test_remove_undo_logs_for_marks_completed_until_cleanup() {
+        let engine = temp_engine();
+
+        let ino = engine.next_inode().unwrap();
+        let record = UndoLogRecord {
+            op_id: 9_999_131,
+            kind: UndoLogKind::PendingCreate,
+            phase: UndoLogPhase::Started,
+            ino,
+            parent: ROOT_INO,
+            name: b"completed-lifecycle.txt".to_vec(),
+            created_at: 0,
+        };
+        engine.append_undo_log(&record).unwrap();
+
+        engine
+            .remove_undo_logs_for(UndoLogKind::PendingCreate, ino)
+            .unwrap();
+        let logs_after_mark = engine.list_undo_logs().unwrap();
+        let completed = logs_after_mark
+            .iter()
+            .find(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino)
+            .expect("record should remain until cleanup");
+        assert_eq!(completed.phase, UndoLogPhase::Completed);
+
+        engine.cleanup_stale_undo_logs().unwrap();
+        assert!(!engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino));
+    }
+
+    #[test]
+    fn test_remove_deferred_delete_performs_post_cleanup_of_completed_undo() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"deferred-completed.txt", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        engine
+            .unlink_open_handle(ROOT_INO, b"deferred-completed.txt")
+            .unwrap();
+
+        engine.remove_deferred_delete(ino).unwrap();
+        assert!(!engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == ino));
+    }
+
+    #[test]
+    fn test_remove_pending_create_performs_post_cleanup_of_completed_undo() {
+        let engine = temp_engine();
+
+        let ino = engine.next_inode().unwrap();
+        let intent = PendingCreateRecord {
+            ino,
+            parent: ROOT_INO,
+            name: b"pending-completed.txt".to_vec(),
+            kind: FileType::RegularFile,
+            created_at: 0,
+        };
+        engine.add_pending_create(&intent).unwrap();
+
+        engine.remove_pending_create(ino).unwrap();
+        assert!(!engine
+            .list_pending_creates()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == ino));
+        assert!(!engine
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino));
+    }
+
+    #[test]
+    fn test_cleanup_stale_undo_logs_removes_completed_even_if_live_rows_exist() {
+        let engine = temp_engine();
+
+        let pending_ino = engine.next_inode().unwrap();
+        let pending_intent = PendingCreateRecord {
+            ino: pending_ino,
+            parent: ROOT_INO,
+            name: b"live-pending-completed-undo.txt".to_vec(),
+            kind: FileType::RegularFile,
+            created_at: 0,
+        };
+        engine.add_pending_create(&pending_intent).unwrap();
+        engine
+            .remove_undo_logs_for(UndoLogKind::PendingCreate, pending_ino)
+            .unwrap();
+
+        let deferred_ino = engine.next_inode().unwrap();
+        let deferred = DeferredDeleteRecord {
+            ino: deferred_ino,
+            parent: ROOT_INO,
+            name: b"live-deferred-completed-undo.txt".to_vec(),
+            created_at: 0,
+        };
+        engine.add_deferred_delete(&deferred).unwrap();
+        engine
+            .append_undo_log(&UndoLogRecord {
+                op_id: 9_999_201,
+                kind: UndoLogKind::DeferredDelete,
+                phase: UndoLogPhase::Started,
+                ino: deferred_ino,
+                parent: ROOT_INO,
+                name: deferred.name.clone(),
+                created_at: 0,
+            })
+            .unwrap();
+        engine
+            .remove_undo_logs_for(UndoLogKind::DeferredDelete, deferred_ino)
+            .unwrap();
+
+        let before = engine.list_undo_logs().unwrap();
+        assert!(before.iter().any(|r| {
+            r.kind == UndoLogKind::PendingCreate
+                && r.ino == pending_ino
+                && r.phase == UndoLogPhase::Completed
+        }));
+        assert!(before.iter().any(|r| {
+            r.kind == UndoLogKind::DeferredDelete
+                && r.ino == deferred_ino
+                && r.phase == UndoLogPhase::Completed
+        }));
+        assert!(engine
+            .list_pending_creates()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == pending_ino));
+        assert!(engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|r| r.ino == deferred_ino));
+
+        engine.cleanup_stale_undo_logs().unwrap();
+        let after = engine.list_undo_logs().unwrap();
+        assert!(!after
+            .iter()
+            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == pending_ino));
+        assert!(!after
+            .iter()
+            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == deferred_ino));
+    }
+
+    #[test]
+    fn test_repeated_pending_and_deferred_cycles_do_not_accumulate_undo_logs() {
+        let engine = temp_engine();
+
+        for i in 0..16u64 {
+            let pending_ino = engine.next_inode().unwrap();
+            let pending_intent = PendingCreateRecord {
+                ino: pending_ino,
+                parent: ROOT_INO,
+                name: format!("loop-pending-{i}.txt").into_bytes(),
+                kind: FileType::RegularFile,
+                created_at: 0,
+            };
+            engine.add_pending_create(&pending_intent).unwrap();
+            engine.remove_pending_create(pending_ino).unwrap();
+
+            let deferred_name = format!("loop-deferred-{i}.txt");
+            let attr = engine
+                .create_file(ROOT_INO, deferred_name.as_bytes(), 1000, 1000, 0o644)
+                .unwrap();
+            engine
+                .unlink_open_handle(ROOT_INO, deferred_name.as_bytes())
+                .unwrap();
+            engine.remove_deferred_delete(attr.ino).unwrap();
+        }
+
+        assert!(
+            engine.list_undo_logs().unwrap().is_empty(),
+            "undo log should remain empty after repeated completed-cleanup cycles"
+        );
     }
 
     #[test]

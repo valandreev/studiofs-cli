@@ -65,6 +65,21 @@ The current architecture relies on these focused regressions:
   - `test_ingress_multi_writer_pressure_prefers_spill_without_wait`
   - `test_ingress_multi_writer_spill_recovers_after_crash`
   - `test_crash_recovery_replays_from_segments_when_spill_files_are_missing`
+  - `test_ingress_backpressure_wait_time_accumulates_until_drain`
+- metadata undo-log / orphan recovery:
+  - `test_recover_undo_logs_replays_deferred_delete`
+  - `test_recover_undo_logs_replays_pending_and_deferred_mixed`
+  - `test_recover_undo_logs_replays_deferred_from_replaying_phase`
+  - `test_recover_undo_logs_replays_pending_from_replaying_phase`
+  - `test_remove_undo_logs_for_marks_completed_until_cleanup`
+  - `test_remove_deferred_delete_performs_post_cleanup_of_completed_undo`
+  - `test_remove_pending_create_performs_post_cleanup_of_completed_undo`
+  - `test_cleanup_stale_undo_logs_removes_completed_even_if_live_rows_exist`
+  - `test_repeated_pending_and_deferred_cycles_do_not_accumulate_undo_logs`
+- janitor runtime recovery:
+  - `test_background_janitor_recovers_pending_create_intent_runtime`
+  - `test_background_janitor_does_not_recover_deferred_delete_undo_runtime`
+  - `test_background_janitor_recovers_only_pending_create_in_mixed_runtime`
 - namespace resolver parity:
   - `namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths`
   - `namespace_resolver_windows_and_posix_match_on_same_namespace_entry`

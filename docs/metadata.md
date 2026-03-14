@@ -545,3 +545,42 @@ Local-only staged state must never leak into checkpoint.
 3. Switch read path to merged `overlay over base`.
 4. Convert write-side namespace ops to write only overlay state.
 5. Tighten conflict detection from inode-scoped to exact inode/name scoped rules.
+
+## SFS-45: orphan/dangling namespace recovery
+
+To harden interrupted-copy and open-unlink crash scenarios, metadata and VFS now
+use a unified undo-recovery path with explicit intent records.
+
+### Undo-intent records
+
+`MetaEngine` exposes:
+
+- `pending_creates` (create intent journal)
+- `deferred_deletes` (open-unlink orphan journal)
+- `undo_log` with:
+  - `kind`: `PendingCreate` / `DeferredDelete`
+  - `phase`: `Started` / `Replaying` / `Completed`
+
+`phase` is serialized with a default (`Started`) so older persisted records
+without the field remain decodable.
+
+### Atomicity and recovery behavior
+
+- Create paths (`create_file/create_dir/create_symlink`) register pending intent
+  before mutation and clear it on completion.
+- Open-unlink uses atomic metadata mutation (`unlink_open_handle`) and persists
+  deferred-delete intent in the same transaction.
+- `recover_undo_logs()` is the primary replay entry point:
+  - heals dangling pending-create dentries
+  - replays deferred-delete cleanup (blocks/attrs/deferred records)
+  - returns touched parent inodes for namespace cache invalidation
+- `recover_undo_logs()` is intended for startup/crash recovery.
+- Runtime janitor replays only pending-create intents (`recover_pending_creates()`)
+  and does not finalize deferred-delete records for still-open unlinked files.
+
+### Self-healing expectations
+
+- Dentries without live inode attrs are eventually removed by janitor recovery.
+- Deferred open-unlink orphan state is finalized after restart/runtime replay.
+- Undo-log records are lifecycle-managed and post-cleaned to avoid long-term
+  accumulation under repeated create-cancel / open-unlink cycles.

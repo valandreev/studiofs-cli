@@ -5102,9 +5102,10 @@ impl StudioVfs {
 
             let wait_started = Instant::now();
             notified.await;
+            let waited_ms = std::cmp::max(1u64, wait_started.elapsed().as_millis() as u64);
             self.state
                 .write_backpressure_wait_ms
-                .fetch_add(wait_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                .fetch_add(waited_ms, Ordering::Relaxed);
         }
     }
 
@@ -5689,7 +5690,21 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let attr = self.meta.get_attr(ino)?;
+        let attr = match self.meta.get_attr(ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => {
+                self.state
+                    .pending_blocks
+                    .lock()
+                    .retain(|(pending_ino, _), _| *pending_ino != ino);
+                self.clear_inode_incarnation(ino);
+                self.state.dirty_attrs.lock().remove(&ino);
+                self.state.attr_read_cache.lock().remove(ino);
+                let _ = self.handle_table.take_orphan(ino);
+                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
+            }
+            Err(err) => return Err(VfsError::Meta(err)),
+        };
         self.state
             .attr_read_cache
             .lock()
@@ -5711,10 +5726,21 @@ impl StudioVfs {
         }
 
         let meta = self.meta.clone();
-        let attr = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            engine.get_attr(ino)
-        })
-        .await?;
+        let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino)).await {
+            Ok(attr) => attr,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                self.state
+                    .pending_blocks
+                    .lock()
+                    .retain(|(pending_ino, _), _| *pending_ino != ino);
+                self.clear_inode_incarnation(ino);
+                self.state.dirty_attrs.lock().remove(&ino);
+                self.state.attr_read_cache.lock().remove(ino);
+                let _ = self.handle_table.take_orphan(ino);
+                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
+            }
+            Err(err) => return Err(err),
+        };
         self.state
             .attr_read_cache
             .lock()
@@ -5921,6 +5947,42 @@ impl StudioVfs {
     // Directory Operations
     // =========================================================================
 
+    fn heal_orphaned_dentry(&self, parent: Ino, name: &[u8], ino_hint: Option<Ino>) {
+        match self.meta.remove_entry(parent, name) {
+            Ok(removed) => {
+                debug!(
+                    parent,
+                    removed_ino = removed.ino,
+                    "healed orphaned dentry after inode-not-found"
+                );
+            }
+            Err(MetaError::EntryNotFound { .. }) => {
+                debug!(parent, "orphaned dentry already absent during heal");
+            }
+            Err(err) => {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    error = %err,
+                    "failed to heal orphaned dentry after inode-not-found"
+                );
+            }
+        }
+
+        if let Some(ino) = ino_hint {
+            self.state
+                .pending_blocks
+                .lock()
+                .retain(|(pending_ino, _), _| *pending_ino != ino);
+            self.clear_inode_incarnation(ino);
+            self.state.dirty_attrs.lock().remove(&ino);
+            self.state.attr_read_cache.lock().remove(ino);
+        }
+
+        self.bump_namespace_for_parents([parent]);
+        self.dentry_cache_insert_negative(parent, name);
+    }
+
     fn lookup_component_impl(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.enforce_access(parent, AccessLevel::ReadOnly)?;
         if let Some(ignored) = self.ignored_entry_lookup(parent, name) {
@@ -5938,6 +6000,8 @@ impl StudioVfs {
                     Ok(attr) => return Ok(attr),
                     Err(MetaError::InodeNotFound(_)) => {
                         self.dentry_cache_invalidate(parent, name);
+                        self.heal_orphaned_dentry(parent, name, Some(child_ino));
+                        return Err(Self::ignored_entry_not_found(parent, name));
                     }
                     Err(err) => return Err(VfsError::Meta(err)),
                 },
@@ -5956,8 +6020,21 @@ impl StudioVfs {
             Err(err) => return Err(VfsError::Meta(err)),
         };
         self.dentry_cache_insert_positive(parent, name, entry.ino);
-        self.enforce_access(entry.ino, AccessLevel::ReadOnly)?;
-        self.getattr_unchecked(entry.ino)
+        if let Err(err) = self.enforce_access(entry.ino, AccessLevel::ReadOnly) {
+            if matches!(err, VfsError::Meta(MetaError::InodeNotFound(_))) {
+                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                return Err(Self::ignored_entry_not_found(parent, name));
+            }
+            return Err(err);
+        }
+        match self.getattr_unchecked(entry.ino) {
+            Ok(attr) => Ok(attr),
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                Err(Self::ignored_entry_not_found(parent, name))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Lookup an entry in a directory.
@@ -6160,10 +6237,18 @@ impl StudioVfs {
                 .unwrap_or(0);
             let meta = self.meta.clone();
             let (removed_ids, total_bytes) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                let blocks = engine.get_file_blocks(ino)?;
+                let blocks = match engine.get_file_blocks(ino) {
+                    Ok(blocks) => blocks,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
                 let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
 
-                let removed_ids = engine.remove_file_blocks(ino)?;
+                let removed_ids = match engine.remove_file_blocks(ino) {
+                    Ok(ids) => ids,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
                 for &object_id in &removed_ids {
                     engine.add_pending_deletion(object_id, timestamp)?;
                 }
@@ -6172,7 +6257,11 @@ impl StudioVfs {
                     engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
                 }
 
-                engine.remove_attr(ino)?;
+                match engine.remove_attr(ino) {
+                    Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
+                    Err(err) => return Err(err),
+                }
+                let _ = engine.remove_deferred_delete(ino);
                 Ok((removed_ids, total_bytes))
             })
             .await?;
@@ -6634,21 +6723,16 @@ impl StudioVfs {
         let open_handles = self.handle_table.open_count(ino);
 
         if open_handles > 0 {
-            // Open-unlink: remove dentry + decrement nlink, but keep inode alive.
-            let ev = self.meta.remove_entry(parent, name)?;
-            if ev.kind == FileType::Directory {
-                return Err(VfsError::Meta(MetaError::IsADirectory(ino)));
-            }
-
-            let mut attr = self.meta.get_attr(ino)?;
-            attr.nlink = attr.nlink.saturating_sub(1);
-            self.meta.set_attr(&attr)?;
-
-            // Update parent mtime
-            if let Ok(mut parent_attr) = self.meta.get_attr(parent) {
-                parent_attr.touch_mtime();
-                let _ = self.meta.set_attr(&parent_attr);
-            }
+            // Open-unlink: atomically remove dentry + decrement nlink, keep inode alive.
+            let _attr = match self.meta.unlink_open_handle(parent, name) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => {
+                    self.heal_orphaned_dentry(parent, name, Some(ino));
+                    return Ok(());
+                }
+                Err(MetaError::IsADirectory(_)) => return Err(VfsError::Meta(MetaError::IsADirectory(ino))),
+                Err(err) => return Err(VfsError::Meta(err)),
+            };
 
             // Mark as orphan — release_fh will do the real cleanup
             self.handle_table.mark_orphan(ino);
@@ -6661,7 +6745,14 @@ impl StudioVfs {
             self.state.attr_read_cache.lock().remove(ino);
         } else {
             // No open handles — immediate full cleanup via meta.unlink()
-            let attr = self.meta.unlink(parent, name)?;
+            let attr = match self.meta.unlink(parent, name) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => {
+                    self.heal_orphaned_dentry(parent, name, Some(ino));
+                    return Ok(());
+                }
+                Err(err) => return Err(VfsError::Meta(err)),
+            };
 
             if attr.nlink == 0 {
                 // Inode fully removed — clean up blocks, caches, pending writes.
@@ -8525,6 +8616,53 @@ impl StudioVfs {
                     }
                 };
 
+            let meta = self.meta.clone();
+            let recovered_undo_parents = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.recover_pending_creates()
+            })
+            .await
+            {
+                Ok(parents) => parents,
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor: pending-create replay failed");
+                    Vec::new()
+                }
+            };
+            if !recovered_undo_parents.is_empty() {
+                for parent in recovered_undo_parents.iter().copied() {
+                    self.dentry_cache_invalidate_parent(parent);
+                }
+                self.bump_namespace_for_parents(recovered_undo_parents.iter().copied());
+            }
+            let meta = self.meta.clone();
+            let (undo_total, undo_started, undo_replaying, undo_completed) =
+                match run_meta(meta, move |engine: Arc<dyn MetaEngine>| engine.list_undo_logs()).await
+                {
+                    Ok(records) => {
+                        let mut started = 0usize;
+                        let mut replaying = 0usize;
+                        let mut completed = 0usize;
+                        for record in records.iter() {
+                            match record.phase {
+                                studiofs_meta::engine::UndoLogPhase::Started => {
+                                    started = started.saturating_add(1)
+                                }
+                                studiofs_meta::engine::UndoLogPhase::Replaying => {
+                                    replaying = replaying.saturating_add(1)
+                                }
+                                studiofs_meta::engine::UndoLogPhase::Completed => {
+                                    completed = completed.saturating_add(1)
+                                }
+                            }
+                        }
+                        (records.len(), started, replaying, completed)
+                    }
+                    Err(e) => {
+                        warn!(cycle, error = %e, "janitor: failed to read undo-log metrics");
+                        (0usize, 0usize, 0usize, 0usize)
+                    }
+                };
+
             let entries = match self
                 .data_write
                 .operator()
@@ -8625,6 +8763,11 @@ impl StudioVfs {
                 referenced = referenced.len(),
                 snapshot_pins = global_snapshot_pins.len(),
                 orphan_candidates,
+                recovered_undo_parents = recovered_undo_parents.len(),
+                undo_total,
+                undo_started,
+                undo_replaying,
+                undo_completed,
                 deleted,
                 skipped_young,
                 skipped_unknown_age,
