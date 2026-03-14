@@ -101,11 +101,11 @@ fn recover_macos_truncated_rename_source(
                 && candidate.ends_with(old_name)
         });
 
-    let recovered = candidates.next()?.to_vec();
+    let recovered = candidates.next()?;
     if candidates.next().is_some() {
         return None;
     }
-    Some(recovered)
+    Some(recovered.to_vec())
 }
 
 /// Convert POSIX O_* flags to our OpenFlags.
@@ -478,7 +478,7 @@ impl Filesystem for StudioFuseFs {
                         if let Some(recovered_old_name) =
                             recover_macos_truncated_rename_source(&old_name, &entries)
                         {
-                            warn!(
+                            debug!(
                                 parent,
                                 newparent,
                                 flags = _flags,
