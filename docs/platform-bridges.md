@@ -168,6 +168,9 @@ in-memory pressure from very large native `com.apple.*` writes:
 - `com.apple.ResourceFork` and all xattrs are validated against `STUDIOFS_XATTR_MAX_BYTES`
 - writes larger than the configured limit fail predictably (`xattr` set error) without partial persistence
 - default limit is `4MB`; raise or lower it with environment configuration if needed
+- `com.apple.ResourceFork` values are stored with a resource-fork-aware metadata codec:
+  compress-on-benefit (RLE + frame), otherwise plain bytes
+- callers still observe plain bytes on `getxattr`; existing plain persisted values remain readable
 
 This keeps shared directories free of macOS-only garbage while preserving normal
 Finder interaction.

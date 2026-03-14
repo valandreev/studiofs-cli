@@ -160,6 +160,151 @@ fn xattr_name_from_key(key: &[u8]) -> &[u8] {
     &key[8..]
 }
 
+const RESOURCE_FORK_XATTR_NAME: &[u8] = b"com.apple.ResourceFork";
+const RESOURCE_FORK_ENCODING_MAGIC: &[u8; 4] = b"SFRF";
+const RESOURCE_FORK_ENCODING_VERSION: u8 = 1;
+const RESOURCE_FORK_ENCODING_SCHEME_RLE: u8 = 1;
+const RESOURCE_FORK_REPEAT_RUN_THRESHOLD: usize = 4;
+
+fn resource_fork_checksum(bytes: &[u8]) -> u32 {
+    // FNV-1a checksum for light framing validation.
+    let mut hash = 0x811c_9dc5u32;
+    for byte in bytes {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn rle_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        let run_byte = input[i];
+        let mut run_len = 1usize;
+        while i + run_len < input.len() && input[i + run_len] == run_byte && run_len < 128 {
+            run_len += 1;
+        }
+
+        if run_len >= RESOURCE_FORK_REPEAT_RUN_THRESHOLD {
+            out.push(0x80 | (run_len as u8 - 1));
+            out.push(run_byte);
+            i += run_len;
+            continue;
+        }
+
+        let literal_start = i;
+        let mut literal_len = run_len;
+        i += run_len;
+        while i < input.len() && literal_len < 128 {
+            let probe_byte = input[i];
+            let mut probe_run = 1usize;
+            while i + probe_run < input.len()
+                && input[i + probe_run] == probe_byte
+                && probe_run < 128
+            {
+                probe_run += 1;
+            }
+            if probe_run >= RESOURCE_FORK_REPEAT_RUN_THRESHOLD {
+                break;
+            }
+            let take = probe_run.min(128 - literal_len);
+            literal_len += take;
+            i += take;
+        }
+        out.push(literal_len as u8 - 1);
+        out.extend_from_slice(&input[literal_start..literal_start + literal_len]);
+    }
+
+    out
+}
+
+fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(expected_len);
+    let mut i = 0usize;
+    while i < input.len() {
+        let token = input[i];
+        i += 1;
+        let len = ((token & 0x7f) as usize) + 1;
+        if token & 0x80 != 0 {
+            let value = *input.get(i)?;
+            i += 1;
+            out.extend(std::iter::repeat_n(value, len));
+        } else {
+            let end = i.checked_add(len)?;
+            let literal = input.get(i..end)?;
+            out.extend_from_slice(literal);
+            i = end;
+        }
+        if out.len() > expected_len {
+            return None;
+        }
+    }
+    if out.len() == expected_len {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
+    let compressed = rle_compress(value);
+    let header_len = 4 + 1 + 1 + 4 + 4;
+    if compressed.len() + header_len >= value.len() {
+        return value.to_vec();
+    }
+
+    let mut framed = Vec::with_capacity(header_len + compressed.len());
+    framed.extend_from_slice(RESOURCE_FORK_ENCODING_MAGIC);
+    framed.push(RESOURCE_FORK_ENCODING_VERSION);
+    framed.push(RESOURCE_FORK_ENCODING_SCHEME_RLE);
+    framed.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    framed.extend_from_slice(&resource_fork_checksum(value).to_le_bytes());
+    framed.extend_from_slice(&compressed);
+    framed
+}
+
+fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> {
+    let header_len = 4 + 1 + 1 + 4 + 4;
+    if stored.len() < header_len {
+        return stored.to_vec();
+    }
+    if &stored[..4] != RESOURCE_FORK_ENCODING_MAGIC {
+        return stored.to_vec();
+    }
+    if stored[4] != RESOURCE_FORK_ENCODING_VERSION || stored[5] != RESOURCE_FORK_ENCODING_SCHEME_RLE
+    {
+        return stored.to_vec();
+    }
+    let expected_len = u32::from_le_bytes([stored[6], stored[7], stored[8], stored[9]]) as usize;
+    let expected_checksum = u32::from_le_bytes([stored[10], stored[11], stored[12], stored[13]]);
+    let payload = &stored[header_len..];
+    match rle_decompress(payload, expected_len) {
+        Some(decoded) if resource_fork_checksum(&decoded) == expected_checksum => decoded,
+        _ => stored.to_vec(),
+    }
+}
+
+fn encode_xattr_value_for_storage(name: &[u8], value: &[u8]) -> Vec<u8> {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        encode_resource_fork_value_for_storage(value)
+    } else {
+        value.to_vec()
+    }
+}
+
+fn decode_xattr_value_from_storage(name: &[u8], stored: &[u8]) -> Vec<u8> {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        decode_resource_fork_value_from_storage(stored)
+    } else {
+        stored.to_vec()
+    }
+}
+
 fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
     let principal_bytes = principal.as_bytes();
     let mut key = Vec::with_capacity(8 + principal_bytes.len());
@@ -924,9 +1069,33 @@ impl RedbMetaEngine {
             return Ok(None);
         }
         if let Some(value) = Self::get_bytes_from_table_slice(txn, XATTRS_TABLE, key.as_slice())? {
-            return Ok(Some(value));
+            return Ok(Some(decode_xattr_value_from_storage(
+                name,
+                value.as_slice(),
+            )));
         }
-        Self::get_bytes_from_table_slice(txn, BASE_XATTRS_TABLE, key.as_slice())
+        Ok(
+            Self::get_bytes_from_table_slice(txn, BASE_XATTRS_TABLE, key.as_slice())?
+                .map(|value| decode_xattr_value_from_storage(name, value.as_slice())),
+        )
+    }
+
+    fn set_xattr_value_in_table_in_txn(
+        txn: &redb::WriteTransaction,
+        table: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let stored = encode_xattr_value_for_storage(name, value);
+        let mut xattrs = txn
+            .open_table(table)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        xattrs
+            .insert(key.as_slice(), stored.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     fn set_inode_overlay_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
@@ -1148,12 +1317,7 @@ impl RedbMetaEngine {
         let _ = tombstones.remove(key.as_slice());
         drop(tombstones);
 
-        let mut xattrs = txn
-            .open_table(XATTRS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        xattrs
-            .insert(key.as_slice(), value)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
         Ok(())
     }
 
@@ -1236,12 +1400,7 @@ impl RedbMetaEngine {
         let _ = tombstones.remove(key.as_slice());
         drop(tombstones);
 
-        let mut xattrs = txn
-            .open_table(XATTRS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        xattrs
-            .insert(key.as_slice(), value)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
         Ok(())
     }
 
@@ -1658,7 +1817,9 @@ impl RedbMetaEngine {
             let mut merged = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
             for row in base.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                merged.insert(k.value().to_vec(), v.value().to_vec());
+                let key = k.value().to_vec();
+                let decoded = decode_xattr_value_from_storage(xattr_name_from_key(&key), v.value());
+                merged.insert(key, decoded);
             }
             for row in tombstones
                 .iter()
@@ -1672,7 +1833,9 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                merged.insert(k.value().to_vec(), v.value().to_vec());
+                let key = k.value().to_vec();
+                let decoded = decode_xattr_value_from_storage(xattr_name_from_key(&key), v.value());
+                merged.insert(key, decoded);
             }
             snapshot.xattrs.extend(merged);
         }
@@ -2309,8 +2472,10 @@ impl RedbMetaEngine {
                 let _ = table.remove(key.as_slice());
             }
             for (k, v) in &snapshot.xattrs {
+                let name = xattr_name_from_key(k.as_slice());
+                let stored = encode_xattr_value_for_storage(name, v.as_slice());
                 table
-                    .insert(k.as_slice(), v.as_slice())
+                    .insert(k.as_slice(), stored.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
@@ -2557,13 +2722,13 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::SetXattr {
                     ino, name, value, ..
                 } => {
-                    let mut table = txn
-                        .open_table(BASE_XATTRS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let key = encode_xattr_key(*ino, name);
-                    table
-                        .insert(key.as_slice(), value.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    Self::set_xattr_value_in_table_in_txn(
+                        &txn,
+                        BASE_XATTRS_TABLE,
+                        *ino,
+                        name,
+                        value,
+                    )?;
                 }
                 crate::events::MetaEvent::RemoveXattr { ino, name } => {
                     let mut table = txn
@@ -2821,13 +2986,13 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::SetXattr {
                     ino, name, value, ..
                 } => {
-                    let mut table = txn
-                        .open_table(BASE_XATTRS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let key = encode_xattr_key(*ino, name);
-                    table
-                        .insert(key.as_slice(), value.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    Self::set_xattr_value_in_table_in_txn(
+                        &txn,
+                        BASE_XATTRS_TABLE,
+                        *ino,
+                        name,
+                        value,
+                    )?;
                 }
                 crate::events::MetaEvent::RemoveXattr { ino, name } => {
                     let mut table = txn
@@ -6715,6 +6880,120 @@ mod tests {
         // Non-existent xattr returns None
         let none = engine.get_xattr(attr.ino, b"user.missing").unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_resource_fork_xattr_compresses_when_beneficial() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"resource-fork.bin", 0, 0, 0o644)
+            .unwrap();
+
+        let value = vec![0x41; 64 * 1024];
+        engine
+            .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
+            .unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let table = txn.open_table(XATTRS_TABLE).unwrap();
+        let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
+        let stored = table
+            .get(key.as_slice())
+            .unwrap()
+            .expect("stored resource fork xattr")
+            .value()
+            .to_vec();
+
+        assert!(
+            stored.len() < value.len(),
+            "expected compressed storage to reduce metadata bytes"
+        );
+        assert_eq!(
+            engine
+                .get_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME)
+                .unwrap(),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn test_resource_fork_xattr_keeps_plain_when_not_compressible() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"resource-fork-random.bin", 0, 0, 0o644)
+            .unwrap();
+
+        let value: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        engine
+            .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
+            .unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let table = txn.open_table(XATTRS_TABLE).unwrap();
+        let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
+        let stored = table
+            .get(key.as_slice())
+            .unwrap()
+            .expect("stored resource fork xattr")
+            .value()
+            .to_vec();
+
+        assert_eq!(
+            stored, value,
+            "non-compressible resource fork payload should stay plain"
+        );
+    }
+
+    #[test]
+    fn test_resource_fork_legacy_plain_storage_is_compatible() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"legacy-rfork.bin", 0, 0, 0o644)
+            .unwrap();
+        let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
+        let legacy_plain = b"legacy-plain-resource-fork".to_vec();
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(XATTRS_TABLE).unwrap();
+            table
+                .insert(key.as_slice(), legacy_plain.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert_eq!(
+            engine
+                .get_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME)
+                .unwrap(),
+            Some(legacy_plain)
+        );
+        assert_eq!(
+            engine.list_xattrs(attr.ino).unwrap(),
+            vec![RESOURCE_FORK_XATTR_NAME.to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_resource_fork_snapshot_exports_plain_value() {
+        let engine = temp_engine();
+        let attr = engine
+            .create_file(ROOT_INO, b"snapshot-rfork.bin", 0, 0, 0o644)
+            .unwrap();
+        let value = vec![0x33; 8192];
+        engine
+            .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
+            .unwrap();
+
+        let snapshot = engine.export_snapshot().unwrap();
+        let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
+        let snap_value = snapshot
+            .xattrs
+            .iter()
+            .find_map(|(k, v)| if k == &key { Some(v.clone()) } else { None })
+            .expect("snapshot xattr entry");
+
+        assert_eq!(snap_value, value);
     }
 
     #[test]

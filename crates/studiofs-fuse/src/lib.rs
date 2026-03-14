@@ -39,8 +39,7 @@ fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
 
 fn build_mount_options(
     volume_name: &str,
-    #[allow(unused_variables)]
-    foreground: bool,
+    #[allow(unused_variables)] foreground: bool,
     read_only: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     validate_volume_name(volume_name)?;
