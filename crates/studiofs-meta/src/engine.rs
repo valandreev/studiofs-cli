@@ -89,6 +89,58 @@ pub struct MetadataReplicationBacklog {
     pub inflight_ops: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeferredDeleteRecord {
+    pub ino: Ino,
+    pub parent: Ino,
+    pub name: Vec<u8>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingCreateRecord {
+    pub ino: Ino,
+    pub parent: Ino,
+    pub name: Vec<u8>,
+    pub kind: FileType,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UndoLogKind {
+    PendingCreate,
+    DeferredDelete,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum UndoLogPhase {
+    #[default]
+    Started,
+    Replaying,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UndoLogRecord {
+    pub op_id: u64,
+    pub kind: UndoLogKind,
+    #[serde(default)]
+    pub phase: UndoLogPhase,
+    pub ino: Ino,
+    pub parent: Ino,
+    pub name: Vec<u8>,
+    pub created_at: i64,
+}
+
 impl MetadataReplicationBacklog {
     pub fn total_ops(self) -> u32 {
         self.pending_ops.saturating_add(self.inflight_ops)
@@ -329,6 +381,50 @@ pub trait MetaEngine: Send + Sync {
         ))
     }
 
+    /// Replay pending create intents and heal dangling namespace entries.
+    ///
+    /// Returns parent inode ids whose directory namespace was mutated during replay.
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
+        Ok(Vec::new())
+    }
+
+    /// Record a pending create intent for crash recovery.
+    fn add_pending_create(&self, _record: &PendingCreateRecord) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// Remove a pending create intent.
+    fn remove_pending_create(&self, _ino: Ino) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// List pending create intents.
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Append an operation into the generic undo log.
+    fn append_undo_log(&self, _record: &UndoLogRecord) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// Remove all undo-log records for the `(kind, ino)` tuple.
+    fn remove_undo_logs_for(&self, _kind: UndoLogKind, _ino: Ino) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// List undo-log records.
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Replay generic undo-log records and heal dangling namespace state.
+    ///
+    /// Returns parent inode ids whose directory namespace was mutated during replay.
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
+        self.recover_pending_creates()
+    }
+
     /// Try to acquire the global janitor lease before contacting remote object storage.
     ///
     /// Local-only engines may allow the janitor to proceed immediately. Distributed
@@ -375,6 +471,27 @@ pub trait MetaEngine: Send + Sync {
 
     /// Unlink a file: remove dentry, decrement nlink, clean up if nlink=0.
     fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Open-unlink transaction: remove dentry and decrement nlink, but keep inode alive.
+    ///
+    /// This is used by VFS when the file still has open handles and final inode/block
+    /// cleanup is deferred until the last handle is released.
+    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Record a deferred delete (open-unlink orphan) for crash-safe cleanup.
+    fn add_deferred_delete(&self, _record: &DeferredDeleteRecord) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// Remove a deferred delete record after final cleanup.
+    fn remove_deferred_delete(&self, _ino: Ino) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// List deferred delete records pending replay/recovery.
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
+        Ok(Vec::new())
+    }
 
     /// Remove an empty directory.
     fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
