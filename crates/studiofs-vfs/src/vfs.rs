@@ -4041,12 +4041,9 @@ impl StudioVfs {
     }
 
     fn invalidate_attr_read_cache(&self, inodes: impl IntoIterator<Item = Ino>) {
-        let mut unique = HashSet::new();
         let mut cache = self.state.attr_read_cache.lock();
         for ino in inodes {
-            if unique.insert(ino) {
-                cache.remove(ino);
-            }
+            cache.remove(ino);
         }
     }
 
