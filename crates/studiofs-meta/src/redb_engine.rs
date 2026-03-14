@@ -5,6 +5,7 @@
 use crate::engine::*;
 use crate::types::*;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -224,7 +225,8 @@ fn rle_compress(input: &[u8]) -> Vec<u8> {
 }
 
 fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(expected_len);
+    let initial_capacity = expected_len.min(64 * 1024);
+    let mut out = Vec::with_capacity(initial_capacity);
     let mut i = 0usize;
     while i < input.len() {
         let token = input[i];
@@ -252,6 +254,9 @@ fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
 }
 
 fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
+    let Ok(len_u32) = u32::try_from(value.len()) else {
+        return value.to_vec();
+    };
     let compressed = rle_compress(value);
     let header_len = 4 + 1 + 1 + 4 + 4;
     if compressed.len() + header_len >= value.len() {
@@ -262,7 +267,7 @@ fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
     framed.extend_from_slice(RESOURCE_FORK_ENCODING_MAGIC);
     framed.push(RESOURCE_FORK_ENCODING_VERSION);
     framed.push(RESOURCE_FORK_ENCODING_SCHEME_RLE);
-    framed.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    framed.extend_from_slice(&len_u32.to_le_bytes());
     framed.extend_from_slice(&resource_fork_checksum(value).to_le_bytes());
     framed.extend_from_slice(&compressed);
     framed
@@ -289,11 +294,11 @@ fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> {
     }
 }
 
-fn encode_xattr_value_for_storage(name: &[u8], value: &[u8]) -> Vec<u8> {
+fn encode_xattr_value_for_storage<'a>(name: &[u8], value: &'a [u8]) -> Cow<'a, [u8]> {
     if name == RESOURCE_FORK_XATTR_NAME {
-        encode_resource_fork_value_for_storage(value)
+        Cow::Owned(encode_resource_fork_value_for_storage(value))
     } else {
-        value.to_vec()
+        Cow::Borrowed(value)
     }
 }
 
@@ -302,6 +307,14 @@ fn decode_xattr_value_from_storage(name: &[u8], stored: &[u8]) -> Vec<u8> {
         decode_resource_fork_value_from_storage(stored)
     } else {
         stored.to_vec()
+    }
+}
+
+fn decode_xattr_value_from_storage_owned(name: &[u8], stored: Vec<u8>) -> Vec<u8> {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        decode_resource_fork_value_from_storage(stored.as_slice())
+    } else {
+        stored
     }
 }
 
@@ -1069,14 +1082,11 @@ impl RedbMetaEngine {
             return Ok(None);
         }
         if let Some(value) = Self::get_bytes_from_table_slice(txn, XATTRS_TABLE, key.as_slice())? {
-            return Ok(Some(decode_xattr_value_from_storage(
-                name,
-                value.as_slice(),
-            )));
+            return Ok(Some(decode_xattr_value_from_storage_owned(name, value)));
         }
         Ok(
             Self::get_bytes_from_table_slice(txn, BASE_XATTRS_TABLE, key.as_slice())?
-                .map(|value| decode_xattr_value_from_storage(name, value.as_slice())),
+                .map(|value| decode_xattr_value_from_storage_owned(name, value)),
         )
     }
 
@@ -1093,7 +1103,7 @@ impl RedbMetaEngine {
             .open_table(table)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         xattrs
-            .insert(key.as_slice(), stored.as_slice())
+            .insert(key.as_slice(), stored.as_ref())
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -2475,7 +2485,7 @@ impl RedbMetaEngine {
                 let name = xattr_name_from_key(k.as_slice());
                 let stored = encode_xattr_value_for_storage(name, v.as_slice());
                 table
-                    .insert(k.as_slice(), stored.as_slice())
+                    .insert(k.as_slice(), stored.as_ref())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
@@ -6994,6 +7004,20 @@ mod tests {
             .expect("snapshot xattr entry");
 
         assert_eq!(snap_value, value);
+    }
+
+    #[test]
+    fn test_resource_fork_decode_handles_poisoned_declared_length() {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(RESOURCE_FORK_ENCODING_MAGIC);
+        framed.push(RESOURCE_FORK_ENCODING_VERSION);
+        framed.push(RESOURCE_FORK_ENCODING_SCHEME_RLE);
+        framed.extend_from_slice(&u32::MAX.to_le_bytes());
+        framed.extend_from_slice(&0u32.to_le_bytes());
+        framed.push(0); // 1-byte literal run marker, but payload is intentionally incomplete
+
+        let decoded = decode_resource_fork_value_from_storage(framed.as_slice());
+        assert_eq!(decoded, framed);
     }
 
     #[test]
