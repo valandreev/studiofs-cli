@@ -11,6 +11,7 @@ use fuser::{
     Request,
 };
 use studiofs_meta::FileType;
+#[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};

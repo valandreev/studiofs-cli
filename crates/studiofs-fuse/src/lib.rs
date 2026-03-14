@@ -39,7 +39,7 @@ fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
 
 fn build_mount_options(
     volume_name: &str,
-    foreground: bool,
+    _foreground: bool,
     read_only: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     validate_volume_name(volume_name)?;
@@ -53,7 +53,7 @@ fn build_mount_options(
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
     }
     #[cfg(target_os = "macos")]
-    if foreground {
+    if _foreground {
         options.push(fuser::MountOption::CUSTOM("foreground".into()));
     }
     if read_only {
