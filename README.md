@@ -93,7 +93,7 @@ studiofs mount myvolume Y:
 | `umount` | Unmount an active mountpoint |
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
-| `fsck` | Scan and repair dangling metadata entries |
+| `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
 | `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
 | `load` | Import a metadata dump into PostgreSQL |
 | `snapshot` | Create/list immutable metadata snapshots |

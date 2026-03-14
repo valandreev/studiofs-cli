@@ -101,6 +101,12 @@ Generate a read-only integrity report:
 studiofs fsck myvolume
 ```
 
+Report includes:
+- dangling dentries
+- orphan inodes
+- `nlink` mismatches
+- pending/deferred undo state
+
 If issues are found, StudioFS asks whether to repair them.
 
 Apply repair immediately without interactive prompt:
@@ -108,3 +114,10 @@ Apply repair immediately without interactive prompt:
 ```bash
 studiofs fsck myvolume --repair
 ```
+
+Repair mode currently:
+- replays undo logs
+- removes dangling dentries
+- removes orphan regular/symlink inodes and schedules their blocks for GC
+- leaves orphan directories / hardlink-like orphan cases and `nlink` mismatch
+  entries as report-only

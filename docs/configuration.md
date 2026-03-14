@@ -90,8 +90,9 @@ studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-
 ### `fsck`
 
 Checks local metadata for namespace inconsistencies (dangling dentries,
-pending/deferred undo state). For PostgreSQL-backed volumes, StudioFS first
-syncs metadata from PostgreSQL and then scans.
+orphan inodes, `nlink` mismatches, and pending/deferred undo state. For
+PostgreSQL-backed volumes, StudioFS first syncs metadata from PostgreSQL and
+then scans.
 
 ```bash
 studiofs fsck <name>
@@ -101,7 +102,13 @@ studiofs fsck <name> --repair
 Notes:
 - default mode is read-only report.
 - if findings exist, interactive mode asks for confirmation before repair.
-- `--repair` applies repairs immediately (undo replay + dangling dentry cleanup).
+- `--repair` applies repairs immediately:
+  - undo replay (`recover_undo_logs`)
+  - dangling dentry cleanup
+  - orphan regular/symlink inode cleanup (blocks are moved to pending GC)
+- orphan directories and hardlink-like orphan cases (`nlink > 1`) are reported
+  and skipped for safety.
+- `nlink` mismatches are currently report-only.
 
 ### `destroy`
 
