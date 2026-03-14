@@ -28,6 +28,11 @@ fn debug_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+#[cfg(target_os = "macos")]
+// macFUSE can deliver FUSE_RENAME with an old-name payload shifted by 8 bytes
+// under some ABI combinations (observed as a missing source-name prefix).
+const MACOS_RENAME_SOURCE_TRUNCATION_BYTES: usize = 8;
+
 fn is_missing_xattr_error(err: &VfsError) -> bool {
     matches!(
         err,
@@ -77,6 +82,30 @@ fn normalize_macos_xattr_flags(flags: i32) -> u32 {
 fn normalize_unix_mode(mode: u32) -> u16 {
     // VFS stores only Unix permission bits; file type is tracked separately.
     (mode & 0o7777) as u16
+}
+
+#[cfg(target_os = "macos")]
+fn recover_macos_truncated_rename_source(
+    old_name: &[u8],
+    entries: &[studiofs_meta::DirEntry],
+) -> Option<Vec<u8>> {
+    if old_name.is_empty() {
+        return None;
+    }
+
+    let mut candidates = entries
+        .iter()
+        .map(|entry| entry.name.as_slice())
+        .filter(|candidate| {
+            candidate.len() == old_name.len() + MACOS_RENAME_SOURCE_TRUNCATION_BYTES
+                && candidate.ends_with(old_name)
+        });
+
+    let recovered = candidates.next()?.to_vec();
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(recovered)
 }
 
 /// Convert POSIX O_* flags to our OpenFlags.
@@ -440,6 +469,55 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.rename(parent, &old_name, newparent, &new_name) {
             Ok(()) => reply.ok(),
             Err(e) => {
+                #[cfg(target_os = "macos")]
+                if matches!(
+                    e,
+                    VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+                ) {
+                    if let Ok(entries) = self.vfs.readdir(parent) {
+                        if let Some(recovered_old_name) =
+                            recover_macos_truncated_rename_source(&old_name, &entries)
+                        {
+                            warn!(
+                                parent,
+                                newparent,
+                                flags = _flags,
+                                old_name = %debug_name(&old_name),
+                                recovered_old_name = %debug_name(&recovered_old_name),
+                                new_name = %debug_name(&new_name),
+                                old_name_bytes = ?old_name,
+                                recovered_old_name_bytes = ?recovered_old_name,
+                                new_name_bytes = ?new_name,
+                                "rename retry with recovered macOS source name"
+                            );
+                            match self
+                                .vfs
+                                .rename(parent, &recovered_old_name, newparent, &new_name)
+                            {
+                                Ok(()) => {
+                                    reply.ok();
+                                    return;
+                                }
+                                Err(retry_err) => {
+                                    error!(
+                                        parent,
+                                        newparent,
+                                        flags = _flags,
+                                        old_name = %debug_name(&old_name),
+                                        recovered_old_name = %debug_name(&recovered_old_name),
+                                        new_name = %debug_name(&new_name),
+                                        old_name_bytes = ?old_name,
+                                        recovered_old_name_bytes = ?recovered_old_name,
+                                        new_name_bytes = ?new_name,
+                                        "rename retry -> {retry_err}"
+                                    );
+                                    reply.error(vfs_err_to_errno(&retry_err));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 error!(
                     parent,
                     newparent,
@@ -1137,8 +1215,12 @@ mod tests {
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
     #[cfg(target_os = "macos")]
-    use super::{merge_xattr_write, normalize_macos_xattr_flags};
+    use super::{
+        merge_xattr_write, normalize_macos_xattr_flags, recover_macos_truncated_rename_source,
+    };
     use studiofs_meta::MetaError;
+    #[cfg(target_os = "macos")]
+    use studiofs_meta::schema::DirEntry;
     use studiofs_vfs::{OpenFlags, VfsError};
 
     #[test]
@@ -1253,5 +1335,62 @@ mod tests {
         assert_eq!(missing_xattr_errno(), libc::ENOATTR);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(missing_xattr_errno(), libc::ENODATA);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recover_macos_rename_source_with_unique_suffix_match() {
+        let entries = vec![
+            DirEntry {
+                name: b"Untitled folder".to_vec(),
+                ino: 1,
+                kind: studiofs_meta::FileType::Directory,
+            },
+            DirEntry {
+                name: b"other".to_vec(),
+                ino: 2,
+                kind: studiofs_meta::FileType::Directory,
+            },
+        ];
+
+        let recovered = recover_macos_truncated_rename_source(b" folder", &entries);
+        assert_eq!(recovered, Some(b"Untitled folder".to_vec()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recover_macos_rename_source_returns_none_when_ambiguous() {
+        let entries = vec![
+            DirEntry {
+                name: b"Untitled folder".to_vec(),
+                ino: 1,
+                kind: studiofs_meta::FileType::Directory,
+            },
+            DirEntry {
+                name: b"Whatever folder".to_vec(),
+                ino: 2,
+                kind: studiofs_meta::FileType::Directory,
+            },
+        ];
+
+        assert_eq!(
+            recover_macos_truncated_rename_source(b" folder", &entries),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recover_macos_rename_source_returns_none_without_match() {
+        let entries = vec![DirEntry {
+            name: b"plain".to_vec(),
+            ino: 1,
+            kind: studiofs_meta::FileType::Directory,
+        }];
+
+        assert_eq!(
+            recover_macos_truncated_rename_source(b" folder", &entries),
+            None
+        );
     }
 }
