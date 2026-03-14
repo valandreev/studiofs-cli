@@ -507,6 +507,7 @@ const DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS: u64 = 128;
 const DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG: u64 = 2;
 const DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS: u64 = 4;
+const DEFAULT_XATTR_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
@@ -558,6 +559,9 @@ pub struct VfsConfig {
     /// Default: 12 GiB.  Larger buffer absorbs write bursts better and lets
     /// the parallel background flusher saturate NVMe.
     pub max_dirty_bytes: usize,
+    /// Maximum bytes allowed in a single xattr value.
+    /// Default: 4 MiB.
+    pub xattr_max_bytes: usize,
 }
 
 impl Default for VfsConfig {
@@ -571,6 +575,7 @@ impl Default for VfsConfig {
             max_concurrent_uploads: 4,
             readahead_width: DEFAULT_READAHEAD_WIDTH,
             max_dirty_bytes: 12 * 1024 * 1024 * 1024,
+            xattr_max_bytes: DEFAULT_XATTR_MAX_BYTES,
         }
     }
 }
@@ -2686,6 +2691,8 @@ pub struct StudioVfs {
     /// Maximum total bytes allowed in the dirty-write memory buffer before
     /// `flush()` / `write()` apply backpressure.
     max_dirty_bytes: usize,
+    /// Maximum bytes allowed for a single xattr value.
+    max_xattr_bytes: usize,
     /// Maximum total bytes allowed in local NVMe spill before foreground
     /// writes block waiting for the pipeline to catch up.
     max_spill_bytes: usize,
@@ -3424,6 +3431,11 @@ impl StudioVfs {
                 .and_then(|v| parse_size_bytes_env(&v))
                 .filter(|v| *v > 0)
                 .unwrap_or(12 * 1024 * 1024 * 1024);
+            let xattr_max_bytes = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
+                .ok()
+                .and_then(|v| parse_size_bytes_env(&v))
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_XATTR_MAX_BYTES);
             let dentry_cache_capacity = std::env::var("STUDIOFS_DENTRY_CACHE_CAPACITY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -3740,6 +3752,7 @@ impl StudioVfs {
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 max_dirty_bytes,
+                xattr_max_bytes,
                 max_spill_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
@@ -3861,6 +3874,7 @@ impl StudioVfs {
                 prefetch_tx,
                 dirty_flush_tx,
                 max_dirty_bytes,
+                max_xattr_bytes: xattr_max_bytes,
                 max_spill_bytes,
                 max_ingress_segment_bytes,
                 ingress_spill_dir: spill_dir,
@@ -6565,6 +6579,12 @@ impl StudioVfs {
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
+        }
+        if value.len() > self.max_xattr_bytes {
+            return Err(VfsError::Meta(MetaError::XattrValueTooLarge {
+                actual: value.len(),
+                limit: self.max_xattr_bytes,
+            }));
         }
         self.meta.set_xattr(ino, name, value, flags)?;
         Ok(())

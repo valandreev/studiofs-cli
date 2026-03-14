@@ -37,6 +37,7 @@ const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
 const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
 const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
+const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = NTSTATUS(0xC000_0206_u32 as i32);
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
 
@@ -297,6 +298,9 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             }
             studiofs_meta::MetaError::NotFormatted => {
                 winfsp::FspError::from(STATUS_UNRECOGNIZED_VOLUME)
+            }
+            studiofs_meta::MetaError::XattrValueTooLarge { .. } => {
+                winfsp::FspError::from(STATUS_INVALID_BUFFER_SIZE)
             }
             _ => {
                 error!("metadata error: {e}");
@@ -1138,6 +1142,13 @@ mod tests {
         let invalid = VfsError::InvalidName("bad".into());
         let status = vfs_to_winfsp_err(invalid).to_ntstatus();
         assert_eq!(status, STATUS_INVALID_PARAMETER.0);
+
+        let xattr_too_big = VfsError::Meta(MetaError::XattrValueTooLarge {
+            actual: 17,
+            limit: 16,
+        });
+        let status = vfs_to_winfsp_err(xattr_too_big).to_ntstatus();
+        assert_eq!(status, STATUS_INVALID_BUFFER_SIZE.0);
     }
 
     #[test]

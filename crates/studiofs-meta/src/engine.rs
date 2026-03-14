@@ -65,6 +65,9 @@ pub enum MetaError {
     #[error("unsupported format version: found {found}, expected {expected}")]
     UnsupportedFormatVersion { found: u16, expected: u16 },
 
+    #[error("xattr value too large: actual={actual} bytes, limit={limit} bytes")]
+    XattrValueTooLarge { actual: usize, limit: usize },
+
     #[error(
         "access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}"
     )]
