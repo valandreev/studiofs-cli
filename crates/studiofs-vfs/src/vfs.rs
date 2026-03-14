@@ -561,7 +561,7 @@ pub struct VfsConfig {
     pub max_dirty_bytes: usize,
     /// Maximum bytes allowed in a single xattr value.
     /// Default: 4 MiB.
-    pub xattr_max_bytes: usize,
+    pub max_xattr_bytes: usize,
 }
 
 impl Default for VfsConfig {
@@ -575,7 +575,7 @@ impl Default for VfsConfig {
             max_concurrent_uploads: 4,
             readahead_width: DEFAULT_READAHEAD_WIDTH,
             max_dirty_bytes: 12 * 1024 * 1024 * 1024,
-            xattr_max_bytes: DEFAULT_XATTR_MAX_BYTES,
+            max_xattr_bytes: DEFAULT_XATTR_MAX_BYTES,
         }
     }
 }
@@ -3431,7 +3431,7 @@ impl StudioVfs {
                 .and_then(|v| parse_size_bytes_env(&v))
                 .filter(|v| *v > 0)
                 .unwrap_or(12 * 1024 * 1024 * 1024);
-            let xattr_max_bytes = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
+            let max_xattr_bytes = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
                 .ok()
                 .and_then(|v| parse_size_bytes_env(&v))
                 .filter(|v| *v > 0)
@@ -3752,7 +3752,7 @@ impl StudioVfs {
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 max_dirty_bytes,
-                xattr_max_bytes,
+                max_xattr_bytes,
                 max_spill_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
@@ -3874,7 +3874,7 @@ impl StudioVfs {
                 prefetch_tx,
                 dirty_flush_tx,
                 max_dirty_bytes,
-                max_xattr_bytes: xattr_max_bytes,
+                max_xattr_bytes,
                 max_spill_bytes,
                 max_ingress_segment_bytes,
                 ingress_spill_dir: spill_dir,
