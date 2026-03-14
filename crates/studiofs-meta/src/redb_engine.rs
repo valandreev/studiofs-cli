@@ -3501,6 +3501,41 @@ impl MetaEngine for RedbMetaEngine {
         Ok(attrs)
     }
 
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+
+        let mut inos = std::collections::BTreeSet::new();
+        for table_def in [BASE_INODES_TABLE, INODES_TABLE] {
+            let table = txn
+                .open_table(table_def)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+                let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                inos.insert(ino.value());
+            }
+        }
+
+        let mut attrs = Vec::with_capacity(inos.len());
+        for ino in inos {
+            match Self::resolve_attr_in_read_snapshot(
+                &txn,
+                ino,
+                &overlay_block_inodes,
+                &overlay_attr_inodes,
+            ) {
+                Ok(attr) => attrs.push(attr),
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(attrs)
+    }
+
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
         let txn = self
             .db
@@ -6922,6 +6957,24 @@ mod tests {
         let ino1 = engine.next_inode().unwrap();
         let ino2 = engine.next_inode().unwrap();
         assert_eq!(ino2, ino1 + 1);
+    }
+
+    #[test]
+    fn test_list_inode_attrs_ignores_sparse_next_inode_range() {
+        let engine = temp_engine();
+        let file = engine
+            .create_file(ROOT_INO, b"sparse.txt", 1000, 1000, 0o644)
+            .unwrap();
+        engine
+            .set_counter(counters::NEXT_INODE, 1_000_000)
+            .unwrap();
+
+        let attrs = engine.list_inode_attrs().unwrap();
+        let inos: std::collections::BTreeSet<_> = attrs.into_iter().map(|attr| attr.ino).collect();
+
+        assert!(inos.contains(&ROOT_INO));
+        assert!(inos.contains(&file.ino));
+        assert_eq!(inos.len(), 2);
     }
 
     // === Architecture Tests ===

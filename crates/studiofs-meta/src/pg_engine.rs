@@ -1773,6 +1773,10 @@ impl MetaEngine for PgMetaEngine {
         self.local.get_attrs_batch(inos)
     }
 
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        self.local.list_inode_attrs()
+    }
+
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
         self.mutate(|local| local.set_attr(attr))
     }

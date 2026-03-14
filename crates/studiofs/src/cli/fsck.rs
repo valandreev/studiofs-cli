@@ -217,6 +217,149 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn remove_orphan_file(
+    meta: &dyn MetaEngine,
+    ino: u64,
+    orphan_blocks_pending_gc: &mut usize,
+    removed_orphans: &mut usize,
+) -> anyhow::Result<()> {
+    let removed_ids = match meta.remove_file_blocks(ino) {
+        Ok(ids) => ids,
+        Err(MetaError::InodeNotFound(_)) => Vec::new(),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to remove orphan blocks for ino {}: {}",
+                ino,
+                err
+            ));
+        }
+    };
+
+    if !removed_ids.is_empty() {
+        let ts = now_unix_secs();
+        for object_id in &removed_ids {
+            meta.add_pending_deletion(*object_id, ts)?;
+        }
+        *orphan_blocks_pending_gc += removed_ids.len();
+    }
+
+    match meta.remove_attr(ino) {
+        Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to remove orphan inode {}: {}",
+                ino,
+                err
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn repair_orphan_directory(
+    meta: &dyn MetaEngine,
+    ino: u64,
+    removed_orphans: &mut usize,
+    orphan_blocks_pending_gc: &mut usize,
+    skipped_hardlink_orphans: &mut usize,
+    processed: &mut HashSet<u64>,
+) -> anyhow::Result<()> {
+    if !processed.insert(ino) {
+        return Ok(());
+    }
+
+    let entries = match meta.readdir(ino) {
+        Ok(entries) => entries,
+        Err(MetaError::InodeNotFound(_)) => return Ok(()),
+        Err(err) => return Err(anyhow::anyhow!("readdir failed for orphan dir {}: {}", ino, err)),
+    };
+
+    for entry in entries {
+        match entry.kind {
+            FileType::Directory => {
+                repair_orphan_directory(
+                    meta,
+                    entry.ino,
+                    removed_orphans,
+                    orphan_blocks_pending_gc,
+                    skipped_hardlink_orphans,
+                    processed,
+                )?;
+                match meta.rmdir(ino, &entry.name) {
+                    Ok(()) | Err(MetaError::EntryNotFound { .. }) => {
+                        *removed_orphans += 1;
+                    }
+                    Err(MetaError::InodeNotFound(_)) => {
+                        *removed_orphans += 1;
+                    }
+                    Err(MetaError::DirNotEmpty(_)) => {}
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to remove orphan dir entry parent={} child={}: {}",
+                            ino,
+                            entry.ino,
+                            err
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let attr = match meta.get_attr(entry.ino) {
+                    Ok(attr) => Some(attr),
+                    Err(MetaError::InodeNotFound(_)) => None,
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "get_attr failed for orphan child ino {} under parent {}: {}",
+                            entry.ino,
+                            ino,
+                            err
+                        ));
+                    }
+                };
+                if attr.as_ref().is_some_and(|attr| attr.nlink > 1) {
+                    *skipped_hardlink_orphans += 1;
+                    continue;
+                }
+
+                match meta.remove_entry(ino, &entry.name) {
+                    Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to remove orphan child entry parent={} child={}: {}",
+                            ino,
+                            entry.ino,
+                            err
+                        ));
+                    }
+                }
+
+                if attr.is_some() {
+                    remove_orphan_file(
+                        meta,
+                        entry.ino,
+                        orphan_blocks_pending_gc,
+                        removed_orphans,
+                    )?;
+                }
+                processed.insert(entry.ino);
+            }
+        }
+    }
+
+    match meta.remove_attr(ino) {
+        Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to remove orphan directory inode {}: {}",
+                ino,
+                err
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     let replayed = meta.recover_undo_logs()?;
     if !replayed.is_empty() {
@@ -241,13 +384,24 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     }
 
     let mut removed_orphans = 0usize;
-    let mut skipped_dir_orphans = 0usize;
+    let skipped_dir_orphans = 0usize;
     let mut skipped_hardlink_orphans = 0usize;
     let mut orphan_blocks_pending_gc = 0usize;
+    let mut processed_orphans = HashSet::new();
 
     for orphan in &report.orphan_inodes {
+        if processed_orphans.contains(&orphan.ino) {
+            continue;
+        }
         if orphan.kind == FileType::Directory {
-            skipped_dir_orphans += 1;
+            repair_orphan_directory(
+                meta,
+                orphan.ino,
+                &mut removed_orphans,
+                &mut orphan_blocks_pending_gc,
+                &mut skipped_hardlink_orphans,
+                &mut processed_orphans,
+            )?;
             continue;
         }
         if orphan.nlink > 1 {
@@ -255,38 +409,13 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
             continue;
         }
 
-        let removed_ids = match meta.remove_file_blocks(orphan.ino) {
-            Ok(ids) => ids,
-            Err(MetaError::InodeNotFound(_)) => {
-                continue;
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to remove orphan blocks for ino {}: {}",
-                    orphan.ino,
-                    err
-                ));
-            }
-        };
-
-        if !removed_ids.is_empty() {
-            let ts = now_unix_secs();
-            for object_id in &removed_ids {
-                meta.add_pending_deletion(*object_id, ts)?;
-            }
-            orphan_blocks_pending_gc += removed_ids.len();
-        }
-
-        match meta.remove_attr(orphan.ino) {
-            Ok(()) | Err(MetaError::InodeNotFound(_)) => removed_orphans += 1,
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to remove orphan inode {}: {}",
-                    orphan.ino,
-                    err
-                ));
-            }
-        }
+        remove_orphan_file(
+            meta,
+            orphan.ino,
+            &mut orphan_blocks_pending_gc,
+            &mut removed_orphans,
+        )?;
+        processed_orphans.insert(orphan.ino);
     }
 
     println!("Repair summary:");
@@ -354,3 +483,43 @@ pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()>
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_meta::RedbMetaEngine;
+
+    fn temp_engine() -> RedbMetaEngine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fsck-test.db");
+        let engine = RedbMetaEngine::open(&path).expect("open redb");
+        engine.init_root(1000, 1000).expect("init root");
+        std::mem::forget(dir);
+        engine
+    }
+
+    #[test]
+    fn repair_removes_orphan_directory_subtree() {
+        let engine = temp_engine();
+        let orphan_dir = engine
+            .create_dir(ROOT_INO, b"orphan-root", 1000, 1000, 0o755)
+            .expect("create orphan root");
+        let nested_dir = engine
+            .create_dir(orphan_dir.ino, b"nested", 1000, 1000, 0o755)
+            .expect("create nested dir");
+        engine
+            .create_file(nested_dir.ino, b"payload.txt", 1000, 1000, 0o644)
+            .expect("create payload");
+
+        engine
+            .remove_entry(ROOT_INO, b"orphan-root")
+            .expect("detach orphan subtree");
+
+        let report = collect_report(&engine).expect("collect pre-repair report");
+        assert_eq!(report.orphan_inodes.len(), 3);
+
+        repair(&engine, &report).expect("repair orphan subtree");
+
+        let post = collect_report(&engine).expect("collect post-repair report");
+        assert!(post.orphan_inodes.is_empty());
+    }
+}
