@@ -1032,6 +1032,16 @@ async fn test_pending_deletions_gc() {
         wait_until_exists(&ds, &old_key, Duration::from_secs(20)).await,
         "initial object should be uploaded before overwrite GC check"
     );
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let attr = vfs.meta().get_attr(ino).unwrap();
+            attr.upload_state == UploadState::Ready
+                && attr.committed_content_epoch == attr.content_epoch
+                && attr.committed_size == attr.size
+        })
+        .await,
+        "initial block should be committed before overwrite GC check"
+    );
 
     // Overwrite with new data. The displaced old block should be marked for
     // deletion once the replacement upload commits.

@@ -87,6 +87,22 @@ studiofs status <name>
 studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>]
 ```
 
+### `fsck`
+
+Checks local metadata for namespace inconsistencies (dangling dentries,
+pending/deferred undo state). For PostgreSQL-backed volumes, StudioFS first
+syncs metadata from PostgreSQL and then scans.
+
+```bash
+studiofs fsck <name>
+studiofs fsck <name> --repair
+```
+
+Notes:
+- default mode is read-only report.
+- if findings exist, interactive mode asks for confirmation before repair.
+- `--repair` applies repairs immediately (undo replay + dangling dentry cleanup).
+
 ### `destroy`
 
 ```bash

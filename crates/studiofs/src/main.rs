@@ -188,6 +188,10 @@ EXAMPLES:
   Run janitor in dry-run mode:
     studiofs janitor myvolume --dry-run
 
+  Run metadata fsck:
+    studiofs fsck myvolume
+    studiofs fsck myvolume --repair
+
 ENV TUNING:
   STUDIOFS_JANITOR_INTERVAL_SECS    Auto-janitor cycle interval (default: 1800).
   STUDIOFS_JANITOR_SKIP_NEWER_SECS  Grace window for orphan deletion (default: 900).
@@ -481,6 +485,20 @@ EXAMPLES:
         #[arg(long, default_value_t = 500)]
         max_deletes: u64,
     },
+    /// Check and optionally repair metadata inconsistencies
+    #[command(after_help = "\
+EXAMPLES:
+  studiofs fsck myvolume
+  studiofs fsck myvolume --repair
+")]
+    Fsck {
+        /// Volume name
+        name: String,
+
+        /// Repair findings immediately without interactive confirmation
+        #[arg(long)]
+        repair: bool,
+    },
     /// Permanently destroy a volume
     #[command(long_about = "\
 Permanently destroy a volume, deleting all data objects from S3, removing the \
@@ -640,6 +658,10 @@ fn main() -> anyhow::Result<()> {
                 skip_newer_minutes,
                 max_deletes,
             )?;
+        }
+        Commands::Fsck { name, repair } => {
+            let meta_dir = cli::utils::get_default_meta_dir(&name)?;
+            cli::fsck::run(&name, &meta_dir, repair)?;
         }
         Commands::Dump { name, path_to_dump } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -843,5 +865,26 @@ mod tests {
     fn log_level_propagates_to_umount() {
         let cli = parse(&["--log-level", "trace", "umount", "Z:"]).unwrap();
         assert_eq!(cli.log_level, "trace");
+    }
+
+    #[test]
+    fn fsck_parses_defaults() {
+        let cli = parse(&["fsck", "vol"]).unwrap();
+        match cli.command {
+            Commands::Fsck { name, repair } => {
+                assert_eq!(name, "vol");
+                assert!(!repair);
+            }
+            other => panic!("expected Fsck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fsck_parses_repair_flag() {
+        let cli = parse(&["fsck", "vol", "--repair"]).unwrap();
+        match cli.command {
+            Commands::Fsck { repair, .. } => assert!(repair),
+            other => panic!("expected Fsck, got {other:?}"),
+        }
     }
 }

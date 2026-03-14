@@ -92,3 +92,19 @@ studiofs snapshot myvolume list
 ```bash
 studiofs mount myvolume Z: --snapshot-id <snapshot-uuid>
 ```
+
+## 8. Run Metadata FSCK
+
+Generate a read-only integrity report:
+
+```bash
+studiofs fsck myvolume
+```
+
+If issues are found, StudioFS asks whether to repair them.
+
+Apply repair immediately without interactive prompt:
+
+```bash
+studiofs fsck myvolume --repair
+```
