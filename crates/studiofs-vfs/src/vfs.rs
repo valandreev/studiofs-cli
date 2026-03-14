@@ -4040,11 +4040,19 @@ impl StudioVfs {
         }
     }
 
+    fn invalidate_attr_read_cache(&self, inodes: impl IntoIterator<Item = Ino>) {
+        let mut cache = self.state.attr_read_cache.lock();
+        for ino in inodes {
+            cache.remove(ino);
+        }
+    }
+
     async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
-        let mut last_token = self.meta.namespace_version_token();
+        let mut last_namespace_token = self.meta.namespace_version_token();
+        let mut last_metadata_token = self.meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
 
-        if last_token.is_some() {
+        if last_namespace_token.is_some() || last_metadata_token.is_some() {
             let meta = self.meta.clone();
             if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 Self::collect_metadata_inodes(engine.as_ref())
@@ -4069,23 +4077,35 @@ impl StudioVfs {
 
             let meta = self.meta.clone();
             let sync = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-                let before = engine.namespace_version_token();
+                let before_namespace = engine.namespace_version_token();
+                let before_metadata = engine.metadata_version_token();
                 engine.sync_metadata()?;
-                let after = engine.namespace_version_token();
-                Ok((before, after))
+                let after_namespace = engine.namespace_version_token();
+                let after_metadata = engine.metadata_version_token();
+                Ok((
+                    before_namespace,
+                    after_namespace,
+                    before_metadata,
+                    after_metadata,
+                ))
             })
             .await;
-            let Ok((_before, after_token)) = sync else {
+            let Ok((
+                _before_namespace,
+                after_namespace_token,
+                _before_metadata,
+                after_metadata_token,
+            )) = sync
+            else {
                 continue;
             };
 
-            let changed = matches!(
-                (&last_token, &after_token),
-                (Some(previous), Some(current)) if previous != current
-            );
-            last_token = after_token.clone();
+            let namespace_changed = last_namespace_token != after_namespace_token;
+            let metadata_changed = last_metadata_token != after_metadata_token;
+            last_namespace_token = after_namespace_token.clone();
+            last_metadata_token = after_metadata_token.clone();
 
-            if !changed {
+            if !namespace_changed && !metadata_changed {
                 continue;
             }
 
@@ -4100,9 +4120,14 @@ impl StudioVfs {
 
             let mut to_invalidate = last_snapshot.clone();
             to_invalidate.extend(current_snapshot.iter().copied());
-            self.invalidate_kernel_inodes(to_invalidate);
-            self.bump_namespace_epoch();
-            self.bump_acl_namespace_epoch();
+            self.invalidate_attr_read_cache(to_invalidate.iter().copied());
+            self.invalidate_kernel_inodes(to_invalidate.iter().copied());
+            if namespace_changed {
+                self.bump_namespace_epoch();
+            }
+            if namespace_changed || metadata_changed {
+                self.bump_acl_namespace_epoch();
+            }
             last_snapshot = current_snapshot;
         }
     }
