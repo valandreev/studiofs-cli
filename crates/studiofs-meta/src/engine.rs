@@ -258,6 +258,23 @@ pub trait MetaEngine: Send + Sync {
     /// Remove an inode's attributes.
     fn remove_attr(&self, ino: Ino) -> MetaResult<()>;
 
+    /// Enumerate existing inode attributes.
+    ///
+    /// Default implementation scans inode ids in `[ROOT_INO, NEXT_INODE)`.
+    /// Backends can override with a direct table scan for better performance.
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        let next = self.get_counter(counters::NEXT_INODE)?;
+        let mut out = Vec::new();
+        for ino in ROOT_INO..next {
+            match self.get_attr(ino) {
+                Ok(attr) => out.push(attr),
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(out)
+    }
+
     // ─── Directory Entries ───────────────────────────────────────────────
 
     /// Look up a child entry by name in a parent directory.
