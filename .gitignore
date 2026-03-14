@@ -10,3 +10,4 @@ docs/logs/*.*
 /tools/fstest/results-new
 .antigravityrules
 tmp/
+.DS_Store
