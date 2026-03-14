@@ -62,11 +62,11 @@ Initialize a new volume:
 
 ```bash
 studiofs init myvolume \
-  --endpoint http://127.0.0.1:9000 \
+  --endpoint http://127.0.0.1:9000 \ ## needs local minio/rustfs running
   --bucket studiofs-test \
   --access-key studiofs \
   --secret-key studiofs123 \
-  --meta postgres://studiofs:studiofs@127.0.0.1:5432
+  --meta postgres://studiofs:studiofs@127.0.0.1:5432 ## needs local postgres running
 ```
 
 Mount it:
