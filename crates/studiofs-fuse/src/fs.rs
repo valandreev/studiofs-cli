@@ -28,12 +28,22 @@ fn debug_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-#[cfg(target_os = "macos")]
-fn should_ignore_missing_macos_xattr_removal(key: &[u8], err: &VfsError) -> bool {
+fn is_missing_xattr_error(err: &VfsError) -> bool {
     matches!(
         err,
         VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
-    ) && key.starts_with(b"com.apple.")
+    )
+}
+
+fn missing_xattr_errno() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        libc::ENOATTR
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        libc::ENODATA
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -854,10 +864,7 @@ impl Filesystem for StudioFuseFs {
                 }
             }
             Ok(None) => {
-                #[cfg(target_os = "macos")]
-                reply.error(libc::ENOATTR);
-                #[cfg(not(target_os = "macos"))]
-                reply.error(libc::ENODATA);
+                reply.error(missing_xattr_errno());
             }
             Err(e) => {
                 error!(
@@ -917,6 +924,19 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.set_xattr(ino, key, &value_buf, normalized_flags) {
             Ok(()) => reply.ok(),
             Err(e) => {
+                if is_missing_xattr_error(&e) {
+                    debug!(
+                        ino,
+                        key = %debug_name(key),
+                        key_bytes = ?key,
+                        flags,
+                        normalized_flags,
+                        position = _position,
+                        "setxattr missing xattr"
+                    );
+                    reply.error(missing_xattr_errno());
+                    return;
+                }
                 error!(
                     ino,
                     key = %debug_name(key),
@@ -939,15 +959,14 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.remove_xattr(ino, key) {
             Ok(()) => reply.ok(),
             Err(e) => {
-                #[cfg(target_os = "macos")]
-                if should_ignore_missing_macos_xattr_removal(key, &e) {
+                if is_missing_xattr_error(&e) {
                     debug!(
                         ino,
                         key = %debug_name(key),
                         key_bytes = ?key,
-                        "removexattr ignored missing macOS xattr"
+                        "removexattr missing xattr"
                     );
-                    reply.ok();
+                    reply.error(missing_xattr_errno());
                     return;
                 }
                 error!(
@@ -1112,15 +1131,13 @@ impl KernelInvalidator for FuseKernelInvalidator {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_unix_mode, posix_flags_to_open_flags, should_log_fuse_invalidation_error,
-        vfs_err_to_errno,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_log_fuse_invalidation_error, vfs_err_to_errno,
     };
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
     #[cfg(target_os = "macos")]
-    use super::{
-        merge_xattr_write, normalize_macos_xattr_flags, should_ignore_missing_macos_xattr_removal,
-    };
+    use super::{merge_xattr_write, normalize_macos_xattr_flags};
     use studiofs_meta::MetaError;
     use studiofs_vfs::{OpenFlags, VfsError};
 
@@ -1218,34 +1235,23 @@ mod tests {
         assert_eq!(normalize_macos_xattr_flags(0x0010), 0);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn ignore_missing_macos_xattr_removal_for_com_apple_keys() {
+    fn detects_missing_xattr_errors() {
         let missing = VfsError::Meta(MetaError::EntryNotFound {
             parent: 1,
             name: "com.apple.FinderInfo".into(),
         });
-        assert!(should_ignore_missing_macos_xattr_removal(
-            b"com.apple.FinderInfo",
-            &missing
-        ));
-        assert!(should_ignore_missing_macos_xattr_removal(
-            b"com.apple.finder.copy.source.inode",
-            &missing
-        ));
-        assert!(!should_ignore_missing_macos_xattr_removal(
-            b"user.color",
-            &missing
-        ));
+        assert!(is_missing_xattr_error(&missing));
+
+        let other = VfsError::Meta(MetaError::Storage("boom".into()));
+        assert!(!is_missing_xattr_error(&other));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn do_not_ignore_non_missing_macos_xattr_removal_errors() {
-        let other = VfsError::Meta(MetaError::Storage("boom".into()));
-        assert!(!should_ignore_missing_macos_xattr_removal(
-            b"com.apple.FinderInfo",
-            &other
-        ));
+    fn missing_xattr_errno_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(missing_xattr_errno(), libc::ENOATTR);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(missing_xattr_errno(), libc::ENODATA);
     }
 }
