@@ -25,8 +25,8 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig,
-    PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PgMetaEngine,
+    PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
@@ -2097,6 +2097,348 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn remote_snapshot_reads_nested_file_after_temp_rename_publish() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("nested-temp-rename-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x91u8; (format_info.block_size as usize) + 64 * 1024];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        let dir = writer_vfs.mkdir(1, b"nested", 0, 0, 0o755).unwrap();
+        let temp = writer_vfs
+            .create(dir.ino, b"temp.bin", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.write(temp.ino, 0, &payload).await.unwrap();
+        writer_vfs.flush(temp.ino).await.unwrap();
+        writer_vfs
+            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                writer_vfs.pending_uploads_for_inode(temp.ino).is_empty()
+                    && writer_meta
+                        .get_attr(temp.ino)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.size == payload.len() as u64
+                                && attr.committed_size == payload.len() as u64
+                        })
+                        .unwrap_or(false)
+            })
+            .await,
+            "writer should publish nested renamed file before snapshot import"
+        );
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let remote_dir = remote_vfs.lookup(1, b"nested").unwrap();
+        let remote_attr = remote_vfs.lookup(remote_dir.ino, b"final.bin").unwrap();
+        assert_eq!(remote_attr.ino, temp.ino);
+        assert_eq!(remote_attr.size, payload.len() as u64);
+        assert_eq!(remote_attr.committed_size, payload.len() as u64);
+
+        let read = remote_vfs
+            .read(remote_attr.ino, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn remote_snapshot_switches_nested_overwrite_to_replacement_inode() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("remote.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume_suffix = format!("nested-overwrite-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+    writer_meta.set_format_info(&format_info).unwrap();
+    let remote_meta = Arc::new(RedbMetaEngine::open(&remote_db).unwrap());
+    remote_meta.init_root(0, 0).unwrap();
+    remote_meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x92u8; format_info.block_size as usize];
+    let replacement_payload = vec![0x93u8; (format_info.block_size as usize) + 32 * 1024];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+        let dir = writer_vfs.mkdir(1, b"shared", 0, 0, 0o755).unwrap();
+        let baseline = writer_vfs
+            .create(dir.ino, b"final.bin", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs
+            .write(baseline.ino, 0, &baseline_payload)
+            .await
+            .unwrap();
+        writer_vfs.flush(baseline.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                writer_vfs
+                    .pending_uploads_for_inode(baseline.ino)
+                    .is_empty()
+                    && writer_meta
+                        .get_attr(baseline.ino)
+                        .map(|attr| attr.upload_state == UploadState::Ready)
+                        .unwrap_or(false)
+            })
+            .await,
+            "baseline nested file should become committed before overwrite"
+        );
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let replacement = writer_vfs
+            .create(dir.ino, b"temp.bin", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs
+            .write(replacement.ino, 0, &replacement_payload)
+            .await
+            .unwrap();
+        writer_vfs.flush(replacement.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                writer_vfs
+                    .pending_uploads_for_inode(replacement.ino)
+                    .is_empty()
+                    && writer_meta
+                        .get_attr(replacement.ino)
+                        .map(|attr| attr.upload_state == UploadState::Ready)
+                        .unwrap_or(false)
+            })
+            .await,
+            "replacement temp should become committed before overwrite rename"
+        );
+
+        writer_vfs
+            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .unwrap();
+
+        import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
+        let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+        let remote_dir = remote_vfs.lookup(1, b"shared").unwrap();
+        let remote_attr = remote_vfs.lookup(remote_dir.ino, b"final.bin").unwrap();
+        assert_eq!(remote_attr.ino, replacement.ino);
+        assert_ne!(remote_attr.ino, baseline.ino);
+        assert_eq!(remote_attr.size, replacement_payload.len() as u64);
+        assert_eq!(remote_attr.committed_size, replacement_payload.len() as u64);
+
+        let read = remote_vfs
+            .read(remote_attr.ino, 0, replacement_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(read.as_ref(), replacement_payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn remote_attr_cache_refreshes_after_nested_publish_sync() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "250");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("meta-a.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("meta-b.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume = PgTestVolume::new(&dsn, "vfs-nested-attr-invalidation");
+    let mut info = volume.format_info();
+    let s3 = test_online_s3_env();
+    info.endpoint = s3.endpoint.clone();
+    info.bucket = s3.bucket.clone();
+    info.access_key = s3.access_key.clone();
+    info.secret_key = s3.secret_key.clone();
+    seed_local(&writer_db, &info);
+    seed_local(&remote_db, &info);
+
+    let writer_meta = PgMetaEngine::open(&writer_db).expect("open writer pg meta");
+    let remote_meta = PgMetaEngine::open(&remote_db).expect("open remote pg meta");
+    let writer_meta_dyn: Arc<dyn MetaEngine> = writer_meta.clone();
+    let remote_meta_dyn: Arc<dyn MetaEngine> = remote_meta.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+
+        let writer_vfs = make_vfs_from_meta(writer_meta_dyn, &info, &writer_cache_str);
+        let remote_vfs = make_vfs_from_meta(remote_meta_dyn, &info, &remote_cache_str);
+        let spy = Arc::new(SpyInvalidator::default());
+        remote_vfs.set_kernel_invalidator(spy.clone());
+
+        let payload = vec![0xA4u8; 512 * 1024];
+        let dir = writer_vfs.mkdir(ROOT_INO, b"nested", 0, 0, 0o755).unwrap();
+        let file = writer_vfs
+            .create(dir.ino, b"remote.bin", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.flush(file.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(12), || {
+                remote_vfs.lookup(ROOT_INO, b"nested").is_ok()
+            })
+            .await,
+            "remote peer should see nested dir"
+        );
+        let remote_dir = remote_vfs.lookup(ROOT_INO, b"nested").unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(12), || {
+                remote_vfs
+                    .lookup(remote_dir.ino, b"remote.bin")
+                    .map(|attr| attr.size == 0 && attr.committed_size == 0)
+                    .unwrap_or(false)
+            })
+            .await,
+            "remote peer should observe uploading placeholder before publish"
+        );
+
+        let cached_remote = remote_vfs
+            .lookup(remote_dir.ino, b"remote.bin")
+            .expect("lookup uploading placeholder");
+        assert_eq!(cached_remote.size, 0);
+        spy.clear();
+
+        writer_vfs.write(file.ino, 0, &payload).await.unwrap();
+        writer_vfs.flush(file.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                writer_vfs.pending_uploads_for_inode(file.ino).is_empty()
+                    && writer_meta
+                        .get_attr(file.ino)
+                        .map(|attr| attr.upload_state == UploadState::Ready)
+                        .unwrap_or(false)
+            })
+            .await,
+            "writer should finish publishing nested file"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(12), || {
+                remote_meta
+                    .get_attr(file.ino)
+                    .map(|attr| attr.size == payload.len() as u64)
+                    .unwrap_or(false)
+                    && spy.snapshot().contains(&file.ino)
+            })
+            .await,
+            "remote metadata watcher should sync published size and invalidate the inode"
+        );
+
+        let refreshed = remote_vfs.getattr(file.ino).expect("refreshed remote attr");
+        assert_eq!(
+            refreshed.size,
+            payload.len() as u64,
+            "remote VFS attr cache must refresh after a pure metadata publish"
+        );
+        assert_eq!(refreshed.committed_size, payload.len() as u64);
     });
     rt.shutdown_background();
 }

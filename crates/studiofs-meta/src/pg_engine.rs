@@ -2193,6 +2193,22 @@ mod tests {
         (dir, engine)
     }
 
+    fn apply_projected_remote_range(
+        writer: &PgMetaEngine,
+        remote: &PgMetaEngine,
+        start: u64,
+        end: u64,
+    ) {
+        let events = writer
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        remote
+            .apply_foreign_batch(&projected, &OverlayConflictSets::default())
+            .expect("apply projected remote batch");
+    }
+
     fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
         run_async(async move {
             let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
@@ -2504,6 +2520,212 @@ mod tests {
     }
 
     #[test]
+    fn unit_remote_projection_preserves_nested_manifest_publish() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+        let start = writer.local.get_counter("nextEventSeq").expect("start seq");
+        let dir = writer
+            .create_dir(ROOT_INO, b"nested", 0, 0, 0o755)
+            .expect("create dir");
+        let file = writer
+            .create_file(dir.ino, b"leaf.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&writer, file.ino, 4096, 1);
+        let block = BlockRef::new_partial(701, 4096);
+        writer
+            .set_file_block(file.ino, 0, &block)
+            .expect("set block");
+        assert!(
+            writer
+                .publish_file_manifest(file.ino, 1)
+                .expect("publish manifest"),
+            "publish must succeed"
+        );
+        let end = writer.local.get_counter("nextEventSeq").expect("end seq");
+
+        apply_projected_remote_range(&writer, &remote, start, end);
+
+        let remote_dir = remote.lookup(ROOT_INO, b"nested").expect("lookup dir");
+        let remote_file = remote
+            .lookup(remote_dir.ino, b"leaf.bin")
+            .expect("lookup file");
+        assert_eq!(remote_file.ino, file.ino);
+        let remote_attr = remote.get_attr(remote_file.ino).expect("get remote attr");
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_size, 4096);
+        assert_eq!(remote_attr.committed_content_epoch, 1);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+        let remote_blocks = remote
+            .get_file_blocks(remote_file.ino)
+            .expect("remote blocks");
+        assert_eq!(remote_blocks, vec![(0, block)]);
+    }
+
+    #[test]
+    fn unit_remote_projection_updates_nested_file_after_temp_rename_then_publish() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+        let batch1_start = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch1 start");
+        let dir = writer
+            .create_dir(ROOT_INO, b"drafts", 0, 0, 0o755)
+            .expect("create dir");
+        let file = writer
+            .create_file(dir.ino, b"temp.bin", 0, 0, 0o644)
+            .expect("create temp file");
+        writer
+            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .expect("rename temp to final");
+        let batch1_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch1 end");
+
+        apply_projected_remote_range(&writer, &remote, batch1_start, batch1_end);
+
+        let remote_dir = remote
+            .lookup(ROOT_INO, b"drafts")
+            .expect("lookup dir after rename");
+        let remote_file = remote
+            .lookup(remote_dir.ino, b"final.bin")
+            .expect("lookup final after rename");
+        assert_eq!(remote_file.ino, file.ino);
+        let remote_attr_before = remote
+            .get_attr(remote_file.ino)
+            .expect("attr before publish");
+        assert_eq!(remote_attr_before.size, 0);
+        assert_eq!(remote_attr_before.committed_size, 0);
+
+        let batch2_start = batch1_end;
+        set_file_state(&writer, file.ino, 8192, 1);
+        let block0 = BlockRef::new_partial(801, 4096);
+        let block1 = BlockRef::new_partial(802, 4096);
+        writer
+            .set_file_block(file.ino, 0, &block0)
+            .expect("set block 0");
+        writer
+            .set_file_block(file.ino, 1, &block1)
+            .expect("set block 1");
+        assert!(
+            writer
+                .publish_file_manifest(file.ino, 1)
+                .expect("publish renamed manifest"),
+            "publish after rename must succeed"
+        );
+        let batch2_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch2 end");
+
+        apply_projected_remote_range(&writer, &remote, batch2_start, batch2_end);
+
+        let remote_file_after = remote
+            .lookup(remote_dir.ino, b"final.bin")
+            .expect("lookup final after publish");
+        assert_eq!(remote_file_after.ino, file.ino);
+        let remote_attr_after = remote
+            .get_attr(remote_file_after.ino)
+            .expect("attr after publish");
+        assert_eq!(remote_attr_after.size, 8192);
+        assert_eq!(remote_attr_after.committed_size, 8192);
+        assert_eq!(remote_attr_after.upload_state, UploadState::Ready);
+        let remote_blocks = remote
+            .get_file_blocks(remote_file_after.ino)
+            .expect("remote blocks after publish");
+        assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
+    }
+
+    #[test]
+    fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+        let seed_start = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("seed start");
+        let dir = writer
+            .create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
+            .expect("create dir");
+        let old = writer
+            .create_file(dir.ino, b"final.bin", 0, 0, 0o644)
+            .expect("create old final");
+        set_file_state(&writer, old.ino, 4096, 1);
+        let old_block = BlockRef::new_partial(901, 4096);
+        writer
+            .set_file_block(old.ino, 0, &old_block)
+            .expect("set old block");
+        assert!(
+            writer
+                .publish_file_manifest(old.ino, 1)
+                .expect("publish old manifest"),
+            "old manifest publish must succeed"
+        );
+        let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+
+        apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
+
+        let remote_dir = remote.lookup(ROOT_INO, b"shared").expect("lookup dir");
+        let remote_old = remote
+            .lookup(remote_dir.ino, b"final.bin")
+            .expect("lookup seeded final");
+        assert_eq!(remote_old.ino, old.ino);
+
+        let replace_start = seed_end;
+        let temp = writer
+            .create_file(dir.ino, b"temp.bin", 0, 0, 0o644)
+            .expect("create replacement temp");
+        set_file_state(&writer, temp.ino, 8192, 2);
+        let new_block0 = BlockRef::new_partial(902, 4096);
+        let new_block1 = BlockRef::new_partial(903, 4096);
+        writer
+            .set_file_block(temp.ino, 0, &new_block0)
+            .expect("set replacement block 0");
+        writer
+            .set_file_block(temp.ino, 1, &new_block1)
+            .expect("set replacement block 1");
+        assert!(
+            writer
+                .publish_file_manifest(temp.ino, 2)
+                .expect("publish replacement temp"),
+            "replacement temp publish must succeed"
+        );
+        writer
+            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .expect("rename replacement over final");
+        let replace_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("replace end");
+
+        apply_projected_remote_range(&writer, &remote, replace_start, replace_end);
+
+        let remote_final = remote
+            .lookup(remote_dir.ino, b"final.bin")
+            .expect("lookup replaced final");
+        assert_eq!(remote_final.ino, temp.ino);
+        assert!(
+            remote.get_attr(old.ino).is_err(),
+            "old inode must be removed"
+        );
+        let remote_attr = remote
+            .get_attr(remote_final.ino)
+            .expect("get replaced attr");
+        assert_eq!(remote_attr.size, 8192);
+        assert_eq!(remote_attr.committed_size, 8192);
+        assert_eq!(remote_attr.committed_content_epoch, 2);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+        let remote_blocks = remote
+            .get_file_blocks(remote_final.ino)
+            .expect("replacement blocks");
+        assert_eq!(remote_blocks, vec![(0, new_block0), (1, new_block1)]);
+    }
+
+    #[test]
     fn claim_and_restore_pending_batch_updates_replication_backlog() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         {
@@ -2794,6 +3016,165 @@ mod tests {
                 .is_none(),
             "staged file blocks must not replicate through PG before publish"
         );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_nested_manifest_publish_visible_on_remote_peer() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-nested-manifest-publish");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let dir = a
+            .create_dir(ROOT_INO, b"nested", 0, 0, 0o755)
+            .expect("create nested dir");
+        a.flush_metadata().expect("flush nested dir");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"nested",
+            Duration::from_secs(10)
+        ));
+
+        let file = a
+            .create_file(dir.ino, b"leaf.bin", 0, 0, 0o644)
+            .expect("create nested file");
+        set_file_state(&a, file.ino, 4096, 1);
+        let block = BlockRef::new_partial(511, 4096);
+        a.set_file_block(file.ino, 0, &block)
+            .expect("set nested block");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish nested manifest")
+        );
+        a.flush_metadata().expect("flush nested publish");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            match b.lookup(ROOT_INO, b"nested") {
+                Ok(remote_dir) => match b.lookup(remote_dir.ino, b"leaf.bin") {
+                    Ok(remote_file) => b
+                        .get_attr(remote_file.ino)
+                        .map(|attr| {
+                            attr.size == 4096
+                                && attr.committed_size == 4096
+                                && attr.upload_state == UploadState::Ready
+                        })
+                        .unwrap_or(false),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            }
+        }));
+
+        let remote_dir = b.lookup(ROOT_INO, b"nested").expect("lookup remote dir");
+        let remote_file = b
+            .lookup(remote_dir.ino, b"leaf.bin")
+            .expect("lookup remote nested file");
+        let remote_blocks = b
+            .get_file_blocks(remote_file.ino)
+            .expect("get remote nested blocks");
+        assert_eq!(remote_blocks, vec![(0, block)]);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_nested_temp_rename_then_publish_visible_on_remote_peer() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-nested-temp-rename-publish");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let dir = a
+            .create_dir(ROOT_INO, b"drafts", 0, 0, 0o755)
+            .expect("create drafts dir");
+        a.flush_metadata().expect("flush drafts dir");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"drafts",
+            Duration::from_secs(10)
+        ));
+
+        let file = a
+            .create_file(dir.ino, b"temp.bin", 0, 0, 0o644)
+            .expect("create temp file");
+        a.rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .expect("rename temp to final");
+        a.flush_metadata().expect("flush rename");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            match b.lookup(ROOT_INO, b"drafts") {
+                Ok(remote_dir) => match b.lookup(remote_dir.ino, b"final.bin") {
+                    Ok(remote_file) => b
+                        .get_attr(remote_file.ino)
+                        .map(|attr| attr.size == 0 && attr.committed_size == 0)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            }
+        }));
+
+        set_file_state(&a, file.ino, 8192, 1);
+        let block0 = BlockRef::new_partial(611, 4096);
+        let block1 = BlockRef::new_partial(612, 4096);
+        a.set_file_block(file.ino, 0, &block0).expect("set block 0");
+        a.set_file_block(file.ino, 1, &block1).expect("set block 1");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish renamed nested manifest")
+        );
+        a.flush_metadata().expect("flush renamed nested manifest");
+
+        assert!(wait_until(Duration::from_secs(12), || {
+            let _ = b.sync_metadata();
+            match b.lookup(ROOT_INO, b"drafts") {
+                Ok(remote_dir) => match b.lookup(remote_dir.ino, b"final.bin") {
+                    Ok(remote_file) => {
+                        let attr_ready = b
+                            .get_attr(remote_file.ino)
+                            .map(|attr| {
+                                attr.size == 8192
+                                    && attr.committed_size == 8192
+                                    && attr.upload_state == UploadState::Ready
+                            })
+                            .unwrap_or(false);
+                        let blocks_ready = b
+                            .get_file_blocks(remote_file.ino)
+                            .map(|blocks| blocks == vec![(0, block0.clone()), (1, block1.clone())])
+                            .unwrap_or(false);
+                        attr_ready && blocks_ready
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            }
+        }));
     }
 
     #[test]
