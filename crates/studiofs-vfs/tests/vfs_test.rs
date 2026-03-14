@@ -26,7 +26,7 @@ use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PgMetaEngine,
-    PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    PostgresConfig, ROOT_INO, RedbMetaEngine, MetaError, ensure_studiofs_database,
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
@@ -2718,6 +2718,7 @@ impl ScopedTestEnv {
             "STUDIOFS_LOCK_RETRY_BASE_MS",
             "STUDIOFS_LOCK_RETRY_MAX_MS",
             "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
+            "STUDIOFS_XATTR_MAX_BYTES",
         ];
         Self {
             _guards: KEYS.iter().map(|&k| ScopedEnvVar::capture(k)).collect(),
@@ -6104,6 +6105,60 @@ async fn test_xattr_multiple_attrs() {
     vfs.set_xattr(attr.ino, b"user.b", b"updated", 0).unwrap();
     let val = vfs.get_xattr(attr.ino, b"user.b").unwrap();
     assert_eq!(val, Some(b"updated".to_vec()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_limit_exact_and_exceeds_boundaries() {
+    ensure_bucket().await;
+    let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
+    unsafe {
+        std::env::set_var("STUDIOFS_XATTR_MAX_BYTES", "16");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr_limit_boundary");
+    let attr = vfs.create(1, b"xattr-limit.txt", 0, 0, 0o644).unwrap();
+
+    let exact = vec![b'a'; 16];
+    vfs.set_xattr(attr.ino, b"user.limit", &exact, 0).unwrap();
+    assert_eq!(vfs.get_xattr(attr.ino, b"user.limit").unwrap(), Some(exact));
+
+    let too_big = vec![b'b'; 17];
+    let err = vfs.set_xattr(attr.ino, b"user.limit", &too_big, 0).unwrap_err();
+    assert!(matches!(
+        err,
+        VfsError::Meta(MetaError::XattrValueTooLarge {
+            actual,
+            limit
+        }) if actual == 17 && limit == 16
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_xattr_resource_fork_honors_limit() {
+    ensure_bucket().await;
+    let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
+    unsafe {
+        std::env::set_var("STUDIOFS_XATTR_MAX_BYTES", "8");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = make_vfs(&tmp, "xattr_limit_resource_fork");
+    let attr = vfs.create(1, b"fork.bin", 0, 0, 0o644).unwrap();
+    let fork_name = b"com.apple.ResourceFork";
+
+    let fits = vec![0x72, 0x73, 0x72, 0x63, 0x00, 0x00, 0x00, 0x00];
+    vfs.set_xattr(attr.ino, fork_name, &fits, 0).unwrap();
+
+    let err = vfs
+        .set_xattr(attr.ino, fork_name, b"toolongforkvalue", 0)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        VfsError::Meta(MetaError::XattrValueTooLarge { .. })
+    ));
 }
 
 // =============================================================================

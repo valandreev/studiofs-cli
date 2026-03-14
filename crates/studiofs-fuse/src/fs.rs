@@ -91,6 +91,7 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
             MetaError::IsADirectory(_) => libc::EISDIR,
             MetaError::DirNotEmpty(_) => libc::ENOTEMPTY,
             MetaError::NotFormatted => libc::ENODEV,
+            MetaError::XattrValueTooLarge { .. } => libc::E2BIG,
             _ => libc::EIO,
         },
         VfsError::BlockNotFound(_, _) => libc::EIO,
@@ -1095,6 +1096,7 @@ mod tests {
         normalize_unix_mode, posix_flags_to_open_flags, should_log_fuse_invalidation_error,
         vfs_err_to_errno,
     };
+    use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
     #[cfg(target_os = "macos")]
     use super::{merge_xattr_write, normalize_macos_xattr_flags};
@@ -1136,6 +1138,12 @@ mod tests {
 
         let blocked = VfsError::WouldBlock;
         assert_eq!(vfs_err_to_errno(&blocked), libc::EAGAIN);
+
+        let xattr_too_big = VfsError::Meta(MetaError::XattrValueTooLarge {
+            actual: 17,
+            limit: 16,
+        });
+        assert_eq!(vfs_err_to_errno(&xattr_too_big), libc::E2BIG);
     }
 
     #[test]

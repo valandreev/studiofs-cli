@@ -163,6 +163,12 @@ StudioFS drops these names at the VFS layer:
 - these root metadata directories are filtered from `readdir`, even if a legacy
   metadata entry already exists
 
+StudioFS also enforces a size limit on xattr values to avoid unbounded metadata
+in-memory pressure from very large native `com.apple.*` writes:
+- `com.apple.ResourceFork` and all xattrs are validated against `STUDIOFS_XATTR_MAX_BYTES`
+- writes larger than the configured limit fail predictably (`xattr` set error) without partial persistence
+- default limit is `4MB`; raise or lower it with environment configuration if needed
+
 This keeps shared directories free of macOS-only garbage while preserving normal
 Finder interaction.
 
