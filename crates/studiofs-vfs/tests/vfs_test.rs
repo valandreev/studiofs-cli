@@ -1187,7 +1187,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn test_background_janitor_heals_dangling_dentry() {
+async fn test_background_janitor_does_not_heal_dangling_dentry_without_foreground_access() {
     ensure_bucket().await;
 
     type EnvRestore = ScopedEnvVar;
@@ -1213,12 +1213,10 @@ async fn test_background_janitor_heals_dangling_dentry() {
         "test setup requires a dentry that still points to the removed inode"
     );
 
+    tokio::time::sleep(Duration::from_secs(6)).await;
     assert!(
-        wait_until(Duration::from_secs(25), || {
-            vfs.meta().lookup(1, b"janitor-dangling.txt").is_err()
-        })
-        .await,
-        "background janitor should remove dangling dentry without foreground access"
+        vfs.meta().lookup(1, b"janitor-dangling.txt").is_ok(),
+        "runtime janitor should not remove dangling dentries without foreground lookup/getattr"
     );
 }
 
@@ -6081,8 +6079,18 @@ async fn test_dangling_dentry_is_self_healed_on_readdir() {
 
     let entries = vfs.readdir(1).unwrap();
     assert!(
-        !entries.iter().any(|entry| entry.name.as_slice() == b"dangling-readdir.txt"),
-        "readdir should hide and clean dangling dentries"
+        entries
+            .iter()
+            .any(|entry| entry.name.as_slice() == b"dangling-readdir.txt"),
+        "readdir should not perform inode existence healing"
+    );
+    assert!(
+        vfs.meta().lookup(1, b"dangling-readdir.txt").is_ok(),
+        "dentry should still exist after readdir-only access"
+    );
+    assert!(
+        vfs.lookup(1, b"dangling-readdir.txt").is_err(),
+        "foreground lookup should trigger lazy dangling-dentry healing"
     );
     assert!(vfs.meta().lookup(1, b"dangling-readdir.txt").is_err());
 }
