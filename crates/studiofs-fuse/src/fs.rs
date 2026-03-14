@@ -28,6 +28,24 @@ fn debug_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+fn is_missing_xattr_error(err: &VfsError) -> bool {
+    matches!(
+        err,
+        VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    )
+}
+
+fn missing_xattr_errno() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        libc::ENOATTR
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        libc::ENODATA
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> Vec<u8> {
     let offset = position as usize;
@@ -846,10 +864,7 @@ impl Filesystem for StudioFuseFs {
                 }
             }
             Ok(None) => {
-                #[cfg(target_os = "macos")]
-                reply.error(libc::ENOATTR);
-                #[cfg(not(target_os = "macos"))]
-                reply.error(libc::ENODATA);
+                reply.error(missing_xattr_errno());
             }
             Err(e) => {
                 error!(
@@ -909,6 +924,19 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.set_xattr(ino, key, &value_buf, normalized_flags) {
             Ok(()) => reply.ok(),
             Err(e) => {
+                if is_missing_xattr_error(&e) {
+                    debug!(
+                        ino,
+                        key = %debug_name(key),
+                        key_bytes = ?key,
+                        flags,
+                        normalized_flags,
+                        position = _position,
+                        "setxattr missing xattr"
+                    );
+                    reply.error(missing_xattr_errno());
+                    return;
+                }
                 error!(
                     ino,
                     key = %debug_name(key),
@@ -931,6 +959,16 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.remove_xattr(ino, key) {
             Ok(()) => reply.ok(),
             Err(e) => {
+                if is_missing_xattr_error(&e) {
+                    debug!(
+                        ino,
+                        key = %debug_name(key),
+                        key_bytes = ?key,
+                        "removexattr missing xattr"
+                    );
+                    reply.error(missing_xattr_errno());
+                    return;
+                }
                 error!(
                     ino,
                     key = %debug_name(key),
@@ -1093,8 +1131,8 @@ impl KernelInvalidator for FuseKernelInvalidator {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_unix_mode, posix_flags_to_open_flags, should_log_fuse_invalidation_error,
-        vfs_err_to_errno,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_log_fuse_invalidation_error, vfs_err_to_errno,
     };
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
@@ -1195,5 +1233,25 @@ mod tests {
             XATTR_CREATE_FLAG | XATTR_REPLACE_FLAG
         );
         assert_eq!(normalize_macos_xattr_flags(0x0010), 0);
+    }
+
+    #[test]
+    fn detects_missing_xattr_errors() {
+        let missing = VfsError::Meta(MetaError::EntryNotFound {
+            parent: 1,
+            name: "com.apple.FinderInfo".into(),
+        });
+        assert!(is_missing_xattr_error(&missing));
+
+        let other = VfsError::Meta(MetaError::Storage("boom".into()));
+        assert!(!is_missing_xattr_error(&other));
+    }
+
+    #[test]
+    fn missing_xattr_errno_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(missing_xattr_errno(), libc::ENOATTR);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(missing_xattr_errno(), libc::ENODATA);
     }
 }
