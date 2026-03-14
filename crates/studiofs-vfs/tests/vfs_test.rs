@@ -25,8 +25,8 @@ use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig, PgMetaEngine,
-    PostgresConfig, ROOT_INO, RedbMetaEngine, MetaError, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetaError, MetadataBackend, MetadataConfig,
+    PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
@@ -6125,7 +6125,9 @@ async fn test_xattr_limit_exact_and_exceeds_boundaries() {
     assert_eq!(vfs.get_xattr(attr.ino, b"user.limit").unwrap(), Some(exact));
 
     let too_big = vec![b'b'; 17];
-    let err = vfs.set_xattr(attr.ino, b"user.limit", &too_big, 0).unwrap_err();
+    let err = vfs
+        .set_xattr(attr.ino, b"user.limit", &too_big, 0)
+        .unwrap_err();
     assert!(matches!(
         err,
         VfsError::Meta(MetaError::XattrValueTooLarge {

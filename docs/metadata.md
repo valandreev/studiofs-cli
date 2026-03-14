@@ -416,6 +416,12 @@ enough for callers and tests.
 `listxattrs` starts from `base_xattrs`, removes tombstoned keys, then overlays
 local `xattrs`.
 
+Resource-fork compatibility:
+- `com.apple.ResourceFork` may be stored in a compressed framed representation
+  inside metadata tables when it is smaller than plain bytes
+- reads decode transparently before returning values to callers
+- legacy plain persisted values are still accepted and returned unchanged
+
 ## Write Rules
 
 ### `create`
@@ -465,12 +471,19 @@ Destination side:
 - validate flags against merged xattr visibility
 - write only to local `xattrs`
 - remove any local tombstone for that key
+- for `com.apple.ResourceFork`, encode to compressed framed bytes only when
+  beneficial; otherwise store plain bytes
 
 ### `removexattr`
 
 - validate existence against merged xattr visibility
 - remove the local `xattrs` entry for that key
 - if the key exists in `base_xattrs`, write a tombstone
+
+Migration behavior:
+- no offline migration is required
+- existing plain `com.apple.ResourceFork` rows remain readable
+- rewrite-on-set progressively upgrades hot keys to compressed representation
 
 ## Foreign PostgreSQL Apply
 
