@@ -6,7 +6,8 @@ use std::path::Path;
 
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
-    FileType, MetaEngine, MetaError, MetadataBackend, ROOT_INO, open_meta_engine,
+    FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
+    open_meta_engine_with_options,
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ struct NamespaceScan {
     dangling: Vec<DanglingDentry>,
     reachable_inodes: HashSet<u64>,
     incoming_links: HashMap<u64, u32>,
+    child_dir_counts: HashMap<u64, u32>,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +86,7 @@ fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
                     scan.reachable_inodes.insert(attr.ino);
                     *scan.incoming_links.entry(attr.ino).or_insert(0) += 1;
                     if attr.kind == FileType::Directory {
+                        *scan.child_dir_counts.entry(parent).or_insert(0) += 1;
                         stack.push(attr.ino);
                     }
                 }
@@ -107,12 +110,36 @@ fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
     Ok(scan)
 }
 
-fn collect_report(meta: &dyn MetaEngine) -> anyhow::Result<FsckReport> {
+fn collect_report_with_progress(meta: &dyn MetaEngine, progress: bool) -> anyhow::Result<FsckReport> {
+    if progress {
+        println!("Collecting fsck inputs...");
+        println!("  reading pending create records...");
+    }
     let pending_creates = meta.list_pending_creates()?;
+    if progress {
+        println!("  reading deferred delete records...");
+    }
     let deferred_deletes = meta.list_deferred_deletes()?;
+    if progress {
+        println!("  reading undo log records...");
+    }
     let undo_logs = meta.list_undo_logs()?;
+    if progress {
+        println!("  enumerating inode attributes...");
+    }
     let all_inodes = meta.list_inode_attrs()?;
+    if progress {
+        println!("  scanning reachable namespace from root...");
+    }
     let scan = scan_namespace(meta)?;
+    if progress {
+        println!(
+            "  namespace scan complete: reachable_inodes={} dangling_dentries={}",
+            scan.reachable_inodes.len(),
+            scan.dangling.len()
+        );
+        println!("  reconciling nlink and orphan state...");
+    }
 
     let mut report = FsckReport {
         dangling: scan.dangling,
@@ -130,16 +157,18 @@ fn collect_report(meta: &dyn MetaEngine) -> anyhow::Result<FsckReport> {
             });
         }
 
-        if attr.kind != FileType::Directory {
-            let actual_links = scan.incoming_links.get(&attr.ino).copied().unwrap_or(0);
-            if attr.nlink != actual_links {
-                report.nlink_mismatches.push(NlinkMismatch {
-                    ino: attr.ino,
-                    kind: attr.kind,
-                    expected_nlink: attr.nlink,
-                    actual_links,
-                });
-            }
+        let actual_nlink = if attr.kind == FileType::Directory {
+            2 + scan.child_dir_counts.get(&attr.ino).copied().unwrap_or(0)
+        } else {
+            scan.incoming_links.get(&attr.ino).copied().unwrap_or(0)
+        };
+        if attr.nlink != actual_nlink {
+            report.nlink_mismatches.push(NlinkMismatch {
+                ino: attr.ino,
+                kind: attr.kind,
+                expected_nlink: attr.nlink,
+                actual_links: actual_nlink,
+            });
         }
     }
 
@@ -151,6 +180,10 @@ fn collect_report(meta: &dyn MetaEngine) -> anyhow::Result<FsckReport> {
     }
 
     Ok(report)
+}
+
+fn collect_report(meta: &dyn MetaEngine) -> anyhow::Result<FsckReport> {
+    collect_report_with_progress(meta, false)
 }
 
 fn print_report(name: &str, report: &FsckReport) {
@@ -418,6 +451,26 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
         processed_orphans.insert(orphan.ino);
     }
 
+    let mut repaired_nlinks = 0usize;
+    let post_cleanup = collect_report(meta)?;
+    for mismatch in &post_cleanup.nlink_mismatches {
+        let mut attr = match meta.get_attr(mismatch.ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => continue,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read inode {} before nlink repair: {}",
+                    mismatch.ino,
+                    err
+                ));
+            }
+        };
+        attr.nlink = mismatch.actual_links;
+        attr.touch_ctime();
+        meta.set_attr(&attr)?;
+        repaired_nlinks += 1;
+    }
+
     println!("Repair summary:");
     println!("  replayed undo parents: {}", replayed.len());
     println!("  dangling entries removed: {}", removed_dangling);
@@ -426,10 +479,7 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     println!("  orphan blocks pending gc: {}", orphan_blocks_pending_gc);
     println!("  orphan dirs skipped: {}", skipped_dir_orphans);
     println!("  orphan hardlinks skipped: {}", skipped_hardlink_orphans);
-    println!(
-        "  nlink mismatches are report-only in this revision: {}",
-        report.nlink_mismatches.len()
-    );
+    println!("  nlink mismatches repaired: {}", repaired_nlinks);
     Ok(())
 }
 
@@ -439,7 +489,12 @@ pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()>
         anyhow::bail!("Volume '{}' not found at {}", name, db_path.display());
     }
 
-    let meta = open_meta_engine(&db_path)?;
+    let meta = open_meta_engine_with_options(
+        &db_path,
+        MetaOpenOptions {
+            background_poll: false,
+        },
+    )?;
     let format_info = meta.get_format_info()?;
 
     if format_info.metadata.backend == MetadataBackend::Postgres {
@@ -447,7 +502,8 @@ pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()>
         meta.sync_metadata()?;
     }
 
-    let report = collect_report(meta.as_ref())?;
+    println!("Collecting fsck report...");
+    let report = collect_report_with_progress(meta.as_ref(), true)?;
     print_report(name, &report);
 
     if !report.has_findings() {
@@ -472,7 +528,7 @@ pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()>
 
     println!();
     println!("Rescanning...");
-    let post = collect_report(meta.as_ref())?;
+    let post = collect_report_with_progress(meta.as_ref(), true)?;
     print_report(name, &post);
     if post.has_findings() {
         println!("Some issues remain; rerun fsck or inspect logs.");
@@ -521,5 +577,6 @@ mod tests {
 
         let post = collect_report(&engine).expect("collect post-repair report");
         assert!(post.orphan_inodes.is_empty());
+        assert!(post.nlink_mismatches.is_empty());
     }
 }

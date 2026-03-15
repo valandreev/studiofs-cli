@@ -53,6 +53,19 @@ pub struct PgMetaEngine {
     janitor_lock: Mutex<Option<PgJanitorLock>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PgOpenOptions {
+    pub background_poll: bool,
+}
+
+impl Default for PgOpenOptions {
+    fn default() -> Self {
+        Self {
+            background_poll: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct PendingReplicationState {
     ops: u32,
@@ -502,6 +515,13 @@ impl PgMetaEngine {
     }
 
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
+        Self::open_with_options(path, PgOpenOptions::default())
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: PgOpenOptions,
+    ) -> MetaResult<Arc<Self>> {
         let local = Arc::new(RedbMetaEngine::open(path)?);
         let info = local.get_format_info()?;
         if info.metadata.backend != MetadataBackend::Postgres {
@@ -584,7 +604,9 @@ impl PgMetaEngine {
         let _ = engine.sync_metadata();
         let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
-        Self::start_background_poll(Arc::downgrade(&engine), engine.poll_interval);
+        if options.background_poll {
+            Self::start_background_poll(Arc::downgrade(&engine), engine.poll_interval);
+        }
         Ok(engine)
     }
 
