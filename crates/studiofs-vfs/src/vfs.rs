@@ -5726,7 +5726,11 @@ impl StudioVfs {
         }
 
         let meta = self.meta.clone();
-        let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino)).await {
+        let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            engine.get_attr(ino)
+        })
+        .await
+        {
             Ok(attr) => attr,
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                 self.state
@@ -6730,7 +6734,9 @@ impl StudioVfs {
                     self.heal_orphaned_dentry(parent, name, Some(ino));
                     return Ok(());
                 }
-                Err(MetaError::IsADirectory(_)) => return Err(VfsError::Meta(MetaError::IsADirectory(ino))),
+                Err(MetaError::IsADirectory(_)) => {
+                    return Err(VfsError::Meta(MetaError::IsADirectory(ino)));
+                }
                 Err(err) => return Err(VfsError::Meta(err)),
             };
 
@@ -8636,7 +8642,10 @@ impl StudioVfs {
             }
             let meta = self.meta.clone();
             let (undo_total, undo_started, undo_replaying, undo_completed) =
-                match run_meta(meta, move |engine: Arc<dyn MetaEngine>| engine.list_undo_logs()).await
+                match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                    engine.list_undo_logs()
+                })
+                .await
                 {
                     Ok(records) => {
                         let mut started = 0usize;

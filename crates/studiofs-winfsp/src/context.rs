@@ -1051,9 +1051,8 @@ mod tests {
         FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
         FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
         STATUS_ACCESS_DENIED, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_OBJECT_NAME_NOT_FOUND,
-        StudioFsContext, WinfspKernelInvalidator, build_notify_info, ino_to_windows_path,
-        notify_filter_for_kind, vfs_to_winfsp_err,
+        STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator, build_notify_info,
+        ino_to_windows_path, notify_filter_for_kind, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;

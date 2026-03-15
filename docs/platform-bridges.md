@@ -175,6 +175,23 @@ in-memory pressure from very large native `com.apple.*` writes:
 This keeps shared directories free of macOS-only garbage while preserving normal
 Finder interaction.
 
+### macOS Unicode normalization (NFC/NFD)
+
+StudioFS keeps namespace bytes unchanged in the shared VFS/metadata layers, but
+applies Unicode normalization handling at the macOS FUSE boundary to match
+Finder/macFUSE expectations.
+
+Current policy:
+- `readdir` / `readdirplus` return names in decomposed form (NFD) for Finder compatibility
+- `lookup` and `rename` resolve names by canonical Unicode equivalence (NFD key),
+  so NFC/NFD variants of the same visible name map to the same directory entry when unique
+- when multiple byte-distinct entries would normalize to the same key, StudioFS
+  does not guess; it falls back to byte-exact behavior
+- Linux and Windows behavior is unchanged
+
+This scope keeps macOS interoperability predictable without broad
+cross-platform name-semantics changes.
+
 ### Implementation: `StudioFuseFs`
 
 Implements `fuser::Filesystem` trait.

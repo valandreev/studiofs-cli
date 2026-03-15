@@ -1271,7 +1271,11 @@ async fn test_background_janitor_recovers_pending_create_intent_runtime() {
         )
         .unwrap();
 
-    assert!(vfs.meta().lookup(ROOT_INO, b"janitor-pending-create.txt").is_ok());
+    assert!(
+        vfs.meta()
+            .lookup(ROOT_INO, b"janitor-pending-create.txt")
+            .is_ok()
+    );
     assert!(vfs.meta().get_attr(ino).is_err());
     assert!(
         vfs.meta()
@@ -1327,19 +1331,25 @@ async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime()
     vfs.meta()
         .unlink_open_handle(ROOT_INO, b"janitor-deferred-undo.txt")
         .unwrap();
-    assert!(vfs.meta().lookup(ROOT_INO, b"janitor-deferred-undo.txt").is_err());
-    assert!(vfs
-        .meta()
-        .list_deferred_deletes()
-        .unwrap()
-        .iter()
-        .any(|record| record.ino == ino));
-    assert!(vfs
-        .meta()
-        .list_undo_logs()
-        .unwrap()
-        .iter()
-        .any(|record| record.kind == UndoLogKind::DeferredDelete && record.ino == ino));
+    assert!(
+        vfs.meta()
+            .lookup(ROOT_INO, b"janitor-deferred-undo.txt")
+            .is_err()
+    );
+    assert!(
+        vfs.meta()
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|record| record.ino == ino)
+    );
+    assert!(
+        vfs.meta()
+            .list_undo_logs()
+            .unwrap()
+            .iter()
+            .any(|record| record.kind == UndoLogKind::DeferredDelete && record.ino == ino)
+    );
 
     assert!(
         wait_until(Duration::from_secs(25), || {
@@ -1407,20 +1417,19 @@ async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime()
     assert!(vfs.meta().get_attr(pending_ino).is_err());
 
     let deferred_name = b"janitor-mixed-deferred.txt";
-    let deferred_attr = vfs
-        .create(ROOT_INO, deferred_name, 0, 0, 0o644)
-        .unwrap();
+    let deferred_attr = vfs.create(ROOT_INO, deferred_name, 0, 0, 0o644).unwrap();
     let deferred_ino = deferred_attr.ino;
     vfs.meta()
         .unlink_open_handle(ROOT_INO, deferred_name)
         .unwrap();
     assert!(vfs.meta().lookup(ROOT_INO, deferred_name).is_err());
-    assert!(vfs
-        .meta()
-        .list_deferred_deletes()
-        .unwrap()
-        .iter()
-        .any(|record| record.ino == deferred_ino));
+    assert!(
+        vfs.meta()
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|record| record.ino == deferred_ino)
+    );
     let undo_before = vfs.meta().list_undo_logs().unwrap();
     assert!(
         undo_before.iter().any(|record| {
@@ -1446,14 +1455,9 @@ async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime()
                     .unwrap()
                     .iter()
                     .any(|record| record.ino == deferred_ino)
-                && vfs
-                    .meta()
-                    .list_undo_logs()
-                    .unwrap()
-                    .iter()
-                    .any(|record| {
-                        record.kind == UndoLogKind::DeferredDelete && record.ino == deferred_ino
-                    })
+                && vfs.meta().list_undo_logs().unwrap().iter().any(|record| {
+                    record.kind == UndoLogKind::DeferredDelete && record.ino == deferred_ino
+                })
         })
         .await,
         "runtime janitor should recover pending-create intents but leave deferred-delete undo for startup/crash recovery"
@@ -5938,7 +5942,9 @@ async fn test_release_fh_orphan_cleanup_is_idempotent_when_inode_already_missing
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "orphan-idempotent-cleanup");
 
-    let attr = vfs.create(1, b"orphan-idempotent.txt", 0, 0, 0o644).unwrap();
+    let attr = vfs
+        .create(1, b"orphan-idempotent.txt", 0, 0, 0o644)
+        .unwrap();
     let ino = attr.ino;
     vfs.write(ino, 0, b"orphan data").await.unwrap();
     vfs.flush(ino).await.unwrap();

@@ -3514,7 +3514,10 @@ impl MetaEngine for RedbMetaEngine {
             let table = txn
                 .open_table(table_def)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for row in table.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
                 let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 inos.insert(ino.value());
             }
@@ -4835,7 +4838,11 @@ impl MetaEngine for RedbMetaEngine {
                 let Some(deferred) = deferred_by_ino.get(&record.ino) else {
                     continue;
                 };
-                self.set_undo_log_phase_for(record.kind.clone(), record.ino, UndoLogPhase::Replaying)?;
+                self.set_undo_log_phase_for(
+                    record.kind.clone(),
+                    record.ino,
+                    UndoLogPhase::Replaying,
+                )?;
 
                 let blocks = match self.get_file_blocks(record.ino) {
                     Ok(blocks) => blocks,
@@ -5172,94 +5179,94 @@ impl MetaEngine for RedbMetaEngine {
         self.add_pending_create(&intent)?;
 
         let create_result = (|| -> MetaResult<InodeAttr> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let result_attr;
-        {
-            let parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
-            if parent_attr.kind != FileType::Directory {
-                return Err(MetaError::NotADirectory(parent));
-            }
-            if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
-                return Err(MetaError::EntryExists {
-                    parent,
-                    name: String::from_utf8_lossy(name).to_string(),
-                });
-            }
-
-            let mut dentries = txn
-                .open_table(DENTRIES_TABLE)
+            let txn = self
+                .db
+                .begin_write()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut counters = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let dentry_key = encode_dentry_key(parent, name);
-
-            let total_inodes = match counters
-                .get(counters::TOTAL_INODES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
+            let result_attr;
             {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            counters
-                .insert(counters::TOTAL_INODES, total_inodes + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+                if parent_attr.kind != FileType::Directory {
+                    return Err(MetaError::NotADirectory(parent));
+                }
+                if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+                    return Err(MetaError::EntryExists {
+                        parent,
+                        name: String::from_utf8_lossy(name).to_string(),
+                    });
+                }
 
-            let attr = InodeAttr::new_file(ino, parent, uid, gid, mode);
-            let attr_data = encode(&attr)?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut inode_tombstones = txn
-                .open_table(INODE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = inode_tombstones.remove(ino);
-            drop(inode_tombstones);
+                let mut dentries = txn
+                    .open_table(DENTRIES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut counters = txn
+                    .open_table(COUNTERS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            let entry_val = encode(&DirEntryValue {
-                ino,
-                kind: FileType::RegularFile,
-            })?;
-            dentries
-                .insert(dentry_key.as_slice(), entry_val.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut dentry_tombstones = txn
-                .open_table(DENTRY_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = dentry_tombstones.remove(dentry_key.as_slice());
+                let dentry_key = encode_dentry_key(parent, name);
 
-            // redb does not allow opening the same table twice in one write txn
-            // while an existing table handle is still alive.
-            drop(counters);
+                let total_inodes = match counters
+                    .get(counters::TOTAL_INODES)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    Some(v) => v.value(),
+                    None => 0,
+                };
+                counters
+                    .insert(counters::TOTAL_INODES, total_inodes + 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            result_attr = attr.clone();
+                let attr = InodeAttr::new_file(ino, parent, uid, gid, mode);
+                let attr_data = encode(&attr)?;
+                inodes
+                    .insert(ino, attr_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inode_tombstones = txn
+                    .open_table(INODE_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = inode_tombstones.remove(ino);
+                drop(inode_tombstones);
 
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name: name.to_vec(),
-                    entry: DirEntryValue {
-                        ino,
-                        kind: FileType::RegularFile,
+                let entry_val = encode(&DirEntryValue {
+                    ino,
+                    kind: FileType::RegularFile,
+                })?;
+                dentries
+                    .insert(dentry_key.as_slice(), entry_val.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut dentry_tombstones = txn
+                    .open_table(DENTRY_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = dentry_tombstones.remove(dentry_key.as_slice());
+
+                // redb does not allow opening the same table twice in one write txn
+                // while an existing table handle is still alive.
+                drop(counters);
+
+                result_attr = attr.clone();
+
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                )?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddEntry {
+                        parent,
+                        name: name.to_vec(),
+                        entry: DirEntryValue {
+                            ino,
+                            kind: FileType::RegularFile,
+                        },
                     },
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(result_attr)
+                )?;
+            }
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Ok(result_attr)
         })();
 
         match create_result {
@@ -5296,109 +5303,109 @@ impl MetaEngine for RedbMetaEngine {
         self.add_pending_create(&intent)?;
 
         let create_result = (|| -> MetaResult<InodeAttr> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let result_attr;
-        {
-            let mut parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
-            if parent_attr.kind != FileType::Directory {
-                return Err(MetaError::NotADirectory(parent));
-            }
-            if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
-                return Err(MetaError::EntryExists {
-                    parent,
-                    name: String::from_utf8_lossy(name).to_string(),
-                });
-            }
-
-            let mut dentries = txn
-                .open_table(DENTRIES_TABLE)
+            let txn = self
+                .db
+                .begin_write()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut counters = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let dentry_key = encode_dentry_key(parent, name);
-
-            let total_inodes = match counters
-                .get(counters::TOTAL_INODES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
+            let result_attr;
             {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            counters
-                .insert(counters::TOTAL_INODES, total_inodes + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+                if parent_attr.kind != FileType::Directory {
+                    return Err(MetaError::NotADirectory(parent));
+                }
+                if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+                    return Err(MetaError::EntryExists {
+                        parent,
+                        name: String::from_utf8_lossy(name).to_string(),
+                    });
+                }
 
-            let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode);
-            let attr_data = encode(&attr)?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut inode_tombstones = txn
-                .open_table(INODE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = inode_tombstones.remove(ino);
-            let _ = inode_tombstones.remove(parent);
-            drop(inode_tombstones);
+                let mut dentries = txn
+                    .open_table(DENTRIES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut counters = txn
+                    .open_table(COUNTERS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            let entry_val = encode(&DirEntryValue {
-                ino,
-                kind: FileType::Directory,
-            })?;
-            dentries
-                .insert(dentry_key.as_slice(), entry_val.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut dentry_tombstones = txn
-                .open_table(DENTRY_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = dentry_tombstones.remove(dentry_key.as_slice());
-            drop(dentry_tombstones);
+                let dentry_key = encode_dentry_key(parent, name);
 
-            parent_attr.nlink += 1;
-            parent_attr.touch_mtime();
-            let p_data = encode(&parent_attr)?;
-            inodes
-                .insert(parent, p_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let total_inodes = match counters
+                    .get(counters::TOTAL_INODES)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    Some(v) => v.value(),
+                    None => 0,
+                };
+                counters
+                    .insert(counters::TOTAL_INODES, total_inodes + 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            // redb does not allow opening the same table twice in one write txn
-            // while an existing table handle is still alive.
-            drop(counters);
+                let attr = InodeAttr::new_dir(ino, parent, uid, gid, mode);
+                let attr_data = encode(&attr)?;
+                inodes
+                    .insert(ino, attr_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inode_tombstones = txn
+                    .open_table(INODE_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = inode_tombstones.remove(ino);
+                let _ = inode_tombstones.remove(parent);
+                drop(inode_tombstones);
 
-            result_attr = attr.clone();
+                let entry_val = encode(&DirEntryValue {
+                    ino,
+                    kind: FileType::Directory,
+                })?;
+                dentries
+                    .insert(dentry_key.as_slice(), entry_val.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut dentry_tombstones = txn
+                    .open_table(DENTRY_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = dentry_tombstones.remove(dentry_key.as_slice());
+                drop(dentry_tombstones);
 
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr {
-                    attr: parent_attr.clone(),
-                },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name: name.to_vec(),
-                    entry: DirEntryValue {
-                        ino,
-                        kind: FileType::Directory,
+                parent_attr.nlink += 1;
+                parent_attr.touch_mtime();
+                let p_data = encode(&parent_attr)?;
+                inodes
+                    .insert(parent, p_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                // redb does not allow opening the same table twice in one write txn
+                // while an existing table handle is still alive.
+                drop(counters);
+
+                result_attr = attr.clone();
+
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                )?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr {
+                        attr: parent_attr.clone(),
                     },
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(result_attr)
+                )?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddEntry {
+                        parent,
+                        name: name.to_vec(),
+                        entry: DirEntryValue {
+                            ino,
+                            kind: FileType::Directory,
+                        },
+                    },
+                )?;
+            }
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Ok(result_attr)
         })();
 
         match create_result {
@@ -5435,104 +5442,104 @@ impl MetaEngine for RedbMetaEngine {
         self.add_pending_create(&intent)?;
 
         let create_result = (|| -> MetaResult<InodeAttr> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let result_attr;
-        {
-            let parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
-            if parent_attr.kind != FileType::Directory {
-                return Err(MetaError::NotADirectory(parent));
-            }
-            if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
-                return Err(MetaError::EntryExists {
-                    parent,
-                    name: String::from_utf8_lossy(name).to_string(),
-                });
-            }
-
-            let mut dentries = txn
-                .open_table(DENTRIES_TABLE)
+            let txn = self
+                .db
+                .begin_write()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut counters = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let dentry_key = encode_dentry_key(parent, name);
-
-            let total_inodes = match counters
-                .get(counters::TOTAL_INODES)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
+            let result_attr;
             {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            counters
-                .insert(counters::TOTAL_INODES, total_inodes + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let parent_attr = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+                if parent_attr.kind != FileType::Directory {
+                    return Err(MetaError::NotADirectory(parent));
+                }
+                if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+                    return Err(MetaError::EntryExists {
+                        parent,
+                        name: String::from_utf8_lossy(name).to_string(),
+                    });
+                }
 
-            let attr = InodeAttr::new_symlink(ino, parent, uid, gid, target.len());
-            let attr_data = encode(&attr)?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut inode_tombstones = txn
-                .open_table(INODE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = inode_tombstones.remove(ino);
-            drop(inode_tombstones);
+                let mut dentries = txn
+                    .open_table(DENTRIES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut counters = txn
+                    .open_table(COUNTERS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            let entry_val = encode(&DirEntryValue {
-                ino,
-                kind: FileType::Symlink,
-            })?;
-            dentries
-                .insert(dentry_key.as_slice(), entry_val.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut dentry_tombstones = txn
-                .open_table(DENTRY_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = dentry_tombstones.remove(dentry_key.as_slice());
-            drop(dentry_tombstones);
+                let dentry_key = encode_dentry_key(parent, name);
 
-            Self::set_symlink_overlay_in_txn(&txn, ino, target)?;
+                let total_inodes = match counters
+                    .get(counters::TOTAL_INODES)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    Some(v) => v.value(),
+                    None => 0,
+                };
+                counters
+                    .insert(counters::TOTAL_INODES, total_inodes + 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            // redb does not allow opening the same table twice in one write txn
-            // while an existing table handle is still alive.
-            drop(counters);
+                let attr = InodeAttr::new_symlink(ino, parent, uid, gid, target.len());
+                let attr_data = encode(&attr)?;
+                inodes
+                    .insert(ino, attr_data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inode_tombstones = txn
+                    .open_table(INODE_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = inode_tombstones.remove(ino);
+                drop(inode_tombstones);
 
-            result_attr = attr.clone();
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetSymlinkTarget {
+                let entry_val = encode(&DirEntryValue {
                     ino,
-                    target: target.to_vec(),
-                },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name: name.to_vec(),
-                    entry: DirEntryValue {
+                    kind: FileType::Symlink,
+                })?;
+                dentries
+                    .insert(dentry_key.as_slice(), entry_val.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut dentry_tombstones = txn
+                    .open_table(DENTRY_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = dentry_tombstones.remove(dentry_key.as_slice());
+                drop(dentry_tombstones);
+
+                Self::set_symlink_overlay_in_txn(&txn, ino, target)?;
+
+                // redb does not allow opening the same table twice in one write txn
+                // while an existing table handle is still alive.
+                drop(counters);
+
+                result_attr = attr.clone();
+
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                )?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetSymlinkTarget {
                         ino,
-                        kind: FileType::Symlink,
+                        target: target.to_vec(),
                     },
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(result_attr)
+                )?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddEntry {
+                        parent,
+                        name: name.to_vec(),
+                        entry: DirEntryValue {
+                            ino,
+                            kind: FileType::Symlink,
+                        },
+                    },
+                )?;
+            }
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Ok(result_attr)
         })();
 
         match create_result {
@@ -6074,10 +6081,7 @@ impl RedbMetaEngine {
                 .open_table(UNDO_LOG_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut entries = Vec::new();
-            for row in undo
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
+            for row in undo.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 let rec: UndoLogRecord = decode(v.value())?;
                 entries.push((k.value(), rec));
@@ -6296,7 +6300,9 @@ mod tests {
             .create_file(ROOT_INO, b"open-unlink.txt", 1000, 1000, 0o644)
             .unwrap();
 
-        let result = engine.unlink_open_handle(ROOT_INO, b"open-unlink.txt").unwrap();
+        let result = engine
+            .unlink_open_handle(ROOT_INO, b"open-unlink.txt")
+            .unwrap();
 
         assert_eq!(result.ino, attr.ino);
         assert_eq!(result.nlink, 0);
@@ -6372,9 +6378,11 @@ mod tests {
         let deferred_after = engine.list_deferred_deletes().unwrap();
         assert!(!deferred_after.iter().any(|r| r.ino == attr.ino));
         let undo_after = engine.list_undo_logs().unwrap();
-        assert!(!undo_after
-            .iter()
-            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == attr.ino));
+        assert!(
+            !undo_after
+                .iter()
+                .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == attr.ino)
+        );
     }
 
     #[test]
@@ -6391,19 +6399,23 @@ mod tests {
             created_at: 0,
         };
         engine.append_undo_log(&stale).unwrap();
-        assert!(engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.op_id == stale.op_id));
+        assert!(
+            engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.op_id == stale.op_id)
+        );
 
         let touched = engine.recover_undo_logs().unwrap();
         assert!(touched.is_empty());
-        assert!(!engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.op_id == stale.op_id));
+        assert!(
+            !engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.op_id == stale.op_id)
+        );
     }
 
     #[test]
@@ -6437,14 +6449,14 @@ mod tests {
         let deferred_attr = engine
             .create_file(ROOT_INO, deferred_name, 1000, 1000, 0o644)
             .unwrap();
-        engine
-            .unlink_open_handle(ROOT_INO, deferred_name)
-            .unwrap();
-        assert!(engine
-            .list_deferred_deletes()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == deferred_attr.ino));
+        engine.unlink_open_handle(ROOT_INO, deferred_name).unwrap();
+        assert!(
+            engine
+                .list_deferred_deletes()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == deferred_attr.ino)
+        );
 
         let touched = engine.recover_undo_logs().unwrap();
         assert!(touched.contains(&ROOT_INO));
@@ -6455,11 +6467,13 @@ mod tests {
             engine.get_attr(deferred_attr.ino),
             Err(MetaError::InodeNotFound(_))
         ));
-        assert!(!engine
-            .list_deferred_deletes()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == deferred_attr.ino));
+        assert!(
+            !engine
+                .list_deferred_deletes()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == deferred_attr.ino)
+        );
         assert!(engine.list_undo_logs().unwrap().is_empty());
     }
 
@@ -6474,11 +6488,13 @@ mod tests {
         engine
             .unlink_open_handle(ROOT_INO, b"replaying-phase.txt")
             .unwrap();
-        assert!(engine
-            .list_deferred_deletes()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == ino));
+        assert!(
+            engine
+                .list_deferred_deletes()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == ino)
+        );
 
         engine
             .remove_undo_logs_for(UndoLogKind::DeferredDelete, ino)
@@ -6496,17 +6512,24 @@ mod tests {
 
         let touched = engine.recover_undo_logs().unwrap();
         assert!(touched.contains(&ROOT_INO));
-        assert!(matches!(engine.get_attr(ino), Err(MetaError::InodeNotFound(_))));
-        assert!(!engine
-            .list_deferred_deletes()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == ino));
-        assert!(!engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == ino));
+        assert!(matches!(
+            engine.get_attr(ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+        assert!(
+            !engine
+                .list_deferred_deletes()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == ino)
+        );
+        assert!(
+            !engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == ino)
+        );
     }
 
     #[test]
@@ -6554,11 +6577,13 @@ mod tests {
         assert!(touched.contains(&ROOT_INO));
         assert!(engine.lookup(ROOT_INO, name).is_err());
         assert!(engine.list_pending_creates().unwrap().is_empty());
-        assert!(!engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino));
+        assert!(
+            !engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino)
+        );
     }
 
     #[test]
@@ -6588,11 +6613,13 @@ mod tests {
         assert_eq!(completed.phase, UndoLogPhase::Completed);
 
         engine.cleanup_stale_undo_logs().unwrap();
-        assert!(!engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino));
+        assert!(
+            !engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino)
+        );
     }
 
     #[test]
@@ -6608,11 +6635,13 @@ mod tests {
             .unwrap();
 
         engine.remove_deferred_delete(ino).unwrap();
-        assert!(!engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == ino));
+        assert!(
+            !engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == ino)
+        );
     }
 
     #[test]
@@ -6630,16 +6659,20 @@ mod tests {
         engine.add_pending_create(&intent).unwrap();
 
         engine.remove_pending_create(ino).unwrap();
-        assert!(!engine
-            .list_pending_creates()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == ino));
-        assert!(!engine
-            .list_undo_logs()
-            .unwrap()
-            .iter()
-            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino));
+        assert!(
+            !engine
+                .list_pending_creates()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == ino)
+        );
+        assert!(
+            !engine
+                .list_undo_logs()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == ino)
+        );
     }
 
     #[test]
@@ -6693,25 +6726,33 @@ mod tests {
                 && r.ino == deferred_ino
                 && r.phase == UndoLogPhase::Completed
         }));
-        assert!(engine
-            .list_pending_creates()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == pending_ino));
-        assert!(engine
-            .list_deferred_deletes()
-            .unwrap()
-            .iter()
-            .any(|r| r.ino == deferred_ino));
+        assert!(
+            engine
+                .list_pending_creates()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == pending_ino)
+        );
+        assert!(
+            engine
+                .list_deferred_deletes()
+                .unwrap()
+                .iter()
+                .any(|r| r.ino == deferred_ino)
+        );
 
         engine.cleanup_stale_undo_logs().unwrap();
         let after = engine.list_undo_logs().unwrap();
-        assert!(!after
-            .iter()
-            .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == pending_ino));
-        assert!(!after
-            .iter()
-            .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == deferred_ino));
+        assert!(
+            !after
+                .iter()
+                .any(|r| r.kind == UndoLogKind::PendingCreate && r.ino == pending_ino)
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|r| r.kind == UndoLogKind::DeferredDelete && r.ino == deferred_ino)
+        );
     }
 
     #[test]
@@ -6965,9 +7006,7 @@ mod tests {
         let file = engine
             .create_file(ROOT_INO, b"sparse.txt", 1000, 1000, 0o644)
             .unwrap();
-        engine
-            .set_counter(counters::NEXT_INODE, 1_000_000)
-            .unwrap();
+        engine.set_counter(counters::NEXT_INODE, 1_000_000).unwrap();
 
         let attrs = engine.list_inode_attrs().unwrap();
         let inos: std::collections::BTreeSet<_> = attrs.into_iter().map(|attr| attr.ino).collect();

@@ -115,16 +115,7 @@ pub enum UndoLogKind {
     DeferredDelete,
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UndoLogPhase {
     #[default]
     Started,
