@@ -147,7 +147,15 @@ fn normalize_macos_readdir_name(name: &[u8]) -> Vec<u8> {
     let Some(name) = std::str::from_utf8(name).ok() else {
         return name.to_vec();
     };
-    name.nfd().collect::<String>().into_bytes()
+    if name.nfd().eq(name.chars()) {
+        return name.as_bytes().to_vec();
+    }
+    let mut normalized = Vec::with_capacity(name.len());
+    for ch in name.nfd() {
+        let mut utf8 = [0_u8; 4];
+        normalized.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+    }
+    normalized
 }
 
 /// Convert POSIX O_* flags to our OpenFlags.
@@ -266,15 +274,25 @@ impl Filesystem for StudioFuseFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_bytes = os_str_bytes(name).to_vec();
         #[cfg(target_os = "macos")]
-        let lookup_name = if let Ok(entries) = self.vfs.readdir(parent) {
-            resolve_macos_namespace_name(&name_bytes, &entries)
-        } else {
-            name_bytes.clone()
-        };
+        let attr_result = self.vfs.lookup(parent, &name_bytes).or_else(|err| {
+            if !matches!(
+                err,
+                VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+            ) {
+                return Err(err);
+            }
+            if let Ok(entries) = self.vfs.readdir(parent) {
+                let resolved = resolve_macos_namespace_name(&name_bytes, &entries);
+                if resolved != name_bytes {
+                    return self.vfs.lookup(parent, &resolved);
+                }
+            }
+            Err(err)
+        });
         #[cfg(not(target_os = "macos"))]
-        let lookup_name = name_bytes.clone();
+        let attr_result = self.vfs.lookup(parent, &name_bytes);
 
-        match self.vfs.lookup(parent, &lookup_name) {
+        match attr_result {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
@@ -518,7 +536,9 @@ impl Filesystem for StudioFuseFs {
         let requested_old_name = os_str_bytes(name).to_vec();
         let requested_new_name = os_str_bytes(newname).to_vec();
         #[cfg(target_os = "macos")]
-        let old_name = if let Ok(entries) = self.vfs.readdir(parent) {
+        let old_name = if self.vfs.lookup(parent, &requested_old_name).is_ok() {
+            requested_old_name.clone()
+        } else if let Ok(entries) = self.vfs.readdir(parent) {
             resolve_macos_namespace_name(&requested_old_name, &entries)
         } else {
             requested_old_name.clone()
@@ -526,7 +546,9 @@ impl Filesystem for StudioFuseFs {
         #[cfg(not(target_os = "macos"))]
         let old_name = requested_old_name.clone();
         #[cfg(target_os = "macos")]
-        let new_name = if let Ok(entries) = self.vfs.readdir(newparent) {
+        let new_name = if self.vfs.lookup(newparent, &requested_new_name).is_ok() {
+            requested_new_name.clone()
+        } else if let Ok(entries) = self.vfs.readdir(newparent) {
             resolve_macos_namespace_name(&requested_new_name, &entries)
         } else {
             requested_new_name.clone()
