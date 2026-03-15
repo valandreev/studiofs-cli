@@ -110,22 +110,20 @@ fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) 
 }
 
 #[cfg(target_os = "macos")]
-fn macos_normalization_key(name: &[u8]) -> Option<String> {
-    let name = std::str::from_utf8(name).ok()?;
-    Some(name.nfd().collect::<String>())
-}
-
-#[cfg(target_os = "macos")]
 fn recover_macos_normalized_name(name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
     // Policy: keep the VFS namespace byte-exact, but at the macOS FUSE boundary
     // resolve name lookup/rename by canonical Unicode equivalence (NFD key).
-    let key = macos_normalization_key(name)?;
+    let key_str = std::str::from_utf8(name).ok()?;
+    let key_nfd = key_str.nfd().collect::<String>();
     let mut canonical_match: Option<&[u8]> = None;
     for entry in entries {
         if entry.name.as_slice() == name {
             return None;
         }
-        if macos_normalization_key(&entry.name).as_deref() != Some(key.as_str()) {
+        let Ok(entry_str) = std::str::from_utf8(&entry.name) else {
+            continue;
+        };
+        if !entry_str.nfd().eq(key_nfd.chars()) {
             continue;
         }
         if canonical_match.is_some() {
@@ -214,10 +212,10 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
 fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32) -> FileAttr {
     let uid = if attr.uid == 0 { mount_uid } else { attr.uid };
     let gid = if attr.gid == 0 { mount_gid } else { attr.gid };
-    FileAttr {
-        ino: attr.ino,
-        size: attr.size,
-        blocks: (attr.size + 511) / 512,
+        FileAttr {
+            ino: attr.ino,
+            size: attr.size,
+            blocks: attr.size.div_ceil(512),
         atime: UNIX_EPOCH + Duration::from_nanos(attr.atime.max(0) as u64),
         mtime: UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64),
         ctime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
@@ -228,7 +226,7 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32)
             FileType::Symlink => FuseFileType::Symlink,
         },
         perm: attr.mode & 0o7777,
-        nlink: attr.nlink as u32,
+        nlink: attr.nlink,
         uid,
         gid,
         rdev: 0,
@@ -275,10 +273,9 @@ impl Filesystem for StudioFuseFs {
         let name_bytes = os_str_bytes(name).to_vec();
         #[cfg(target_os = "macos")]
         let attr_result = self.vfs.lookup(parent, &name_bytes).or_else(|err| {
-            if !matches!(
-                err,
-                VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
-            ) {
+            if !matches!(err, VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. }))
+                || name_bytes.is_ascii()
+            {
                 return Err(err);
             }
             if let Ok(entries) = self.vfs.readdir(parent) {
@@ -538,6 +535,8 @@ impl Filesystem for StudioFuseFs {
         #[cfg(target_os = "macos")]
         let old_name = if self.vfs.lookup(parent, &requested_old_name).is_ok() {
             requested_old_name.clone()
+        } else if requested_old_name.is_ascii() {
+            requested_old_name.clone()
         } else if let Ok(entries) = self.vfs.readdir(parent) {
             resolve_macos_namespace_name(&requested_old_name, &entries)
         } else {
@@ -547,6 +546,8 @@ impl Filesystem for StudioFuseFs {
         let old_name = requested_old_name.clone();
         #[cfg(target_os = "macos")]
         let new_name = if self.vfs.lookup(newparent, &requested_new_name).is_ok() {
+            requested_new_name.clone()
+        } else if requested_new_name.is_ascii() {
             requested_new_name.clone()
         } else if let Ok(entries) = self.vfs.readdir(newparent) {
             resolve_macos_namespace_name(&requested_new_name, &entries)
@@ -563,12 +564,31 @@ impl Filesystem for StudioFuseFs {
                 if matches!(
                     e,
                     VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
-                ) {
-                    if let Ok(entries) = self.vfs.readdir(parent) {
-                        if let Some(recovered_old_name) =
-                            recover_macos_truncated_rename_source(&old_name, &entries)
-                        {
-                            debug!(
+                ) && let Ok(entries) = self.vfs.readdir(parent)
+                && let Some(recovered_old_name) = recover_macos_truncated_rename_source(&old_name, &entries)
+                {
+                    debug!(
+                        parent,
+                        newparent,
+                        flags = _flags,
+                        old_name = %debug_name(&old_name),
+                        recovered_old_name = %debug_name(&recovered_old_name),
+                        new_name = %debug_name(&new_name),
+                        old_name_bytes = ?old_name,
+                        recovered_old_name_bytes = ?recovered_old_name,
+                        new_name_bytes = ?new_name,
+                        "rename retry with recovered macOS source name"
+                    );
+                    match self
+                        .vfs
+                        .rename(parent, &recovered_old_name, newparent, &new_name)
+                    {
+                        Ok(()) => {
+                            reply.ok();
+                            return;
+                        }
+                        Err(retry_err) => {
+                            error!(
                                 parent,
                                 newparent,
                                 flags = _flags,
@@ -578,33 +598,10 @@ impl Filesystem for StudioFuseFs {
                                 old_name_bytes = ?old_name,
                                 recovered_old_name_bytes = ?recovered_old_name,
                                 new_name_bytes = ?new_name,
-                                "rename retry with recovered macOS source name"
+                                "rename retry -> {retry_err}"
                             );
-                            match self
-                                .vfs
-                                .rename(parent, &recovered_old_name, newparent, &new_name)
-                            {
-                                Ok(()) => {
-                                    reply.ok();
-                                    return;
-                                }
-                                Err(retry_err) => {
-                                    error!(
-                                        parent,
-                                        newparent,
-                                        flags = _flags,
-                                        old_name = %debug_name(&old_name),
-                                        recovered_old_name = %debug_name(&recovered_old_name),
-                                        new_name = %debug_name(&new_name),
-                                        old_name_bytes = ?old_name,
-                                        recovered_old_name_bytes = ?recovered_old_name,
-                                        new_name_bytes = ?new_name,
-                                        "rename retry -> {retry_err}"
-                                    );
-                                    reply.error(vfs_err_to_errno(&retry_err));
-                                    return;
-                                }
-                            }
+                            reply.error(vfs_err_to_errno(&retry_err));
+                            return;
                         }
                     }
                 }

@@ -182,6 +182,9 @@ pub fn mount_and_serve(
     // Drain uploads and persist cache checkpoint before process exit.
     tracing::info!("unmounted, draining uploads …");
     rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
+    // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard exit.
+    // Without this, libfuse resources can remain partially alive and abort on process shutdown.
+    drop(session);
     // Use process::exit to avoid blocking on tokio Runtime drop, which would
     // wait for all background tasks (janitor, GC etc.) to complete — causing
     // an indefinite hang after unmount on Linux/WSL.
