@@ -110,7 +110,10 @@ fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
     Ok(scan)
 }
 
-fn collect_report_with_progress(meta: &dyn MetaEngine, progress: bool) -> anyhow::Result<FsckReport> {
+fn collect_report_with_progress(
+    meta: &dyn MetaEngine,
+    progress: bool,
+) -> anyhow::Result<FsckReport> {
     if progress {
         println!("Collecting fsck inputs...");
         println!("  reading pending create records...");
@@ -305,7 +308,13 @@ fn repair_orphan_directory(
     let entries = match meta.readdir(ino) {
         Ok(entries) => entries,
         Err(MetaError::InodeNotFound(_)) => return Ok(()),
-        Err(err) => return Err(anyhow::anyhow!("readdir failed for orphan dir {}: {}", ino, err)),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "readdir failed for orphan dir {}: {}",
+                ino,
+                err
+            ));
+        }
     };
 
     for entry in entries {
@@ -368,12 +377,7 @@ fn repair_orphan_directory(
                 }
 
                 if attr.is_some() {
-                    remove_orphan_file(
-                        meta,
-                        entry.ino,
-                        orphan_blocks_pending_gc,
-                        removed_orphans,
-                    )?;
+                    remove_orphan_file(meta, entry.ino, orphan_blocks_pending_gc, removed_orphans)?;
                 }
                 processed.insert(entry.ino);
             }
@@ -396,7 +400,10 @@ fn repair_orphan_directory(
 fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     let replayed = meta.recover_undo_logs()?;
     if !replayed.is_empty() {
-        println!("Replayed undo logs, touched {} parent dirs.", replayed.len());
+        println!(
+            "Replayed undo logs, touched {} parent dirs.",
+            replayed.len()
+        );
     }
 
     let mut removed_dangling = 0usize;

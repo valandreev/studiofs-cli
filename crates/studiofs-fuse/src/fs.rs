@@ -13,10 +13,14 @@ use fuser::{
 use studiofs_meta::FileType;
 #[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
+#[cfg(target_os = "macos")]
+use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, warn};
+#[cfg(target_os = "macos")]
+use unicode_normalization::UnicodeNormalization;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -85,10 +89,7 @@ fn normalize_unix_mode(mode: u32) -> u16 {
 }
 
 #[cfg(target_os = "macos")]
-fn recover_macos_truncated_rename_source(
-    old_name: &[u8],
-    entries: &[studiofs_meta::DirEntry],
-) -> Option<Vec<u8>> {
+fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
     if old_name.is_empty() {
         return None;
     }
@@ -106,6 +107,47 @@ fn recover_macos_truncated_rename_source(
         return None;
     }
     Some(recovered.to_vec())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_normalization_key(name: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(name).ok()?;
+    Some(name.nfd().collect::<String>())
+}
+
+#[cfg(target_os = "macos")]
+fn recover_macos_normalized_name(name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
+    // Policy: keep the VFS namespace byte-exact, but at the macOS FUSE boundary
+    // resolve name lookup/rename by canonical Unicode equivalence (NFD key).
+    let key = macos_normalization_key(name)?;
+    let mut canonical_match: Option<&[u8]> = None;
+    for entry in entries {
+        if entry.name.as_slice() == name {
+            return None;
+        }
+        if macos_normalization_key(&entry.name).as_deref() != Some(key.as_str()) {
+            continue;
+        }
+        if canonical_match.is_some() {
+            return None;
+        }
+        canonical_match = Some(entry.name.as_slice());
+    }
+    canonical_match.map(ToOwned::to_owned)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_namespace_name(name: &[u8], entries: &[DirEntry]) -> Vec<u8> {
+    recover_macos_normalized_name(name, entries).unwrap_or_else(|| name.to_vec())
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_readdir_name(name: &[u8]) -> Vec<u8> {
+    // Finder/macFUSE expect decomposed (NFD) names in directory listings.
+    let Some(name) = std::str::from_utf8(name).ok() else {
+        return name.to_vec();
+    };
+    name.nfd().collect::<String>().into_bytes()
 }
 
 /// Convert POSIX O_* flags to our OpenFlags.
@@ -223,7 +265,16 @@ impl StudioFuseFs {
 impl Filesystem for StudioFuseFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_bytes = os_str_bytes(name).to_vec();
-        match self.vfs.lookup(parent, &name_bytes) {
+        #[cfg(target_os = "macos")]
+        let lookup_name = if let Ok(entries) = self.vfs.readdir(parent) {
+            resolve_macos_namespace_name(&name_bytes, &entries)
+        } else {
+            name_bytes.clone()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let lookup_name = name_bytes.clone();
+
+        match self.vfs.lookup(parent, &lookup_name) {
             Ok(attr) => reply.entry(
                 &TTL,
                 &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
@@ -464,8 +515,25 @@ impl Filesystem for StudioFuseFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let old_name = os_str_bytes(name).to_vec();
-        let new_name = os_str_bytes(newname).to_vec();
+        let requested_old_name = os_str_bytes(name).to_vec();
+        let requested_new_name = os_str_bytes(newname).to_vec();
+        #[cfg(target_os = "macos")]
+        let old_name = if let Ok(entries) = self.vfs.readdir(parent) {
+            resolve_macos_namespace_name(&requested_old_name, &entries)
+        } else {
+            requested_old_name.clone()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let old_name = requested_old_name.clone();
+        #[cfg(target_os = "macos")]
+        let new_name = if let Ok(entries) = self.vfs.readdir(newparent) {
+            resolve_macos_namespace_name(&requested_new_name, &entries)
+        } else {
+            requested_new_name.clone()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let new_name = requested_new_name.clone();
+
         match self.vfs.rename(parent, &old_name, newparent, &new_name) {
             Ok(()) => reply.ok(),
             Err(e) => {
@@ -522,8 +590,12 @@ impl Filesystem for StudioFuseFs {
                     parent,
                     newparent,
                     flags = _flags,
+                    requested_old_name = %debug_name(&requested_old_name),
+                    requested_new_name = %debug_name(&requested_new_name),
                     old_name = %debug_name(&old_name),
                     new_name = %debug_name(&new_name),
+                    requested_old_name_bytes = ?requested_old_name,
+                    requested_new_name_bytes = ?requested_new_name,
                     old_name_bytes = ?old_name,
                     new_name_bytes = ?new_name,
                     "rename -> {e}"
@@ -714,11 +786,15 @@ impl Filesystem for StudioFuseFs {
                 continue;
             }
             let ft = fuse_file_type(entry.kind);
+            #[cfg(target_os = "macos")]
+            let entry_name = normalize_macos_readdir_name(&entry.name);
+            #[cfg(not(target_os = "macos"))]
+            let entry_name = entry.name.clone();
             if reply.add(
                 entry.ino,
                 (entry_idx + 1) as i64,
                 ft,
-                OsStr::from_bytes(&entry.name),
+                OsStr::from_bytes(&entry_name),
             ) {
                 break;
             }
@@ -788,10 +864,14 @@ impl Filesystem for StudioFuseFs {
                 Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
                 Err(_) => continue, // skip entries we can't stat
             };
+            #[cfg(target_os = "macos")]
+            let entry_name = normalize_macos_readdir_name(&entry.name);
+            #[cfg(not(target_os = "macos"))]
+            let entry_name = entry.name.clone();
             if reply.add(
                 entry.ino,
                 (entry_idx + 1) as i64,
-                OsStr::from_bytes(&entry.name),
+                OsStr::from_bytes(&entry_name),
                 &TTL,
                 &fattr,
                 0,
@@ -1216,12 +1296,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::{
-        merge_xattr_write, normalize_macos_xattr_flags, recover_macos_truncated_rename_source,
+        merge_xattr_write, normalize_macos_readdir_name, normalize_macos_xattr_flags,
+        recover_macos_normalized_name, recover_macos_truncated_rename_source,
+        resolve_macos_namespace_name,
     };
     use studiofs_meta::MetaError;
     #[cfg(target_os = "macos")]
     use studiofs_meta::schema::DirEntry;
     use studiofs_vfs::{OpenFlags, VfsError};
+    #[cfg(target_os = "macos")]
+    use unicode_normalization::UnicodeNormalization;
 
     #[test]
     fn normalize_unix_mode_strips_file_type_bits() {
@@ -1392,5 +1476,111 @@ mod tests {
             recover_macos_truncated_rename_source(b" folder", &entries),
             None
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recover_macos_normalized_name_maps_nfd_lookup_to_nfc_entry() {
+        let latin_nfc = "café";
+        let latin_nfd = latin_nfc.nfd().collect::<String>();
+        let entries = vec![DirEntry {
+            name: latin_nfc.as_bytes().to_vec(),
+            ino: 10,
+            kind: studiofs_meta::FileType::RegularFile,
+        }];
+
+        let recovered = recover_macos_normalized_name(latin_nfd.as_bytes(), &entries);
+        assert_eq!(recovered, Some(latin_nfc.as_bytes().to_vec()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recover_macos_normalized_name_maps_nfc_lookup_to_nfd_entry() {
+        let cyrillic_nfc = "Йога";
+        let cyrillic_nfd = cyrillic_nfc.nfd().collect::<String>();
+        let entries = vec![DirEntry {
+            name: cyrillic_nfd.as_bytes().to_vec(),
+            ino: 11,
+            kind: studiofs_meta::FileType::Directory,
+        }];
+
+        let recovered = recover_macos_normalized_name(cyrillic_nfc.as_bytes(), &entries);
+        assert_eq!(recovered, Some(cyrillic_nfd.as_bytes().to_vec()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normalize_macos_readdir_name_returns_nfd_for_finder_compatibility() {
+        let latin_nfc = "café";
+        let cyrillic_nfc = "Йога";
+        let latin_nfd = latin_nfc.nfd().collect::<String>();
+        let cyrillic_nfd = cyrillic_nfc.nfd().collect::<String>();
+
+        assert_eq!(
+            normalize_macos_readdir_name(latin_nfc.as_bytes()),
+            latin_nfd.as_bytes()
+        );
+        assert_eq!(
+            normalize_macos_readdir_name(cyrillic_nfc.as_bytes()),
+            cyrillic_nfd.as_bytes()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_namespace_name_supports_top_level_rename_nfc_nfd_roundtrip() {
+        let latin_nfc = "café";
+        let latin_nfd = latin_nfc.nfd().collect::<String>();
+
+        let source_entries = vec![DirEntry {
+            name: latin_nfc.as_bytes().to_vec(),
+            ino: 100,
+            kind: studiofs_meta::FileType::RegularFile,
+        }];
+        let target_entries = vec![DirEntry {
+            name: latin_nfd.as_bytes().to_vec(),
+            ino: 101,
+            kind: studiofs_meta::FileType::RegularFile,
+        }];
+
+        let old_for_nfd_request =
+            resolve_macos_namespace_name(latin_nfd.as_bytes(), &source_entries);
+        let new_for_nfc_request =
+            resolve_macos_namespace_name(latin_nfc.as_bytes(), &target_entries);
+        assert_eq!(old_for_nfd_request, latin_nfc.as_bytes());
+        assert_eq!(new_for_nfc_request, latin_nfd.as_bytes());
+
+        let old_for_nfc_request =
+            resolve_macos_namespace_name(latin_nfc.as_bytes(), &target_entries);
+        let new_for_nfd_request =
+            resolve_macos_namespace_name(latin_nfd.as_bytes(), &source_entries);
+        assert_eq!(old_for_nfc_request, latin_nfd.as_bytes());
+        assert_eq!(new_for_nfd_request, latin_nfc.as_bytes());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_namespace_name_supports_nested_directory_rename_with_cyrillic() {
+        let cyrillic_nfc = "Йога";
+        let cyrillic_nfd = cyrillic_nfc.nfd().collect::<String>();
+
+        let nested_parent_entries = vec![DirEntry {
+            name: cyrillic_nfd.as_bytes().to_vec(),
+            ino: 201,
+            kind: studiofs_meta::FileType::Directory,
+        }];
+        let nested_target_entries = vec![DirEntry {
+            name: cyrillic_nfc.as_bytes().to_vec(),
+            ino: 202,
+            kind: studiofs_meta::FileType::Directory,
+        }];
+
+        let old_for_nfc_request =
+            resolve_macos_namespace_name(cyrillic_nfc.as_bytes(), &nested_parent_entries);
+        let new_for_nfd_request =
+            resolve_macos_namespace_name(cyrillic_nfd.as_bytes(), &nested_target_entries);
+
+        assert_eq!(old_for_nfc_request, cyrillic_nfd.as_bytes());
+        assert_eq!(new_for_nfd_request, cyrillic_nfc.as_bytes());
     }
 }
