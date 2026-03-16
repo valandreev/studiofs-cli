@@ -1289,7 +1289,10 @@ impl FuseKernelInvalidator {
 }
 
 fn should_log_fuse_invalidation_error(err: &std::io::Error) -> bool {
-    err.kind() != std::io::ErrorKind::NotFound
+    !matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotConnected
+    )
 }
 
 impl KernelInvalidator for FuseKernelInvalidator {
@@ -1336,9 +1339,11 @@ mod tests {
     #[test]
     fn fuse_invalidation_not_found_is_benign() {
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let not_connected = std::io::Error::from(std::io::ErrorKind::NotConnected);
         let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
 
         assert!(!should_log_fuse_invalidation_error(&not_found));
+        assert!(!should_log_fuse_invalidation_error(&not_connected));
         assert!(should_log_fuse_invalidation_error(&other));
     }
 

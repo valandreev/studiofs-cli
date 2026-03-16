@@ -5515,6 +5515,14 @@ impl StudioVfs {
         *self.kernel_invalidator.write().unwrap() = Some(inv);
     }
 
+    /// Clear kernel cache invalidator registration.
+    ///
+    /// Used during unmount/shutdown so in-flight metadata watchers do not
+    /// attempt to notify a torn-down filesystem channel.
+    pub fn clear_kernel_invalidator(&self) {
+        *self.kernel_invalidator.write().unwrap() = None;
+    }
+
     /// Get metadata engine reference.
     pub fn meta(&self) -> &dyn MetaEngine {
         self.meta.as_ref()

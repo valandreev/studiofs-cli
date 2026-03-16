@@ -72,9 +72,9 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
 }
 
 /// Spawn a background thread that watches for SIGINT/SIGTERM and triggers
-/// `umount` on the mount point so that `fuser::mount2` returns cleanly and
+/// an in-process unmount so `fuser::Session::run` returns cleanly and
 /// the VFS shutdown/drain logic can execute.
-fn spawn_signal_watcher(mount_point: &str) {
+fn spawn_signal_watcher(mount_point: String, mut unmount: fuser::SessionUnmounter) {
     let mp = mount_point.to_string();
     // Install signal handlers (replaces the default "terminate" action).
     unsafe {
@@ -101,34 +101,7 @@ fn spawn_signal_watcher(mount_point: &str) {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
                 libc::signal(libc::SIGTERM, libc::SIG_DFL);
             }
-            // Trigger a clean unmount so fuser::mount2() returns.
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("umount").arg(&mp).status();
-            }
-            #[cfg(target_os = "linux")]
-            {
-                // Use lazy unmount (-z) so the command succeeds even when the
-                // FUSE daemon process itself is keeping the mount busy.  The
-                // mount point is detached from the filesystem hierarchy
-                // immediately, which severs the FUSE connection and lets
-                // fuser::mount2() return.  Actual cleanup happens once no
-                // process references the mount any more (i.e. right after we
-                // exit).
-                let _ = std::process::Command::new("fusermount3")
-                    .args(["-uz", &mp])
-                    .status()
-                    .or_else(|_| {
-                        std::process::Command::new("fusermount")
-                            .args(["-uz", &mp])
-                            .status()
-                    })
-                    .or_else(|_| {
-                        std::process::Command::new("umount")
-                            .args(["-l", &mp])
-                            .status()
-                    });
-            }
+            let _ = unmount.unmount();
         })
         .expect("failed to spawn signal-watcher thread");
 }
@@ -160,9 +133,6 @@ pub fn mount_and_serve(
     // Do not use `noappledouble` or `noapplexattr`: StudioFS accepts native
     // macOS xattrs (including resource forks) via FUSE xattr callbacks, and
     // these options would interfere with expected metadata behavior.
-    // Watch for Ctrl+C / SIGTERM and trigger a clean unmount.
-    spawn_signal_watcher(mount_point);
-
     tracing::info!("mounting StudioFS at {mount_point}, press Ctrl+C to unmount");
 
     // Use Session::new + run() instead of fuser::mount2 so we can obtain a
@@ -170,6 +140,9 @@ pub fn mount_and_serve(
     // proactively clear the kernel FUSE dentry/attribute cache, making remote
     // creates/deletes visible immediately without waiting for TTL expiry.
     let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;
+    let unmount = session.unmount_callable();
+    // Watch for Ctrl+C / SIGTERM and trigger in-process unmount.
+    spawn_signal_watcher(mount_point.to_string(), unmount);
     let notifier = session.notifier();
 
     // Register the kernel cache invalidator with the VFS.
@@ -180,6 +153,7 @@ pub fn mount_and_serve(
 
     // Session::run returns when the filesystem is unmounted.
     // Drain uploads and persist cache checkpoint before process exit.
+    vfs_ref.clear_kernel_invalidator();
     tracing::info!("unmounted, draining uploads …");
     rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
     // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard exit.
