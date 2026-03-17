@@ -6,7 +6,7 @@ use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
-use studiofs_vfs::{StudioVfs, VfsConfig};
+use studiofs_vfs::{parse_size_bytes, StudioVfs, VfsConfig};
 use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
@@ -39,29 +39,6 @@ fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     } else {
         mount_path.join(name)
     }
-}
-
-fn parse_size_bytes(raw: &str) -> Option<usize> {
-    let s = raw.trim().to_ascii_uppercase();
-    if s.is_empty() {
-        return None;
-    }
-    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
-        (v, 1024u128 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("GB") {
-        (v, 1024u128 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("MB") {
-        (v, 1024u128 * 1024)
-    } else if let Some(v) = s.strip_suffix("KB") {
-        (v, 1024u128)
-    } else if let Some(v) = s.strip_suffix('B') {
-        (v, 1u128)
-    } else {
-        (s.as_str(), 1u128)
-    };
-    let num = num_part.trim().parse::<u128>().ok()?;
-    let bytes = num.checked_mul(multiplier)?;
-    usize::try_from(bytes).ok()
 }
 
 fn parse_env_usize(key: &str) -> Option<usize> {
@@ -204,7 +181,13 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     );
     set_u64!("STUDIOFS_UPLOAD_RETRY_BASE_MS", upload_retry_base_ms);
     set_u64!("STUDIOFS_UPLOAD_RETRY_MAX_MS", upload_retry_max_ms);
-    set_u64!("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", slab_flush_interval_ms);
+    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
+        if interval_ms > 0 {
+            config.slab_flush_interval_ms = interval_ms;
+        } else {
+            config.background_slab_flush_enabled = false;
+        }
+    }
     if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
         config.background_slab_flush_enabled = !disable;
     }

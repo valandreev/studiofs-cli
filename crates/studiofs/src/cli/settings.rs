@@ -45,6 +45,10 @@ pub struct SettingsArgs {
     /// Disable the background slab flusher.
     #[arg(long = "disable-bg-slab-flush")]
     pub disable_bg_slab_flush: bool,
+
+    /// Enable the background slab flusher.
+    #[arg(long = "enable-bg-slab-flush", overrides_with = "disable_bg_slab_flush")]
+    pub enable_bg_slab_flush: bool,
 }
 
 fn config_file_path() -> anyhow::Result<PathBuf> {
@@ -204,8 +208,19 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(interval_ms) = args.slab_flush_interval_ms && interval_ms > 0 {
-        config.vfs.slab_flush_interval_ms = interval_ms;
+    if let Some(interval_ms) = args.slab_flush_interval_ms {
+        if interval_ms > 0 {
+            config.vfs.slab_flush_interval_ms = interval_ms;
+            changed = true;
+        } else {
+            config.vfs.background_slab_flush_enabled = false;
+            changed = true;
+            eprintln!("warning: slab flush interval 0 disables background slab flush");
+        }
+    }
+
+    if args.enable_bg_slab_flush {
+        config.vfs.background_slab_flush_enabled = true;
         changed = true;
     }
 

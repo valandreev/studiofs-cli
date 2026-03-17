@@ -21,6 +21,7 @@ pub use readahead::{DirAccessTracker, ReadAheadTracker};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use vfs::{
+    parse_size_bytes,
     KernelInvalidator, LockKind, NamespaceParent, NamespacePathStyle, NamespaceResolver, OpenFile,
     OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError, VfsIngressLane, VfsIngressPressure,
     VfsIngressStats, VfsResult, VfsUploadStats,

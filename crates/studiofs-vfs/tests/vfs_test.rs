@@ -31,7 +31,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsIngressLane,
+    parse_size_bytes, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError,
+    VfsIngressLane,
     VfsUploadState,
 };
 use uuid::Uuid;
@@ -123,29 +124,6 @@ fn test_env_var(key: &str, default: &str) -> String {
         .ok()
         .or_else(|| workspace_dotenv_var(key))
         .unwrap_or_else(|| default.to_string())
-}
-
-fn parse_size_bytes(raw: &str) -> Option<usize> {
-    let s = raw.trim().to_ascii_uppercase();
-    if s.is_empty() {
-        return None;
-    }
-    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
-        (v, 1024u128 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("GB") {
-        (v, 1024u128 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("MB") {
-        (v, 1024u128 * 1024)
-    } else if let Some(v) = s.strip_suffix("KB") {
-        (v, 1024u128)
-    } else if let Some(v) = s.strip_suffix('B') {
-        (v, 1u128)
-    } else {
-        (s.as_str(), 1u128)
-    };
-    let num = num_part.trim().parse::<u128>().ok()?;
-    let bytes = num.checked_mul(multiplier)?;
-    usize::try_from(bytes).ok()
 }
 
 fn parse_env_usize(key: &str) -> Option<usize> {

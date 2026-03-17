@@ -106,7 +106,7 @@ Notes:
 
 ```bash
 studiofs settings [--mount-point <path>] [--cache-dir <path>] [--memory-limit <e.g. 1GB>] [--cache-size <e.g. 200GB>]
-studiofs settings [--slab-flush-interval <ms>] [--disable-bg-slab-flush]
+studiofs settings [--slab-flush-interval <ms>] [--disable-bg-slab-flush] [--enable-bg-slab-flush]
 ```
 
 Stores global defaults in `config.toml` for future `studiofs mount` runs.
@@ -118,6 +118,8 @@ Notes:
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
 - `studiofs settings --slab-flush-interval` stores the background slab flusher wake interval in the `[vfs]` section.
 - `studiofs settings --disable-bg-slab-flush` disables the background slab flusher in the `[vfs]` section.
+- `studiofs settings --enable-bg-slab-flush` re-enables the background slab flusher in the `[vfs]` section.
+- `studiofs settings --slab-flush-interval 0` disables the background slab flusher (for environments where zero is a preferred explicit override).
 - The `[vfs]` section also stores advanced runtime knobs such as upload/fetch retry windows, QoS slot counts, materializer drain batch size, and publish visibility timeout.
 
 ### `umount`
@@ -240,6 +242,8 @@ studiofs mount projectfs /mnt/studio/projectfs-b
 
 ### Runtime
 
+Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.5GB`; parsing rounds down fractional bytes.
+
 | Variable | Default | Description |
 |---|---|---|
 | `STUDIOFS_JANITOR_INTERVAL_SECS` | `1800` | Background janitor interval |
@@ -303,7 +307,7 @@ studiofs mount projectfs /mnt/studio/projectfs-b
 | `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `10` | Upload metrics log interval |
-| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval |
+| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
 | `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots |
 | `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Penalty multiplied by client wait penalty |
