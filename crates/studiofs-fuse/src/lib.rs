@@ -158,9 +158,18 @@ pub fn mount_and_serve(
     vfs_ref.clear_kernel_invalidator();
     tracing::info!("unmounted, draining uploads …");
     rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
-    // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard exit.
-    // Without this, libfuse resources can remain partially alive and abort on process shutdown.
-    drop(session);
+    // If we arrived here without SIGINT/SIGTERM, the mount point was most
+    // likely detached by Finder/umount. In that case skip dropping the session
+    // object to avoid a second unmount attempt during Drop (EINVAL on macOS).
+    let requested_shutdown = SHUTDOWN_REQUESTED.load(Ordering::Acquire);
+    if requested_shutdown {
+        // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard
+        // exit. Without this, libfuse resources can remain partially alive and
+        // abort on process shutdown.
+        drop(session);
+    } else {
+        std::mem::forget(session);
+    }
     // Use process::exit to avoid blocking on tokio Runtime drop, which would
     // wait for all background tasks (janitor, GC etc.) to complete — causing
     // an indefinite hang after unmount on Linux/WSL.
