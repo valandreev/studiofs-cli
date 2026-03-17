@@ -106,7 +106,7 @@ pub fn resolve_studiofs_config_for_mount(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         })
-        .map(normalize_mount_point)
+        .map(|s| s.to_string())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No mount point provided and no default mount_point is configured.\n\
