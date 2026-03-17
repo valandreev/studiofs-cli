@@ -80,19 +80,28 @@ pub fn run(
     let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT")
         .unwrap_or_else(|_| mount_point.to_string());
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
+    let is_drive_root = if cfg!(windows) {
+        is_drive_root(&actual_mount_path)
+    } else {
+        false
+    };
 
-    if let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
-        #[cfg(target_os = "macos")]
-        if err.kind() == std::io::ErrorKind::PermissionDenied && actual_mount_path.contains("/Volumes") {
-            anyhow::bail!(
-                "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
-                actual_mount_path,
-                actual_mount_path,
-                actual_mount_path
-            );
+    if !is_drive_root {
+        if let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
+            #[cfg(target_os = "macos")]
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                && actual_mount_path.contains("/Volumes")
+            {
+                anyhow::bail!(
+                    "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
+                    actual_mount_path,
+                    actual_mount_path,
+                    actual_mount_path
+                );
+            }
+
+            return Err(err.into());
         }
-
-        return Err(err.into());
     }
 
     // Canonicalize the mount point here for detached mode, where the daemon may run
@@ -105,7 +114,7 @@ pub fn run(
     }
 
     #[cfg(windows)]
-    if !is_drive_root(&actual_mount_path) {
+    if !is_drive_root {
         if let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
             actual_mount_path = abs_path.to_string_lossy().into_owned();
         }
@@ -113,7 +122,7 @@ pub fn run(
 
     let actual_mount_path = actual_mount_path;
     #[cfg(windows)]
-    {
+    if !is_drive_root {
         let mut entries = std::fs::read_dir(&actual_mount_path)?;
         if entries.next().is_some() {
             anyhow::bail!(
