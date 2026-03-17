@@ -740,7 +740,7 @@ mod tests {
                 mount_point,
                 ..
             } => {
-            assert!(detach);
+                assert!(detach);
                 assert!(!foreground);
                 assert!(!mount_runs_in_foreground(foreground, detach));
                 assert_eq!(name, "vol");
