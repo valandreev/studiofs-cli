@@ -40,5 +40,6 @@ vexp capsule "inspect project status" --max-tokens 1200
 
 ## Required workflow for this repo
 
-- Always start repo exploration and refactor tasks with `run_pipeline(...)` in vexp MCP context (when available).
-- Avoid manual grep/glob and manual indexing as primary analysis path.
+- Always start repo exploration, refactor, and code-edit tasks with `run_pipeline(...)` in vexp MCP context.
+- If vexp MCP is unavailable in the current environment, state that explicitly and use the best fallback available for the task.
+- Avoid manual grep/glob and manual indexing as the primary analysis path.

@@ -43,7 +43,7 @@ Never commit `.env` or real credentials. Use `.env.example` defaults for local d
 
 ## vexp <!-- vexp v1.0.0 -->
 
-**MANDATORY: always use `run_pipeline` first for any repo analysis or edits — do NOT grep or glob the codebase manually.**
+**MANDATORY: always use `run_pipeline` first for any repo analysis or edits. Do not use grep, glob, or manual codebase browsing as the primary exploration path.**
 
 Install + setup:
 ```bash
@@ -57,9 +57,10 @@ cd /Volumes/Storage/dev/studiofs && vexp index .
 ```
 
 Hard rule:
-- Every task that touches code context in this repo must start with `run_pipeline({ task: "..." })`.
-- If `run_pipeline` is unavailable, proceed with the best available tools and document the limitation explicitly.
-vexp returns pre-indexed, graph-ranked context in a single call.
+- Every task that touches code context in this repo must start with `run_pipeline({ task: "..." })` whenever the vexp MCP is available.
+- Never silently skip vexp. If it is unavailable in the current environment, say so explicitly and use the best fallback available for that task.
+- `run_pipeline` is the default entry point for exploration, impact analysis, and edits in this repo.
+- vexp returns pre-indexed, graph-ranked context in a single call.
 
 ### Workflow
 1. `run_pipeline` with your task description — ALWAYS FIRST (replaces all other tools)
@@ -79,7 +80,7 @@ vexp returns pre-indexed, graph-ranked context in a single call.
 - `save_observation` — persist insights (prefer run_pipeline's observation param)
 
 ### Agentic search
-- Do NOT use built-in file search, grep, or codebase indexing — always call `run_pipeline` first
+- Do NOT use built-in file search, grep, or codebase indexing as the first step — always call `run_pipeline` first when vexp is available
 - If you spawn sub-agents or background tasks, pass them the context from `run_pipeline`
   rather than letting them search the codebase independently
 
