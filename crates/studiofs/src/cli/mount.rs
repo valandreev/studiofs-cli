@@ -6,7 +6,7 @@ use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
-use studiofs_vfs::StudioVfs;
+use studiofs_vfs::{parse_size_bytes, StudioVfs, VfsConfig};
 use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
@@ -41,6 +41,235 @@ fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     }
 }
 
+fn parse_env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn parse_env_u64(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn parse_env_u64_any(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
+fn parse_env_f64(key: &str) -> Option<f64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+}
+
+fn parse_env_bool(key: &str) -> Option<bool> {
+    let value = std::env::var(key).ok()?;
+    let value = value.trim().to_ascii_lowercase();
+    Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
+    macro_rules! set_usize {
+        ($key:literal, $field:ident) => {
+            if let Some(value) = parse_env_usize($key) {
+                config.$field = value;
+            }
+        };
+    }
+    macro_rules! set_u64 {
+        ($key:literal, $field:ident) => {
+            if let Some(value) = parse_env_u64($key) {
+                config.$field = value;
+            }
+        };
+    }
+    macro_rules! set_f64 {
+        ($key:literal, $field:ident) => {
+            if let Some(value) = parse_env_f64($key) {
+                config.$field = value;
+            }
+        };
+    }
+    macro_rules! set_size {
+        ($key:literal, $field:ident) => {
+            if let Ok(v) = std::env::var($key)
+                && let Some(bytes) = parse_size_bytes(&v).filter(|v| *v > 0)
+            {
+                config.$field = bytes;
+            }
+        };
+    }
+
+    set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
+    set_size!("STUDIOFS_MAX_SPILL_BYTES", max_spill_bytes);
+    if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v).filter(|v| *v > 0)
+    {
+        config.max_ingress_segment_bytes = bytes as u64;
+    }
+    set_u64!("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", metadata_invalidation_sync_interval_ms);
+    set_u64!("STUDIOFS_READ_BUFFER_MB", read_buffer_mb);
+    set_usize!("STUDIOFS_PREFETCH_CONCURRENCY", prefetch_concurrency);
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_WIDTH") {
+        config.readahead_width = value as u32;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_MIN_PREFETCH") {
+        config.readahead_min_prefetch = value as u32;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_SEQ_STEP") {
+        config.readahead_seq_step = value as u8;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_RANDOM_PENALTY") {
+        config.readahead_random_penalty = value as u8;
+    }
+    set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
+    set_usize!("STUDIOFS_READDIR_ATTR_BATCH_CHUNK", readdir_attr_batch_chunk);
+    set_usize!(
+        "STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES",
+        readdir_attr_batch_max_inodes
+    );
+    set_usize!(
+        "STUDIOFS_PREFETCH_FOREGROUND_RESERVE",
+        prefetch_foreground_reserve
+    );
+    set_usize!("STUDIOFS_PREFETCH_MAX_PER_CYCLE", prefetch_max_per_cycle);
+    set_u64!(
+        "STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS",
+        prefetch_pause_on_neterr_ms
+    );
+    set_usize!("STUDIOFS_MAX_DRAIN_BATCH", max_drain_batch);
+    set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
+    set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
+    set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);
+    set_size!("STUDIOFS_XATTR_MAX_BYTES", max_xattr_bytes);
+    set_usize!("STUDIOFS_DENTRY_CACHE_CAPACITY", dentry_cache_capacity);
+    set_size!("STUDIOFS_DENTRY_CACHE_BYTES", dentry_cache_bytes);
+    set_usize!(
+        "STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY",
+        path_shortcut_cache_capacity
+    );
+    set_size!("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES", path_shortcut_cache_bytes);
+    set_usize!("STUDIOFS_ATTR_READ_CACHE_CAPACITY", attr_read_cache_capacity);
+    set_size!("STUDIOFS_ATTR_READ_CACHE_BYTES", attr_read_cache_bytes);
+    set_u64!("STUDIOFS_JANITOR_INTERVAL_SECS", janitor_interval_secs);
+    if let Some(value) = parse_env_u64_any("STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
+        config.janitor_skip_newer_secs = value;
+    }
+    set_u64!("STUDIOFS_JANITOR_MAX_DELETES", janitor_max_deletes);
+    set_u64!("STUDIOFS_JANITOR_LEASE_TTL_SECS", janitor_lease_ttl_secs);
+    set_usize!("STUDIOFS_UPLOAD_CACHE_IO_SLOTS", upload_cache_io_slots);
+    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
+        config.upload_cache_io_user_penalty = value as u32;
+    }
+    set_u64!("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS", upload_user_idle_grace_ms);
+    if let Some(value) = parse_env_u64_any("STUDIOFS_UPLOAD_DELAY_MS") {
+        config.upload_delay_ms = value;
+    }
+    set_u64!("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", upload_requeue_base_ms);
+    set_u64!("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", upload_requeue_max_ms);
+    set_u64!("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS", upload_stats_interval_secs);
+    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
+        config.upload_max_attempts = value as u32;
+    }
+    set_u64!(
+        "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
+        upload_request_timeout_secs
+    );
+    set_u64!("STUDIOFS_UPLOAD_RETRY_BASE_MS", upload_retry_base_ms);
+    set_u64!("STUDIOFS_UPLOAD_RETRY_MAX_MS", upload_retry_max_ms);
+    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
+        if interval_ms > 0 {
+            config.slab_flush_interval_ms = interval_ms;
+        } else {
+            config.background_slab_flush_enabled = false;
+        }
+    }
+    if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
+        config.background_slab_flush_enabled = !disable;
+    }
+    set_u64!(
+        "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
+        shutdown_metadata_flush_timeout_secs
+    );
+    set_u64!(
+        "STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS",
+        publish_visibility_timeout_secs
+    );
+    set_f64!("STUDIOFS_FETCH_INITIAL_WINDOW", fetch_initial_window);
+    set_f64!("STUDIOFS_FETCH_MIN_WINDOW", fetch_min_window);
+    set_f64!("STUDIOFS_FETCH_MAX_WINDOW", fetch_max_window);
+    set_f64!("STUDIOFS_FETCH_INCREASE_STEP", fetch_increase_step);
+    set_f64!("STUDIOFS_FETCH_DECREASE_FACTOR", fetch_decrease_factor);
+    set_u64!(
+        "STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS",
+        fetch_decrease_cooldown_secs
+    );
+    if let Some(value) = parse_env_usize("STUDIOFS_FETCH_MAX_ATTEMPTS") {
+        config.fetch_max_attempts = value as u32;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
+        config.prefetch_fetch_max_attempts = value as u32;
+    }
+    set_u64!(
+        "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
+        fetch_request_timeout_secs
+    );
+    set_u64!("STUDIOFS_FETCH_RETRY_BASE_MS", fetch_retry_base_ms);
+    set_u64!("STUDIOFS_FETCH_RETRY_MAX_MS", fetch_retry_max_ms);
+    set_usize!("STUDIOFS_FETCH_PREFETCH_RESERVE", fetch_prefetch_reserve);
+    set_u64!(
+        "STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS",
+        fetch_prefetch_acquire_wait_ms
+    );
+    set_f64!("STUDIOFS_UPLOAD_INITIAL_WINDOW", upload_initial_window);
+    set_f64!("STUDIOFS_UPLOAD_MIN_WINDOW", upload_min_window);
+    set_f64!("STUDIOFS_UPLOAD_MAX_WINDOW", upload_max_window);
+    set_f64!("STUDIOFS_UPLOAD_INCREASE_STEP", upload_increase_step);
+    set_f64!("STUDIOFS_UPLOAD_DECREASE_FACTOR", upload_decrease_factor);
+    set_u64!(
+        "STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS",
+        upload_decrease_cooldown_secs
+    );
+    set_usize!("STUDIOFS_QOS_ACCEPT_SLOTS", qos_accept_slots);
+    set_usize!("STUDIOFS_QOS_MATERIALIZE_SLOTS", qos_materialize_slots);
+    set_usize!("STUDIOFS_QOS_UPLOAD_SLOTS", qos_upload_slots);
+    set_usize!("STUDIOFS_QOS_COMMIT_SLOTS", qos_commit_slots);
+    set_usize!("STUDIOFS_QOS_FETCH_SLOTS", qos_fetch_slots);
+    set_u64!("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS", ingress_checkpoint_interval_secs);
+    set_u64!(
+        "STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES",
+        ingress_checkpoint_min_append_bytes
+    );
+    set_u64!(
+        "STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS",
+        ingress_checkpoint_min_mutations
+    );
+    set_u64!(
+        "STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG",
+        ingress_checkpoint_max_segment_lag
+    );
+    set_u64!(
+        "STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS",
+        ingress_checkpoint_max_live_segments
+    );
+    if let Ok(principal) = std::env::var("STUDIOFS_PRINCIPAL") {
+        let principal = principal.trim();
+        if !principal.is_empty() {
+            config.principal = principal.to_string();
+        }
+    }
+    if let Some(worker_count) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
+        config.upload_worker_count = worker_count;
+    } else if let Some(max_spawned) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
+        config.upload_worker_count = max_spawned;
+    }
+    config
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
@@ -63,6 +292,8 @@ pub fn run(
         )?;
 
     let cache_dir = resolved_cache_dir;
+    let mut vfs_config = super::settings::load_studiofs_config()?.vfs;
+    vfs_config = overlay_vfs_env(vfs_config);
 
     let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
@@ -130,6 +361,7 @@ pub fn run(
         unsafe {
             std::env::set_var("STUDIOFS_PRINCIPAL", principal);
         }
+        vfs_config.principal = principal.to_string();
     }
 
     // ── Guard against double-mount ──────────────────────────────────────────
@@ -218,6 +450,7 @@ pub fn run(
         cache_path_str,
         cache_size_bytes,
         mem_limit,
+        vfs_config,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 

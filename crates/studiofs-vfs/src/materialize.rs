@@ -61,11 +61,7 @@ impl Materializer {
     }
 
     async fn drain_inner(vfs: &StudioVfs) {
-        let max_drain_batch = std::env::var("STUDIOFS_MAX_DRAIN_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(1024);
+        let max_drain_batch = vfs.max_drain_batch.max(1);
 
         loop {
             let Some((extents, results)) = Self::collect_batch(vfs, max_drain_batch).await else {

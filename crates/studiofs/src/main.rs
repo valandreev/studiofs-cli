@@ -202,20 +202,32 @@ ENV TUNING:
   STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
   STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
   STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background slab flusher wake interval (default: 10).
+  STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background slab flushing (default: 0).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
+  STUDIOFS_MAX_DRAIN_BATCH          Max staged blocks drained per flusher cycle (default: 1024).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).
   STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES  Wake checkpointing after this much uncheckpointed append churn (default: 64MiB).
   STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS  Wake checkpointing after this many uncheckpointed ingress mutations (default: 128).
   STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG  Wake checkpointing when active head is this many segments ahead of the last checkpoint (default: 2).
   STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS  Wake checkpointing when live ingress refs span this many segments (default: 4).
+  STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS  Max time to wait for uploaded objects to become visible before publishing manifests (default: 30).
   STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
   STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY  Upload slot cost when reads active (default: 4).
   STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 250).
+  STUDIOFS_UPLOAD_MAX_ATTEMPTS      Max upload retries (default: 10).
+  STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS  Per-upload request timeout (default: 120).
+  STUDIOFS_FETCH_MAX_ATTEMPTS       Max fetch retries (default: 8).
+  STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS  Per-fetch request timeout (default: 45).
   STUDIOFS_DENTRY_CACHE_CAPACITY    VFS dentry cache entry budget (default: 65536).
   STUDIOFS_DENTRY_CACHE_BYTES       VFS dentry cache byte budget (default: 64MB).
   STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY  VFS full-path shortcut cache entry budget (default: 16384).
   STUDIOFS_PATH_SHORTCUT_CACHE_BYTES     VFS full-path shortcut cache byte budget (default: 16MB).
+  STUDIOFS_QOS_ACCEPT_SLOTS         QoS slots for accept operations (default: 64).
+  STUDIOFS_QOS_MATERIALIZE_SLOTS    QoS slots for materialization (default: 2).
+  STUDIOFS_QOS_UPLOAD_SLOTS         QoS slots for uploads (default: 4).
+  STUDIOFS_QOS_COMMIT_SLOTS         QoS slots for commits (default: 4).
+  STUDIOFS_QOS_FETCH_SLOTS          QoS slots for fetches (default: 128).
   STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS  Wait uploads on unmount (default: 0, resume next mount).
   STUDIOFS_XATTR_MAX_BYTES             Max bytes allowed per xattr value (default: 4MB).
 

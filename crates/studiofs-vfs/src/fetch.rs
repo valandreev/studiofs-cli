@@ -11,6 +11,7 @@
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
 use crate::qos::QosController;
+use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
 use opendal::ErrorKind;
@@ -26,14 +27,6 @@ use tracing::{debug, error, info, warn};
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Defaults for retry/timeout tuning (all overrideable via env).
-const DEFAULT_MAX_FETCH_ATTEMPTS: u32 = 8;
-const DEFAULT_PREFETCH_MAX_FETCH_ATTEMPTS: u32 = 4;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 45;
-const DEFAULT_RETRY_BASE_MS: u64 = 50;
-const DEFAULT_RETRY_MAX_MS: u64 = 2_000;
-const DEFAULT_PREFETCH_ACQUIRE_WAIT_MS: u64 = 75;
 
 /// Capacity of the broadcast channel used for singleflight notifications.
 const BROADCAST_CAPACITY: usize = 2;
@@ -157,42 +150,19 @@ impl FetchScheduler {
         aimd_config: AimdConfig,
         default_prefetch_reserve_slots: usize,
         qos: Arc<QosController>,
+        config: &VfsConfig,
     ) -> Self {
-        fn env_u32(key: &str, default: u32) -> u32 {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(default)
-        }
-        fn env_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(default)
-        }
-
-        let max_fetch_attempts = env_u32("STUDIOFS_FETCH_MAX_ATTEMPTS", DEFAULT_MAX_FETCH_ATTEMPTS);
-        let prefetch_max_fetch_attempts = env_u32(
-            "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS",
-            DEFAULT_PREFETCH_MAX_FETCH_ATTEMPTS,
-        );
-        let request_timeout_s = env_u64(
-            "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
-            DEFAULT_REQUEST_TIMEOUT_SECS,
-        );
-        let retry_base_ms = env_u64("STUDIOFS_FETCH_RETRY_BASE_MS", DEFAULT_RETRY_BASE_MS);
-        let retry_max_ms =
-            env_u64("STUDIOFS_FETCH_RETRY_MAX_MS", DEFAULT_RETRY_MAX_MS).max(retry_base_ms);
-        let prefetch_reserve_slots = env_u64(
-            "STUDIOFS_FETCH_PREFETCH_RESERVE",
-            default_prefetch_reserve_slots as u64,
-        ) as usize;
-        let prefetch_acquire_wait_ms = env_u64(
-            "STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS",
-            DEFAULT_PREFETCH_ACQUIRE_WAIT_MS,
-        );
+        let max_fetch_attempts = config.fetch_max_attempts.max(1);
+        let prefetch_max_fetch_attempts = config.prefetch_fetch_max_attempts.max(1);
+        let request_timeout_s = config.fetch_request_timeout_secs.max(1);
+        let retry_base_ms = config.fetch_retry_base_ms.max(1);
+        let retry_max_ms = config.fetch_retry_max_ms.max(retry_base_ms);
+        let prefetch_reserve_slots = if config.fetch_prefetch_reserve > 0 {
+            config.fetch_prefetch_reserve
+        } else {
+            default_prefetch_reserve_slots
+        };
+        let prefetch_acquire_wait_ms = config.fetch_prefetch_acquire_wait_ms.max(1);
 
         debug!(
             initial_window = aimd_config.initial_window,

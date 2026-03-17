@@ -3,15 +3,6 @@ use super::*;
 pub(super) struct CommitCoordinator;
 
 impl CommitCoordinator {
-    fn publish_visibility_timeout() -> Duration {
-        let timeout_secs = std::env::var("STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(30);
-        Duration::from_secs(timeout_secs)
-    }
-
     pub(super) async fn finish_extent_upload(
         vfs: &StudioVfs,
         op: &PendingUpload,
@@ -98,7 +89,7 @@ impl CommitCoordinator {
         vfs: &StudioVfs,
         live_extents: &[(u32, ExtentRecordId)],
     ) -> VfsResult<()> {
-        let visibility_timeout = Self::publish_visibility_timeout();
+        let visibility_timeout = vfs.publish_visibility_timeout;
         let deadline = tokio::time::Instant::now() + visibility_timeout;
         loop {
             let mut all_visible = true;

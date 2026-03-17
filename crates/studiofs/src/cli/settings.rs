@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use studiofs_vfs::VfsConfig;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_CACHE_SIZE: &str = "100GB";
@@ -15,6 +16,8 @@ pub struct StudioFsConfig {
     pub cache_dir: Option<String>,
     pub memory_limit: Option<String>,
     pub cache_size: Option<String>,
+    #[serde(default)]
+    pub vfs: VfsConfig,
 }
 
 #[derive(Debug, Args, Default)]
@@ -34,6 +37,18 @@ pub struct SettingsArgs {
     /// Default max disk cache size used by `studiofs mount` when omitted.
     #[arg(long)]
     pub cache_size: Option<String>,
+
+    /// Default slab flush interval used by `studiofs mount`.
+    #[arg(long = "slab-flush-interval")]
+    pub slab_flush_interval_ms: Option<u64>,
+
+    /// Disable the background slab flusher.
+    #[arg(long = "disable-bg-slab-flush")]
+    pub disable_bg_slab_flush: bool,
+
+    /// Enable the background slab flusher.
+    #[arg(long = "enable-bg-slab-flush", overrides_with = "disable_bg_slab_flush")]
+    pub enable_bg_slab_flush: bool,
 }
 
 fn config_file_path() -> anyhow::Result<PathBuf> {
@@ -193,6 +208,27 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(interval_ms) = args.slab_flush_interval_ms {
+        if interval_ms > 0 {
+            config.vfs.slab_flush_interval_ms = interval_ms;
+            changed = true;
+        } else {
+            config.vfs.background_slab_flush_enabled = false;
+            changed = true;
+            eprintln!("warning: slab flush interval 0 disables background slab flush");
+        }
+    }
+
+    if args.enable_bg_slab_flush {
+        config.vfs.background_slab_flush_enabled = true;
+        changed = true;
+    }
+
+    if args.disable_bg_slab_flush {
+        config.vfs.background_slab_flush_enabled = false;
+        changed = true;
+    }
+
     if changed {
         save_studiofs_config(&config)?;
         println!("✓ Updated studiofs settings");
@@ -217,6 +253,18 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     println!(
         "  cache-size: {}",
         config.cache_size.unwrap_or_else(|| DEFAULT_CACHE_SIZE.to_string())
+    );
+    println!(
+        "  slab-flush-interval-ms: {}",
+        config.vfs.slab_flush_interval_ms
+    );
+    println!(
+        "  background-slab-flush: {}",
+        if config.vfs.background_slab_flush_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     if !changed {
