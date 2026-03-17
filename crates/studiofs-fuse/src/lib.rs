@@ -51,6 +51,8 @@ fn build_mount_options(
     #[cfg(target_os = "macos")]
     {
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
+        // Tell macFUSE to treat this as a local drive, which enables native Trash.
+        options.push(fuser::MountOption::CUSTOM("local".into()));
     }
     #[cfg(target_os = "macos")]
     if foreground {
@@ -156,9 +158,18 @@ pub fn mount_and_serve(
     vfs_ref.clear_kernel_invalidator();
     tracing::info!("unmounted, draining uploads …");
     rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
-    // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard exit.
-    // Without this, libfuse resources can remain partially alive and abort on process shutdown.
-    drop(session);
+    // If we arrived here without SIGINT/SIGTERM, the mount point was most
+    // likely detached by Finder/umount. In that case skip dropping the session
+    // object to avoid a second unmount attempt during Drop (EINVAL on macOS).
+    let requested_shutdown = SHUTDOWN_REQUESTED.load(Ordering::Acquire);
+    if requested_shutdown {
+        // Explicitly drop the FUSE session to trigger fuser/OS cleanup before hard
+        // exit. Without this, libfuse resources can remain partially alive and
+        // abort on process shutdown.
+        drop(session);
+    } else {
+        std::mem::forget(session);
+    }
     // Use process::exit to avoid blocking on tokio Runtime drop, which would
     // wait for all background tasks (janitor, GC etc.) to complete — causing
     // an indefinite hang after unmount on Linux/WSL.
@@ -233,5 +244,14 @@ mod tests {
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "volname=studiofs-mac")
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_options_sets_macos_local_flag() {
+        let options = build_mount_options("studiofs-mac", false, false).expect("options");
+        assert!(options
+            .iter()
+            .any(|opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "local")));
     }
 }

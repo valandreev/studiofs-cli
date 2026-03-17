@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
-    Request,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite,
+    ReplyXattr, Request,
 };
 use studiofs_meta::FileType;
 #[cfg(target_os = "macos")]
@@ -533,9 +533,9 @@ impl Filesystem for StudioFuseFs {
         let requested_old_name = os_str_bytes(name).to_vec();
         let requested_new_name = os_str_bytes(newname).to_vec();
         #[cfg(target_os = "macos")]
-        let old_name = if self.vfs.lookup(parent, &requested_old_name).is_ok() {
-            requested_old_name.clone()
-        } else if requested_old_name.is_ascii() {
+        let old_name = if self.vfs.lookup(parent, &requested_old_name).is_ok()
+            || requested_old_name.is_ascii()
+        {
             requested_old_name.clone()
         } else if let Ok(entries) = self.vfs.readdir(parent) {
             resolve_macos_namespace_name(&requested_old_name, &entries)
@@ -545,9 +545,9 @@ impl Filesystem for StudioFuseFs {
         #[cfg(not(target_os = "macos"))]
         let old_name = requested_old_name.clone();
         #[cfg(target_os = "macos")]
-        let new_name = if self.vfs.lookup(newparent, &requested_new_name).is_ok() {
-            requested_new_name.clone()
-        } else if requested_new_name.is_ascii() {
+        let new_name = if self.vfs.lookup(newparent, &requested_new_name).is_ok()
+            || requested_new_name.is_ascii()
+        {
             requested_new_name.clone()
         } else if let Ok(entries) = self.vfs.readdir(newparent) {
             resolve_macos_namespace_name(&requested_new_name, &entries)
@@ -1018,6 +1018,34 @@ impl Filesystem for StudioFuseFs {
     // so we just say OK here.
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
         reply.ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ioctl(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: ReplyIoctl,
+    ) {
+        // macFUSE issues control-plane ioctls on root/unmount paths during mount-cycle
+        // events. We don't currently need custom behavior for them, but we reply with
+        // ENOTTY instead of the default warn/error spam so kernel probes do not look
+        // like errors in logs.
+        debug!(
+            ino,
+            fh,
+            flags,
+            cmd,
+            in_len = in_data.len(),
+            out_size,
+            "ioctl not implemented in StudioFS FUSE backend"
+        );
+        reply.error(libc::ENOTTY);
     }
 
     fn getxattr(

@@ -124,6 +124,7 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground)
 | `auto_unmount` | Yes |
 | `allow_other` | Yes |
 | macOS: `volname` | `"StudioFS"` |
+| macOS: `local` | Yes |
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
@@ -136,8 +137,10 @@ On macOS, Finder-style delete may arrive at the filesystem as a rename into a
 Trash directory (`.Trash`, `.Trashes`, `.Trash-<uid>`) instead of a direct
 `unlink`.
 
-StudioFS handles this as a namespace-preserving trash move plus **local
-cache-only eviction**:
+StudioFS mounts the volume as a local drive (via `local`) and allows
+`.Trashes` to be materialized as a real directory. Finder then performs native
+Trash semantics, so deletes go through ordinary rename/restore flow instead of
+`unlink` fallback:
 - the file remains available in Trash
 - inode metadata is preserved
 - local L1/L2 cache blocks for the file are evicted promptly to release disk
@@ -150,7 +153,7 @@ from Finder-driven deletes.
 
 Finder and related macOS services may also try to create metadata sidecar files
 such as `.DS_Store`, AppleDouble `._*`, and root-level system metadata names like
-`.Spotlight-V100`, `.Trashes`, and `.fseventsd`.
+`.Spotlight-V100`, and `.fseventsd`.
 
 StudioFS drops these names at the VFS layer:
 - `create` / `open` flows succeed locally so Finder does not surface errors
@@ -174,6 +177,13 @@ in-memory pressure from very large native `com.apple.*` writes:
 
 This keeps shared directories free of macOS-only garbage while preserving normal
 Finder interaction.
+
+### macOS unsupported ioctls
+
+During mount/unmount lifecycle macOS may probe some filesystem control operations
+that are not implemented by StudioFS. These `ioctl` requests are answered with
+`ENOTTY` and do not indicate filesystem corruption; they are handled as explicit,
+expected no-op control-plane responses.
 
 ### macOS Unicode normalization (NFC/NFD)
 
@@ -236,7 +246,7 @@ Implements `fuser::Filesystem` trait.
 mount_and_serve(vfs, rt, mount_point, foreground)
   │
   ├─ Build mount options
-  ├─ fuser::mount2() — blocks until unmount
+  ├─ `fuser::Session::new(...).run()` — blocks until unmount
   │
   └─ Shutdown:
        ├─ Drain pending uploads

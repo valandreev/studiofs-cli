@@ -450,7 +450,7 @@ fn is_ignored_macos_metadata_name(name: &[u8]) -> bool {
 }
 
 fn is_blocked_root_macos_metadata_dir(name: &[u8]) -> bool {
-    matches!(name, b".Spotlight-V100" | b".Trashes" | b".fseventsd")
+    matches!(name, b".Spotlight-V100" | b".fseventsd")
 }
 
 // =============================================================================
@@ -9896,13 +9896,13 @@ mod tests {
 
         meta.create_dir(ROOT_INO, b".Trashes", 1000, 1000, 0o755)
             .expect("seed blocked root dir in metadata");
-        assert!(
-            vfs.lookup(ROOT_INO, b".Trashes").is_err(),
-            "component lookup must hide blocked root metadata entry"
-        );
-        assert!(
-            resolver.resolve_path("\\.Trashes").is_err(),
-            "full-path resolver must hide blocked root metadata entry"
+        let trashes = vfs
+            .lookup(ROOT_INO, b".Trashes")
+            .expect("component lookup .Trashes");
+        assert_eq!(
+            resolver.resolve_path("\\.Trashes").expect("resolve .Trashes").ino,
+            trashes.ino,
+            "blocked-root policy should allow .Trashes to be materialized"
         );
     }
 
