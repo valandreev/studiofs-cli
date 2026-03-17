@@ -361,7 +361,6 @@ fn daemon_log_stem(name: &str, meta_dir: &Path) -> anyhow::Result<String> {
         format_info.uuid
     ))
 }
-}
 
 fn sanitize_log_component(raw: &str) -> String {
     let sanitized: String = raw
