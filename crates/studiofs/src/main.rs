@@ -395,19 +395,19 @@ ACL PRINCIPAL:
         name: String,
 
         /// Mount point: drive letter on Windows (Z:), directory path on Unix (/mnt/studio)
-        mount_point: String,
+        mount_point: Option<String>,
 
         /// Disk cache directory (defaults to <meta-dir>/cache)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
 
         /// Maximum disk cache size (e.g. 100GB, 50GB, 1TB)
-        #[arg(long, default_value = "100GB")]
-        cache_size: String,
+        #[arg(long)]
+        cache_size: Option<String>,
 
         /// Maximum in-memory cache size (e.g. 1GB, 512MB, 4GB)
-        #[arg(long, default_value = "2GB")]
-        memory_limit: String,
+        #[arg(long)]
+        memory_limit: Option<String>,
 
         /// Principal identity used for ACL checks in this mount instance.
         #[arg(long)]
@@ -452,6 +452,17 @@ EXAMPLES:
         /// Override local cache base directory (defaults to <meta-dir>/cache)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+    },
+
+    /// Manage defaults for `studiofs mount`.
+    #[command(after_help = "\
+Examples:
+  Persist default mount + cache settings for quick mount commands:
+    studiofs settings --mount-point /mnt/studio
+    studiofs settings --cache-dir ~/.cache/studiofs --memory-limit 4GB --cache-size 1TB")]
+    Settings {
+        #[command(flatten)]
+        settings: cli::settings::SettingsArgs,
     },
 
     /// Scan data objects and remove orphaned ones (Phase 6 prototype)
@@ -618,16 +629,19 @@ fn main() -> anyhow::Result<()> {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::mount::run(
                 &name,
-                &mount_point,
+                mount_point.as_deref(),
                 &meta_dir,
                 cache_dir.as_deref(),
-                &cache_size,
-                &memory_limit,
+                cache_size.as_deref(),
+                memory_limit.as_deref(),
                 principal.as_deref(),
                 foreground,
                 detach,
                 snapshot_id.as_deref(),
             )?;
+        }
+        Commands::Settings { settings } => {
+            cli::settings::run(settings)?;
         }
         Commands::Umount { mount_point } => {
             cli::umount::run(&mount_point)?;
@@ -730,7 +744,7 @@ mod tests {
                 assert!(!foreground);
                 assert!(!mount_runs_in_foreground(foreground, detach));
                 assert_eq!(name, "vol");
-                assert_eq!(mount_point, "Z:");
+                assert_eq!(mount_point.as_deref(), Some("Z:"));
             }
             other => panic!("expected Mount, got {other:?}"),
         }
@@ -793,10 +807,43 @@ mod tests {
                 ..
             } => {
                 assert!(detach);
-                assert_eq!(memory_limit, "4GB");
-                assert_eq!(cache_size, "200GB");
+                assert_eq!(memory_limit.unwrap(), "4GB");
+                assert_eq!(cache_size.unwrap(), "200GB");
             }
             other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_parses_mount_point() {
+        let cli = parse(&["settings", "--mount-point", "/mnt/studio"]).unwrap();
+        match cli.command {
+            Commands::Settings { settings } => {
+                assert_eq!(settings.mount_point.unwrap(), "/mnt/studio");
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_parses_cache_options() {
+        let cli = parse(&[
+            "settings",
+            "--cache-dir",
+            "/tmp/studio-cache",
+            "--memory-limit",
+            "4GB",
+            "--cache-size",
+            "100GB",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Settings { settings } => {
+                assert_eq!(settings.cache_dir.unwrap(), PathBuf::from("/tmp/studio-cache"));
+                assert_eq!(settings.memory_limit.unwrap(), "4GB");
+                assert_eq!(settings.cache_size.unwrap(), "100GB");
+            }
+            other => panic!("expected Settings, got {other:?}"),
         }
     }
 

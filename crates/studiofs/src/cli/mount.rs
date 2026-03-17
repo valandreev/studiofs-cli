@@ -30,7 +30,7 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     let mount_path = Path::new(mount_point);
     #[cfg(windows)]
-    if is_drive_root(mount_point) {
+    if super::utils::is_drive_root(mount_point) {
         return mount_path.to_path_buf();
     }
 
@@ -41,47 +41,33 @@ fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     }
 }
 
-#[cfg(windows)]
-fn is_drive_root(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if bytes.len() < 2 {
-        return false;
-    }
-
-    let drive = bytes[0];
-    let colon = bytes[1];
-    if !(drive.is_ascii_alphabetic() && colon == b':') {
-        return false;
-    }
-
-    if bytes.len() == 2 {
-        return true;
-    }
-    let sep = bytes[2];
-    if !(sep == b'\\' || sep == b'/') {
-        return false;
-    }
-    bytes.len() == 3
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
-    mount_point: &str,
+    mount_point: Option<&str>,
     meta_dir: &Path,
     cache_dir: Option<&Path>,
-    cache_size: &str,
-    memory_limit: &str,
+    cache_size: Option<&str>,
+    memory_limit: Option<&str>,
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT")
-        .unwrap_or_else(|_| mount_point.to_string());
+    let (mount_point, resolved_cache_dir, memory_limit, cache_size) =
+        super::settings::resolve_studiofs_config_for_mount(
+            mount_point,
+            cache_dir,
+            memory_limit,
+            cache_size,
+        )?;
+
+    let cache_dir = resolved_cache_dir;
+
+    let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
     #[cfg(windows)]
-    let is_drive_root = is_drive_root(&actual_mount_path);
+    let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
 
     #[cfg(not(windows))]
     let is_drive_root = false;
@@ -206,12 +192,10 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let mem_limit = parse_size(memory_limit)?;
-
-    let cache_size_bytes = parse_size(cache_size)?;
-    let base_cache_path = cache_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| meta_dir.join("cache"));
+    let mem_limit = parse_size(&memory_limit)?;
+    let cache_size_bytes = parse_size(&cache_size)?;
+    let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
+    std::fs::create_dir_all(&base_cache_path)?;
 
     // BlockCache will create blocks/ and upload/ subdirectories inside this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);

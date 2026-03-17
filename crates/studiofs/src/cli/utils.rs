@@ -76,6 +76,28 @@ pub fn remove_pid_file(mount_point: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub fn is_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+
+    if !(bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+        return false;
+    }
+
+    if bytes.len() == 2 {
+        return true;
+    }
+
+    if bytes.len() == 3 && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        return true;
+    }
+
+    false
+}
+
 /// Named-event identifier used on Windows for graceful external shutdown.
 #[cfg(any(windows, test))]
 pub fn shutdown_event_name(mount_point: &str) -> String {

@@ -6,6 +6,21 @@
 studiofs [--log-level <trace|debug|info|warn|error>] <command> ...
 ```
 
+StudioFS stores global defaults for mount in the OS-standard config path under:
+
+- macOS: `~/Library/Application Support/studiofs/config.toml`
+- Linux: `~/.config/studiofs/config.toml`
+- Windows: `%APPDATA%\studiofs\config.toml`
+
+Values in the config file are used by `studiofs mount` when the corresponding CLI flags are omitted.
+
+Priority for each setting:
+
+1. CLI flag (`--mount-point`, `--cache-dir`, `--memory-limit`, `--cache-size`)
+2. Value from `config.toml`
+3. Legacy default (`memory-limit=2GB`, `cache-size=100GB`)
+4. For `mount-point`, no implicit default is used; `cache-dir` still falls back to `<meta-dir>/cache` when neither CLI nor config provides a value.
+
 ## Commands
 
 ### `init`
@@ -50,7 +65,7 @@ without requiring `discover`.
 ### `mount`
 
 ```bash
-studiofs mount <name> <mount-point> \
+studiofs mount <name> [<mount-point>] \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
@@ -61,6 +76,8 @@ studiofs mount <name> <mount-point> \
 ```
 
 Notes:
+- You can persist defaults with `studiofs settings`.
+- If `<mount-point>` is omitted, `studiofs mount` uses the configured default from `settings`.
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
@@ -69,6 +86,20 @@ Notes:
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
+
+### `settings`
+
+```bash
+studiofs settings [--mount-point <path>] [--cache-dir <path>] [--memory-limit <e.g. 1GB>] [--cache-size <e.g. 200GB>]
+```
+
+Stores global defaults in `config.toml` for future `studiofs mount` runs.
+
+Notes:
+- CLI arguments override existing config values.
+- `studiofs settings --mount-point` creates the mount directory if needed.
+- `studiofs settings --cache-dir` creates the cache directory if needed.
+- `studiofs settings` with no options prints current defaults and leaves the file unchanged.
 
 ### `umount`
 
