@@ -6,6 +6,7 @@ pub mod dump_load;
 pub mod fsck;
 pub mod init;
 pub mod janitor;
+pub mod settings;
 pub mod mount;
 pub mod snapshot;
 pub mod status;

@@ -9,6 +9,9 @@ use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engin
 use studiofs_vfs::StudioVfs;
 use tracing::{debug, info};
 
+const DEFAULT_CACHE_SIZE: &str = "100GB";
+const DEFAULT_MEMORY_LIMIT: &str = "2GB";
+
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_uppercase();
@@ -67,18 +70,38 @@ fn is_drive_root(path: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
-    mount_point: &str,
+    mount_point: Option<&str>,
     meta_dir: &Path,
     cache_dir: Option<&Path>,
-    cache_size: &str,
-    memory_limit: &str,
+    cache_size: Option<&str>,
+    memory_limit: Option<&str>,
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT")
-        .unwrap_or_else(|_| mount_point.to_string());
+    let (mount_point, resolved_cache_dir, cache_size, memory_limit) =
+        super::settings::resolve_studiofs_config_for_mount(
+            mount_point,
+            cache_dir,
+            memory_limit,
+            cache_size,
+        )?;
+
+    let cache_dir = resolved_cache_dir;
+    let cache_size = if cache_size.is_empty() {
+        DEFAULT_CACHE_SIZE.to_string()
+    } else {
+        cache_size.to_string()
+    };
+
+    let memory_limit = if memory_limit.is_empty() {
+        DEFAULT_MEMORY_LIMIT.to_string()
+    } else {
+        memory_limit.to_string()
+    };
+
+    let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
     #[cfg(windows)]
     let is_drive_root = is_drive_root(&actual_mount_path);
@@ -206,12 +229,10 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let mem_limit = parse_size(memory_limit)?;
-
-    let cache_size_bytes = parse_size(cache_size)?;
-    let base_cache_path = cache_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| meta_dir.join("cache"));
+    let mem_limit = parse_size(&memory_limit)?;
+    let cache_size_bytes = parse_size(&cache_size)?;
+    let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
+    std::fs::create_dir_all(&base_cache_path)?;
 
     // BlockCache will create blocks/ and upload/ subdirectories inside this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
