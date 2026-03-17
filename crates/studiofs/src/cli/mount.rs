@@ -86,22 +86,21 @@ pub fn run(
     #[cfg(not(windows))]
     let is_drive_root = false;
 
-    if !is_drive_root {
-        if let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
-            #[cfg(target_os = "macos")]
-            if err.kind() == std::io::ErrorKind::PermissionDenied
-                && actual_mount_path.contains("/Volumes")
-            {
-                anyhow::bail!(
-                    "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
-                    actual_mount_path,
-                    actual_mount_path,
-                    actual_mount_path
-                );
-            }
-
-            return Err(err.into());
+    if !is_drive_root
+        && let Err(err) = std::fs::create_dir_all(&actual_mount_path)
+    {
+        #[cfg(target_os = "macos")]
+        if err.kind() == std::io::ErrorKind::PermissionDenied && actual_mount_path.contains("/Volumes")
+        {
+            anyhow::bail!(
+                "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
+                actual_mount_path,
+                actual_mount_path,
+                actual_mount_path
+            );
         }
+
+        return Err(err.into());
     }
 
     // Canonicalize the mount point here for detached mode, where the daemon may run
