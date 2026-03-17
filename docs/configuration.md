@@ -63,6 +63,7 @@ studiofs mount <name> <mount-point> \
 Notes:
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
+- If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
@@ -176,13 +177,13 @@ Behavior:
 Client A:
 ```bash
 studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta postgres://studiofs:studiofs@127.0.0.1:5432
-studiofs mount projectfs Z:
+studiofs mount projectfs /mnt/studio/projectfs
 ```
 
 Client B:
 ```bash
 studiofs discover projectfs --meta postgres://studiofs:studiofs@127.0.0.1:5432
-studiofs mount projectfs Y:
+studiofs mount projectfs /mnt/studio/projectfs-b
 ```
 
 ## Environment Variables
