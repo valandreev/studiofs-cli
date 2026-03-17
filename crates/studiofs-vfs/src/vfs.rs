@@ -678,6 +678,10 @@ pub struct VfsConfig {
     pub fetch_prefetch_reserve: usize,
     /// Prefetch acquire wait.
     pub fetch_prefetch_acquire_wait_ms: u64,
+    /// Materializer batch limit for each drain cycle.
+    pub max_drain_batch: usize,
+    /// Time to wait for remote visibility before publishing a manifest.
+    pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
     pub shutdown_metadata_flush_timeout_secs: u64,
     /// QoS slots for accept operations.
@@ -765,6 +769,8 @@ impl Default for VfsConfig {
             fetch_retry_max_ms: 2_000,
             fetch_prefetch_reserve: 0,
             fetch_prefetch_acquire_wait_ms: 75,
+            max_drain_batch: 1024,
+            publish_visibility_timeout_secs: 30,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: 64,
             qos_materialize_slots: 2,
@@ -2844,6 +2850,8 @@ pub struct StudioVfs {
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
     upload_worker_count: usize,
+    max_drain_batch: usize,
+    publish_visibility_timeout: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
     /// Directory-level prefetch tracker.
@@ -3700,6 +3708,10 @@ impl StudioVfs {
             } else {
                 4
             };
+            let max_drain_batch = config.max_drain_batch.max(1);
+            let publish_visibility_timeout = Duration::from_secs(
+                config.publish_visibility_timeout_secs.max(1),
+            );
             debug!(
                 writeback = true,
                 upload_delay_ms = upload_delay.as_millis() as u64,
@@ -3835,6 +3847,8 @@ impl StudioVfs {
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace,
                 upload_worker_count,
+                max_drain_batch,
+                publish_visibility_timeout,
                 readahead: readahead.clone(),
                 dir_prefetch,
                 prefetch_tx,

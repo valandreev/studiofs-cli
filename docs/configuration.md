@@ -17,6 +17,18 @@ Advanced VFS tuning lives under the `[vfs]` table in `config.toml`. CLI flags
 from `studiofs settings` and `STUDIOFS_*` environment variables override that
 file when `studiofs mount` starts.
 
+The `[vfs]` section currently covers:
+
+- dirty/spill budgets and ingress segment sizing
+- janitor cadence and lease settings
+- read-ahead, prefetch, and directory hydration tuning
+- xattr limits and cache capacities
+- upload/fetch retry and timeout tuning
+- QoS semaphore slot counts
+- slab flush behavior and shutdown flush timeout
+- materializer drain batch sizing
+- publish visibility timeout before manifest commit
+
 Priority for each setting:
 
 1. CLI flag (`--mount-point`, `--cache-dir`, `--memory-limit`, `--cache-size`)
@@ -106,6 +118,7 @@ Notes:
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
 - `studiofs settings --slab-flush-interval` stores the background slab flusher wake interval in the `[vfs]` section.
 - `studiofs settings --disable-bg-slab-flush` disables the background slab flusher in the `[vfs]` section.
+- The `[vfs]` section also stores advanced runtime knobs such as upload/fetch retry windows, QoS slot counts, materializer drain batch size, and publish visibility timeout.
 
 ### `umount`
 
@@ -251,6 +264,7 @@ studiofs mount projectfs /mnt/studio/projectfs-b
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
+| `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |
 | `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Periodic ingress checkpoint cadence |
@@ -258,6 +272,23 @@ studiofs mount projectfs /mnt/studio/projectfs-b
 | `STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS` | `128` | Immediate checkpoint trigger on ingress record mutations |
 | `STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG` | `2` | Checkpoint trigger when active segment runs too far ahead |
 | `STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS` | `4` | Checkpoint trigger when live ingress index spans too many segments |
+| `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Max attempts for upload retries |
+| `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-upload request timeout |
+| `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base delay |
+| `STUDIOFS_UPLOAD_RETRY_MAX_MS` | `5000` | Upload retry max delay |
+| `STUDIOFS_FETCH_MAX_ATTEMPTS` | `8` | Max attempts for foreground fetch retries |
+| `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` | `4` | Max attempts for best-effort prefetch fetches |
+| `STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS` | `45` | Per-fetch request timeout |
+| `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base delay |
+| `STUDIOFS_FETCH_RETRY_MAX_MS` | `2000` | Fetch retry max delay |
+| `STUDIOFS_FETCH_PREFETCH_RESERVE` | `0` | Reserved fetch slots kept free for foreground reads; `0` uses the runtime default |
+| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `75` | Max time a prefetch waits for a fetch slot before skipping |
+| `STUDIOFS_QOS_ACCEPT_SLOTS` | `64` | QoS semaphore slots for accept operations |
+| `STUDIOFS_QOS_MATERIALIZE_SLOTS` | `2` | QoS semaphore slots for materialization |
+| `STUDIOFS_QOS_UPLOAD_SLOTS` | `4` | QoS semaphore slots for uploads |
+| `STUDIOFS_QOS_COMMIT_SLOTS` | `4` | QoS semaphore slots for commits |
+| `STUDIOFS_QOS_FETCH_SLOTS` | `128` | QoS semaphore slots for fetches |
+| `STUDIOFS_UPLOAD_WORKER_COUNT` | `4` | Upload worker pool size |
 | `STUDIOFS_FETCH_MAX_ATTEMPTS` | `8` | Foreground fetch max retry attempts |
 | `STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS` | `45` | Per-attempt S3 GET timeout |
 | `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base backoff |

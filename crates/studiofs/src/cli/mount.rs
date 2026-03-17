@@ -164,6 +164,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         "STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS",
         prefetch_pause_on_neterr_ms
     );
+    set_usize!("STUDIOFS_MAX_DRAIN_BATCH", max_drain_batch);
     set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
     set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
     set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);
@@ -210,6 +211,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_u64!(
         "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
         shutdown_metadata_flush_timeout_secs
+    );
+    set_u64!(
+        "STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS",
+        publish_visibility_timeout_secs
     );
     set_f64!("STUDIOFS_FETCH_INITIAL_WINDOW", fetch_initial_window);
     set_f64!("STUDIOFS_FETCH_MIN_WINDOW", fetch_min_window);

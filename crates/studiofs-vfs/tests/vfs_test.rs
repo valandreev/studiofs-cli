@@ -266,6 +266,9 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Some(ms) = parse_env_u64("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS") {
         config.prefetch_pause_on_neterr_ms = ms;
     }
+    if let Some(value) = parse_env_usize("STUDIOFS_MAX_DRAIN_BATCH") {
+        config.max_drain_batch = value;
+    }
     if let Some(secs) = parse_env_u64("STUDIOFS_LOCK_TTL_SECS") {
         config.lock_ttl_secs = secs;
     }
@@ -340,6 +343,9 @@ fn test_vfs_config_from_env() -> VfsConfig {
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_RETRY_MAX_MS") {
         config.upload_retry_max_ms = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS") {
+        config.publish_visibility_timeout_secs = value;
     }
     if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_INITIAL_WINDOW") {
         config.upload_initial_window = value;
@@ -3297,6 +3303,7 @@ impl ScopedTestEnv {
             "STUDIOFS_PREFETCH_FOREGROUND_RESERVE",
             "STUDIOFS_PREFETCH_MAX_PER_CYCLE",
             "STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS",
+            "STUDIOFS_MAX_DRAIN_BATCH",
             "STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS",
             "STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES",
             "STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS",
@@ -3316,6 +3323,7 @@ impl ScopedTestEnv {
             "STUDIOFS_LOCK_TTL_SECS",
             "STUDIOFS_LOCK_RETRY_BASE_MS",
             "STUDIOFS_LOCK_RETRY_MAX_MS",
+            "STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS",
             "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
             "STUDIOFS_XATTR_MAX_BYTES",
         ];
