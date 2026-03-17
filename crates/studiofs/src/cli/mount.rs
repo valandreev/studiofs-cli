@@ -9,9 +9,6 @@ use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engin
 use studiofs_vfs::StudioVfs;
 use tracing::{debug, info};
 
-const DEFAULT_CACHE_SIZE: &str = "100GB";
-const DEFAULT_MEMORY_LIMIT: &str = "2GB";
-
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_uppercase();
@@ -33,7 +30,7 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     let mount_path = Path::new(mount_point);
     #[cfg(windows)]
-    if is_drive_root(mount_point) {
+    if super::utils::is_drive_root(mount_point) {
         return mount_path.to_path_buf();
     }
 
@@ -42,29 +39,6 @@ fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     } else {
         mount_path.join(name)
     }
-}
-
-#[cfg(windows)]
-fn is_drive_root(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if bytes.len() < 2 {
-        return false;
-    }
-
-    let drive = bytes[0];
-    let colon = bytes[1];
-    if !(drive.is_ascii_alphabetic() && colon == b':') {
-        return false;
-    }
-
-    if bytes.len() == 2 {
-        return true;
-    }
-    let sep = bytes[2];
-    if !(sep == b'\\' || sep == b'/') {
-        return false;
-    }
-    bytes.len() == 3
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,7 +54,7 @@ pub fn run(
     detach: bool,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (mount_point, resolved_cache_dir, cache_size, memory_limit) =
+    let (mount_point, resolved_cache_dir, memory_limit, cache_size) =
         super::settings::resolve_studiofs_config_for_mount(
             mount_point,
             cache_dir,
@@ -89,22 +63,13 @@ pub fn run(
         )?;
 
     let cache_dir = resolved_cache_dir;
-    let cache_size = if cache_size.is_empty() {
-        DEFAULT_CACHE_SIZE.to_string()
-    } else {
-        cache_size.to_string()
-    };
-
-    let memory_limit = if memory_limit.is_empty() {
-        DEFAULT_MEMORY_LIMIT.to_string()
-    } else {
-        memory_limit.to_string()
-    };
+    let cache_size = cache_size.to_string();
+    let memory_limit = memory_limit.to_string();
 
     let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
     #[cfg(windows)]
-    let is_drive_root = is_drive_root(&actual_mount_path);
+    let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
 
     #[cfg(not(windows))]
     let is_drive_root = false;
