@@ -19,7 +19,7 @@ Priority for each setting:
 1. CLI flag (`--mount-point`, `--cache-dir`, `--memory-limit`, `--cache-size`)
 2. Value from `config.toml`
 3. Legacy default (`memory-limit=2GB`, `cache-size=100GB`)
-4. For `mount-point` and `cache-dir`, no implicit default is used; mount requires a value from CLI or config.
+4. For `mount-point`, no implicit default is used; `cache-dir` still falls back to `<meta-dir>/cache` when neither CLI nor config provides a value.
 
 ## Commands
 
