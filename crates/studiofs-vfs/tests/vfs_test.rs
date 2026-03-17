@@ -7166,29 +7166,27 @@ async fn blocked_root_metadata_names_should_be_ignored_for_file_and_symlink_crea
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "ignore-root-macos-metadata-names");
 
-    let file = vfs.create(1, b".Trashes", 1000, 1000, 0o644).unwrap();
+    let file = vfs.create(1, b".fseventsd", 1000, 1000, 0o644).unwrap();
     let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
-    let written = vfs.write(file.ino, 0, b"trash-marker").await.unwrap();
-    assert_eq!(written, b"trash-marker".len() as u32);
+    let written = vfs.write(file.ino, 0, b"fs-event-marker").await.unwrap();
+    assert_eq!(written, b"fs-event-marker".len() as u32);
     vfs.flush(file.ino).await.unwrap();
-    assert!(vfs.lookup(1, b".Trashes").is_ok());
     vfs.release_fh(fh).await.unwrap();
 
     let symlink = vfs
-        .symlink(1, b".fseventsd", b"/tmp/ignored", 1000, 1000)
+        .symlink(1, b".Spotlight-V100", b"/tmp/ignored", 1000, 1000)
         .unwrap();
     assert_eq!(symlink.kind, studiofs_meta::types::FileType::Symlink);
     assert_eq!(vfs.readlink(symlink.ino).unwrap(), Vec::<u8>::new());
 
-    assert!(vfs.lookup(1, b".Trashes").is_err());
-    assert!(vfs.lookup(1, b".fseventsd").is_ok());
-    assert!(vfs.meta().lookup(1, b".Trashes").is_err());
+    assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
     assert!(vfs.meta().lookup(1, b".fseventsd").is_err());
     assert!(vfs.readdir(1).unwrap().is_empty());
 
-    vfs.unlink(1, b".fseventsd").unwrap();
-    assert!(vfs.lookup(1, b".Trashes").is_err());
+    vfs.unlink(1, b".Spotlight-V100").unwrap();
+    assert!(vfs.meta().lookup(1, b".fseventsd").is_err());
     assert!(vfs.lookup(1, b".fseventsd").is_err());
+    assert!(vfs.meta().lookup(1, b".Spotlight-V100").is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7212,11 +7210,12 @@ async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
         .unwrap();
 
     let entries = vfs.readdir(1).unwrap();
-    let names: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.name).collect();
-    assert_eq!(names, vec![b"visible".to_vec()]);
+    let mut names: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.name).collect();
+    names.sort();
+    assert_eq!(names, vec![b".Trashes".to_vec(), b"visible".to_vec()]);
 
     assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
-    assert!(vfs.lookup(1, b".Trashes").is_err());
+    assert!(vfs.lookup(1, b".Trashes").is_ok());
     assert!(vfs.lookup(1, b".fseventsd").is_err());
     assert!(vfs.lookup(1, b"visible").is_ok());
 }
@@ -7229,12 +7228,12 @@ async fn unlink_should_remove_legacy_persisted_root_blocked_regular_file() {
     let vfs = make_vfs(&tmp, "unlink-legacy-root-blocked-file");
 
     vfs.meta()
-        .create_file(1, b".Trashes", 1000, 1000, 0o644)
+        .create_file(1, b".fseventsd", 1000, 1000, 0o644)
         .unwrap();
 
-    assert!(vfs.lookup(1, b".Trashes").is_err());
-    vfs.unlink(1, b".Trashes").unwrap();
-    assert!(vfs.meta().lookup(1, b".Trashes").is_err());
+    assert!(vfs.lookup(1, b".fseventsd").is_err());
+    vfs.unlink(1, b".fseventsd").unwrap();
+    assert!(vfs.meta().lookup(1, b".fseventsd").is_err());
 }
 
 // ─── 9.3 Rename & Unlink Edge Cases ────────────────────────────────────────

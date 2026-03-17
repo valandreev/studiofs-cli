@@ -51,6 +51,8 @@ fn build_mount_options(
     #[cfg(target_os = "macos")]
     {
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
+        // Tell macFUSE to treat this as a local drive, which enables native Trash.
+        options.push(fuser::MountOption::CUSTOM("local".into()));
     }
     #[cfg(target_os = "macos")]
     if foreground {
@@ -233,5 +235,14 @@ mod tests {
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "volname=studiofs-mac")
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_options_sets_macos_local_flag() {
+        let options = build_mount_options("studiofs-mac", false, false).expect("options");
+        assert!(options
+            .iter()
+            .any(|opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "local")));
     }
 }
