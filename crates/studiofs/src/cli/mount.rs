@@ -254,12 +254,11 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         .map(|arg| arg.to_string())
         .collect();
 
-    if let Some(mount_cmd_idx) = args.iter().position(|arg| arg == "mount")
-        && let Some(arg) = args.get_mut(mount_cmd_idx + 2)
-    {
+    if let Some(mount_arg_idx) = find_daemon_mount_point_arg_index(&args, name) {
+        if let Some(arg) = args.get_mut(mount_arg_idx) {
         *arg = mount_point.to_string();
     }
-
+    }
     let logs_dir = super::utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
     let today = Utc::now().format("%Y-%m-%d");
@@ -323,6 +322,52 @@ fn daemon_log_stem(name: &str, meta_dir: &Path) -> anyhow::Result<String> {
     ))
 }
 
+fn find_daemon_mount_point_arg_index(args: &[String], volume_name: &str) -> Option<usize> {
+    let mount_cmd_idx = args.iter().position(|arg| arg == "mount")?;
+    let mut i = mount_cmd_idx + 1;
+
+    while i < args.len() {
+        if args[i] == volume_name {
+            i += 1;
+            while i < args.len() {
+                let arg = &args[i];
+                if arg == "-d" || arg == "--detach" || arg == "--foreground" {
+                    i += 1;
+                    continue;
+                }
+                if arg.starts_with("--cache-dir=")
+                    || arg.starts_with("--cache-size=")
+                    || arg.starts_with("--memory-limit=")
+                    || arg.starts_with("--principal=")
+                    || arg.starts_with("--snapshot-id=")
+                {
+                    i += 1;
+                    continue;
+                }
+                if arg == "--cache-dir"
+                    || arg == "--cache-size"
+                    || arg == "--memory-limit"
+                    || arg == "--principal"
+                    || arg == "--snapshot-id"
+                {
+                    i += 2;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+
+                return Some(i);
+            }
+            return None;
+        }
+        i += 1;
+    }
+
+    None
+}
+
 fn sanitize_log_component(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
@@ -363,5 +408,33 @@ mod tests {
             resolve_mount_path("projectfs", "/mnt/projectfs"),
             Path::new("/mnt/projectfs")
         );
+    }
+
+    #[test]
+    fn test_find_volume_name_index_with_flags_between_name_and_mount_point() {
+        let args = vec![
+            "mount".to_string(),
+            "projectfs".to_string(),
+            "--foreground".to_string(),
+            "/mnt/studio".to_string(),
+            "-d".to_string(),
+        ];
+        let mount_arg_idx = find_daemon_mount_point_arg_index(&args, "projectfs").unwrap();
+        assert_eq!(mount_arg_idx, 3);
+        assert_eq!(args[mount_arg_idx], "/mnt/studio");
+    }
+
+    #[test]
+    fn test_find_mount_point_with_value_flags() {
+        let args = vec![
+            "mount".to_string(),
+            "projectfs".to_string(),
+            "--cache-dir".to_string(),
+            "/tmp/studio-cache".to_string(),
+            "/mnt/studio".to_string(),
+        ];
+        let mount_arg_idx = find_daemon_mount_point_arg_index(&args, "projectfs").unwrap();
+        assert_eq!(mount_arg_idx, 4);
+        assert_eq!(args[mount_arg_idx], "/mnt/studio");
     }
 }
