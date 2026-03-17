@@ -3,6 +3,7 @@
 //! This mirrors the fetch-side adaptive control, but for PUT requests.
 
 use crate::aimd::{AimdConfig, AimdController};
+use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use opendal::ErrorKind;
 use std::sync::Arc;
@@ -79,27 +80,11 @@ pub struct UploadScheduler {
 }
 
 impl UploadScheduler {
-    pub fn new(data_store: Arc<DataStore>, aimd_config: AimdConfig) -> Self {
-        fn env_u32(key: &str, default: u32) -> u32 {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(default)
-        }
-
-        fn env_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(default)
-        }
-
-        let max_attempts = env_u32("STUDIOFS_UPLOAD_MAX_ATTEMPTS", 10);
-        let request_timeout_s = env_u64("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", 120);
-        let retry_base_ms = env_u64("STUDIOFS_UPLOAD_RETRY_BASE_MS", 200);
-        let retry_max_ms = env_u64("STUDIOFS_UPLOAD_RETRY_MAX_MS", 5_000).max(retry_base_ms);
+    pub fn new(data_store: Arc<DataStore>, aimd_config: AimdConfig, config: &VfsConfig) -> Self {
+        let max_attempts = config.upload_max_attempts.max(1);
+        let request_timeout_s = config.upload_request_timeout_secs.max(1);
+        let retry_base_ms = config.upload_retry_base_ms.max(1);
+        let retry_max_ms = config.upload_retry_max_ms.max(retry_base_ms);
 
         debug!(
             initial_window = aimd_config.initial_window,

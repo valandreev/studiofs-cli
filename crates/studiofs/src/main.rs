@@ -202,6 +202,7 @@ ENV TUNING:
   STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
   STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
   STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background slab flusher wake interval (default: 10).
+  STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background slab flushing (default: 0).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).

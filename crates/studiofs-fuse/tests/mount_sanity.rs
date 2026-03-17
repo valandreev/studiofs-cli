@@ -7,7 +7,7 @@ use studiofs_fuse::StudioFuseFs;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
 };
-use studiofs_vfs::StudioVfs;
+use studiofs_vfs::{StudioVfs, VfsConfig};
 
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("fuse-test-{volume_suffix}-{}", std::process::id());
@@ -47,6 +47,7 @@ fn make_test_vfs(
         cache_dir.to_str().expect("cache dir str"),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
+        VfsConfig::default(),
     )
     .expect("create vfs")
 }

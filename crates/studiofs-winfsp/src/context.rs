@@ -1062,7 +1062,7 @@ mod tests {
         CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataConfig, ROOT_INO, RedbMetaEngine,
     };
     use studiofs_vfs::VfsError;
-    use studiofs_vfs::{KernelInvalidator, StudioVfs};
+    use studiofs_vfs::{KernelInvalidator, StudioVfs, VfsConfig};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -1100,6 +1100,7 @@ mod tests {
             cache_dir.to_str().expect("cache dir str"),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
+            VfsConfig::default(),
         )
         .expect("create vfs")
     }

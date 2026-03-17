@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
+use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key};
 use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
@@ -535,72 +535,244 @@ struct RemoteLockRecord {
 // =============================================================================
 
 /// VFS configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VfsConfig {
-    /// Path to metadata database.
-    pub meta_path: String,
-    /// Path to disk cache directory.
-    pub cache_dir: String,
-    /// Maximum disk cache size in bytes (L2 NVMe budget).
-    pub cache_size: u64,
-    /// L1 RAM cache budget in bytes.
-    pub memory_limit: u64,
-    /// Block size in bytes (default 8MB).
-    pub block_size: u32,
-    /// Maximum concurrent uploads.
-    pub max_concurrent_uploads: usize,
-    /// Number of blocks to prefetch ahead when a sequential access pattern is
-    /// detected.  0 disables read-ahead entirely.  Default: 128 (= 1024 MB with
-    /// 8 MB blocks).
+    /// Background janitor cycle interval.
+    pub janitor_interval_secs: u64,
+    /// Janitor grace window for newer objects.
+    pub janitor_skip_newer_secs: u64,
+    /// Max janitor deletes per cycle.
+    pub janitor_max_deletes: u64,
+    /// Janitor lease TTL in metadata store.
+    pub janitor_lease_ttl_secs: u64,
+    /// Sync interval for metadata invalidation watcher.
+    pub metadata_invalidation_sync_interval_ms: u64,
+    /// Read buffer size used to derive fetch/prefetch defaults.
+    pub read_buffer_mb: u64,
+    /// Prefetch concurrency budget.
+    pub prefetch_concurrency: usize,
+    /// Sequential read-ahead window.
     pub readahead_width: u32,
-    /// Maximum bytes to hold in the dirty-write memory buffer before applying
-    /// backpressure.  This buffer stores blocks that `flush()` has accepted
-    /// but the background flusher has not yet written to disk.
-    /// Default: 12 GiB.  Larger buffer absorbs write bursts better and lets
-    /// the parallel background flusher saturate NVMe.
+    /// Minimum prefetch count for sequential patterns.
+    pub readahead_min_prefetch: u32,
+    /// Sequential step size.
+    pub readahead_seq_step: u8,
+    /// Random access penalty.
+    pub readahead_random_penalty: u8,
+    /// Directory prefetch batch size.
+    pub dir_prefetch_max_batch: usize,
+    /// Readdir attr hydration chunk size.
+    pub readdir_attr_batch_chunk: usize,
+    /// Readdir attr hydration cap.
+    pub readdir_attr_batch_max_inodes: usize,
+    /// Foreground reserve for prefetch scheduling.
+    pub prefetch_foreground_reserve: usize,
+    /// Max prefetches per cycle.
+    pub prefetch_max_per_cycle: usize,
+    /// Pause between prefetch retries on network errors.
+    pub prefetch_pause_on_neterr_ms: u64,
+    /// Lock lease TTL.
+    pub lock_ttl_secs: u64,
+    /// Lock retry base backoff.
+    pub lock_retry_base_ms: u64,
+    /// Lock retry max backoff.
+    pub lock_retry_max_ms: u64,
+    /// Maximum total bytes allowed in the dirty-write memory buffer.
     pub max_dirty_bytes: usize,
-    /// Maximum bytes allowed in a single xattr value.
-    /// Default: 4 MiB.
+    /// Maximum bytes allowed for a single xattr value.
     pub max_xattr_bytes: usize,
+    /// Dentry cache entry budget.
+    pub dentry_cache_capacity: usize,
+    /// Dentry cache byte budget.
+    pub dentry_cache_bytes: usize,
+    /// Path shortcut cache entry budget.
+    pub path_shortcut_cache_capacity: usize,
+    /// Path shortcut cache byte budget.
+    pub path_shortcut_cache_bytes: usize,
+    /// Attr read cache entry budget.
+    pub attr_read_cache_capacity: usize,
+    /// Attr read cache byte budget.
+    pub attr_read_cache_bytes: usize,
+    /// Effective ACL cache entry budget.
+    pub effective_acl_cache_capacity: usize,
+    /// Maximum bytes allowed in local NVMe spill.
+    pub max_spill_bytes: usize,
+    /// Maximum active ingress segment size.
+    pub max_ingress_segment_bytes: u64,
+    /// Principal used for ACL evaluation.
+    pub principal: String,
+    /// Initial fetch window.
+    pub fetch_initial_window: f64,
+    /// Minimum fetch window.
+    pub fetch_min_window: f64,
+    /// Maximum fetch window.
+    pub fetch_max_window: f64,
+    /// Fetch AIMD increase step.
+    pub fetch_increase_step: f64,
+    /// Fetch AIMD decrease factor.
+    pub fetch_decrease_factor: f64,
+    /// Fetch AIMD cooldown.
+    pub fetch_decrease_cooldown_secs: u64,
+    /// Initial upload window.
+    pub upload_initial_window: f64,
+    /// Minimum upload window.
+    pub upload_min_window: f64,
+    /// Maximum upload window.
+    pub upload_max_window: f64,
+    /// Upload AIMD increase step.
+    pub upload_increase_step: f64,
+    /// Upload AIMD decrease factor.
+    pub upload_decrease_factor: f64,
+    /// Upload AIMD cooldown.
+    pub upload_decrease_cooldown_secs: u64,
+    /// Delay uploads for overwrite/delete coalescing.
+    pub upload_delay_ms: u64,
+    /// Base backoff for exhausted upload requeue.
+    pub upload_requeue_base_ms: u64,
+    /// Max backoff for exhausted upload requeue.
+    pub upload_requeue_max_ms: u64,
+    /// Upload metrics log interval.
+    pub upload_stats_interval_secs: u64,
+    /// Background slab flusher wake interval.
+    pub slab_flush_interval_ms: u64,
+    /// Whether background slab flushing is enabled.
+    pub background_slab_flush_enabled: bool,
+    /// Periodic ingress checkpoint interval.
+    pub ingress_checkpoint_interval_secs: u64,
+    /// Immediate checkpoint trigger on uncheckpointed ingress bytes.
+    pub ingress_checkpoint_min_append_bytes: u64,
+    /// Immediate checkpoint trigger on ingress record mutations.
+    pub ingress_checkpoint_min_mutations: u64,
+    /// Checkpoint trigger when active segment runs too far ahead.
+    pub ingress_checkpoint_max_segment_lag: u64,
+    /// Checkpoint trigger when live ingress index spans too many segments.
+    pub ingress_checkpoint_max_live_segments: u64,
+    /// Upload local-cache I/O slots.
+    pub upload_cache_io_slots: usize,
+    /// Upload slot cost when foreground reads are active.
+    pub upload_cache_io_user_penalty: u32,
+    /// User idle grace after the last foreground read.
+    pub upload_user_idle_grace_ms: u64,
+    /// Upload worker pool size.
+    pub upload_worker_count: usize,
+    /// Upload max attempts.
+    pub upload_max_attempts: u32,
+    /// Upload request timeout.
+    pub upload_request_timeout_secs: u64,
+    /// Upload retry base delay.
+    pub upload_retry_base_ms: u64,
+    /// Upload retry max delay.
+    pub upload_retry_max_ms: u64,
+    /// Fetch max attempts.
+    pub fetch_max_attempts: u32,
+    /// Prefetch fetch max attempts.
+    pub prefetch_fetch_max_attempts: u32,
+    /// Fetch request timeout.
+    pub fetch_request_timeout_secs: u64,
+    /// Fetch retry base delay.
+    pub fetch_retry_base_ms: u64,
+    /// Fetch retry max delay.
+    pub fetch_retry_max_ms: u64,
+    /// Prefetch reserve slots.
+    pub fetch_prefetch_reserve: usize,
+    /// Prefetch acquire wait.
+    pub fetch_prefetch_acquire_wait_ms: u64,
+    /// Metadata flush timeout during shutdown.
+    pub shutdown_metadata_flush_timeout_secs: u64,
+    /// QoS slots for accept operations.
+    pub qos_accept_slots: usize,
+    /// QoS slots for materialization.
+    pub qos_materialize_slots: usize,
+    /// QoS slots for uploads.
+    pub qos_upload_slots: usize,
+    /// QoS slots for commits.
+    pub qos_commit_slots: usize,
+    /// QoS slots for fetches.
+    pub qos_fetch_slots: usize,
 }
 
 impl Default for VfsConfig {
     fn default() -> Self {
         Self {
-            meta_path: String::new(),
-            cache_dir: String::new(),
-            cache_size: DEFAULT_L2_SIZE,
-            memory_limit: DEFAULT_L1_SIZE,
-            block_size: studiofs_meta::types::DEFAULT_BLOCK_SIZE,
-            max_concurrent_uploads: 4,
+            janitor_interval_secs: DEFAULT_JANITOR_INTERVAL.as_secs(),
+            janitor_skip_newer_secs: DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs(),
+            janitor_max_deletes: DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
+            janitor_lease_ttl_secs: DEFAULT_JANITOR_LEASE_TTL.as_secs(),
+            metadata_invalidation_sync_interval_ms: DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS,
+            read_buffer_mb: DEFAULT_READ_BUFFER_MB,
+            prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY.max(16),
             readahead_width: DEFAULT_READAHEAD_WIDTH,
+            readahead_min_prefetch: DEFAULT_READAHEAD_MIN_PREFETCH,
+            readahead_seq_step: DEFAULT_READAHEAD_SEQ_STEP,
+            readahead_random_penalty: DEFAULT_READAHEAD_RANDOM_PENALTY,
+            dir_prefetch_max_batch: DEFAULT_DIR_PREFETCH_MAX_BATCH,
+            readdir_attr_batch_chunk: DEFAULT_READDIR_ATTR_BATCH_CHUNK,
+            readdir_attr_batch_max_inodes: DEFAULT_READDIR_ATTR_BATCH_MAX_INODES,
+            prefetch_foreground_reserve: DEFAULT_PREFETCH_FOREGROUND_RESERVE,
+            prefetch_max_per_cycle: DEFAULT_PREFETCH_MAX_PER_CYCLE,
+            prefetch_pause_on_neterr_ms: DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS,
+            lock_ttl_secs: DEFAULT_LOCK_LEASE_TTL.as_secs(),
+            lock_retry_base_ms: DEFAULT_LOCK_RETRY_BASE_MS,
+            lock_retry_max_ms: DEFAULT_LOCK_RETRY_MAX_MS,
             max_dirty_bytes: 12 * 1024 * 1024 * 1024,
             max_xattr_bytes: DEFAULT_XATTR_MAX_BYTES,
+            dentry_cache_capacity: DEFAULT_DENTRY_CACHE_CAPACITY,
+            dentry_cache_bytes: DEFAULT_DENTRY_CACHE_BYTES,
+            path_shortcut_cache_capacity: DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY,
+            path_shortcut_cache_bytes: DEFAULT_PATH_SHORTCUT_CACHE_BYTES,
+            attr_read_cache_capacity: DEFAULT_ATTR_READ_CACHE_CAPACITY,
+            attr_read_cache_bytes: DEFAULT_ATTR_READ_CACHE_BYTES,
+            effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
+            max_spill_bytes: 64 * 1024 * 1024 * 1024usize,
+            max_ingress_segment_bytes: DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
+            principal: "*".to_string(),
+            fetch_initial_window: 0.0,
+            fetch_min_window: 1.0,
+            fetch_max_window: 0.0,
+            fetch_increase_step: 0.0,
+            fetch_decrease_factor: 0.85,
+            fetch_decrease_cooldown_secs: 3,
+            upload_initial_window: 16.0,
+            upload_min_window: 1.0,
+            upload_max_window: 512.0,
+            upload_increase_step: 2.0,
+            upload_decrease_factor: 0.85,
+            upload_decrease_cooldown_secs: 3,
+            upload_delay_ms: DEFAULT_UPLOAD_DELAY_MS,
+            upload_requeue_base_ms: DEFAULT_UPLOAD_REQUEUE_BASE_MS,
+            upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
+            upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
+            slab_flush_interval_ms: 10,
+            background_slab_flush_enabled: true,
+            ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
+            ingress_checkpoint_min_append_bytes: DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES,
+            ingress_checkpoint_min_mutations: DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS,
+            ingress_checkpoint_max_segment_lag: DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG,
+            ingress_checkpoint_max_live_segments: DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS,
+            upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
+            upload_cache_io_user_penalty: DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY,
+            upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
+            upload_worker_count: 0,
+            upload_max_attempts: 10,
+            upload_request_timeout_secs: 120,
+            upload_retry_base_ms: 200,
+            upload_retry_max_ms: 5_000,
+            fetch_max_attempts: 8,
+            prefetch_fetch_max_attempts: 4,
+            fetch_request_timeout_secs: 45,
+            fetch_retry_base_ms: 50,
+            fetch_retry_max_ms: 2_000,
+            fetch_prefetch_reserve: 0,
+            fetch_prefetch_acquire_wait_ms: 75,
+            shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
+            qos_accept_slots: 64,
+            qos_materialize_slots: 2,
+            qos_upload_slots: 4,
+            qos_commit_slots: 4,
+            qos_fetch_slots: 128,
         }
     }
-}
-
-fn parse_size_bytes_env(raw: &str) -> Option<usize> {
-    let s = raw.trim().to_ascii_uppercase();
-    if s.is_empty() {
-        return None;
-    }
-    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
-        (v, 1024u128 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("GB") {
-        (v, 1024u128 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("MB") {
-        (v, 1024u128 * 1024)
-    } else if let Some(v) = s.strip_suffix("KB") {
-        (v, 1024u128)
-    } else if let Some(v) = s.strip_suffix('B') {
-        (v, 1u128)
-    } else {
-        (s.as_str(), 1u128)
-    };
-    let num = num_part.trim().parse::<u128>().ok()?;
-    let bytes = num.checked_mul(multiplier)?;
-    usize::try_from(bytes).ok()
 }
 
 // =============================================================================
@@ -2139,15 +2311,6 @@ fn latest_ingress_checkpoint_path(dir: &std::path::Path) -> PathBuf {
     dir.join("latest.json")
 }
 
-fn shutdown_metadata_flush_timeout() -> Duration {
-    Duration::from_secs(
-        std::env::var("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS),
-    )
-}
-
 fn run_sync_with_timeout<T: Send + 'static>(
     timeout: Duration,
     operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
@@ -2666,6 +2829,7 @@ pub struct StudioVfs {
     upload_requeue_max: Duration,
     upload_stats_interval: Duration,
     slab_flush_interval: Duration,
+    shutdown_metadata_flush_timeout: Duration,
     ingress_checkpoint_interval: Duration,
     ingress_checkpoint_min_append_bytes: u64,
     ingress_checkpoint_min_mutations: u64,
@@ -2678,6 +2842,8 @@ pub struct StudioVfs {
     upload_cache_io_user_penalty: u32,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
+    /// Upload worker pool size.
+    upload_worker_count: usize,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
     /// Directory-level prefetch tracker.
@@ -3286,6 +3452,7 @@ impl StudioVfs {
         cache_dir: &str,
         cache_size: u64,
         memory_limit: u64,
+        config: VfsConfig,
     ) -> VfsResult<Arc<Self>> {
         {
             // Get volume info
@@ -3298,43 +3465,14 @@ impl StudioVfs {
                 format!("{}/", format_info.data_prefix)
             };
             let block_size = format_info.block_size;
-            let janitor_interval = Duration::from_secs(
-                std::env::var("STUDIOFS_JANITOR_INTERVAL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_JANITOR_INTERVAL.as_secs()),
-            );
-            let janitor_skip_newer_than = Duration::from_secs(
-                std::env::var("STUDIOFS_JANITOR_SKIP_NEWER_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs()),
-            );
-            let janitor_max_deletes_per_run = std::env::var("STUDIOFS_JANITOR_MAX_DELETES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_JANITOR_MAX_DELETES_PER_RUN);
-            let janitor_lease_ttl = Duration::from_secs(
-                std::env::var("STUDIOFS_JANITOR_LEASE_TTL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_JANITOR_LEASE_TTL.as_secs()),
-            );
+            let janitor_interval = Duration::from_secs(config.janitor_interval_secs.max(1));
+            let janitor_skip_newer_than = Duration::from_secs(config.janitor_skip_newer_secs);
+            let janitor_max_deletes_per_run = config.janitor_max_deletes.max(1);
+            let janitor_lease_ttl = Duration::from_secs(config.janitor_lease_ttl_secs.max(1));
             let metadata_invalidation_sync_interval = Duration::from_millis(
-                std::env::var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS),
+                config.metadata_invalidation_sync_interval_ms.max(1),
             );
-            let read_buffer_mb = std::env::var("STUDIOFS_READ_BUFFER_MB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_READ_BUFFER_MB);
+            let read_buffer_mb = config.read_buffer_mb.max(1);
             let block_size_nonzero = block_size.max(1) as u128;
             let mb_to_blocks = |mb: u64| -> u32 {
                 let bytes = (mb as u128) * 1024 * 1024;
@@ -3342,156 +3480,49 @@ impl StudioVfs {
                 blocks as u32
             };
             let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
-            let prefetch_concurrency_default = DEFAULT_PREFETCH_CONCURRENCY;
-
-            let prefetch_concurrency = std::env::var("STUDIOFS_PREFETCH_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(prefetch_concurrency_default.max(16));
-            let readahead_width = std::env::var("STUDIOFS_READAHEAD_WIDTH")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_READAHEAD_WIDTH);
-            let min_readahead_prefetch_floor = DEFAULT_READAHEAD_MIN_PREFETCH.min(16);
-            let readahead_min_prefetch = std::env::var("STUDIOFS_READAHEAD_MIN_PREFETCH")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_READAHEAD_MIN_PREFETCH.max(min_readahead_prefetch_floor));
-            let readahead_seq_step = std::env::var("STUDIOFS_READAHEAD_SEQ_STEP")
-                .ok()
-                .and_then(|v| v.parse::<u8>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_READAHEAD_SEQ_STEP);
-            let readahead_random_penalty = std::env::var("STUDIOFS_READAHEAD_RANDOM_PENALTY")
-                .ok()
-                .and_then(|v| v.parse::<u8>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_READAHEAD_RANDOM_PENALTY);
-            let dir_prefetch_max_batch = std::env::var("STUDIOFS_DIR_PREFETCH_MAX_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_DIR_PREFETCH_MAX_BATCH);
-            let readdir_attr_batch_chunk = std::env::var("STUDIOFS_READDIR_ATTR_BATCH_CHUNK")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_READDIR_ATTR_BATCH_CHUNK);
-            let readdir_attr_batch_max_inodes =
-                std::env::var("STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_READDIR_ATTR_BATCH_MAX_INODES);
-            let prefetch_foreground_reserve_default =
-                (prefetch_concurrency / 2).clamp(16, (buffer_blocks_default as usize).max(16));
-            let prefetch_foreground_reserve = std::env::var("STUDIOFS_PREFETCH_FOREGROUND_RESERVE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(
-                    prefetch_foreground_reserve_default.max(DEFAULT_PREFETCH_FOREGROUND_RESERVE),
-                );
-            let prefetch_max_per_cycle_default = DEFAULT_PREFETCH_MAX_PER_CYCLE;
-            let min_prefetch_cycle_floor = DEFAULT_PREFETCH_MAX_PER_CYCLE.min(32);
-            let prefetch_max_per_cycle = std::env::var("STUDIOFS_PREFETCH_MAX_PER_CYCLE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(prefetch_max_per_cycle_default.max(min_prefetch_cycle_floor));
-            let prefetch_pause_on_neterr = Duration::from_millis(
-                std::env::var("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS),
-            );
-            let _lock_lease_ttl = Duration::from_secs(
-                std::env::var("STUDIOFS_LOCK_TTL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_LOCK_LEASE_TTL.as_secs()),
-            );
-            let lock_retry_base_ms = std::env::var("STUDIOFS_LOCK_RETRY_BASE_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_LOCK_RETRY_BASE_MS);
-            let _lock_retry_max_ms = std::env::var("STUDIOFS_LOCK_RETRY_MAX_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v >= lock_retry_base_ms)
-                .unwrap_or(DEFAULT_LOCK_RETRY_MAX_MS.max(lock_retry_base_ms));
+            let prefetch_concurrency = config.prefetch_concurrency.max(1);
+            let readahead_width = config.readahead_width.max(1);
+            let readahead_min_prefetch = config.readahead_min_prefetch.max(1);
+            let readahead_seq_step = config.readahead_seq_step.max(1);
+            let readahead_random_penalty = config.readahead_random_penalty.max(1);
+            let dir_prefetch_max_batch = config.dir_prefetch_max_batch.max(1);
+            let readdir_attr_batch_chunk = config.readdir_attr_batch_chunk.max(1);
+            let readdir_attr_batch_max_inodes = config.readdir_attr_batch_max_inodes.max(1);
+            let prefetch_foreground_reserve = config.prefetch_foreground_reserve.max(1);
+            let prefetch_max_per_cycle = config.prefetch_max_per_cycle.max(1);
+            let prefetch_pause_on_neterr = Duration::from_millis(config.prefetch_pause_on_neterr_ms);
+            let _lock_lease_ttl = Duration::from_secs(config.lock_ttl_secs.max(1));
+            let lock_retry_base_ms = config.lock_retry_base_ms.max(1);
+            let _lock_retry_max_ms = config.lock_retry_max_ms.max(lock_retry_base_ms);
 
             let janitor_lease = None;
             let distributed_flock = None;
-            let max_dirty_bytes = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .unwrap_or(12 * 1024 * 1024 * 1024);
-            let max_xattr_bytes = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_XATTR_MAX_BYTES);
-            let dentry_cache_capacity = std::env::var("STUDIOFS_DENTRY_CACHE_CAPACITY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_DENTRY_CACHE_CAPACITY);
-            let dentry_cache_bytes = std::env::var("STUDIOFS_DENTRY_CACHE_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_DENTRY_CACHE_BYTES);
-            let path_shortcut_cache_capacity =
-                std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY);
-            let path_shortcut_cache_bytes = std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_PATH_SHORTCUT_CACHE_BYTES);
-            let attr_read_cache_capacity = std::env::var("STUDIOFS_ATTR_READ_CACHE_CAPACITY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_ATTR_READ_CACHE_CAPACITY);
-            let attr_read_cache_bytes = std::env::var("STUDIOFS_ATTR_READ_CACHE_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_ATTR_READ_CACHE_BYTES);
-            let effective_acl_cache_capacity =
-                std::env::var("STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY);
-            let max_spill_bytes = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .unwrap_or(64 * 1024 * 1024 * 1024usize);
-            let max_ingress_segment_bytes = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
-                .ok()
-                .and_then(|v| parse_size_bytes_env(&v))
-                .filter(|v| *v > 0)
-                .map(|v| v as u64)
-                .unwrap_or(DEFAULT_INGRESS_SEGMENT_MAX_BYTES);
+            let max_dirty_bytes = config.max_dirty_bytes.max(1);
+            let max_xattr_bytes = config.max_xattr_bytes.max(1);
+            let dentry_cache_capacity = config.dentry_cache_capacity.max(1);
+            let dentry_cache_bytes = config.dentry_cache_bytes.max(1);
+            let path_shortcut_cache_capacity = config.path_shortcut_cache_capacity.max(1);
+            let path_shortcut_cache_bytes = config.path_shortcut_cache_bytes.max(1);
+            let attr_read_cache_capacity = config.attr_read_cache_capacity.max(1);
+            let attr_read_cache_bytes = config.attr_read_cache_bytes.max(1);
+            let effective_acl_cache_capacity = config.effective_acl_cache_capacity.max(1);
+            let max_spill_bytes = config.max_spill_bytes.max(1);
+            let max_ingress_segment_bytes = config.max_ingress_segment_bytes.max(1);
             let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
             std::fs::create_dir_all(&spill_dir).map_err(VfsError::Io)?;
             let ingress_segment_dir = spill_dir.join("segments");
             std::fs::create_dir_all(&ingress_segment_dir).map_err(VfsError::Io)?;
             let ingress_checkpoint_dir = spill_dir.join("checkpoints");
             std::fs::create_dir_all(&ingress_checkpoint_dir).map_err(VfsError::Io)?;
-            let acl_principal = std::env::var("STUDIOFS_PRINCIPAL")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "*".to_string());
+            let acl_principal = config
+                .principal
+                .trim()
+                .to_string();
+            let acl_principal = if acl_principal.is_empty() {
+                "*".to_string()
+            } else {
+                acl_principal
+            };
             let existing_checkpoint =
                 load_latest_ingress_checkpoint(&ingress_checkpoint_dir, &ingress_segment_dir)?;
             let (
@@ -3549,7 +3580,7 @@ impl StudioVfs {
                 })?,
             );
 
-            // Build AIMD config for the fetch scheduler from env or defaults.
+            // Build AIMD config for the fetch scheduler from config.
             let fetch_aimd_config = {
                 let fetch_max_window_default = (buffer_blocks_default as f64).clamp(64.0, 4096.0);
                 let fetch_initial_window_default =
@@ -3559,31 +3590,28 @@ impl StudioVfs {
                 } else {
                     2.0
                 };
-                let initial = std::env::var("STUDIOFS_FETCH_INITIAL_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(fetch_initial_window_default);
-                let min = std::env::var("STUDIOFS_FETCH_MIN_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(1.0);
-                let max = std::env::var("STUDIOFS_FETCH_MAX_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(fetch_max_window_default);
-                let increase = std::env::var("STUDIOFS_FETCH_INCREASE_STEP")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(fetch_increase_default);
-                let decrease = std::env::var("STUDIOFS_FETCH_DECREASE_FACTOR")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.85);
-                let cooldown_secs = std::env::var("STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(3);
+                let initial = if config.fetch_initial_window > 0.0 {
+                    config.fetch_initial_window
+                } else {
+                    fetch_initial_window_default
+                };
+                let min = config.fetch_min_window.max(1.0);
+                let max = if config.fetch_max_window > 0.0 {
+                    config.fetch_max_window
+                } else {
+                    fetch_max_window_default
+                };
+                let increase = if config.fetch_increase_step > 0.0 {
+                    config.fetch_increase_step
+                } else {
+                    fetch_increase_default
+                };
+                let decrease = if config.fetch_decrease_factor > 0.0 {
+                    config.fetch_decrease_factor
+                } else {
+                    0.85
+                };
+                let cooldown_secs = config.fetch_decrease_cooldown_secs.max(1);
                 crate::aimd::AimdConfig {
                     initial_window: initial,
                     min_window: min,
@@ -3594,42 +3622,44 @@ impl StudioVfs {
                 }
             };
 
-            let qos = Arc::new(QosController::from_env());
+            let qos = Arc::new(QosController::from_config(&config));
             let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
                 data_read,
                 block_cache.clone(),
                 fetch_aimd_config,
                 prefetch_foreground_reserve,
                 qos.clone(),
+                &config,
             ));
 
-            // Build AIMD config for upload scheduling from env or defaults.
+            // Build AIMD config for upload scheduling from config.
             let upload_aimd_config = {
-                let initial = std::env::var("STUDIOFS_UPLOAD_INITIAL_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(16.0);
-                let min = std::env::var("STUDIOFS_UPLOAD_MIN_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(1.0);
-                let max = std::env::var("STUDIOFS_UPLOAD_MAX_WINDOW")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(512.0);
-                let increase = std::env::var("STUDIOFS_UPLOAD_INCREASE_STEP")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(2.0);
-                let decrease = std::env::var("STUDIOFS_UPLOAD_DECREASE_FACTOR")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.85);
-                let cooldown_secs = std::env::var("STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(3);
+                let initial = if config.upload_initial_window > 0.0 {
+                    config.upload_initial_window
+                } else {
+                    16.0
+                };
+                let min = if config.upload_min_window > 0.0 {
+                    config.upload_min_window
+                } else {
+                    1.0
+                };
+                let max = if config.upload_max_window > 0.0 {
+                    config.upload_max_window
+                } else {
+                    512.0
+                };
+                let increase = if config.upload_increase_step > 0.0 {
+                    config.upload_increase_step
+                } else {
+                    2.0
+                };
+                let decrease = if config.upload_decrease_factor > 0.0 {
+                    config.upload_decrease_factor
+                } else {
+                    0.85
+                };
+                let cooldown_secs = config.upload_decrease_cooldown_secs.max(1);
                 crate::aimd::AimdConfig {
                     initial_window: initial,
                     min_window: min,
@@ -3642,100 +3672,34 @@ impl StudioVfs {
             let upload_scheduler = Arc::new(crate::upload::UploadScheduler::new(
                 data_write.clone(),
                 upload_aimd_config,
+                &config,
             ));
-            let upload_delay = Duration::from_millis(
-                std::env::var("STUDIOFS_UPLOAD_DELAY_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(DEFAULT_UPLOAD_DELAY_MS),
-            );
-            let upload_requeue_base = Duration::from_millis(
-                std::env::var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_UPLOAD_REQUEUE_BASE_MS),
-            );
+            let upload_delay = Duration::from_millis(config.upload_delay_ms);
+            let upload_requeue_base = Duration::from_millis(config.upload_requeue_base_ms);
             let upload_requeue_max = Duration::from_millis(
-                std::env::var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v >= upload_requeue_base.as_millis() as u64)
-                    .unwrap_or(
-                        DEFAULT_UPLOAD_REQUEUE_MAX_MS.max(upload_requeue_base.as_millis() as u64),
-                    ),
+                config.upload_requeue_max_ms.max(upload_requeue_base.as_millis() as u64),
             );
-            let upload_stats_interval = Duration::from_secs(
-                std::env::var("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_UPLOAD_STATS_INTERVAL_SECS),
+            let upload_stats_interval = Duration::from_secs(config.upload_stats_interval_secs.max(1));
+            let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms.max(1));
+            let shutdown_metadata_flush_timeout = Duration::from_secs(
+                config.shutdown_metadata_flush_timeout_secs.max(1),
             );
-            let slab_flush_interval = Duration::from_millis(
-                std::env::var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(10),
-            );
-            let disable_background_slab_flush =
-                std::env::var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH")
-                    .ok()
-                    .is_some_and(|v| {
-                        let v = v.trim().to_ascii_lowercase();
-                        v == "1" || v == "true" || v == "yes" || v == "on"
-                    });
-            let ingress_checkpoint_interval = Duration::from_secs(
-                std::env::var("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS),
-            );
-            let ingress_checkpoint_min_append_bytes =
-                std::env::var("STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES")
-                    .ok()
-                    .and_then(|v| parse_size_bytes_env(&v))
-                    .filter(|v| *v > 0)
-                    .map(|v| v as u64)
-                    .unwrap_or(DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES);
-            let ingress_checkpoint_min_mutations =
-                std::env::var("STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS);
-            let ingress_checkpoint_max_segment_lag =
-                std::env::var("STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG);
-            let ingress_checkpoint_max_live_segments =
-                std::env::var("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS);
-            let upload_cache_io_slots = std::env::var("STUDIOFS_UPLOAD_CACHE_IO_SLOTS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_SLOTS);
+            let disable_background_slab_flush = !config.background_slab_flush_enabled;
+            let ingress_checkpoint_interval =
+                Duration::from_secs(config.ingress_checkpoint_interval_secs.max(1));
+            let ingress_checkpoint_min_append_bytes = config.ingress_checkpoint_min_append_bytes;
+            let ingress_checkpoint_min_mutations = config.ingress_checkpoint_min_mutations;
+            let ingress_checkpoint_max_segment_lag = config.ingress_checkpoint_max_segment_lag;
+            let ingress_checkpoint_max_live_segments = config.ingress_checkpoint_max_live_segments;
+            let upload_cache_io_slots = config.upload_cache_io_slots.max(1);
             let upload_cache_io_user_penalty =
-                std::env::var("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY)
-                    .min(upload_cache_io_slots as u32);
-            let upload_user_idle_grace = Duration::from_millis(
-                std::env::var("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(DEFAULT_UPLOAD_USER_IDLE_GRACE_MS),
-            );
+                config.upload_cache_io_user_penalty.max(1).min(upload_cache_io_slots as u32);
+            let upload_user_idle_grace = Duration::from_millis(config.upload_user_idle_grace_ms);
+            let upload_worker_count = if config.upload_worker_count > 0 {
+                config.upload_worker_count
+            } else {
+                4
+            };
             debug!(
                 writeback = true,
                 upload_delay_ms = upload_delay.as_millis() as u64,
@@ -3860,6 +3824,7 @@ impl StudioVfs {
                 upload_requeue_max,
                 upload_stats_interval,
                 slab_flush_interval,
+                shutdown_metadata_flush_timeout,
                 ingress_checkpoint_interval,
                 ingress_checkpoint_min_append_bytes,
                 ingress_checkpoint_min_mutations,
@@ -3869,6 +3834,7 @@ impl StudioVfs {
                 qos,
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace,
+                upload_worker_count,
                 readahead: readahead.clone(),
                 dir_prefetch,
                 prefetch_tx,
@@ -7743,17 +7709,7 @@ impl StudioVfs {
         mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
     ) {
         info!("background uploader started");
-        let worker_count = std::env::var("STUDIOFS_UPLOAD_WORKER_COUNT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or_else(|| {
-                std::env::var("STUDIOFS_UPLOAD_MAX_SPAWNED")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(4)
-            });
+        let worker_count = self.upload_worker_count.max(1);
 
         let dispatch_capacity = worker_count.max(1) * 2;
         let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<PendingUpload>(dispatch_capacity);
@@ -9020,7 +8976,7 @@ impl StudioVfs {
             "VFS shutdown: persisting metadata"
         );
         let meta = self.meta.clone();
-        let metadata_flush_timeout = shutdown_metadata_flush_timeout();
+        let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         match run_sync_with_timeout(metadata_flush_timeout, move || {
             meta.flush_metadata().map_err(VfsError::Meta)
         }) {
@@ -9094,6 +9050,7 @@ mod tests {
             cache_dir.to_str().expect("cache dir str"),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
+            VfsConfig::default(),
         )
         .expect("create vfs");
         (rt, vfs, meta)

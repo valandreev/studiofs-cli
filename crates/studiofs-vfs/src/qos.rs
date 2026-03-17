@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::vfs::VfsConfig;
 use studiofs_meta::Ino;
 
 #[derive(Debug)]
@@ -15,24 +16,13 @@ pub struct QosController {
 }
 
 impl QosController {
-    pub fn from_env() -> Self {
-        fn env_usize(key: &str, default: usize) -> usize {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(default)
-        }
-
+    pub fn from_config(config: &VfsConfig) -> Self {
         Self {
-            accept_slots: Arc::new(Semaphore::new(env_usize("STUDIOFS_QOS_ACCEPT_SLOTS", 64))),
-            materialize_slots: Arc::new(Semaphore::new(env_usize(
-                "STUDIOFS_QOS_MATERIALIZE_SLOTS",
-                2,
-            ))),
-            upload_slots: Arc::new(Semaphore::new(env_usize("STUDIOFS_QOS_UPLOAD_SLOTS", 4))),
-            commit_slots: Arc::new(Semaphore::new(env_usize("STUDIOFS_QOS_COMMIT_SLOTS", 4))),
-            fetch_slots: Arc::new(Semaphore::new(env_usize("STUDIOFS_QOS_FETCH_SLOTS", 128))),
+            accept_slots: Arc::new(Semaphore::new(config.qos_accept_slots.max(1))),
+            materialize_slots: Arc::new(Semaphore::new(config.qos_materialize_slots.max(1))),
+            upload_slots: Arc::new(Semaphore::new(config.qos_upload_slots.max(1))),
+            commit_slots: Arc::new(Semaphore::new(config.qos_commit_slots.max(1))),
+            fetch_slots: Arc::new(Semaphore::new(config.qos_fetch_slots.max(1))),
         }
     }
 

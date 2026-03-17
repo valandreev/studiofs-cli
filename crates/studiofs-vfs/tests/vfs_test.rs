@@ -31,7 +31,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError, VfsIngressLane, VfsUploadState,
+    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsIngressLane,
+    VfsUploadState,
 };
 use uuid::Uuid;
 
@@ -124,6 +125,317 @@ fn test_env_var(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+fn parse_size_bytes(raw: &str) -> Option<usize> {
+    let s = raw.trim().to_ascii_uppercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
+        (v, 1024u128 * 1024 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("GB") {
+        (v, 1024u128 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("MB") {
+        (v, 1024u128 * 1024)
+    } else if let Some(v) = s.strip_suffix("KB") {
+        (v, 1024u128)
+    } else if let Some(v) = s.strip_suffix('B') {
+        (v, 1u128)
+    } else {
+        (s.as_str(), 1u128)
+    };
+    let num = num_part.trim().parse::<u128>().ok()?;
+    let bytes = num.checked_mul(multiplier)?;
+    usize::try_from(bytes).ok()
+}
+
+fn parse_env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn parse_env_u64(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn parse_env_u64_any(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
+fn parse_env_f64(key: &str) -> Option<f64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+}
+
+fn parse_env_bool(key: &str) -> Option<bool> {
+    let value = std::env::var(key).ok()?;
+    let value = value.trim().to_ascii_lowercase();
+    Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn test_vfs_config_from_env() -> VfsConfig {
+    load_test_env();
+    let mut config = VfsConfig::default();
+    if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.max_dirty_bytes = bytes;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.max_spill_bytes = bytes;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.max_ingress_segment_bytes = bytes as u64;
+    }
+    if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
+        config.background_slab_flush_enabled = !disable;
+    }
+    if let Some(ms) = parse_env_u64("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
+        config.slab_flush_interval_ms = ms;
+    }
+    if let Some(secs) = parse_env_u64("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS") {
+        config.shutdown_metadata_flush_timeout_secs = secs;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_PRINCIPAL") {
+        let v = v.trim();
+        if !v.is_empty() {
+            config.principal = v.to_string();
+        }
+    }
+    if let Some(secs) = parse_env_u64("STUDIOFS_JANITOR_INTERVAL_SECS") {
+        config.janitor_interval_secs = secs;
+    }
+    if let Some(secs) = parse_env_u64_any("STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
+        config.janitor_skip_newer_secs = secs;
+    }
+    if let Some(count) = parse_env_u64("STUDIOFS_JANITOR_MAX_DELETES") {
+        config.janitor_max_deletes = count;
+    }
+    if let Some(secs) = parse_env_u64("STUDIOFS_JANITOR_LEASE_TTL_SECS") {
+        config.janitor_lease_ttl_secs = secs;
+    }
+    if let Some(ms) = parse_env_u64("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS") {
+        config.metadata_invalidation_sync_interval_ms = ms;
+    }
+    if let Some(mb) = parse_env_u64("STUDIOFS_READ_BUFFER_MB") {
+        config.read_buffer_mb = mb;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_CONCURRENCY") {
+        config.prefetch_concurrency = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_WIDTH") {
+        config.readahead_width = value as u32;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_MIN_PREFETCH") {
+        config.readahead_min_prefetch = value as u32;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_SEQ_STEP") {
+        config.readahead_seq_step = value as u8;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_RANDOM_PENALTY") {
+        config.readahead_random_penalty = value as u8;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_DIR_PREFETCH_MAX_BATCH") {
+        config.dir_prefetch_max_batch = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READDIR_ATTR_BATCH_CHUNK") {
+        config.readdir_attr_batch_chunk = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES") {
+        config.readdir_attr_batch_max_inodes = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_FOREGROUND_RESERVE") {
+        config.prefetch_foreground_reserve = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_MAX_PER_CYCLE") {
+        config.prefetch_max_per_cycle = value;
+    }
+    if let Some(ms) = parse_env_u64("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS") {
+        config.prefetch_pause_on_neterr_ms = ms;
+    }
+    if let Some(secs) = parse_env_u64("STUDIOFS_LOCK_TTL_SECS") {
+        config.lock_ttl_secs = secs;
+    }
+    if let Some(ms) = parse_env_u64("STUDIOFS_LOCK_RETRY_BASE_MS") {
+        config.lock_retry_base_ms = ms;
+    }
+    if let Some(ms) = parse_env_u64("STUDIOFS_LOCK_RETRY_MAX_MS") {
+        config.lock_retry_max_ms = ms;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.max_xattr_bytes = bytes;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_DENTRY_CACHE_CAPACITY") {
+        config.dentry_cache_capacity = value;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_DENTRY_CACHE_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.dentry_cache_bytes = bytes;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY") {
+        config.path_shortcut_cache_capacity = value;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.path_shortcut_cache_bytes = bytes;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_ATTR_READ_CACHE_CAPACITY") {
+        config.attr_read_cache_capacity = value;
+    }
+    if let Ok(v) = std::env::var("STUDIOFS_ATTR_READ_CACHE_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+    {
+        config.attr_read_cache_bytes = bytes;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_SLOTS") {
+        config.upload_cache_io_slots = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
+        config.upload_cache_io_user_penalty = value as u32;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS") {
+        config.upload_user_idle_grace_ms = value;
+    }
+    if let Some(value) = parse_env_u64_any("STUDIOFS_UPLOAD_DELAY_MS") {
+        config.upload_delay_ms = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_REQUEUE_BASE_MS") {
+        config.upload_requeue_base_ms = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_REQUEUE_MAX_MS") {
+        config.upload_requeue_max_ms = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS") {
+        config.upload_stats_interval_secs = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
+        config.upload_max_attempts = value as u32;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS") {
+        config.upload_request_timeout_secs = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_RETRY_BASE_MS") {
+        config.upload_retry_base_ms = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_RETRY_MAX_MS") {
+        config.upload_retry_max_ms = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_INITIAL_WINDOW") {
+        config.upload_initial_window = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_MIN_WINDOW") {
+        config.upload_min_window = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_MAX_WINDOW") {
+        config.upload_max_window = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_INCREASE_STEP") {
+        config.upload_increase_step = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_DECREASE_FACTOR") {
+        config.upload_decrease_factor = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS") {
+        config.upload_decrease_cooldown_secs = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_FETCH_INITIAL_WINDOW") {
+        config.fetch_initial_window = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_FETCH_MIN_WINDOW") {
+        config.fetch_min_window = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_FETCH_MAX_WINDOW") {
+        config.fetch_max_window = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_FETCH_INCREASE_STEP") {
+        config.fetch_increase_step = value;
+    }
+    if let Some(value) = parse_env_f64("STUDIOFS_FETCH_DECREASE_FACTOR") {
+        config.fetch_decrease_factor = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS") {
+        config.fetch_decrease_cooldown_secs = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_FETCH_MAX_ATTEMPTS") {
+        config.fetch_max_attempts = value as u32;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
+        config.prefetch_fetch_max_attempts = value as u32;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS") {
+        config.fetch_request_timeout_secs = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_FETCH_RETRY_BASE_MS") {
+        config.fetch_retry_base_ms = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_FETCH_RETRY_MAX_MS") {
+        config.fetch_retry_max_ms = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_FETCH_PREFETCH_RESERVE") {
+        config.fetch_prefetch_reserve = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS") {
+        config.fetch_prefetch_acquire_wait_ms = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_QOS_ACCEPT_SLOTS") {
+        config.qos_accept_slots = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_QOS_MATERIALIZE_SLOTS") {
+        config.qos_materialize_slots = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_QOS_UPLOAD_SLOTS") {
+        config.qos_upload_slots = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_QOS_COMMIT_SLOTS") {
+        config.qos_commit_slots = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_QOS_FETCH_SLOTS") {
+        config.qos_fetch_slots = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS") {
+        config.ingress_checkpoint_interval_secs = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES") {
+        config.ingress_checkpoint_min_append_bytes = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS") {
+        config.ingress_checkpoint_min_mutations = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG") {
+        config.ingress_checkpoint_max_segment_lag = value;
+    }
+    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS") {
+        config.ingress_checkpoint_max_live_segments = value;
+    }
+    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
+        config.upload_worker_count = value;
+    } else if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
+        config.upload_worker_count = value;
+    }
+    config
+}
+
 fn load_test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     let _ = ONCE.get_or_init(|| {
@@ -208,6 +520,7 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
         cache_dir_str,
         cache_size,
         512 * 1024 * 1024,
+        test_vfs_config_from_env(),
     )
     .expect("failed to create StudioVfs")
 }
@@ -225,6 +538,7 @@ fn make_vfs_from_meta(
         cache_dir_str,
         1024 * 1024 * 1024,
         512 * 1024 * 1024,
+        test_vfs_config_from_env(),
     )
     .expect("failed to create StudioVfs")
 }
@@ -243,6 +557,7 @@ fn make_vfs_with_meta(
         cache_dir_str,
         1024 * 1024 * 1024,
         512 * 1024 * 1024,
+        test_vfs_config_from_env(),
     )
     .expect("failed to create StudioVfs")
 }
@@ -261,9 +576,10 @@ fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> boo
 
 #[allow(dead_code)]
 fn pg_dsn() -> Option<String> {
-    let _ = dotenvy::dotenv();
+    load_test_env();
     let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
         .ok()
+        .or_else(|| workspace_dotenv_var("STUDIOFS_TEST_PG_DSN"))
         .filter(|v| !v.trim().is_empty())?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1501,6 +1817,7 @@ fn test_crash_recovery_replays_pending_journal() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
@@ -1558,6 +1875,7 @@ fn test_crash_recovery_replays_pending_journal() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -1588,15 +1906,9 @@ fn test_crash_recovery_replays_pending_journal() {
 
 #[test]
 fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
-    type EnvRestore = ScopedEnvVar;
-
     // Keep S3 settings stable for this long-running crash/restart scenario.
     // Other tests intentionally toggle endpoint reachability; pinning online
     // values here avoids inheriting a stale offline endpoint.
-    let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
-    let _restore_bucket = EnvRestore::capture("STUDIOFS_S3_BUCKET");
-    let _restore_access_key = EnvRestore::capture("STUDIOFS_S3_ACCESS_KEY");
-    let _restore_secret_key = EnvRestore::capture("STUDIOFS_S3_SECRET_KEY");
     apply_test_online_s3_env();
 
     fn segment_file_count(dir: &std::path::Path) -> usize {
@@ -1639,12 +1951,19 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                background_slab_flush_enabled: true,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                vfs_config,
             )
             .unwrap();
             let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
@@ -1667,37 +1986,25 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
         });
     }
 
-    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    let _restore_fetch_attempts = EnvRestore::capture("STUDIOFS_FETCH_MAX_ATTEMPTS");
-    let _restore_fetch_timeout = EnvRestore::capture("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS");
-    let _restore_upload_attempts = EnvRestore::capture("STUDIOFS_UPLOAD_MAX_ATTEMPTS");
-    let _restore_upload_timeout = EnvRestore::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        // Keep this regression deterministic and fast when it accidentally
-        // falls back to remote fetch/upload paths.
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_FETCH_MAX_ATTEMPTS", "1");
-        std::env::set_var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS", "2");
-        std::env::set_var("STUDIOFS_UPLOAD_MAX_ATTEMPTS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "2");
-    }
-
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
+            let vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                background_slab_flush_enabled: false,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                vfs_config,
             )
             .unwrap();
 
@@ -1750,6 +2057,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -1814,6 +2122,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -1878,6 +2187,7 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"restart-local.bin", 0, 0, 0o644).unwrap();
@@ -1906,6 +2216,7 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
@@ -2086,6 +2397,7 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
         let attr = vfs
@@ -2758,23 +3070,6 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
     let mut format_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
     let data_config_online = DataStoreConfig::from(&format_info);
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-        std::env::set_var("STUDIOFS_FETCH_MAX_ATTEMPTS", "1");
-        std::env::set_var("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS", "2");
-        std::env::set_var("STUDIOFS_UPLOAD_MAX_ATTEMPTS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "2");
-        // Keep checkpointing out of the critical path so this test validates
-        // spill replay, not periodic checkpoint timing.
-        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS", "86400");
-        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES", "1GB");
-        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS", "1000000");
-        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG", "1000000");
-        std::env::set_var("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS", "1000000");
-    }
-
     {
         meta.init_root(0, 0).unwrap();
         meta.set_format_info(&format_info).unwrap();
@@ -2784,12 +3079,19 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let online_vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                background_slab_flush_enabled: true,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config_online,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                online_vfs_config,
             )
             .unwrap();
 
@@ -2813,11 +3115,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
-    }
+    format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
 
     let data_config_offline = DataStoreConfig::from(&format_info);
     {
@@ -2828,12 +3126,19 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                background_slab_flush_enabled: false,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config_offline,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                vfs_config,
             )
             .unwrap();
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
@@ -2854,12 +3159,19 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let offline_vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                background_slab_flush_enabled: false,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config_offline,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                offline_vfs_config,
             )
             .unwrap();
             let blocks = vfs.meta().get_file_blocks(ino).unwrap();
@@ -2944,6 +3256,8 @@ impl ScopedTestEnv {
             "STUDIOFS_UPLOAD_MAX_SPAWNED",
             "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
             "STUDIOFS_UPLOAD_MAX_ATTEMPTS",
+            "STUDIOFS_UPLOAD_RETRY_BASE_MS",
+            "STUDIOFS_UPLOAD_RETRY_MAX_MS",
             "STUDIOFS_UPLOAD_CACHE_IO_SLOTS",
             "STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY",
             "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
@@ -2954,7 +3268,12 @@ impl ScopedTestEnv {
             "STUDIOFS_UPLOAD_DECREASE_FACTOR",
             "STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS",
             "STUDIOFS_FETCH_MAX_ATTEMPTS",
+            "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS",
             "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
+            "STUDIOFS_FETCH_RETRY_BASE_MS",
+            "STUDIOFS_FETCH_RETRY_MAX_MS",
+            "STUDIOFS_FETCH_PREFETCH_RESERVE",
+            "STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS",
             "STUDIOFS_FETCH_INITIAL_WINDOW",
             "STUDIOFS_FETCH_MIN_WINDOW",
             "STUDIOFS_FETCH_MAX_WINDOW",
@@ -3035,6 +3354,7 @@ fn new_file_enters_uploading_state() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3099,6 +3419,7 @@ fn committed_file_mutation_enters_updating_state() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"updating.bin", 0, 0, 0o644).unwrap();
@@ -3136,6 +3457,7 @@ fn committed_file_mutation_enters_updating_state() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             vfs.write(ino, 0, &patch).await.unwrap();
@@ -3205,6 +3527,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"overlay-read.bin", 0, 0, 0o644).unwrap();
@@ -3242,6 +3565,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             vfs.write(ino, 0, &patch).await.unwrap();
@@ -3304,6 +3628,7 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3380,6 +3705,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3460,6 +3786,7 @@ fn single_inode_never_has_two_pending_incarnations() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"single-pending.bin", 0, 0, 0o644).unwrap();
@@ -3497,6 +3824,7 @@ fn single_inode_never_has_two_pending_incarnations() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -3568,6 +3896,7 @@ fn large_file_unlink_cancels_pending_uploads() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3682,6 +4011,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -3795,6 +4125,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -3843,6 +4174,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -3911,6 +4243,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4087,6 +4420,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4167,6 +4501,7 @@ fn restart_replays_only_live_pending_extents() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4202,6 +4537,7 @@ fn restart_replays_only_live_pending_extents() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4269,6 +4605,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4310,6 +4647,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4380,6 +4718,7 @@ fn offline_s3_does_not_break_local_read_after_write() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4487,6 +4826,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4530,6 +4870,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4658,6 +4999,7 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4754,6 +5096,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
                 &roomy_cache_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4817,6 +5160,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
                 &tight_cache_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4887,6 +5231,7 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -5003,6 +5348,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -5039,6 +5385,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -5126,6 +5473,7 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -5210,6 +5558,7 @@ fn test_ingress_prefers_spill_before_backpressure() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
         let attr = vfs.create(1, b"spill-first.bin", 0, 0, 0o644).unwrap();
@@ -5287,6 +5636,7 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
         let attr = vfs
@@ -5352,6 +5702,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+        test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -5395,19 +5746,6 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 
 #[test]
 fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
-    type EnvRestore = ScopedEnvVar;
-
-    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
-    let _restore_disable_flush = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "4MB");
-        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "5000");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
-
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -5426,12 +5764,20 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         .unwrap();
     rt.block_on(async {
         ensure_bucket().await;
+        let vfs_config = VfsConfig {
+            max_dirty_bytes: 1,
+            max_spill_bytes: 4 * 1024 * 1024,
+            slab_flush_interval_ms: 5000,
+            background_slab_flush_enabled: false,
+            ..VfsConfig::default()
+        };
         let vfs = StudioVfs::new(
             meta,
             &data_config,
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
+            vfs_config,
         )
         .unwrap();
         let writer_count = 4usize;
@@ -5477,8 +5823,6 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
 
 #[test]
 fn test_ingress_multi_writer_spill_recovers_after_crash() {
-    type EnvRestore = ScopedEnvVar;
-
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
         std::fs::read_dir(dir)
@@ -5486,17 +5830,6 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
             .count()
-    }
-
-    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
-    let _restore_disable_flush = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
-        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "5000");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -5522,12 +5855,20 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             .unwrap();
         rt.block_on(async {
             ensure_bucket().await;
+            let vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 8 * 1024 * 1024,
+                slab_flush_interval_ms: 5000,
+                background_slab_flush_enabled: false,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                vfs_config,
             )
             .unwrap();
 
@@ -5560,10 +5901,6 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
         segment_file_count(&spill_dir) > 0,
         "simulated crash should leave ingress segments for accepted writers"
     );
-    unsafe {
-        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    }
-
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5577,6 +5914,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+            test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -5596,15 +5934,6 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
 #[test]
 #[ignore]
 fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
-    type EnvRestore = ScopedEnvVar;
-
-    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-    }
-
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -5627,12 +5956,18 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                vfs_config,
             )
             .unwrap();
             let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();
@@ -5665,12 +6000,18 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let vfs_config = VfsConfig {
+                max_dirty_bytes: 1,
+                max_spill_bytes: 16 * 1024 * 1024,
+                ..VfsConfig::default()
+            };
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
+                vfs_config,
             )
             .unwrap();
             let data =

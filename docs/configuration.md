@@ -13,6 +13,9 @@ StudioFS stores global defaults for mount in the OS-standard config path under:
 - Windows: `%APPDATA%\studiofs\config.toml`
 
 Values in the config file are used by `studiofs mount` when the corresponding CLI flags are omitted.
+Advanced VFS tuning lives under the `[vfs]` table in `config.toml`. CLI flags
+from `studiofs settings` and `STUDIOFS_*` environment variables override that
+file when `studiofs mount` starts.
 
 Priority for each setting:
 
@@ -91,6 +94,7 @@ Notes:
 
 ```bash
 studiofs settings [--mount-point <path>] [--cache-dir <path>] [--memory-limit <e.g. 1GB>] [--cache-size <e.g. 200GB>]
+studiofs settings [--slab-flush-interval <ms>] [--disable-bg-slab-flush]
 ```
 
 Stores global defaults in `config.toml` for future `studiofs mount` runs.
@@ -100,6 +104,8 @@ Notes:
 - `studiofs settings --mount-point` creates the mount directory if needed.
 - `studiofs settings --cache-dir` creates the cache directory if needed.
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
+- `studiofs settings --slab-flush-interval` stores the background slab flusher wake interval in the `[vfs]` section.
+- `studiofs settings --disable-bg-slab-flush` disables the background slab flusher in the `[vfs]` section.
 
 ### `umount`
 
@@ -267,6 +273,7 @@ studiofs mount projectfs /mnt/studio/projectfs-b
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `10` | Upload metrics log interval |
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval |
+| `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots |
 | `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Penalty multiplied by client wait penalty |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
