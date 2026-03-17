@@ -80,11 +80,11 @@ pub fn run(
     let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT")
         .unwrap_or_else(|_| mount_point.to_string());
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
-    let is_drive_root = if cfg!(windows) {
-        is_drive_root(&actual_mount_path)
-    } else {
-        false
-    };
+    #[cfg(windows)]
+    let is_drive_root = is_drive_root(&actual_mount_path);
+
+    #[cfg(not(windows))]
+    let is_drive_root = false;
 
     if !is_drive_root {
         if let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
