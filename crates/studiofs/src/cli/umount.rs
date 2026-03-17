@@ -41,6 +41,7 @@ fn run_with(
 
     // Clean up PID file
     let _ = remove_pid_file(mount_point);
+    let _ = std::fs::remove_dir(mount_point);
 
     println!("✓ Successfully unmounted '{}'", mount_point);
     Ok(())

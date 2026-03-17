@@ -17,7 +17,7 @@ studiofs init myvolume \
 
 ### On Windows
 
-Mount as drive Z:
+Mount as drive base `Z:` (resulting mount point `Z:\myvolume`):
 
 ```bash
 studiofs mount myvolume Z:
@@ -25,10 +25,9 @@ studiofs mount myvolume Z:
 
 ### On Linux / macOS
 
-Mount to a local directory:
+Mount to a base directory (`/mnt/studio` becomes `/mnt/studio/myvolume`):
 
 ```bash
-mkdir -p /mnt/studio
 studiofs mount myvolume /mnt/studio
 ```
 
@@ -56,7 +55,7 @@ studiofs discover myvolume \
 ```
 After that, you can mount the volume:
 ```bash
-studiofs mount myvolume Y:
+studiofs mount myvolume /shared/projects
 ```
 
 ## 5. Clean Up Old Objects (Janitor)

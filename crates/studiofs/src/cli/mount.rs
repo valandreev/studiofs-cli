@@ -1,7 +1,7 @@
 //! `studiofs mount` — mount a filesystem volume.
 
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
@@ -27,6 +27,15 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
     Ok(num * multiplier)
 }
 
+fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
+    let mount_path = Path::new(mount_point);
+    if mount_path.ends_with(name) {
+        mount_path.to_path_buf()
+    } else {
+        mount_path.join(name)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
@@ -40,9 +49,39 @@ pub fn run(
     detach: bool,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let actual_mount_path = resolve_mount_path(name, mount_point);
+    let actual_mount_path = actual_mount_path.to_string_lossy().into_owned();
+
+    if let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
+        #[cfg(target_os = "macos")]
+        if err.kind() == std::io::ErrorKind::PermissionDenied
+            && actual_mount_path.starts_with("/Volumes")
+        {
+            anyhow::bail!(
+                "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
+                actual_mount_path,
+                actual_mount_path,
+                actual_mount_path
+            );
+        }
+
+        return Err(err.into());
+    }
+
+    #[cfg(windows)]
+    {
+        let mut entries = std::fs::read_dir(&actual_mount_path)?;
+        if entries.next().is_some() {
+            anyhow::bail!(
+                "Mount point '{}' must be empty to mount a volume.",
+                actual_mount_path
+            );
+        }
+    }
+
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
     if detach {
-        return spawn_daemon(name, mount_point, meta_dir);
+        return spawn_daemon(name, &actual_mount_path, meta_dir);
     }
 
     let run_in_foreground = foreground || !detach;
@@ -59,17 +98,17 @@ pub fn run(
     // Note: when launched via `mount -d`, the parent pre-writes the PID file
     // with the child's PID before the child starts.  The child must therefore
     // ignore a PID file that points to itself.
-    if let Ok((pid, _, _)) = super::utils::read_pid_file(mount_point) {
+    if let Ok((pid, _, _)) = super::utils::read_pid_file(&actual_mount_path) {
         if pid != std::process::id() && super::utils::is_process_running(pid) {
             anyhow::bail!(
                 "Already mounted at '{}' (PID {}). Run `studiofs umount \"{}\"` first.",
-                mount_point,
+                actual_mount_path,
                 pid,
-                mount_point
+                actual_mount_path
             );
         }
         // Stale PID file (or the pre-written entry from the parent) — clean up
-        let _ = super::utils::remove_pid_file(mount_point);
+        let _ = super::utils::remove_pid_file(&actual_mount_path);
     }
 
     let db_path = meta_dir.join(format!("{name}.db"));
@@ -146,7 +185,7 @@ pub fn run(
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 
-    println!("✓ Volume '{}' ready to mount at '{}'", name, mount_point);
+    println!("✓ Volume '{}' ready to mount at '{}'", name, actual_mount_path);
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
     println!(
@@ -161,18 +200,18 @@ pub fn run(
     // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
 
     // Write PID file so `studiofs umount` can find us
-    let _ = super::utils::write_pid_file(mount_point, name, std::process::id());
+    let _ = super::utils::write_pid_file(&actual_mount_path, name, std::process::id());
 
     // Start platform-specific FUSE mount
     #[cfg(windows)]
     {
         // Named event for external graceful shutdown (used by `studiofs umount`).
-        let event_name = super::utils::shutdown_event_name(mount_point);
-        info!("starting WinFSP mount at {mount_point}");
+        let event_name = super::utils::shutdown_event_name(&actual_mount_path);
+        info!("starting WinFSP mount at {actual_mount_path}");
         studiofs_winfsp::mount_and_serve(
             vfs,
             rt,
-            mount_point,
+            &actual_mount_path,
             &format_info.name,
             run_in_foreground,
             read_only_mount,
@@ -181,16 +220,16 @@ pub fn run(
         .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
 
         // WinFSP returns normally — clean up PID file
-        let _ = super::utils::remove_pid_file(mount_point);
+        let _ = super::utils::remove_pid_file(&actual_mount_path);
     }
 
     #[cfg(unix)]
     {
-        info!("starting FUSE mount at {mount_point}");
+        info!("starting FUSE mount at {actual_mount_path}");
         studiofs_fuse::mount_and_serve(
             vfs,
             rt,
-            mount_point,
+            &actual_mount_path,
             &format_info.name,
             run_in_foreground,
             read_only_mount,
@@ -209,10 +248,17 @@ pub fn run(
 /// terminal. The child enables daily-rotated tracing logs under `~/.studiofs/logs/`.
 fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
     // Reconstruct args, stripping the detach flag
-    let args: Vec<String> = std::env::args()
+    let mut args: Vec<String> = std::env::args()
         .skip(1) // skip program name
         .filter(|a| a != "-d" && a != "--detach")
+        .map(|arg| arg.to_string())
         .collect();
+
+    if let Some(mount_cmd_idx) = args.iter().position(|arg| arg == "mount")
+        && let Some(arg) = args.get_mut(mount_cmd_idx + 2)
+    {
+        *arg = mount_point.to_string();
+    }
 
     let logs_dir = super::utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
@@ -305,5 +351,17 @@ mod tests {
         assert_eq!(parse_size("512MB").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_size("1TB").unwrap(), 1024 * 1024 * 1024 * 1024);
         assert_eq!(parse_size("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_resolve_mount_path() {
+        assert_eq!(
+            resolve_mount_path("projectfs", "/mnt"),
+            Path::new("/mnt").join("projectfs")
+        );
+        assert_eq!(
+            resolve_mount_path("projectfs", "/mnt/projectfs"),
+            Path::new("/mnt/projectfs")
+        );
     }
 }
