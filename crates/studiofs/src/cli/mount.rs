@@ -29,11 +29,39 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
 
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     let mount_path = Path::new(mount_point);
+    #[cfg(windows)]
+    if is_drive_root(mount_point) {
+        return mount_path.to_path_buf();
+    }
+
     if mount_path.ends_with(name) {
         mount_path.to_path_buf()
     } else {
         mount_path.join(name)
     }
+}
+
+#[cfg(windows)]
+fn is_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+
+    let drive = bytes[0];
+    let colon = bytes[1];
+    if !(drive.is_ascii_alphabetic() && colon == b':') {
+        return false;
+    }
+
+    if bytes.len() == 2 {
+        return true;
+    }
+    let sep = bytes[2];
+    if !(sep == b'\\' || sep == b'/') {
+        return false;
+    }
+    bytes.len() == 3
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,14 +77,13 @@ pub fn run(
     detach: bool,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let actual_mount_path = resolve_mount_path(name, mount_point);
-    let actual_mount_path = actual_mount_path.to_string_lossy().into_owned();
+    let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT")
+        .unwrap_or_else(|_| mount_point.to_string());
+    let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
 
     if let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
         #[cfg(target_os = "macos")]
-        if err.kind() == std::io::ErrorKind::PermissionDenied
-            && actual_mount_path.starts_with("/Volumes")
-        {
+        if err.kind() == std::io::ErrorKind::PermissionDenied && actual_mount_path.contains("/Volumes") {
             anyhow::bail!(
                 "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
                 actual_mount_path,
@@ -68,6 +95,23 @@ pub fn run(
         return Err(err.into());
     }
 
+    // Canonicalize the mount point here for detached mode, where the daemon may run
+    // from a different working directory.
+    #[cfg(not(windows))]
+    {
+        if let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
+            actual_mount_path = abs_path.to_string_lossy().into_owned();
+        }
+    }
+
+    #[cfg(windows)]
+    if !is_drive_root(&actual_mount_path) {
+        if let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
+            actual_mount_path = abs_path.to_string_lossy().into_owned();
+        }
+    }
+
+    let actual_mount_path = actual_mount_path;
     #[cfg(windows)]
     {
         let mut entries = std::fs::read_dir(&actual_mount_path)?;
@@ -248,17 +292,12 @@ pub fn run(
 /// terminal. The child enables daily-rotated tracing logs under `~/.studiofs/logs/`.
 fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
     // Reconstruct args, stripping the detach flag
-    let mut args: Vec<String> = std::env::args()
+    let args: Vec<String> = std::env::args()
         .skip(1) // skip program name
         .filter(|a| a != "-d" && a != "--detach")
         .map(|arg| arg.to_string())
         .collect();
 
-    if let Some(mount_arg_idx) = find_daemon_mount_point_arg_index(&args, name) {
-        if let Some(arg) = args.get_mut(mount_arg_idx) {
-        *arg = mount_point.to_string();
-    }
-    }
     let logs_dir = super::utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
     let today = Utc::now().format("%Y-%m-%d");
@@ -267,6 +306,7 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(&args)
+        .env("STUDIOFS_DAEMON_MOUNT_POINT", mount_point)
         .env("STUDIOFS_DAEMON_LOG_STEM", &log_stem)
         .env("STUDIOFS_DAEMON_LOG_DIR", &logs_dir)
         .stdin(std::process::Stdio::null())
@@ -321,51 +361,6 @@ fn daemon_log_stem(name: &str, meta_dir: &Path) -> anyhow::Result<String> {
         format_info.uuid
     ))
 }
-
-fn find_daemon_mount_point_arg_index(args: &[String], volume_name: &str) -> Option<usize> {
-    let mount_cmd_idx = args.iter().position(|arg| arg == "mount")?;
-    let mut i = mount_cmd_idx + 1;
-
-    while i < args.len() {
-        if args[i] == volume_name {
-            i += 1;
-            while i < args.len() {
-                let arg = &args[i];
-                if arg == "-d" || arg == "--detach" || arg == "--foreground" {
-                    i += 1;
-                    continue;
-                }
-                if arg.starts_with("--cache-dir=")
-                    || arg.starts_with("--cache-size=")
-                    || arg.starts_with("--memory-limit=")
-                    || arg.starts_with("--principal=")
-                    || arg.starts_with("--snapshot-id=")
-                {
-                    i += 1;
-                    continue;
-                }
-                if arg == "--cache-dir"
-                    || arg == "--cache-size"
-                    || arg == "--memory-limit"
-                    || arg == "--principal"
-                    || arg == "--snapshot-id"
-                {
-                    i += 2;
-                    continue;
-                }
-                if arg.starts_with('-') {
-                    i += 1;
-                    continue;
-                }
-
-                return Some(i);
-            }
-            return None;
-        }
-        i += 1;
-    }
-
-    None
 }
 
 fn sanitize_log_component(raw: &str) -> String {
@@ -410,31 +405,16 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn test_find_daemon_mount_point_arg_with_flags_between_name_and_mount_point() {
-        let args = vec![
-            "mount".to_string(),
-            "projectfs".to_string(),
-            "--foreground".to_string(),
-            "/mnt/studio".to_string(),
-            "-d".to_string(),
-        ];
-        let mount_arg_idx = find_daemon_mount_point_arg_index(&args, "projectfs").unwrap();
-        assert_eq!(mount_arg_idx, 3);
-        assert_eq!(args[mount_arg_idx], "/mnt/studio");
-    }
-
-    #[test]
-    fn test_find_daemon_mount_point_arg_with_value_flags() {
-        let args = vec![
-            "mount".to_string(),
-            "projectfs".to_string(),
-            "--cache-dir".to_string(),
-            "/tmp/studio-cache".to_string(),
-            "/mnt/studio".to_string(),
-        ];
-        let mount_arg_idx = find_daemon_mount_point_arg_index(&args, "projectfs").unwrap();
-        assert_eq!(mount_arg_idx, 4);
-        assert_eq!(args[mount_arg_idx], "/mnt/studio");
+    fn test_resolve_mount_path_on_windows_drive_root() {
+        assert_eq!(
+            resolve_mount_path("projectfs", "Z:"),
+            Path::new("Z:").to_path_buf()
+        );
+        assert_eq!(
+            resolve_mount_path("projectfs", "Z:\\"),
+            Path::new("Z:\\").to_path_buf()
+        );
     }
 }
