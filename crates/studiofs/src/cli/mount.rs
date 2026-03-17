@@ -63,8 +63,6 @@ pub fn run(
         )?;
 
     let cache_dir = resolved_cache_dir;
-    let cache_size = cache_size.to_string();
-    let memory_limit = memory_limit.to_string();
 
     let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
