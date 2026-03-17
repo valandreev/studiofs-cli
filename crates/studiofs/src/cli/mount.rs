@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_volume_name_index_with_flags_between_name_and_mount_point() {
+    fn test_find_daemon_mount_point_arg_with_flags_between_name_and_mount_point() {
         let args = vec![
             "mount".to_string(),
             "projectfs".to_string(),
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_mount_point_with_value_flags() {
+    fn test_find_daemon_mount_point_arg_with_value_flags() {
         let args = vec![
             "mount".to_string(),
             "projectfs".to_string(),
