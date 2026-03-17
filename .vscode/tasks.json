@@ -1,0 +1,55 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "vexp:setup",
+      "type": "shell",
+      "command": "npm run vexp:setup",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "vexp:index",
+      "type": "shell",
+      "command": "npm run vexp:index",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "vexp:verify",
+      "type": "shell",
+      "command": "npm run vexp:verify",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "vexp:mcp",
+      "type": "shell",
+      "command": "vexp mcp",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "vexp:daemon-status",
+      "type": "shell",
+      "command": "npm run vexp:daemon-status",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

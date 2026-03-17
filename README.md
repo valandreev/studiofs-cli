@@ -152,6 +152,7 @@ Project docs live in [docs/](docs/):
 - [docs/roadmap.md](docs/roadmap.md) - future development plans
 - [docs/examples.md](docs/examples.md) - usage variants and examples
 - [docs/architecture.md](docs/architecture.md) - current system design and data flow
+- [docs/vexp.md](docs/vexp.md) - Vexp MCP setup and verification
 - [docs/configuration.md](docs/configuration.md) - CLI commands, flags, env vars
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow
 - [docs/tests.md](docs/tests.md) - test matrix and infra expectations

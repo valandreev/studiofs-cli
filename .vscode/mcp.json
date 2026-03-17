@@ -2,7 +2,7 @@
   "servers": {
     "vexp": {
       "type": "stdio",
-      "command": "/Users/val/.nvm/versions/node/v24.13.1/lib/node_modules/vexp-cli/node_modules/@vexp/core-darwin-arm64/bin/vexp-core",
+      "command": "vexp",
       "args": [
         "mcp"
       ]

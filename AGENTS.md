@@ -43,7 +43,22 @@ Never commit `.env` or real credentials. Use `.env.example` defaults for local d
 
 ## vexp <!-- vexp v1.0.0 -->
 
-**MANDATORY: use `run_pipeline` — do NOT grep or glob the codebase.**
+**MANDATORY: always use `run_pipeline` first for any repo analysis or edits — do NOT grep or glob the codebase manually.**
+
+Install + setup:
+```bash
+npm install -g vexp-cli@latest
+cd /Volumes/Storage/dev/studiofs
+vexp setup --personal . --no-index
+```
+If you want to re-index after installation:
+```bash
+cd /Volumes/Storage/dev/studiofs && vexp index .
+```
+
+Hard rule:
+- Every task that touches code context in this repo must start with `run_pipeline({ task: "..." })`.
+- If `run_pipeline` is unavailable, proceed with the best available tools and document the limitation explicitly.
 vexp returns pre-indexed, graph-ranked context in a single call.
 
 ### Workflow

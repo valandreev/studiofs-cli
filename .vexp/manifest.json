@@ -56,8 +56,8 @@
     "crates/studiofs/tests/destroy_test.rs": "b0fc275c9b20aa5ecc87f6e1c69f7396f03cdc5675f5d48fbfaf55e892f9caa3",
     "crates/studiofs/tests/dump_load_test.rs": "cbe284436e3245b154294ea47bfc62592dd661b4d8d917ebca1769e81435aa86"
   },
-  "indexed_at_commit": "b4f1120d85f632d8508cbd671b291eed8801bd01",
-  "indexed_at_timestamp": "2026-03-17T01:06:41.081157+00:00",
+  "indexed_at_commit": "ebe5da4a3620f8fa1b8ec914e56068acdffd9955",
+  "indexed_at_timestamp": "2026-03-17T18:03:13.236131+00:00",
   "schema_version": 3,
   "stats": {
     "total_edges": 4112,
