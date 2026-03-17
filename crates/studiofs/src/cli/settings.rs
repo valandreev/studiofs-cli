@@ -167,11 +167,12 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     }
 
     if let Some(cache_dir) = args.cache_dir {
-        let cache_dir = cache_dir
-            .to_string_lossy()
-            .trim()
-            .to_string();
         std::fs::create_dir_all(&cache_dir)?;
+        let cache_dir = cache_dir.into_os_string().into_string().map_err(|_|
+            anyhow::anyhow!(
+                "cache-dir must be valid UTF-8 to be stored in config"
+            )
+        )?;
         config.cache_dir = Some(cache_dir);
         changed = true;
     }
