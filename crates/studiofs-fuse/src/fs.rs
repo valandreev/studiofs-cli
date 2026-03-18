@@ -212,10 +212,10 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
 fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32) -> FileAttr {
     let uid = if attr.uid == 0 { mount_uid } else { attr.uid };
     let gid = if attr.gid == 0 { mount_gid } else { attr.gid };
-        FileAttr {
-            ino: attr.ino,
-            size: attr.size,
-            blocks: attr.size.div_ceil(512),
+    FileAttr {
+        ino: attr.ino,
+        size: attr.size,
+        blocks: attr.size.div_ceil(512),
         atime: UNIX_EPOCH + Duration::from_nanos(attr.atime.max(0) as u64),
         mtime: UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64),
         ctime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
@@ -273,8 +273,10 @@ impl Filesystem for StudioFuseFs {
         let name_bytes = os_str_bytes(name).to_vec();
         #[cfg(target_os = "macos")]
         let attr_result = self.vfs.lookup(parent, &name_bytes).or_else(|err| {
-            if !matches!(err, VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. }))
-                || name_bytes.is_ascii()
+            if !matches!(
+                err,
+                VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+            ) || name_bytes.is_ascii()
             {
                 return Err(err);
             }
@@ -565,7 +567,8 @@ impl Filesystem for StudioFuseFs {
                     e,
                     VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
                 ) && let Ok(entries) = self.vfs.readdir(parent)
-                && let Some(recovered_old_name) = recover_macos_truncated_rename_source(&old_name, &entries)
+                    && let Some(recovered_old_name) =
+                        recover_macos_truncated_rename_source(&old_name, &entries)
                 {
                     debug!(
                         parent,

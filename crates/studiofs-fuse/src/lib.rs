@@ -250,8 +250,10 @@ mod tests {
     #[test]
     fn build_mount_options_sets_macos_local_flag() {
         let options = build_mount_options("studiofs-mac", false, false).expect("options");
-        assert!(options
-            .iter()
-            .any(|opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "local")));
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "local"))
+        );
     }
 }

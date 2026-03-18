@@ -31,9 +31,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    parse_size_bytes, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError,
-    VfsIngressLane,
-    VfsUploadState,
+    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsIngressLane,
+    VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -1801,7 +1800,7 @@ fn test_crash_recovery_replays_pending_journal() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
@@ -1859,7 +1858,7 @@ fn test_crash_recovery_replays_pending_journal() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -2041,7 +2040,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -2106,7 +2105,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -2171,7 +2170,7 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"restart-local.bin", 0, 0, 0o644).unwrap();
@@ -2200,7 +2199,7 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
@@ -2381,7 +2380,7 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
         let attr = vfs
@@ -3340,7 +3339,7 @@ fn new_file_enters_uploading_state() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3405,7 +3404,7 @@ fn committed_file_mutation_enters_updating_state() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"updating.bin", 0, 0, 0o644).unwrap();
@@ -3443,7 +3442,7 @@ fn committed_file_mutation_enters_updating_state() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             vfs.write(ino, 0, &patch).await.unwrap();
@@ -3513,7 +3512,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"overlay-read.bin", 0, 0, 0o644).unwrap();
@@ -3551,7 +3550,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             vfs.write(ino, 0, &patch).await.unwrap();
@@ -3614,7 +3613,7 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3772,7 +3771,7 @@ fn single_inode_never_has_two_pending_incarnations() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
             let attr = vfs.create(1, b"single-pending.bin", 0, 0, 0o644).unwrap();
@@ -3882,7 +3881,7 @@ fn large_file_unlink_cancels_pending_uploads() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -3997,7 +3996,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4111,7 +4110,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4160,7 +4159,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4229,7 +4228,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4487,7 +4486,7 @@ fn restart_replays_only_live_pending_extents() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4523,7 +4522,7 @@ fn restart_replays_only_live_pending_extents() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4591,7 +4590,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4633,7 +4632,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4704,7 +4703,7 @@ fn offline_s3_does_not_break_local_read_after_write() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -4812,7 +4811,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -4985,7 +4984,7 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -5082,7 +5081,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
                 &roomy_cache_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -5217,7 +5216,7 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -5334,7 +5333,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -5371,7 +5370,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 
@@ -5459,7 +5458,7 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
 
@@ -5622,7 +5621,7 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+            test_vfs_config_from_env(),
         )
         .unwrap();
         let attr = vfs
@@ -5900,7 +5899,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-            test_vfs_config_from_env(),
+                test_vfs_config_from_env(),
             )
             .unwrap();
 

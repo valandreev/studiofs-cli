@@ -78,10 +78,7 @@ pub fn read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
     let pid = v["pid"]
         .as_u64()
         .ok_or_else(|| anyhow!("corrupt PID file"))? as u32;
-    let mp = v["mount_point"]
-        .as_str()
-        .unwrap_or(&normalized)
-        .to_string();
+    let mp = v["mount_point"].as_str().unwrap_or(&normalized).to_string();
     let vol = v["volume"].as_str().unwrap_or("unknown").to_string();
     Ok((pid, mp, vol))
 }

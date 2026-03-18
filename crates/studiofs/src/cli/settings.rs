@@ -47,7 +47,10 @@ pub struct SettingsArgs {
     pub disable_bg_slab_flush: bool,
 
     /// Enable the background slab flusher.
-    #[arg(long = "enable-bg-slab-flush", overrides_with = "disable_bg_slab_flush")]
+    #[arg(
+        long = "enable-bg-slab-flush",
+        overrides_with = "disable_bg_slab_flush"
+    )]
     pub enable_bg_slab_flush: bool,
 }
 
@@ -69,7 +72,10 @@ pub fn load_studiofs_config() -> anyhow::Result<StudioFsConfig> {
     }
 
     let bytes = std::fs::read_to_string(&path).map_err(|e| {
-        anyhow::anyhow!("failed to read config file '{}': {e}", path.to_string_lossy())
+        anyhow::anyhow!(
+            "failed to read config file '{}': {e}",
+            path.to_string_lossy()
+        )
     })?;
 
     toml::from_str(&bytes)
@@ -82,8 +88,9 @@ fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let content = toml::to_string_pretty(config)
-        .map_err(|e| anyhow::anyhow!("failed to serialize config file '{}': {e}", path.display()))?;
+    let content = toml::to_string_pretty(config).map_err(|e| {
+        anyhow::anyhow!("failed to serialize config file '{}': {e}", path.display())
+    })?;
     std::fs::write(&path, content)?;
     Ok(())
 }
@@ -208,11 +215,10 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
 
     if let Some(cache_dir) = args.cache_dir {
         std::fs::create_dir_all(&cache_dir)?;
-        let cache_dir = cache_dir.into_os_string().into_string().map_err(|_|
-            anyhow::anyhow!(
-                "cache-dir must be valid UTF-8 to be stored in config"
-            )
-        )?;
+        let cache_dir = cache_dir
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("cache-dir must be valid UTF-8 to be stored in config"))?;
         config.cache_dir = Some(cache_dir);
         changed = true;
     }
@@ -273,11 +279,15 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     );
     println!(
         "  memory-limit: {}",
-        config.memory_limit.unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string())
+        config
+            .memory_limit
+            .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string())
     );
     println!(
         "  cache-size: {}",
-        config.cache_size.unwrap_or_else(|| DEFAULT_CACHE_SIZE.to_string())
+        config
+            .cache_size
+            .unwrap_or_else(|| DEFAULT_CACHE_SIZE.to_string())
     );
     println!(
         "  slab-flush-interval-ms: {}",
