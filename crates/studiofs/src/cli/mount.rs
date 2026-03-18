@@ -41,6 +41,11 @@ fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+fn normalize_windows_mount_path(path: &str) -> String {
+    super::utils::normalize_mount_point(path)
+}
+
 fn parse_env_usize(key: &str) -> Option<usize> {
     std::env::var(key)
         .ok()
@@ -332,7 +337,7 @@ pub fn run(
     #[cfg(windows)]
     if !is_drive_root
         && let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
-            actual_mount_path = abs_path.to_string_lossy().into_owned();
+            actual_mount_path = normalize_windows_mount_path(&abs_path.to_string_lossy());
         }
 
     let actual_mount_path = actual_mount_path;
@@ -638,6 +643,33 @@ mod tests {
         assert_eq!(
             resolve_mount_path("projectfs", "Z:\\"),
             Path::new("Z:\\").to_path_buf()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalize_windows_mount_path_removes_extended_prefix() {
+        assert_eq!(
+            normalize_windows_mount_path(r"\\?\C:\Users\valen\studiofs\test"),
+            r"C:\Users\valen\studiofs\test"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalize_windows_mount_path_unchanged_without_prefix() {
+        assert_eq!(
+            normalize_windows_mount_path(r"C:\Users\valen\studiofs\test"),
+            r"C:\Users\valen\studiofs\test"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalize_windows_mount_path_unc_extended_prefix() {
+        assert_eq!(
+            normalize_windows_mount_path(r"\\?\UNC\server\share\vol"),
+            r"\\server\share\vol"
         );
     }
 }

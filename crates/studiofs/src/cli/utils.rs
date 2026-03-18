@@ -18,6 +18,21 @@ pub fn sanitize_mount_point(mp: &str) -> String {
     if s.is_empty() { "root".to_string() } else { s }
 }
 
+#[cfg(windows)]
+pub fn normalize_mount_point(mp: &str) -> String {
+    const PREFIX: &str = r"\\?\";
+    let without_prefix = mp.strip_prefix(PREFIX).unwrap_or(mp);
+    if let Some(unc_tail) = without_prefix.strip_prefix("UNC\\") {
+        return format!(r"\\{unc_tail}");
+    }
+    without_prefix.to_string()
+}
+
+#[cfg(not(windows))]
+pub fn normalize_mount_point(mp: &str) -> String {
+    mp.to_string()
+}
+
 /// `~/.studiofs/mounts/`
 pub fn get_mounts_dir() -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
@@ -37,7 +52,7 @@ pub fn get_logs_dir() -> Result<PathBuf> {
 /// Full path to the PID file for a given mount point.
 pub fn pid_file_path(mount_point: &str) -> Result<PathBuf> {
     let dir = get_mounts_dir()?;
-    let sanitized = sanitize_mount_point(mount_point);
+    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
     Ok(dir.join(format!("{sanitized}.json")))
 }
 
@@ -55,21 +70,25 @@ pub fn write_pid_file(mount_point: &str, volume: &str, pid: u32) -> Result<()> {
 
 /// Read PID file → `(pid, mount_point, volume)`.
 pub fn read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
-    let path = pid_file_path(mount_point)?;
+    let normalized = normalize_mount_point(mount_point);
+    let path = pid_file_path(&normalized)?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("No mount found for '{mount_point}'. Is it mounted?"))?;
     let v: serde_json::Value = serde_json::from_str(&data)?;
     let pid = v["pid"]
         .as_u64()
         .ok_or_else(|| anyhow!("corrupt PID file"))? as u32;
-    let mp = v["mount_point"].as_str().unwrap_or(mount_point).to_string();
+    let mp = v["mount_point"]
+        .as_str()
+        .unwrap_or(&normalized)
+        .to_string();
     let vol = v["volume"].as_str().unwrap_or("unknown").to_string();
     Ok((pid, mp, vol))
 }
 
 /// Remove PID file if it exists.
 pub fn remove_pid_file(mount_point: &str) -> Result<()> {
-    let path = pid_file_path(mount_point)?;
+    let path = pid_file_path(&normalize_mount_point(mount_point))?;
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -101,7 +120,7 @@ pub fn is_drive_root(path: &str) -> bool {
 /// Named-event identifier used on Windows for graceful external shutdown.
 #[cfg(any(windows, test))]
 pub fn shutdown_event_name(mount_point: &str) -> String {
-    let sanitized = sanitize_mount_point(mount_point);
+    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
     format!("Local\\StudioFS_{sanitized}")
 }
 
@@ -158,7 +177,7 @@ pub fn write_pid_file_in(
 /// Read a PID file from the given directory.
 #[cfg(test)]
 pub fn read_pid_file_in(dir: &std::path::Path, mount_point: &str) -> Result<(u32, String, String)> {
-    let sanitized = sanitize_mount_point(mount_point);
+    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
     let path = dir.join(format!("{sanitized}.json"));
     let data = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("No mount found for '{mount_point}'."))?;
@@ -219,6 +238,24 @@ mod tests {
     #[test]
     fn sanitize_just_separators() {
         assert_eq!(sanitize_mount_point("///"), "root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_mount_point_removes_nt_extended_prefix() {
+        assert_eq!(
+            normalize_mount_point(r"\\?\C:\Users\valen\studiofs\test"),
+            r"C:\Users\valen\studiofs\test"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_mount_point_unc_extended_prefix() {
+        assert_eq!(
+            normalize_mount_point(r"\\?\UNC\server\share\vol"),
+            r"\\server\share\vol"
+        );
     }
 
     // ── shutdown_event_name ──────────────────────────────────────────────

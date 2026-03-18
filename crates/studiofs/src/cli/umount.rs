@@ -47,8 +47,9 @@ fn run_with(
 }
 
 pub fn run(mount_point: &str) -> Result<()> {
+    let mount_point = super::utils::normalize_mount_point(mount_point);
     run_with(
-        mount_point,
+        &mount_point,
         super::utils::read_pid_file,
         super::utils::remove_pid_file,
         super::utils::is_process_running,
