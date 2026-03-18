@@ -41,51 +41,77 @@ Current history favors short, direct subjects (for example: `io path overhaul`, 
 Never commit `.env` or real credentials. Use `.env.example` defaults for local development, and sanitize endpoints/keys in logs or shared repro steps.
 
 
-## vexp <!-- vexp v1.0.0 -->
+## vexp (mandatory policy)
 
-**MANDATORY: always use `run_pipeline` first for any repo analysis or edits. Do not use grep, glob, or manual codebase browsing as the primary exploration path.**
+### 1) Hard rule
 
-Install + setup:
-```bash
-npm install -g vexp-cli@latest
-vexp setup --personal . --no-index
+- In this repo, every code/context task starts with vexp MCP.
+- Use `run_pipeline` first for discovery, exploration, impact and edit planning.
+- If `run_pipeline` (or other vexp tools) is unavailable in the current environment, explicitly report it and continue with the best available fallback.
+
+### 2) Setup and index health checks
+
+Before any code changes:
+- verify vexp workspace presence:
+  - `.vexp/manifest.json` (project metadata)
+  - `.vexp/workspace.json` (if multi-repo is used)
+  - `.vexp/index.db` (project index, local cache)
+- if any critical file is missing, report:
+  - `vexp is not configured in this repo`
+  - and ask to run `vexp: Setup Workspace` in the editor (preferred) or `vexp setup .`.
+- re-check status with `index_status` and force re-index with `vexp index .` when stale.
+
+### 3) Mandatory workflow
+
+1. `run_pipeline({ task: "..." })`
+2. target edits by returned context
+3. validate impact with `get_impact_graph` / `search_logic_flow` if needed
+4. if symbols changed or architecture impact is unclear, run second-context pass.
+
+### 4) Cross-platform sync policy (critical)
+
+- `vexp` index is machine-local and must **not** be synced:
+  - `.vexp/index.db`
+  - `.vexp/index.db-shm`
+  - `.vexp/index.db-wal`
+  - `.vexp/daemon.pid`
+  - `.vexp/healthy`
+- Keep these repo-level files for portability:
+  - `.vexp/manifest.json`
+  - `.vexp/workspace.json` (if used)
+- This repo's `.gitignore` must include local vexp index artifacts.
+
+### 5) New project AGENTS template
+
+For a new repository, include this block in `AGENTS.md`:
+
+```markdown
+## vexp (mandatory policy)
+
+### 1) Hard rule
+- Start repo work with `run_pipeline`.
+- Do not use grep/file walking as primary exploration when vexp is available.
+
+### 2) Setup and health
+- check `.vexp/manifest.json`, `.vexp/workspace.json` (if any), `.vexp/index.db`
+- if missing: run `vexp: Setup Workspace` or `vexp setup .`
+
+### 3) Sync policy
+- do not commit `.vexp/index.db*`
+- keep `.vexp/manifest.json` and `.vexp/workspace.json` in git when needed
+
+### 4) Tools order
+- `run_pipeline` → targeted changes → optional `get_impact_graph` / `search_logic_flow`
 ```
-If you want to re-index after installation:
-```bash
-vexp index .
-```
 
-Hard rule:
-- Every task that touches code context in this repo must start with `run_pipeline({ task: "..." })` whenever the vexp MCP is available.
-- Never silently skip vexp. If it is unavailable in the current environment, say so explicitly and use the best fallback available for that task.
-- `run_pipeline` is the default entry point for exploration, impact analysis, and edits in this repo.
-- vexp returns pre-indexed, graph-ranked context in a single call.
-
-### Workflow
-1. `run_pipeline` with your task description — ALWAYS FIRST (replaces all other tools)
-2. Make targeted changes based on the context returned
-3. `run_pipeline` again only if you need more context
-
-### Available MCP tools
-- `run_pipeline` — **PRIMARY TOOL**. Runs capsule + impact + memory in 1 call.
-  Auto-detects intent. Includes file content. Example: `run_pipeline({ "task": "fix auth bug" })`
-- `get_context_capsule` — lightweight, for simple questions only
-- `get_impact_graph` — impact analysis of a specific symbol
-- `search_logic_flow` — execution paths between functions
-- `get_skeleton` — compact file structure
-- `index_status` — indexing status
-- `get_session_context` — recall observations from sessions
-- `search_memory` — cross-session search
-- `save_observation` — persist insights (prefer run_pipeline's observation param)
-
-### Agentic search
-- Do NOT use built-in file search, grep, or codebase indexing as the first step — always call `run_pipeline` first when vexp is available
-- If you spawn sub-agents or background tasks, pass them the context from `run_pipeline`
-  rather than letting them search the codebase independently
-
-### Smart Features
-Intent auto-detection, hybrid ranking, session memory, auto-expanding budget.
-
-### Multi-Repo
-`run_pipeline` auto-queries all indexed repos. Use `repos: ["alias"]` to scope. Run `index_status` to see aliases.
+### Available vexp MCP tools
+- `run_pipeline`
+- `get_context_capsule`
+- `get_impact_graph`
+- `search_logic_flow`
+- `get_skeleton`
+- `index_status`
+- `get_session_context`
+- `search_memory`
+- `save_observation`
 <!-- /vexp -->

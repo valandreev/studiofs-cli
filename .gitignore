@@ -1,5 +1,14 @@
 target/
 *.db
+# vexp: never sync local vexp index/storage runtime artifacts
+.vexp/index.db
+.vexp/index.db-shm
+.vexp/index.db-wal
+.vexp/daemon.pid
+.vexp/healthy
+*.db
+*.db-shm
+*.db-wal
 Cargo.lock
 /docs/done
 /docs/ideas
@@ -12,3 +21,4 @@ docs/logs/*.*
 .antigravityrules
 tmp/
 .DS_Store
+AGENTS.vexp.template.md
