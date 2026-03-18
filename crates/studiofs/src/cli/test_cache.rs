@@ -22,9 +22,11 @@ use studiofs_vfs::parse_size_bytes;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
+use tokio::time::sleep;
 
 const DEFAULT_DIRECT_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_E2E_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LATENCY_SAMPLES: usize = 200_000;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheMode {
@@ -106,29 +108,38 @@ struct LatencySamples {
     samples_ns: Vec<u64>,
     total_ops: u64,
     total_bytes: u64,
+    total_latency_ns: u128,
+    sample_keep_every: u64,
 }
 
 impl LatencySamples {
     fn record(&mut self, elapsed: Duration, bytes: u64) {
         let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-        self.samples_ns.push(ns);
+        self.total_latency_ns = self.total_latency_ns.saturating_add(ns as u128);
         self.total_ops = self.total_ops.saturating_add(1);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
+
+        // Keep percentile estimation memory-bounded for long benchmark runs.
+        let keep_every = self.sample_keep_every.max(1);
+        if (self.total_ops - 1).is_multiple_of(keep_every) {
+            self.samples_ns.push(ns);
+        }
+
+        if self.samples_ns.len() > MAX_LATENCY_SAMPLES {
+            self.samples_ns = self.samples_ns.iter().step_by(2).copied().collect();
+            self.sample_keep_every = keep_every.saturating_mul(2);
+        }
     }
 
     fn total_duration_ms(&self) -> f64 {
-        self.samples_ns
-            .iter()
-            .map(|ns| *ns as f64 / 1_000_000.0)
-            .sum::<f64>()
+        self.total_latency_ns as f64 / 1_000_000.0
     }
 
     fn avg_ns(&self) -> f64 {
         if self.total_ops == 0 {
             return 0.0;
         }
-        let ns_total = self.samples_ns.iter().copied().map(|ns| ns as f64).sum::<f64>();
-        ns_total / self.total_ops as f64
+        self.total_latency_ns as f64 / self.total_ops as f64
     }
 
     fn percentile_ns(&self, p: f64) -> u64 {
@@ -603,7 +614,7 @@ fn clear_mount_artifacts(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
 }
 
-fn wait_for_pid_file(
+async fn wait_for_pid_file(
     mount_point: &Path,
     expected_volume: &str,
     timeout: Duration,
@@ -630,7 +641,7 @@ fn wait_for_pid_file(
             }
         }
 
-        std::thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -732,7 +743,8 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
         None,
     )?;
 
-    let (_pid, actual_mount_point) = wait_for_pid_file(mount_dir, volume, Duration::from_secs(60))?;
+    let (_pid, actual_mount_point) =
+        wait_for_pid_file(mount_dir, volume, Duration::from_secs(60)).await?;
     let actual_mount_point = Path::new(&actual_mount_point).to_path_buf();
     let work_root = actual_mount_point.join(".studiofs-test-cache");
     let benchmark_result = async {
