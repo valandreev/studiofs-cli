@@ -122,3 +122,31 @@ Repair mode currently:
 - removes orphan regular/symlink inodes and schedules their blocks for GC
 - leaves orphan directories / hardlink-like orphan cases and `nlink` mismatch
   entries as report-only
+
+## 9. Benchmark Cache (`test-cache`)
+
+Direct L2 benchmark (bypass VFS/mount):
+
+```bash
+studiofs test-cache \
+  --cache-dir /tmp/studiofs-cache-bench \
+  --mode direct-l2 \
+  --block-size 8MB \
+  --read-size 1MB \
+  --concurrency 16 \
+  --io-depth 64 \
+  --access-pattern mixed \
+  --small-file-share 20 \
+  --l1-limit 2GB \
+  --l2-limit 100GB
+```
+
+End-to-end benchmark through mounted filesystem:
+
+```bash
+studiofs test-cache \
+  --cache-dir /tmp/studiofs-cache-bench \
+  --mode e2e \
+  --volume myvolume \
+  --mount-point /mnt/studio
+```
