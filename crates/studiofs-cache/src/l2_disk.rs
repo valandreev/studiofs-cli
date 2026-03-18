@@ -257,6 +257,8 @@ impl L2DiskCache {
                 object_id,
                 data.len() as u64,
                 tokio::task::spawn_blocking(move || -> (io::Result<()>, u64) {
+                    // Intentionally measure on-worker disk write latency only.
+                    // Queueing delay before worker pickup is excluded.
                     let started = std::time::Instant::now();
                     let result = Self::write_block_file(&path, &tmp_path, &owned);
                     let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;

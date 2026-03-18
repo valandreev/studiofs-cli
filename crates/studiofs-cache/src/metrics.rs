@@ -23,13 +23,7 @@ const LATENCY_BUCKET_UPPER_NS: [u64; 16] = [
 const LATENCY_BUCKET_COUNT: usize = LATENCY_BUCKET_UPPER_NS.len() + 1;
 
 fn update_peak(peak: &AtomicUsize, value: usize) {
-    let mut current = peak.load(Ordering::Relaxed);
-    while value > current {
-        match peak.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(next) => current = next,
-        }
-    }
+    peak.fetch_max(value, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone)]
@@ -108,18 +102,7 @@ impl IoStats {
             .fetch_add(elapsed_ns, Ordering::Relaxed);
         self.latency_histogram.observe_ns(elapsed_ns);
 
-        let mut current = self.max_latency_ns.load(Ordering::Relaxed);
-        while elapsed_ns > current {
-            match self.max_latency_ns.compare_exchange_weak(
-                current,
-                elapsed_ns,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
+        self.max_latency_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> IoStatsSnapshot {

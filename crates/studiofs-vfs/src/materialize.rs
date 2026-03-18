@@ -1,6 +1,21 @@
 use super::*;
 use std::collections::{BTreeSet, HashMap};
 
+struct MaterializeInflightGuard<'a>(&'a studiofs_cache::metrics::MaterializeBatchStats);
+
+impl<'a> MaterializeInflightGuard<'a> {
+    fn new(stats: &'a studiofs_cache::metrics::MaterializeBatchStats) -> Self {
+        stats.enter_inflight();
+        Self(stats)
+    }
+}
+
+impl Drop for MaterializeInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.leave_inflight();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MaterializedExtent {
     ino: Ino,
@@ -57,9 +72,8 @@ impl Materializer {
                 return;
             }
         };
-        vfs.state.materialize_batch_stats.enter_inflight();
+        let _inflight_guard = MaterializeInflightGuard::new(&vfs.state.materialize_batch_stats);
         Self::drain_inner(vfs).await;
-        vfs.state.materialize_batch_stats.leave_inflight();
     }
 
     async fn drain_inner(vfs: &StudioVfs) {
