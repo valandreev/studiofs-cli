@@ -328,12 +328,15 @@ async fn run_l2_writes(
     io_depth: usize,
     concurrency: usize,
 ) -> Result<LatencySamples> {
+    let queue_depth = io_depth.max(1);
+    let worker_count = concurrency.max(queue_depth);
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(concurrency);
+    let sem = Arc::new(Semaphore::new(queue_depth));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+        Vec::with_capacity(worker_count);
 
-    for worker_id in 0..concurrency {
+    for worker_id in 0..worker_count {
         let cache = Arc::clone(&cache);
         let order = order.to_vec();
         let sizes = sizes.to_vec();
@@ -394,12 +397,15 @@ async fn run_l2_reads(
     concurrency: usize,
     read_size: u64,
 ) -> Result<LatencySamples> {
+    let queue_depth = io_depth.max(1);
+    let worker_count = concurrency.max(queue_depth);
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(concurrency);
+    let sem = Arc::new(Semaphore::new(queue_depth));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+        Vec::with_capacity(worker_count);
 
-    for _ in 0..concurrency {
+    for _ in 0..worker_count {
         let cache = Arc::clone(&cache);
         let order = order.to_vec();
         let sizes = sizes.to_vec();
@@ -468,12 +474,15 @@ async fn run_filesystem_writes(
     io_depth: usize,
     concurrency: usize,
 ) -> Result<LatencySamples> {
+    let queue_depth = io_depth.max(1);
+    let worker_count = concurrency.max(queue_depth);
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(concurrency);
+    let sem = Arc::new(Semaphore::new(queue_depth));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+        Vec::with_capacity(worker_count);
 
-    for _ in 0..concurrency {
+    for _ in 0..worker_count {
         let files = files.to_vec();
         let order = order.to_vec();
         let stats = Arc::clone(&stats);
@@ -536,12 +545,15 @@ async fn run_filesystem_reads(
     concurrency: usize,
     read_size: u64,
 ) -> Result<LatencySamples> {
+    let queue_depth = io_depth.max(1);
+    let worker_count = concurrency.max(queue_depth);
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(concurrency);
+    let sem = Arc::new(Semaphore::new(queue_depth));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+        Vec::with_capacity(worker_count);
 
-    for _ in 0..concurrency {
+    for _ in 0..worker_count {
         let files = files.to_vec();
         let order = order.to_vec();
         let stats = Arc::clone(&stats);
@@ -569,26 +581,15 @@ async fn run_filesystem_reads(
                     .await
                     .with_context(|| format!("open {}", item.path.display()))?;
                 let mut buf = vec![0u8; read_len];
-                let mut read = 0usize;
-                while read < buf.len() {
-                    let n = in_f
-                        .read(&mut buf[read..])
-                        .await
-                        .with_context(|| format!("read {}", item.path.display()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    read += n;
-                }
-                if read == 0 {
-                    return Err(anyhow!("read returned 0 bytes for {}", item.path.display()));
-                }
+                in_f.read_exact(&mut buf)
+                    .await
+                    .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
 
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))?;
-                s.record(elapsed, read as u64);
+                s.record(elapsed, read_len as u64);
             }
         }));
     }
