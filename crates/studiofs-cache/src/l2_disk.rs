@@ -246,7 +246,7 @@ impl L2DiskCache {
     /// Each block is written in its own `spawn_blocking` task so NVMe can
     /// service them concurrently through multiple queues.  Returns errors
     /// for individual blocks as `(object_id, Error)`.
-    pub async fn put_batch(&self, blocks: &[(u64, Bytes)]) -> Vec<(u64, io::Result<()>)> {
+    pub async fn put_batch(&self, blocks: &[(u64, Bytes)]) -> Vec<(u64, io::Result<()>, u64)> {
         let mut handles = Vec::with_capacity(blocks.len());
         for (id, data) in blocks {
             let path = self.block_path(*id);
@@ -256,22 +256,25 @@ impl L2DiskCache {
             handles.push((
                 object_id,
                 data.len() as u64,
-                tokio::task::spawn_blocking(move || -> io::Result<()> {
-                    Self::write_block_file(&path, &tmp_path, &owned)
+                tokio::task::spawn_blocking(move || -> (io::Result<()>, u64) {
+                    let started = std::time::Instant::now();
+                    let result = Self::write_block_file(&path, &tmp_path, &owned);
+                    let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    (result, elapsed_ns)
                 }),
             ));
         }
         let mut results = Vec::with_capacity(handles.len());
         for (id, len, handle) in handles {
-            let res = match handle.await {
-                Ok(Ok(())) => {
+            let (res, elapsed_ns) = match handle.await {
+                Ok((Ok(()), elapsed_ns)) => {
                     self.total_bytes.fetch_add(len, Ordering::Relaxed);
-                    Ok(())
+                    (Ok(()), elapsed_ns)
                 }
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(io::Error::other(e)),
+                Ok((Err(e), elapsed_ns)) => (Err(e), elapsed_ns),
+                Err(e) => (Err(io::Error::other(e)), 0),
             };
-            results.push((id, res));
+            results.push((id, res, elapsed_ns));
         }
         results
     }

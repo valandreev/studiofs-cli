@@ -18,6 +18,7 @@ pub mod block_cache;
 pub mod l1_mem;
 pub mod l2_disk;
 pub mod lru_tracker;
+pub mod metrics;
 pub mod upload_queue;
 
 // --- Re-exports ---

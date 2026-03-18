@@ -175,6 +175,22 @@ The background flusher runs every 10ms and drains continuously (keeps processing
 | L2 write (batch) | ~3 GB/s | Parallel `spawn_blocking` |
 | S3 upload | Variable | AIMD-controlled, raw payload in STFS object |
 
+## Cache Pipeline Observability
+
+StudioFS now exposes first-class cache pipeline metrics for local debugging and
+benchmarks:
+
+- L2 read/write throughput counters (`ops`, `bytes`) and latency histograms
+- ingress append throughput counters and latency histogram
+- materialize batch counters (`batches`, `blocks`, `bytes`), duration histogram,
+  and concurrent batch depth/peak
+- queue depth metrics for upload queue (`pending_depth`, `pending_depth_peak`)
+- backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
+
+Runtime logs (`upload pipeline counters`) include these metrics continuously
+while the pipeline is active. `studiofs test-cache --mode direct-l2` also emits
+the cache pipeline snapshot in JSON under `cache_pipeline`.
+
 ## Crash Recovery
 
 On startup:

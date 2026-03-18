@@ -4,19 +4,19 @@
 //! - direct L2 benchmark mode (`direct-l2`) that bypasses VFS
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use clap::ValueEnum;
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
-    Mutex,
 };
 use std::time::{Duration, Instant};
 use studiofs_cache::block_cache::{DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
+use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_cache::{BlockCache, BlockCacheConfig};
 use studiofs_vfs::parse_size_bytes;
 use tokio::fs;
@@ -99,8 +99,111 @@ struct BenchmarkReport {
     l1_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     l2_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_pipeline: Option<CachePipelineReport>,
     writes: OpReport,
     reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+struct LatencyHistogramReport {
+    bucket_upper_bounds_ns: Vec<u64>,
+    bucket_counts: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct IoStatsReport {
+    ops: u64,
+    bytes: u64,
+    total_latency_ns: u64,
+    max_latency_ns: u64,
+    latency_histogram: LatencyHistogramReport,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializeBatchStatsReport {
+    batches: u64,
+    blocks: u64,
+    bytes: u64,
+    inflight_batches: usize,
+    inflight_batches_peak: usize,
+    duration_histogram: LatencyHistogramReport,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadQueueStatsReport {
+    pending_depth: usize,
+    pending_depth_peak: usize,
+    submitted: u64,
+    completed: u64,
+    requeued: u64,
+    canceled: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CachePipelineReport {
+    l2_read: IoStatsReport,
+    l2_write: IoStatsReport,
+    materialize_batches: MaterializeBatchStatsReport,
+    upload_queue: UploadQueueStatsReport,
+}
+
+impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogramReport {
+    fn from(snapshot: studiofs_cache::metrics::LatencyHistogramSnapshot) -> Self {
+        Self {
+            bucket_upper_bounds_ns: snapshot.bucket_upper_bounds_ns,
+            bucket_counts: snapshot.bucket_counts,
+        }
+    }
+}
+
+impl From<studiofs_cache::metrics::IoStatsSnapshot> for IoStatsReport {
+    fn from(snapshot: studiofs_cache::metrics::IoStatsSnapshot) -> Self {
+        Self {
+            ops: snapshot.ops,
+            bytes: snapshot.bytes,
+            total_latency_ns: snapshot.total_latency_ns,
+            max_latency_ns: snapshot.max_latency_ns,
+            latency_histogram: snapshot.latency_histogram.into(),
+        }
+    }
+}
+
+impl From<studiofs_cache::metrics::MaterializeBatchStatsSnapshot> for MaterializeBatchStatsReport {
+    fn from(snapshot: studiofs_cache::metrics::MaterializeBatchStatsSnapshot) -> Self {
+        Self {
+            batches: snapshot.batches,
+            blocks: snapshot.blocks,
+            bytes: snapshot.bytes,
+            inflight_batches: snapshot.inflight_batches,
+            inflight_batches_peak: snapshot.inflight_batches_peak,
+            duration_histogram: snapshot.duration_histogram.into(),
+        }
+    }
+}
+
+impl From<studiofs_cache::metrics::UploadQueueStatsSnapshot> for UploadQueueStatsReport {
+    fn from(snapshot: studiofs_cache::metrics::UploadQueueStatsSnapshot) -> Self {
+        Self {
+            pending_depth: snapshot.pending_depth,
+            pending_depth_peak: snapshot.pending_depth_peak,
+            submitted: snapshot.submitted,
+            completed: snapshot.completed,
+            requeued: snapshot.requeued,
+            canceled: snapshot.canceled,
+        }
+    }
+}
+
+impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
+    fn from(snapshot: CachePipelineMetricsSnapshot) -> Self {
+        Self {
+            l2_read: snapshot.l2_read.into(),
+            l2_write: snapshot.l2_write.into(),
+            materialize_batches: snapshot.materialize_batches.into(),
+            upload_queue: snapshot.upload_queue.into(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -333,8 +436,7 @@ async fn run_l2_writes(
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
-        Vec::with_capacity(worker_count);
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for worker_id in 0..worker_count {
         let cache = Arc::clone(&cache);
@@ -357,9 +459,15 @@ async fn run_l2_writes(
                     .map_err(|e| anyhow!("L2 write semaphore closed: {e}"))?;
                 let _permit = permit;
 
-                let data_len = usize::try_from(sizes[work_index]).context("L2 write size overflow")?;
+                let data_len =
+                    usize::try_from(sizes[work_index]).context("L2 write size overflow")?;
                 let object_id = (work_index as u64) + 1;
-                let data = deterministic_bytes(data_len, object_id.saturating_mul(31).saturating_add(worker_id as u64));
+                let data = deterministic_bytes(
+                    data_len,
+                    object_id
+                        .saturating_mul(31)
+                        .saturating_add(worker_id as u64),
+                );
 
                 let start = Instant::now();
                 cache
@@ -402,8 +510,7 @@ async fn run_l2_reads(
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
-        Vec::with_capacity(worker_count);
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
         let cache = Arc::clone(&cache);
@@ -435,7 +542,9 @@ async fn run_l2_reads(
                 let read = usize::try_from(read_size.min(sizes[work_index]).max(1))
                     .context("L2 read size overflow")?;
                 if payload.is_empty() {
-                    return Err(anyhow!("L2 read returned empty payload for object id {object_id}"));
+                    return Err(anyhow!(
+                        "L2 read returned empty payload for object id {object_id}"
+                    ));
                 }
                 if payload.len() < read {
                     return Err(anyhow!(
@@ -479,8 +588,7 @@ async fn run_filesystem_writes(
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
-        Vec::with_capacity(worker_count);
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
         let files = files.to_vec();
@@ -550,8 +658,7 @@ async fn run_filesystem_reads(
     let stats = Arc::new(Mutex::new(LatencySamples::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
-    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
-        Vec::with_capacity(worker_count);
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
         let files = files.to_vec();
@@ -609,8 +716,7 @@ async fn run_filesystem_reads(
 
 fn clear_mount_artifacts(path: &Path) -> Result<()> {
     if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove {}", path.display()))?;
+        std::fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
     }
     std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
 }
@@ -630,7 +736,8 @@ async fn wait_for_pid_file(
         if Instant::now() >= deadline {
             return Err(anyhow!(
                 "timeout waiting for mount point '{}', expected volume '{}'",
-                mp, expected_volume
+                mp,
+                expected_volume
             ));
         }
 
@@ -650,11 +757,7 @@ async fn run_direct(params: &TestCacheParams) -> Result<BenchmarkReport> {
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let cache_config = BlockCacheConfig::new(
-        &params.cache_dir,
-        params.l1_limit,
-        params.l2_limit,
-    );
+    let cache_config = BlockCacheConfig::new(&params.cache_dir, params.l1_limit, params.l2_limit);
     let (cache, _rx) = BlockCache::open(cache_config)
         .with_context(|| format!("open cache dir {}", params.cache_dir.display()))?;
     let cache = Arc::new(cache);
@@ -711,6 +814,7 @@ async fn run_direct(params: &TestCacheParams) -> Result<BenchmarkReport> {
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),
         l2_bytes: Some(cache_stats.l2_bytes),
+        cache_pipeline: Some(cache.cache_pipeline_metrics().into()),
         writes: writes.to_report(total_elapsed_ms),
         reads: reads.to_report(total_elapsed_ms),
     })
@@ -719,12 +823,14 @@ async fn run_direct(params: &TestCacheParams) -> Result<BenchmarkReport> {
 async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let volume = params.volume.as_deref().ok_or_else(|| {
-        anyhow!("--volume is required for e2e mode")
-    })?;
-    let mount_point = params.mount_point.as_ref().ok_or_else(|| {
-        anyhow!("--mount-point is required for e2e mode")
-    })?;
+    let volume = params
+        .volume
+        .as_deref()
+        .ok_or_else(|| anyhow!("--volume is required for e2e mode"))?;
+    let mount_point = params
+        .mount_point
+        .as_ref()
+        .ok_or_else(|| anyhow!("--mount-point is required for e2e mode"))?;
     let mount_point = mount_point
         .to_str()
         .context("mount point is not valid UTF-8")?;
@@ -761,19 +867,11 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
         if files.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
-        let order = build_access_sequence(
-            files.len(),
-            params.access_pattern,
-            0x55aa_55aa_d00d_f00d,
-        );
+        let order =
+            build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
 
-        let writes = run_filesystem_writes(
-            &files,
-            &order,
-            params.io_depth,
-            params.concurrency,
-        )
-        .await?;
+        let writes =
+            run_filesystem_writes(&files, &order, params.io_depth, params.concurrency).await?;
         let reads = run_filesystem_reads(
             &files,
             &order,
@@ -791,8 +889,7 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
             mode: "e2e".to_string(),
             cache_dir: params.cache_dir.display().to_string(),
             started_at,
-            completed_at: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            completed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             total_elapsed_ms,
             block_size: params.block_size,
             read_size: params.read_size,
@@ -806,6 +903,7 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
             mount_point: Some(actual_mount_point.display().to_string()),
             l1_bytes: None,
             l2_bytes: None,
+            cache_pipeline: None,
             writes: writes.to_report(total_elapsed_ms),
             reads: reads.to_report(total_elapsed_ms),
         })
@@ -819,8 +917,8 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
     );
     match (benchmark_result, unmount_result) {
         (Ok(mut report), Ok(())) => {
-            report.completed_at = chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            report.completed_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             report.total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
             Ok(report)
         }
@@ -871,8 +969,20 @@ fn print_human_summary(report: &BenchmarkReport) {
         "  write throughput: {:.2} MiB/s",
         report.writes.throughput_bytes_per_sec / 1024.0 / 1024.0
     );
+    if let Some(pipeline) = &report.cache_pipeline {
+        println!(
+            "  cache L2 ops: read={} write={} (queue depth now={}, peak={})",
+            pipeline.l2_read.ops,
+            pipeline.l2_write.ops,
+            pipeline.upload_queue.pending_depth,
+            pipeline.upload_queue.pending_depth_peak
+        );
+    }
     println!("  JSON");
-    println!("{}", serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -911,15 +1021,11 @@ pub fn run(
     .max(1);
     let l1_limit = parse_size_arg(
         "l1-limit",
-        l1_limit
-            .as_deref()
-            .unwrap_or(&DEFAULT_L1_SIZE.to_string()),
+        l1_limit.as_deref().unwrap_or(&DEFAULT_L1_SIZE.to_string()),
     )?;
     let l2_limit = parse_size_arg(
         "l2-limit",
-        l2_limit
-            .as_deref()
-            .unwrap_or(&DEFAULT_L2_SIZE.to_string()),
+        l2_limit.as_deref().unwrap_or(&DEFAULT_L2_SIZE.to_string()),
     )?;
 
     if l1_limit < 1 || l2_limit < 1 {

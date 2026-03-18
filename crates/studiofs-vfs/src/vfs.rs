@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig};
+use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key};
 use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
@@ -186,6 +187,8 @@ pub struct VfsIngressStats {
     /// Cumulative milliseconds spent waiting on local backpressure in the
     /// foreground path.
     pub write_backpressure_wait_ms: u64,
+    /// Number of times foreground writes had to wait due to local backpressure.
+    pub write_backpressure_events: u64,
     /// Number of blocks that were forced to spill because RAM acceptance was
     /// over budget.
     pub forced_spill_blocks: u64,
@@ -2777,6 +2780,12 @@ struct VfsState {
     drained_spill_bytes: AtomicU64,
     /// Total time foreground writers spent waiting on local backpressure.
     write_backpressure_wait_ms: AtomicU64,
+    /// Number of times foreground writes entered backpressure waiting.
+    write_backpressure_events: AtomicU64,
+    /// Ingress append throughput/latency metrics.
+    ingress_append_stats: IoStats,
+    /// Materialize batch throughput/latency metrics.
+    materialize_batch_stats: MaterializeBatchStats,
     /// Notification fired by the background flusher each time it drains blocks
     /// from `dirty_mem`, used for low-latency backpressure wakeup in `write()`
     /// and `flush()` instead of polling with `sleep(5ms)`.
@@ -3535,9 +3544,8 @@ impl StudioVfs {
             let janitor_skip_newer_than = Duration::from_secs(config.janitor_skip_newer_secs);
             let janitor_max_deletes_per_run = config.janitor_max_deletes.max(1);
             let janitor_lease_ttl = Duration::from_secs(config.janitor_lease_ttl_secs.max(1));
-            let metadata_invalidation_sync_interval = Duration::from_millis(
-                config.metadata_invalidation_sync_interval_ms.max(1),
-            );
+            let metadata_invalidation_sync_interval =
+                Duration::from_millis(config.metadata_invalidation_sync_interval_ms.max(1));
             let read_buffer_mb = config.read_buffer_mb.max(1);
             let block_size_nonzero = block_size.max(1) as u128;
             let mb_to_blocks = |mb: u64| -> u32 {
@@ -3556,7 +3564,8 @@ impl StudioVfs {
             let readdir_attr_batch_max_inodes = config.readdir_attr_batch_max_inodes.max(1);
             let prefetch_foreground_reserve = config.prefetch_foreground_reserve.max(1);
             let prefetch_max_per_cycle = config.prefetch_max_per_cycle.max(1);
-            let prefetch_pause_on_neterr = Duration::from_millis(config.prefetch_pause_on_neterr_ms);
+            let prefetch_pause_on_neterr =
+                Duration::from_millis(config.prefetch_pause_on_neterr_ms);
             let _lock_lease_ttl = Duration::from_secs(config.lock_ttl_secs.max(1));
             let lock_retry_base_ms = config.lock_retry_base_ms.max(1);
             let _lock_retry_max_ms = config.lock_retry_max_ms.max(lock_retry_base_ms);
@@ -3580,10 +3589,7 @@ impl StudioVfs {
             std::fs::create_dir_all(&ingress_segment_dir).map_err(VfsError::Io)?;
             let ingress_checkpoint_dir = spill_dir.join("checkpoints");
             std::fs::create_dir_all(&ingress_checkpoint_dir).map_err(VfsError::Io)?;
-            let acl_principal = config
-                .principal
-                .trim()
-                .to_string();
+            let acl_principal = config.principal.trim().to_string();
             let acl_principal = if acl_principal.is_empty() {
                 "*".to_string()
             } else {
@@ -3743,13 +3749,15 @@ impl StudioVfs {
             let upload_delay = Duration::from_millis(config.upload_delay_ms);
             let upload_requeue_base = Duration::from_millis(config.upload_requeue_base_ms);
             let upload_requeue_max = Duration::from_millis(
-                config.upload_requeue_max_ms.max(upload_requeue_base.as_millis() as u64),
+                config
+                    .upload_requeue_max_ms
+                    .max(upload_requeue_base.as_millis() as u64),
             );
-            let upload_stats_interval = Duration::from_secs(config.upload_stats_interval_secs.max(1));
+            let upload_stats_interval =
+                Duration::from_secs(config.upload_stats_interval_secs.max(1));
             let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms.max(1));
-            let shutdown_metadata_flush_timeout = Duration::from_secs(
-                config.shutdown_metadata_flush_timeout_secs.max(1),
-            );
+            let shutdown_metadata_flush_timeout =
+                Duration::from_secs(config.shutdown_metadata_flush_timeout_secs.max(1));
             let disable_background_slab_flush = !config.background_slab_flush_enabled;
             let ingress_checkpoint_interval =
                 Duration::from_secs(config.ingress_checkpoint_interval_secs.max(1));
@@ -3758,8 +3766,10 @@ impl StudioVfs {
             let ingress_checkpoint_max_segment_lag = config.ingress_checkpoint_max_segment_lag;
             let ingress_checkpoint_max_live_segments = config.ingress_checkpoint_max_live_segments;
             let upload_cache_io_slots = config.upload_cache_io_slots.max(1);
-            let upload_cache_io_user_penalty =
-                config.upload_cache_io_user_penalty.max(1).min(upload_cache_io_slots as u32);
+            let upload_cache_io_user_penalty = config
+                .upload_cache_io_user_penalty
+                .max(1)
+                .min(upload_cache_io_slots as u32);
             let upload_user_idle_grace = Duration::from_millis(config.upload_user_idle_grace_ms);
             let upload_worker_count = if config.upload_worker_count > 0 {
                 config.upload_worker_count
@@ -3767,9 +3777,8 @@ impl StudioVfs {
                 4
             };
             let max_drain_batch = config.max_drain_batch.max(1);
-            let publish_visibility_timeout = Duration::from_secs(
-                config.publish_visibility_timeout_secs.max(1),
-            );
+            let publish_visibility_timeout =
+                Duration::from_secs(config.publish_visibility_timeout_secs.max(1));
             debug!(
                 writeback = true,
                 upload_delay_ms = upload_delay.as_millis() as u64,
@@ -3844,6 +3853,9 @@ impl StudioVfs {
                     drained_spill_blocks: AtomicU64::new(0),
                     drained_spill_bytes: AtomicU64::new(0),
                     write_backpressure_wait_ms: AtomicU64::new(0),
+                    write_backpressure_events: AtomicU64::new(0),
+                    ingress_append_stats: IoStats::default(),
+                    materialize_batch_stats: MaterializeBatchStats::default(),
                     dirty_drained_notify: tokio::sync::Notify::new(),
                     dirty_drain_lock: tokio::sync::Mutex::new(()),
                     spill_seq: AtomicU64::new(recovered_spill_seq),
@@ -4452,6 +4464,7 @@ impl StudioVfs {
         kind: u8,
         payload: &[u8],
     ) -> VfsResult<(u64, PathBuf)> {
+        let started = Instant::now();
         let _guard = self.state.ingress_segment_write_lock.lock();
         let record_len = INGRESS_RECORD_HEADER_LEN as u64 + payload.len() as u64;
         let mut active_segment_id = self.state.active_ingress_segment_id.load(Ordering::Relaxed);
@@ -4479,6 +4492,9 @@ impl StudioVfs {
         if let Err(e) = self.persist_ingress_state() {
             warn!("failed to persist ingress state after append: {}", e);
         }
+        self.state
+            .ingress_append_stats
+            .record(record_len, started.elapsed());
         Ok((
             offset,
             ingress_segment_path(&self.ingress_segment_dir, active_segment_id),
@@ -5142,6 +5158,9 @@ impl StudioVfs {
             notified.await;
             let waited_ms = std::cmp::max(1u64, wait_started.elapsed().as_millis() as u64);
             self.state
+                .write_backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
+            self.state
                 .write_backpressure_wait_ms
                 .fetch_add(waited_ms, Ordering::Relaxed);
         }
@@ -5648,6 +5667,7 @@ impl StudioVfs {
                 .state
                 .write_backpressure_wait_ms
                 .load(Ordering::Relaxed),
+            write_backpressure_events: self.state.write_backpressure_events.load(Ordering::Relaxed),
             forced_spill_blocks: self.state.forced_spill_blocks.load(Ordering::Relaxed),
             drained_mem_blocks: self.state.drained_mem_blocks.load(Ordering::Relaxed),
             drained_mem_bytes: self.state.drained_mem_bytes.load(Ordering::Relaxed),
@@ -8276,6 +8296,9 @@ impl StudioVfs {
             let pending_metadata_ops = metadata_backlog.total_ops();
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
+            let ingress_append = self.state.ingress_append_stats.snapshot();
+            let materialize_batches = self.state.materialize_batch_stats.snapshot();
+            let cache_pipeline = self.block_cache.cache_pipeline_metrics();
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
@@ -8330,6 +8353,36 @@ impl StudioVfs {
                     checkpoint_active_segment_lag = ingress.checkpoint_active_segment_lag,
                     checkpoint_live_segments = ingress.checkpoint_live_segments,
                     write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
+                    write_backpressure_events = ingress.write_backpressure_events,
+                    ingress_append_ops = ingress_append.ops,
+                    ingress_append_bytes = ingress_append.bytes,
+                    ingress_append_total_latency_ns = ingress_append.total_latency_ns,
+                    ingress_append_max_latency_ns = ingress_append.max_latency_ns,
+                    ingress_append_latency_histogram = ?ingress_append.latency_histogram.bucket_counts,
+                    materialize_batches_total = materialize_batches.batches,
+                    materialize_batches_blocks = materialize_batches.blocks,
+                    materialize_batches_bytes = materialize_batches.bytes,
+                    materialize_batches_inflight = materialize_batches.inflight_batches,
+                    materialize_batches_inflight_peak = materialize_batches.inflight_batches_peak,
+                    materialize_batch_duration_histogram = ?materialize_batches.duration_histogram.bucket_counts,
+                    cache_l2_read_ops = cache_pipeline.l2_read.ops,
+                    cache_l2_read_bytes = cache_pipeline.l2_read.bytes,
+                    cache_l2_read_total_latency_ns = cache_pipeline.l2_read.total_latency_ns,
+                    cache_l2_read_max_latency_ns = cache_pipeline.l2_read.max_latency_ns,
+                    cache_l2_read_latency_histogram = ?cache_pipeline.l2_read.latency_histogram.bucket_counts,
+                    cache_l2_write_ops = cache_pipeline.l2_write.ops,
+                    cache_l2_write_bytes = cache_pipeline.l2_write.bytes,
+                    cache_l2_write_total_latency_ns = cache_pipeline.l2_write.total_latency_ns,
+                    cache_l2_write_max_latency_ns = cache_pipeline.l2_write.max_latency_ns,
+                    cache_l2_write_latency_histogram = ?cache_pipeline.l2_write.latency_histogram.bucket_counts,
+                    upload_queue_depth = cache_pipeline.upload_queue.pending_depth,
+                    upload_queue_depth_peak = cache_pipeline.upload_queue.pending_depth_peak,
+                    upload_queue_submitted = cache_pipeline.upload_queue.submitted,
+                    upload_queue_completed = cache_pipeline.upload_queue.completed,
+                    upload_queue_requeued = cache_pipeline.upload_queue.requeued,
+                    upload_queue_canceled = cache_pipeline.upload_queue.canceled,
+                    cache_l2_batch_inflight = cache_pipeline.materialize_batches.inflight_batches,
+                    cache_l2_batch_inflight_peak = cache_pipeline.materialize_batches.inflight_batches_peak,
                     upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
                     qos_accept_available = self.qos.accept_available(),
                     qos_materialize_available = self.qos.materialize_available(),
@@ -9936,7 +9989,10 @@ mod tests {
             .lookup(ROOT_INO, b".Trashes")
             .expect("component lookup .Trashes");
         assert_eq!(
-            resolver.resolve_path("\\.Trashes").expect("resolve .Trashes").ino,
+            resolver
+                .resolve_path("\\.Trashes")
+                .expect("resolve .Trashes")
+                .ino,
             trashes.ino,
             "blocked-root policy should allow .Trashes to be materialized"
         );

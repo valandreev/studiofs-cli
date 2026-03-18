@@ -57,16 +57,21 @@ impl Materializer {
                 return;
             }
         };
+        vfs.state.materialize_batch_stats.enter_inflight();
         Self::drain_inner(vfs).await;
+        vfs.state.materialize_batch_stats.leave_inflight();
     }
 
     async fn drain_inner(vfs: &StudioVfs) {
         let max_drain_batch = vfs.max_drain_batch.max(1);
 
         loop {
+            let batch_started = Instant::now();
             let Some((extents, results)) = Self::collect_batch(vfs, max_drain_batch).await else {
                 return;
             };
+            let batch_blocks = extents.len() as u64;
+            let batch_bytes = extents.iter().map(|extent| extent.data.len() as u64).sum();
 
             let manifests = match Self::build_pending_manifest_summaries(vfs, &extents).await {
                 Ok(manifests) => manifests,
@@ -77,6 +82,11 @@ impl Materializer {
             };
 
             let batch_len = Self::apply_batch(vfs, extents, results, manifests);
+            vfs.state.materialize_batch_stats.record_batch(
+                batch_blocks,
+                batch_bytes,
+                batch_started.elapsed(),
+            );
             if batch_len < max_drain_batch {
                 return;
             }
