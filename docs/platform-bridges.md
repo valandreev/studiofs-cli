@@ -257,7 +257,7 @@ mount_and_serve(vfs, rt, mount_point, foreground)
 
 | Feature | Windows (WinFSP) | Linux/macOS (FUSE) |
 |---------|-------------------|---------------------|
-| Mount point | Drive letter (`Z:`) or directory | Directory |
+| Mount point | Drive letter (`Z:`) only | Directory |
 | Case sensitivity | Configurable (default: sensitive) | Always sensitive |
 | Windows attrs | `win_attrs` field in `InodeAttr` | Ignored |
 | Hardlinks | Limited by NTFS | Full support |

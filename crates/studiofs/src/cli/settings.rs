@@ -90,11 +90,18 @@ fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn ensure_mount_point_exists(mount_point: &str) -> anyhow::Result<()> {
-    #[cfg(windows)]
     if super::utils::is_drive_root(mount_point) {
         return Ok(());
     }
 
+    anyhow::bail!(
+        "Setting a mount-point directory is not supported on Windows.\n\
+         Specify a drive letter (for example, Z:) when mounting."
+    )
+}
+
+#[cfg(not(windows))]
+fn ensure_mount_point_exists(mount_point: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(mount_point)?;
     Ok(())
 }
@@ -110,20 +117,35 @@ pub fn resolve_studiofs_config_for_mount(
     let mount_point = cli_mount_point
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            config
-                .mount_point
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+        .or({
+            #[cfg(not(windows))]
+            {
+                config
+                    .mount_point
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            }
+            #[cfg(windows)]
+            {
+                None
+            }
         })
         .map(|s| s.to_string())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "No mount point provided and no default mount_point is configured.\n\
-                 Run `studiofs settings --mount-point <path>` or pass a mount point to `studiofs mount`."
+                "No mount point provided.\n\
+                 On Windows, you must pass a drive letter explicitly, for example `Z:`."
             )
         })?;
+
+    #[cfg(windows)]
+    if !super::utils::is_drive_root(&mount_point) {
+        anyhow::bail!(
+            "Invalid mount point '{}': Windows requires a drive letter mount (for example `Z:`).",
+            mount_point
+        );
+    }
 
     let cache_dir = cli_cache_dir
         .map(Path::to_path_buf)
@@ -172,9 +194,16 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
 
     if let Some(mount_point) = args.mount_point {
         let mount_point = mount_point.trim().to_string();
-        ensure_mount_point_exists(&mount_point)?;
-        config.mount_point = Some(mount_point);
-        changed = true;
+        if let Err(err) = ensure_mount_point_exists(&mount_point) {
+            if cfg!(windows) {
+                println!("  (warning) ignoring --mount-point on Windows: {err}");
+            } else {
+                return Err(err);
+            }
+        } else {
+            config.mount_point = Some(mount_point);
+            changed = true;
+        }
     }
 
     if let Some(cache_dir) = args.cache_dir {

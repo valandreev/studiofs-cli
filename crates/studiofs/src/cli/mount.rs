@@ -300,7 +300,27 @@ pub fn run(
     let mut vfs_config = super::settings::load_studiofs_config()?.vfs;
     vfs_config = overlay_vfs_env(vfs_config);
 
+    #[cfg(windows)]
+    let mount_point = {
+        if let Ok(from_env) = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL") {
+            from_env
+        } else {
+            mount_point.to_string()
+        }
+    };
+
+    #[cfg(not(windows))]
     let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
+
+    #[cfg(windows)]
+    {
+        if !super::utils::is_drive_root(&mount_point) {
+            anyhow::bail!(
+                "Invalid mount point '{}': Windows mount is supported only on drive letters (for example `Z:`). Directory mount points are not supported."
+            , mount_point);
+        }
+    }
+
     let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
     #[cfg(windows)]
     let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
@@ -535,7 +555,6 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(&args)
-        .env("STUDIOFS_DAEMON_MOUNT_POINT", mount_point)
         .env("STUDIOFS_DAEMON_LOG_STEM", &log_stem)
         .env("STUDIOFS_DAEMON_LOG_DIR", &logs_dir)
         .stdin(std::process::Stdio::null())
@@ -547,7 +566,13 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.env("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL", mount_point);
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    #[cfg(not(windows))]
+    {
+        cmd.env("STUDIOFS_DAEMON_MOUNT_POINT", mount_point);
     }
 
     #[cfg(unix)]

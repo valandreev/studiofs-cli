@@ -55,8 +55,10 @@ studiofs discover myvolume \
 ```
 After that, you can mount the volume:
 ```bash
-studiofs mount myvolume /shared/projects
+studiofs mount myvolume /mnt/shared/projects
 ```
+
+On Windows, use a free drive letter (for example `Z:`) instead of a folder path.
 
 ## 5. Clean Up Old Objects (Janitor)
 

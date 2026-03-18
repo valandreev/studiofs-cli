@@ -46,13 +46,38 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
 fn apply_volume_params(
     volume_params: &mut winfsp::host::VolumeParams,
     options: &WinfspMountOptions,
+    mount_point: &str,
 ) {
     volume_params.filesystem_name("StudioFS");
-    // `Prefix` switches WinFSP to network-device mode (WinFsp.Net). We mount
-    // as a local disk (drive letter), so leave Prefix empty and keep the
-    // human-readable label in `get_volume_info`.
+    // `Prefix` switches WinFSP to network-device mode (WinFsp.Net). When
+    // mounting into a directory, we need that mode to avoid object namespace
+    // collisions with the default local-disk device name.
+    if !is_drive_root_mount_point(mount_point) {
+        volume_params.prefix("studiofs");
+    }
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
+}
+
+fn is_drive_root_mount_point(mount_point: &str) -> bool {
+    let bytes = mount_point.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+
+    if !(bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+        return false;
+    }
+
+    if bytes.len() == 2 {
+        return true;
+    }
+
+    if bytes.len() == 3 && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        return true;
+    }
+
+    false
 }
 
 fn shutdown_upload_drain_timeout() -> std::time::Duration {
@@ -97,7 +122,7 @@ pub fn mount_and_serve(
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
     // WinFSP layer tuning:
     // - file_info_timeout and dir_info_timeout tuned for fast metadata refresh.
-    apply_volume_params(&mut volume_params, &options);
+    apply_volume_params(&mut volume_params, &options, mount_point);
 
     // Keep a reference for shutdown() (vfs is moved into context).
     let vfs_ref = vfs.clone();

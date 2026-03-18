@@ -92,11 +92,13 @@ studiofs mount <name> [<mount-point>] \
 
 Notes:
 - You can persist defaults with `studiofs settings`.
-- If `<mount-point>` is omitted, `studiofs mount` uses the configured default from `settings`.
+- If `<mount-point>` is omitted, `studiofs mount` uses the configured default from `settings` on non-Windows platforms.
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
+- On Windows, `<mount-point>` must be a drive letter (for example `Z:`). Directory mount points are not supported.
+- `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
@@ -113,7 +115,9 @@ Stores global defaults in `config.toml` for future `studiofs mount` runs.
 
 Notes:
 - CLI arguments override existing config values.
-- `studiofs settings --mount-point` creates the mount directory if needed.
+- `studiofs settings --mount-point` is not supported on Windows and is ignored there.
+  On Windows, specify the drive letter directly when running `studiofs mount`.
+- `studiofs settings --mount-point` creates the mount directory if needed on non-Windows systems.
 - `studiofs settings --cache-dir` creates the cache directory if needed.
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
 - `studiofs settings --slab-flush-interval` stores the background slab flusher wake interval in the `[vfs]` section.
