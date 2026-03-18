@@ -94,12 +94,29 @@ studiofs mount myvolume Y:
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
 | `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
+| `test-cache` | Run direct L2 and end-to-end cache benchmarks |
 | `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
 | `load` | Import a metadata dump into PostgreSQL |
 | `snapshot` | Create/list immutable metadata snapshots |
 | `destroy` | Remove a volume locally or locally + remotely |
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
+
+Quick benchmark example:
+
+```bash
+studiofs test-cache \
+  --cache-dir /tmp/studiofs-cache-bench \
+  --mode direct-l2 \
+  --block-size 8MB \
+  --read-size 1MB \
+  --concurrency 16 \
+  --io-depth 64 \
+  --access-pattern mixed \
+  --small-file-share 20 \
+  --l1-limit 2GB \
+  --l2-limit 100GB
+```
 
 ## Development
 

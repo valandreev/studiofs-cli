@@ -558,6 +558,57 @@ WARNING: This action is irreversible.")]
         postgresql_adress: String,
     },
 
+    /// Run cache benchmarks (direct L2 and mounted end-to-end)
+    TestCache {
+        /// Cache directory for the benchmark workspace.
+        #[arg(long)]
+        cache_dir: PathBuf,
+
+        /// Benchmark mode: `direct-l2` (bypass VFS) or `e2e` (through mount).
+        #[arg(long, value_enum, default_value_t = cli::test_cache::TestCacheMode::DirectL2)]
+        mode: cli::test_cache::TestCacheMode,
+
+        /// Block payload size (e.g. 1MB, 4MB, 8MB). Defaults to 8MB.
+        #[arg(long)]
+        block_size: Option<String>,
+
+        /// Read chunk size (e.g. 4KB, 1MB). Defaults to block-size.
+        #[arg(long)]
+        read_size: Option<String>,
+
+        /// Concurrent workload workers.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+
+        /// Maximum in-flight I/O operations.
+        #[arg(long, default_value_t = 32)]
+        io_depth: usize,
+
+        /// Access pattern: `sequential`, `random`, or `mixed`.
+        #[arg(long, value_enum, default_value_t = cli::test_cache::TestCacheAccessPattern::Sequential)]
+        access_pattern: cli::test_cache::TestCacheAccessPattern,
+
+        /// Percentage of small files in generated workload.
+        #[arg(long, default_value_t = 20)]
+        small_file_share: u8,
+
+        /// In-memory L1 cache limit (e.g. 2GB).
+        #[arg(long)]
+        l1_limit: Option<String>,
+
+        /// On-disk L2 cache limit (e.g. 100GB).
+        #[arg(long)]
+        l2_limit: Option<String>,
+
+        /// Volume name for `e2e` mode.
+        #[arg(long)]
+        volume: Option<String>,
+
+        /// Mount point for `e2e` mode.
+        #[arg(long)]
+        mount_point: Option<PathBuf>,
+    },
+
     /// Create or list immutable metadata snapshots
     Snapshot {
         /// Volume name
@@ -698,6 +749,35 @@ fn main() -> anyhow::Result<()> {
             postgresql_adress,
         } => {
             cli::dump_load::load(&path_to_dump, &postgresql_adress)?;
+        }
+        Commands::TestCache {
+            cache_dir,
+            mode,
+            block_size,
+            read_size,
+            concurrency,
+            io_depth,
+            access_pattern,
+            small_file_share,
+            l1_limit,
+            l2_limit,
+            volume,
+            mount_point,
+        } => {
+            cli::test_cache::run(
+                cache_dir,
+                mode,
+                block_size,
+                read_size,
+                concurrency,
+                io_depth,
+                access_pattern,
+                small_file_share,
+                l1_limit,
+                l2_limit,
+                volume,
+                mount_point,
+            )?;
         }
         Commands::Snapshot { name, action } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -944,6 +1024,128 @@ mod tests {
         match cli.command {
             Commands::Fsck { repair, .. } => assert!(repair),
             other => panic!("expected Fsck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_parses_defaults() {
+        let cli = parse(&[
+            "test-cache",
+            "--cache-dir",
+            "/tmp/studiofs-cache",
+            "--volume",
+            "vol",
+            "--mount-point",
+            "/mnt/studiofs",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::TestCache {
+                cache_dir,
+                mode,
+                concurrency,
+                io_depth,
+                small_file_share,
+                block_size,
+                read_size,
+                access_pattern,
+                l1_limit,
+                l2_limit,
+                volume,
+                mount_point,
+                ..
+            } => {
+                assert_eq!(cache_dir, PathBuf::from("/tmp/studiofs-cache"));
+                assert!(matches!(
+                    mode,
+                    cli::test_cache::TestCacheMode::DirectL2
+                ));
+                assert_eq!(concurrency, 4);
+                assert_eq!(io_depth, 32);
+                assert_eq!(small_file_share, 20);
+                assert_eq!(block_size.as_deref(), None);
+                assert_eq!(read_size.as_deref(), None);
+                assert!(matches!(
+                    access_pattern,
+                    cli::test_cache::TestCacheAccessPattern::Sequential
+                ));
+                assert_eq!(volume.unwrap(), "vol".to_string());
+                assert_eq!(mount_point, Some(PathBuf::from("/mnt/studiofs")));
+                assert!(l1_limit.is_none());
+                assert!(l2_limit.is_none());
+            }
+            other => panic!("expected TestCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_e2e_mode_parses() {
+        let cli = parse(&[
+            "test-cache",
+            "--mode",
+            "e2e",
+            "--cache-dir",
+            "/tmp/studiofs-cache",
+            "--volume",
+            "vol",
+            "--mount-point",
+            "/mnt/studiofs",
+            "--block-size",
+            "4MB",
+            "--read-size",
+            "1MB",
+            "--concurrency",
+            "16",
+            "--io-depth",
+            "64",
+            "--access-pattern",
+            "random",
+            "--small-file-share",
+            "40",
+            "--l1-limit",
+            "4GB",
+            "--l2-limit",
+            "1TB",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::TestCache {
+                mode,
+                cache_dir,
+                volume,
+                mount_point,
+                block_size,
+                read_size,
+                access_pattern,
+                concurrency,
+                io_depth,
+                small_file_share,
+                l1_limit,
+                l2_limit,
+                ..
+            } => {
+                assert!(matches!(
+                    mode,
+                    cli::test_cache::TestCacheMode::EndToEnd
+                ));
+                assert_eq!(cache_dir, PathBuf::from("/tmp/studiofs-cache"));
+                assert_eq!(volume.unwrap(), "vol");
+                assert_eq!(mount_point, Some(PathBuf::from("/mnt/studiofs")));
+                assert_eq!(block_size.unwrap(), "4MB");
+                assert_eq!(read_size.unwrap(), "1MB");
+                assert!(matches!(
+                    access_pattern,
+                    cli::test_cache::TestCacheAccessPattern::Random
+                ));
+                assert_eq!(concurrency, 16);
+                assert_eq!(io_depth, 64);
+                assert_eq!(small_file_share, 40);
+                assert_eq!(l1_limit.unwrap(), "4GB");
+                assert_eq!(l2_limit.unwrap(), "1TB");
+            }
+            other => panic!("expected TestCache, got {other:?}"),
         }
     }
 }

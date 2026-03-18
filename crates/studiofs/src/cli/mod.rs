@@ -10,6 +10,7 @@ pub mod settings;
 pub mod mount;
 pub mod snapshot;
 pub mod status;
+pub mod test_cache;
 pub mod test;
 pub mod umount;
 pub mod utils;
