@@ -330,11 +330,10 @@ pub fn run(
     }
 
     #[cfg(windows)]
-    if !is_drive_root {
-        if let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
+    if !is_drive_root
+        && let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
             actual_mount_path = abs_path.to_string_lossy().into_owned();
         }
-    }
 
     let actual_mount_path = actual_mount_path;
     #[cfg(windows)]

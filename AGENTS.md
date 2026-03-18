@@ -48,12 +48,11 @@ Never commit `.env` or real credentials. Use `.env.example` defaults for local d
 Install + setup:
 ```bash
 npm install -g vexp-cli@latest
-cd /Volumes/Storage/dev/studiofs
 vexp setup --personal . --no-index
 ```
 If you want to re-index after installation:
 ```bash
-cd /Volumes/Storage/dev/studiofs && vexp index .
+vexp index .
 ```
 
 Hard rule:

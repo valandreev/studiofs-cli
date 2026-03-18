@@ -89,10 +89,6 @@ fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn normalize_mount_point(mount_point: &str) -> String {
-    mount_point.trim().to_string()
-}
-
 fn ensure_mount_point_exists(mount_point: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     if super::utils::is_drive_root(mount_point) {
