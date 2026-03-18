@@ -1,6 +1,21 @@
 use super::*;
 use std::collections::{BTreeSet, HashMap};
 
+struct MaterializeInflightGuard<'a>(&'a studiofs_cache::metrics::MaterializeBatchStats);
+
+impl<'a> MaterializeInflightGuard<'a> {
+    fn new(stats: &'a studiofs_cache::metrics::MaterializeBatchStats) -> Self {
+        stats.enter_inflight();
+        Self(stats)
+    }
+}
+
+impl Drop for MaterializeInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.leave_inflight();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MaterializedExtent {
     ino: Ino,
@@ -57,6 +72,7 @@ impl Materializer {
                 return;
             }
         };
+        let _inflight_guard = MaterializeInflightGuard::new(&vfs.state.materialize_batch_stats);
         Self::drain_inner(vfs).await;
     }
 
@@ -64,9 +80,12 @@ impl Materializer {
         let max_drain_batch = vfs.max_drain_batch.max(1);
 
         loop {
+            let batch_started = Instant::now();
             let Some((extents, results)) = Self::collect_batch(vfs, max_drain_batch).await else {
                 return;
             };
+            let batch_blocks = extents.len() as u64;
+            let batch_bytes = extents.iter().map(|extent| extent.data.len() as u64).sum();
 
             let manifests = match Self::build_pending_manifest_summaries(vfs, &extents).await {
                 Ok(manifests) => manifests,
@@ -77,6 +96,11 @@ impl Materializer {
             };
 
             let batch_len = Self::apply_batch(vfs, extents, results, manifests);
+            vfs.state.materialize_batch_stats.record_batch(
+                batch_blocks,
+                batch_bytes,
+                batch_started.elapsed(),
+            );
             if batch_len < max_drain_batch {
                 return;
             }

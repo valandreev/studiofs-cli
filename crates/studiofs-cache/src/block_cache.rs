@@ -17,13 +17,14 @@ use bytes::Bytes;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::l1_mem::L1MemCache;
 use crate::l2_disk::{self, L2DiskCache};
 use crate::lru_tracker::{BlockLocation, CheckpointEntry, LruStats, LruTracker, ObjectId};
+use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::upload_queue::{PendingUpload, UploadQueue};
 
 // =============================================================================
@@ -97,6 +98,8 @@ pub struct BlockCache {
     evict_notify: Arc<Notify>,
     /// Signal to stop background tasks.
     shutdown_notify: Arc<Notify>,
+    /// Cache-pipeline observability for throughput/latency/queue depth.
+    metrics: CachePipelineMetrics,
 }
 
 impl BlockCache {
@@ -170,6 +173,7 @@ impl BlockCache {
             config,
             evict_notify,
             shutdown_notify,
+            metrics: CachePipelineMetrics::default(),
         });
 
         Ok((cache, upload_rx))
@@ -205,7 +209,11 @@ impl BlockCache {
         }
 
         // L2 hit?
+        let started = Instant::now();
         let data = self.l2.get(object_id).await?;
+        self.metrics
+            .l2_read
+            .record(data.len() as u64, started.elapsed());
 
         // Promote to L1 if budget allows (or near budget).
         self.promote_to_l1(object_id, data.clone());
@@ -229,7 +237,11 @@ impl BlockCache {
         let size = data.len() as u32;
 
         // Write to L2 (NVMe file) — async, non-blocking.
+        let started = Instant::now();
         self.l2.put(object_id, &data).await?;
+        self.metrics
+            .l2_write
+            .record(data.len() as u64, started.elapsed());
 
         // Insert into L1 (RAM).
         self.l1.insert(object_id, data);
@@ -304,7 +316,11 @@ impl BlockCache {
     /// Called from a fire-and-forget background task spawned by `drain_dirty_mem`.
     /// Does NOT unpin — the block stays pinned until the S3 upload completes.
     pub async fn commit_l2(&self, object_id: ObjectId, data: &[u8]) -> io::Result<()> {
+        let started = Instant::now();
         self.l2.put(object_id, data).await?;
+        self.metrics
+            .l2_write
+            .record(data.len() as u64, started.elapsed());
         self.lru
             .set_location(object_id, BlockLocation::MemoryAndDisk);
         // Trigger eviction check if budgets exceeded.
@@ -321,12 +337,22 @@ impl BlockCache {
     /// disk writes are submitted to the thread pool simultaneously, letting
     /// the NVMe service them across multiple queues.
     pub async fn commit_l2_batch(&self, blocks: &[(ObjectId, Bytes)]) {
+        self.metrics.materialize_batches.enter_inflight();
+        let batch_started = Instant::now();
+        let total_bytes = blocks
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
         let results = self.l2.put_batch(blocks).await;
-        for (object_id, res) in results {
+        for (idx, (object_id, res, elapsed_ns)) in results.into_iter().enumerate() {
             match res {
                 Ok(()) => {
                     self.lru
                         .set_location(object_id, BlockLocation::MemoryAndDisk);
+                    let (_, data) = &blocks[idx];
+                    self.metrics
+                        .l2_write
+                        .record_ns(data.len() as u64, elapsed_ns);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -337,6 +363,12 @@ impl BlockCache {
                 }
             }
         }
+        self.metrics.materialize_batches.record_batch(
+            blocks.len() as u64,
+            total_bytes,
+            batch_started.elapsed(),
+        );
+        self.metrics.materialize_batches.leave_inflight();
         if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {
             self.evict_notify.notify_one();
         }
@@ -351,6 +383,9 @@ impl BlockCache {
         self.lru.pin(object_id);
         self.upload_queue
             .submit(ino, offset, object_id, content_epoch);
+        self.metrics
+            .upload_queue
+            .record_submit(self.upload_queue.pending_count());
     }
 
     /// Submit multiple blocks for async S3 upload in a batch.
@@ -363,6 +398,9 @@ impl BlockCache {
             self.lru.pin(object_id);
             self.upload_queue
                 .submit(ino, offset, object_id, content_epoch);
+            self.metrics
+                .upload_queue
+                .record_submit(self.upload_queue.pending_count());
         }
     }
 
@@ -370,11 +408,16 @@ impl BlockCache {
     pub fn complete_upload(&self, op: &PendingUpload) {
         self.lru.unpin(op.object_id);
         self.upload_queue.complete(op);
+        self.metrics.upload_queue.record_complete();
     }
 
     /// Requeue a failed upload for retry.
     pub fn requeue_upload(&self, op: PendingUpload) -> bool {
-        self.upload_queue.requeue(op)
+        let queued = self.upload_queue.requeue(op);
+        if queued {
+            self.metrics.upload_queue.record_requeue();
+        }
+        queued
     }
 
     /// Cancel a pending upload: unpin the block, remove the journal entry,
@@ -383,6 +426,7 @@ impl BlockCache {
     pub fn cancel_upload(&self, op: &PendingUpload, remove_block: bool) {
         self.lru.unpin(op.object_id);
         self.upload_queue.cancel(op);
+        self.metrics.upload_queue.record_cancel();
         if remove_block {
             self.remove_sync(op.object_id);
         }
@@ -445,6 +489,11 @@ impl BlockCache {
     /// Cache directory.
     pub fn cache_dir(&self) -> &Path {
         self.l2.cache_dir()
+    }
+
+    /// Snapshot cache-pipeline metrics for debugging/benchmark reporting.
+    pub fn cache_pipeline_metrics(&self) -> CachePipelineMetricsSnapshot {
+        self.metrics.snapshot(self.upload_queue.pending_count())
     }
 
     // =========================================================================

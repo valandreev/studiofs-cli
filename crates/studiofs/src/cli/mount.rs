@@ -6,7 +6,7 @@ use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
-use studiofs_vfs::{parse_size_bytes, StudioVfs, VfsConfig};
+use studiofs_vfs::{StudioVfs, VfsConfig, parse_size_bytes};
 use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
@@ -116,7 +116,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     {
         config.max_ingress_segment_bytes = bytes as u64;
     }
-    set_u64!("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", metadata_invalidation_sync_interval_ms);
+    set_u64!(
+        "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS",
+        metadata_invalidation_sync_interval_ms
+    );
     set_u64!("STUDIOFS_READ_BUFFER_MB", read_buffer_mb);
     set_usize!("STUDIOFS_PREFETCH_CONCURRENCY", prefetch_concurrency);
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_WIDTH") {
@@ -132,7 +135,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         config.readahead_random_penalty = value as u8;
     }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
-    set_usize!("STUDIOFS_READDIR_ATTR_BATCH_CHUNK", readdir_attr_batch_chunk);
+    set_usize!(
+        "STUDIOFS_READDIR_ATTR_BATCH_CHUNK",
+        readdir_attr_batch_chunk
+    );
     set_usize!(
         "STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES",
         readdir_attr_batch_max_inodes
@@ -157,8 +163,14 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         "STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY",
         path_shortcut_cache_capacity
     );
-    set_size!("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES", path_shortcut_cache_bytes);
-    set_usize!("STUDIOFS_ATTR_READ_CACHE_CAPACITY", attr_read_cache_capacity);
+    set_size!(
+        "STUDIOFS_PATH_SHORTCUT_CACHE_BYTES",
+        path_shortcut_cache_bytes
+    );
+    set_usize!(
+        "STUDIOFS_ATTR_READ_CACHE_CAPACITY",
+        attr_read_cache_capacity
+    );
     set_size!("STUDIOFS_ATTR_READ_CACHE_BYTES", attr_read_cache_bytes);
     set_u64!("STUDIOFS_JANITOR_INTERVAL_SECS", janitor_interval_secs);
     if let Some(value) = parse_env_u64_any("STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
@@ -170,13 +182,19 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
         config.upload_cache_io_user_penalty = value as u32;
     }
-    set_u64!("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS", upload_user_idle_grace_ms);
+    set_u64!(
+        "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
+        upload_user_idle_grace_ms
+    );
     if let Some(value) = parse_env_u64_any("STUDIOFS_UPLOAD_DELAY_MS") {
         config.upload_delay_ms = value;
     }
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", upload_requeue_base_ms);
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", upload_requeue_max_ms);
-    set_u64!("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS", upload_stats_interval_secs);
+    set_u64!(
+        "STUDIOFS_UPLOAD_STATS_INTERVAL_SECS",
+        upload_stats_interval_secs
+    );
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
         config.upload_max_attempts = value as u32;
     }
@@ -244,7 +262,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_usize!("STUDIOFS_QOS_UPLOAD_SLOTS", qos_upload_slots);
     set_usize!("STUDIOFS_QOS_COMMIT_SLOTS", qos_commit_slots);
     set_usize!("STUDIOFS_QOS_FETCH_SLOTS", qos_fetch_slots);
-    set_u64!("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS", ingress_checkpoint_interval_secs);
+    set_u64!(
+        "STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS",
+        ingress_checkpoint_interval_secs
+    );
     set_u64!(
         "STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES",
         ingress_checkpoint_min_append_bytes
@@ -316,23 +337,25 @@ pub fn run(
     {
         if !super::utils::is_drive_root(&mount_point) {
             anyhow::bail!(
-                "Invalid mount point '{}': Windows mount is supported only on drive letters (for example `Z:`). Directory mount points are not supported."
-            , mount_point);
+                "Invalid mount point '{}': Windows mount is supported only on drive letters (for example `Z:`). Directory mount points are not supported.",
+                mount_point
+            );
         }
     }
 
-    let mut actual_mount_path = resolve_mount_path(name, &mount_point).to_string_lossy().into_owned();
+    let mut actual_mount_path = resolve_mount_path(name, &mount_point)
+        .to_string_lossy()
+        .into_owned();
     #[cfg(windows)]
     let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
 
     #[cfg(not(windows))]
     let is_drive_root = false;
 
-    if !is_drive_root
-        && let Err(err) = std::fs::create_dir_all(&actual_mount_path)
-    {
+    if !is_drive_root && let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
         #[cfg(target_os = "macos")]
-        if err.kind() == std::io::ErrorKind::PermissionDenied && actual_mount_path.contains("/Volumes")
+        if err.kind() == std::io::ErrorKind::PermissionDenied
+            && actual_mount_path.contains("/Volumes")
         {
             anyhow::bail!(
                 "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
@@ -355,10 +378,9 @@ pub fn run(
     }
 
     #[cfg(windows)]
-    if !is_drive_root
-        && let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
-            actual_mount_path = normalize_windows_mount_path(&abs_path.to_string_lossy());
-        }
+    if !is_drive_root && let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
+        actual_mount_path = normalize_windows_mount_path(&abs_path.to_string_lossy());
+    }
 
     let actual_mount_path = actual_mount_path;
     #[cfg(windows)]
@@ -478,7 +500,10 @@ pub fn run(
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
 
-    println!("✓ Volume '{}' ready to mount at '{}'", name, actual_mount_path);
+    println!(
+        "✓ Volume '{}' ready to mount at '{}'",
+        name, actual_mount_path
+    );
     println!("  Memory limit: {}", memory_limit);
     println!("  Cache size:   {}", cache_size);
     println!(

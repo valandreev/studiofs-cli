@@ -150,3 +150,11 @@ studiofs test-cache \
   --volume myvolume \
   --mount-point /mnt/studio
 ```
+
+Notes:
+- `direct-l2` JSON output includes a `cache_pipeline` section with:
+  - `l2_read` / `l2_write` throughput + latency histograms
+  - `materialize_batches` batch size/duration/concurrency metrics
+  - `upload_queue` depth and queue counters
+- `e2e` mode keeps filesystem-level read/write reports; cache internals are
+  emitted through mount logs (`upload pipeline counters`).

@@ -357,7 +357,15 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Shutdown upload drain max wait |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
-Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution. Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
+Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
+
+- dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
+- ingress append throughput (`ops`, `bytes`) and latency histogram
+- materialize batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
+- cache L2 read/write throughput and latency histograms
+- queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
+
+Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
 
 ### Testing
 

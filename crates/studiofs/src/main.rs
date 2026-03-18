@@ -931,7 +931,10 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Settings { settings } => {
-                assert_eq!(settings.cache_dir.unwrap(), PathBuf::from("/tmp/studio-cache"));
+                assert_eq!(
+                    settings.cache_dir.unwrap(),
+                    PathBuf::from("/tmp/studio-cache")
+                );
                 assert_eq!(settings.memory_limit.unwrap(), "4GB");
                 assert_eq!(settings.cache_size.unwrap(), "100GB");
             }
@@ -1057,10 +1060,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(cache_dir, PathBuf::from("/tmp/studiofs-cache"));
-                assert!(matches!(
-                    mode,
-                    cli::test_cache::TestCacheMode::DirectL2
-                ));
+                assert!(matches!(mode, cli::test_cache::TestCacheMode::DirectL2));
                 assert_eq!(concurrency, 4);
                 assert_eq!(io_depth, 32);
                 assert_eq!(small_file_share, 20);
@@ -1126,10 +1126,7 @@ mod tests {
                 l2_limit,
                 ..
             } => {
-                assert!(matches!(
-                    mode,
-                    cli::test_cache::TestCacheMode::EndToEnd
-                ));
+                assert!(matches!(mode, cli::test_cache::TestCacheMode::EndToEnd));
                 assert_eq!(cache_dir, PathBuf::from("/tmp/studiofs-cache"));
                 assert_eq!(volume.unwrap(), "vol");
                 assert_eq!(mount_point, Some(PathBuf::from("/mnt/studiofs")));
