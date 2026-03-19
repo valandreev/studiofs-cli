@@ -25,10 +25,12 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
-const DEFAULT_DIRECT_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
-const DEFAULT_E2E_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LATENCY_SAMPLES: usize = 200_000;
 const BINARY_UNIT_DIVISOR: f64 = 1024.0;
+const WORKLOAD_FILES_PER_TIER: usize = 100;
+const SMALL_FILE_MIN_BYTES: u64 = 1 * 1024;
+const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
+const LARGE_FILE_MULTIPLIER: u64 = 8;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -48,7 +50,6 @@ struct TestCacheParams {
     concurrency: usize,
     io_depth: usize,
     access_pattern: TestCacheAccessPattern,
-    small_file_share: u8,
     l1_limit: u64,
     l2_limit: u64,
 }
@@ -95,7 +96,6 @@ struct BenchmarkReport {
     concurrency: usize,
     io_depth: usize,
     access_pattern: String,
-    small_file_share: u8,
     l1_limit: u64,
     l2_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,10 +324,6 @@ impl XorShift64 {
         }
         (self.next_u64() % max_exclusive as u64) as usize
     }
-
-    fn next_bool_percent(&mut self, threshold_percent: u8) -> bool {
-        (self.next_u64() % 100) < threshold_percent as u64
-    }
 }
 
 fn parse_size_arg(label: &str, raw: &str) -> Result<u64> {
@@ -373,33 +369,23 @@ fn build_access_sequence(len: usize, pattern: TestCacheAccessPattern, seed: u64)
     order
 }
 
-fn build_work_sizes(
-    total_bytes: u64,
-    block_size: u64,
-    read_size: u64,
-    small_file_share: u8,
-) -> Vec<u64> {
+fn build_work_sizes(block_size: u64) -> Vec<u64> {
     let mut rng = XorShift64::new(0x5ed0_f00d_beef);
-    let mut remaining = total_bytes;
-    let mut sizes = Vec::new();
-    let small_size = read_size.max(4 * 1024).min(block_size);
+    let mut sizes = Vec::with_capacity(WORKLOAD_FILES_PER_TIER * 3);
 
-    if remaining == 0 {
-        return Vec::new();
+    for _ in 0..WORKLOAD_FILES_PER_TIER {
+        let span = SMALL_FILE_MAX_BYTES - SMALL_FILE_MIN_BYTES + 1;
+        let size = SMALL_FILE_MIN_BYTES + (rng.next_u64() % span);
+        sizes.push(size);
     }
 
-    while remaining > 0 {
-        let mut next = if rng.next_bool_percent(small_file_share) {
-            small_size
-        } else {
-            block_size
-        };
-        if next == 0 {
-            next = block_size.max(1);
-        }
-        let take = next.min(remaining);
-        sizes.push(take);
-        remaining -= take;
+    for _ in 0..WORKLOAD_FILES_PER_TIER {
+        sizes.push(block_size.max(1));
+    }
+
+    let large_size = block_size.max(1).saturating_mul(LARGE_FILE_MULTIPLIER);
+    for _ in 0..WORKLOAD_FILES_PER_TIER {
+        sizes.push(large_size.max(1));
     }
 
     sizes
@@ -414,14 +400,8 @@ fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-fn build_file_worklist(
-    total_bytes: u64,
-    block_size: u64,
-    read_size: u64,
-    small_file_share: u8,
-    mount_root: &Path,
-) -> Vec<WorkFile> {
-    let sizes = build_work_sizes(total_bytes, block_size, read_size, small_file_share);
+fn build_file_worklist(block_size: u64, mount_root: &Path) -> Vec<WorkFile> {
+    let sizes = build_work_sizes(block_size);
     sizes
         .into_iter()
         .enumerate()
@@ -865,12 +845,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
     let cache = Arc::new(cache);
 
-    let work_sizes = build_work_sizes(
-        DEFAULT_DIRECT_TOTAL_BYTES,
-        params.block_size,
-        params.read_size,
-        params.small_file_share,
-    );
+    let work_sizes = build_work_sizes(params.block_size);
     let order = build_access_sequence(
         work_sizes.len(),
         params.access_pattern,
@@ -910,7 +885,6 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         concurrency: params.concurrency,
         io_depth: params.io_depth,
         access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
-        small_file_share: params.small_file_share,
         l1_limit: params.l1_limit,
         l2_limit: params.l2_limit,
         volume: None,
@@ -935,13 +909,7 @@ async fn run_mounted_end_to_end(
     let benchmark_result = async {
         clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
 
-        let files = build_file_worklist(
-            DEFAULT_E2E_TOTAL_BYTES,
-            params.block_size,
-            params.read_size,
-            params.small_file_share,
-            work_root,
-        );
+        let files = build_file_worklist(params.block_size, work_root);
         if files.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
@@ -974,7 +942,6 @@ async fn run_mounted_end_to_end(
             concurrency: params.concurrency,
             io_depth: params.io_depth,
             access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
-            small_file_share: params.small_file_share,
             l1_limit: params.l1_limit,
             l2_limit: params.l2_limit,
             work_root: Some(work_root.display().to_string()),
@@ -1247,13 +1214,13 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     );
     let _ = writeln!(
         &mut out,
-        "Workload:  block {}, read {}, concurrency {}, io-depth {}, pattern {}, small files {}%",
+        "Workload:  100 small (1-10 KiB), 100 medium ({}), 100 large ({}), read {}, concurrency {}, io-depth {}, pattern {}",
         format_bytes(report.block_size),
+        format_bytes(report.block_size.saturating_mul(LARGE_FILE_MULTIPLIER)),
         format_bytes(report.read_size),
         report.concurrency,
         report.io_depth,
         report.access_pattern,
-        report.small_file_share,
     );
     let _ = writeln!(
         &mut out,
@@ -1368,7 +1335,6 @@ pub fn run(
     concurrency: usize,
     io_depth: usize,
     access_pattern: TestCacheAccessPattern,
-    small_file_share: u8,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
     json_output: Option<PathBuf>,
@@ -1379,10 +1345,6 @@ pub fn run(
     if concurrency == 0 {
         return Err(anyhow!("--concurrency must be >= 1"));
     }
-    if small_file_share > 100 {
-        return Err(anyhow!("--small-file-share must be in range 0..100"));
-    }
-
     let block_size = parse_size_arg("block-size", block_size.as_deref().unwrap_or("8MB"))?;
     let read_size = parse_size_arg(
         "read-size",
@@ -1412,7 +1374,6 @@ pub fn run(
         concurrency,
         io_depth,
         access_pattern,
-        small_file_share,
         l1_limit,
         l2_limit,
     };
@@ -1455,7 +1416,6 @@ mod tests {
             concurrency: 4,
             io_depth: 32,
             access_pattern: "sequential".to_string(),
-            small_file_share: 20,
             l1_limit: 2 * 1024 * 1024 * 1024,
             l2_limit: 100 * 1024 * 1024 * 1024,
             work_root: None,
@@ -1525,6 +1485,29 @@ mod tests {
                 throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
             },
         }
+    }
+
+    #[test]
+    fn workload_profile_has_expected_tiers() {
+        let block_size = 8 * 1024 * 1024;
+        let sizes = build_work_sizes(block_size);
+        assert_eq!(sizes.len(), WORKLOAD_FILES_PER_TIER * 3);
+
+        let small = &sizes[..WORKLOAD_FILES_PER_TIER];
+        let medium = &sizes[WORKLOAD_FILES_PER_TIER..WORKLOAD_FILES_PER_TIER * 2];
+        let large = &sizes[WORKLOAD_FILES_PER_TIER * 2..];
+
+        assert!(
+            small
+                .iter()
+                .all(|size| *size >= SMALL_FILE_MIN_BYTES && *size <= SMALL_FILE_MAX_BYTES)
+        );
+        assert!(medium.iter().all(|size| *size == block_size));
+        assert!(
+            large
+                .iter()
+                .all(|size| *size == block_size * LARGE_FILE_MULTIPLIER)
+        );
     }
 
     #[test]
