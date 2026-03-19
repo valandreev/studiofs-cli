@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
-use studiofs_vfs::VfsConfig;
+use studiofs_vfs::{CacheSafetyMode, VfsConfig};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_CACHE_SIZE: &str = "100GB";
@@ -52,6 +52,26 @@ pub struct SettingsArgs {
         overrides_with = "disable_bg_slab_flush"
     )]
     pub enable_bg_slab_flush: bool,
+
+    /// Cache safety mode for mount write-path durability.
+    #[arg(long = "cache-safety-mode", value_enum)]
+    pub cache_safety_mode: Option<SettingsCacheSafetyMode>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum SettingsCacheSafetyMode {
+    Fast,
+    Durable,
+}
+
+impl From<SettingsCacheSafetyMode> for CacheSafetyMode {
+    fn from(value: SettingsCacheSafetyMode) -> Self {
+        match value {
+            SettingsCacheSafetyMode::Fast => CacheSafetyMode::Fast,
+            SettingsCacheSafetyMode::Durable => CacheSafetyMode::Durable,
+        }
+    }
 }
 
 fn config_file_path() -> anyhow::Result<PathBuf> {
@@ -260,6 +280,11 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         changed = true;
     }
 
+    if let Some(mode) = args.cache_safety_mode {
+        config.vfs.cache_safety_mode = mode.into();
+        changed = true;
+    }
+
     if changed {
         save_studiofs_config(&config)?;
         println!("✓ Updated studiofs settings");
@@ -299,6 +324,13 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
             "enabled"
         } else {
             "disabled"
+        }
+    );
+    println!(
+        "  cache-safety-mode: {}",
+        match config.vfs.cache_safety_mode {
+            CacheSafetyMode::Fast => "fast",
+            CacheSafetyMode::Durable => "durable",
         }
     );
 

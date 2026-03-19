@@ -6,7 +6,7 @@ use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
-use studiofs_vfs::{StudioVfs, VfsConfig, parse_size_bytes};
+use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfig, parse_size_bytes};
 use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
@@ -77,6 +77,16 @@ fn parse_env_bool(key: &str) -> Option<bool> {
     Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
+fn parse_env_cache_safety_mode(key: &str) -> Option<CacheSafetyMode> {
+    let value = std::env::var(key).ok()?;
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "fast" => Some(CacheSafetyMode::Fast),
+        "durable" => Some(CacheSafetyMode::Durable),
+        _ => None,
+    }
+}
+
 fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     macro_rules! set_usize {
         ($key:literal, $field:ident) => {
@@ -115,6 +125,9 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         && let Some(bytes) = parse_size_bytes(&v).filter(|v| *v > 0)
     {
         config.max_ingress_segment_bytes = bytes as u64;
+    }
+    if let Some(mode) = parse_env_cache_safety_mode("STUDIOFS_CACHE_SAFETY_MODE") {
+        config.cache_safety_mode = mode;
     }
     set_u64!(
         "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS",

@@ -191,6 +191,12 @@ pub struct VfsIngressStats {
     pub write_backpressure_wait_ms: u64,
     /// Number of times foreground writes had to wait due to local backpressure.
     pub write_backpressure_events: u64,
+    /// Foreground wait time spent in fast-mode backpressure only.
+    pub fast_backpressure_wait_ms: u64,
+    /// Number of fast-mode backpressure wait events.
+    pub fast_backpressure_events: u64,
+    /// Maximum single fast-mode backpressure stall observed since startup.
+    pub fast_backpressure_stall_max_ms: u64,
     /// Number of blocks that were forced to spill because RAM acceptance was
     /// over budget.
     pub forced_spill_blocks: u64,
@@ -591,6 +597,19 @@ struct RemoteLockRecord {
     shared_owners: BTreeSet<String>,
 }
 
+/// Local cache durability/safety mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheSafetyMode {
+    /// Prefer a single local NVMe payload write (L2 cache) and recover
+    /// best-effort by self-healing stale ingress artifacts on startup.
+    #[default]
+    Fast,
+    /// Keep a durable local accept path via append-only ingress WAL +
+    /// checkpoint recovery state.
+    Durable,
+}
+
 // =============================================================================
 // VFS Configuration
 // =============================================================================
@@ -661,6 +680,8 @@ pub struct VfsConfig {
     pub max_spill_bytes: usize,
     /// Maximum active ingress segment size.
     pub max_ingress_segment_bytes: u64,
+    /// Local cache durability/safety policy.
+    pub cache_safety_mode: CacheSafetyMode,
     /// Principal used for ACL evaluation.
     pub principal: String,
     /// Initial fetch window.
@@ -797,6 +818,7 @@ impl Default for VfsConfig {
             effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
             max_spill_bytes: 64 * 1024 * 1024 * 1024usize,
             max_ingress_segment_bytes: DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
+            cache_safety_mode: CacheSafetyMode::Fast,
             principal: "*".to_string(),
             fetch_initial_window: 0.0,
             fetch_min_window: 1.0,
@@ -2727,6 +2749,113 @@ fn recover_spill_dir(spill_dir: &std::path::Path) -> VfsResult<RecoveredSpillSta
     Ok((spill_entries, total_bytes, next_seq, active_segment_id))
 }
 
+fn reset_ingress_artifacts_for_fast_mode(spill_dir: &std::path::Path) -> VfsResult<()> {
+    std::fs::create_dir_all(spill_dir)?;
+    let segment_dir = spill_dir.join("segments");
+    let checkpoint_dir = spill_dir.join("checkpoints");
+
+    if let Err(e) = std::fs::remove_dir_all(&segment_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VfsError::Io(e));
+    }
+    if let Err(e) = std::fs::remove_dir_all(&checkpoint_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VfsError::Io(e));
+    }
+    std::fs::create_dir_all(&segment_dir)?;
+    std::fs::create_dir_all(&checkpoint_dir)?;
+
+    if let Err(e) = std::fs::remove_file(ingress_state_path(spill_dir))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VfsError::Io(e));
+    }
+
+    for entry in std::fs::read_dir(spill_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "spill") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn scan_ingress_artifacts(spill_dir: &std::path::Path) -> VfsResult<(usize, usize, bool)> {
+    let segment_dir = spill_dir.join("segments");
+    let checkpoint_dir = spill_dir.join("checkpoints");
+    let segment_count = list_ingress_segment_files(&segment_dir)?.len();
+    let checkpoint_present = latest_ingress_checkpoint_path(&checkpoint_dir).exists();
+    let state_present = ingress_state_path(spill_dir).exists();
+    Ok((
+        segment_count,
+        usize::from(checkpoint_present),
+        state_present,
+    ))
+}
+
+type IngressRecoveryInit = (RecoveredSpillMap, usize, u64, u64, Option<(u64, u64, u64)>);
+
+fn init_ingress_recovery_state(
+    cache_safety_mode: CacheSafetyMode,
+    spill_dir: &std::path::Path,
+    ingress_checkpoint_dir: &std::path::Path,
+    ingress_segment_dir: &std::path::Path,
+) -> VfsResult<IngressRecoveryInit> {
+    if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
+        let existing_checkpoint =
+            load_latest_ingress_checkpoint(ingress_checkpoint_dir, ingress_segment_dir)?;
+        let (
+            recovered_spill,
+            recovered_spill_bytes,
+            recovered_spill_seq,
+            active_ingress_segment_id,
+        ) = recover_spill_dir(spill_dir)?;
+        let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
+            let checkpoint_path = latest_ingress_checkpoint_path(ingress_checkpoint_dir);
+            let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            (
+                checkpoint_unix_ms,
+                checkpoint.covered_segment_id,
+                checkpoint.covered_offset,
+            )
+        });
+        return Ok((
+            recovered_spill,
+            recovered_spill_bytes,
+            recovered_spill_seq,
+            active_ingress_segment_id,
+            initial_checkpoint_meta,
+        ));
+    }
+
+    let (segment_count, checkpoint_count, state_present) = scan_ingress_artifacts(spill_dir)?;
+    if segment_count > 0 || checkpoint_count > 0 || state_present {
+        warn!(
+            mode = "fast",
+            segment_count,
+            checkpoint_count,
+            state_present,
+            "startup detected durable ingress artifacts; fast mode will discard them during self-heal"
+        );
+    }
+    reset_ingress_artifacts_for_fast_mode(spill_dir)?;
+    Ok((
+        RecoveredSpillMap::new(),
+        0,
+        1,
+        INITIAL_INGRESS_SEGMENT_ID,
+        None,
+    ))
+}
+
 // =============================================================================
 // Internal State (for Clone support)
 // =============================================================================
@@ -2790,6 +2919,12 @@ struct VfsState {
     write_backpressure_wait_ms: AtomicU64,
     /// Number of times foreground writes entered backpressure waiting.
     write_backpressure_events: AtomicU64,
+    /// Foreground wait time spent in fast-mode backpressure only.
+    fast_backpressure_wait_ms: AtomicU64,
+    /// Number of fast-mode backpressure wait events.
+    fast_backpressure_events: AtomicU64,
+    /// Maximum single fast-mode backpressure stall observed since startup.
+    fast_backpressure_stall_max_ms: AtomicU64,
     /// Ingress append throughput/latency metrics.
     ingress_append_stats: IoStats,
     /// Materialize batch throughput/latency metrics.
@@ -2898,6 +3033,8 @@ pub struct StudioVfs {
     data_prefix: String,
     /// Internal state (mutable).
     state: Arc<VfsState>,
+    /// Local cache durability/safety mode.
+    cache_safety_mode: CacheSafetyMode,
     /// Principal used for ACL evaluation in this mounted VFS instance.
     acl_principal: String,
     /// Max number of entries in effective ACL cache.
@@ -2987,6 +3124,11 @@ impl StudioVfs {
             .by_ino
             .get(&ino)
             .map(|ignored| ignored.attr.clone())
+    }
+
+    #[inline]
+    fn durable_cache_safety_mode(&self) -> bool {
+        matches!(self.cache_safety_mode, CacheSafetyMode::Durable)
     }
 
     fn ignored_dir_attr(&self, ino: Ino) -> Option<InodeAttr> {
@@ -3591,6 +3733,7 @@ impl StudioVfs {
             let effective_acl_cache_capacity = config.effective_acl_cache_capacity.max(1);
             let max_spill_bytes = config.max_spill_bytes.max(1);
             let max_ingress_segment_bytes = config.max_ingress_segment_bytes.max(1);
+            let cache_safety_mode = config.cache_safety_mode;
             let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
             std::fs::create_dir_all(&spill_dir).map_err(VfsError::Io)?;
             let ingress_segment_dir = spill_dir.join("segments");
@@ -3603,28 +3746,18 @@ impl StudioVfs {
             } else {
                 acl_principal
             };
-            let existing_checkpoint =
-                load_latest_ingress_checkpoint(&ingress_checkpoint_dir, &ingress_segment_dir)?;
             let (
                 recovered_spill,
                 recovered_spill_bytes,
                 recovered_spill_seq,
                 active_ingress_segment_id,
-            ) = recover_spill_dir(&spill_dir)?;
-            let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
-                let checkpoint_path = latest_ingress_checkpoint_path(&ingress_checkpoint_dir);
-                let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
-                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                (
-                    checkpoint_unix_ms,
-                    checkpoint.covered_segment_id,
-                    checkpoint.covered_offset,
-                )
-            });
+                initial_checkpoint_meta,
+            ) = init_ingress_recovery_state(
+                cache_safety_mode,
+                &spill_dir,
+                &ingress_checkpoint_dir,
+                &ingress_segment_dir,
+            )?;
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
@@ -3824,6 +3957,7 @@ impl StudioVfs {
                 block_cache,
                 block_size,
                 data_prefix,
+                cache_safety_mode,
                 acl_principal,
                 effective_acl_cache_capacity,
                 state: Arc::new(VfsState {
@@ -3864,6 +3998,9 @@ impl StudioVfs {
                     drained_spill_bytes: AtomicU64::new(0),
                     write_backpressure_wait_ms: AtomicU64::new(0),
                     write_backpressure_events: AtomicU64::new(0),
+                    fast_backpressure_wait_ms: AtomicU64::new(0),
+                    fast_backpressure_events: AtomicU64::new(0),
+                    fast_backpressure_stall_max_ms: AtomicU64::new(0),
                     ingress_append_stats: IoStats::default(),
                     materialize_batch_stats: MaterializeBatchStats::default(),
                     dirty_drained_notify: tokio::sync::Notify::new(),
@@ -4400,14 +4537,6 @@ impl StudioVfs {
         )
     }
 
-    fn persist_ingress_state(&self) -> VfsResult<()> {
-        write_ingress_state(
-            &self.ingress_spill_dir,
-            self.state.active_ingress_segment_id.load(Ordering::Relaxed),
-            self.state.spill_seq.load(Ordering::Relaxed),
-        )
-    }
-
     fn persist_ingress_recovery_state_owned(
         state: Arc<VfsState>,
         ingress_checkpoint_dir: PathBuf,
@@ -4499,9 +4628,6 @@ impl StudioVfs {
             payload,
         )?;
         self.note_ingress_checkpoint_churn(record_len);
-        if let Err(e) = self.persist_ingress_state() {
-            warn!("failed to persist ingress state after append: {}", e);
-        }
         self.state
             .ingress_append_stats
             .record(record_len, started.elapsed());
@@ -5117,10 +5243,15 @@ impl StudioVfs {
             // and `notified().await`.
             let notified = self.state.dirty_drained_notify.notified();
             let dirty_bytes = self.state.dirty_bytes.load(Ordering::Relaxed);
-            if dirty_bytes.saturating_add(total) <= self.max_dirty_bytes {
-                for (block_index, data) in &blocks {
-                    self.spill_block_async((ino, *block_index), data.clone())
-                        .await?;
+            let fast_overcommit_head = !self.durable_cache_safety_mode()
+                && dirty_bytes == 0
+                && self.state.dirty_mem.lock().is_empty();
+            if dirty_bytes.saturating_add(total) <= self.max_dirty_bytes || fast_overcommit_head {
+                if self.durable_cache_safety_mode() {
+                    for (block_index, data) in &blocks {
+                        self.spill_block_async((ino, *block_index), data.clone())
+                            .await?;
+                    }
                 }
                 {
                     let mut dirty = self.state.dirty_mem.lock();
@@ -5140,30 +5271,33 @@ impl StudioVfs {
                 return Ok(());
             }
 
-            let spill_bytes = self.state.dirty_spill_bytes.load(Ordering::Relaxed);
-            if spill_bytes.saturating_add(total) <= self.max_spill_bytes {
-                for (block_index, data) in blocks {
-                    {
-                        let mut dirty = self.state.dirty_mem.lock();
-                        if let Some(old) = dirty.remove(&(ino, block_index)) {
-                            self.state
-                                .dirty_bytes
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                    Some(v.saturating_sub(old.len()))
-                                })
-                                .ok();
+            if self.durable_cache_safety_mode() {
+                let spill_bytes = self.state.dirty_spill_bytes.load(Ordering::Relaxed);
+                if spill_bytes.saturating_add(total) <= self.max_spill_bytes {
+                    for (block_index, data) in blocks {
+                        {
+                            let mut dirty = self.state.dirty_mem.lock();
+                            if let Some(old) = dirty.remove(&(ino, block_index)) {
+                                self.state
+                                    .dirty_bytes
+                                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                        Some(v.saturating_sub(old.len()))
+                                    })
+                                    .ok();
+                            }
                         }
+                        self.spill_block_async((ino, block_index), data).await?;
                     }
-                    self.spill_block_async((ino, block_index), data).await?;
+                    self.state
+                        .forced_spill_blocks
+                        .fetch_add(block_count, Ordering::Relaxed);
+                    self.state.dirty_drained_notify.notify_waiters();
+                    let _ = self.dirty_flush_tx.send(());
+                    return Ok(());
                 }
-                self.state
-                    .forced_spill_blocks
-                    .fetch_add(block_count, Ordering::Relaxed);
-                self.state.dirty_drained_notify.notify_waiters();
-                let _ = self.dirty_flush_tx.send(());
-                return Ok(());
             }
 
+            let _ = self.dirty_flush_tx.send(());
             let wait_started = Instant::now();
             notified.await;
             let waited_ms = std::cmp::max(1u64, wait_started.elapsed().as_millis() as u64);
@@ -5173,13 +5307,23 @@ impl StudioVfs {
             self.state
                 .write_backpressure_wait_ms
                 .fetch_add(waited_ms, Ordering::Relaxed);
+            if !self.durable_cache_safety_mode() {
+                self.state
+                    .fast_backpressure_events
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .fast_backpressure_wait_ms
+                    .fetch_add(waited_ms, Ordering::Relaxed);
+                self.state
+                    .fast_backpressure_stall_max_ms
+                    .fetch_max(waited_ms, Ordering::Relaxed);
+            }
         }
     }
 
     async fn spill_block_async(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
         let state = self.state.clone();
         let ingress_segment_dir = self.ingress_segment_dir.clone();
-        let spill_state_dir = self.ingress_spill_dir.clone();
         let max_ingress_segment_bytes = self.max_ingress_segment_bytes;
         let data = data.as_ref().to_vec();
         run_blocking(move || {
@@ -5213,11 +5357,6 @@ impl StudioVfs {
                     INGRESS_RECORD_PUT,
                     &data,
                 )?;
-                let _ = write_ingress_state(
-                    &spill_state_dir,
-                    segment_id,
-                    state.spill_seq.load(Ordering::Relaxed),
-                );
                 (seq, created_unix_ms, segment_id, offset)
             };
 
@@ -5678,6 +5817,12 @@ impl StudioVfs {
                 .write_backpressure_wait_ms
                 .load(Ordering::Relaxed),
             write_backpressure_events: self.state.write_backpressure_events.load(Ordering::Relaxed),
+            fast_backpressure_wait_ms: self.state.fast_backpressure_wait_ms.load(Ordering::Relaxed),
+            fast_backpressure_events: self.state.fast_backpressure_events.load(Ordering::Relaxed),
+            fast_backpressure_stall_max_ms: self
+                .state
+                .fast_backpressure_stall_max_ms
+                .load(Ordering::Relaxed),
             forced_spill_blocks: self.state.forced_spill_blocks.load(Ordering::Relaxed),
             drained_mem_blocks: self.state.drained_mem_blocks.load(Ordering::Relaxed),
             drained_mem_bytes: self.state.drained_mem_bytes.load(Ordering::Relaxed),
@@ -5726,17 +5871,27 @@ impl StudioVfs {
     pub fn ingress_pressure_for(&self, next_bytes: usize) -> VfsIngressPressure {
         let dirty_mem_bytes = self.state.dirty_bytes.load(Ordering::Relaxed);
         let spill_bytes = self.state.dirty_spill_bytes.load(Ordering::Relaxed);
-        // Prefer spill once spill accounting is already in use, even for tiny writes,
-        // so we do not oscillate between spill and DirtyMem after RAM capacity was
-        // exhausted once in the current process lifetime.
-        let prefer_dirty_mem =
-            spill_bytes == 0 && dirty_mem_bytes.saturating_add(next_bytes) <= self.max_dirty_bytes;
-        let lane = if prefer_dirty_mem {
-            VfsIngressLane::DirtyMem
-        } else if spill_bytes.saturating_add(next_bytes) <= self.max_spill_bytes {
-            VfsIngressLane::Spill
+        let durable_mode = self.durable_cache_safety_mode();
+        let lane = if !durable_mode {
+            let dirty_fits = dirty_mem_bytes.saturating_add(next_bytes) <= self.max_dirty_bytes;
+            if dirty_fits || dirty_mem_bytes == 0 {
+                VfsIngressLane::DirtyMem
+            } else {
+                VfsIngressLane::Backpressure
+            }
         } else {
-            VfsIngressLane::Backpressure
+            // Prefer spill once spill accounting is already in use, even for tiny writes,
+            // so we do not oscillate between spill and DirtyMem after RAM capacity was
+            // exhausted once in the current process lifetime.
+            let dirty_fits = dirty_mem_bytes.saturating_add(next_bytes) <= self.max_dirty_bytes;
+            let prefer_dirty_mem = dirty_fits && spill_bytes == 0;
+            if prefer_dirty_mem {
+                VfsIngressLane::DirtyMem
+            } else if spill_bytes.saturating_add(next_bytes) <= self.max_spill_bytes {
+                VfsIngressLane::Spill
+            } else {
+                VfsIngressLane::Backpressure
+            }
         };
 
         VfsIngressPressure {
@@ -8364,6 +8519,9 @@ impl StudioVfs {
                     checkpoint_live_segments = ingress.checkpoint_live_segments,
                     write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
                     write_backpressure_events = ingress.write_backpressure_events,
+                    fast_backpressure_wait_ms = ingress.fast_backpressure_wait_ms,
+                    fast_backpressure_events = ingress.fast_backpressure_events,
+                    fast_backpressure_stall_max_ms = ingress.fast_backpressure_stall_max_ms,
                     ingress_append_ops = ingress_append.ops,
                     ingress_append_bytes = ingress_append.bytes,
                     ingress_append_total_latency_ns = ingress_append.total_latency_ns,
@@ -9054,24 +9212,31 @@ impl StudioVfs {
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: drain complete"
         );
-        let state = self.state.clone();
-        let ingress_checkpoint_dir = self.ingress_checkpoint_dir.clone();
-        let ingress_segment_dir = self.ingress_segment_dir.clone();
-        let ingress_spill_dir = self.ingress_spill_dir.clone();
-        if let Err(e) = run_blocking(move || {
-            Self::persist_ingress_recovery_state_owned(
-                state,
-                ingress_checkpoint_dir,
-                ingress_segment_dir,
-                ingress_spill_dir,
-            )
-        })
-        .await
-        {
-            self.state
-                .ingress_checkpoint_failures
-                .fetch_add(1, Ordering::Relaxed);
-            warn!("VFS shutdown: ingress recovery state persist failed: {}", e);
+        if self.durable_cache_safety_mode() {
+            let state = self.state.clone();
+            let ingress_checkpoint_dir = self.ingress_checkpoint_dir.clone();
+            let ingress_segment_dir = self.ingress_segment_dir.clone();
+            let ingress_spill_dir = self.ingress_spill_dir.clone();
+            if let Err(e) = run_blocking(move || {
+                Self::persist_ingress_recovery_state_owned(
+                    state,
+                    ingress_checkpoint_dir,
+                    ingress_segment_dir,
+                    ingress_spill_dir,
+                )
+            })
+            .await
+            {
+                self.state
+                    .ingress_checkpoint_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!("VFS shutdown: ingress recovery state persist failed: {}", e);
+            }
+        } else if let Err(e) = reset_ingress_artifacts_for_fast_mode(&self.ingress_spill_dir) {
+            warn!(
+                "VFS shutdown: failed to self-heal ingress artifacts in fast mode: {}",
+                e
+            );
         }
 
         // Phase 3: wait for uploads to drain, reconcile already-uploaded blocks.
@@ -10501,6 +10666,45 @@ mod tests {
         assert_eq!(total_bytes, "payload".len());
         assert_eq!(next_seq, 10);
         assert_eq!(active_segment_id, 2);
+    }
+
+    #[test]
+    fn test_vfs_config_defaults_to_fast_cache_safety_mode() {
+        assert_eq!(
+            VfsConfig::default().cache_safety_mode,
+            CacheSafetyMode::Fast
+        );
+    }
+
+    #[test]
+    fn test_reset_ingress_artifacts_for_fast_mode_cleans_recovery_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill_dir = dir.path();
+        let segment_dir = spill_dir.join("segments");
+        let checkpoint_dir = spill_dir.join("checkpoints");
+
+        append_ingress_record(
+            &segment_dir,
+            1,
+            (7, 1),
+            1,
+            42,
+            INGRESS_RECORD_PUT,
+            b"payload",
+        )
+        .unwrap();
+        write_ingress_state(spill_dir, 1, 2).unwrap();
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(checkpoint_dir.join("latest.json"), br#"{"version":1}"#).unwrap();
+        std::fs::write(spill_dir.join("legacy.spill"), b"legacy").unwrap();
+
+        reset_ingress_artifacts_for_fast_mode(spill_dir).unwrap();
+
+        assert!(segment_dir.exists());
+        assert!(checkpoint_dir.exists());
+        assert!(list_ingress_segment_files(&segment_dir).unwrap().is_empty());
+        assert!(!ingress_state_path(spill_dir).exists());
+        assert!(!spill_dir.join("legacy.spill").exists());
     }
 
     #[test]

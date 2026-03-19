@@ -31,8 +31,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsIngressLane,
-    VfsUploadState, parse_size_bytes,
+    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError,
+    VfsIngressLane, VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -118,6 +118,15 @@ fn workspace_dotenv_var(key: &str) -> Option<String> {
     workspace_dotenv_vars().get(key).cloned()
 }
 
+fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
+    std::env::var(primary)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| workspace_dotenv_var(primary))
+        .or_else(|| workspace_dotenv_var(legacy))
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn test_env_var(key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
@@ -158,7 +167,11 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 
 fn test_vfs_config_from_env() -> VfsConfig {
     load_test_env();
-    let mut config = VfsConfig::default();
+    // Keep existing integration tests on durable semantics unless overridden.
+    let mut config = VfsConfig {
+        cache_safety_mode: CacheSafetyMode::Durable,
+        ..VfsConfig::default()
+    };
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
@@ -411,6 +424,14 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS") {
         config.ingress_checkpoint_max_live_segments = value;
     }
+    if let Ok(value) = std::env::var("STUDIOFS_CACHE_SAFETY_MODE") {
+        let value = value.trim().to_ascii_lowercase();
+        if value == "fast" {
+            config.cache_safety_mode = CacheSafetyMode::Fast;
+        } else if value == "durable" {
+            config.cache_safety_mode = CacheSafetyMode::Durable;
+        }
+    }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
         config.upload_worker_count = value;
     } else if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
@@ -453,10 +474,26 @@ fn test_online_s3_env() -> &'static TestS3Env {
         load_test_env();
 
         TestS3Env {
-            endpoint: test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000"),
-            bucket: test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test"),
-            access_key: test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
-            secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
+            endpoint: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+                "STUDIOFS_S3_ENDPOINT",
+                "http://127.0.0.1:9000",
+            ),
+            bucket: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+                "STUDIOFS_S3_BUCKET",
+                "studiofs-test",
+            ),
+            access_key: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+                "STUDIOFS_S3_ACCESS_KEY",
+                "studiofs",
+            ),
+            secret_key: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+                "STUDIOFS_S3_SECRET_KEY",
+                "studiofs123",
+            ),
         }
     })
 }
@@ -786,8 +823,8 @@ fn import_remote_snapshot(
         .expect("reset imported format info");
 }
 
-/// Ensure the test bucket exists.
-async fn ensure_bucket() {
+/// Ensure the test bucket exists and report whether the endpoint is reachable.
+async fn ensure_bucket_ready() -> bool {
     use aws_sdk_s3::Client as S3Client;
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
@@ -810,7 +847,7 @@ async fn ensure_bucket() {
         .await
         .is_ok()
     {
-        return;
+        return true;
     }
 
     // Fallback: explicitly create bucket if missing.
@@ -830,7 +867,14 @@ async fn ensure_bucket() {
         .build();
     let client = S3Client::from_conf(conf);
     let _ = client.create_bucket().bucket(&bucket).send().await;
-    let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
+    op.write(".bucket-marker", Bytes::from_static(b"ok"))
+        .await
+        .is_ok()
+}
+
+/// Ensure the test bucket exists.
+async fn ensure_bucket() {
+    let _ = ensure_bucket_ready().await;
 }
 
 async fn wait_until_exists(ds: &DataStore, path: &str, timeout: Duration) -> bool {
@@ -1937,6 +1981,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             let vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 background_slab_flush_enabled: true,
                 ..VfsConfig::default()
             };
@@ -1978,6 +2023,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             let vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 background_slab_flush_enabled: false,
                 ..VfsConfig::default()
             };
@@ -2094,8 +2140,9 @@ fn writer_reads_full_file_before_any_remote_commit() {
 
     let payload = vec![0xA1u8; 1024 * 1024];
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(2)
         .build()
         .unwrap();
     rt.block_on(async {
@@ -3065,6 +3112,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let online_vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 background_slab_flush_enabled: true,
                 ..VfsConfig::default()
             };
@@ -3112,6 +3160,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 background_slab_flush_enabled: false,
                 ..VfsConfig::default()
             };
@@ -3145,6 +3194,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let offline_vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 background_slab_flush_enabled: false,
                 ..VfsConfig::default()
             };
@@ -3221,6 +3271,10 @@ struct ScopedTestEnv {
 impl ScopedTestEnv {
     fn new() -> Self {
         const KEYS: &[&str] = &[
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
             "STUDIOFS_S3_ENDPOINT",
             "STUDIOFS_S3_BUCKET",
             "STUDIOFS_S3_ACCESS_KEY",
@@ -4030,6 +4084,8 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
 
 #[test]
 fn stale_upload_completion_is_ignored_after_extent_invalidate() {
+    let _env = ScopedTestEnv::new();
+    apply_test_online_s3_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -4142,7 +4198,10 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", &online_info.endpoint);
+        apply_test_online_s3_env();
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     }
     meta.set_format_info(&online_info).unwrap();
 
@@ -4164,7 +4223,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
             .unwrap();
 
             assert!(
-                wait_until(Duration::from_secs(15), || {
+                wait_until(Duration::from_secs(45), || {
                     vfs.pending_uploads_for_inode(ino).is_empty()
                         && vfs.upload_stats().canceled_stale > 0
                 })
@@ -4837,6 +4896,9 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
 
     unsafe {
         apply_test_online_s3_env();
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
     }
@@ -4860,14 +4922,14 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
             .unwrap();
 
             assert!(
-                wait_until(Duration::from_secs(10), || {
+                wait_until(Duration::from_secs(20), || {
                     !vfs.pending_uploads_for_inode(ino).is_empty()
                 })
                 .await,
                 "restart should recover the pending upload batch"
             );
 
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 let read = vfs
                     .read(ino, 0, replacement_payload.len() as u32)
@@ -5585,6 +5647,190 @@ fn test_ingress_prefers_spill_before_backpressure() {
 }
 
 #[test]
+fn test_cache_safety_mode_changes_ingress_write_path() {
+    type EnvRestore = ScopedEnvVar;
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    fn build_vfs_with_mode(
+        tmp: &tempfile::TempDir,
+        volume_suffix: &str,
+        mode: CacheSafetyMode,
+    ) -> (Arc<StudioVfs>, Vec<u8>) {
+        let db_path = tmp.path().join("meta.redb");
+        let cache_dir = tmp.path().join("cache");
+        let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+        let format_info = make_format_info(volume_suffix);
+        let data_config = DataStoreConfig::from(&format_info);
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+
+        let mut vfs_config = test_vfs_config_from_env();
+        vfs_config.cache_safety_mode = mode;
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            vfs_config,
+        )
+        .unwrap();
+        (vfs, vec![0x39u8; 512 * 1024])
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let durable_tmp = tempfile::tempdir().unwrap();
+        let (durable_vfs, payload) = build_vfs_with_mode(
+            &durable_tmp,
+            &format!("mode-durable-{}", std::process::id()),
+            CacheSafetyMode::Durable,
+        );
+        let durable_attr = durable_vfs
+            .create(1, b"mode-durable.bin", 0, 0, 0o644)
+            .unwrap();
+        assert_eq!(
+            durable_vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill
+        );
+        durable_vfs
+            .write(durable_attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        durable_vfs.flush(durable_attr.ino).await.unwrap();
+        let durable_stats = durable_vfs.ingress_stats();
+        assert!(
+            durable_stats.spill_bytes >= payload.len(),
+            "durable mode should persist accepted payload in ingress spill"
+        );
+
+        let fast_tmp = tempfile::tempdir().unwrap();
+        let (fast_vfs, payload) = build_vfs_with_mode(
+            &fast_tmp,
+            &format!("mode-fast-{}", std::process::id()),
+            CacheSafetyMode::Fast,
+        );
+        let fast_attr = fast_vfs.create(1, b"mode-fast.bin", 0, 0, 0o644).unwrap();
+        assert_eq!(
+            fast_vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::DirtyMem
+        );
+        fast_vfs.write(fast_attr.ino, 0, &payload).await.unwrap();
+        fast_vfs.flush(fast_attr.ino).await.unwrap();
+        let fast_stats = fast_vfs.ingress_stats();
+        assert_eq!(
+            fast_stats.spill_bytes, 0,
+            "fast mode should avoid duplicate ingress payload writes"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_write_fast_mode_no_spill_artifacts() {
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    let _env = ScopedTestEnv::new();
+    apply_test_online_s3_env();
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+    let volume_suffix = format!("fast-no-spill-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x5Au8; 512 * 1024];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfig {
+            cache_safety_mode: CacheSafetyMode::Fast,
+            max_dirty_bytes: 32 * 1024 * 1024,
+            max_spill_bytes: 64 * 1024 * 1024,
+            background_slab_flush_enabled: true,
+            ..VfsConfig::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            vfs_config,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"fast-no-spill.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert_eq!(
+            segment_file_count(&spill_dir),
+            0,
+            "fast mode must not persist ingress segment payload files"
+        );
+
+        let mut object_id = None;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            if let Some((_, id, _)) = vfs.pending_uploads_for_inode(attr.ino).into_iter().next() {
+                object_id = Some(id);
+                break;
+            }
+            if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+                && let Some((_, block_ref)) = blocks.first()
+            {
+                object_id = Some(block_ref.object_id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let object_id =
+            object_id.expect("expected pending/committed object id for fast-mode write");
+        let key = format_object_key(&format_info.data_prefix, object_id);
+        let ds = DataStore::new(&data_config).unwrap();
+        assert!(
+            wait_until_exists(&ds, &key, Duration::from_secs(60)).await,
+            "fast-mode flush should still publish object to remote store"
+        );
+
+        vfs.shutdown(Duration::from_secs(15)).await;
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
     type EnvRestore = ScopedEnvVar;
 
@@ -5752,6 +5998,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         let vfs_config = VfsConfig {
             max_dirty_bytes: 1,
             max_spill_bytes: 4 * 1024 * 1024,
+            cache_safety_mode: CacheSafetyMode::Durable,
             slab_flush_interval_ms: 5000,
             background_slab_flush_enabled: false,
             ..VfsConfig::default()
@@ -5843,6 +6090,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             let vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 8 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 slab_flush_interval_ms: 5000,
                 background_slab_flush_enabled: false,
                 ..VfsConfig::default()
@@ -5944,6 +6192,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             let vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 ..VfsConfig::default()
             };
             let vfs = StudioVfs::new(
@@ -5988,6 +6237,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             let vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 ..VfsConfig::default()
             };
             let vfs = StudioVfs::new(

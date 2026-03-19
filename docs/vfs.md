@@ -78,10 +78,22 @@ data arrives
 ```
 pending_blocks for this inode
   │
-  ├─ Append accepted records to ingress segments (durable local accept)
+  ├─ `cache_safety_mode=durable`: append accepted records to ingress segments
+  │   (durable local accept + startup replay)
+  ├─ `cache_safety_mode=fast`: keep accepted payloads in RAM only and avoid
+  │   duplicate ingress payload writes
   ├─ Update live ingress index / pending incarnation state
   └─ Notify background pipeline
 ```
+
+`cache_safety_mode` is configurable via VFS config / `studiofs settings --cache-safety-mode`
+or environment variable `STUDIOFS_CACHE_SAFETY_MODE=fast|durable`.
+
+Crash semantics note:
+- `fast` mode does not keep WAL-backed accepted payloads. After abrupt termination
+  (`SIGKILL`/process crash), very recent accepted writes that were not yet
+  materialized can be lost (typically the last materializer window).
+- `durable` mode keeps WAL/checkpoint-backed restart recovery for accepted ingress.
 
 ### 3. Background Materializer (`drain_dirty_mem` lineage)
 

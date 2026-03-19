@@ -55,7 +55,9 @@ Core invariants:
 1. App calls a VFS mutation.
 2. StudioFS updates local metadata in `redb`.
 3. File payload enters local write staging (`pending_blocks`, `dirty_mem`, ingress live index backed by `ingress_spill/segments/`, cache).
-4. `flush(ino)`/`close(ino)` appends accepted records to ingress and makes local accepted view durable.
+4. `flush(ino)`/`close(ino)` applies the configured cache safety policy:
+   - `durable`: appends accepted records to ingress (durable local accept path),
+   - `fast`: skips ingress payload persistence and relies on best-effort self-heal on restart.
 5. Background workers materialize and upload accepted records.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
@@ -67,7 +69,9 @@ Core invariants:
 1. Split incoming data into blocks.
 2. Stage bytes locally in memory and, if needed, NVMe spill.
 3. Track staged data in pending incarnation state.
-4. On `flush()` / `close()`, append records to ingress as accepted local data.
+4. On `flush()` / `close()`, ingress behavior depends on `cache_safety_mode`:
+   - `durable` appends accepted records,
+   - `fast` avoids duplicate ingress payload writes.
 5. Background materialization builds and updates pending manifests as needed.
 6. On publish, update remote committed incarnation and `committed_size`.
 
@@ -79,7 +83,7 @@ still observe committed incarnations as they become published.
 Reads prefer local state in this order:
 1. `pending_blocks`
 2. `dirty_mem`
-3. ingress live index (`ingress_spill/segments/`)
+3. ingress live index (`ingress_spill/segments/`, `durable` mode)
 4. cache (L1/L2)
 5. S3 fetch
 
