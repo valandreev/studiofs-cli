@@ -155,10 +155,27 @@ struct UploadQueueStatsReport {
 }
 
 #[derive(Debug, Serialize)]
+struct L2CommitSchedulerStatsReport {
+    queue_depth: usize,
+    queue_depth_peak: usize,
+    queue_capacity: usize,
+    configured_workers: usize,
+    active_workers: usize,
+    active_workers_peak: usize,
+    submitted: u64,
+    completed: u64,
+    failed: u64,
+    backpressure_events: u64,
+    backpressure_wait_avg_ms: f64,
+    backpressure_wait_max_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct CachePipelineReport {
     l2_read: IoStatsReport,
     l2_write: IoStatsReport,
     materialize_batches: MaterializeBatchStatsReport,
+    l2_commit_scheduler: L2CommitSchedulerStatsReport,
     upload_queue: UploadQueueStatsReport,
     blocking_tasks: BlockingTaskStatsReport,
 }
@@ -250,6 +267,33 @@ impl From<studiofs_cache::metrics::UploadQueueStatsSnapshot> for UploadQueueStat
     }
 }
 
+impl From<studiofs_cache::metrics::L2CommitSchedulerStatsSnapshot>
+    for L2CommitSchedulerStatsReport
+{
+    fn from(snapshot: studiofs_cache::metrics::L2CommitSchedulerStatsSnapshot) -> Self {
+        Self {
+            queue_depth: snapshot.queue_depth,
+            queue_depth_peak: snapshot.queue_depth_peak,
+            queue_capacity: snapshot.queue_capacity,
+            configured_workers: snapshot.configured_workers,
+            active_workers: snapshot.active_workers,
+            active_workers_peak: snapshot.active_workers_peak,
+            submitted: snapshot.submitted,
+            completed: snapshot.completed,
+            failed: snapshot.failed,
+            backpressure_events: snapshot.backpressure_events,
+            backpressure_wait_avg_ms: if snapshot.backpressure_events == 0 {
+                0.0
+            } else {
+                snapshot.backpressure_wait_total_ns as f64
+                    / snapshot.backpressure_events as f64
+                    / 1_000_000.0
+            },
+            backpressure_wait_max_ms: snapshot.backpressure_wait_max_ns as f64 / 1_000_000.0,
+        }
+    }
+}
+
 impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
     fn from(snapshot: CachePipelineMetricsSnapshot) -> Self {
         let to_report = |stats: &studiofs_cache::metrics::BlockingTaskStatsSnapshot| {
@@ -288,6 +332,7 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
             l2_read: snapshot.l2_read.into(),
             l2_write: snapshot.l2_write.into(),
             materialize_batches: snapshot.materialize_batches.into(),
+            l2_commit_scheduler: snapshot.l2_commit_scheduler.into(),
             upload_queue: snapshot.upload_queue.into(),
             blocking_tasks: BlockingTaskStatsReport {
                 total: to_report(&snapshot.blocking_tasks.total),
@@ -1581,6 +1626,22 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         );
         let _ = writeln!(
             &mut out,
+            "L2 commit scheduler: queue {} / {} (peak {}), workers active {} / {} (peak {}), submitted {}, completed {}, failed {}, backpressure {} (avg {}, max {})",
+            pipeline.l2_commit_scheduler.queue_depth,
+            pipeline.l2_commit_scheduler.queue_capacity,
+            pipeline.l2_commit_scheduler.queue_depth_peak,
+            pipeline.l2_commit_scheduler.active_workers,
+            pipeline.l2_commit_scheduler.configured_workers,
+            pipeline.l2_commit_scheduler.active_workers_peak,
+            pipeline.l2_commit_scheduler.submitted,
+            pipeline.l2_commit_scheduler.completed,
+            pipeline.l2_commit_scheduler.failed,
+            pipeline.l2_commit_scheduler.backpressure_events,
+            format_duration_ms(pipeline.l2_commit_scheduler.backpressure_wait_avg_ms),
+            format_duration_ms(pipeline.l2_commit_scheduler.backpressure_wait_max_ms),
+        );
+        let _ = writeln!(
+            &mut out,
             "Blocking tasks: active {} (peak {}), submitted {}, started {}, completed {}, queue wait avg {}, max {}, exec avg {}, max {}",
             pipeline.blocking_tasks.total.active,
             pipeline.blocking_tasks.total.active_peak,
@@ -1768,6 +1829,20 @@ mod tests {
                         bucket_upper_bounds_ns: vec![50_000],
                         bucket_counts: vec![4],
                     },
+                },
+                l2_commit_scheduler: L2CommitSchedulerStatsReport {
+                    queue_depth: 0,
+                    queue_depth_peak: 8,
+                    queue_capacity: 512,
+                    configured_workers: 4,
+                    active_workers: 0,
+                    active_workers_peak: 4,
+                    submitted: 16,
+                    completed: 16,
+                    failed: 0,
+                    backpressure_events: 2,
+                    backpressure_wait_avg_ms: 0.4,
+                    backpressure_wait_max_ms: 1.3,
                 },
                 upload_queue: UploadQueueStatsReport {
                     pending_depth: 0,

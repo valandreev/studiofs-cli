@@ -52,6 +52,8 @@ the capacity limit is reached.
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Max prefetch depth |
 | `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
+| `l2_commit_workers` | 4 | Bounded L2 commit scheduler workers |
+| `l2_commit_queue_capacity` | 512 | Bounded L2 commit queue capacity |
 
 Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on
@@ -95,8 +97,8 @@ dirty_mem + ingress_spill
   │    ├─ cache.stage_l1(id, data)
   │    └─ meta.flush_blocks_batch()   ← local pending refs only
   │
-  ├─ Phase 2: L2 commit (parallel)
-  │    └─ cache.commit_l2_batch(blocks) — parallel NVMe writes
+  ├─ Phase 2: L2 commit scheduling (bounded)
+  │    └─ cache.commit_l2_batch(blocks) — bounded queue + fixed worker pool
   │
   ├─ Phase 3: Upload enqueue for accepted incarnation extents
   │    └─ cache.submit_upload(..., content_epoch) for each

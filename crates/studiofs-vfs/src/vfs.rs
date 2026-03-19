@@ -44,7 +44,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig};
+use studiofs_cache::block_cache::{
+    BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
+};
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key};
@@ -741,6 +743,10 @@ pub struct VfsConfig {
     pub fetch_prefetch_acquire_wait_ms: u64,
     /// Materializer batch limit for each drain cycle.
     pub max_drain_batch: usize,
+    /// Number of L2 commit scheduler workers.
+    pub l2_commit_workers: usize,
+    /// Queue capacity for pending L2 commit jobs.
+    pub l2_commit_queue_capacity: usize,
     /// Time to wait for remote visibility before publishing a manifest.
     pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
@@ -831,6 +837,8 @@ impl Default for VfsConfig {
             fetch_prefetch_reserve: 0,
             fetch_prefetch_acquire_wait_ms: 75,
             max_drain_batch: 1024,
+            l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
+            l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
             publish_visibility_timeout_secs: 30,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: 64,
@@ -3619,7 +3627,9 @@ impl StudioVfs {
             });
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
-            let cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
+            let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
+            cache_config.l2_commit_workers = config.l2_commit_workers.max(1);
+            cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity.max(1);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
             block_cache.spawn_background_tasks();
 
@@ -8375,6 +8385,19 @@ impl StudioVfs {
                     cache_l2_write_total_latency_ns = cache_pipeline.l2_write.total_latency_ns,
                     cache_l2_write_max_latency_ns = cache_pipeline.l2_write.max_latency_ns,
                     cache_l2_write_latency_histogram = ?cache_pipeline.l2_write.latency_histogram.bucket_counts,
+                    cache_l2_commit_queue_depth = cache_pipeline.l2_commit_scheduler.queue_depth,
+                    cache_l2_commit_queue_depth_peak = cache_pipeline.l2_commit_scheduler.queue_depth_peak,
+                    cache_l2_commit_queue_capacity = cache_pipeline.l2_commit_scheduler.queue_capacity,
+                    cache_l2_commit_workers_configured = cache_pipeline.l2_commit_scheduler.configured_workers,
+                    cache_l2_commit_workers_active = cache_pipeline.l2_commit_scheduler.active_workers,
+                    cache_l2_commit_workers_active_peak = cache_pipeline.l2_commit_scheduler.active_workers_peak,
+                    cache_l2_commit_submitted = cache_pipeline.l2_commit_scheduler.submitted,
+                    cache_l2_commit_completed = cache_pipeline.l2_commit_scheduler.completed,
+                    cache_l2_commit_failed = cache_pipeline.l2_commit_scheduler.failed,
+                    cache_l2_commit_backpressure_events = cache_pipeline.l2_commit_scheduler.backpressure_events,
+                    cache_l2_commit_backpressure_wait_total_ns = cache_pipeline.l2_commit_scheduler.backpressure_wait_total_ns,
+                    cache_l2_commit_backpressure_wait_max_ns = cache_pipeline.l2_commit_scheduler.backpressure_wait_max_ns,
+                    cache_l2_commit_backpressure_wait_histogram = ?cache_pipeline.l2_commit_scheduler.backpressure_wait_histogram.bucket_counts,
                     upload_queue_depth = cache_pipeline.upload_queue.pending_depth,
                     upload_queue_depth_peak = cache_pipeline.upload_queue.pending_depth_peak,
                     upload_queue_submitted = cache_pipeline.upload_queue.submitted,

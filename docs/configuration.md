@@ -312,6 +312,8 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
+| `STUDIOFS_L2_COMMIT_WORKERS` | `4` | Number of bounded L2 commit scheduler workers |
+| `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `512` | L2 commit queue capacity before enqueue backpressure |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |
@@ -365,6 +367,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - ingress append throughput (`ops`, `bytes`) and latency histogram
 - materialize batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache L2 read/write throughput and latency histograms
+- L2 commit scheduler counters (`cache_l2_commit_queue_depth`, `cache_l2_commit_queue_depth_peak`, `cache_l2_commit_workers_active`, `cache_l2_commit_workers_active_peak`, `cache_l2_commit_backpressure_events`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.

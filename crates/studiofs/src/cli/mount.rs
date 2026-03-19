@@ -153,6 +153,11 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         prefetch_pause_on_neterr_ms
     );
     set_usize!("STUDIOFS_MAX_DRAIN_BATCH", max_drain_batch);
+    set_usize!("STUDIOFS_L2_COMMIT_WORKERS", l2_commit_workers);
+    set_usize!(
+        "STUDIOFS_L2_COMMIT_QUEUE_CAPACITY",
+        l2_commit_queue_capacity
+    );
     set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
     set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
     set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);

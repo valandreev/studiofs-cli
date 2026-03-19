@@ -205,6 +205,8 @@ ENV TUNING:
   STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background slab flushing (default: 0).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
   STUDIOFS_MAX_DRAIN_BATCH          Max staged blocks drained per flusher cycle (default: 1024).
+  STUDIOFS_L2_COMMIT_WORKERS        L2 commit scheduler workers (default: 4).
+  STUDIOFS_L2_COMMIT_QUEUE_CAPACITY L2 commit scheduler queue depth before backpressure (default: 512).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).
   STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES  Wake checkpointing after this much uncheckpointed append churn (default: 64MiB).
