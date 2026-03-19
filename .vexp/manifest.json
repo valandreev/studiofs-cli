@@ -52,20 +52,20 @@
     "crates/studiofs/src/cli/snapshot.rs": "212a5661b3755a5bc39c362a5397c4f61874cb50ae0bf3599f3ed89964dbea69",
     "crates/studiofs/src/cli/status.rs": "283e0d8b18e3794b92e9948ab56fc1b2be066c54b277a81b53799874ce80a41c",
     "crates/studiofs/src/cli/test.rs": "516f9f37d207e0971cfc7b4c8789c14defaa139fc895caf71aa2c49be010b95a",
-    "crates/studiofs/src/cli/test_cache.rs": "8a225bbb8320ffaff92c8a81cc769a299a466dfd8832d97e41f2ad0bbdb62082",
+    "crates/studiofs/src/cli/test_cache.rs": "f725edf99a10f29ebf1828500ba7c1a26229a02f979267a6f39851add4addc8e",
     "crates/studiofs/src/cli/umount.rs": "bfa349995480e86601853aee13d3e80752ba8676027efae2b68d73e3f2ed42ea",
     "crates/studiofs/src/cli/utils.rs": "6525c50dc9f3f90f2410129b5febe93589a574288881825687fc6e1114a8bf5c",
-    "crates/studiofs/src/main.rs": "4e45ac16ee71966441b3c52e8f7f1130f70866e961aa0383e146dbbcdac86f3d",
+    "crates/studiofs/src/main.rs": "cb65fb8b3f5b71b3cd5cb6918dfa879a0cf1b4c5de30f07be5437e7c07bab10d",
     "crates/studiofs/tests/destroy_test.rs": "b0fc275c9b20aa5ecc87f6e1c69f7396f03cdc5675f5d48fbfaf55e892f9caa3",
     "crates/studiofs/tests/dump_load_test.rs": "cbe284436e3245b154294ea47bfc62592dd661b4d8d917ebca1769e81435aa86"
   },
-  "indexed_at_commit": "c4c8ffcfda56a63bbb976d95e4d2ee706c4f5259",
-  "indexed_at_timestamp": "2026-03-19T07:53:56.708169900+00:00",
+  "indexed_at_commit": "2bc5528f95742d3cdb159267eb177bd1c0e9109f",
+  "indexed_at_timestamp": "2026-03-19T08:44:38.266996+00:00",
   "schema_version": 3,
   "stats": {
-    "total_edges": 4208,
+    "total_edges": 4236,
     "total_files": 58,
-    "total_nodes": 2020
+    "total_nodes": 2036
   },
   "vexp_version": "1.2.28"
 }
