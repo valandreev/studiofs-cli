@@ -22,21 +22,10 @@ use studiofs_vfs::parse_size_bytes;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tokio::time::sleep;
 
 const DEFAULT_DIRECT_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_E2E_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LATENCY_SAMPLES: usize = 200_000;
-
-#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
-pub enum TestCacheMode {
-    /// Write/read blocks directly through `studiofs-cache` L2 API.
-    #[value(name = "direct-l2")]
-    DirectL2,
-    /// Mount a volume and run copy/read workloads through the filesystem path.
-    #[value(name = "e2e")]
-    EndToEnd,
-}
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -50,8 +39,7 @@ pub enum TestCacheAccessPattern {
 
 #[derive(Debug)]
 struct TestCacheParams {
-    cache_dir: PathBuf,
-    mode: TestCacheMode,
+    target: PathBuf,
     block_size: u64,
     read_size: u64,
     concurrency: usize,
@@ -60,8 +48,24 @@ struct TestCacheParams {
     small_file_share: u8,
     l1_limit: u64,
     l2_limit: u64,
-    volume: Option<String>,
-    mount_point: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveMount {
+    mount_point: PathBuf,
+    volume: String,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedRunMode {
+    DirectL2 {
+        cache_dir: PathBuf,
+    },
+    MountedE2E {
+        volume: String,
+        mount_point: PathBuf,
+        work_root: PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +95,8 @@ struct BenchmarkReport {
     small_file_share: u8,
     l1_limit: u64,
     l2_limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     volume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -721,45 +727,139 @@ fn clear_mount_artifacts(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
 }
 
-async fn wait_for_pid_file(
-    mount_point: &Path,
-    expected_volume: &str,
-    timeout: Duration,
-) -> Result<(u32, String)> {
-    let mp = mount_point
-        .to_str()
-        .context("mount point is not valid UTF-8")?
-        .to_string();
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "timeout waiting for mount point '{}', expected volume '{}'",
-                mp,
-                expected_volume
-            ));
-        }
-
-        if let Ok((pid, mounted_mp, mounted_vol)) = super::utils::read_pid_file(&mp) {
-            if !super::utils::is_process_running(pid) {
-                let _ = super::utils::remove_pid_file(&mounted_mp);
-            } else if mounted_vol.is_empty() || mounted_vol == expected_volume {
-                return Ok((pid, mounted_mp));
-            }
-        }
-
-        sleep(Duration::from_millis(100)).await;
+fn normalize_path_for_compare(path: &Path) -> Option<String> {
+    let raw = path.to_str()?;
+    #[cfg(windows)]
+    {
+        Some(
+            super::utils::normalize_mount_point(raw)
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Some(raw.trim_end_matches('/').to_string())
     }
 }
 
-async fn run_direct(params: &TestCacheParams) -> Result<BenchmarkReport> {
+fn cleanup_stale_mounts() -> Result<()> {
+    let mounts_dir = super::utils::get_mounts_dir()?;
+    for entry in std::fs::read_dir(&mounts_dir)
+        .with_context(|| format!("read mounts dir {}", mounts_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))?;
+        let Some(pid) = parsed.get("pid").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(mount_point) = parsed
+            .get("mount_point")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !super::utils::is_process_running(pid as u32) {
+            let _ = super::utils::remove_pid_file(mount_point);
+        }
+    }
+    Ok(())
+}
+
+fn is_path_under_mount(target: &Path, mount_point: &Path) -> bool {
+    let Some(target_norm) = normalize_path_for_compare(target) else {
+        return false;
+    };
+    let Some(mount_norm) = normalize_path_for_compare(mount_point) else {
+        return false;
+    };
+    target_norm == mount_norm
+        || target_norm
+            .strip_prefix(&mount_norm)
+            .is_some_and(|tail| tail.starts_with('\\') || tail.starts_with('/'))
+}
+
+fn active_mounts() -> Result<Vec<ActiveMount>> {
+    let mounts_dir = super::utils::get_mounts_dir()?;
+    let mut mounts = Vec::new();
+    for entry in std::fs::read_dir(&mounts_dir)
+        .with_context(|| format!("read mounts dir {}", mounts_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))?;
+        let Some(pid) = parsed.get("pid").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(mount_point) = parsed
+            .get("mount_point")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let volume = parsed
+            .get("volume")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !super::utils::is_process_running(pid as u32) {
+            continue;
+        }
+        mounts.push(ActiveMount {
+            mount_point: PathBuf::from(mount_point),
+            volume: volume.to_string(),
+        });
+    }
+    Ok(mounts)
+}
+
+fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
+    cleanup_stale_mounts()?;
+    let mut best: Option<ActiveMount> = None;
+    for mount in active_mounts()? {
+        if is_path_under_mount(target, &mount.mount_point) {
+            let keep = best.as_ref().is_none_or(|existing| {
+                mount.mount_point.components().count() > existing.mount_point.components().count()
+            });
+            if keep {
+                best = Some(mount);
+            }
+        }
+    }
+
+    if let Some(active) = best {
+        Ok(ResolvedRunMode::MountedE2E {
+            volume: active.volume,
+            mount_point: active.mount_point,
+            work_root: target.join(".studiofs-test-cache"),
+        })
+    } else {
+        Ok(ResolvedRunMode::DirectL2 {
+            cache_dir: target.to_path_buf(),
+        })
+    }
+}
+
+async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<BenchmarkReport> {
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let cache_config = BlockCacheConfig::new(&params.cache_dir, params.l1_limit, params.l2_limit);
+    let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit, params.l2_limit);
     let (cache, _rx) = BlockCache::open(cache_config)
-        .with_context(|| format!("open cache dir {}", params.cache_dir.display()))?;
+        .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
     let cache = Arc::new(cache);
 
     let work_sizes = build_work_sizes(
@@ -798,7 +898,7 @@ async fn run_direct(params: &TestCacheParams) -> Result<BenchmarkReport> {
 
     Ok(BenchmarkReport {
         mode: "direct-l2".to_string(),
-        cache_dir: params.cache_dir.display().to_string(),
+        cache_dir: cache_dir.display().to_string(),
         started_at,
         completed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         total_elapsed_ms,
@@ -815,54 +915,29 @@ async fn run_direct(params: &TestCacheParams) -> Result<BenchmarkReport> {
         l1_bytes: Some(cache_stats.l1_bytes),
         l2_bytes: Some(cache_stats.l2_bytes),
         cache_pipeline: Some(cache.cache_pipeline_metrics().into()),
+        work_root: None,
         writes: writes.to_report(total_elapsed_ms),
         reads: reads.to_report(total_elapsed_ms),
     })
 }
 
-async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
+async fn run_mounted_end_to_end(
+    params: &TestCacheParams,
+    volume: &str,
+    mount_point: &Path,
+    work_root: &Path,
+) -> Result<BenchmarkReport> {
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let volume = params
-        .volume
-        .as_deref()
-        .ok_or_else(|| anyhow!("--volume is required for e2e mode"))?;
-    let mount_point = params
-        .mount_point
-        .as_ref()
-        .ok_or_else(|| anyhow!("--mount-point is required for e2e mode"))?;
-    let mount_point = mount_point
-        .to_str()
-        .context("mount point is not valid UTF-8")?;
-    let mount_dir = Path::new(mount_point);
-
-    let meta_dir = super::utils::get_default_meta_dir(volume)?;
-    super::mount::run(
-        volume,
-        Some(mount_point),
-        &meta_dir,
-        Some(&params.cache_dir),
-        Some(&params.l2_limit.to_string()),
-        Some(&params.l1_limit.to_string()),
-        None,
-        false,
-        true,
-        None,
-    )?;
-
-    let (_pid, actual_mount_point) =
-        wait_for_pid_file(mount_dir, volume, Duration::from_secs(60)).await?;
-    let actual_mount_point = Path::new(&actual_mount_point).to_path_buf();
-    let work_root = actual_mount_point.join(".studiofs-test-cache");
     let benchmark_result = async {
-        clear_mount_artifacts(&work_root).context("prepare mount benchmark directory")?;
+        clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
 
         let files = build_file_worklist(
             DEFAULT_E2E_TOTAL_BYTES,
             params.block_size,
             params.read_size,
             params.small_file_share,
-            &work_root,
+            work_root,
         );
         if files.is_empty() {
             anyhow::bail!("nothing to benchmark");
@@ -883,11 +958,11 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
 
         let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
 
-        let _ = fs::remove_dir_all(&work_root).await;
+        let _ = fs::remove_dir_all(work_root).await;
 
         Ok::<_, anyhow::Error>(BenchmarkReport {
             mode: "e2e".to_string(),
-            cache_dir: params.cache_dir.display().to_string(),
+            cache_dir: params.target.display().to_string(),
             started_at,
             completed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             total_elapsed_ms,
@@ -899,8 +974,9 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
             small_file_share: params.small_file_share,
             l1_limit: params.l1_limit,
             l2_limit: params.l2_limit,
+            work_root: Some(work_root.display().to_string()),
             volume: Some(volume.to_string()),
-            mount_point: Some(actual_mount_point.display().to_string()),
+            mount_point: Some(mount_point.display().to_string()),
             l1_bytes: None,
             l2_bytes: None,
             cache_pipeline: None,
@@ -909,24 +985,14 @@ async fn run_end_to_end(params: &TestCacheParams) -> Result<BenchmarkReport> {
         })
     }
     .await;
-
-    let unmount_result = super::umount::run(
-        actual_mount_point
-            .to_str()
-            .context("mounted path is not valid UTF-8")?,
-    );
-    match (benchmark_result, unmount_result) {
-        (Ok(mut report), Ok(())) => {
+    match benchmark_result {
+        Ok(mut report) => {
             report.completed_at =
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             report.total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
             Ok(report)
         }
-        (Err(err), Ok(())) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(bench_err), Err(unmount_err)) => Err(anyhow!(
-            "benchmark failed: {bench_err}; additionally failed to unmount: {unmount_err}"
-        )),
+        Err(err) => Err(err),
     }
 }
 
@@ -987,8 +1053,7 @@ fn print_human_summary(report: &BenchmarkReport) {
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    cache_dir: PathBuf,
-    mode: TestCacheMode,
+    target: PathBuf,
     block_size: Option<String>,
     read_size: Option<String>,
     concurrency: usize,
@@ -997,8 +1062,6 @@ pub fn run(
     small_file_share: u8,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
-    volume: Option<String>,
-    mount_point: Option<PathBuf>,
 ) -> Result<()> {
     if io_depth == 0 {
         return Err(anyhow!("--io-depth must be >= 1"));
@@ -1033,8 +1096,7 @@ pub fn run(
     }
 
     let params = TestCacheParams {
-        cache_dir,
-        mode,
+        target: target.clone(),
         block_size,
         read_size,
         concurrency,
@@ -1043,18 +1105,57 @@ pub fn run(
         small_file_share,
         l1_limit,
         l2_limit,
-        volume,
-        mount_point,
     };
+
+    let resolved_mode = resolve_run_mode(&target)?;
 
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let report = rt.block_on(async {
-        match params.mode {
-            TestCacheMode::DirectL2 => run_direct(&params).await,
-            TestCacheMode::EndToEnd => run_end_to_end(&params).await,
+        match &resolved_mode {
+            ResolvedRunMode::DirectL2 { cache_dir } => run_direct(&params, cache_dir).await,
+            ResolvedRunMode::MountedE2E {
+                volume,
+                mount_point,
+                work_root,
+            } => run_mounted_end_to_end(&params, volume, mount_point, work_root).await,
         }
     })?;
 
     print_human_summary(&report);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_path_detection_handles_nested_paths() {
+        let mount = PathBuf::from("/mnt/studiofs");
+        let target = PathBuf::from("/mnt/studiofs/cache-bench");
+        assert!(is_path_under_mount(&target, &mount));
+    }
+
+    #[test]
+    fn mount_path_detection_rejects_sibling_paths() {
+        let mount = PathBuf::from("/mnt/studiofs");
+        let target = PathBuf::from("/mnt/studiofs-other/cache-bench");
+        assert!(!is_path_under_mount(&target, &mount));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_path_detection_normalizes_extended_drive_prefix() {
+        let mount = PathBuf::from(r"C:\StudioFS");
+        let target = PathBuf::from(r"\\?\C:\StudioFS\bench");
+        assert!(is_path_under_mount(&target, &mount));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_path_detection_normalizes_unc_prefix() {
+        let mount = PathBuf::from(r"\\server\share\studiofs");
+        let target = PathBuf::from(r"\\?\UNC\server\share\studiofs\bench");
+        assert!(is_path_under_mount(&target, &mount));
+    }
 }

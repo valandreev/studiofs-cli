@@ -129,8 +129,7 @@ Direct L2 benchmark (bypass VFS/mount):
 
 ```bash
 studiofs test-cache \
-  --cache-dir /tmp/studiofs-cache-bench \
-  --mode direct-l2 \
+  /tmp/studiofs-cache-bench \
   --block-size 8MB \
   --read-size 1MB \
   --concurrency 16 \
@@ -141,17 +140,19 @@ studiofs test-cache \
   --l2-limit 100GB
 ```
 
-End-to-end benchmark through mounted filesystem:
+End-to-end benchmark through an already mounted filesystem:
 
 ```bash
 studiofs test-cache \
-  --cache-dir /tmp/studiofs-cache-bench \
-  --mode e2e \
-  --volume myvolume \
-  --mount-point /mnt/studio
+  /mnt/studio/bench
 ```
 
 Notes:
+- If `<path>` is not inside an active StudioFS mount, benchmark runs in
+  `direct-l2` mode and uses `<path>` as cache dir.
+- If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
+  through that mounted process and writes temp workload files into
+  `<path>/.studiofs-test-cache`.
 - `direct-l2` JSON output includes a `cache_pipeline` section with:
   - `l2_read` / `l2_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics

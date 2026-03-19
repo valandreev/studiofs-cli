@@ -106,8 +106,7 @@ Quick benchmark example:
 
 ```bash
 studiofs test-cache \
-  --cache-dir /tmp/studiofs-cache-bench \
-  --mode direct-l2 \
+  /tmp/studiofs-cache-bench \
   --block-size 8MB \
   --read-size 1MB \
   --concurrency 16 \

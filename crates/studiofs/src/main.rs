@@ -560,13 +560,13 @@ WARNING: This action is irreversible.")]
 
     /// Run cache benchmarks (direct L2 and mounted end-to-end)
     TestCache {
-        /// Cache directory for the benchmark workspace.
-        #[arg(long)]
-        cache_dir: PathBuf,
-
-        /// Benchmark mode: `direct-l2` (bypass VFS) or `e2e` (through mount).
-        #[arg(long, value_enum, default_value_t = cli::test_cache::TestCacheMode::DirectL2)]
-        mode: cli::test_cache::TestCacheMode,
+        /// Target benchmark path.
+        ///
+        /// If path is inside an active StudioFS mount, benchmark runs end-to-end
+        /// through that mounted process and stores temporary files under
+        /// `<path>/.studiofs-test-cache`. Otherwise benchmark runs direct L2 mode
+        /// and treats this path as cache directory.
+        path: PathBuf,
 
         /// Block payload size (e.g. 1MB, 4MB, 8MB). Defaults to 8MB.
         #[arg(long)]
@@ -599,14 +599,6 @@ WARNING: This action is irreversible.")]
         /// On-disk L2 cache limit (e.g. 100GB).
         #[arg(long)]
         l2_limit: Option<String>,
-
-        /// Volume name for `e2e` mode.
-        #[arg(long)]
-        volume: Option<String>,
-
-        /// Mount point for `e2e` mode.
-        #[arg(long)]
-        mount_point: Option<PathBuf>,
     },
 
     /// Create or list immutable metadata snapshots
@@ -751,8 +743,7 @@ fn main() -> anyhow::Result<()> {
             cli::dump_load::load(&path_to_dump, &postgresql_adress)?;
         }
         Commands::TestCache {
-            cache_dir,
-            mode,
+            path,
             block_size,
             read_size,
             concurrency,
@@ -761,12 +752,9 @@ fn main() -> anyhow::Result<()> {
             small_file_share,
             l1_limit,
             l2_limit,
-            volume,
-            mount_point,
         } => {
             cli::test_cache::run(
-                cache_dir,
-                mode,
+                path,
                 block_size,
                 read_size,
                 concurrency,
@@ -775,8 +763,6 @@ fn main() -> anyhow::Result<()> {
                 small_file_share,
                 l1_limit,
                 l2_limit,
-                volume,
-                mount_point,
             )?;
         }
         Commands::Snapshot { name, action } => {
@@ -1032,21 +1018,11 @@ mod tests {
 
     #[test]
     fn test_cache_parses_defaults() {
-        let cli = parse(&[
-            "test-cache",
-            "--cache-dir",
-            "/tmp/studiofs-cache",
-            "--volume",
-            "vol",
-            "--mount-point",
-            "/mnt/studiofs",
-        ])
-        .unwrap();
+        let cli = parse(&["test-cache", "/tmp/studiofs-cache"]).unwrap();
 
         match cli.command {
             Commands::TestCache {
-                cache_dir,
-                mode,
+                path,
                 concurrency,
                 io_depth,
                 small_file_share,
@@ -1055,12 +1031,9 @@ mod tests {
                 access_pattern,
                 l1_limit,
                 l2_limit,
-                volume,
-                mount_point,
                 ..
             } => {
-                assert_eq!(cache_dir, PathBuf::from("/tmp/studiofs-cache"));
-                assert!(matches!(mode, cli::test_cache::TestCacheMode::DirectL2));
+                assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
                 assert_eq!(concurrency, 4);
                 assert_eq!(io_depth, 32);
                 assert_eq!(small_file_share, 20);
@@ -1070,8 +1043,6 @@ mod tests {
                     access_pattern,
                     cli::test_cache::TestCacheAccessPattern::Sequential
                 ));
-                assert_eq!(volume.unwrap(), "vol".to_string());
-                assert_eq!(mount_point, Some(PathBuf::from("/mnt/studiofs")));
                 assert!(l1_limit.is_none());
                 assert!(l2_limit.is_none());
             }
@@ -1080,17 +1051,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_e2e_mode_parses() {
+    fn test_cache_parses_full_flags() {
         let cli = parse(&[
             "test-cache",
-            "--mode",
-            "e2e",
-            "--cache-dir",
-            "/tmp/studiofs-cache",
-            "--volume",
-            "vol",
-            "--mount-point",
-            "/mnt/studiofs",
+            "Z:\\bench",
             "--block-size",
             "4MB",
             "--read-size",
@@ -1112,10 +1076,7 @@ mod tests {
 
         match cli.command {
             Commands::TestCache {
-                mode,
-                cache_dir,
-                volume,
-                mount_point,
+                path,
                 block_size,
                 read_size,
                 access_pattern,
@@ -1126,10 +1087,7 @@ mod tests {
                 l2_limit,
                 ..
             } => {
-                assert!(matches!(mode, cli::test_cache::TestCacheMode::EndToEnd));
-                assert_eq!(cache_dir, PathBuf::from("/tmp/studiofs-cache"));
-                assert_eq!(volume.unwrap(), "vol");
-                assert_eq!(mount_point, Some(PathBuf::from("/mnt/studiofs")));
+                assert_eq!(path, PathBuf::from("Z:\\bench"));
                 assert_eq!(block_size.unwrap(), "4MB");
                 assert_eq!(read_size.unwrap(), "1MB");
                 assert!(matches!(
