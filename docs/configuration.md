@@ -312,6 +312,8 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
+| `STUDIOFS_L2_COMMIT_WORKERS` | `4` | Number of bounded L2 commit scheduler workers |
+| `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `512` | L2 commit queue capacity before enqueue backpressure |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |

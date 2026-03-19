@@ -52,6 +52,8 @@ the capacity limit is reached.
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Max prefetch depth |
 | `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
+| `l2_commit_workers` | 4 | Bounded L2 commit scheduler workers |
+| `l2_commit_queue_capacity` | 512 | Bounded L2 commit queue capacity |
 
 Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on

@@ -57,6 +57,12 @@ pub const DEFAULT_L2_COMMIT_WORKERS: usize = 4;
 /// Bounded queue depth for background L2 commit scheduling.
 pub const DEFAULT_L2_COMMIT_QUEUE_CAPACITY: usize = 512;
 
+/// Maximum attempts per L2 commit job (initial try + retries).
+const L2_COMMIT_MAX_ATTEMPTS: u32 = 3;
+
+/// Base retry backoff for transient L2 write failures.
+const L2_COMMIT_RETRY_BASE_MS: u64 = 10;
+
 /// Checkpoint interval (seconds).
 const CHECKPOINT_INTERVAL_SECS: u64 = 60;
 
@@ -678,24 +684,53 @@ impl BlockCache {
             let _worker_guard = self.metrics.l2_commit_scheduler.enter_worker();
 
             let started = Instant::now();
-            match self.l2.put(job.object_id, &job.data).await {
-                Ok(()) => {
-                    self.metrics
-                        .l2_write
-                        .record(job.data.len() as u64, started.elapsed());
-                    self.lru
-                        .set_location(job.object_id, BlockLocation::MemoryAndDisk);
-                    self.metrics.l2_commit_scheduler.record_complete();
+            let mut attempts = 0u32;
+            let mut completed = false;
+            while attempts < L2_COMMIT_MAX_ATTEMPTS {
+                attempts += 1;
+                match self.l2.put(job.object_id, &job.data).await {
+                    Ok(()) => {
+                        self.metrics
+                            .l2_write
+                            .record(job.data.len() as u64, started.elapsed());
+                        self.lru
+                            .set_location(job.object_id, BlockLocation::MemoryAndDisk);
+                        self.metrics.l2_commit_scheduler.record_complete();
+                        completed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        if attempts >= L2_COMMIT_MAX_ATTEMPTS {
+                            self.metrics.l2_commit_scheduler.record_failed();
+                            warn!(
+                                worker_id,
+                                object_id = job.object_id,
+                                attempts,
+                                error = %e,
+                                "L2 commit worker exhausted retries"
+                            );
+                            break;
+                        }
+                        let backoff_ms = L2_COMMIT_RETRY_BASE_MS << (attempts - 1);
+                        warn!(
+                            worker_id,
+                            object_id = job.object_id,
+                            attempts,
+                            backoff_ms,
+                            error = %e,
+                            "L2 commit worker retrying after transient failure"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
                 }
-                Err(e) => {
-                    self.metrics.l2_commit_scheduler.record_failed();
-                    warn!(
-                        worker_id,
-                        object_id = job.object_id,
-                        error = %e,
-                        "L2 commit worker failed to persist block"
-                    );
-                }
+            }
+
+            if !completed && tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    worker_id,
+                    object_id = job.object_id,
+                    "L2 commit worker dropped job after retries (block remains in L1)"
+                );
             }
 
             if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {

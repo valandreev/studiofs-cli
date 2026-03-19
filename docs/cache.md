@@ -76,6 +76,8 @@ Bounded scheduler for asynchronous L2 commits from the materializer path.
 
 This replaces the previous fire-and-forget fan-out model and caps concurrent
 L2 write operations to the worker count.
+Runtime tuning is available through `STUDIOFS_L2_COMMIT_WORKERS` and
+`STUDIOFS_L2_COMMIT_QUEUE_CAPACITY`.
 
 ### LRU Tracker (`lru_tracker.rs`)
 
