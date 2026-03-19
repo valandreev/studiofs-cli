@@ -89,6 +89,12 @@ pending_blocks for this inode
 `cache_safety_mode` is configurable via VFS config / `studiofs settings --cache-safety-mode`
 or environment variable `STUDIOFS_CACHE_SAFETY_MODE=fast|durable`.
 
+Crash semantics note:
+- `fast` mode does not keep WAL-backed accepted payloads. After abrupt termination
+  (`SIGKILL`/process crash), very recent accepted writes that were not yet
+  materialized can be lost (typically the last materializer window).
+- `durable` mode keeps WAL/checkpoint-backed restart recovery for accepted ingress.
+
 ### 3. Background Materializer (`drain_dirty_mem` lineage)
 
 Runs every 10ms, processes continuously while data exists:

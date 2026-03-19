@@ -370,6 +370,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - cache L2 read/write throughput and latency histograms
 - L2 commit scheduler counters (`cache_l2_commit_queue_depth`, `cache_l2_commit_queue_depth_peak`, `cache_l2_commit_workers_active`, `cache_l2_commit_workers_active_peak`, `cache_l2_commit_backpressure_events`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
+- fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
 

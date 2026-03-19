@@ -2108,8 +2108,9 @@ fn writer_reads_full_file_before_any_remote_commit() {
 
     let payload = vec![0xA1u8; 1024 * 1024];
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(2)
         .build()
         .unwrap();
     rt.block_on(async {
@@ -5686,6 +5687,100 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
             fast_stats.spill_bytes, 0,
             "fast mode should avoid duplicate ingress payload writes"
         );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_write_fast_mode_no_spill_artifacts() {
+    fn segment_file_count(dir: &std::path::Path) -> usize {
+        let dir = dir.join("segments");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .count()
+    }
+
+    apply_test_online_s3_env();
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let spill_dir = cache_dir.join("ingress_spill");
+    let volume_suffix = format!("fast-no-spill-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x5Au8; 512 * 1024];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfig {
+            cache_safety_mode: CacheSafetyMode::Fast,
+            max_dirty_bytes: 32 * 1024 * 1024,
+            max_spill_bytes: 64 * 1024 * 1024,
+            background_slab_flush_enabled: true,
+            ..VfsConfig::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            vfs_config,
+        )
+        .unwrap();
+
+        let attr = vfs.create(1, b"fast-no-spill.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert_eq!(
+            segment_file_count(&spill_dir),
+            0,
+            "fast mode must not persist ingress segment payload files"
+        );
+
+        let mut object_id = None;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            if let Some((_, id, _)) = vfs.pending_uploads_for_inode(attr.ino).into_iter().next() {
+                object_id = Some(id);
+                break;
+            }
+            if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+                && let Some((_, block_ref)) = blocks.first()
+            {
+                object_id = Some(block_ref.object_id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let object_id =
+            object_id.expect("expected pending/committed object id for fast-mode write");
+        let key = format_object_key(&format_info.data_prefix, object_id);
+        let ds = DataStore::new(&data_config).unwrap();
+        assert!(
+            wait_until_exists(&ds, &key, Duration::from_secs(60)).await,
+            "fast-mode flush should still publish object to remote store"
+        );
+
+        vfs.shutdown(Duration::from_secs(15)).await;
     });
     rt.shutdown_background();
 }

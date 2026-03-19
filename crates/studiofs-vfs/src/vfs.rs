@@ -191,6 +191,10 @@ pub struct VfsIngressStats {
     pub write_backpressure_wait_ms: u64,
     /// Number of times foreground writes had to wait due to local backpressure.
     pub write_backpressure_events: u64,
+    /// Foreground wait time spent in fast-mode backpressure only.
+    pub fast_backpressure_wait_ms: u64,
+    /// Number of fast-mode backpressure wait events.
+    pub fast_backpressure_events: u64,
     /// Number of blocks that were forced to spill because RAM acceptance was
     /// over budget.
     pub forced_spill_blocks: u64,
@@ -2777,6 +2781,19 @@ fn reset_ingress_artifacts_for_fast_mode(spill_dir: &std::path::Path) -> VfsResu
     Ok(())
 }
 
+fn scan_ingress_artifacts(spill_dir: &std::path::Path) -> VfsResult<(usize, usize, bool)> {
+    let segment_dir = spill_dir.join("segments");
+    let checkpoint_dir = spill_dir.join("checkpoints");
+    let segment_count = list_ingress_segment_files(&segment_dir)?.len();
+    let checkpoint_present = latest_ingress_checkpoint_path(&checkpoint_dir).exists();
+    let state_present = ingress_state_path(spill_dir).exists();
+    Ok((
+        segment_count,
+        usize::from(checkpoint_present),
+        state_present,
+    ))
+}
+
 // =============================================================================
 // Internal State (for Clone support)
 // =============================================================================
@@ -2840,6 +2857,10 @@ struct VfsState {
     write_backpressure_wait_ms: AtomicU64,
     /// Number of times foreground writes entered backpressure waiting.
     write_backpressure_events: AtomicU64,
+    /// Foreground wait time spent in fast-mode backpressure only.
+    fast_backpressure_wait_ms: AtomicU64,
+    /// Number of fast-mode backpressure wait events.
+    fast_backpressure_events: AtomicU64,
     /// Ingress append throughput/latency metrics.
     ingress_append_stats: IoStats,
     /// Materialize batch throughput/latency metrics.
@@ -3698,6 +3719,17 @@ impl StudioVfs {
                     initial_checkpoint_meta,
                 )
             } else {
+                let (segment_count, checkpoint_count, state_present) =
+                    scan_ingress_artifacts(&spill_dir)?;
+                if segment_count > 0 || checkpoint_count > 0 || state_present {
+                    warn!(
+                        mode = "fast",
+                        segment_count,
+                        checkpoint_count,
+                        state_present,
+                        "startup detected durable ingress artifacts; fast mode will discard them during self-heal"
+                    );
+                }
                 reset_ingress_artifacts_for_fast_mode(&spill_dir)?;
                 (
                     RecoveredSpillMap::new(),
@@ -3947,6 +3979,8 @@ impl StudioVfs {
                     drained_spill_bytes: AtomicU64::new(0),
                     write_backpressure_wait_ms: AtomicU64::new(0),
                     write_backpressure_events: AtomicU64::new(0),
+                    fast_backpressure_wait_ms: AtomicU64::new(0),
+                    fast_backpressure_events: AtomicU64::new(0),
                     ingress_append_stats: IoStats::default(),
                     materialize_batch_stats: MaterializeBatchStats::default(),
                     dirty_drained_notify: tokio::sync::Notify::new(),
@@ -5253,6 +5287,14 @@ impl StudioVfs {
             self.state
                 .write_backpressure_wait_ms
                 .fetch_add(waited_ms, Ordering::Relaxed);
+            if !self.durable_cache_safety_mode() {
+                self.state
+                    .fast_backpressure_events
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .fast_backpressure_wait_ms
+                    .fetch_add(waited_ms, Ordering::Relaxed);
+            }
         }
     }
 
@@ -5752,6 +5794,8 @@ impl StudioVfs {
                 .write_backpressure_wait_ms
                 .load(Ordering::Relaxed),
             write_backpressure_events: self.state.write_backpressure_events.load(Ordering::Relaxed),
+            fast_backpressure_wait_ms: self.state.fast_backpressure_wait_ms.load(Ordering::Relaxed),
+            fast_backpressure_events: self.state.fast_backpressure_events.load(Ordering::Relaxed),
             forced_spill_blocks: self.state.forced_spill_blocks.load(Ordering::Relaxed),
             drained_mem_blocks: self.state.drained_mem_blocks.load(Ordering::Relaxed),
             drained_mem_bytes: self.state.drained_mem_bytes.load(Ordering::Relaxed),
@@ -8448,6 +8492,8 @@ impl StudioVfs {
                     checkpoint_live_segments = ingress.checkpoint_live_segments,
                     write_backpressure_wait_ms = ingress.write_backpressure_wait_ms,
                     write_backpressure_events = ingress.write_backpressure_events,
+                    fast_backpressure_wait_ms = ingress.fast_backpressure_wait_ms,
+                    fast_backpressure_events = ingress.fast_backpressure_events,
                     ingress_append_ops = ingress_append.ops,
                     ingress_append_bytes = ingress_append.bytes,
                     ingress_append_total_latency_ns = ingress_append.total_latency_ns,
