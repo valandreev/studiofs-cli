@@ -3161,7 +3161,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let offline_vfs_config = VfsConfig {
                 max_dirty_bytes: 1,
                 max_spill_bytes: 16 * 1024 * 1024,
-                                cache_safety_mode: CacheSafetyMode::Durable,
+                cache_safety_mode: CacheSafetyMode::Durable,
                 background_slab_flush_enabled: false,
                 ..VfsConfig::default()
             };
@@ -5858,7 +5858,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         let vfs_config = VfsConfig {
             max_dirty_bytes: 1,
             max_spill_bytes: 4 * 1024 * 1024,
-                        cache_safety_mode: CacheSafetyMode::Durable,
+            cache_safety_mode: CacheSafetyMode::Durable,
             slab_flush_interval_ms: 5000,
             background_slab_flush_enabled: false,
             ..VfsConfig::default()
