@@ -173,8 +173,7 @@ Runs cache benchmarks without changing regular runtime configuration.
 
 ```bash
 studiofs test-cache \
-  --cache-dir <path> \
-  [--mode <direct-l2|e2e>] \
+  <path> \
   [--block-size <e.g. 8MB>] \
   [--read-size <e.g. 1MB>] \
   [--concurrency <usize>] \
@@ -182,13 +181,10 @@ studiofs test-cache \
   [--access-pattern <sequential|random|mixed>] \
   [--small-file-share <0..100>] \
   [--l1-limit <e.g. 2GB>] \
-  [--l2-limit <e.g. 100GB>] \
-  [--volume <name>] \
-  [--mount-point <path>]
+  [--l2-limit <e.g. 100GB>]
 ```
 
 Defaults:
-- `--mode direct-l2`
 - `--block-size 8MB`
 - `--read-size` defaults to `block-size`
 - `--concurrency 4`
@@ -199,8 +195,11 @@ Defaults:
 - `--l2-limit 100GB`
 
 Notes:
-- `direct-l2` benchmarks `studiofs-cache` directly (bypasses VFS/mount).
-- `e2e` benchmarks through a mounted filesystem path and requires both `--volume` and `--mount-point`.
+- If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-l2`
+  mode and treats `<path>` as cache directory.
+- If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
+  through the already running mounted process and uses
+  `<path>/.studiofs-test-cache` for temporary workload files.
 - Effective in-flight queue pressure is driven by `--io-depth`; worker count is raised to at least that value.
 - Output includes a human-readable summary and JSON payload suitable for cross-platform run comparison.
 - Current built-in workload volumes are modest (`128MB` direct-l2, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.

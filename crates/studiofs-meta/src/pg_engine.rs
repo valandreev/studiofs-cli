@@ -642,6 +642,10 @@ impl PgMetaEngine {
     where
         F: std::future::Future<Output = MetaResult<T>>,
     {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut));
+        }
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

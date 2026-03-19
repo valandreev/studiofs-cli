@@ -188,7 +188,7 @@ benchmarks:
 - backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
 
 Runtime logs (`upload pipeline counters`) include these metrics continuously
-while the pipeline is active. `studiofs test-cache --mode direct-l2` also emits
+while the pipeline is active. `studiofs test-cache <cache-dir>` also emits
 the cache pipeline snapshot in JSON under `cache_pipeline`.
 
 ## Crash Recovery
