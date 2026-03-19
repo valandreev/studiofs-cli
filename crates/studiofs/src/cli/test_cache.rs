@@ -731,7 +731,12 @@ fn normalize_path_for_compare(path: &Path) -> Option<String> {
     let raw = path.to_str()?;
     #[cfg(windows)]
     {
-        Some(raw.replace('/', "\\").trim_end_matches('\\').to_lowercase())
+        Some(
+            super::utils::normalize_mount_point(raw)
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase(),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -1136,5 +1141,21 @@ mod tests {
         let mount = PathBuf::from("/mnt/studiofs");
         let target = PathBuf::from("/mnt/studiofs-other/cache-bench");
         assert!(!is_path_under_mount(&target, &mount));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_path_detection_normalizes_extended_drive_prefix() {
+        let mount = PathBuf::from(r"C:\StudioFS");
+        let target = PathBuf::from(r"\\?\C:\StudioFS\bench");
+        assert!(is_path_under_mount(&target, &mount));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mount_path_detection_normalizes_unc_prefix() {
+        let mount = PathBuf::from(r"\\server\share\studiofs");
+        let target = PathBuf::from(r"\\?\UNC\server\share\studiofs\bench");
+        assert!(is_path_under_mount(&target, &mount));
     }
 }
