@@ -42,6 +42,9 @@ mod checkpoint {
     pub const ENTRY_SIZE: usize = 18;
 }
 
+type CheckpointSignature = (u32, u32);
+type CheckpointWrite = (Vec<u8>, CheckpointSignature);
+
 /// Default L1 (RAM) size: 2 GiB.
 pub const DEFAULT_L1_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -859,7 +862,7 @@ impl BlockCache {
     // Checkpoint persistence
     // =========================================================================
 
-    fn prepare_checkpoint_write(&self) -> io::Result<Option<(Vec<u8>, (u32, u32))>> {
+    fn prepare_checkpoint_write(&self) -> io::Result<Option<CheckpointWrite>> {
         let (buf, signature) = self.build_checkpoint_payload();
         let should_skip = {
             let guard = self
@@ -875,7 +878,7 @@ impl BlockCache {
         }
     }
 
-    fn build_checkpoint_payload(&self) -> (Vec<u8>, (u32, u32)) {
+    fn build_checkpoint_payload(&self) -> CheckpointWrite {
         let entries = self.lru.snapshot_for_checkpoint();
         let count = entries.len() as u32;
 
@@ -918,7 +921,7 @@ impl BlockCache {
         Ok(())
     }
 
-    fn record_checkpoint_signature(&self, signature: (u32, u32)) -> io::Result<()> {
+    fn record_checkpoint_signature(&self, signature: CheckpointSignature) -> io::Result<()> {
         let mut guard = self
             .last_checkpoint_signature
             .lock()
