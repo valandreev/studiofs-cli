@@ -28,7 +28,7 @@ use tokio::sync::Semaphore;
 const MAX_LATENCY_SAMPLES: usize = 200_000;
 const BINARY_UNIT_DIVISOR: f64 = 1024.0;
 const WORKLOAD_FILES_PER_TIER: usize = 100;
-const SMALL_FILE_MIN_BYTES: u64 = 1 * 1024;
+const SMALL_FILE_MIN_BYTES: u64 = 1024;
 const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
 
@@ -955,7 +955,7 @@ fn process_cpu_time() -> Option<Duration> {
         let ft_to_u64 =
             |ft: FileTime| ((ft.dw_high_date_time as u64) << 32) | ft.dw_low_date_time as u64;
         let total_100ns = ft_to_u64(kernel).saturating_add(ft_to_u64(user));
-        return Some(Duration::from_nanos(total_100ns.saturating_mul(100)));
+        Some(Duration::from_nanos(total_100ns.saturating_mul(100)))
     }
 
     #[cfg(not(any(unix, windows)))]
