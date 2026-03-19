@@ -205,7 +205,10 @@ impl UploadQueue {
         {
             return;
         }
-        let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(5))).await;
+        let _ = crate::runtime::spawn_blocking_profiled("upload_flush_barrier_wait", move || {
+            rx.recv_timeout(Duration::from_secs(5))
+        })
+        .await;
     }
 
     /// Wait until all currently pending uploads complete or `timeout` elapses.

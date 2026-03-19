@@ -52,6 +52,8 @@ struct TestCacheParams {
     access_pattern: TestCacheAccessPattern,
     l1_limit: u64,
     l2_limit: u64,
+    profile: bool,
+    run_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +88,7 @@ struct OpReport {
 
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
+    run_id: String,
     mode: String,
     cache_dir: String,
     started_at: String,
@@ -110,6 +113,8 @@ struct BenchmarkReport {
     l2_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_pipeline: Option<CachePipelineReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<BenchmarkProfileReport>,
     writes: OpReport,
     reads: OpReport,
 }
@@ -155,6 +160,35 @@ struct CachePipelineReport {
     l2_write: IoStatsReport,
     materialize_batches: MaterializeBatchStatsReport,
     upload_queue: UploadQueueStatsReport,
+    blocking_tasks: BlockingTaskStatsReport,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockingTaskStatsReport {
+    active: usize,
+    active_peak: usize,
+    submitted: u64,
+    started: u64,
+    completed: u64,
+    queue_wait_avg_ms: f64,
+    queue_wait_max_ms: f64,
+    execution_avg_ms: f64,
+    execution_max_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkProfileReport {
+    enabled: bool,
+    cpu_profile: CpuProfileReport,
+}
+
+#[derive(Debug, Serialize)]
+struct CpuProfileReport {
+    total_wall_ms: f64,
+    total_cpu_ms: f64,
+    cpu_utilization_percent: f64,
+    write_phase_cpu_percent: f64,
+    read_phase_cpu_percent: f64,
 }
 
 impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogramReport {
@@ -206,11 +240,36 @@ impl From<studiofs_cache::metrics::UploadQueueStatsSnapshot> for UploadQueueStat
 
 impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
     fn from(snapshot: CachePipelineMetricsSnapshot) -> Self {
+        let queue_wait_avg_ms = if snapshot.blocking_tasks.started == 0 {
+            0.0
+        } else {
+            snapshot.blocking_tasks.queue_wait_total_ns as f64
+                / snapshot.blocking_tasks.started as f64
+                / 1_000_000.0
+        };
+        let execution_avg_ms = if snapshot.blocking_tasks.completed == 0 {
+            0.0
+        } else {
+            snapshot.blocking_tasks.execution_total_ns as f64
+                / snapshot.blocking_tasks.completed as f64
+                / 1_000_000.0
+        };
         Self {
             l2_read: snapshot.l2_read.into(),
             l2_write: snapshot.l2_write.into(),
             materialize_batches: snapshot.materialize_batches.into(),
             upload_queue: snapshot.upload_queue.into(),
+            blocking_tasks: BlockingTaskStatsReport {
+                active: snapshot.blocking_tasks.active,
+                active_peak: snapshot.blocking_tasks.active_peak,
+                submitted: snapshot.blocking_tasks.submitted,
+                started: snapshot.blocking_tasks.started,
+                completed: snapshot.blocking_tasks.completed,
+                queue_wait_avg_ms,
+                queue_wait_max_ms: snapshot.blocking_tasks.queue_wait_max_ns as f64 / 1_000_000.0,
+                execution_avg_ms,
+                execution_max_ms: snapshot.blocking_tasks.execution_max_ns as f64 / 1_000_000.0,
+            },
         }
     }
 }
@@ -836,8 +895,88 @@ fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
     }
 }
 
+fn process_cpu_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `getrusage` initializes the provided pointer when it returns 0.
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: guarded by successful `getrusage` above.
+        let usage = unsafe { usage.assume_init() };
+        let user = Duration::new(
+            usage.ru_utime.tv_sec as u64,
+            (usage.ru_utime.tv_usec as u32).saturating_mul(1_000),
+        );
+        let sys = Duration::new(
+            usage.ru_stime.tv_sec as u64,
+            (usage.ru_stime.tv_usec as u32).saturating_mul(1_000),
+        );
+        return Some(user.saturating_add(sys));
+    }
+
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileTime {
+            dw_low_date_time: u32,
+            dw_high_date_time: u32,
+        }
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetProcessTimes(
+                hProcess: *mut std::ffi::c_void,
+                lpCreationTime: *mut FileTime,
+                lpExitTime: *mut FileTime,
+                lpKernelTime: *mut FileTime,
+                lpUserTime: *mut FileTime,
+            ) -> i32;
+        }
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        // SAFETY: pointers are valid and writable for this call.
+        let ok = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let ft_to_u64 =
+            |ft: FileTime| ((ft.dw_high_date_time as u64) << 32) | ft.dw_low_date_time as u64;
+        let total_100ns = ft_to_u64(kernel).saturating_add(ft_to_u64(user));
+        return Some(Duration::from_nanos(total_100ns.saturating_mul(100)));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
+    let wall_ns = wall.as_nanos() as f64;
+    if wall_ns <= 0.0 {
+        0.0
+    } else {
+        (cpu.as_nanos() as f64 / wall_ns) * 100.0
+    }
+}
+
 async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<BenchmarkReport> {
+    studiofs_cache::runtime::reset_blocking_task_stats();
     let started = Instant::now();
+    let started_cpu = process_cpu_time();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit, params.l2_limit);
@@ -852,6 +991,14 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         0x1234_5678_9abc_def0,
     );
 
+    tracing::info!(
+        target: "studiofs.cache.profile",
+        run_id = %params.run_id,
+        phase = "direct-l2-write",
+        "cache benchmark phase start"
+    );
+    let writes_wall_start = Instant::now();
+    let writes_cpu_start = process_cpu_time();
     let writes = run_l2_writes(
         Arc::clone(&cache),
         &work_sizes,
@@ -860,6 +1007,19 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         params.concurrency,
     )
     .await?;
+    let writes_wall = writes_wall_start.elapsed();
+    let writes_cpu = writes_cpu_start
+        .and_then(|start_cpu| process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu)))
+        .unwrap_or_default();
+
+    tracing::info!(
+        target: "studiofs.cache.profile",
+        run_id = %params.run_id,
+        phase = "direct-l2-read",
+        "cache benchmark phase start"
+    );
+    let reads_wall_start = Instant::now();
+    let reads_cpu_start = process_cpu_time();
     let reads = run_l2_reads(
         Arc::clone(&cache),
         &work_sizes,
@@ -869,12 +1029,31 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         params.read_size,
     )
     .await?;
+    let reads_wall = reads_wall_start.elapsed();
+    let reads_cpu = reads_cpu_start
+        .and_then(|start_cpu| process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu)))
+        .unwrap_or_default();
 
     let completed = Instant::now();
     let total_elapsed_ms = (completed - started).as_secs_f64() * 1000.0;
     let cache_stats = cache.stats();
+    let total_wall = completed - started;
+    let total_cpu = started_cpu
+        .and_then(|cpu_start| process_cpu_time().map(|cpu_end| cpu_end.saturating_sub(cpu_start)))
+        .unwrap_or_default();
+    let profile = params.profile.then_some(BenchmarkProfileReport {
+        enabled: true,
+        cpu_profile: CpuProfileReport {
+            total_wall_ms: total_wall.as_secs_f64() * 1000.0,
+            total_cpu_ms: total_cpu.as_secs_f64() * 1000.0,
+            cpu_utilization_percent: cpu_utilization_percent(total_cpu, total_wall),
+            write_phase_cpu_percent: cpu_utilization_percent(writes_cpu, writes_wall),
+            read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
+        },
+    });
 
     Ok(BenchmarkReport {
+        run_id: params.run_id.clone(),
         mode: "direct-l2".to_string(),
         cache_dir: cache_dir.display().to_string(),
         started_at,
@@ -892,6 +1071,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         l1_bytes: Some(cache_stats.l1_bytes),
         l2_bytes: Some(cache_stats.l2_bytes),
         cache_pipeline: Some(cache.cache_pipeline_metrics().into()),
+        profile,
         work_root: None,
         writes: writes.to_report(total_elapsed_ms),
         reads: reads.to_report(total_elapsed_ms),
@@ -905,6 +1085,7 @@ async fn run_mounted_end_to_end(
     work_root: &Path,
 ) -> Result<BenchmarkReport> {
     let started = Instant::now();
+    let started_cpu = process_cpu_time();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let benchmark_result = async {
         clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
@@ -916,8 +1097,31 @@ async fn run_mounted_end_to_end(
         let order =
             build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
 
+        tracing::info!(
+            target: "studiofs.cache.profile",
+            run_id = %params.run_id,
+            phase = "e2e-write",
+            "cache benchmark phase start"
+        );
+        let writes_wall_start = Instant::now();
+        let writes_cpu_start = process_cpu_time();
         let writes =
             run_filesystem_writes(&files, &order, params.io_depth, params.concurrency).await?;
+        let writes_wall = writes_wall_start.elapsed();
+        let writes_cpu = writes_cpu_start
+            .and_then(|start_cpu| {
+                process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+            })
+            .unwrap_or_default();
+
+        tracing::info!(
+            target: "studiofs.cache.profile",
+            run_id = %params.run_id,
+            phase = "e2e-read",
+            "cache benchmark phase start"
+        );
+        let reads_wall_start = Instant::now();
+        let reads_cpu_start = process_cpu_time();
         let reads = run_filesystem_reads(
             &files,
             &order,
@@ -926,12 +1130,35 @@ async fn run_mounted_end_to_end(
             params.read_size,
         )
         .await?;
+        let reads_wall = reads_wall_start.elapsed();
+        let reads_cpu = reads_cpu_start
+            .and_then(|start_cpu| {
+                process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+            })
+            .unwrap_or_default();
 
         let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
+        let total_wall = Instant::now() - started;
+        let total_cpu = started_cpu
+            .and_then(|cpu_start| {
+                process_cpu_time().map(|cpu_end| cpu_end.saturating_sub(cpu_start))
+            })
+            .unwrap_or_default();
+        let profile = params.profile.then_some(BenchmarkProfileReport {
+            enabled: true,
+            cpu_profile: CpuProfileReport {
+                total_wall_ms: total_wall.as_secs_f64() * 1000.0,
+                total_cpu_ms: total_cpu.as_secs_f64() * 1000.0,
+                cpu_utilization_percent: cpu_utilization_percent(total_cpu, total_wall),
+                write_phase_cpu_percent: cpu_utilization_percent(writes_cpu, writes_wall),
+                read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
+            },
+        });
 
         let _ = fs::remove_dir_all(work_root).await;
 
         Ok::<_, anyhow::Error>(BenchmarkReport {
+            run_id: params.run_id.clone(),
             mode: "e2e".to_string(),
             cache_dir: params.target.display().to_string(),
             started_at,
@@ -950,6 +1177,7 @@ async fn run_mounted_end_to_end(
             l1_bytes: None,
             l2_bytes: None,
             cache_pipeline: None,
+            profile,
             writes: writes.to_report(total_elapsed_ms),
             reads: reads.to_report(total_elapsed_ms),
         })
@@ -1194,6 +1422,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     };
 
     let _ = writeln!(&mut out, "Cache benchmark");
+    let _ = writeln!(&mut out, "Run ID:    {}", report.run_id);
     let _ = writeln!(&mut out, "{target_label}: {}", report.cache_dir);
     let _ = writeln!(&mut out, "Mode:      {}", report.mode);
     if let Some(volume) = &report.volume {
@@ -1322,6 +1551,33 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             pipeline.materialize_batches.inflight_batches,
             pipeline.materialize_batches.inflight_batches_peak,
         );
+        let _ = writeln!(
+            &mut out,
+            "Blocking tasks: active {} (peak {}), submitted {}, started {}, completed {}, queue wait avg {}, max {}, exec avg {}, max {}",
+            pipeline.blocking_tasks.active,
+            pipeline.blocking_tasks.active_peak,
+            pipeline.blocking_tasks.submitted,
+            pipeline.blocking_tasks.started,
+            pipeline.blocking_tasks.completed,
+            format_duration_ms(pipeline.blocking_tasks.queue_wait_avg_ms),
+            format_duration_ms(pipeline.blocking_tasks.queue_wait_max_ms),
+            format_duration_ms(pipeline.blocking_tasks.execution_avg_ms),
+            format_duration_ms(pipeline.blocking_tasks.execution_max_ms),
+        );
+    }
+
+    if let Some(profile) = &report.profile {
+        out.push('\n');
+        let _ = writeln!(&mut out, "On-demand profile");
+        let _ = writeln!(
+            &mut out,
+            "CPU util: total {:.1}% (write {:.1}%, read {:.1}%), wall {}, CPU {}",
+            profile.cpu_profile.cpu_utilization_percent,
+            profile.cpu_profile.write_phase_cpu_percent,
+            profile.cpu_profile.read_phase_cpu_percent,
+            format_duration_ms(profile.cpu_profile.total_wall_ms),
+            format_duration_ms(profile.cpu_profile.total_cpu_ms),
+        );
     }
 
     out
@@ -1337,6 +1593,7 @@ pub fn run(
     access_pattern: TestCacheAccessPattern,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
+    profile: bool,
     json_output: Option<PathBuf>,
 ) -> Result<()> {
     if io_depth == 0 {
@@ -1367,6 +1624,13 @@ pub fn run(
         return Err(anyhow!("cache limits must be > 0"));
     }
 
+    let run_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!(
+        target: "studiofs.cache.profile",
+        run_id = %run_id,
+        profile_enabled = profile,
+        "test-cache run started"
+    );
     let params = TestCacheParams {
         target: target.clone(),
         block_size,
@@ -1376,6 +1640,8 @@ pub fn run(
         access_pattern,
         l1_limit,
         l2_limit,
+        profile,
+        run_id: run_id.clone(),
     };
 
     let resolved_mode = resolve_run_mode(&target)?;
@@ -1395,6 +1661,12 @@ pub fn run(
     print!("{}", render_human_summary(&report));
     let report_path = save_benchmark_report(&report, json_output.as_deref())?;
     println!("JSON report: {}", report_path.display());
+    tracing::info!(
+        target: "studiofs.cache.profile",
+        run_id = %run_id,
+        report_path = %report_path.display(),
+        "test-cache run completed"
+    );
     Ok(())
 }
 
@@ -1406,6 +1678,7 @@ mod tests {
 
     fn sample_report() -> BenchmarkReport {
         BenchmarkReport {
+            run_id: "run-123".to_string(),
             mode: "direct-l2".to_string(),
             cache_dir: r"D:\test-cache".to_string(),
             started_at: "2026-03-18T15:12:55Z".to_string(),
@@ -1462,6 +1735,27 @@ mod tests {
                     completed: 16,
                     requeued: 0,
                     canceled: 0,
+                },
+                blocking_tasks: BlockingTaskStatsReport {
+                    active: 0,
+                    active_peak: 4,
+                    submitted: 32,
+                    started: 32,
+                    completed: 32,
+                    queue_wait_avg_ms: 0.2,
+                    queue_wait_max_ms: 1.5,
+                    execution_avg_ms: 3.1,
+                    execution_max_ms: 9.4,
+                },
+            }),
+            profile: Some(BenchmarkProfileReport {
+                enabled: true,
+                cpu_profile: CpuProfileReport {
+                    total_wall_ms: 93.05,
+                    total_cpu_ms: 85.0,
+                    cpu_utilization_percent: 91.3,
+                    write_phase_cpu_percent: 92.0,
+                    read_phase_cpu_percent: 90.4,
                 },
             }),
             writes: OpReport {

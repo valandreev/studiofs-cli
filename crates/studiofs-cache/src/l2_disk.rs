@@ -158,7 +158,8 @@ impl L2DiskCache {
     /// Uses a single `spawn_blocking` so this never blocks the tokio runtime.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match tokio::task::spawn_blocking(move || std::fs::read(&path)).await {
+        match crate::runtime::spawn_blocking_profiled("l2_get", move || std::fs::read(&path)).await
+        {
             Ok(Ok(data)) => Some(Bytes::from(data)),
             Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
             Ok(Err(e)) => {
@@ -183,7 +184,9 @@ impl L2DiskCache {
             let path = self.block_path(id);
             handles.push((
                 id,
-                tokio::task::spawn_blocking(move || std::fs::read(&path)),
+                crate::runtime::spawn_blocking_profiled("l2_get_batch", move || {
+                    std::fs::read(&path)
+                }),
             ));
         }
         let mut results = Vec::with_capacity(handles.len());
@@ -231,7 +234,7 @@ impl L2DiskCache {
         let len = data.len() as u64;
         let owned = data.to_vec();
 
-        tokio::task::spawn_blocking(move || -> io::Result<()> {
+        crate::runtime::spawn_blocking_profiled("l2_put", move || -> io::Result<()> {
             Self::write_block_file(&path, &tmp_path, &owned)
         })
         .await
@@ -256,14 +259,17 @@ impl L2DiskCache {
             handles.push((
                 object_id,
                 data.len() as u64,
-                tokio::task::spawn_blocking(move || -> (io::Result<()>, u64) {
-                    // Intentionally measure on-worker disk write latency only.
-                    // Queueing delay before worker pickup is excluded.
-                    let started = std::time::Instant::now();
-                    let result = Self::write_block_file(&path, &tmp_path, &owned);
-                    let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    (result, elapsed_ns)
-                }),
+                crate::runtime::spawn_blocking_profiled(
+                    "l2_put_batch",
+                    move || -> (io::Result<()>, u64) {
+                        // Intentionally measure on-worker disk write latency only.
+                        // Queueing delay before worker pickup is excluded.
+                        let started = std::time::Instant::now();
+                        let result = Self::write_block_file(&path, &tmp_path, &owned);
+                        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        (result, elapsed_ns)
+                    },
+                ),
             ));
         }
         let mut results = Vec::with_capacity(handles.len());
@@ -299,7 +305,7 @@ impl L2DiskCache {
     pub async fn remove(&self, object_id: u64) {
         let path = self.block_path(object_id);
         // Single spawn_blocking for metadata + remove.
-        let removed_size = tokio::task::spawn_blocking(move || -> u64 {
+        let removed_size = crate::runtime::spawn_blocking_profiled("l2_remove", move || -> u64 {
             match std::fs::metadata(&path) {
                 Ok(meta) => {
                     let size = meta.len();

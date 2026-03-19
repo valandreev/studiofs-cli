@@ -600,6 +600,10 @@ WARNING: This action is irreversible.")]
         /// current working directory.
         #[arg(long)]
         json_output: Option<PathBuf>,
+
+        /// Enable on-demand CPU/profile hooks for this benchmark run.
+        #[arg(long)]
+        profile: bool,
     },
 
     /// Create or list immutable metadata snapshots
@@ -753,6 +757,7 @@ fn main() -> anyhow::Result<()> {
             l1_limit,
             l2_limit,
             json_output,
+            profile,
         } => {
             cli::test_cache::run(
                 path,
@@ -763,6 +768,7 @@ fn main() -> anyhow::Result<()> {
                 access_pattern,
                 l1_limit,
                 l2_limit,
+                profile,
                 json_output,
             )?;
         }
@@ -1032,6 +1038,7 @@ mod tests {
                 l1_limit,
                 l2_limit,
                 json_output,
+                profile,
                 ..
             } => {
                 assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
@@ -1046,6 +1053,7 @@ mod tests {
                 assert!(l1_limit.is_none());
                 assert!(l2_limit.is_none());
                 assert!(json_output.is_none());
+                assert!(!profile);
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
@@ -1072,6 +1080,7 @@ mod tests {
             "1TB",
             "--json-output",
             "reports/cache-run.json",
+            "--profile",
         ])
         .unwrap();
 
@@ -1086,6 +1095,7 @@ mod tests {
                 l1_limit,
                 l2_limit,
                 json_output,
+                profile,
                 ..
             } => {
                 assert_eq!(path, PathBuf::from("Z:\\bench"));
@@ -1103,6 +1113,7 @@ mod tests {
                     json_output.unwrap(),
                     PathBuf::from("reports/cache-run.json")
                 );
+                assert!(profile);
             }
             other => panic!("expected TestCache, got {other:?}"),
         }

@@ -120,6 +120,8 @@ studiofs test-cache \
 JSON report in the current working directory using an auto-generated file name
 such as `studiofs-test-cache-direct-l2-20260319-151255.json`. Use
 `--json-output <path>` to override the report location or file name.
+Use `--profile` for on-demand CPU/profile hooks; reports include a `run_id`
+that also tags profile tracing events and cache blocking-task pressure counters.
 
 ## Development
 
