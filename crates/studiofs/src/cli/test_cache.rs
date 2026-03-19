@@ -50,7 +50,6 @@ struct TestCacheParams {
     concurrency: usize,
     io_depth: usize,
     access_pattern: TestCacheAccessPattern,
-    small_file_share: u8,
     l1_limit: u64,
     l2_limit: u64,
 }
@@ -97,7 +96,6 @@ struct BenchmarkReport {
     concurrency: usize,
     io_depth: usize,
     access_pattern: String,
-    small_file_share: u8,
     l1_limit: u64,
     l2_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -887,7 +885,6 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         concurrency: params.concurrency,
         io_depth: params.io_depth,
         access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
-        small_file_share: params.small_file_share,
         l1_limit: params.l1_limit,
         l2_limit: params.l2_limit,
         volume: None,
@@ -945,7 +942,6 @@ async fn run_mounted_end_to_end(
             concurrency: params.concurrency,
             io_depth: params.io_depth,
             access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
-            small_file_share: params.small_file_share,
             l1_limit: params.l1_limit,
             l2_limit: params.l2_limit,
             work_root: Some(work_root.display().to_string()),
@@ -1218,13 +1214,13 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     );
     let _ = writeln!(
         &mut out,
-        "Workload:  block {}, read {}, concurrency {}, io-depth {}, pattern {}, small files {}%",
+        "Workload:  100 small (1-10 KiB), 100 medium ({}), 100 large ({}), read {}, concurrency {}, io-depth {}, pattern {}",
         format_bytes(report.block_size),
+        format_bytes(report.block_size.saturating_mul(LARGE_FILE_MULTIPLIER)),
         format_bytes(report.read_size),
         report.concurrency,
         report.io_depth,
         report.access_pattern,
-        report.small_file_share,
     );
     let _ = writeln!(
         &mut out,
@@ -1339,7 +1335,6 @@ pub fn run(
     concurrency: usize,
     io_depth: usize,
     access_pattern: TestCacheAccessPattern,
-    small_file_share: u8,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
     json_output: Option<PathBuf>,
@@ -1350,10 +1345,6 @@ pub fn run(
     if concurrency == 0 {
         return Err(anyhow!("--concurrency must be >= 1"));
     }
-    if small_file_share > 100 {
-        return Err(anyhow!("--small-file-share must be in range 0..100"));
-    }
-
     let block_size = parse_size_arg("block-size", block_size.as_deref().unwrap_or("8MB"))?;
     let read_size = parse_size_arg(
         "read-size",
@@ -1383,7 +1374,6 @@ pub fn run(
         concurrency,
         io_depth,
         access_pattern,
-        small_file_share,
         l1_limit,
         l2_limit,
     };
@@ -1426,7 +1416,6 @@ mod tests {
             concurrency: 4,
             io_depth: 32,
             access_pattern: "sequential".to_string(),
-            small_file_share: 20,
             l1_limit: 2 * 1024 * 1024 * 1024,
             l2_limit: 100 * 1024 * 1024 * 1024,
             work_root: None,

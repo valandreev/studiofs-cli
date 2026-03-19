@@ -112,7 +112,6 @@ studiofs test-cache \
   --concurrency 16 \
   --io-depth 64 \
   --access-pattern mixed \
-  --small-file-share 20 \
   --l1-limit 2GB \
   --l2-limit 100GB
 ```

@@ -588,10 +588,6 @@ WARNING: This action is irreversible.")]
         #[arg(long, value_enum, default_value_t = cli::test_cache::TestCacheAccessPattern::Sequential)]
         access_pattern: cli::test_cache::TestCacheAccessPattern,
 
-        /// Percentage of small files in generated workload.
-        #[arg(long, default_value_t = 20)]
-        small_file_share: u8,
-
         /// In-memory L1 cache limit (e.g. 2GB).
         #[arg(long)]
         l1_limit: Option<String>,
@@ -754,7 +750,6 @@ fn main() -> anyhow::Result<()> {
             concurrency,
             io_depth,
             access_pattern,
-            small_file_share,
             l1_limit,
             l2_limit,
             json_output,
@@ -766,7 +761,6 @@ fn main() -> anyhow::Result<()> {
                 concurrency,
                 io_depth,
                 access_pattern,
-                small_file_share,
                 l1_limit,
                 l2_limit,
                 json_output,
@@ -1032,7 +1026,6 @@ mod tests {
                 path,
                 concurrency,
                 io_depth,
-                small_file_share,
                 block_size,
                 read_size,
                 access_pattern,
@@ -1044,7 +1037,6 @@ mod tests {
                 assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
                 assert_eq!(concurrency, 4);
                 assert_eq!(io_depth, 32);
-                assert_eq!(small_file_share, 20);
                 assert_eq!(block_size.as_deref(), None);
                 assert_eq!(read_size.as_deref(), None);
                 assert!(matches!(
@@ -1074,8 +1066,6 @@ mod tests {
             "64",
             "--access-pattern",
             "random",
-            "--small-file-share",
-            "40",
             "--l1-limit",
             "4GB",
             "--l2-limit",
@@ -1093,7 +1083,6 @@ mod tests {
                 access_pattern,
                 concurrency,
                 io_depth,
-                small_file_share,
                 l1_limit,
                 l2_limit,
                 json_output,
@@ -1108,7 +1097,6 @@ mod tests {
                 ));
                 assert_eq!(concurrency, 16);
                 assert_eq!(io_depth, 64);
-                assert_eq!(small_file_share, 40);
                 assert_eq!(l1_limit.unwrap(), "4GB");
                 assert_eq!(l2_limit.unwrap(), "1TB");
                 assert_eq!(
