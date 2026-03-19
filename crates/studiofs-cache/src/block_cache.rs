@@ -618,10 +618,32 @@ impl BlockCache {
 
         // Persist final checkpoint.
         let checkpoint_path = self.config.cache_dir.join("cache.meta");
-        if let Err(e) = self.save_checkpoint(&checkpoint_path) {
-            warn!(error = %e, "failed to save final cache checkpoint");
-        } else {
-            debug!("saved final cache checkpoint");
+        match self.prepare_checkpoint_write() {
+            Ok(Some((buf, signature))) => {
+                let path = checkpoint_path.clone();
+                match crate::runtime::spawn_blocking_profiled(
+                    "cache_checkpoint_shutdown_save",
+                    move || Self::persist_checkpoint_file(&path, &buf),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        if let Err(e) = self.record_checkpoint_signature(signature) {
+                            warn!(error = %e, "failed to record final cache checkpoint signature");
+                        } else {
+                            debug!("saved final cache checkpoint");
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "failed to save final cache checkpoint"),
+                    Err(e) => warn!(error = %e, "final checkpoint save task failed"),
+                }
+            }
+            Ok(None) => {
+                debug!("final cache checkpoint unchanged; skipping write");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to prepare final cache checkpoint");
+            }
         }
     }
 
@@ -837,7 +859,23 @@ impl BlockCache {
     // Checkpoint persistence
     // =========================================================================
 
-    fn save_checkpoint(&self, path: &Path) -> io::Result<()> {
+    fn prepare_checkpoint_write(&self) -> io::Result<Option<(Vec<u8>, (u32, u32))>> {
+        let (buf, signature) = self.build_checkpoint_payload();
+        let should_skip = {
+            let guard = self
+                .last_checkpoint_signature
+                .lock()
+                .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
+            matches!(*guard, Some(last) if last == signature)
+        };
+        if should_skip {
+            Ok(None)
+        } else {
+            Ok(Some((buf, signature)))
+        }
+    }
+
+    fn build_checkpoint_payload(&self) -> (Vec<u8>, (u32, u32)) {
         let entries = self.lru.snapshot_for_checkpoint();
         let count = entries.len() as u32;
 
@@ -870,31 +908,32 @@ impl BlockCache {
         let entry_data = &buf[crc_offset + 4..];
         let crc = crc32fast::hash(entry_data);
         buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
-        let signature = (count, crc);
+        (buf, (count, crc))
+    }
 
-        // Skip file churn when checkpoint payload is byte-identical to the
-        // last successfully persisted snapshot.
-        let should_skip = {
-            let guard = self
-                .last_checkpoint_signature
-                .lock()
-                .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
-            matches!(*guard, Some(last) if last == signature)
-        };
-        if should_skip {
-            return Ok(());
-        }
-
-        // Atomic write: tmp + rename.
+    fn persist_checkpoint_file(path: &Path, buf: &[u8]) -> io::Result<()> {
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)?;
+        std::fs::write(&tmp, buf)?;
         std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
 
+    fn record_checkpoint_signature(&self, signature: (u32, u32)) -> io::Result<()> {
         let mut guard = self
             .last_checkpoint_signature
             .lock()
             .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
         *guard = Some(signature);
+        Ok(())
+    }
+
+    fn save_checkpoint(&self, path: &Path) -> io::Result<()> {
+        let Some((buf, signature)) = self.prepare_checkpoint_write()? else {
+            return Ok(());
+        };
+
+        Self::persist_checkpoint_file(path, &buf)?;
+        self.record_checkpoint_signature(signature)?;
 
         Ok(())
     }
