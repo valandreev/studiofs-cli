@@ -316,6 +316,7 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `512` | L2 commit queue capacity before enqueue backpressure |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
+| `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |
 | `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |
 | `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Periodic ingress checkpoint cadence |
 | `STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES` | `64MB` | Immediate checkpoint trigger on uncheckpointed ingress bytes |
