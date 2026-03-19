@@ -153,6 +153,9 @@ Notes:
 - If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
   through that mounted process and writes temp workload files into
   `<path>/.studiofs-test-cache`.
+- Terminal output is a readable benchmark summary. The full structured JSON
+  report is saved in the directory where `studiofs test-cache` was started,
+  using an auto-generated file name unless `--json-output <path>` is provided.
 - `direct-l2` JSON output includes a `cache_pipeline` section with:
   - `l2_read` / `l2_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics

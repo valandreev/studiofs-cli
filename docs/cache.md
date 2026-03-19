@@ -189,7 +189,9 @@ benchmarks:
 
 Runtime logs (`upload pipeline counters`) include these metrics continuously
 while the pipeline is active. `studiofs test-cache <cache-dir>` also emits
-the cache pipeline snapshot in JSON under `cache_pipeline`.
+the cache pipeline snapshot in its saved JSON report under `cache_pipeline`,
+while the terminal keeps a human-readable summary focused on the benchmark
+results.
 
 ## Crash Recovery
 

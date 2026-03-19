@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::Serialize;
 use std::fmt::Write as _;
@@ -996,59 +997,334 @@ async fn run_mounted_end_to_end(
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    let mut out = String::new();
-    let units = ["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut value = bytes as f64;
-    let mut i = 0usize;
-    while value >= 1024.0 && i + 1 < units.len() {
+fn format_binary_value(mut value: f64) -> (f64, &'static str) {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut unit = units[0];
+    for next_unit in units.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
         value /= 1024.0;
-        i += 1;
+        unit = next_unit;
     }
-    let _ = write!(&mut out, "{value:.2}{}", units[i]);
+    (value, unit)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let (value, unit) = format_binary_value(bytes as f64);
+    if unit == "B" {
+        format!("{value:.0} {unit}")
+    } else {
+        format!("{value:.2} {unit}")
+    }
+}
+
+fn format_throughput(bytes_per_sec: f64) -> String {
+    let (value, unit) = format_binary_value(bytes_per_sec.max(0.0));
+    if unit == "B" {
+        format!("{value:.0} {unit}/s")
+    } else {
+        format!("{value:.2} {unit}/s")
+    }
+}
+
+fn format_duration_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.2} s", ms / 1000.0)
+    } else {
+        format!("{ms:.2} ms")
+    }
+}
+
+fn avg_latency_ms(total_latency_ns: u64, ops: u64) -> f64 {
+    if ops == 0 {
+        0.0
+    } else {
+        total_latency_ns as f64 / ops as f64 / 1_000_000.0
+    }
+}
+
+fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in rows {
+        assert_eq!(row.len(), headers.len(), "table row width mismatch");
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(cell.len());
+        }
+    }
+
+    let mut out = String::new();
+    let write_border = |out: &mut String| {
+        out.push('+');
+        for width in &widths {
+            out.push_str(&"-".repeat(*width + 2));
+            out.push('+');
+        }
+        out.push('\n');
+    };
+
+    let write_row = |out: &mut String, cells: &[String]| {
+        out.push('|');
+        for (idx, cell) in cells.iter().enumerate() {
+            let _ = write!(out, " {:<width$} |", cell, width = widths[idx]);
+        }
+        out.push('\n');
+    };
+
+    write_border(&mut out);
+    let header_cells: Vec<String> = headers.iter().map(|header| (*header).to_string()).collect();
+    write_row(&mut out, &header_cells);
+    write_border(&mut out);
+    for row in rows {
+        write_row(&mut out, row);
+    }
+    write_border(&mut out);
     out
 }
 
-fn print_human_summary(report: &BenchmarkReport) {
-    println!("Benchmark summary");
-    println!("  mode: {}", report.mode);
-    println!("  cache-dir: {}", report.cache_dir);
+fn slugify_report_segment(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "report".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn default_report_file_name(report: &BenchmarkReport, now: DateTime<Utc>) -> String {
+    format!(
+        "studiofs-test-cache-{}-{}.json",
+        slugify_report_segment(&report.mode),
+        now.format("%Y%m%d-%H%M%S"),
+    )
+}
+
+fn next_available_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("studiofs-test-cache");
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+
+    for suffix in 2.. {
+        let candidate_name = if extension.is_empty() {
+            format!("{stem}-{suffix}")
+        } else {
+            format!("{stem}-{suffix}.{extension}")
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!("integer suffix iteration is unbounded")
+}
+
+fn resolve_report_path(
+    report: &BenchmarkReport,
+    json_output: Option<&Path>,
+    current_dir: &Path,
+    now: DateTime<Utc>,
+) -> PathBuf {
+    if let Some(json_output) = json_output {
+        let explicit = if json_output.is_absolute() {
+            json_output.to_path_buf()
+        } else {
+            current_dir.join(json_output)
+        };
+        if explicit.is_dir() {
+            return next_available_path(explicit.join(default_report_file_name(report, now)));
+        }
+        return explicit;
+    }
+
+    next_available_path(current_dir.join(default_report_file_name(report, now)))
+}
+
+fn save_benchmark_report_in(
+    report: &BenchmarkReport,
+    json_output: Option<&Path>,
+    current_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<PathBuf> {
+    let report_path = resolve_report_path(report, json_output, current_dir, now);
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create report dir {}", parent.display()))?;
+    }
+    let json =
+        serde_json::to_vec_pretty(report).context("serialize benchmark report as JSON report")?;
+    std::fs::write(&report_path, json)
+        .with_context(|| format!("write benchmark report {}", report_path.display()))?;
+    Ok(report_path)
+}
+
+fn save_benchmark_report(report: &BenchmarkReport, json_output: Option<&Path>) -> Result<PathBuf> {
+    let current_dir = std::env::current_dir().context("resolve current working directory")?;
+    save_benchmark_report_in(report, json_output, &current_dir, Utc::now())
+}
+
+fn render_human_summary(report: &BenchmarkReport) -> String {
+    let mut out = String::new();
+    let target_label = if report.mode == "direct-l2" {
+        "Cache dir"
+    } else {
+        "Target"
+    };
+
+    let _ = writeln!(&mut out, "Cache benchmark");
+    let _ = writeln!(&mut out, "{target_label}: {}", report.cache_dir);
+    let _ = writeln!(&mut out, "Mode:      {}", report.mode);
     if let Some(volume) = &report.volume {
-        println!("  volume: {volume}");
+        let _ = writeln!(&mut out, "Volume:    {volume}");
     }
     if let Some(mount_point) = &report.mount_point {
-        println!("  mount: {mount_point}");
+        let _ = writeln!(&mut out, "Mount:     {mount_point}");
     }
-    println!("  elapsed: {:.2} ms", report.total_elapsed_ms);
-    println!(
-        "  reads: {} ops ({}), writes: {} ops ({})",
-        report.reads.operations,
-        format_bytes(report.reads.bytes),
-        report.writes.operations,
-        format_bytes(report.writes.bytes),
+    if let Some(work_root) = &report.work_root {
+        let _ = writeln!(&mut out, "Work root: {work_root}");
+    }
+    let _ = writeln!(&mut out, "Started:   {}", report.started_at);
+    let _ = writeln!(&mut out, "Completed: {}", report.completed_at);
+    let _ = writeln!(
+        &mut out,
+        "Elapsed:   {}",
+        format_duration_ms(report.total_elapsed_ms)
     );
-    println!(
-        "  read throughput: {:.2} MiB/s",
-        report.reads.throughput_bytes_per_sec / 1024.0 / 1024.0
+    let _ = writeln!(
+        &mut out,
+        "Workload:  block {}, read {}, concurrency {}, io-depth {}, pattern {}, small files {}%",
+        format_bytes(report.block_size),
+        format_bytes(report.read_size),
+        report.concurrency,
+        report.io_depth,
+        report.access_pattern,
+        report.small_file_share,
     );
-    println!(
-        "  write throughput: {:.2} MiB/s",
-        report.writes.throughput_bytes_per_sec / 1024.0 / 1024.0
+    let _ = writeln!(
+        &mut out,
+        "Limits:    L1 {}, L2 {}",
+        format_bytes(report.l1_limit),
+        format_bytes(report.l2_limit),
     );
-    if let Some(pipeline) = &report.cache_pipeline {
-        println!(
-            "  cache L2 ops: read={} write={} (queue depth now={}, peak={})",
-            pipeline.l2_read.ops,
-            pipeline.l2_write.ops,
-            pipeline.upload_queue.pending_depth,
-            pipeline.upload_queue.pending_depth_peak
+    if report.l1_bytes.is_some() || report.l2_bytes.is_some() {
+        let _ = writeln!(
+            &mut out,
+            "Resident:  L1 {}, L2 {}",
+            report
+                .l1_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "-".to_string()),
+            report
+                .l2_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "-".to_string()),
         );
     }
-    println!("  JSON");
-    println!(
+    out.push('\n');
+    let _ = writeln!(&mut out, "Operation results");
+    let operation_rows = vec![
+        vec![
+            "Write".to_string(),
+            report.writes.operations.to_string(),
+            format_bytes(report.writes.bytes),
+            format_throughput(report.writes.throughput_bytes_per_sec),
+            format_duration_ms(report.writes.avg_latency_ms),
+            format_duration_ms(report.writes.p95_ms),
+            format_duration_ms(report.writes.p99_ms),
+        ],
+        vec![
+            "Read".to_string(),
+            report.reads.operations.to_string(),
+            format_bytes(report.reads.bytes),
+            format_throughput(report.reads.throughput_bytes_per_sec),
+            format_duration_ms(report.reads.avg_latency_ms),
+            format_duration_ms(report.reads.p95_ms),
+            format_duration_ms(report.reads.p99_ms),
+        ],
+    ];
+    let _ = write!(
+        &mut out,
         "{}",
-        serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+        format_table(
+            &["Phase", "Ops", "Data", "Throughput", "Avg", "P95", "P99"],
+            &operation_rows,
+        )
     );
+
+    if let Some(pipeline) = &report.cache_pipeline {
+        out.push('\n');
+        let _ = writeln!(&mut out, "Cache pipeline");
+        let pipeline_rows = vec![
+            vec![
+                "L2 write".to_string(),
+                pipeline.l2_write.ops.to_string(),
+                format_bytes(pipeline.l2_write.bytes),
+                format_duration_ms(avg_latency_ms(
+                    pipeline.l2_write.total_latency_ns,
+                    pipeline.l2_write.ops,
+                )),
+                format_duration_ms(pipeline.l2_write.max_latency_ns as f64 / 1_000_000.0),
+            ],
+            vec![
+                "L2 read".to_string(),
+                pipeline.l2_read.ops.to_string(),
+                format_bytes(pipeline.l2_read.bytes),
+                format_duration_ms(avg_latency_ms(
+                    pipeline.l2_read.total_latency_ns,
+                    pipeline.l2_read.ops,
+                )),
+                format_duration_ms(pipeline.l2_read.max_latency_ns as f64 / 1_000_000.0),
+            ],
+        ];
+        let _ = write!(
+            &mut out,
+            "{}",
+            format_table(&["Stage", "Ops", "Data", "Avg", "Max"], &pipeline_rows)
+        );
+        let _ = writeln!(
+            &mut out,
+            "Upload queue: depth {} (peak {}), submitted {}, completed {}, requeued {}, canceled {}",
+            pipeline.upload_queue.pending_depth,
+            pipeline.upload_queue.pending_depth_peak,
+            pipeline.upload_queue.submitted,
+            pipeline.upload_queue.completed,
+            pipeline.upload_queue.requeued,
+            pipeline.upload_queue.canceled,
+        );
+        let _ = writeln!(
+            &mut out,
+            "Materialize: {} batches, {} blocks, {}, inflight {} (peak {})",
+            pipeline.materialize_batches.batches,
+            pipeline.materialize_batches.blocks,
+            format_bytes(pipeline.materialize_batches.bytes),
+            pipeline.materialize_batches.inflight_batches,
+            pipeline.materialize_batches.inflight_batches_peak,
+        );
+    }
+
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1062,6 +1338,7 @@ pub fn run(
     small_file_share: u8,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
+    json_output: Option<PathBuf>,
 ) -> Result<()> {
     if io_depth == 0 {
         return Err(anyhow!("--io-depth must be >= 1"));
@@ -1121,13 +1398,101 @@ pub fn run(
         }
     })?;
 
-    print_human_summary(&report);
+    print!("{}", render_human_summary(&report));
+    let report_path = save_benchmark_report(&report, json_output.as_deref())?;
+    println!("JSON report: {}", report_path.display());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use tempfile::tempdir;
+
+    fn sample_report() -> BenchmarkReport {
+        BenchmarkReport {
+            mode: "direct-l2".to_string(),
+            cache_dir: r"D:\test-cache".to_string(),
+            started_at: "2026-03-18T15:12:55Z".to_string(),
+            completed_at: "2026-03-18T15:12:55Z".to_string(),
+            total_elapsed_ms: 93.05,
+            block_size: 8 * 1024 * 1024,
+            read_size: 8 * 1024 * 1024,
+            concurrency: 4,
+            io_depth: 32,
+            access_pattern: "sequential".to_string(),
+            small_file_share: 20,
+            l1_limit: 2 * 1024 * 1024 * 1024,
+            l2_limit: 100 * 1024 * 1024 * 1024,
+            work_root: None,
+            volume: None,
+            mount_point: None,
+            l1_bytes: Some(128 * 1024 * 1024),
+            l2_bytes: Some(0),
+            cache_pipeline: Some(CachePipelineReport {
+                l2_read: IoStatsReport {
+                    ops: 0,
+                    bytes: 0,
+                    total_latency_ns: 0,
+                    max_latency_ns: 0,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![0],
+                    },
+                },
+                l2_write: IoStatsReport {
+                    ops: 16,
+                    bytes: 128 * 1024 * 1024,
+                    total_latency_ns: 64_000_000,
+                    max_latency_ns: 8_000_000,
+                    latency_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![16],
+                    },
+                },
+                materialize_batches: MaterializeBatchStatsReport {
+                    batches: 4,
+                    blocks: 16,
+                    bytes: 128 * 1024 * 1024,
+                    inflight_batches: 0,
+                    inflight_batches_peak: 2,
+                    duration_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![4],
+                    },
+                },
+                upload_queue: UploadQueueStatsReport {
+                    pending_depth: 0,
+                    pending_depth_peak: 3,
+                    submitted: 16,
+                    completed: 16,
+                    requeued: 0,
+                    canceled: 0,
+                },
+            }),
+            writes: OpReport {
+                operations: 16,
+                bytes: 128 * 1024 * 1024,
+                elapsed_ms: 80.0,
+                avg_latency_ms: 5.0,
+                p50_ms: 4.7,
+                p95_ms: 8.3,
+                p99_ms: 8.8,
+                throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
+            },
+            reads: OpReport {
+                operations: 16,
+                bytes: 128 * 1024 * 1024,
+                elapsed_ms: 78.0,
+                avg_latency_ms: 4.8,
+                p50_ms: 4.5,
+                p95_ms: 8.1,
+                p99_ms: 8.6,
+                throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
+            },
+        }
+    }
 
     #[test]
     fn mount_path_detection_handles_nested_paths() {
@@ -1157,5 +1522,67 @@ mod tests {
         let mount = PathBuf::from(r"\\server\share\studiofs");
         let target = PathBuf::from(r"\\?\UNC\server\share\studiofs\bench");
         assert!(is_path_under_mount(&target, &mount));
+    }
+
+    #[test]
+    fn default_report_path_uses_current_dir_and_avoids_collisions() {
+        let temp = tempdir().unwrap();
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let first = resolve_report_path(&report, None, temp.path(), now);
+        assert_eq!(
+            first,
+            temp.path()
+                .join("studiofs-test-cache-direct-l2-20260319-151255.json")
+        );
+
+        std::fs::write(&first, b"{}").unwrap();
+
+        let second = resolve_report_path(&report, None, temp.path(), now);
+        assert_eq!(
+            second,
+            temp.path()
+                .join("studiofs-test-cache-direct-l2-20260319-151255-2.json")
+        );
+    }
+
+    #[test]
+    fn save_benchmark_report_writes_pretty_json_to_requested_path() {
+        let temp = tempdir().unwrap();
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved = save_benchmark_report_in(
+            &report,
+            Some(Path::new("reports/cache-run.json")),
+            temp.path(),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(saved, temp.path().join("reports/cache-run.json"));
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["mode"], "direct-l2");
+        assert!(content.contains("\n  \"mode\""));
+    }
+
+    #[test]
+    fn render_human_summary_is_table_oriented_without_json_blob() {
+        let summary = render_human_summary(&sample_report());
+        assert!(summary.contains("Operation results"));
+        assert!(summary.contains("| Phase |"));
+        assert!(summary.contains("Cache pipeline"));
+        assert!(summary.contains("Upload queue:"));
+        assert!(!summary.contains("\"cache_pipeline\""));
+        assert!(!summary.contains("\"mode\""));
     }
 }
