@@ -145,6 +145,12 @@ impl L2CommitScheduler {
     }
 }
 
+#[derive(Debug)]
+struct LoadedCheckpoint {
+    entries: Vec<CheckpointEntry>,
+    signature: (u32, u32),
+}
+
 // =============================================================================
 // BlockCache
 // =============================================================================
@@ -169,6 +175,9 @@ pub struct BlockCache {
     l2_commit_scheduler: L2CommitScheduler,
     /// Cache-pipeline observability for throughput/latency/queue depth.
     metrics: CachePipelineMetrics,
+    /// Last persisted checkpoint signature: `(entry_count, crc32(entries))`.
+    /// Used to skip redundant tmp+rename cycles when metadata is unchanged.
+    last_checkpoint_signature: std::sync::Mutex<Option<(u32, u32)>>,
 }
 
 impl BlockCache {
@@ -189,7 +198,11 @@ impl BlockCache {
 
         // Try loading checkpoint, then reconcile with actual files on disk.
         let checkpoint_path = config.cache_dir.join("cache.meta");
-        let checkpoint_entries = load_checkpoint(&checkpoint_path).unwrap_or_default();
+        let loaded_checkpoint = load_checkpoint(&checkpoint_path).ok();
+        let (checkpoint_entries, initial_checkpoint_signature) = match loaded_checkpoint {
+            Some(loaded) => (loaded.entries, Some(loaded.signature)),
+            None => (Vec::new(), None),
+        };
         let had_checkpoint = !checkpoint_entries.is_empty();
 
         // Scan disk to find actual block files.
@@ -252,6 +265,7 @@ impl BlockCache {
             shutdown_notify,
             l2_commit_scheduler,
             metrics,
+            last_checkpoint_signature: std::sync::Mutex::new(initial_checkpoint_signature),
         });
 
         Ok((cache, upload_rx))
@@ -325,7 +339,7 @@ impl BlockCache {
 
         // Write to L2 (NVMe file) — async, non-blocking.
         let started = Instant::now();
-        self.l2.put(object_id, &data).await?;
+        self.l2.put_bytes(object_id, data.clone()).await?;
         self.metrics
             .l2_write
             .record(data.len() as u64, started.elapsed());
@@ -604,10 +618,32 @@ impl BlockCache {
 
         // Persist final checkpoint.
         let checkpoint_path = self.config.cache_dir.join("cache.meta");
-        if let Err(e) = self.save_checkpoint(&checkpoint_path) {
-            warn!(error = %e, "failed to save final cache checkpoint");
-        } else {
-            debug!("saved final cache checkpoint");
+        match self.prepare_checkpoint_write() {
+            Ok(Some((buf, signature))) => {
+                let path = checkpoint_path.clone();
+                match crate::runtime::spawn_blocking_profiled(
+                    "cache_checkpoint_shutdown_save",
+                    move || Self::persist_checkpoint_file(&path, &buf),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        if let Err(e) = self.record_checkpoint_signature(signature) {
+                            warn!(error = %e, "failed to record final cache checkpoint signature");
+                        } else {
+                            debug!("saved final cache checkpoint");
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "failed to save final cache checkpoint"),
+                    Err(e) => warn!(error = %e, "final checkpoint save task failed"),
+                }
+            }
+            Ok(None) => {
+                debug!("final cache checkpoint unchanged; skipping write");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to prepare final cache checkpoint");
+            }
         }
     }
 
@@ -688,7 +724,7 @@ impl BlockCache {
             let mut completed = false;
             while attempts < L2_COMMIT_MAX_ATTEMPTS {
                 attempts += 1;
-                match self.l2.put(job.object_id, &job.data).await {
+                match self.l2.put_bytes(job.object_id, job.data.clone()).await {
                     Ok(()) => {
                         self.metrics
                             .l2_write
@@ -801,8 +837,19 @@ impl BlockCache {
             }
 
             let path = self.config.cache_dir.join("cache.meta");
-            if let Err(e) = self.save_checkpoint(&path) {
-                warn!(error = %e, "failed to save cache checkpoint");
+            let cache = Arc::clone(&self);
+            match crate::runtime::spawn_blocking_profiled("cache_checkpoint_save", move || {
+                cache.save_checkpoint(&path)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "failed to save cache checkpoint");
+                }
+                Err(e) => {
+                    warn!(error = %e, "checkpoint save task failed");
+                }
             }
         }
         debug!("background checkpoint stopped");
@@ -812,7 +859,23 @@ impl BlockCache {
     // Checkpoint persistence
     // =========================================================================
 
-    fn save_checkpoint(&self, path: &Path) -> io::Result<()> {
+    fn prepare_checkpoint_write(&self) -> io::Result<Option<(Vec<u8>, (u32, u32))>> {
+        let (buf, signature) = self.build_checkpoint_payload();
+        let should_skip = {
+            let guard = self
+                .last_checkpoint_signature
+                .lock()
+                .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
+            matches!(*guard, Some(last) if last == signature)
+        };
+        if should_skip {
+            Ok(None)
+        } else {
+            Ok(Some((buf, signature)))
+        }
+    }
+
+    fn build_checkpoint_payload(&self) -> (Vec<u8>, (u32, u32)) {
         let entries = self.lru.snapshot_for_checkpoint();
         let count = entries.len() as u32;
 
@@ -845,18 +908,39 @@ impl BlockCache {
         let entry_data = &buf[crc_offset + 4..];
         let crc = crc32fast::hash(entry_data);
         buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+        (buf, (count, crc))
+    }
 
-        // Atomic write: tmp + rename.
+    fn persist_checkpoint_file(path: &Path, buf: &[u8]) -> io::Result<()> {
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)?;
+        std::fs::write(&tmp, buf)?;
         std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn record_checkpoint_signature(&self, signature: (u32, u32)) -> io::Result<()> {
+        let mut guard = self
+            .last_checkpoint_signature
+            .lock()
+            .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
+        *guard = Some(signature);
+        Ok(())
+    }
+
+    fn save_checkpoint(&self, path: &Path) -> io::Result<()> {
+        let Some((buf, signature)) = self.prepare_checkpoint_write()? else {
+            return Ok(());
+        };
+
+        Self::persist_checkpoint_file(path, &buf)?;
+        self.record_checkpoint_signature(signature)?;
 
         Ok(())
     }
 }
 
-/// Load a checkpoint file.  Returns empty vec on any error.
-fn load_checkpoint(path: &Path) -> io::Result<Vec<CheckpointEntry>> {
+/// Load and validate a checkpoint file.
+fn load_checkpoint(path: &Path) -> io::Result<LoadedCheckpoint> {
     let data = std::fs::read(path)?;
     let header_size = checkpoint::MAGIC.len() + 2 + 4 + 4; // magic(6) + version(2) + count(4) + crc(4)
     if data.len() < header_size {
@@ -918,7 +1002,10 @@ fn load_checkpoint(path: &Path) -> io::Result<Vec<CheckpointEntry>> {
         });
     }
 
-    Ok(entries)
+    Ok(LoadedCheckpoint {
+        entries,
+        signature: (count as u32, stored_crc),
+    })
 }
 
 // =============================================================================
@@ -1000,6 +1087,27 @@ mod tests {
             let got = cache.get(2).await.unwrap();
             assert_eq!(got, Bytes::from_static(b"bbb"));
         }
+    }
+
+    #[tokio::test]
+    async fn reopen_initializes_checkpoint_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        {
+            let (cache, _rx) = BlockCache::open(config.clone()).unwrap();
+            cache.put(11, Bytes::from_static(b"seed")).await.unwrap();
+            cache.shutdown().await;
+        }
+
+        let (cache, _rx) = BlockCache::open(config).unwrap();
+        let signature = cache
+            .last_checkpoint_signature
+            .lock()
+            .unwrap()
+            .as_ref()
+            .copied();
+        assert!(signature.is_some());
     }
 
     #[tokio::test]
