@@ -46,11 +46,6 @@ where
         let queue_wait = queued_at.elapsed();
         let queue_wait_ns = queue_wait.as_nanos().min(u64::MAX as u128) as u64;
         let _guard_total = blocking_task_registry().total.record_start(queue_wait);
-        let kind_stats = blocking_task_registry()
-            .by_kind
-            .entry(task_kind)
-            .or_insert_with(|| Arc::new(BlockingTaskStats::default()))
-            .clone();
         let _guard_kind = kind_stats.record_start(queue_wait);
         if tracing::enabled!(target: "studiofs.cache.profile", tracing::Level::TRACE) {
             tracing::trace!(
