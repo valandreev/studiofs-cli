@@ -239,6 +239,18 @@ pub struct BlockingTaskStatsSnapshot {
     pub execution_histogram: LatencyHistogramSnapshot,
 }
 
+#[derive(Debug, Clone)]
+pub struct BlockingTaskKindStatsSnapshot {
+    pub task_kind: String,
+    pub stats: BlockingTaskStatsSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockingTaskMetricsSnapshot {
+    pub total: BlockingTaskStatsSnapshot,
+    pub by_kind: Vec<BlockingTaskKindStatsSnapshot>,
+}
+
 #[derive(Debug, Default)]
 pub struct BlockingTaskStats {
     active: AtomicUsize,
@@ -297,6 +309,11 @@ impl BlockingTaskStats {
         }
     }
 
+    /// Best-effort reset for observability counters.
+    ///
+    /// This method intentionally uses per-field relaxed stores. Concurrent task
+    /// start/finish events can interleave with reset, so snapshots immediately
+    /// after reset may be transiently inconsistent.
     pub fn reset(&self) {
         self.active.store(0, Ordering::Relaxed);
         self.active_peak.store(0, Ordering::Relaxed);
@@ -339,7 +356,7 @@ pub struct CachePipelineMetricsSnapshot {
     pub l2_write: IoStatsSnapshot,
     pub materialize_batches: MaterializeBatchStatsSnapshot,
     pub upload_queue: UploadQueueStatsSnapshot,
-    pub blocking_tasks: BlockingTaskStatsSnapshot,
+    pub blocking_tasks: BlockingTaskMetricsSnapshot,
 }
 
 #[derive(Debug, Default)]

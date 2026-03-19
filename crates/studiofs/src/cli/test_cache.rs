@@ -165,6 +165,18 @@ struct CachePipelineReport {
 
 #[derive(Debug, Serialize)]
 struct BlockingTaskStatsReport {
+    total: BlockingTaskSingleStatsReport,
+    by_kind: Vec<BlockingTaskKindStatsReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockingTaskKindStatsReport {
+    task_kind: String,
+    stats: BlockingTaskSingleStatsReport,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockingTaskSingleStatsReport {
     active: usize,
     active_peak: usize,
     submitted: u64,
@@ -240,35 +252,46 @@ impl From<studiofs_cache::metrics::UploadQueueStatsSnapshot> for UploadQueueStat
 
 impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
     fn from(snapshot: CachePipelineMetricsSnapshot) -> Self {
-        let queue_wait_avg_ms = if snapshot.blocking_tasks.started == 0 {
-            0.0
-        } else {
-            snapshot.blocking_tasks.queue_wait_total_ns as f64
-                / snapshot.blocking_tasks.started as f64
-                / 1_000_000.0
+        let to_report = |stats: &studiofs_cache::metrics::BlockingTaskStatsSnapshot| {
+            BlockingTaskSingleStatsReport {
+                active: stats.active,
+                active_peak: stats.active_peak,
+                submitted: stats.submitted,
+                started: stats.started,
+                completed: stats.completed,
+                queue_wait_avg_ms: if stats.started == 0 {
+                    0.0
+                } else {
+                    stats.queue_wait_total_ns as f64 / stats.started as f64 / 1_000_000.0
+                },
+                queue_wait_max_ms: stats.queue_wait_max_ns as f64 / 1_000_000.0,
+                execution_avg_ms: if stats.completed == 0 {
+                    0.0
+                } else {
+                    stats.execution_total_ns as f64 / stats.completed as f64 / 1_000_000.0
+                },
+                execution_max_ms: stats.execution_max_ns as f64 / 1_000_000.0,
+            }
         };
-        let execution_avg_ms = if snapshot.blocking_tasks.completed == 0 {
-            0.0
-        } else {
-            snapshot.blocking_tasks.execution_total_ns as f64
-                / snapshot.blocking_tasks.completed as f64
-                / 1_000_000.0
-        };
+        let mut by_kind: Vec<BlockingTaskKindStatsReport> = snapshot
+            .blocking_tasks
+            .by_kind
+            .iter()
+            .map(|item| BlockingTaskKindStatsReport {
+                task_kind: item.task_kind.clone(),
+                stats: to_report(&item.stats),
+            })
+            .collect();
+        by_kind.sort_by(|a, b| b.stats.submitted.cmp(&a.stats.submitted));
+
         Self {
             l2_read: snapshot.l2_read.into(),
             l2_write: snapshot.l2_write.into(),
             materialize_batches: snapshot.materialize_batches.into(),
             upload_queue: snapshot.upload_queue.into(),
             blocking_tasks: BlockingTaskStatsReport {
-                active: snapshot.blocking_tasks.active,
-                active_peak: snapshot.blocking_tasks.active_peak,
-                submitted: snapshot.blocking_tasks.submitted,
-                started: snapshot.blocking_tasks.started,
-                completed: snapshot.blocking_tasks.completed,
-                queue_wait_avg_ms,
-                queue_wait_max_ms: snapshot.blocking_tasks.queue_wait_max_ns as f64 / 1_000_000.0,
-                execution_avg_ms,
-                execution_max_ms: snapshot.blocking_tasks.execution_max_ns as f64 / 1_000_000.0,
+                total: to_report(&snapshot.blocking_tasks.total),
+                by_kind,
             },
         }
     }
@@ -308,9 +331,10 @@ impl LatencySamples {
 
     fn avg_ns(&self) -> f64 {
         if self.total_ops == 0 {
-            return 0.0;
+            0.0
+        } else {
+            self.total_latency_ns as f64 / self.total_ops as f64
         }
-        self.total_latency_ns as f64 / self.total_ops as f64
     }
 
     fn percentile_ns(&self, p: f64) -> u64 {
@@ -950,6 +974,10 @@ fn process_cpu_time() -> Option<Duration> {
             )
         };
         if ok == 0 {
+            tracing::warn!(
+                target: "studiofs.cache.profile",
+                "GetProcessTimes failed; CPU profile sample unavailable on this call"
+            );
             return None;
         }
         let ft_to_u64 =
@@ -1554,16 +1582,29 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         let _ = writeln!(
             &mut out,
             "Blocking tasks: active {} (peak {}), submitted {}, started {}, completed {}, queue wait avg {}, max {}, exec avg {}, max {}",
-            pipeline.blocking_tasks.active,
-            pipeline.blocking_tasks.active_peak,
-            pipeline.blocking_tasks.submitted,
-            pipeline.blocking_tasks.started,
-            pipeline.blocking_tasks.completed,
-            format_duration_ms(pipeline.blocking_tasks.queue_wait_avg_ms),
-            format_duration_ms(pipeline.blocking_tasks.queue_wait_max_ms),
-            format_duration_ms(pipeline.blocking_tasks.execution_avg_ms),
-            format_duration_ms(pipeline.blocking_tasks.execution_max_ms),
+            pipeline.blocking_tasks.total.active,
+            pipeline.blocking_tasks.total.active_peak,
+            pipeline.blocking_tasks.total.submitted,
+            pipeline.blocking_tasks.total.started,
+            pipeline.blocking_tasks.total.completed,
+            format_duration_ms(pipeline.blocking_tasks.total.queue_wait_avg_ms),
+            format_duration_ms(pipeline.blocking_tasks.total.queue_wait_max_ms),
+            format_duration_ms(pipeline.blocking_tasks.total.execution_avg_ms),
+            format_duration_ms(pipeline.blocking_tasks.total.execution_max_ms),
         );
+        if !pipeline.blocking_tasks.by_kind.is_empty() {
+            let _ = writeln!(&mut out, "Blocking tasks by kind:");
+            for kind in &pipeline.blocking_tasks.by_kind {
+                let _ = writeln!(
+                    &mut out,
+                    "- {}: submitted {}, queue wait avg {}, max {}",
+                    kind.task_kind,
+                    kind.stats.submitted,
+                    format_duration_ms(kind.stats.queue_wait_avg_ms),
+                    format_duration_ms(kind.stats.queue_wait_max_ms),
+                );
+            }
+        }
     }
 
     if let Some(profile) = &report.profile {
@@ -1737,15 +1778,47 @@ mod tests {
                     canceled: 0,
                 },
                 blocking_tasks: BlockingTaskStatsReport {
-                    active: 0,
-                    active_peak: 4,
-                    submitted: 32,
-                    started: 32,
-                    completed: 32,
-                    queue_wait_avg_ms: 0.2,
-                    queue_wait_max_ms: 1.5,
-                    execution_avg_ms: 3.1,
-                    execution_max_ms: 9.4,
+                    total: BlockingTaskSingleStatsReport {
+                        active: 0,
+                        active_peak: 4,
+                        submitted: 32,
+                        started: 32,
+                        completed: 32,
+                        queue_wait_avg_ms: 0.2,
+                        queue_wait_max_ms: 1.5,
+                        execution_avg_ms: 3.1,
+                        execution_max_ms: 9.4,
+                    },
+                    by_kind: vec![
+                        BlockingTaskKindStatsReport {
+                            task_kind: "l2_put_batch".to_string(),
+                            stats: BlockingTaskSingleStatsReport {
+                                active: 0,
+                                active_peak: 3,
+                                submitted: 16,
+                                started: 16,
+                                completed: 16,
+                                queue_wait_avg_ms: 0.3,
+                                queue_wait_max_ms: 1.5,
+                                execution_avg_ms: 3.7,
+                                execution_max_ms: 9.4,
+                            },
+                        },
+                        BlockingTaskKindStatsReport {
+                            task_kind: "l2_get_batch".to_string(),
+                            stats: BlockingTaskSingleStatsReport {
+                                active: 0,
+                                active_peak: 2,
+                                submitted: 16,
+                                started: 16,
+                                completed: 16,
+                                queue_wait_avg_ms: 0.1,
+                                queue_wait_max_ms: 0.6,
+                                execution_avg_ms: 2.5,
+                                execution_max_ms: 7.8,
+                            },
+                        },
+                    ],
                 },
             }),
             profile: Some(BenchmarkProfileReport {
