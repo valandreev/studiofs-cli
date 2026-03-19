@@ -96,6 +96,8 @@ struct BenchmarkReport {
     l1_limit: u64,
     l2_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    work_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     volume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mount_point: Option<String>,
@@ -737,6 +739,36 @@ fn normalize_path_for_compare(path: &Path) -> Option<String> {
     }
 }
 
+fn cleanup_stale_mounts() -> Result<()> {
+    let mounts_dir = super::utils::get_mounts_dir()?;
+    for entry in std::fs::read_dir(&mounts_dir)
+        .with_context(|| format!("read mounts dir {}", mounts_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))?;
+        let Some(pid) = parsed.get("pid").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(mount_point) = parsed
+            .get("mount_point")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !super::utils::is_process_running(pid as u32) {
+            let _ = super::utils::remove_pid_file(mount_point);
+        }
+    }
+    Ok(())
+}
+
 fn is_path_under_mount(target: &Path, mount_point: &Path) -> bool {
     let Some(target_norm) = normalize_path_for_compare(target) else {
         return false;
@@ -778,9 +810,7 @@ fn active_mounts() -> Result<Vec<ActiveMount>> {
             .get("volume")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-
         if !super::utils::is_process_running(pid as u32) {
-            let _ = super::utils::remove_pid_file(mount_point);
             continue;
         }
         mounts.push(ActiveMount {
@@ -792,6 +822,7 @@ fn active_mounts() -> Result<Vec<ActiveMount>> {
 }
 
 fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
+    cleanup_stale_mounts()?;
     let mut best: Option<ActiveMount> = None;
     for mount in active_mounts()? {
         if is_path_under_mount(target, &mount.mount_point) {
@@ -879,6 +910,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         l1_bytes: Some(cache_stats.l1_bytes),
         l2_bytes: Some(cache_stats.l2_bytes),
         cache_pipeline: Some(cache.cache_pipeline_metrics().into()),
+        work_root: None,
         writes: writes.to_report(total_elapsed_ms),
         reads: reads.to_report(total_elapsed_ms),
     })
@@ -937,6 +969,7 @@ async fn run_mounted_end_to_end(
             small_file_share: params.small_file_share,
             l1_limit: params.l1_limit,
             l2_limit: params.l2_limit,
+            work_root: Some(work_root.display().to_string()),
             volume: Some(volume.to_string()),
             mount_point: Some(mount_point.display().to_string()),
             l1_bytes: None,
