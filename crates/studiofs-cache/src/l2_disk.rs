@@ -221,27 +221,35 @@ impl L2DiskCache {
         }
     }
 
-    /// Write a block to disk (decompressed data).
+    /// Write a block to disk (decompressed data) from an owned `Bytes` buffer.
     ///
     /// Atomic: writes to a `.tmp` file then renames — combined in a single
     /// `spawn_blocking` call to halve the thread-pool scheduling overhead.
     ///
     /// Shard directories are pre-created by `open()`, so no `create_dir_all`
     /// call on the hot path.
-    pub async fn put(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
+    pub async fn put_bytes(&self, object_id: u64, data: Bytes) -> io::Result<()> {
         let path = self.block_path(object_id);
         let tmp_path = path.with_extension("tmp");
         let len = data.len() as u64;
-        let owned = data.to_vec();
 
         crate::runtime::spawn_blocking_profiled("l2_put", move || -> io::Result<()> {
-            Self::write_block_file(&path, &tmp_path, &owned)
+            Self::write_block_file(&path, &tmp_path, &data)
         })
         .await
         .map_err(io::Error::other)??;
 
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Write a block to disk from a byte slice.
+    ///
+    /// This compatibility helper copies into an owned `Bytes` payload; prefer
+    /// [`put_bytes`] on hot paths that already own a `Bytes` buffer.
+    pub async fn put(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
+        self.put_bytes(object_id, Bytes::copy_from_slice(data))
+            .await
     }
 
     /// Write multiple blocks to disk in parallel.

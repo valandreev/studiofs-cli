@@ -169,6 +169,9 @@ pub struct BlockCache {
     l2_commit_scheduler: L2CommitScheduler,
     /// Cache-pipeline observability for throughput/latency/queue depth.
     metrics: CachePipelineMetrics,
+    /// Last persisted checkpoint signature: `(entry_count, crc32(entries))`.
+    /// Used to skip redundant tmp+rename cycles when metadata is unchanged.
+    last_checkpoint_signature: std::sync::Mutex<Option<(u32, u32)>>,
 }
 
 impl BlockCache {
@@ -252,6 +255,7 @@ impl BlockCache {
             shutdown_notify,
             l2_commit_scheduler,
             metrics,
+            last_checkpoint_signature: std::sync::Mutex::new(None),
         });
 
         Ok((cache, upload_rx))
@@ -325,7 +329,7 @@ impl BlockCache {
 
         // Write to L2 (NVMe file) — async, non-blocking.
         let started = Instant::now();
-        self.l2.put(object_id, &data).await?;
+        self.l2.put_bytes(object_id, data.clone()).await?;
         self.metrics
             .l2_write
             .record(data.len() as u64, started.elapsed());
@@ -688,7 +692,7 @@ impl BlockCache {
             let mut completed = false;
             while attempts < L2_COMMIT_MAX_ATTEMPTS {
                 attempts += 1;
-                match self.l2.put(job.object_id, &job.data).await {
+                match self.l2.put_bytes(job.object_id, job.data.clone()).await {
                     Ok(()) => {
                         self.metrics
                             .l2_write
@@ -845,11 +849,29 @@ impl BlockCache {
         let entry_data = &buf[crc_offset + 4..];
         let crc = crc32fast::hash(entry_data);
         buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+        let signature = (count, crc);
+
+        // Skip file churn when checkpoint payload is byte-identical to the
+        // last successfully persisted snapshot.
+        let should_skip = {
+            let guard = self
+                .last_checkpoint_signature
+                .lock()
+                .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
+            matches!(*guard, Some(last) if last == signature)
+        };
+        if should_skip {
+            return Ok(());
+        }
 
         // Atomic write: tmp + rename.
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &buf)?;
         std::fs::rename(&tmp, path)?;
+
+        if let Ok(mut guard) = self.last_checkpoint_signature.lock() {
+            *guard = Some(signature);
+        }
 
         Ok(())
     }
