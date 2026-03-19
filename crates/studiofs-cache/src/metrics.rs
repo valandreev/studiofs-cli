@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LATENCY_BUCKET_UPPER_NS: [u64; 16] = [
     50_000,
@@ -67,6 +67,12 @@ impl LatencyHistogram {
                 .iter()
                 .map(|bucket| bucket.load(Ordering::Relaxed))
                 .collect(),
+        }
+    }
+
+    pub fn reset(&self) {
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -219,11 +225,138 @@ impl UploadQueueStats {
 }
 
 #[derive(Debug, Clone)]
+pub struct BlockingTaskStatsSnapshot {
+    pub active: usize,
+    pub active_peak: usize,
+    pub submitted: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub queue_wait_total_ns: u64,
+    pub queue_wait_max_ns: u64,
+    pub queue_wait_histogram: LatencyHistogramSnapshot,
+    pub execution_total_ns: u64,
+    pub execution_max_ns: u64,
+    pub execution_histogram: LatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockingTaskKindStatsSnapshot {
+    pub task_kind: String,
+    pub stats: BlockingTaskStatsSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockingTaskMetricsSnapshot {
+    pub total: BlockingTaskStatsSnapshot,
+    pub by_kind: Vec<BlockingTaskKindStatsSnapshot>,
+}
+
+#[derive(Debug, Default)]
+pub struct BlockingTaskStats {
+    active: AtomicUsize,
+    active_peak: AtomicUsize,
+    submitted: AtomicU64,
+    started: AtomicU64,
+    completed: AtomicU64,
+    queue_wait_total_ns: AtomicU64,
+    queue_wait_max_ns: AtomicU64,
+    queue_wait_histogram: LatencyHistogram,
+    execution_total_ns: AtomicU64,
+    execution_max_ns: AtomicU64,
+    execution_histogram: LatencyHistogram,
+}
+
+pub struct BlockingTaskExecutionGuard<'a> {
+    stats: &'a BlockingTaskStats,
+    started_at: Instant,
+}
+
+impl BlockingTaskStats {
+    pub fn record_submit(&self) {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_start(&self, queue_wait: Duration) -> BlockingTaskExecutionGuard<'_> {
+        let wait_ns = queue_wait.as_nanos().min(u64::MAX as u128) as u64;
+        self.started.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_total_ns
+            .fetch_add(wait_ns, Ordering::Relaxed);
+        self.queue_wait_max_ns.fetch_max(wait_ns, Ordering::Relaxed);
+        self.queue_wait_histogram.observe_ns(wait_ns);
+
+        let active_now = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+        update_peak(&self.active_peak, active_now);
+
+        BlockingTaskExecutionGuard {
+            stats: self,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn snapshot(&self) -> BlockingTaskStatsSnapshot {
+        BlockingTaskStatsSnapshot {
+            active: self.active.load(Ordering::Relaxed),
+            active_peak: self.active_peak.load(Ordering::Relaxed),
+            submitted: self.submitted.load(Ordering::Relaxed),
+            started: self.started.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            queue_wait_total_ns: self.queue_wait_total_ns.load(Ordering::Relaxed),
+            queue_wait_max_ns: self.queue_wait_max_ns.load(Ordering::Relaxed),
+            queue_wait_histogram: self.queue_wait_histogram.snapshot(),
+            execution_total_ns: self.execution_total_ns.load(Ordering::Relaxed),
+            execution_max_ns: self.execution_max_ns.load(Ordering::Relaxed),
+            execution_histogram: self.execution_histogram.snapshot(),
+        }
+    }
+
+    /// Best-effort reset for observability counters.
+    ///
+    /// This method intentionally uses per-field relaxed stores. Concurrent task
+    /// start/finish events can interleave with reset, so snapshots immediately
+    /// after reset may be transiently inconsistent.
+    pub fn reset(&self) {
+        self.active.store(0, Ordering::Relaxed);
+        self.active_peak.store(0, Ordering::Relaxed);
+        self.submitted.store(0, Ordering::Relaxed);
+        self.started.store(0, Ordering::Relaxed);
+        self.completed.store(0, Ordering::Relaxed);
+        self.queue_wait_total_ns.store(0, Ordering::Relaxed);
+        self.queue_wait_max_ns.store(0, Ordering::Relaxed);
+        self.execution_total_ns.store(0, Ordering::Relaxed);
+        self.execution_max_ns.store(0, Ordering::Relaxed);
+        self.queue_wait_histogram.reset();
+        self.execution_histogram.reset();
+    }
+}
+
+impl Drop for BlockingTaskExecutionGuard<'_> {
+    fn drop(&mut self) {
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        let elapsed_ns = self.started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.stats
+            .execution_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.stats
+            .execution_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.stats.execution_histogram.observe_ns(elapsed_ns);
+
+        let _ = self
+            .stats
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 { Some(v - 1) } else { Some(0) }
+            });
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CachePipelineMetricsSnapshot {
     pub l2_read: IoStatsSnapshot,
     pub l2_write: IoStatsSnapshot,
     pub materialize_batches: MaterializeBatchStatsSnapshot,
     pub upload_queue: UploadQueueStatsSnapshot,
+    pub blocking_tasks: BlockingTaskMetricsSnapshot,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +374,7 @@ impl CachePipelineMetrics {
             l2_write: self.l2_write.snapshot(),
             materialize_batches: self.materialize_batches.snapshot(),
             upload_queue: self.upload_queue.snapshot(pending_uploads),
+            blocking_tasks: crate::runtime::blocking_task_stats_snapshot(),
         }
     }
 }

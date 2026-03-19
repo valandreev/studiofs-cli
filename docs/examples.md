@@ -136,7 +136,8 @@ studiofs test-cache \
   --io-depth 64 \
   --access-pattern mixed \
   --l1-limit 2GB \
-  --l2-limit 100GB
+  --l2-limit 100GB \
+  --profile
 ```
 
 End-to-end benchmark through an already mounted filesystem:
@@ -155,9 +156,12 @@ Notes:
 - Terminal output is a readable benchmark summary. The full structured JSON
   report is saved in the directory where `studiofs test-cache` was started,
   using an auto-generated file name unless `--json-output <path>` is provided.
+- JSON report contains a `run_id` field to correlate benchmark output with
+  tracing/profile events.
 - `direct-l2` JSON output includes a `cache_pipeline` section with:
   - `l2_read` / `l2_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
   - `upload_queue` depth and queue counters
+  - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
 - `e2e` mode keeps filesystem-level read/write reports; cache internals are
   emitted through mount logs (`upload pipeline counters`).
