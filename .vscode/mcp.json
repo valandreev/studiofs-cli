@@ -1,11 +1,3 @@
 {
-  "servers": {
-    "vexp": {
-      "type": "stdio",
-      "command": "vexp",
-      "args": [
-        "mcp"
-      ]
-    }
-  }
+  "servers": {}
 }

@@ -29,26 +29,6 @@ studiofs-cli/
 cp .env.example .env
 ```
 
-## Vexp MCP Context Tooling
-
-- Install and setup:
-
-```bash
-npm run vexp:setup
-```
-
-- Reindex when repo structure changes:
-
-```bash
-npm run vexp:index
-```
-
-- Verify MCP/daemon/context health:
-
-```bash
-npm run vexp:verify
-```
-
 Recommended `.env` values:
 - `STUDIOFS_S3_ENDPOINT`
 - `STUDIOFS_S3_ACCESS_KEY`
@@ -118,7 +98,7 @@ studiofs mount <name> <mount-point>
 
 ## Related Docs
 
-- [Contributing](contributing.md) — vexp-first workflow and repo contribution rules
+- [Contributing](contributing.md) — contribution rules
 - [Architecture Overview](architecture.md)
 - [Metadata Engine](metadata.md)
 - [Configuration Reference](configuration.md)

@@ -1,12 +1,5 @@
 {
   "name": "studiofs",
   "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "vexp:setup": "npm install -g vexp-cli@latest && vexp setup --personal . --no-index",
-    "vexp:index": "vexp index .",
-    "vexp:mcp": "vexp mcp",
-    "vexp:daemon-status": "vexp daemon-cmd status",
-    "vexp:verify": "vexp daemon-cmd status && vexp capsule \"sanity context check\" --max-tokens 400"
-  }
+  "private": true
 }
