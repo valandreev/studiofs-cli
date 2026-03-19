@@ -186,12 +186,19 @@ benchmarks:
   and concurrent batch depth/peak
 - queue depth metrics for upload queue (`pending_depth`, `pending_depth_peak`)
 - backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
+- blocking-task pressure metrics for cache hot paths:
+  - active blocking tasks (`active`, `active_peak`)
+  - lifecycle counters (`submitted`, `started`, `completed`)
+  - wait-before-execution timing (avg/max + histogram buckets in snapshot)
+  - blocking execution timing (avg/max + histogram buckets in snapshot)
 
 Runtime logs (`upload pipeline counters`) include these metrics continuously
 while the pipeline is active. `studiofs test-cache <cache-dir>` also emits
 the cache pipeline snapshot in its saved JSON report under `cache_pipeline`,
 while the terminal keeps a human-readable summary focused on the benchmark
-results.
+results. Each `test-cache` report now also includes a `run_id` for correlation
+with profile/tracing events, and optional on-demand CPU profile output when
+running `studiofs test-cache ... --profile`.
 
 ## Crash Recovery
 

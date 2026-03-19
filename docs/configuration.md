@@ -179,9 +179,9 @@ studiofs test-cache \
   [--concurrency <usize>] \
   [--io-depth <usize>] \
   [--access-pattern <sequential|random|mixed>] \
-  [--small-file-share <0..100>] \
   [--l1-limit <e.g. 2GB>] \
-  [--l2-limit <e.g. 100GB>]
+  [--l2-limit <e.g. 100GB>] \
+  [--profile]
 ```
 
 Defaults:
@@ -190,9 +190,9 @@ Defaults:
 - `--concurrency 4`
 - `--io-depth 32`
 - `--access-pattern sequential`
-- `--small-file-share 20`
 - `--l1-limit 2GB`
 - `--l2-limit 100GB`
+- `--profile false`
 
 Notes:
 - If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-l2`
@@ -202,6 +202,9 @@ Notes:
   `<path>/.studiofs-test-cache` for temporary workload files.
 - Effective in-flight queue pressure is driven by `--io-depth`; worker count is raised to at least that value.
 - Output includes a human-readable summary and JSON payload suitable for cross-platform run comparison.
+- JSON report includes a stable `run_id` for correlating `test-cache` output with tracing/profile hooks.
+- `--profile` enables on-demand CPU utilization profiling in the saved JSON report (disabled by default to avoid benchmark distortion).
+- `direct-l2` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
 - Current built-in workload volumes are modest (`128MB` direct-l2, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
 
 ### `destroy`
