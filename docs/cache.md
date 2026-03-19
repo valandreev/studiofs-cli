@@ -63,6 +63,20 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 - `put_batch(blocks)` — parallel `spawn_blocking` per block
 - `get_batch(ids)` — parallel `spawn_blocking` per block
 
+### L2 Commit Scheduler (`block_cache.rs`)
+
+Bounded scheduler for asynchronous L2 commits from the materializer path.
+
+| Property | Value |
+|----------|-------|
+| Workers | 4 (internal default) |
+| Queue capacity | 512 (internal default) |
+| Backpressure | `commit_l2_batch` awaits when queue is full |
+| Worker behavior | each worker writes sequentially via `l2.put()` |
+
+This replaces the previous fire-and-forget fan-out model and caps concurrent
+L2 write operations to the worker count.
+
 ### LRU Tracker (`lru_tracker.rs`)
 
 Global LRU across both tiers, tracking block location and eviction order.
@@ -114,6 +128,8 @@ Unified API combining all components above.
 | `l2_size` | 100 GiB | Maximum L2 disk |
 | `cache_dir` | — | Root directory for L2 + journals |
 | `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
+| `l2_commit_workers` | 4 | L2 commit worker count |
+| `l2_commit_queue_capacity` | 512 | Max queued L2 commit jobs before backpressure |
 
 **Key methods:**
 
@@ -122,14 +138,14 @@ Unified API combining all components above.
 | `open(config)` | Initialize L1, L2, LRU, upload queue; scan L2 for recovery |
 | `get(id)` | L1 → L2 → miss (returns None) |
 | `stage_l1(id, data)` | Insert into L1 + LRU as `MemoryOnly` |
-| `commit_l2(id, data)` | Write to L2, update LRU to `MemoryAndDisk` |
-| `commit_l2_batch(blocks)` | Parallel L2 writes, single eviction check |
+| `commit_l2(id, data)` | Enqueue one L2 commit into bounded scheduler |
+| `commit_l2_batch(blocks)` | Enqueue batch into bounded scheduler (applies backpressure on full queue) |
 | `submit_upload(ino, offset, id)` | Enqueue for S3 upload via journal |
 | `complete_upload(pending)` | Unpin block in LRU |
 | `evict_one_l1()` | Demote one block from L1 |
 | `evict_one_l2()` | Remove one block from L2 |
 
-**Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache_map.bin`. On startup, loads checkpoint and reconciles with L2 scan.
+**Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.
 
 Checkpoint format: magic `STFSCM` (6 bytes), version `u16`, then entries of 18 bytes each (`object_id: u64`, `size: u32`, `location: u8`, `pinned: u8`, `last_access: u32`).
 
@@ -157,7 +173,7 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   ├─ Take batch of up to 1024 blocks
   ├─ stage_l1() for each block          ← immediate L1 insert
   ├─ Batch metadata commit (local staged refs only)
-  ├─ commit_l2_batch() in parallel      ← parallel NVMe writes
+  ├─ commit_l2_batch() enqueue          ← bounded queue + fixed workers
   └─ submit_upload(..., content_epoch)  ← journal + S3 queue
 ```
 
@@ -184,6 +200,11 @@ benchmarks:
 - ingress append throughput counters and latency histogram
 - materialize batch counters (`batches`, `blocks`, `bytes`), duration histogram,
   and concurrent batch depth/peak
+- L2 commit scheduler counters:
+  - queue depth (`queue_depth`, `queue_depth_peak`, `queue_capacity`)
+  - worker utilization (`active_workers`, `active_workers_peak`, `configured_workers`)
+  - lifecycle (`submitted`, `completed`, `failed`)
+  - backpressure (`backpressure_events`, backpressure wait totals/max/histogram)
 - queue depth metrics for upload queue (`pending_depth`, `pending_depth_peak`)
 - backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
 - blocking-task pressure metrics for cache hot paths:

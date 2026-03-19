@@ -95,8 +95,8 @@ dirty_mem + ingress_spill
   │    ├─ cache.stage_l1(id, data)
   │    └─ meta.flush_blocks_batch()   ← local pending refs only
   │
-  ├─ Phase 2: L2 commit (parallel)
-  │    └─ cache.commit_l2_batch(blocks) — parallel NVMe writes
+  ├─ Phase 2: L2 commit scheduling (bounded)
+  │    └─ cache.commit_l2_batch(blocks) — bounded queue + fixed worker pool
   │
   ├─ Phase 3: Upload enqueue for accepted incarnation extents
   │    └─ cache.submit_upload(..., content_epoch) for each

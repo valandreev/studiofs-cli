@@ -161,6 +161,7 @@ Notes:
 - `direct-l2` JSON output includes a `cache_pipeline` section with:
   - `l2_read` / `l2_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
+  - `l2_commit_scheduler` queue depth / worker activity / backpressure counters
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
 - `e2e` mode keeps filesystem-level read/write reports; cache internals are
