@@ -5702,6 +5702,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
             .count()
     }
 
+    let _env = ScopedTestEnv::new();
     apply_test_online_s3_env();
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
