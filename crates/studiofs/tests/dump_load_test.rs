@@ -9,7 +9,10 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 use studiofs_data::object::{create_object, format_object_key, read_object};
 use studiofs_data::{DataStore, DataStoreConfig};
-use studiofs_meta::{BlockRef, ROOT_INO, ensure_studiofs_database, open_meta_engine};
+use studiofs_meta::{
+    BlockRef, MetaOpenOptions, ROOT_INO, ensure_studiofs_database, open_meta_engine,
+    open_meta_engine_with_options,
+};
 use uuid::Uuid;
 
 struct TestEnv {
@@ -150,58 +153,78 @@ fn volume_exists(pg_dsn: &str, name: &str) -> bool {
 
 fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
     let db_path = default_meta_dir(home, disk_name).join(format!("{disk_name}.db"));
-    let meta = open_meta_engine(&db_path).expect("open meta engine");
-    let format_info = meta.get_format_info().expect("get format info");
+    {
+        let meta = open_meta_engine_with_options(
+            &db_path,
+            MetaOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open meta engine");
+        let format_info = meta.get_format_info().expect("get format info");
 
-    let file = meta
-        .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
-        .expect("create file");
-    let object_id = meta.next_block_id().expect("next block id");
-    let block = BlockRef::new_partial(object_id, payload.len() as u32);
-    meta.set_file_block(file.ino, 0, &block)
-        .expect("set file block");
-    meta.commit_uploaded_block(file.ino, 0, 0, &block)
-        .expect("commit uploaded block");
-    meta.publish_file_manifest(file.ino, 0)
-        .expect("publish file manifest");
+        let file = meta
+            .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
+            .expect("create file");
+        let object_id = meta.next_block_id().expect("next block id");
+        let block = BlockRef::new_partial(object_id, payload.len() as u32);
+        meta.set_file_block(file.ino, 0, &block)
+            .expect("set file block");
+        meta.commit_uploaded_block(file.ino, 0, 0, &block)
+            .expect("commit uploaded block");
+        meta.publish_file_manifest(file.ino, 0)
+            .expect("publish file manifest");
 
-    let mut attr = meta.get_attr(file.ino).expect("get attr");
-    attr.size = payload.len() as u64;
-    attr.committed_size = payload.len() as u64;
-    meta.set_attr(&attr).expect("set attr");
+        let mut attr = meta.get_attr(file.ino).expect("get attr");
+        attr.size = payload.len() as u64;
+        attr.committed_size = payload.len() as u64;
+        meta.set_attr(&attr).expect("set attr");
 
-    let object = create_object(payload).expect("encode object");
-    let key = format_object_key(&format_info.data_prefix, object_id);
-    let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async { store.put_by_key(&key, Bytes::from(object)).await })
-        .expect("put object");
+        let object = create_object(payload).expect("encode object");
+        let key = format_object_key(&format_info.data_prefix, object_id);
+        let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async { store.put_by_key(&key, Bytes::from(object)).await })
+            .expect("put object");
 
-    meta.flush_metadata().expect("flush metadata");
+        meta.flush_metadata().expect("flush metadata");
+        // The next step shells out to `studiofs dump`, which re-opens this same
+        // redb file. Ensure the local probe handle is dropped before that.
+        drop(meta);
+    }
 }
 
 fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8]) {
     let db_path = default_meta_dir(home, disk_name).join(format!("{disk_name}.db"));
-    let meta = open_meta_engine(&db_path).expect("open discovered meta");
-    let format_info = meta.get_format_info().expect("format info");
-    let entry = meta
-        .lookup(ROOT_INO, b"payload.bin")
-        .expect("lookup payload.bin");
-    let attr = meta.get_attr(entry.ino).expect("get payload attr");
-    assert_eq!(attr.committed_size, expected.len() as u64);
+    {
+        let meta = open_meta_engine_with_options(
+            &db_path,
+            MetaOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open discovered meta");
+        let format_info = meta.get_format_info().expect("format info");
+        let entry = meta
+            .lookup(ROOT_INO, b"payload.bin")
+            .expect("lookup payload.bin");
+        let attr = meta.get_attr(entry.ino).expect("get payload attr");
+        assert_eq!(attr.committed_size, expected.len() as u64);
 
-    let block = meta
-        .get_file_block(entry.ino, 0)
-        .expect("get file block")
-        .expect("block 0 exists");
-    let key = format_object_key(&format_info.data_prefix, block.object_id);
-    let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let raw = rt
-        .block_on(async { store.get_by_key(&key).await })
-        .expect("get object");
-    let decoded = read_object(&raw).expect("decode object");
-    assert_eq!(decoded, expected);
+        let block = meta
+            .get_file_block(entry.ino, 0)
+            .expect("get file block")
+            .expect("block 0 exists");
+        let key = format_object_key(&format_info.data_prefix, block.object_id);
+        let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let raw = rt
+            .block_on(async { store.get_by_key(&key).await })
+            .expect("get object");
+        let decoded = read_object(&raw).expect("decode object");
+        assert_eq!(decoded, expected);
+        drop(meta);
+    }
 }
 
 #[test]
