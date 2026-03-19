@@ -22,3 +22,4 @@ docs/logs/*.*
 tmp/
 .DS_Store
 AGENTS.vexp.template.md
+.vexp/daemon.log
