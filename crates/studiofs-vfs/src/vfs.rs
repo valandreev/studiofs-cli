@@ -195,6 +195,8 @@ pub struct VfsIngressStats {
     pub fast_backpressure_wait_ms: u64,
     /// Number of fast-mode backpressure wait events.
     pub fast_backpressure_events: u64,
+    /// Maximum single fast-mode backpressure stall observed since startup.
+    pub fast_backpressure_stall_max_ms: u64,
     /// Number of blocks that were forced to spill because RAM acceptance was
     /// over budget.
     pub forced_spill_blocks: u64,
@@ -2794,6 +2796,66 @@ fn scan_ingress_artifacts(spill_dir: &std::path::Path) -> VfsResult<(usize, usiz
     ))
 }
 
+type IngressRecoveryInit = (RecoveredSpillMap, usize, u64, u64, Option<(u64, u64, u64)>);
+
+fn init_ingress_recovery_state(
+    cache_safety_mode: CacheSafetyMode,
+    spill_dir: &std::path::Path,
+    ingress_checkpoint_dir: &std::path::Path,
+    ingress_segment_dir: &std::path::Path,
+) -> VfsResult<IngressRecoveryInit> {
+    if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
+        let existing_checkpoint =
+            load_latest_ingress_checkpoint(ingress_checkpoint_dir, ingress_segment_dir)?;
+        let (
+            recovered_spill,
+            recovered_spill_bytes,
+            recovered_spill_seq,
+            active_ingress_segment_id,
+        ) = recover_spill_dir(spill_dir)?;
+        let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
+            let checkpoint_path = latest_ingress_checkpoint_path(ingress_checkpoint_dir);
+            let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            (
+                checkpoint_unix_ms,
+                checkpoint.covered_segment_id,
+                checkpoint.covered_offset,
+            )
+        });
+        return Ok((
+            recovered_spill,
+            recovered_spill_bytes,
+            recovered_spill_seq,
+            active_ingress_segment_id,
+            initial_checkpoint_meta,
+        ));
+    }
+
+    let (segment_count, checkpoint_count, state_present) = scan_ingress_artifacts(spill_dir)?;
+    if segment_count > 0 || checkpoint_count > 0 || state_present {
+        warn!(
+            mode = "fast",
+            segment_count,
+            checkpoint_count,
+            state_present,
+            "startup detected durable ingress artifacts; fast mode will discard them during self-heal"
+        );
+    }
+    reset_ingress_artifacts_for_fast_mode(spill_dir)?;
+    Ok((
+        RecoveredSpillMap::new(),
+        0,
+        1,
+        INITIAL_INGRESS_SEGMENT_ID,
+        None,
+    ))
+}
+
 // =============================================================================
 // Internal State (for Clone support)
 // =============================================================================
@@ -2861,6 +2923,8 @@ struct VfsState {
     fast_backpressure_wait_ms: AtomicU64,
     /// Number of fast-mode backpressure wait events.
     fast_backpressure_events: AtomicU64,
+    /// Maximum single fast-mode backpressure stall observed since startup.
+    fast_backpressure_stall_max_ms: AtomicU64,
     /// Ingress append throughput/latency metrics.
     ingress_append_stats: IoStats,
     /// Materialize batch throughput/latency metrics.
@@ -3688,57 +3752,12 @@ impl StudioVfs {
                 recovered_spill_seq,
                 active_ingress_segment_id,
                 initial_checkpoint_meta,
-            ) = if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
-                let existing_checkpoint =
-                    load_latest_ingress_checkpoint(&ingress_checkpoint_dir, &ingress_segment_dir)?;
-                let (
-                    recovered_spill,
-                    recovered_spill_bytes,
-                    recovered_spill_seq,
-                    active_ingress_segment_id,
-                ) = recover_spill_dir(&spill_dir)?;
-                let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
-                    let checkpoint_path = latest_ingress_checkpoint_path(&ingress_checkpoint_dir);
-                    let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
-                        .ok()
-                        .and_then(|meta| meta.modified().ok())
-                        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    (
-                        checkpoint_unix_ms,
-                        checkpoint.covered_segment_id,
-                        checkpoint.covered_offset,
-                    )
-                });
-                (
-                    recovered_spill,
-                    recovered_spill_bytes,
-                    recovered_spill_seq,
-                    active_ingress_segment_id,
-                    initial_checkpoint_meta,
-                )
-            } else {
-                let (segment_count, checkpoint_count, state_present) =
-                    scan_ingress_artifacts(&spill_dir)?;
-                if segment_count > 0 || checkpoint_count > 0 || state_present {
-                    warn!(
-                        mode = "fast",
-                        segment_count,
-                        checkpoint_count,
-                        state_present,
-                        "startup detected durable ingress artifacts; fast mode will discard them during self-heal"
-                    );
-                }
-                reset_ingress_artifacts_for_fast_mode(&spill_dir)?;
-                (
-                    RecoveredSpillMap::new(),
-                    0,
-                    1,
-                    INITIAL_INGRESS_SEGMENT_ID,
-                    None,
-                )
-            };
+            ) = init_ingress_recovery_state(
+                cache_safety_mode,
+                &spill_dir,
+                &ingress_checkpoint_dir,
+                &ingress_segment_dir,
+            )?;
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
@@ -3981,6 +4000,7 @@ impl StudioVfs {
                     write_backpressure_events: AtomicU64::new(0),
                     fast_backpressure_wait_ms: AtomicU64::new(0),
                     fast_backpressure_events: AtomicU64::new(0),
+                    fast_backpressure_stall_max_ms: AtomicU64::new(0),
                     ingress_append_stats: IoStats::default(),
                     materialize_batch_stats: MaterializeBatchStats::default(),
                     dirty_drained_notify: tokio::sync::Notify::new(),
@@ -5294,6 +5314,9 @@ impl StudioVfs {
                 self.state
                     .fast_backpressure_wait_ms
                     .fetch_add(waited_ms, Ordering::Relaxed);
+                self.state
+                    .fast_backpressure_stall_max_ms
+                    .fetch_max(waited_ms, Ordering::Relaxed);
             }
         }
     }
@@ -5796,6 +5819,10 @@ impl StudioVfs {
             write_backpressure_events: self.state.write_backpressure_events.load(Ordering::Relaxed),
             fast_backpressure_wait_ms: self.state.fast_backpressure_wait_ms.load(Ordering::Relaxed),
             fast_backpressure_events: self.state.fast_backpressure_events.load(Ordering::Relaxed),
+            fast_backpressure_stall_max_ms: self
+                .state
+                .fast_backpressure_stall_max_ms
+                .load(Ordering::Relaxed),
             forced_spill_blocks: self.state.forced_spill_blocks.load(Ordering::Relaxed),
             drained_mem_blocks: self.state.drained_mem_blocks.load(Ordering::Relaxed),
             drained_mem_bytes: self.state.drained_mem_bytes.load(Ordering::Relaxed),
@@ -8494,6 +8521,7 @@ impl StudioVfs {
                     write_backpressure_events = ingress.write_backpressure_events,
                     fast_backpressure_wait_ms = ingress.fast_backpressure_wait_ms,
                     fast_backpressure_events = ingress.fast_backpressure_events,
+                    fast_backpressure_stall_max_ms = ingress.fast_backpressure_stall_max_ms,
                     ingress_append_ops = ingress_append.ops,
                     ingress_append_bytes = ingress_append.bytes,
                     ingress_append_total_latency_ns = ingress_append.total_latency_ns,
