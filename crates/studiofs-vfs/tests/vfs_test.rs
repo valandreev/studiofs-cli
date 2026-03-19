@@ -31,8 +31,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError, VfsIngressLane,
-    VfsUploadState, parse_size_bytes,
+    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError,
+    VfsIngressLane, VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -159,6 +159,8 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 fn test_vfs_config_from_env() -> VfsConfig {
     load_test_env();
     let mut config = VfsConfig::default();
+    // Keep existing integration tests on durable semantics unless overridden.
+    config.cache_safety_mode = CacheSafetyMode::Durable;
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
@@ -410,6 +412,14 @@ fn test_vfs_config_from_env() -> VfsConfig {
     }
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS") {
         config.ingress_checkpoint_max_live_segments = value;
+    }
+    if let Ok(value) = std::env::var("STUDIOFS_CACHE_SAFETY_MODE") {
+        let value = value.trim().to_ascii_lowercase();
+        if value == "fast" {
+            config.cache_safety_mode = CacheSafetyMode::Fast;
+        } else if value == "durable" {
+            config.cache_safety_mode = CacheSafetyMode::Durable;
+        }
     }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
         config.upload_worker_count = value;
@@ -5579,6 +5589,95 @@ fn test_ingress_prefers_spill_before_backpressure() {
             vfs.ingress_pressure_for(1).lane,
             VfsIngressLane::Spill,
             "small follow-up payloads should still prefer spill before entering backpressure"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn test_cache_safety_mode_changes_ingress_write_path() {
+    type EnvRestore = ScopedEnvVar;
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    }
+
+    fn build_vfs_with_mode(
+        tmp: &tempfile::TempDir,
+        volume_suffix: &str,
+        mode: CacheSafetyMode,
+    ) -> (Arc<StudioVfs>, Vec<u8>) {
+        let db_path = tmp.path().join("meta.redb");
+        let cache_dir = tmp.path().join("cache");
+        let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+        let format_info = make_format_info(volume_suffix);
+        let data_config = DataStoreConfig::from(&format_info);
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+        meta.init_root(0, 0).unwrap();
+        meta.set_format_info(&format_info).unwrap();
+
+        let mut vfs_config = test_vfs_config_from_env();
+        vfs_config.cache_safety_mode = mode;
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            vfs_config,
+        )
+        .unwrap();
+        (vfs, vec![0x39u8; 512 * 1024])
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let durable_tmp = tempfile::tempdir().unwrap();
+        let (durable_vfs, payload) = build_vfs_with_mode(
+            &durable_tmp,
+            &format!("mode-durable-{}", std::process::id()),
+            CacheSafetyMode::Durable,
+        );
+        let durable_attr = durable_vfs
+            .create(1, b"mode-durable.bin", 0, 0, 0o644)
+            .unwrap();
+        assert_eq!(
+            durable_vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Spill
+        );
+        durable_vfs
+            .write(durable_attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        durable_vfs.flush(durable_attr.ino).await.unwrap();
+        let durable_stats = durable_vfs.ingress_stats();
+        assert!(
+            durable_stats.spill_bytes >= payload.len(),
+            "durable mode should persist accepted payload in ingress spill"
+        );
+
+        let fast_tmp = tempfile::tempdir().unwrap();
+        let (fast_vfs, payload) = build_vfs_with_mode(
+            &fast_tmp,
+            &format!("mode-fast-{}", std::process::id()),
+            CacheSafetyMode::Fast,
+        );
+        let fast_attr = fast_vfs.create(1, b"mode-fast.bin", 0, 0, 0o644).unwrap();
+        assert_eq!(
+            fast_vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::DirtyMem
+        );
+        fast_vfs.write(fast_attr.ino, 0, &payload).await.unwrap();
+        fast_vfs.flush(fast_attr.ino).await.unwrap();
+        let fast_stats = fast_vfs.ingress_stats();
+        assert_eq!(
+            fast_stats.spill_bytes, 0,
+            "fast mode should avoid duplicate ingress payload writes"
         );
     });
     rt.shutdown_background();
