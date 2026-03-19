@@ -47,7 +47,7 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 
 | Property | Value |
 |----------|-------|
-| Default size | 50 GiB |
+| Default size | 100 GiB |
 | Sharding | 256 directories (`00/`–`ff/`), shard = `(object_id >> 56) as u8` |
 | File pattern | `{shard_hex}/{object_id:016x}.block` |
 | Write strategy | Atomic (write to `.tmp` + rename) |
@@ -56,6 +56,8 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 **Key design choices:**
 - **Pre-computed shard paths** — all 256 directory paths cached in `Arc<[PathBuf; 256]>` to avoid repeated allocations
 - **Atomic writes** — prevents partial reads on crash via write-to-temp + rename
+- **Owned-buffer hot path** — `put_bytes(object_id, Bytes)` writes already-owned
+  payloads without an extra `to_vec()` clone in the async L2 write path
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
 
@@ -72,7 +74,7 @@ Bounded scheduler for asynchronous L2 commits from the materializer path.
 | Workers | 4 (internal default) |
 | Queue capacity | 512 (internal default) |
 | Backpressure | `commit_l2_batch` awaits when queue is full |
-| Worker behavior | each worker writes sequentially via `l2.put()` |
+| Worker behavior | each worker writes sequentially via `l2.put_bytes()` |
 
 This replaces the previous fire-and-forget fan-out model and caps concurrent
 L2 write operations to the worker count.
@@ -148,8 +150,12 @@ Unified API combining all components above.
 | `evict_one_l2()` | Remove one block from L2 |
 
 **Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.
+If the serialized checkpoint payload is unchanged (same entry count + CRC), the
+writer skips the redundant tmp+rename cycle to reduce metadata-heavy file ops.
 
-Checkpoint format: magic `STFSCM` (6 bytes), version `u16`, then entries of 18 bytes each (`object_id: u64`, `size: u32`, `location: u8`, `pinned: u8`, `last_access: u32`).
+Checkpoint format: magic `STFSCM` (6 bytes), version `u16`, entry count `u32`,
+entries CRC32 `u32`, then entries of 18 bytes each (`object_id: u64`, `size:
+u32`, `location: u8`, `pinned: u8`, `padding: [u8; 4]`).
 
 ## Eviction Strategy
 
@@ -227,7 +233,7 @@ running `studiofs test-cache ... --profile`.
 
 On startup:
 
-1. Load LRU checkpoint (`cache_map.bin`) if present
+1. Load LRU checkpoint (`cache.meta`) if present
 2. Scan L2 directory to rebuild actual block inventory
 3. Reconcile: remove LRU entries for missing L2 files, add L2 entries not in checkpoint
 4. Scan upload journal (`upload/*.pending`) and re-queue pending uploads
