@@ -95,7 +95,7 @@ impl Materializer {
                 }
             };
 
-            let batch_len = Self::apply_batch(vfs, extents, results, manifests);
+            let batch_len = Self::apply_batch(vfs, extents, results, manifests).await;
             vfs.state.materialize_batch_stats.record_batch(
                 batch_blocks,
                 batch_bytes,
@@ -296,7 +296,7 @@ impl Materializer {
         Ok(manifests)
     }
 
-    fn apply_batch(
+    async fn apply_batch(
         vfs: &StudioVfs,
         extents: Vec<MaterializedExtent>,
         results: Vec<BatchFlushResult>,
@@ -415,10 +415,9 @@ impl Materializer {
             drained_spill_bytes,
         );
 
-        let cache = vfs.block_cache.clone();
-        tokio::spawn(async move {
-            cache.commit_l2_batch(&l2_work).await;
-        });
+        if let Err(e) = vfs.block_cache.commit_l2_batch(&l2_work).await {
+            warn!(error = %e, blocks = batch_len, "materializer: failed to enqueue L2 batch");
+        }
 
         batch_len
     }

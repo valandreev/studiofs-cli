@@ -16,9 +16,12 @@
 use bytes::Bytes;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::l1_mem::L1MemCache;
@@ -48,6 +51,12 @@ pub const DEFAULT_L2_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 /// Default free-disk-space ratio threshold for emergency eviction.
 pub const DEFAULT_DISK_FREE_RATIO: f64 = 0.10;
 
+/// Fixed worker count for bounded background L2 commits.
+pub const DEFAULT_L2_COMMIT_WORKERS: usize = 4;
+
+/// Bounded queue depth for background L2 commit scheduling.
+pub const DEFAULT_L2_COMMIT_QUEUE_CAPACITY: usize = 512;
+
 /// Checkpoint interval (seconds).
 const CHECKPOINT_INTERVAL_SECS: u64 = 60;
 
@@ -65,6 +74,10 @@ pub struct BlockCacheConfig {
     pub cache_dir: PathBuf,
     /// Target free disk space ratio (trigger lazy eviction below this).
     pub disk_free_ratio: f64,
+    /// Number of background workers that commit staged blocks to L2.
+    pub l2_commit_workers: usize,
+    /// Queue capacity for pending L2 commits (backpressure when full).
+    pub l2_commit_queue_capacity: usize,
 }
 
 impl BlockCacheConfig {
@@ -74,7 +87,55 @@ impl BlockCacheConfig {
             l2_size,
             cache_dir: cache_dir.into(),
             disk_free_ratio: DEFAULT_DISK_FREE_RATIO,
+            l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
+            l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
         }
+    }
+}
+
+#[derive(Debug)]
+struct L2CommitJob {
+    object_id: ObjectId,
+    data: Bytes,
+}
+
+#[derive(Debug)]
+struct L2CommitScheduler {
+    tx: mpsc::Sender<L2CommitJob>,
+    rx: Arc<Mutex<mpsc::Receiver<L2CommitJob>>>,
+    workers: usize,
+    workers_started: AtomicBool,
+}
+
+impl L2CommitScheduler {
+    fn new(workers: usize, queue_capacity: usize) -> Self {
+        let workers = workers.max(1);
+        let queue_capacity = queue_capacity.max(1);
+        let (tx, rx) = mpsc::channel(queue_capacity);
+        Self {
+            tx,
+            rx: Arc::new(Mutex::new(rx)),
+            workers,
+            workers_started: AtomicBool::new(false),
+        }
+    }
+
+    fn queue_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
+    fn workers(&self) -> usize {
+        self.workers
+    }
+
+    fn receiver(&self) -> Arc<Mutex<mpsc::Receiver<L2CommitJob>>> {
+        Arc::clone(&self.rx)
+    }
+
+    fn mark_started(&self) -> bool {
+        self.workers_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -98,6 +159,8 @@ pub struct BlockCache {
     evict_notify: Arc<Notify>,
     /// Signal to stop background tasks.
     shutdown_notify: Arc<Notify>,
+    /// Bounded scheduler for asynchronous L2 commits.
+    l2_commit_scheduler: L2CommitScheduler,
     /// Cache-pipeline observability for throughput/latency/queue depth.
     metrics: CachePipelineMetrics,
 }
@@ -115,6 +178,8 @@ impl BlockCache {
         let lru = LruTracker::new();
         let evict_notify = Arc::new(Notify::new());
         let shutdown_notify = Arc::new(Notify::new());
+        let l2_commit_scheduler =
+            L2CommitScheduler::new(config.l2_commit_workers, config.l2_commit_queue_capacity);
 
         // Try loading checkpoint, then reconcile with actual files on disk.
         let checkpoint_path = config.cache_dir.join("cache.meta");
@@ -165,6 +230,12 @@ impl BlockCache {
             lru.pin(pending.object_id);
         }
 
+        let metrics = CachePipelineMetrics::default();
+        metrics.l2_commit_scheduler.configure(
+            l2_commit_scheduler.workers(),
+            l2_commit_scheduler.queue_capacity(),
+        );
+
         let cache = Arc::new(Self {
             l1,
             l2,
@@ -173,7 +244,8 @@ impl BlockCache {
             config,
             evict_notify,
             shutdown_notify,
-            metrics: CachePipelineMetrics::default(),
+            l2_commit_scheduler,
+            metrics,
         });
 
         Ok((cache, upload_rx))
@@ -183,6 +255,15 @@ impl BlockCache {
     ///
     /// Must be called after `open()` from within a tokio runtime.
     pub fn spawn_background_tasks(self: &Arc<Self>) {
+        if self.l2_commit_scheduler.mark_started() {
+            for worker_id in 0..self.l2_commit_scheduler.workers() {
+                let cache = self.clone();
+                tokio::spawn(async move {
+                    cache.background_l2_commit_worker(worker_id).await;
+                });
+            }
+        }
+
         let cache = self.clone();
         tokio::spawn(async move {
             cache.background_evictor().await;
@@ -313,64 +394,74 @@ impl BlockCache {
     /// **Phase 2 — background.** Write a block to L2 (NVMe) and promote its
     /// LRU location from `MemoryOnly` to `MemoryAndDisk`.
     ///
-    /// Called from a fire-and-forget background task spawned by `drain_dirty_mem`.
+    /// The write is routed through the bounded L2 scheduler; this method
+    /// applies backpressure when the scheduler queue is saturated.
     /// Does NOT unpin — the block stays pinned until the S3 upload completes.
     pub async fn commit_l2(&self, object_id: ObjectId, data: &[u8]) -> io::Result<()> {
-        let started = Instant::now();
-        self.l2.put(object_id, data).await?;
-        self.metrics
-            .l2_write
-            .record(data.len() as u64, started.elapsed());
-        self.lru
-            .set_location(object_id, BlockLocation::MemoryAndDisk);
-        // Trigger eviction check if budgets exceeded.
-        if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {
-            self.evict_notify.notify_one();
-        }
-        Ok(())
+        self.enqueue_l2_commit(object_id, Bytes::copy_from_slice(data))
+            .await
     }
 
-    /// **Phase 2 — background batch.** Write multiple blocks to L2 (NVMe) in
-    /// parallel and promote their LRU locations.
+    /// **Phase 2 — background batch.** Enqueue multiple L2 commits through the
+    /// bounded scheduler.
     ///
-    /// Much more efficient than calling `commit_l2` in a loop because all
-    /// disk writes are submitted to the thread pool simultaneously, letting
-    /// the NVMe service them across multiple queues.
-    pub async fn commit_l2_batch(&self, blocks: &[(ObjectId, Bytes)]) {
+    /// Backpressure is applied when the queue is full and this call awaits
+    /// worker progress.
+    pub async fn commit_l2_batch(&self, blocks: &[(ObjectId, Bytes)]) -> io::Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
         self.metrics.materialize_batches.enter_inflight();
         let batch_started = Instant::now();
         let total_bytes = blocks
             .iter()
             .map(|(_, data)| data.len() as u64)
             .sum::<u64>();
-        let results = self.l2.put_batch(blocks).await;
-        for (idx, (object_id, res, elapsed_ns)) in results.into_iter().enumerate() {
-            match res {
-                Ok(()) => {
-                    self.lru
-                        .set_location(object_id, BlockLocation::MemoryAndDisk);
-                    let (_, data) = &blocks[idx];
-                    self.metrics
-                        .l2_write
-                        .record_ns(data.len() as u64, elapsed_ns);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        object_id,
-                        error = %e,
-                        "batch L2 write failed (block safe in L1 + upload queue)"
-                    );
-                }
+
+        let enqueue_result = async {
+            for (object_id, data) in blocks {
+                self.enqueue_l2_commit(*object_id, data.clone()).await?;
             }
+            Ok::<(), io::Error>(())
         }
+        .await;
+
         self.metrics.materialize_batches.record_batch(
             blocks.len() as u64,
             total_bytes,
             batch_started.elapsed(),
         );
         self.metrics.materialize_batches.leave_inflight();
-        if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {
-            self.evict_notify.notify_one();
+
+        enqueue_result
+    }
+
+    async fn enqueue_l2_commit(&self, object_id: ObjectId, data: Bytes) -> io::Result<()> {
+        let job = L2CommitJob { object_id, data };
+        match self.l2_commit_scheduler.tx.try_reserve() {
+            Ok(permit) => {
+                self.metrics.l2_commit_scheduler.record_enqueue();
+                permit.send(job);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.l2_commit_scheduler.record_backpressure_event();
+                let backpressure_started = Instant::now();
+                let permit = self.l2_commit_scheduler.tx.reserve().await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "l2 commit queue closed")
+                })?;
+                self.metrics
+                    .l2_commit_scheduler
+                    .record_backpressure_wait(backpressure_started.elapsed());
+                self.metrics.l2_commit_scheduler.record_enqueue();
+                permit.send(job);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "l2 commit queue closed",
+            )),
         }
     }
 
@@ -568,6 +659,53 @@ impl BlockCache {
     // Background tasks
     // =========================================================================
 
+    async fn background_l2_commit_worker(self: Arc<Self>, worker_id: usize) {
+        let rx = self.l2_commit_scheduler.receiver();
+        loop {
+            let maybe_job = tokio::select! {
+                biased;
+                _ = self.shutdown_notify.notified() => break,
+                job = async {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                } => job,
+            };
+            let Some(job) = maybe_job else {
+                break;
+            };
+
+            self.metrics.l2_commit_scheduler.record_dequeue();
+            let _worker_guard = self.metrics.l2_commit_scheduler.enter_worker();
+
+            let started = Instant::now();
+            match self.l2.put(job.object_id, &job.data).await {
+                Ok(()) => {
+                    self.metrics
+                        .l2_write
+                        .record(job.data.len() as u64, started.elapsed());
+                    self.lru
+                        .set_location(job.object_id, BlockLocation::MemoryAndDisk);
+                    self.metrics.l2_commit_scheduler.record_complete();
+                }
+                Err(e) => {
+                    self.metrics.l2_commit_scheduler.record_failed();
+                    warn!(
+                        worker_id,
+                        object_id = job.object_id,
+                        error = %e,
+                        "L2 commit worker failed to persist block"
+                    );
+                }
+            }
+
+            if self.l1.over_budget() || self.l2.total_bytes() > self.l2.max_bytes() {
+                self.evict_notify.notify_one();
+            }
+        }
+
+        debug!(worker_id, "background L2 commit worker stopped");
+    }
+
     async fn background_evictor(self: Arc<Self>) {
         let mut interval = tokio::time::interval(Duration::from_secs(EVICTION_INTERVAL_SECS));
         loop {
@@ -762,6 +900,8 @@ mod tests {
             l2_size: 10 * 1024 * 1024, // 10 MiB
             cache_dir: dir.to_path_buf(),
             disk_free_ratio: 0.01,
+            l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
+            l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
         }
     }
 

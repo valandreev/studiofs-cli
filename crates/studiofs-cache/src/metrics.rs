@@ -225,6 +225,122 @@ impl UploadQueueStats {
 }
 
 #[derive(Debug, Clone)]
+pub struct L2CommitSchedulerStatsSnapshot {
+    pub queue_depth: usize,
+    pub queue_depth_peak: usize,
+    pub queue_capacity: usize,
+    pub configured_workers: usize,
+    pub active_workers: usize,
+    pub active_workers_peak: usize,
+    pub submitted: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub backpressure_events: u64,
+    pub backpressure_wait_total_ns: u64,
+    pub backpressure_wait_max_ns: u64,
+    pub backpressure_wait_histogram: LatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Default)]
+pub struct L2CommitSchedulerStats {
+    queue_depth: AtomicUsize,
+    queue_depth_peak: AtomicUsize,
+    queue_capacity: AtomicUsize,
+    configured_workers: AtomicUsize,
+    active_workers: AtomicUsize,
+    active_workers_peak: AtomicUsize,
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    backpressure_events: AtomicU64,
+    backpressure_wait_total_ns: AtomicU64,
+    backpressure_wait_max_ns: AtomicU64,
+    backpressure_wait_histogram: LatencyHistogram,
+}
+
+pub struct L2CommitWorkerGuard<'a> {
+    stats: &'a L2CommitSchedulerStats,
+}
+
+impl L2CommitSchedulerStats {
+    pub fn configure(&self, configured_workers: usize, queue_capacity: usize) {
+        self.configured_workers
+            .store(configured_workers, Ordering::Relaxed);
+        self.queue_capacity.store(queue_capacity, Ordering::Relaxed);
+    }
+
+    pub fn record_enqueue(&self) {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        let queue_depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        update_peak(&self.queue_depth_peak, queue_depth);
+    }
+
+    pub fn record_dequeue(&self) {
+        let _ = self
+            .queue_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 { Some(v - 1) } else { Some(0) }
+            });
+    }
+
+    pub fn enter_worker(&self) -> L2CommitWorkerGuard<'_> {
+        let active_now = self.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
+        update_peak(&self.active_workers_peak, active_now);
+        L2CommitWorkerGuard { stats: self }
+    }
+
+    pub fn record_complete(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_backpressure_event(&self) {
+        self.backpressure_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_backpressure_wait(&self, elapsed: Duration) {
+        let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.backpressure_wait_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.backpressure_wait_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.backpressure_wait_histogram.observe_ns(elapsed_ns);
+    }
+
+    pub fn snapshot(&self) -> L2CommitSchedulerStatsSnapshot {
+        L2CommitSchedulerStatsSnapshot {
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_depth_peak: self.queue_depth_peak.load(Ordering::Relaxed),
+            queue_capacity: self.queue_capacity.load(Ordering::Relaxed),
+            configured_workers: self.configured_workers.load(Ordering::Relaxed),
+            active_workers: self.active_workers.load(Ordering::Relaxed),
+            active_workers_peak: self.active_workers_peak.load(Ordering::Relaxed),
+            submitted: self.submitted.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
+            backpressure_wait_total_ns: self.backpressure_wait_total_ns.load(Ordering::Relaxed),
+            backpressure_wait_max_ns: self.backpressure_wait_max_ns.load(Ordering::Relaxed),
+            backpressure_wait_histogram: self.backpressure_wait_histogram.snapshot(),
+        }
+    }
+}
+
+impl Drop for L2CommitWorkerGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .stats
+            .active_workers
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 { Some(v - 1) } else { Some(0) }
+            });
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BlockingTaskStatsSnapshot {
     pub active: usize,
     pub active_peak: usize,
@@ -355,6 +471,7 @@ pub struct CachePipelineMetricsSnapshot {
     pub l2_read: IoStatsSnapshot,
     pub l2_write: IoStatsSnapshot,
     pub materialize_batches: MaterializeBatchStatsSnapshot,
+    pub l2_commit_scheduler: L2CommitSchedulerStatsSnapshot,
     pub upload_queue: UploadQueueStatsSnapshot,
     pub blocking_tasks: BlockingTaskMetricsSnapshot,
 }
@@ -364,6 +481,7 @@ pub struct CachePipelineMetrics {
     pub l2_read: IoStats,
     pub l2_write: IoStats,
     pub materialize_batches: MaterializeBatchStats,
+    pub l2_commit_scheduler: L2CommitSchedulerStats,
     pub upload_queue: UploadQueueStats,
 }
 
@@ -373,6 +491,7 @@ impl CachePipelineMetrics {
             l2_read: self.l2_read.snapshot(),
             l2_write: self.l2_write.snapshot(),
             materialize_batches: self.materialize_batches.snapshot(),
+            l2_commit_scheduler: self.l2_commit_scheduler.snapshot(),
             upload_queue: self.upload_queue.snapshot(pending_uploads),
             blocking_tasks: crate::runtime::blocking_task_stats_snapshot(),
         }
