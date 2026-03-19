@@ -599,6 +599,11 @@ WARNING: This action is irreversible.")]
         /// On-disk L2 cache limit (e.g. 100GB).
         #[arg(long)]
         l2_limit: Option<String>,
+
+        /// JSON report output path. Defaults to an auto-named file in the
+        /// current working directory.
+        #[arg(long)]
+        json_output: Option<PathBuf>,
     },
 
     /// Create or list immutable metadata snapshots
@@ -752,6 +757,7 @@ fn main() -> anyhow::Result<()> {
             small_file_share,
             l1_limit,
             l2_limit,
+            json_output,
         } => {
             cli::test_cache::run(
                 path,
@@ -763,6 +769,7 @@ fn main() -> anyhow::Result<()> {
                 small_file_share,
                 l1_limit,
                 l2_limit,
+                json_output,
             )?;
         }
         Commands::Snapshot { name, action } => {
@@ -1031,6 +1038,7 @@ mod tests {
                 access_pattern,
                 l1_limit,
                 l2_limit,
+                json_output,
                 ..
             } => {
                 assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
@@ -1045,6 +1053,7 @@ mod tests {
                 ));
                 assert!(l1_limit.is_none());
                 assert!(l2_limit.is_none());
+                assert!(json_output.is_none());
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
@@ -1071,6 +1080,8 @@ mod tests {
             "4GB",
             "--l2-limit",
             "1TB",
+            "--json-output",
+            "reports/cache-run.json",
         ])
         .unwrap();
 
@@ -1085,6 +1096,7 @@ mod tests {
                 small_file_share,
                 l1_limit,
                 l2_limit,
+                json_output,
                 ..
             } => {
                 assert_eq!(path, PathBuf::from("Z:\\bench"));
@@ -1099,6 +1111,10 @@ mod tests {
                 assert_eq!(small_file_share, 40);
                 assert_eq!(l1_limit.unwrap(), "4GB");
                 assert_eq!(l2_limit.unwrap(), "1TB");
+                assert_eq!(
+                    json_output.unwrap(),
+                    PathBuf::from("reports/cache-run.json")
+                );
             }
             other => panic!("expected TestCache, got {other:?}"),
         }

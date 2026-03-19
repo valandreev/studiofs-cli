@@ -117,6 +117,11 @@ studiofs test-cache \
   --l2-limit 100GB
 ```
 
+`test-cache` prints a readable terminal summary and also saves the full structured
+JSON report in the current working directory using an auto-generated file name
+such as `studiofs-test-cache-direct-l2-20260319-151255.json`. Use
+`--json-output <path>` to override the report location or file name.
+
 ## Development
 
 Build:
