@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::Serialize;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -27,6 +28,7 @@ use tokio::sync::Semaphore;
 const DEFAULT_DIRECT_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_E2E_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LATENCY_SAMPLES: usize = 200_000;
+const BINARY_UNIT_DIVISOR: f64 = 1024.0;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -1001,10 +1003,10 @@ fn format_binary_value(mut value: f64) -> (f64, &'static str) {
     let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut unit = units[0];
     for next_unit in units.iter().skip(1) {
-        if value < 1024.0 {
+        if value < BINARY_UNIT_DIVISOR {
             break;
         }
-        value /= 1024.0;
+        value /= BINARY_UNIT_DIVISOR;
         unit = next_unit;
     }
     (value, unit)
@@ -1047,9 +1049,9 @@ fn avg_latency_ms(total_latency_ns: u64, ops: u64) -> f64 {
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
     for row in rows {
-        assert_eq!(row.len(), headers.len(), "table row width mismatch");
-        for (idx, cell) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(cell.len());
+        for (idx, width) in widths.iter_mut().enumerate() {
+            let cell = row.get(idx).map(String::as_str).unwrap_or("");
+            *width = (*width).max(cell.len());
         }
     }
 
@@ -1057,7 +1059,9 @@ fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let write_border = |out: &mut String| {
         out.push('+');
         for width in &widths {
-            out.push_str(&"-".repeat(*width + 2));
+            for _ in 0..(*width + 2) {
+                out.push('-');
+            }
             out.push('+');
         }
         out.push('\n');
@@ -1065,8 +1069,9 @@ fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 
     let write_row = |out: &mut String, cells: &[String]| {
         out.push('|');
-        for (idx, cell) in cells.iter().enumerate() {
-            let _ = write!(out, " {:<width$} |", cell, width = widths[idx]);
+        for (idx, width) in widths.iter().enumerate() {
+            let cell = cells.get(idx).map(String::as_str).unwrap_or("");
+            let _ = write!(out, " {:<width$} |", cell, width = width);
         }
         out.push('\n');
     };
@@ -1111,11 +1116,7 @@ fn default_report_file_name(report: &BenchmarkReport, now: DateTime<Utc>) -> Str
     )
 }
 
-fn next_available_path(path: PathBuf) -> PathBuf {
-    if !path.exists() {
-        return path;
-    }
-
+fn next_available_path(path: &Path, suffix: usize) -> PathBuf {
     let parent = path
         .parent()
         .map(Path::to_path_buf)
@@ -1125,28 +1126,20 @@ fn next_available_path(path: PathBuf) -> PathBuf {
         .and_then(|stem| stem.to_str())
         .unwrap_or("studiofs-test-cache");
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-
-    for suffix in 2.. {
-        let candidate_name = if extension.is_empty() {
-            format!("{stem}-{suffix}")
-        } else {
-            format!("{stem}-{suffix}.{extension}")
-        };
-        let candidate = parent.join(candidate_name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-
-    unreachable!("integer suffix iteration is unbounded")
+    let candidate_name = if extension.is_empty() {
+        format!("{stem}-{suffix}")
+    } else {
+        format!("{stem}-{suffix}.{extension}")
+    };
+    parent.join(candidate_name)
 }
 
-fn resolve_report_path(
+fn resolve_report_target(
     report: &BenchmarkReport,
     json_output: Option<&Path>,
     current_dir: &Path,
     now: DateTime<Utc>,
-) -> PathBuf {
+) -> (PathBuf, bool) {
     if let Some(json_output) = json_output {
         let explicit = if json_output.is_absolute() {
             json_output.to_path_buf()
@@ -1154,12 +1147,58 @@ fn resolve_report_path(
             current_dir.join(json_output)
         };
         if explicit.is_dir() {
-            return next_available_path(explicit.join(default_report_file_name(report, now)));
+            return (explicit.join(default_report_file_name(report, now)), true);
         }
-        return explicit;
+        return (explicit, false);
     }
 
-    next_available_path(current_dir.join(default_report_file_name(report, now)))
+    (
+        current_dir.join(default_report_file_name(report, now)),
+        true,
+    )
+}
+
+fn write_report_file(report_path: &Path, json: &[u8], auto_named: bool) -> Result<PathBuf> {
+    if !auto_named {
+        if let Some(parent) = report_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create report dir {}", parent.display()))?;
+        }
+        std::fs::write(report_path, json)
+            .with_context(|| format!("write benchmark report {}", report_path.display()))?;
+        return Ok(report_path.to_path_buf());
+    }
+
+    let mut candidate = report_path.to_path_buf();
+    let mut suffix = 2usize;
+    loop {
+        if let Some(parent) = candidate.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create report dir {}", parent.display()))?;
+        }
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(json)
+                    .with_context(|| format!("write benchmark report {}", candidate.display()))?;
+                file.flush()
+                    .with_context(|| format!("flush benchmark report {}", candidate.display()))?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = next_available_path(report_path, suffix);
+                suffix = suffix.saturating_add(1);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create benchmark report {}", candidate.display()));
+            }
+        }
+    }
 }
 
 fn save_benchmark_report_in(
@@ -1168,16 +1207,10 @@ fn save_benchmark_report_in(
     current_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<PathBuf> {
-    let report_path = resolve_report_path(report, json_output, current_dir, now);
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create report dir {}", parent.display()))?;
-    }
     let json =
         serde_json::to_vec_pretty(report).context("serialize benchmark report as JSON report")?;
-    std::fs::write(&report_path, json)
-        .with_context(|| format!("write benchmark report {}", report_path.display()))?;
-    Ok(report_path)
+    let (report_path, auto_named) = resolve_report_target(report, json_output, current_dir, now);
+    write_report_file(&report_path, &json, auto_named)
 }
 
 fn save_benchmark_report(report: &BenchmarkReport, json_output: Option<&Path>) -> Result<PathBuf> {
@@ -1533,16 +1566,14 @@ mod tests {
             .single()
             .unwrap();
 
-        let first = resolve_report_path(&report, None, temp.path(), now);
+        let first = save_benchmark_report_in(&report, None, temp.path(), now).unwrap();
         assert_eq!(
             first,
             temp.path()
                 .join("studiofs-test-cache-direct-l2-20260319-151255.json")
         );
 
-        std::fs::write(&first, b"{}").unwrap();
-
-        let second = resolve_report_path(&report, None, temp.path(), now);
+        let second = save_benchmark_report_in(&report, None, temp.path(), now).unwrap();
         assert_eq!(
             second,
             temp.path()
