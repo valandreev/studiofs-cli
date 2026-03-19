@@ -158,9 +158,11 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 
 fn test_vfs_config_from_env() -> VfsConfig {
     load_test_env();
-    let mut config = VfsConfig::default();
     // Keep existing integration tests on durable semantics unless overridden.
-    config.cache_safety_mode = CacheSafetyMode::Durable;
+    let mut config = VfsConfig {
+        cache_safety_mode: CacheSafetyMode::Durable,
+        ..VfsConfig::default()
+    };
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
