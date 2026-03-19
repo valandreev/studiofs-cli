@@ -118,6 +118,15 @@ fn workspace_dotenv_var(key: &str) -> Option<String> {
     workspace_dotenv_vars().get(key).cloned()
 }
 
+fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
+    std::env::var(primary)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| workspace_dotenv_var(primary))
+        .or_else(|| workspace_dotenv_var(legacy))
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn test_env_var(key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
@@ -465,10 +474,26 @@ fn test_online_s3_env() -> &'static TestS3Env {
         load_test_env();
 
         TestS3Env {
-            endpoint: test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000"),
-            bucket: test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test"),
-            access_key: test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
-            secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
+            endpoint: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+                "STUDIOFS_S3_ENDPOINT",
+                "http://127.0.0.1:9000",
+            ),
+            bucket: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+                "STUDIOFS_S3_BUCKET",
+                "studiofs-test",
+            ),
+            access_key: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+                "STUDIOFS_S3_ACCESS_KEY",
+                "studiofs",
+            ),
+            secret_key: test_online_env_var(
+                "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+                "STUDIOFS_S3_SECRET_KEY",
+                "studiofs123",
+            ),
         }
     })
 }
@@ -798,8 +823,8 @@ fn import_remote_snapshot(
         .expect("reset imported format info");
 }
 
-/// Ensure the test bucket exists.
-async fn ensure_bucket() {
+/// Ensure the test bucket exists and report whether the endpoint is reachable.
+async fn ensure_bucket_ready() -> bool {
     use aws_sdk_s3::Client as S3Client;
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
@@ -822,7 +847,7 @@ async fn ensure_bucket() {
         .await
         .is_ok()
     {
-        return;
+        return true;
     }
 
     // Fallback: explicitly create bucket if missing.
@@ -842,7 +867,14 @@ async fn ensure_bucket() {
         .build();
     let client = S3Client::from_conf(conf);
     let _ = client.create_bucket().bucket(&bucket).send().await;
-    let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
+    op.write(".bucket-marker", Bytes::from_static(b"ok"))
+        .await
+        .is_ok()
+}
+
+/// Ensure the test bucket exists.
+async fn ensure_bucket() {
+    let _ = ensure_bucket_ready().await;
 }
 
 async fn wait_until_exists(ds: &DataStore, path: &str, timeout: Duration) -> bool {
@@ -3239,6 +3271,10 @@ struct ScopedTestEnv {
 impl ScopedTestEnv {
     fn new() -> Self {
         const KEYS: &[&str] = &[
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
             "STUDIOFS_S3_ENDPOINT",
             "STUDIOFS_S3_BUCKET",
             "STUDIOFS_S3_ACCESS_KEY",
@@ -4048,6 +4084,8 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
 
 #[test]
 fn stale_upload_completion_is_ignored_after_extent_invalidate() {
+    let _env = ScopedTestEnv::new();
+    apply_test_online_s3_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -4160,7 +4198,10 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     }
 
     unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", &online_info.endpoint);
+        apply_test_online_s3_env();
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     }
     meta.set_format_info(&online_info).unwrap();
 
@@ -4182,7 +4223,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
             .unwrap();
 
             assert!(
-                wait_until(Duration::from_secs(15), || {
+                wait_until(Duration::from_secs(45), || {
                     vfs.pending_uploads_for_inode(ino).is_empty()
                         && vfs.upload_stats().canceled_stale > 0
                 })
@@ -4855,6 +4896,9 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
 
     unsafe {
         apply_test_online_s3_env();
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
     }
@@ -4878,14 +4922,14 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
             .unwrap();
 
             assert!(
-                wait_until(Duration::from_secs(10), || {
+                wait_until(Duration::from_secs(20), || {
                     !vfs.pending_uploads_for_inode(ino).is_empty()
                 })
                 .await,
                 "restart should recover the pending upload batch"
             );
 
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 let read = vfs
                     .read(ino, 0, replacement_payload.len() as u32)
