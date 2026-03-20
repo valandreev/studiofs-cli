@@ -390,6 +390,15 @@ EXAMPLES:
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
 
+PYROSCOPE PROFILING:
+  studiofs mount myvolume /mnt/studio --profile
+  studiofs mount myvolume /mnt/studio --profile=off
+  STUDIOFS_PROFILE=pyroscope|off
+  STUDIOFS_PYROSCOPE_URL=http://localhost:4040
+  STUDIOFS_PYROSCOPE_APP_NAME=studiofs.mount
+  STUDIOFS_PYROSCOPE_SAMPLE_RATE=100
+  STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable
+
 SIZE FORMATS:
   --memory-limit and --cache-size accept: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
 
@@ -437,6 +446,10 @@ ACL PRINCIPAL:
         /// Use `studiofs umount <mount_point>` to stop.
         #[arg(short = 'd', long, conflicts_with = "foreground")]
         detach: bool,
+
+        /// Enable or disable Pyroscope profiling for the mount runtime.
+        #[arg(long, num_args = 0..=1, default_missing_value = "pyroscope", value_enum)]
+        profile: Option<cli::mount_profile::MountProfileMode>,
 
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
@@ -709,6 +722,7 @@ fn main() -> anyhow::Result<()> {
             principal,
             foreground,
             detach,
+            profile,
             snapshot_id,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -722,6 +736,7 @@ fn main() -> anyhow::Result<()> {
                 principal.as_deref(),
                 foreground,
                 detach,
+                profile,
                 snapshot_id.as_deref(),
             )?;
         }
@@ -930,6 +945,30 @@ mod tests {
                 assert_eq!(memory_limit.unwrap(), "4GB");
                 assert_eq!(cache_size.unwrap(), "200GB");
             }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_profile_shorthand() {
+        let cli = parse(&["mount", "vol", "Z:", "--profile"]).unwrap();
+        match cli.command {
+            Commands::Mount { profile, .. } => assert!(matches!(
+                profile,
+                Some(cli::mount_profile::MountProfileMode::Pyroscope)
+            )),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_profile_off() {
+        let cli = parse(&["mount", "vol", "Z:", "--profile=off"]).unwrap();
+        match cli.command {
+            Commands::Mount { profile, .. } => assert!(matches!(
+                profile,
+                Some(cli::mount_profile::MountProfileMode::Off)
+            )),
             other => panic!("expected Mount, got {other:?}"),
         }
     }

@@ -39,6 +39,15 @@ Mount a volume in the background (terminal will not be blocked):
 studiofs mount myvolume Z: -d
 ```
 
+Mount with Pyroscope profiling enabled:
+
+```bash
+STUDIOFS_PROFILE=pyroscope \
+STUDIOFS_PYROSCOPE_URL=http://localhost:4040 \
+STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable \
+studiofs mount myvolume Z: --profile
+```
+
 To unmount a volume running in the background:
 
 ```bash

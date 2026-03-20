@@ -100,6 +100,7 @@ pub fn mount_and_serve(
     _foreground: bool,
     read_only: bool,
     shutdown_event_name: Option<&str>,
+    profiling: Option<Box<dyn FnMut()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
@@ -217,6 +218,9 @@ pub fn mount_and_serve(
     // By default do not block process exit on remote uploads; pending journal
     // entries are resumed on next mount.
     rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
+    if let Some(mut profiling) = profiling {
+        profiling();
+    }
 
     Ok(())
 }

@@ -118,6 +118,7 @@ pub fn mount_and_serve(
     volume_name: &str,
     foreground: bool,
     read_only: bool,
+    profiling: Option<Box<dyn FnMut()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Keep a reference for shutdown() after the FUSE session ends
     // (vfs is moved into StudioFuseFs below).
@@ -169,6 +170,9 @@ pub fn mount_and_serve(
         drop(session);
     } else {
         std::mem::forget(session);
+    }
+    if let Some(mut profiling) = profiling {
+        profiling();
     }
     // Use process::exit to avoid blocking on tokio Runtime drop, which would
     // wait for all background tasks (janitor, GC etc.) to complete — causing

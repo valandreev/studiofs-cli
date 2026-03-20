@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
@@ -325,6 +325,7 @@ pub fn run(
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
+    profile: Option<super::mount_profile::MountProfileMode>,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mount_point, resolved_cache_dir, memory_limit, cache_size) =
@@ -338,6 +339,7 @@ pub fn run(
     let cache_dir = resolved_cache_dir;
     let mut vfs_config = super::settings::load_studiofs_config()?.vfs;
     vfs_config = overlay_vfs_env(vfs_config);
+    let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
 
     #[cfg(windows)]
     let mount_point = {
@@ -418,6 +420,23 @@ pub fn run(
     }
 
     let run_in_foreground = foreground || !detach;
+    let mount_mode = if run_in_foreground {
+        "foreground"
+    } else {
+        "daemon"
+    };
+
+    #[cfg(windows)]
+    let platform = "windows";
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let platform = "linux";
+
+    #[cfg(windows)]
+    let bridge = "winfsp";
+    #[cfg(unix)]
+    let bridge = "fuse";
 
     if let Some(principal) = principal {
         // SAFETY: this happens before Tokio runtime creation, so no runtime
@@ -500,6 +519,27 @@ pub fn run(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?;
 
+    let profiling = super::mount_profile::MountProfileSession::start(
+        profile,
+        name,
+        platform,
+        bridge,
+        mount_mode,
+        &cache_mode,
+        &cache_path,
+    );
+    let profiling = profiling.map(|profiling| {
+        let profiling = Arc::new(Mutex::new(Some(profiling)));
+        let hook = Arc::clone(&profiling);
+        Box::new(move || {
+            if let Ok(mut guard) = hook.lock()
+                && let Some(profiling) = guard.take()
+            {
+                profiling.finish();
+            }
+        }) as Box<dyn FnMut()>
+    });
+
     // Create a tokio runtime for async ops in FUSE callbacks and background tasks
     let rt = Arc::new(
         tokio::runtime::Runtime::new()
@@ -552,6 +592,7 @@ pub fn run(
             run_in_foreground,
             read_only_mount,
             Some(&event_name),
+            profiling,
         )
         .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
 
@@ -569,6 +610,7 @@ pub fn run(
             &format_info.name,
             run_in_foreground,
             read_only_mount,
+            profiling,
         )
         .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
         // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.

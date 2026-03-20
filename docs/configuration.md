@@ -102,6 +102,15 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
+- `--profile` enables optional Pyroscope profiling for the mount runtime.
+- `--profile=off` disables profiling explicitly, even if `STUDIOFS_PROFILE` is set.
+- `STUDIOFS_PROFILE=pyroscope|off` controls the same toggle from the environment.
+- `STUDIOFS_PYROSCOPE_URL` or `PYROSCOPE_URL` configures the Pyroscope endpoint for the mount process.
+- `STUDIOFS_PYROSCOPE_APP_NAME` or `PYROSCOPE_APPLICATION_NAME` overrides the service name.
+- `STUDIOFS_PYROSCOPE_SAMPLE_RATE` or `PYROSCOPE_SAMPLE_RATE` sets the CPU sampling rate in Hz.
+- `STUDIOFS_PYROSCOPE_TAGS` or `PYROSCOPE_TAGS` adds comma-separated `key=value` labels.
+- Default mount tags include platform, volume name, mount mode, cache mode, bridge, and `runtime=mount`.
+- When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
 
 ### `settings`
