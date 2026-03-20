@@ -2342,7 +2342,7 @@ async fn run_mounted_end_to_end(
             })
             .unwrap_or_default();
 
-        let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
+        let measured_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
         let total_wall = Instant::now() - started;
         let total_cpu = started_cpu
             .and_then(|cpu_start| {
@@ -2366,19 +2366,21 @@ async fn run_mounted_end_to_end(
             &reads,
             None,
             None,
-            total_elapsed_ms,
+            measured_elapsed_ms,
         );
         let stream_results =
-            stream_reports_from_telemetry(&writes_by_stream, &reads_by_stream, total_elapsed_ms);
+            stream_reports_from_telemetry(&writes_by_stream, &reads_by_stream, measured_elapsed_ms);
 
         let _ = fs::remove_dir_all(work_root).await;
+        let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
+        let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         Ok::<_, anyhow::Error>(BenchmarkReport {
             run_id: params.run_id.clone(),
             mode: "e2e".to_string(),
             cache_dir: params.target.display().to_string(),
             started_at,
-            completed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            completed_at,
             total_elapsed_ms,
             block_size: params.block_size,
             read_size: params.read_size,
@@ -2403,8 +2405,8 @@ async fn run_mounted_end_to_end(
             profile,
             advanced_metrics: Some(advanced_metrics),
             stream_results,
-            writes: writes.overall.to_report(total_elapsed_ms),
-            reads: reads.overall.to_report(total_elapsed_ms),
+            writes: writes.overall.to_report(measured_elapsed_ms),
+            reads: reads.overall.to_report(measured_elapsed_ms),
         })
     }
     .await;
