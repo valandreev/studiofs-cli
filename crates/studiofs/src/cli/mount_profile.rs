@@ -440,7 +440,7 @@ fn send_profile(
         .timeout(Duration::from_secs(10));
 
     if let (Some(username), Some(password)) = (&endpoint.username, &endpoint.password) {
-        request = request.basic_auth(username.clone(), Some(password.clone()));
+        request = request.basic_auth(username, Some(password));
     }
     if let Some(tenant_id) = &endpoint.tenant_id {
         request = request.header("X-Scope-OrgID", tenant_id);

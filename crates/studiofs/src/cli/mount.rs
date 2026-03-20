@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
@@ -529,12 +529,9 @@ pub fn run(
         &cache_path,
     );
     let profiling = profiling.map(|profiling| {
-        let profiling = Arc::new(Mutex::new(Some(profiling)));
-        let hook = Arc::clone(&profiling);
+        let mut profiling = Some(profiling);
         Box::new(move || {
-            if let Ok(mut guard) = hook.lock()
-                && let Some(profiling) = guard.take()
-            {
+            if let Some(profiling) = profiling.take() {
                 profiling.finish();
             }
         }) as Box<dyn FnMut()>
