@@ -134,8 +134,11 @@ studiofs test-cache \
   --read-size 1MB \
   --small-max 10KB \
   --medium-max 8MB \
-  --concurrency 16 \
+  --sizes small=60,medium=30,large=10 \
+  --concurrency 2 \
+  --sequential-streams \
   --io-depth 64 \
+  --warmup-runs 2 \
   --access-pattern mixed \
   --l1-limit 2GB \
   --l2-limit 100GB \
@@ -158,6 +161,14 @@ Notes:
 - Terminal output is a readable benchmark summary. The full structured JSON
   report is saved in the directory where `studiofs test-cache` was started,
   using an auto-generated file name unless `--json-output <path>` is provided.
+- `--sizes` accepts percentages (`small=60,medium=30,large=10`) or explicit
+  lists (`4KB,64KB,1MB,8MB`).
+- `--warmup-runs` runs prefill cycles that are not included in measured
+  metrics.
+- `--sequential-streams` runs each stream in-order and emits per-stream results
+  in both terminal and JSON output.
+- in `--sequential-streams` mode, effective in-flight I/O is
+  `min(--concurrency, --io-depth)` because each stream executes serially.
 - JSON report contains a `run_id` field to correlate benchmark output with
   tracing/profile events.
 - JSON report contains an `advanced_metrics` section with:

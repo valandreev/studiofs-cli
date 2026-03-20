@@ -246,6 +246,16 @@ Size classes are configurable from the CLI:
 - `--small-max <size>`: inclusive upper bound for the small class (default `10KB`)
 - `--medium-max <size>`: inclusive upper bound for the medium class
   (default `--block-size`)
+- `--sizes <spec>`: workload composition, either percentages
+  (`small=60,medium=30,large=10`) or explicit lists (`4KB,128KB,1MB,8MB`)
+
+Warm-cache measurement controls:
+
+- `--warmup-runs <n>` runs `n` prefill cycles before measured phases
+- `--sequential-streams` keeps each stream sequential over its assigned segment
+- `--concurrency <n>` controls number of streams (default `1`)
+- in sequential mode, effective in-flight I/O is bounded by
+  `min(--concurrency, --io-depth)`
 
 The terminal summary now shows p50/p95/p99 + throughput for overall write/read
 results and for each size class.
