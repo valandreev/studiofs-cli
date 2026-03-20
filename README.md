@@ -109,6 +109,8 @@ studiofs test-cache \
   /tmp/studiofs-cache-bench \
   --block-size 8MB \
   --read-size 1MB \
+  --small-max 10KB \
+  --medium-max 8MB \
   --concurrency 16 \
   --io-depth 64 \
   --access-pattern mixed \
@@ -122,6 +124,10 @@ such as `studiofs-test-cache-direct-l2-20260319-151255.json`. Use
 `--json-output <path>` to override the report location or file name.
 Use `--profile` for on-demand CPU/profile hooks; reports include a `run_id`
 that also tags profile tracing events and cache blocking-task pressure counters.
+The JSON report also contains an `advanced_metrics` section with per-size-class
+latency/throughput (small/medium/large), configurable boundaries, queue
+backpressure percentiles, and (in direct-l2 mode) L1/L2 hit-miss and bytes-served
+breakdown with per-level latency distributions.
 
 ## Development
 

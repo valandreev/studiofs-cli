@@ -176,6 +176,8 @@ studiofs test-cache \
   <path> \
   [--block-size <e.g. 8MB>] \
   [--read-size <e.g. 1MB>] \
+  [--small-max <e.g. 10KB>] \
+  [--medium-max <e.g. 8MB>] \
   [--concurrency <usize>] \
   [--io-depth <usize>] \
   [--access-pattern <sequential|random|mixed>] \
@@ -187,6 +189,8 @@ studiofs test-cache \
 Defaults:
 - `--block-size 8MB`
 - `--read-size` defaults to `block-size`
+- `--small-max 10KB`
+- `--medium-max` defaults to `block-size`
 - `--concurrency 4`
 - `--io-depth 32`
 - `--access-pattern sequential`
@@ -203,6 +207,11 @@ Notes:
 - Effective in-flight queue pressure is driven by `--io-depth`; worker count is raised to at least that value.
 - Output includes a human-readable summary and JSON payload suitable for cross-platform run comparison.
 - JSON report includes a stable `run_id` for correlating `test-cache` output with tracing/profile hooks.
+- JSON report includes `advanced_metrics`:
+  - `size_class_boundaries` (`small_max_bytes`, `medium_max_bytes`)
+  - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
+  - `queue_backpressure` with L2 commit queue depth/worker/backpressure percentiles
+  - direct-l2 only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
 - `--profile` enables on-demand CPU utilization profiling in the saved JSON report (disabled by default to avoid benchmark distortion).
 - `direct-l2` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
 - Current built-in workload volumes are modest (`128MB` direct-l2, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
