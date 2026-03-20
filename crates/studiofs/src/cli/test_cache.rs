@@ -3385,9 +3385,25 @@ pub fn run(
         }
     })?;
 
-    let profile_report = profile_session
-        .map(|session| session.finish(&report_dir))
-        .transpose()?;
+    let profile_report = match profile_session.map(|session| session.finish(&report_dir)) {
+        Some(Ok(report)) => Some(report),
+        Some(Err(err)) => {
+            tracing::warn!(
+                target: "studiofs.cache.profile",
+                run_id = %run_id,
+                error = %err,
+                "profile session failed to finish; benchmark report will still be written"
+            );
+            Some(TestCacheProfileResult {
+                endpoint: None,
+                artifacts: Vec::new(),
+                warnings: vec![format!(
+                    "profile session failed to finish: {err:#}; benchmark metrics are still valid"
+                )],
+            })
+        }
+        None => None,
+    };
     let report = merge_profile_report(report, profile_report);
 
     print!("{}", render_human_summary(&report));

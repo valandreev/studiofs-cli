@@ -152,7 +152,7 @@ impl TestCacheProfileSession {
                             artifacts.push(ProfileArtifactReport {
                                 kind: "cpu".to_string(),
                                 path: artifact.display().to_string(),
-                                bytes: fs::metadata(&artifact)?.len(),
+                                bytes: bytes.len() as u64,
                                 sent_to_endpoint: sent,
                             });
                         }
@@ -202,7 +202,7 @@ impl TestCacheProfileSession {
                     artifacts.push(ProfileArtifactReport {
                         kind: "memory".to_string(),
                         path: artifact.display().to_string(),
-                        bytes: fs::metadata(&artifact)?.len(),
+                        bytes: bytes.len() as u64,
                         sent_to_endpoint: sent,
                     });
                 }
@@ -336,7 +336,9 @@ fn send_profile(
     profile_type: &str,
     raw_profile: &[u8],
 ) -> Result<()> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("failed to build reqwest client")?;
     let labels = vec![
         LabelPair {
             name: "service_name".to_string(),

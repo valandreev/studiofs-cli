@@ -17,3 +17,4 @@ tmp/
 *.tmp
 .grepai/
 dif*.txt
+test*
