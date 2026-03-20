@@ -11,9 +11,10 @@ StudioFS is a Rust workspace (`Cargo.toml`) with crates under `crates/`:
 
 Documentation lives in `docs/` (architecture, config, tests, development). Integration tests are primarily in `crates/studiofs-data/tests/` and `crates/studiofs-vfs/tests/`; many crate-level unit tests are inline in `src/*.rs`.
 
-## GrepAI Usage
-- Before starting work in this repository, run `grepai watch --status` to confirm the indexer is active.
-- Prefer `grepai` for code search and navigation in this repository; use `rg` only when you specifically need a raw text scan or `grepai` is unavailable.
+## Codebase Memory MCP Usage
+- This repository uses `codebase-memory-mcp` for semantic code search, call graph analysis, and architectural mapping.
+- Prefer `search_graph`, `trace_call_path`, and `query_graph` tools for navigating the codebase.
+- Use `get_architecture` to understand high-level system components and their relationships.
 
 ## Build, Test, and Development Commands
 - `cargo build --release`: production build for all workspace crates.
