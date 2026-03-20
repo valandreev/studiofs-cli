@@ -13,7 +13,12 @@ Documentation lives in `docs/` (architecture, config, tests, development). Integ
 
 ## Codebase Memory MCP Usage
 - This repository uses `codebase-memory-mcp` for semantic code search, call graph analysis, and architectural mapping.
-- Prefer `search_graph`, `trace_call_path`, and `query_graph` tools for navigating the codebase.
+- Policy line: always verify `codebase-memory-mcp` availability and repo indexing before any codebase exploration; use graph tools first when both are available.
+- Mandatory workflow:
+  - Check whether `codebase-memory-mcp` is available.
+  - Check whether this repository is indexed.
+  - Use graph tools first if both checks pass.
+  - Fall back to grep or broad file scans only if the server is unavailable or the repo is not indexed.
 - Use `get_architecture` to understand high-level system components and their relationships.
 
 ## Build, Test, and Development Commands
