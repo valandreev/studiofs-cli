@@ -337,7 +337,7 @@ fn send_profile(
     raw_profile: &[u8],
 ) -> Result<()> {
     let client = reqwest::blocking::Client::new();
-    let mut labels = vec![
+    let labels = vec![
         LabelPair {
             name: "service_name".to_string(),
             value: application_name.to_string(),
@@ -357,10 +357,7 @@ fn send_profile(
     ];
     let req = PushRequest {
         series: vec![RawProfileSeries {
-            labels: {
-                labels.shrink_to_fit();
-                labels
-            },
+            labels,
             samples: vec![RawSample {
                 raw_profile: raw_profile.to_vec(),
                 id: uuid::Uuid::new_v4().to_string(),
