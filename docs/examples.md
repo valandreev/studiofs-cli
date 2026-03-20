@@ -142,7 +142,7 @@ studiofs test-cache \
   --access-pattern mixed \
   --l1-limit 2GB \
   --l2-limit 100GB \
-  --profile
+  --profile=pyroscope
 ```
 
 End-to-end benchmark through an already mounted filesystem:
@@ -171,6 +171,9 @@ Notes:
   `min(--concurrency, --io-depth)` because each stream executes serially.
 - JSON report contains a `run_id` field to correlate benchmark output with
   tracing/profile events.
+- When `--profile=pyroscope` is enabled, `studiofs test-cache` writes local
+  pprof artifacts next to the JSON report. If `STUDIOFS_PYROSCOPE_URL` is set,
+  the same CPU and memory profiles are also pushed to that endpoint.
 - JSON report contains an `advanced_metrics` section with:
   - size-class boundaries (`small_max_bytes`, `medium_max_bytes`)
   - per-size-class throughput and latency percentiles (p50/p95/p99)

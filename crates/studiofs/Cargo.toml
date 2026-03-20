@@ -32,11 +32,14 @@ uuid.workspace = true
 home.workspace = true
 libc.workspace = true
 bytes.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+pyroscope = { version = "2", features = ["backend-jemalloc", "backend-pprof-rs"] }
+prost = "0.14"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(unix)'.dependencies]
 studiofs-fuse.workspace = true

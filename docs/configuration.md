@@ -186,7 +186,7 @@ studiofs test-cache \
   [--access-pattern <sequential|random|mixed>] \
   [--l1-limit <e.g. 2GB>] \
   [--l2-limit <e.g. 100GB>] \
-  [--profile]
+  [--profile[=pyroscope]]
 ```
 
 Defaults:
@@ -202,7 +202,20 @@ Defaults:
 - `--access-pattern sequential`
 - `--l1-limit 2GB`
 - `--l2-limit 100GB`
-- `--profile false`
+- `--profile` disabled by default
+- `--profile=pyroscope` enables Pyroscope sampling; `--profile` without a
+  value is accepted as shorthand for the same mode
+
+Profiling environment variables:
+- `STUDIOFS_PYROSCOPE_URL` or `PYROSCOPE_URL`: endpoint base URL for Grafana
+  Pyroscope
+- `STUDIOFS_PYROSCOPE_APP_NAME` or `PYROSCOPE_APPLICATION_NAME`: service name
+  shown in Pyroscope/Grafana
+- `STUDIOFS_PYROSCOPE_SAMPLE_RATE` or `PYROSCOPE_SAMPLE_RATE`: CPU sampling
+  frequency in Hz (default `100`)
+- `STUDIOFS_PYROSCOPE_USERNAME` / `STUDIOFS_PYROSCOPE_PASSWORD`: optional
+  basic-auth credentials
+- `STUDIOFS_PYROSCOPE_TENANT_ID`: optional Grafana Cloud / multi-tenant header
 
 Notes:
 - If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-l2`
@@ -222,7 +235,13 @@ Notes:
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
   - `queue_backpressure` with L2 commit queue depth/worker/backpressure percentiles
   - direct-l2 only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
-- `--profile` enables on-demand CPU utilization profiling in the saved JSON report (disabled by default to avoid benchmark distortion).
+- `--profile=pyroscope` enables on-demand Pyroscope profiling. The run still
+  completes if profiling backends or the endpoint are missing; the command emits
+  warnings and continues.
+- When profiling is enabled, local pprof artifacts are written beside the JSON
+  report:
+  - `...-cpu.pprof.gz`
+  - `...-memory.pprof.gz`
 - `direct-l2` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
 - Current built-in workload volumes are modest (`128MB` direct-l2, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
 

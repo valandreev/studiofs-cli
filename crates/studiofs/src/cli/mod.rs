@@ -12,5 +12,6 @@ pub mod snapshot;
 pub mod status;
 pub mod test;
 pub mod test_cache;
+pub mod test_cache_profile;
 pub mod umount;
 pub mod utils;

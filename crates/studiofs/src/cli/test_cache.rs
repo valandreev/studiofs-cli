@@ -4,6 +4,9 @@
 //! - direct L2 benchmark mode (`direct-l2`) that bypasses VFS
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
+use crate::cli::test_cache_profile::{
+    TestCacheProfileMode, TestCacheProfileResult, TestCacheProfileSession,
+};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -368,7 +371,14 @@ struct BlockingTaskSingleStatsReport {
 #[derive(Debug, Serialize)]
 struct BenchmarkProfileReport {
     enabled: bool,
+    profile_mode: String,
     cpu_profile: CpuProfileReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<ProfileEndpointReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    artifacts: Vec<ProfileArtifactSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,6 +388,20 @@ struct CpuProfileReport {
     cpu_utilization_percent: f64,
     write_phase_cpu_percent: f64,
     read_phase_cpu_percent: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfileEndpointReport {
+    url: String,
+    application_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfileArtifactSummary {
+    kind: String,
+    path: String,
+    bytes: u64,
+    sent_to_endpoint: bool,
 }
 
 impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogramReport {
@@ -1960,7 +1984,7 @@ fn process_cpu_time() -> Option<Duration> {
             usage.ru_stime.tv_sec as u64,
             (usage.ru_stime.tv_usec as u32).saturating_mul(1_000),
         );
-        return Some(user.saturating_add(sys));
+        Some(user.saturating_add(sys))
     }
 
     #[cfg(windows)]
@@ -2193,6 +2217,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         .unwrap_or_default();
     let profile = params.profile.then_some(BenchmarkProfileReport {
         enabled: true,
+        profile_mode: "pyroscope".to_string(),
         cpu_profile: CpuProfileReport {
             total_wall_ms: total_wall.as_secs_f64() * 1000.0,
             total_cpu_ms: total_cpu.as_secs_f64() * 1000.0,
@@ -2200,6 +2225,9 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
             write_phase_cpu_percent: cpu_utilization_percent(writes_cpu, writes_wall),
             read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
         },
+        endpoint: None,
+        artifacts: Vec::new(),
+        warnings: Vec::new(),
     });
     let cache_pipeline: CachePipelineReport = cache.cache_pipeline_metrics().into();
     let advanced_metrics = build_advanced_metrics(
@@ -2420,6 +2448,7 @@ async fn run_mounted_end_to_end(
             .unwrap_or_default();
         let profile = params.profile.then_some(BenchmarkProfileReport {
             enabled: true,
+            profile_mode: "pyroscope".to_string(),
             cpu_profile: CpuProfileReport {
                 total_wall_ms: total_wall.as_secs_f64() * 1000.0,
                 total_cpu_ms: total_cpu.as_secs_f64() * 1000.0,
@@ -2427,6 +2456,9 @@ async fn run_mounted_end_to_end(
                 write_phase_cpu_percent: cpu_utilization_percent(writes_cpu, writes_wall),
                 read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
             },
+            endpoint: None,
+            artifacts: Vec::new(),
+            warnings: Vec::new(),
         });
         let advanced_metrics = build_advanced_metrics(
             params.size_class_small_max,
@@ -3125,6 +3157,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     if let Some(profile) = &report.profile {
         out.push('\n');
         let _ = writeln!(&mut out, "On-demand profile");
+        let _ = writeln!(&mut out, "Mode: {}", profile.profile_mode);
         let _ = writeln!(
             &mut out,
             "CPU util: total {:.1}% (write {:.1}%, read {:.1}%), wall {}, CPU {}",
@@ -3134,9 +3167,98 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             format_duration_ms(profile.cpu_profile.total_wall_ms),
             format_duration_ms(profile.cpu_profile.total_cpu_ms),
         );
+        if let Some(endpoint) = &profile.endpoint {
+            let _ = writeln!(
+                &mut out,
+                "Pyroscope endpoint: {} ({})",
+                endpoint.url, endpoint.application_name
+            );
+        }
+        if !profile.artifacts.is_empty() {
+            let _ = writeln!(&mut out, "Profile artifacts:");
+            for artifact in &profile.artifacts {
+                let _ = writeln!(
+                    &mut out,
+                    "- {}: {} ({} bytes, sent: {})",
+                    artifact.kind,
+                    artifact.path,
+                    artifact.bytes,
+                    if artifact.sent_to_endpoint {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                );
+            }
+        }
+        if !profile.warnings.is_empty() {
+            let _ = writeln!(&mut out, "Profile warnings:");
+            for warning in &profile.warnings {
+                let _ = writeln!(&mut out, "- {}", warning);
+            }
+        }
     }
 
     out
+}
+
+fn merge_profile_report(
+    mut report: BenchmarkReport,
+    profile_report: Option<TestCacheProfileResult>,
+) -> BenchmarkReport {
+    let Some(profile_report) = profile_report else {
+        return report;
+    };
+
+    let artifacts = profile_report
+        .artifacts
+        .into_iter()
+        .map(|artifact| ProfileArtifactSummary {
+            kind: artifact.kind,
+            path: artifact.path,
+            bytes: artifact.bytes,
+            sent_to_endpoint: artifact.sent_to_endpoint,
+        })
+        .collect();
+
+    let profile_mode = "pyroscope".to_string();
+    let endpoint = profile_report
+        .endpoint
+        .map(|endpoint| ProfileEndpointReport {
+            url: endpoint.url,
+            application_name: endpoint.application_name,
+        });
+
+    match report.profile.take() {
+        Some(existing) => {
+            report.profile = Some(BenchmarkProfileReport {
+                enabled: existing.enabled,
+                profile_mode,
+                cpu_profile: existing.cpu_profile,
+                endpoint,
+                artifacts,
+                warnings: profile_report.warnings,
+            });
+        }
+        None => {
+            report.profile = Some(BenchmarkProfileReport {
+                enabled: true,
+                profile_mode,
+                cpu_profile: CpuProfileReport {
+                    total_wall_ms: 0.0,
+                    total_cpu_ms: 0.0,
+                    cpu_utilization_percent: 0.0,
+                    write_phase_cpu_percent: 0.0,
+                    read_phase_cpu_percent: 0.0,
+                },
+                endpoint,
+                artifacts,
+                warnings: profile_report.warnings,
+            });
+        }
+    }
+
+    report
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3154,7 +3276,7 @@ pub fn run(
     access_pattern: TestCacheAccessPattern,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
-    profile: bool,
+    profile: Option<TestCacheProfileMode>,
     json_output: Option<PathBuf>,
 ) -> Result<()> {
     if io_depth == 0 {
@@ -3219,7 +3341,7 @@ pub fn run(
     tracing::info!(
         target: "studiofs.cache.profile",
         run_id = %run_id,
-        profile_enabled = profile,
+        profile_enabled = profile.is_some(),
         "test-cache run started"
     );
     let params = TestCacheParams {
@@ -3236,11 +3358,20 @@ pub fn run(
         access_pattern,
         l1_limit,
         l2_limit,
-        profile,
+        profile: profile.is_some(),
         run_id: run_id.clone(),
     };
 
     let resolved_mode = resolve_run_mode(&target)?;
+    let benchmark_mode = match &resolved_mode {
+        ResolvedRunMode::DirectL2 { .. } => "direct-l2",
+        ResolvedRunMode::MountedE2E { .. } => "e2e",
+    };
+    let report_dir = json_output
+        .as_ref()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or(std::env::current_dir().context("resolve current directory")?);
+    let profile_session = TestCacheProfileSession::start(profile, &run_id, benchmark_mode)?;
 
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let report = rt.block_on(async {
@@ -3253,6 +3384,11 @@ pub fn run(
             } => run_mounted_end_to_end(&params, volume, mount_point, work_root).await,
         }
     })?;
+
+    let profile_report = profile_session
+        .map(|session| session.finish(&report_dir))
+        .transpose()?;
+    let report = merge_profile_report(report, profile_report);
 
     print!("{}", render_human_summary(&report));
     let report_path = save_benchmark_report(&report, json_output.as_deref())?;
@@ -3403,6 +3539,7 @@ mod tests {
             }),
             profile: Some(BenchmarkProfileReport {
                 enabled: true,
+                profile_mode: "pyroscope".to_string(),
                 cpu_profile: CpuProfileReport {
                     total_wall_ms: 93.05,
                     total_cpu_ms: 85.0,
@@ -3410,6 +3547,18 @@ mod tests {
                     write_phase_cpu_percent: 92.0,
                     read_phase_cpu_percent: 90.4,
                 },
+                endpoint: Some(ProfileEndpointReport {
+                    url: "http://pyroscope:4040".to_string(),
+                    application_name: "studiofs.test-cache.direct-l2".to_string(),
+                }),
+                artifacts: vec![ProfileArtifactSummary {
+                    kind: "cpu".to_string(),
+                    path: r"D:\test-cache\studiofs-test-cache-direct-l2-run-123-cpu.pprof.gz"
+                        .to_string(),
+                    bytes: 2048,
+                    sent_to_endpoint: true,
+                }],
+                warnings: vec![],
             }),
             advanced_metrics: Some(AdvancedMetricsReport {
                 size_class_boundaries: SizeClassBoundaryReport {
