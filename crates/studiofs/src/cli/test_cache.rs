@@ -192,6 +192,7 @@ struct CacheLevelReport {
     hits: u64,
     misses: u64,
     bytes_served: u64,
+    throughput_bytes_per_sec: f64,
     avg_latency_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
@@ -655,6 +656,7 @@ impl CacheLevelTelemetryAccumulator {
                 hits: self.l1_hits,
                 misses: self.l1_misses,
                 bytes_served: self.l1_bytes_served,
+                throughput_bytes_per_sec: l1_report.throughput_bytes_per_sec,
                 avg_latency_ms: l1_report.avg_latency_ms,
                 p50_ms: l1_report.p50_ms,
                 p95_ms: l1_report.p95_ms,
@@ -665,6 +667,7 @@ impl CacheLevelTelemetryAccumulator {
                 hits: self.l2_hits,
                 misses: self.l2_misses,
                 bytes_served: self.l2_bytes_served,
+                throughput_bytes_per_sec: l2_report.throughput_bytes_per_sec,
                 avg_latency_ms: l2_report.avg_latency_ms,
                 p50_ms: l2_report.p50_ms,
                 p95_ms: l2_report.p95_ms,
@@ -699,23 +702,40 @@ fn histogram_percentile_ms(histogram: &LatencyHistogramReport, p: f64) -> f64 {
     if total == 0 {
         return 0.0;
     }
-    let target = ((total as f64 - 1.0) * p).round() as u64;
+    let target = ((total as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as u64;
     let mut acc = 0u64;
     for (idx, count) in histogram.bucket_counts.iter().enumerate() {
         acc = acc.saturating_add(*count);
         if acc > target {
-            if idx < histogram.bucket_upper_bounds_ns.len() {
-                return histogram.bucket_upper_bounds_ns[idx] as f64 / 1_000_000.0;
-            }
-            let tail = histogram
-                .bucket_upper_bounds_ns
-                .last()
-                .copied()
-                .unwrap_or(0) as f64;
-            return (tail * 1.25) / 1_000_000.0;
+            let lower_ns = if idx == 0 {
+                0.0
+            } else {
+                histogram.bucket_upper_bounds_ns[idx.saturating_sub(1)] as f64
+            };
+            let upper_ns = if idx < histogram.bucket_upper_bounds_ns.len() {
+                histogram.bucket_upper_bounds_ns[idx] as f64
+            } else {
+                let tail = histogram
+                    .bucket_upper_bounds_ns
+                    .last()
+                    .copied()
+                    .unwrap_or(0) as f64;
+                (tail * 1.25).max(lower_ns + 1.0)
+            };
+            let bucket_start = acc.saturating_sub(*count);
+            let in_bucket_rank = target.saturating_sub(bucket_start) as f64;
+            let bucket_count = (*count).max(1) as f64;
+            let ratio = (in_bucket_rank / bucket_count).clamp(0.0, 1.0);
+            let estimate_ns = lower_ns + (upper_ns - lower_ns) * ratio;
+            return estimate_ns / 1_000_000.0;
         }
     }
-    0.0
+    histogram
+        .bucket_upper_bounds_ns
+        .last()
+        .copied()
+        .unwrap_or(0) as f64
+        / 1_000_000.0
 }
 
 #[derive(Clone, Debug)]
@@ -2090,6 +2110,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
                     levels.l1.hits.to_string(),
                     levels.l1.misses.to_string(),
                     format_bytes(levels.l1.bytes_served),
+                    format_throughput(levels.l1.throughput_bytes_per_sec),
                     format_duration_ms(levels.l1.p50_ms),
                     format_duration_ms(levels.l1.p95_ms),
                     format_duration_ms(levels.l1.p99_ms),
@@ -2099,6 +2120,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
                     levels.l2.hits.to_string(),
                     levels.l2.misses.to_string(),
                     format_bytes(levels.l2.bytes_served),
+                    format_throughput(levels.l2.throughput_bytes_per_sec),
                     format_duration_ms(levels.l2.p50_ms),
                     format_duration_ms(levels.l2.p95_ms),
                     format_duration_ms(levels.l2.p99_ms),
@@ -2113,6 +2135,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
                         "Hits",
                         "Misses",
                         "Bytes served",
+                        "Throughput",
                         "P50",
                         "P95",
                         "P99"
@@ -2268,35 +2291,34 @@ pub fn run(
         return Err(anyhow!("--concurrency must be >= 1"));
     }
     let block_size = parse_size_arg("block-size", block_size.as_deref().unwrap_or("8MB"))?;
+    let block_size_default = block_size.to_string();
+    let l1_limit_default = DEFAULT_L1_SIZE.to_string();
+    let l2_limit_default = DEFAULT_L2_SIZE.to_string();
+    let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
+    let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(
         "read-size",
         read_size
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&block_size.to_string()),
+            .unwrap_or(&block_size_default),
     )?
     .max(1);
-    let l1_limit = parse_size_arg(
-        "l1-limit",
-        l1_limit.as_deref().unwrap_or(&DEFAULT_L1_SIZE.to_string()),
-    )?;
-    let l2_limit = parse_size_arg(
-        "l2-limit",
-        l2_limit.as_deref().unwrap_or(&DEFAULT_L2_SIZE.to_string()),
-    )?;
+    let l1_limit = parse_size_arg("l1-limit", l1_limit.as_deref().unwrap_or(&l1_limit_default))?;
+    let l2_limit = parse_size_arg("l2-limit", l2_limit.as_deref().unwrap_or(&l2_limit_default))?;
     let size_class_small_max = parse_size_arg(
         "small-max",
         small_max
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&DEFAULT_SMALL_CLASS_MAX_BYTES.to_string()),
+            .unwrap_or(&small_max_default),
     )?;
     let size_class_medium_max = parse_size_arg(
         "medium-max",
         medium_max
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&block_size.to_string()),
+            .unwrap_or(&medium_max_default),
     )?;
 
     if l1_limit < 1 || l2_limit < 1 {
@@ -2571,6 +2593,7 @@ mod tests {
                         hits: 9,
                         misses: 7,
                         bytes_served: 72 * 1024 * 1024,
+                        throughput_bytes_per_sec: 774.0 * 1024.0 * 1024.0,
                         avg_latency_ms: 0.15,
                         p50_ms: 0.12,
                         p95_ms: 0.30,
@@ -2584,6 +2607,7 @@ mod tests {
                         hits: 7,
                         misses: 0,
                         bytes_served: 56 * 1024 * 1024,
+                        throughput_bytes_per_sec: 602.0 * 1024.0 * 1024.0,
                         avg_latency_ms: 4.8,
                         p50_ms: 4.4,
                         p95_ms: 7.9,
