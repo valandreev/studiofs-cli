@@ -213,6 +213,7 @@ Notes:
 - `--warmup-runs` executes write+read cycles before measured phases; warm-up cycles are excluded from reported metrics.
 - `--sizes` accepts either class percentages (`small=60,medium=30,large=10`) or an explicit list (`4KB,128KB,1MB,8MB`).
 - `--sequential-streams` runs each stream over its own segment in order and emits per-stream read/write metrics in JSON and terminal output.
+- In `--sequential-streams` mode, effective in-flight I/O is bounded by `min(--concurrency, --io-depth)` because each stream executes I/O serially.
 - Effective in-flight queue pressure is driven by `--io-depth`; worker count is raised to at least that value.
 - Output includes a human-readable summary and JSON payload suitable for cross-platform run comparison.
 - JSON report includes a stable `run_id` for correlating `test-cache` output with tracing/profile hooks.

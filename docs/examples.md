@@ -167,6 +167,8 @@ Notes:
   metrics.
 - `--sequential-streams` runs each stream in-order and emits per-stream results
   in both terminal and JSON output.
+- in `--sequential-streams` mode, effective in-flight I/O is
+  `min(--concurrency, --io-depth)` because each stream executes serially.
 - JSON report contains a `run_id` field to correlate benchmark output with
   tracing/profile events.
 - JSON report contains an `advanced_metrics` section with:

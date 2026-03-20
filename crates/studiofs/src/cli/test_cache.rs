@@ -625,16 +625,48 @@ impl LatencySamples {
         }
     }
 
-    fn merge_from(&mut self, mut other: Self) {
-        self.samples_ns.append(&mut other.samples_ns);
+    fn downsample_in_place(samples: &mut Vec<u64>, step: usize) {
+        if step <= 1 || samples.len() <= 1 {
+            return;
+        }
+        *samples = samples.iter().step_by(step).copied().collect();
+    }
+
+    fn effective_keep_every(&self) -> u64 {
+        if self.total_ops == 0 {
+            1
+        } else {
+            self.sample_keep_every.max(1)
+        }
+    }
+
+    fn merge_from_ref(&mut self, other: &Self) {
+        let self_keep = self.effective_keep_every();
+        let other_keep = other.effective_keep_every();
+        let mut target_keep = self_keep.max(other_keep);
+
+        if self_keep < target_keep {
+            let step = target_keep.div_ceil(self_keep) as usize;
+            Self::downsample_in_place(&mut self.samples_ns, step);
+        }
+
+        if other_keep < target_keep {
+            let step = target_keep.div_ceil(other_keep) as usize;
+            self.samples_ns
+                .extend(other.samples_ns.iter().step_by(step).copied());
+        } else {
+            self.samples_ns.extend_from_slice(&other.samples_ns);
+        }
+
         self.total_ops = self.total_ops.saturating_add(other.total_ops);
         self.total_bytes = self.total_bytes.saturating_add(other.total_bytes);
         self.total_latency_ns = self.total_latency_ns.saturating_add(other.total_latency_ns);
-        self.sample_keep_every = self.sample_keep_every.max(other.sample_keep_every);
-        if self.samples_ns.len() > MAX_LATENCY_SAMPLES {
-            self.samples_ns = self.samples_ns.iter().step_by(2).copied().collect();
-            self.sample_keep_every = self.sample_keep_every.max(2);
+
+        while self.samples_ns.len() > MAX_LATENCY_SAMPLES {
+            Self::downsample_in_place(&mut self.samples_ns, 2);
+            target_keep = target_keep.saturating_mul(2);
         }
+        self.sample_keep_every = if self.total_ops == 0 { 0 } else { target_keep };
     }
 }
 
@@ -665,10 +697,10 @@ impl SizeClassLatencySamples {
         ]
     }
 
-    fn merge_from(&mut self, other: Self) {
-        self.small.merge_from(other.small);
-        self.medium.merge_from(other.medium);
-        self.large.merge_from(other.large);
+    fn merge_from_ref(&mut self, other: &Self) {
+        self.small.merge_from_ref(&other.small);
+        self.medium.merge_from_ref(&other.medium);
+        self.large.merge_from_ref(&other.large);
     }
 }
 
@@ -684,9 +716,9 @@ impl PhaseTelemetry {
         self.by_size.get_mut(class).record(elapsed, bytes);
     }
 
-    fn merge_from(&mut self, other: Self) {
-        self.overall.merge_from(other.overall);
-        self.by_size.merge_from(other.by_size);
+    fn merge_from_ref(&mut self, other: &Self) {
+        self.overall.merge_from_ref(&other.overall);
+        self.by_size.merge_from_ref(&other.by_size);
     }
 }
 
@@ -752,15 +784,17 @@ impl CacheLevelTelemetryAccumulator {
         }
     }
 
-    fn merge_from(&mut self, other: Self) {
+    fn merge_from_ref(&mut self, other: &Self) {
         self.l1_hits = self.l1_hits.saturating_add(other.l1_hits);
         self.l1_misses = self.l1_misses.saturating_add(other.l1_misses);
         self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
-        self.l1_lookup_latency.merge_from(other.l1_lookup_latency);
+        self.l1_lookup_latency
+            .merge_from_ref(&other.l1_lookup_latency);
         self.l2_hits = self.l2_hits.saturating_add(other.l2_hits);
         self.l2_misses = self.l2_misses.saturating_add(other.l2_misses);
         self.l2_bytes_served = self.l2_bytes_served.saturating_add(other.l2_bytes_served);
-        self.l2_lookup_latency.merge_from(other.l2_lookup_latency);
+        self.l2_lookup_latency
+            .merge_from_ref(&other.l2_lookup_latency);
     }
 }
 
@@ -771,9 +805,9 @@ struct DirectReadTelemetry {
 }
 
 impl DirectReadTelemetry {
-    fn merge_from(&mut self, other: Self) {
-        self.phase.merge_from(other.phase);
-        self.cache_levels.merge_from(other.cache_levels);
+    fn merge_from_ref(&mut self, other: &Self) {
+        self.phase.merge_from_ref(&other.phase);
+        self.cache_levels.merge_from_ref(&other.cache_levels);
     }
 }
 
@@ -892,9 +926,13 @@ fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
     }
 
     if raw.contains('=') {
-        let mut small: Option<u8> = None;
-        let mut medium: Option<u8> = None;
-        let mut large: Option<u8> = None;
+        let mut small = 0u8;
+        let mut medium = 0u8;
+        let mut large = 0u8;
+        let mut seen_any = false;
+        let mut seen_small = false;
+        let mut seen_medium = false;
+        let mut seen_large = false;
 
         for segment in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (name, value_raw) = segment.split_once('=').ok_or_else(|| {
@@ -905,10 +943,29 @@ fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
                 .trim_end_matches('%')
                 .parse::<u8>()
                 .with_context(|| format!("invalid percentage in --sizes segment '{segment}'"))?;
+            seen_any = true;
             match name.trim().to_ascii_lowercase().as_str() {
-                "small" => small = Some(value),
-                "medium" => medium = Some(value),
-                "large" => large = Some(value),
+                "small" => {
+                    if seen_small {
+                        return Err(anyhow!("duplicate 'small' entry in --sizes"));
+                    }
+                    small = value;
+                    seen_small = true;
+                }
+                "medium" => {
+                    if seen_medium {
+                        return Err(anyhow!("duplicate 'medium' entry in --sizes"));
+                    }
+                    medium = value;
+                    seen_medium = true;
+                }
+                "large" => {
+                    if seen_large {
+                        return Err(anyhow!("duplicate 'large' entry in --sizes"));
+                    }
+                    large = value;
+                    seen_large = true;
+                }
                 other => {
                     return Err(anyhow!(
                         "invalid size class '{other}' in --sizes; expected small, medium, large"
@@ -917,11 +974,11 @@ fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
             }
         }
 
-        let (small, medium, large) = (
-            small.ok_or_else(|| anyhow!("--sizes percentages must include small=<percent>"))?,
-            medium.ok_or_else(|| anyhow!("--sizes percentages must include medium=<percent>"))?,
-            large.ok_or_else(|| anyhow!("--sizes percentages must include large=<percent>"))?,
-        );
+        if !seen_any {
+            return Err(anyhow!(
+                "--sizes percentages are empty; expected values like small=60,medium=30,large=10"
+            ));
+        }
         if u16::from(small) + u16::from(medium) + u16::from(large) != 100 {
             return Err(anyhow!(
                 "--sizes percentages must add up to 100 (got {} + {} + {})",
@@ -977,18 +1034,32 @@ fn build_access_sequence(len: usize, pattern: TestCacheAccessPattern, seed: u64)
     order
 }
 
-fn build_work_sizes(block_size: u64, size_input: &WorkloadSizeInput) -> WorkloadPlan {
+fn build_work_sizes(
+    block_size: u64,
+    size_input: &WorkloadSizeInput,
+    size_class_bounds: SizeClassBounds,
+) -> WorkloadPlan {
     let mut rng = XorShift64::new(0x5ed0_f00d_beef);
-    let medium_size = block_size.max(1);
+    let small_max = size_class_bounds.small_max.max(1);
+    let medium_max = size_class_bounds
+        .medium_max
+        .max(small_max.saturating_add(1));
+    let medium_size = block_size
+        .max(1)
+        .min(medium_max)
+        .max(small_max.saturating_add(1));
     let large_size = block_size
         .max(1)
         .saturating_mul(LARGE_FILE_MULTIPLIER)
+        .max(medium_max.saturating_add(1))
         .max(1);
 
     let mut generate_small = |out: &mut Vec<u64>, count: usize| {
+        let lower = SMALL_FILE_MIN_BYTES.min(small_max).max(1);
+        let upper = small_max.max(lower);
+        let span = upper.saturating_sub(lower).saturating_add(1);
         for _ in 0..count {
-            let span = SMALL_FILE_MAX_BYTES - SMALL_FILE_MIN_BYTES + 1;
-            let size = SMALL_FILE_MIN_BYTES + (rng.next_u64() % span);
+            let size = lower + (rng.next_u64() % span);
             out.push(size);
         }
     };
@@ -1055,12 +1126,10 @@ fn build_work_sizes(block_size: u64, size_input: &WorkloadSizeInput) -> Workload
             let mut medium_files = 0usize;
             let mut large_files = 0usize;
             for size in items {
-                if *size <= SMALL_FILE_MAX_BYTES {
-                    small_files += 1;
-                } else if *size <= medium_size {
-                    medium_files += 1;
-                } else {
-                    large_files += 1;
+                match classify_size(*size, small_max, medium_max) {
+                    SizeClass::Small => small_files += 1,
+                    SizeClass::Medium => medium_files += 1,
+                    SizeClass::Large => large_files += 1,
                 }
             }
             WorkloadPlan {
@@ -1962,12 +2031,12 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
     let cache = Arc::new(cache);
 
-    let workload = build_work_sizes(params.block_size, &params.sizes);
-    let work_sizes = workload.sizes.clone();
     let size_class_bounds = SizeClassBounds {
         small_max: params.size_class_small_max,
         medium_max: params.size_class_medium_max,
     };
+    let workload = build_work_sizes(params.block_size, &params.sizes, size_class_bounds);
+    let work_sizes = workload.sizes.clone();
     let order = build_access_sequence(
         work_sizes.len(),
         params.access_pattern,
@@ -2049,7 +2118,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         .await?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
-            merged.merge_from(stream.clone());
+            merged.merge_from_ref(stream);
         }
         (merged, writes_by_stream)
     } else {
@@ -2092,7 +2161,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         .await?;
         let mut merged = DirectReadTelemetry::default();
         for stream in &reads_by_stream {
-            merged.merge_from(stream.clone());
+            merged.merge_from_ref(stream);
         }
         (merged, reads_by_stream)
     } else {
@@ -2193,15 +2262,15 @@ async fn run_mounted_end_to_end(
     let benchmark_result = async {
         clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
 
-        let workload = build_work_sizes(params.block_size, &params.sizes);
-        if workload.sizes.is_empty() {
-            anyhow::bail!("nothing to benchmark");
-        }
-        let files = build_file_worklist(&workload.sizes, work_root);
         let size_class_bounds = SizeClassBounds {
             small_max: params.size_class_small_max,
             medium_max: params.size_class_medium_max,
         };
+        let workload = build_work_sizes(params.block_size, &params.sizes, size_class_bounds);
+        if workload.sizes.is_empty() {
+            anyhow::bail!("nothing to benchmark");
+        }
+        let files = build_file_worklist(&workload.sizes, work_root);
         let order =
             build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
 
@@ -2275,7 +2344,7 @@ async fn run_mounted_end_to_end(
             .await?;
             let mut merged = PhaseTelemetry::default();
             for stream in &writes_by_stream {
-                merged.merge_from(stream.clone());
+                merged.merge_from_ref(stream);
             }
             (merged, writes_by_stream)
         } else {
@@ -2318,7 +2387,7 @@ async fn run_mounted_end_to_end(
             .await?;
             let mut merged = PhaseTelemetry::default();
             for stream in &reads_by_stream {
-                merged.merge_from(stream.clone());
+                merged.merge_from_ref(stream);
             }
             (merged, reads_by_stream)
         } else {
@@ -2742,6 +2811,14 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         "Config:    sizes {}, warmups {}, sequential-streams {}",
         report.sizes, report.warmup_runs, report.sequential_streams
     );
+    if report.sequential_streams {
+        let effective = report.concurrency.min(report.io_depth.max(1));
+        let _ = writeln!(
+            &mut out,
+            "Effective: sequential streams cap in-flight I/O at min(concurrency, io-depth) = {}",
+            effective
+        );
+    }
     if let Some(advanced) = &report.advanced_metrics {
         let _ = writeln!(
             &mut out,
@@ -3127,6 +3204,16 @@ pub fn run(
     if size_class_medium_max <= size_class_small_max {
         return Err(anyhow!("--medium-max must be greater than --small-max"));
     }
+    if sequential_streams {
+        let effective = concurrency.min(io_depth.max(1));
+        tracing::warn!(
+            target: "studiofs.cache.profile",
+            requested_concurrency = concurrency,
+            requested_io_depth = io_depth,
+            effective_inflight_io = effective,
+            "sequential-streams mode processes each stream serially; effective in-flight IO is bounded by min(concurrency, io-depth)"
+        );
+    }
 
     let run_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(
@@ -3484,7 +3571,11 @@ mod tests {
     #[test]
     fn workload_profile_has_expected_tiers() {
         let block_size = 8 * 1024 * 1024;
-        let plan = build_work_sizes(block_size, &WorkloadSizeInput::Default);
+        let bounds = SizeClassBounds {
+            small_max: SMALL_FILE_MAX_BYTES,
+            medium_max: block_size,
+        };
+        let plan = build_work_sizes(block_size, &WorkloadSizeInput::Default, bounds);
         let sizes = plan.sizes;
         assert_eq!(sizes.len(), WORKLOAD_FILES_PER_TIER * 3);
 
@@ -3520,6 +3611,20 @@ mod tests {
     }
 
     #[test]
+    fn sizes_percentages_allow_missing_classes_as_zero() {
+        let parsed = parse_sizes_arg(Some("small=50,large=50")).unwrap();
+        assert!(matches!(
+            parsed,
+            WorkloadSizeInput::Percentages {
+                small: 50,
+                medium: 0,
+                large: 50
+            }
+        ));
+        assert!(parse_sizes_arg(Some("small=50,small=50")).is_err());
+    }
+
+    #[test]
     fn sizes_explicit_list_parses() {
         let parsed = parse_sizes_arg(Some("4KB,1MB,8MB")).unwrap();
         match parsed {
@@ -3531,6 +3636,70 @@ mod tests {
             }
             other => panic!("expected explicit list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workload_respects_custom_size_class_bounds() {
+        let bounds = SizeClassBounds {
+            small_max: 2 * 1024,
+            medium_max: 6 * 1024,
+        };
+        let plan = build_work_sizes(
+            8 * 1024 * 1024,
+            &WorkloadSizeInput::ExplicitList(vec![1024, 4 * 1024, 8 * 1024]),
+            bounds,
+        );
+        assert_eq!(plan.small_files, 1);
+        assert_eq!(plan.medium_files, 1);
+        assert_eq!(plan.large_files, 1);
+
+        let default_plan = build_work_sizes(8 * 1024 * 1024, &WorkloadSizeInput::Default, bounds);
+        assert!(
+            default_plan.sizes[..WORKLOAD_FILES_PER_TIER]
+                .iter()
+                .all(|size| *size <= bounds.small_max)
+        );
+    }
+
+    #[test]
+    fn latency_merge_upsamples_keep_every_progressively() {
+        let mut left = LatencySamples {
+            samples_ns: (0..MAX_LATENCY_SAMPLES as u64).collect(),
+            total_ops: MAX_LATENCY_SAMPLES as u64,
+            total_bytes: 0,
+            total_latency_ns: 0,
+            sample_keep_every: 2,
+        };
+        let right = LatencySamples {
+            samples_ns: (0..MAX_LATENCY_SAMPLES as u64).collect(),
+            total_ops: MAX_LATENCY_SAMPLES as u64,
+            total_bytes: 0,
+            total_latency_ns: 0,
+            sample_keep_every: 2,
+        };
+        left.merge_from_ref(&right);
+        assert_eq!(left.sample_keep_every, 4);
+    }
+
+    #[test]
+    fn latency_merge_aligns_sampling_density_before_append() {
+        let mut left = LatencySamples {
+            samples_ns: vec![1, 2, 3, 4],
+            total_ops: 4,
+            total_bytes: 0,
+            total_latency_ns: 0,
+            sample_keep_every: 1,
+        };
+        let right = LatencySamples {
+            samples_ns: vec![10, 20, 30, 40],
+            total_ops: 8,
+            total_bytes: 0,
+            total_latency_ns: 0,
+            sample_keep_every: 2,
+        };
+        left.merge_from_ref(&right);
+        assert_eq!(left.sample_keep_every, 2);
+        assert_eq!(left.samples_ns, vec![1, 3, 10, 20, 30, 40]);
     }
 
     #[test]
