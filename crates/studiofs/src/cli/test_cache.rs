@@ -94,6 +94,12 @@ impl SizeClass {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SizeClassBounds {
+    small_max: u64,
+    medium_max: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct OpReport {
     operations: u64,
@@ -841,8 +847,7 @@ async fn run_l2_writes(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
+    size_class_bounds: SizeClassBounds,
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
@@ -890,8 +895,8 @@ async fn run_l2_writes(
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     sizes[work_index],
-                    size_class_small_max,
-                    size_class_medium_max,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
                 );
 
                 let mut s = stats
@@ -922,8 +927,7 @@ async fn run_l2_reads(
     io_depth: usize,
     concurrency: usize,
     read_size: u64,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
+    size_class_bounds: SizeClassBounds,
 ) -> Result<DirectReadTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
@@ -977,8 +981,8 @@ async fn run_l2_reads(
                 let elapsed = op_start.elapsed();
                 let class = classify_size(
                     sizes[work_index],
-                    size_class_small_max,
-                    size_class_medium_max,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
                 );
                 let mut s = stats
                     .lock()
@@ -1024,8 +1028,7 @@ async fn run_filesystem_writes(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
+    size_class_bounds: SizeClassBounds,
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
@@ -1069,7 +1072,11 @@ async fn run_filesystem_writes(
                 out.flush().await?;
 
                 let elapsed = start.elapsed();
-                let class = classify_size(item.size, size_class_small_max, size_class_medium_max);
+                let class = classify_size(
+                    item.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem write latency stats lock poisoned"))?;
@@ -1097,8 +1104,7 @@ async fn run_filesystem_reads(
     io_depth: usize,
     concurrency: usize,
     read_size: u64,
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
+    size_class_bounds: SizeClassBounds,
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
@@ -1139,7 +1145,11 @@ async fn run_filesystem_reads(
                     .await
                     .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
-                let class = classify_size(item.size, size_class_small_max, size_class_medium_max);
+                let class = classify_size(
+                    item.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
 
                 let mut s = stats
                     .lock()
@@ -1389,6 +1399,10 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     let cache = Arc::new(cache);
 
     let work_sizes = build_work_sizes(params.block_size);
+    let size_class_bounds = SizeClassBounds {
+        small_max: params.size_class_small_max,
+        medium_max: params.size_class_medium_max,
+    };
     let order = build_access_sequence(
         work_sizes.len(),
         params.access_pattern,
@@ -1409,8 +1423,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         &order,
         params.io_depth,
         params.concurrency,
-        params.size_class_small_max,
-        params.size_class_medium_max,
+        size_class_bounds,
     )
     .await?;
     let writes_wall = writes_wall_start.elapsed();
@@ -1433,8 +1446,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         params.io_depth,
         params.concurrency,
         params.read_size,
-        params.size_class_small_max,
-        params.size_class_medium_max,
+        size_class_bounds,
     )
     .await?;
     let reads_wall = reads_wall_start.elapsed();
@@ -1513,6 +1525,10 @@ async fn run_mounted_end_to_end(
         if files.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
+        let size_class_bounds = SizeClassBounds {
+            small_max: params.size_class_small_max,
+            medium_max: params.size_class_medium_max,
+        };
         let order =
             build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
 
@@ -1529,8 +1545,7 @@ async fn run_mounted_end_to_end(
             &order,
             params.io_depth,
             params.concurrency,
-            params.size_class_small_max,
-            params.size_class_medium_max,
+            size_class_bounds,
         )
         .await?;
         let writes_wall = writes_wall_start.elapsed();
@@ -1554,8 +1569,7 @@ async fn run_mounted_end_to_end(
             params.io_depth,
             params.concurrency,
             params.read_size,
-            params.size_class_small_max,
-            params.size_class_medium_max,
+            size_class_bounds,
         )
         .await?;
         let reads_wall = reads_wall_start.elapsed();
