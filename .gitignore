@@ -16,4 +16,4 @@ tmp/
 .DS_Store
 *.tmp
 .grepai/
-diff*.txt
+dif*.txt
