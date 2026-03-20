@@ -7,6 +7,7 @@ pub mod fsck;
 pub mod init;
 pub mod janitor;
 pub mod mount;
+pub mod mount_profile;
 pub mod settings;
 pub mod snapshot;
 pub mod status;
