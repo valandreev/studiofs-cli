@@ -587,13 +587,27 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         medium_max: Option<String>,
 
-        /// Concurrent workload workers.
-        #[arg(long, default_value_t = 4)]
+        /// Number of concurrent streams.
+        #[arg(long, default_value_t = 1)]
         concurrency: usize,
+
+        /// Run each stream sequentially across its assigned segment.
+        #[arg(long)]
+        sequential_streams: bool,
 
         /// Maximum in-flight I/O operations.
         #[arg(long, default_value_t = 32)]
         io_depth: usize,
+
+        /// Number of warm-up cycles executed before metrics collection.
+        #[arg(long, default_value_t = 0)]
+        warmup_runs: u32,
+
+        /// Workload size profile:
+        /// - percentages: `small=60,medium=30,large=10`
+        /// - explicit sizes: `4KB,128KB,1MB,8MB`
+        #[arg(long)]
+        sizes: Option<String>,
 
         /// Access pattern: `sequential`, `random`, or `mixed`.
         #[arg(long, value_enum, default_value_t = cli::test_cache::TestCacheAccessPattern::Sequential)]
@@ -765,7 +779,10 @@ fn main() -> anyhow::Result<()> {
             small_max,
             medium_max,
             concurrency,
+            sequential_streams,
             io_depth,
+            warmup_runs,
+            sizes,
             access_pattern,
             l1_limit,
             l2_limit,
@@ -779,7 +796,10 @@ fn main() -> anyhow::Result<()> {
                 small_max,
                 medium_max,
                 concurrency,
+                sequential_streams,
                 io_depth,
+                warmup_runs,
+                sizes,
                 access_pattern,
                 l1_limit,
                 l2_limit,
@@ -1046,7 +1066,10 @@ mod tests {
             Commands::TestCache {
                 path,
                 concurrency,
+                sequential_streams,
                 io_depth,
+                warmup_runs,
+                sizes,
                 block_size,
                 read_size,
                 small_max,
@@ -1059,8 +1082,11 @@ mod tests {
                 ..
             } => {
                 assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
-                assert_eq!(concurrency, 4);
+                assert_eq!(concurrency, 1);
+                assert!(!sequential_streams);
                 assert_eq!(io_depth, 32);
+                assert_eq!(warmup_runs, 0);
+                assert_eq!(sizes.as_deref(), None);
                 assert_eq!(block_size.as_deref(), None);
                 assert_eq!(read_size.as_deref(), None);
                 assert_eq!(small_max.as_deref(), None);
@@ -1093,8 +1119,13 @@ mod tests {
             "16MB",
             "--concurrency",
             "16",
+            "--sequential-streams",
             "--io-depth",
             "64",
+            "--warmup-runs",
+            "2",
+            "--sizes",
+            "small=60,medium=30,large=10",
             "--access-pattern",
             "random",
             "--l1-limit",
@@ -1116,7 +1147,10 @@ mod tests {
                 medium_max,
                 access_pattern,
                 concurrency,
+                sequential_streams,
                 io_depth,
+                warmup_runs,
+                sizes,
                 l1_limit,
                 l2_limit,
                 json_output,
@@ -1133,7 +1167,10 @@ mod tests {
                     cli::test_cache::TestCacheAccessPattern::Random
                 ));
                 assert_eq!(concurrency, 16);
+                assert!(sequential_streams);
                 assert_eq!(io_depth, 64);
+                assert_eq!(warmup_runs, 2);
+                assert_eq!(sizes.unwrap(), "small=60,medium=30,large=10");
                 assert_eq!(l1_limit.unwrap(), "4GB");
                 assert_eq!(l2_limit.unwrap(), "1TB");
                 assert_eq!(

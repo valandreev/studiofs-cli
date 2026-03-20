@@ -28,6 +28,7 @@ use tokio::sync::Semaphore;
 const MAX_LATENCY_SAMPLES: usize = 200_000;
 const BINARY_UNIT_DIVISOR: f64 = 1024.0;
 const WORKLOAD_FILES_PER_TIER: usize = 100;
+const DEFAULT_WORKLOAD_FILES: usize = WORKLOAD_FILES_PER_TIER * 3;
 const SMALL_FILE_MIN_BYTES: u64 = 1024;
 const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
@@ -51,7 +52,10 @@ struct TestCacheParams {
     size_class_small_max: u64,
     size_class_medium_max: u64,
     concurrency: usize,
+    sequential_streams: bool,
     io_depth: usize,
+    warmup_runs: u32,
+    sizes: WorkloadSizeInput,
     access_pattern: TestCacheAccessPattern,
     l1_limit: u64,
     l2_limit: u64,
@@ -94,6 +98,38 @@ impl SizeClass {
     }
 }
 
+#[derive(Clone, Debug)]
+enum WorkloadSizeInput {
+    Default,
+    Percentages { small: u8, medium: u8, large: u8 },
+    ExplicitList(Vec<u64>),
+}
+
+impl WorkloadSizeInput {
+    fn display_label(&self) -> String {
+        match self {
+            Self::Default => "default".to_string(),
+            Self::Percentages {
+                small,
+                medium,
+                large,
+            } => {
+                format!("small={small}%,medium={medium}%,large={large}%")
+            }
+            Self::ExplicitList(items) => format!("explicit-list({})", items.len()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkloadPlan {
+    sizes: Vec<u64>,
+    source: String,
+    small_files: usize,
+    medium_files: usize,
+    large_files: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SizeClassBounds {
     small_max: u64,
@@ -123,7 +159,14 @@ struct BenchmarkReport {
     block_size: u64,
     read_size: u64,
     concurrency: usize,
+    sequential_streams: bool,
     io_depth: usize,
+    warmup_runs: u32,
+    sizes: String,
+    workload_files: usize,
+    workload_small_files: usize,
+    workload_medium_files: usize,
+    workload_large_files: usize,
     access_pattern: String,
     l1_limit: u64,
     l2_limit: u64,
@@ -143,6 +186,15 @@ struct BenchmarkReport {
     profile: Option<BenchmarkProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     advanced_metrics: Option<AdvancedMetricsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_results: Option<Vec<StreamResultReport>>,
+    writes: OpReport,
+    reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamResultReport {
+    stream_id: usize,
     writes: OpReport,
     reads: OpReport,
 }
@@ -451,7 +503,7 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct LatencySamples {
     samples_ns: Vec<u64>,
     total_ops: u64,
@@ -572,9 +624,21 @@ impl LatencySamples {
             bucket_counts,
         }
     }
+
+    fn merge_from(&mut self, mut other: Self) {
+        self.samples_ns.append(&mut other.samples_ns);
+        self.total_ops = self.total_ops.saturating_add(other.total_ops);
+        self.total_bytes = self.total_bytes.saturating_add(other.total_bytes);
+        self.total_latency_ns = self.total_latency_ns.saturating_add(other.total_latency_ns);
+        self.sample_keep_every = self.sample_keep_every.max(other.sample_keep_every);
+        if self.samples_ns.len() > MAX_LATENCY_SAMPLES {
+            self.samples_ns = self.samples_ns.iter().step_by(2).copied().collect();
+            self.sample_keep_every = self.sample_keep_every.max(2);
+        }
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SizeClassLatencySamples {
     small: LatencySamples,
     medium: LatencySamples,
@@ -600,9 +664,15 @@ impl SizeClassLatencySamples {
                 .to_size_class_report(SizeClass::Large, wall_elapsed_ms),
         ]
     }
+
+    fn merge_from(&mut self, other: Self) {
+        self.small.merge_from(other.small);
+        self.medium.merge_from(other.medium);
+        self.large.merge_from(other.large);
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PhaseTelemetry {
     overall: LatencySamples,
     by_size: SizeClassLatencySamples,
@@ -613,9 +683,14 @@ impl PhaseTelemetry {
         self.overall.record(elapsed, bytes);
         self.by_size.get_mut(class).record(elapsed, bytes);
     }
+
+    fn merge_from(&mut self, other: Self) {
+        self.overall.merge_from(other.overall);
+        self.by_size.merge_from(other.by_size);
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct CacheLevelTelemetryAccumulator {
     l1_hits: u64,
     l1_misses: u64,
@@ -676,12 +751,30 @@ impl CacheLevelTelemetryAccumulator {
             },
         }
     }
+
+    fn merge_from(&mut self, other: Self) {
+        self.l1_hits = self.l1_hits.saturating_add(other.l1_hits);
+        self.l1_misses = self.l1_misses.saturating_add(other.l1_misses);
+        self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
+        self.l1_lookup_latency.merge_from(other.l1_lookup_latency);
+        self.l2_hits = self.l2_hits.saturating_add(other.l2_hits);
+        self.l2_misses = self.l2_misses.saturating_add(other.l2_misses);
+        self.l2_bytes_served = self.l2_bytes_served.saturating_add(other.l2_bytes_served);
+        self.l2_lookup_latency.merge_from(other.l2_lookup_latency);
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct DirectReadTelemetry {
     phase: PhaseTelemetry,
     cache_levels: CacheLevelTelemetryAccumulator,
+}
+
+impl DirectReadTelemetry {
+    fn merge_from(&mut self, other: Self) {
+        self.phase.merge_from(other.phase);
+        self.cache_levels.merge_from(other.cache_levels);
+    }
 }
 
 fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeClass {
@@ -789,6 +882,73 @@ fn parse_size_arg(label: &str, raw: &str) -> Result<u64> {
         })
 }
 
+fn parse_sizes_arg(raw: Option<&str>) -> Result<WorkloadSizeInput> {
+    let Some(raw) = raw else {
+        return Ok(WorkloadSizeInput::Default);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(WorkloadSizeInput::Default);
+    }
+
+    if raw.contains('=') {
+        let mut small: Option<u8> = None;
+        let mut medium: Option<u8> = None;
+        let mut large: Option<u8> = None;
+
+        for segment in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, value_raw) = segment.split_once('=').ok_or_else(|| {
+                anyhow!("invalid --sizes segment '{segment}', expected key=value")
+            })?;
+            let value = value_raw
+                .trim()
+                .trim_end_matches('%')
+                .parse::<u8>()
+                .with_context(|| format!("invalid percentage in --sizes segment '{segment}'"))?;
+            match name.trim().to_ascii_lowercase().as_str() {
+                "small" => small = Some(value),
+                "medium" => medium = Some(value),
+                "large" => large = Some(value),
+                other => {
+                    return Err(anyhow!(
+                        "invalid size class '{other}' in --sizes; expected small, medium, large"
+                    ));
+                }
+            }
+        }
+
+        let (small, medium, large) = (
+            small.ok_or_else(|| anyhow!("--sizes percentages must include small=<percent>"))?,
+            medium.ok_or_else(|| anyhow!("--sizes percentages must include medium=<percent>"))?,
+            large.ok_or_else(|| anyhow!("--sizes percentages must include large=<percent>"))?,
+        );
+        if u16::from(small) + u16::from(medium) + u16::from(large) != 100 {
+            return Err(anyhow!(
+                "--sizes percentages must add up to 100 (got {} + {} + {})",
+                small,
+                medium,
+                large
+            ));
+        }
+        return Ok(WorkloadSizeInput::Percentages {
+            small,
+            medium,
+            large,
+        });
+    }
+
+    let mut sizes = Vec::new();
+    for value in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        sizes.push(parse_size_arg("sizes", value)?);
+    }
+    if sizes.is_empty() {
+        return Err(anyhow!(
+            "--sizes explicit list is empty; provide comma-separated sizes like 4KB,128KB,1MB"
+        ));
+    }
+    Ok(WorkloadSizeInput::ExplicitList(sizes))
+}
+
 fn build_access_sequence(len: usize, pattern: TestCacheAccessPattern, seed: u64) -> Vec<usize> {
     let mut order: Vec<usize> = (0..len).collect();
     if len <= 1 {
@@ -817,26 +977,101 @@ fn build_access_sequence(len: usize, pattern: TestCacheAccessPattern, seed: u64)
     order
 }
 
-fn build_work_sizes(block_size: u64) -> Vec<u64> {
+fn build_work_sizes(block_size: u64, size_input: &WorkloadSizeInput) -> WorkloadPlan {
     let mut rng = XorShift64::new(0x5ed0_f00d_beef);
-    let mut sizes = Vec::with_capacity(WORKLOAD_FILES_PER_TIER * 3);
+    let medium_size = block_size.max(1);
+    let large_size = block_size
+        .max(1)
+        .saturating_mul(LARGE_FILE_MULTIPLIER)
+        .max(1);
 
-    for _ in 0..WORKLOAD_FILES_PER_TIER {
-        let span = SMALL_FILE_MAX_BYTES - SMALL_FILE_MIN_BYTES + 1;
-        let size = SMALL_FILE_MIN_BYTES + (rng.next_u64() % span);
-        sizes.push(size);
+    let mut generate_small = |out: &mut Vec<u64>, count: usize| {
+        for _ in 0..count {
+            let span = SMALL_FILE_MAX_BYTES - SMALL_FILE_MIN_BYTES + 1;
+            let size = SMALL_FILE_MIN_BYTES + (rng.next_u64() % span);
+            out.push(size);
+        }
+    };
+
+    match size_input {
+        WorkloadSizeInput::Default => {
+            let mut sizes = Vec::with_capacity(DEFAULT_WORKLOAD_FILES);
+            generate_small(&mut sizes, WORKLOAD_FILES_PER_TIER);
+            for _ in 0..WORKLOAD_FILES_PER_TIER {
+                sizes.push(medium_size);
+            }
+            for _ in 0..WORKLOAD_FILES_PER_TIER {
+                sizes.push(large_size);
+            }
+            WorkloadPlan {
+                sizes,
+                source: size_input.display_label(),
+                small_files: WORKLOAD_FILES_PER_TIER,
+                medium_files: WORKLOAD_FILES_PER_TIER,
+                large_files: WORKLOAD_FILES_PER_TIER,
+            }
+        }
+        WorkloadSizeInput::Percentages {
+            small,
+            medium,
+            large,
+        } => {
+            let total = DEFAULT_WORKLOAD_FILES as u64;
+            let small_count = (total * u64::from(*small) / 100) as usize;
+            let mut medium_count = (total * u64::from(*medium) / 100) as usize;
+            let mut large_count = (total * u64::from(*large) / 100) as usize;
+            let assigned = small_count + medium_count + large_count;
+            if assigned < DEFAULT_WORKLOAD_FILES {
+                medium_count += DEFAULT_WORKLOAD_FILES - assigned;
+            } else if assigned > DEFAULT_WORKLOAD_FILES {
+                let overshoot = assigned - DEFAULT_WORKLOAD_FILES;
+                let trim = overshoot.min(medium_count);
+                medium_count -= trim;
+                let remain = overshoot - trim;
+                if remain > 0 {
+                    large_count = large_count.saturating_sub(remain);
+                }
+            }
+
+            let mut sizes = Vec::with_capacity(DEFAULT_WORKLOAD_FILES);
+            generate_small(&mut sizes, small_count);
+            for _ in 0..medium_count {
+                sizes.push(medium_size);
+            }
+            for _ in 0..large_count {
+                sizes.push(large_size);
+            }
+
+            WorkloadPlan {
+                sizes,
+                source: size_input.display_label(),
+                small_files: small_count,
+                medium_files: medium_count,
+                large_files: large_count,
+            }
+        }
+        WorkloadSizeInput::ExplicitList(items) => {
+            let mut small_files = 0usize;
+            let mut medium_files = 0usize;
+            let mut large_files = 0usize;
+            for size in items {
+                if *size <= SMALL_FILE_MAX_BYTES {
+                    small_files += 1;
+                } else if *size <= medium_size {
+                    medium_files += 1;
+                } else {
+                    large_files += 1;
+                }
+            }
+            WorkloadPlan {
+                sizes: items.clone(),
+                source: size_input.display_label(),
+                small_files,
+                medium_files,
+                large_files,
+            }
+        }
     }
-
-    for _ in 0..WORKLOAD_FILES_PER_TIER {
-        sizes.push(block_size.max(1));
-    }
-
-    let large_size = block_size.max(1).saturating_mul(LARGE_FILE_MULTIPLIER);
-    for _ in 0..WORKLOAD_FILES_PER_TIER {
-        sizes.push(large_size.max(1));
-    }
-
-    sizes
 }
 
 fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -848,17 +1083,59 @@ fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-fn build_file_worklist(block_size: u64, mount_root: &Path) -> Vec<WorkFile> {
-    let sizes = build_work_sizes(block_size);
-    sizes
-        .into_iter()
+fn build_file_worklist(work_sizes: &[u64], mount_root: &Path) -> Vec<WorkFile> {
+    work_sizes
+        .iter()
         .enumerate()
         .map(|(idx, size)| WorkFile {
             path: mount_root.join(format!("test_cache_file_{idx:06}.bin")),
-            size,
+            size: *size,
             index: idx,
         })
         .collect()
+}
+
+fn split_stream_segments(order: &[usize], stream_count: usize) -> Vec<Vec<usize>> {
+    if order.is_empty() {
+        return Vec::new();
+    }
+    let streams = stream_count.max(1).min(order.len());
+    let base = order.len() / streams;
+    let extra = order.len() % streams;
+    let mut segments = Vec::with_capacity(streams);
+    let mut start = 0usize;
+    for stream_idx in 0..streams {
+        let mut len = base;
+        if stream_idx < extra {
+            len += 1;
+        }
+        let end = start + len;
+        segments.push(order[start..end].to_vec());
+        start = end;
+    }
+    segments
+}
+
+fn stream_reports_from_telemetry(
+    writes_by_stream: &[PhaseTelemetry],
+    reads_by_stream: &[PhaseTelemetry],
+    wall_elapsed_ms: f64,
+) -> Option<Vec<StreamResultReport>> {
+    if writes_by_stream.len() <= 1 || writes_by_stream.len() != reads_by_stream.len() {
+        return None;
+    }
+    Some(
+        writes_by_stream
+            .iter()
+            .zip(reads_by_stream.iter())
+            .enumerate()
+            .map(|(idx, (writes, reads))| StreamResultReport {
+                stream_id: idx,
+                writes: writes.overall.to_report(wall_elapsed_ms),
+                reads: reads.overall.to_report(wall_elapsed_ms),
+            })
+            .collect(),
+    )
 }
 
 async fn run_l2_writes(
@@ -1043,6 +1320,160 @@ async fn run_l2_reads(
         .map_err(|_| anyhow!("L2 read latency stats lock poisoned"))
 }
 
+async fn run_l2_writes_sequential_streams(
+    cache: Arc<BlockCache>,
+    sizes: &[u64],
+    order: &[usize],
+    stream_count: usize,
+    io_depth: usize,
+    size_class_bounds: SizeClassBounds,
+) -> Result<Vec<PhaseTelemetry>> {
+    let segments = split_stream_segments(order, stream_count);
+    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
+        Vec::with_capacity(segments.len());
+
+    for (stream_id, segment) in segments.into_iter().enumerate() {
+        let cache = Arc::clone(&cache);
+        let sem = Arc::clone(&sem);
+        let sizes = sizes.to_vec();
+        handles.push(tokio::spawn(async move {
+            let mut telemetry = PhaseTelemetry::default();
+            for work_index in segment {
+                let permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow!("L2 sequential write semaphore closed: {e}"))?;
+                let _permit = permit;
+                let data_len = usize::try_from(sizes[work_index])
+                    .context("L2 sequential write size overflow")?;
+                let object_id = (work_index as u64) + 1;
+                let data = deterministic_bytes(
+                    data_len,
+                    object_id
+                        .saturating_mul(31)
+                        .saturating_add(stream_id as u64),
+                );
+                let start = Instant::now();
+                cache
+                    .put(object_id, Bytes::from(data))
+                    .await
+                    .context("L2 sequential put failed")?;
+                let elapsed = start.elapsed();
+                let class = classify_size(
+                    sizes[work_index],
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
+                telemetry.record(class, elapsed, sizes[work_index]);
+            }
+            Ok::<_, anyhow::Error>((stream_id, telemetry))
+        }));
+    }
+
+    let mut by_stream = vec![PhaseTelemetry::default(); handles.len()];
+    for handle in handles {
+        let (stream_id, telemetry) = handle
+            .await
+            .context("L2 sequential write stream panicked")?
+            .context("L2 sequential write stream failed")?;
+        by_stream[stream_id] = telemetry;
+    }
+    Ok(by_stream)
+}
+
+async fn run_l2_reads_sequential_streams(
+    cache: Arc<BlockCache>,
+    sizes: &[u64],
+    order: &[usize],
+    stream_count: usize,
+    io_depth: usize,
+    read_size: u64,
+    size_class_bounds: SizeClassBounds,
+) -> Result<Vec<DirectReadTelemetry>> {
+    let segments = split_stream_segments(order, stream_count);
+    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, DirectReadTelemetry)>>> =
+        Vec::with_capacity(segments.len());
+
+    for (stream_id, segment) in segments.into_iter().enumerate() {
+        let cache = Arc::clone(&cache);
+        let sem = Arc::clone(&sem);
+        let sizes = sizes.to_vec();
+        handles.push(tokio::spawn(async move {
+            let mut telemetry = DirectReadTelemetry::default();
+            for work_index in segment {
+                let permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow!("L2 sequential read semaphore closed: {e}"))?;
+                let _permit = permit;
+
+                let object_id = (work_index as u64) + 1;
+                let op_start = Instant::now();
+                let (payload, trace) = cache.get_with_trace(object_id).await;
+                let payload = payload
+                    .with_context(|| format!("L2 sequential read missed object id {object_id}"))?;
+                let read = usize::try_from(read_size.min(sizes[work_index]).max(1))
+                    .context("L2 sequential read size overflow")?;
+                if payload.len() < read {
+                    return Err(anyhow!(
+                        "L2 sequential read requested {} bytes but object {} had only {} bytes",
+                        read,
+                        object_id,
+                        payload.len()
+                    ));
+                }
+                let elapsed = op_start.elapsed();
+                let class = classify_size(
+                    sizes[work_index],
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
+                telemetry.phase.record(class, elapsed, read as u64);
+                match trace.level {
+                    CacheReadLevel::L1 => {
+                        telemetry.cache_levels.record_l1(
+                            true,
+                            trace.l1_lookup_latency,
+                            read as u64,
+                        );
+                    }
+                    CacheReadLevel::L2 => {
+                        telemetry
+                            .cache_levels
+                            .record_l1(false, trace.l1_lookup_latency, 0);
+                        if let Some(l2_latency) = trace.l2_lookup_latency {
+                            telemetry
+                                .cache_levels
+                                .record_l2(true, l2_latency, read as u64);
+                        }
+                    }
+                    CacheReadLevel::Miss => {
+                        telemetry
+                            .cache_levels
+                            .record_l1(false, trace.l1_lookup_latency, 0);
+                        if let Some(l2_latency) = trace.l2_lookup_latency {
+                            telemetry.cache_levels.record_l2(false, l2_latency, 0);
+                        }
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>((stream_id, telemetry))
+        }));
+    }
+
+    let mut by_stream = vec![DirectReadTelemetry::default(); handles.len()];
+    for handle in handles {
+        let (stream_id, telemetry) = handle
+            .await
+            .context("L2 sequential read stream panicked")?
+            .context("L2 sequential read stream failed")?;
+        by_stream[stream_id] = telemetry;
+    }
+    Ok(by_stream)
+}
+
 async fn run_filesystem_writes(
     files: &[WorkFile],
     order: &[usize],
@@ -1190,6 +1621,122 @@ async fn run_filesystem_reads(
         .map_err(|_| anyhow!("filesystem read worker coordination failed"))?
         .into_inner()
         .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))
+}
+
+async fn run_filesystem_writes_sequential_streams(
+    files: &[WorkFile],
+    order: &[usize],
+    stream_count: usize,
+    io_depth: usize,
+    size_class_bounds: SizeClassBounds,
+) -> Result<Vec<PhaseTelemetry>> {
+    let segments = split_stream_segments(order, stream_count);
+    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
+        Vec::with_capacity(segments.len());
+
+    for (stream_id, segment) in segments.into_iter().enumerate() {
+        let sem = Arc::clone(&sem);
+        let files = files.to_vec();
+        handles.push(tokio::spawn(async move {
+            let mut telemetry = PhaseTelemetry::default();
+            for work_index in segment {
+                let item = &files[work_index];
+                let data = deterministic_bytes(
+                    usize::try_from(item.size).context("sequential file write size overflow")?,
+                    item.index as u64 + 123 + stream_id as u64,
+                );
+                let permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow!("filesystem sequential write semaphore closed: {e}"))?;
+                let _permit = permit;
+                let start = Instant::now();
+                let mut out = fs::File::create(&item.path)
+                    .await
+                    .with_context(|| format!("create {}", item.path.display()))?;
+                out.write_all(&data)
+                    .await
+                    .with_context(|| format!("write {}", item.path.display()))?;
+                out.flush().await?;
+                let elapsed = start.elapsed();
+                let class = classify_size(
+                    item.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
+                telemetry.record(class, elapsed, item.size);
+            }
+            Ok::<_, anyhow::Error>((stream_id, telemetry))
+        }));
+    }
+
+    let mut by_stream = vec![PhaseTelemetry::default(); handles.len()];
+    for handle in handles {
+        let (stream_id, telemetry) = handle
+            .await
+            .context("filesystem sequential write stream panicked")?
+            .context("filesystem sequential write stream failed")?;
+        by_stream[stream_id] = telemetry;
+    }
+    Ok(by_stream)
+}
+
+async fn run_filesystem_reads_sequential_streams(
+    files: &[WorkFile],
+    order: &[usize],
+    stream_count: usize,
+    io_depth: usize,
+    read_size: u64,
+    size_class_bounds: SizeClassBounds,
+) -> Result<Vec<PhaseTelemetry>> {
+    let segments = split_stream_segments(order, stream_count);
+    let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
+        Vec::with_capacity(segments.len());
+
+    for (stream_id, segment) in segments.into_iter().enumerate() {
+        let sem = Arc::clone(&sem);
+        let files = files.to_vec();
+        handles.push(tokio::spawn(async move {
+            let mut telemetry = PhaseTelemetry::default();
+            for work_index in segment {
+                let item = &files[work_index];
+                let read_len = read_size.min(item.size).max(1) as usize;
+                let permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow!("filesystem sequential read semaphore closed: {e}"))?;
+                let _permit = permit;
+                let start = Instant::now();
+                let mut in_f = fs::File::open(&item.path)
+                    .await
+                    .with_context(|| format!("open {}", item.path.display()))?;
+                let mut buf = vec![0u8; read_len];
+                in_f.read_exact(&mut buf)
+                    .await
+                    .with_context(|| format!("read {}", item.path.display()))?;
+                let elapsed = start.elapsed();
+                let class = classify_size(
+                    item.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
+                telemetry.record(class, elapsed, read_len as u64);
+            }
+            Ok::<_, anyhow::Error>((stream_id, telemetry))
+        }));
+    }
+
+    let mut by_stream = vec![PhaseTelemetry::default(); handles.len()];
+    for handle in handles {
+        let (stream_id, telemetry) = handle
+            .await
+            .context("filesystem sequential read stream panicked")?
+            .context("filesystem sequential read stream failed")?;
+        by_stream[stream_id] = telemetry;
+    }
+    Ok(by_stream)
 }
 
 fn clear_mount_artifacts(path: &Path) -> Result<()> {
@@ -1409,16 +1956,14 @@ fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
 
 async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<BenchmarkReport> {
     studiofs_cache::runtime::reset_blocking_task_stats();
-    let started = Instant::now();
-    let started_cpu = process_cpu_time();
-    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit, params.l2_limit);
     let (cache, _rx) = BlockCache::open(cache_config)
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
     let cache = Arc::new(cache);
 
-    let work_sizes = build_work_sizes(params.block_size);
+    let workload = build_work_sizes(params.block_size, &params.sizes);
+    let work_sizes = workload.sizes.clone();
     let size_class_bounds = SizeClassBounds {
         small_max: params.size_class_small_max,
         medium_max: params.size_class_medium_max,
@@ -1429,6 +1974,61 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         0x1234_5678_9abc_def0,
     );
 
+    for warmup in 0..params.warmup_runs {
+        tracing::info!(
+            target: "studiofs.cache.profile",
+            run_id = %params.run_id,
+            warmup = warmup + 1,
+            total_warmups = params.warmup_runs,
+            "cache benchmark warm-up cycle started"
+        );
+        if params.sequential_streams {
+            let _ = run_l2_writes_sequential_streams(
+                Arc::clone(&cache),
+                &work_sizes,
+                &order,
+                params.concurrency,
+                params.io_depth,
+                size_class_bounds,
+            )
+            .await?;
+            let _ = run_l2_reads_sequential_streams(
+                Arc::clone(&cache),
+                &work_sizes,
+                &order,
+                params.concurrency,
+                params.io_depth,
+                params.read_size,
+                size_class_bounds,
+            )
+            .await?;
+        } else {
+            let _ = run_l2_writes(
+                Arc::clone(&cache),
+                &work_sizes,
+                &order,
+                params.io_depth,
+                params.concurrency,
+                size_class_bounds,
+            )
+            .await?;
+            let _ = run_l2_reads(
+                Arc::clone(&cache),
+                &work_sizes,
+                &order,
+                params.io_depth,
+                params.concurrency,
+                params.read_size,
+                size_class_bounds,
+            )
+            .await?;
+        }
+    }
+
+    let started = Instant::now();
+    let started_cpu = process_cpu_time();
+    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
     tracing::info!(
         target: "studiofs.cache.profile",
         run_id = %params.run_id,
@@ -1437,15 +2037,35 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     );
     let writes_wall_start = Instant::now();
     let writes_cpu_start = process_cpu_time();
-    let writes = run_l2_writes(
-        Arc::clone(&cache),
-        &work_sizes,
-        &order,
-        params.io_depth,
-        params.concurrency,
-        size_class_bounds,
-    )
-    .await?;
+    let (writes, writes_by_stream) = if params.sequential_streams {
+        let writes_by_stream = run_l2_writes_sequential_streams(
+            Arc::clone(&cache),
+            &work_sizes,
+            &order,
+            params.concurrency,
+            params.io_depth,
+            size_class_bounds,
+        )
+        .await?;
+        let mut merged = PhaseTelemetry::default();
+        for stream in &writes_by_stream {
+            merged.merge_from(stream.clone());
+        }
+        (merged, writes_by_stream)
+    } else {
+        (
+            run_l2_writes(
+                Arc::clone(&cache),
+                &work_sizes,
+                &order,
+                params.io_depth,
+                params.concurrency,
+                size_class_bounds,
+            )
+            .await?,
+            Vec::new(),
+        )
+    };
     let writes_wall = writes_wall_start.elapsed();
     let writes_cpu = writes_cpu_start
         .and_then(|start_cpu| process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu)))
@@ -1459,16 +2079,37 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     );
     let reads_wall_start = Instant::now();
     let reads_cpu_start = process_cpu_time();
-    let reads = run_l2_reads(
-        Arc::clone(&cache),
-        &work_sizes,
-        &order,
-        params.io_depth,
-        params.concurrency,
-        params.read_size,
-        size_class_bounds,
-    )
-    .await?;
+    let (reads, reads_by_stream) = if params.sequential_streams {
+        let reads_by_stream = run_l2_reads_sequential_streams(
+            Arc::clone(&cache),
+            &work_sizes,
+            &order,
+            params.concurrency,
+            params.io_depth,
+            params.read_size,
+            size_class_bounds,
+        )
+        .await?;
+        let mut merged = DirectReadTelemetry::default();
+        for stream in &reads_by_stream {
+            merged.merge_from(stream.clone());
+        }
+        (merged, reads_by_stream)
+    } else {
+        (
+            run_l2_reads(
+                Arc::clone(&cache),
+                &work_sizes,
+                &order,
+                params.io_depth,
+                params.concurrency,
+                params.read_size,
+                size_class_bounds,
+            )
+            .await?,
+            Vec::new(),
+        )
+    };
     let reads_wall = reads_wall_start.elapsed();
     let reads_cpu = reads_cpu_start
         .and_then(|start_cpu| process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu)))
@@ -1501,6 +2142,12 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         Some(&cache_pipeline),
         total_elapsed_ms,
     );
+    let reads_phase_by_stream: Vec<PhaseTelemetry> = reads_by_stream
+        .iter()
+        .map(|item| item.phase.clone())
+        .collect();
+    let stream_results =
+        stream_reports_from_telemetry(&writes_by_stream, &reads_phase_by_stream, total_elapsed_ms);
 
     Ok(BenchmarkReport {
         run_id: params.run_id.clone(),
@@ -1512,7 +2159,14 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         block_size: params.block_size,
         read_size: params.read_size,
         concurrency: params.concurrency,
+        sequential_streams: params.sequential_streams,
         io_depth: params.io_depth,
+        warmup_runs: params.warmup_runs,
+        sizes: workload.source,
+        workload_files: work_sizes.len(),
+        workload_small_files: workload.small_files,
+        workload_medium_files: workload.medium_files,
+        workload_large_files: workload.large_files,
         access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
         l1_limit: params.l1_limit,
         l2_limit: params.l2_limit,
@@ -1523,6 +2177,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         cache_pipeline: Some(cache_pipeline),
         profile,
         advanced_metrics: Some(advanced_metrics),
+        stream_results,
         work_root: None,
         writes: writes.overall.to_report(total_elapsed_ms),
         reads: reads.phase.overall.to_report(total_elapsed_ms),
@@ -1535,22 +2190,71 @@ async fn run_mounted_end_to_end(
     mount_point: &Path,
     work_root: &Path,
 ) -> Result<BenchmarkReport> {
-    let started = Instant::now();
-    let started_cpu = process_cpu_time();
-    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let benchmark_result = async {
         clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
 
-        let files = build_file_worklist(params.block_size, work_root);
-        if files.is_empty() {
+        let workload = build_work_sizes(params.block_size, &params.sizes);
+        if workload.sizes.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
+        let files = build_file_worklist(&workload.sizes, work_root);
         let size_class_bounds = SizeClassBounds {
             small_max: params.size_class_small_max,
             medium_max: params.size_class_medium_max,
         };
         let order =
             build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
+
+        for warmup in 0..params.warmup_runs {
+            tracing::info!(
+                target: "studiofs.cache.profile",
+                run_id = %params.run_id,
+                warmup = warmup + 1,
+                total_warmups = params.warmup_runs,
+                "cache benchmark warm-up cycle started"
+            );
+            if params.sequential_streams {
+                let _ = run_filesystem_writes_sequential_streams(
+                    &files,
+                    &order,
+                    params.concurrency,
+                    params.io_depth,
+                    size_class_bounds,
+                )
+                .await?;
+                let _ = run_filesystem_reads_sequential_streams(
+                    &files,
+                    &order,
+                    params.concurrency,
+                    params.io_depth,
+                    params.read_size,
+                    size_class_bounds,
+                )
+                .await?;
+            } else {
+                let _ = run_filesystem_writes(
+                    &files,
+                    &order,
+                    params.io_depth,
+                    params.concurrency,
+                    size_class_bounds,
+                )
+                .await?;
+                let _ = run_filesystem_reads(
+                    &files,
+                    &order,
+                    params.io_depth,
+                    params.concurrency,
+                    params.read_size,
+                    size_class_bounds,
+                )
+                .await?;
+            }
+        }
+
+        let started = Instant::now();
+        let started_cpu = process_cpu_time();
+        let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         tracing::info!(
             target: "studiofs.cache.profile",
@@ -1560,14 +2264,33 @@ async fn run_mounted_end_to_end(
         );
         let writes_wall_start = Instant::now();
         let writes_cpu_start = process_cpu_time();
-        let writes = run_filesystem_writes(
-            &files,
-            &order,
-            params.io_depth,
-            params.concurrency,
-            size_class_bounds,
-        )
-        .await?;
+        let (writes, writes_by_stream) = if params.sequential_streams {
+            let writes_by_stream = run_filesystem_writes_sequential_streams(
+                &files,
+                &order,
+                params.concurrency,
+                params.io_depth,
+                size_class_bounds,
+            )
+            .await?;
+            let mut merged = PhaseTelemetry::default();
+            for stream in &writes_by_stream {
+                merged.merge_from(stream.clone());
+            }
+            (merged, writes_by_stream)
+        } else {
+            (
+                run_filesystem_writes(
+                    &files,
+                    &order,
+                    params.io_depth,
+                    params.concurrency,
+                    size_class_bounds,
+                )
+                .await?,
+                Vec::new(),
+            )
+        };
         let writes_wall = writes_wall_start.elapsed();
         let writes_cpu = writes_cpu_start
             .and_then(|start_cpu| {
@@ -1583,15 +2306,35 @@ async fn run_mounted_end_to_end(
         );
         let reads_wall_start = Instant::now();
         let reads_cpu_start = process_cpu_time();
-        let reads = run_filesystem_reads(
-            &files,
-            &order,
-            params.io_depth,
-            params.concurrency,
-            params.read_size,
-            size_class_bounds,
-        )
-        .await?;
+        let (reads, reads_by_stream) = if params.sequential_streams {
+            let reads_by_stream = run_filesystem_reads_sequential_streams(
+                &files,
+                &order,
+                params.concurrency,
+                params.io_depth,
+                params.read_size,
+                size_class_bounds,
+            )
+            .await?;
+            let mut merged = PhaseTelemetry::default();
+            for stream in &reads_by_stream {
+                merged.merge_from(stream.clone());
+            }
+            (merged, reads_by_stream)
+        } else {
+            (
+                run_filesystem_reads(
+                    &files,
+                    &order,
+                    params.io_depth,
+                    params.concurrency,
+                    params.read_size,
+                    size_class_bounds,
+                )
+                .await?,
+                Vec::new(),
+            )
+        };
         let reads_wall = reads_wall_start.elapsed();
         let reads_cpu = reads_cpu_start
             .and_then(|start_cpu| {
@@ -1625,6 +2368,8 @@ async fn run_mounted_end_to_end(
             None,
             total_elapsed_ms,
         );
+        let stream_results =
+            stream_reports_from_telemetry(&writes_by_stream, &reads_by_stream, total_elapsed_ms);
 
         let _ = fs::remove_dir_all(work_root).await;
 
@@ -1638,7 +2383,14 @@ async fn run_mounted_end_to_end(
             block_size: params.block_size,
             read_size: params.read_size,
             concurrency: params.concurrency,
+            sequential_streams: params.sequential_streams,
             io_depth: params.io_depth,
+            warmup_runs: params.warmup_runs,
+            sizes: workload.source,
+            workload_files: files.len(),
+            workload_small_files: workload.small_files,
+            workload_medium_files: workload.medium_files,
+            workload_large_files: workload.large_files,
             access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
             l1_limit: params.l1_limit,
             l2_limit: params.l2_limit,
@@ -1650,18 +2402,14 @@ async fn run_mounted_end_to_end(
             cache_pipeline: None,
             profile,
             advanced_metrics: Some(advanced_metrics),
+            stream_results,
             writes: writes.overall.to_report(total_elapsed_ms),
             reads: reads.overall.to_report(total_elapsed_ms),
         })
     }
     .await;
     match benchmark_result {
-        Ok(mut report) => {
-            report.completed_at =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            report.total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
-            Ok(report)
-        }
+        Ok(report) => Ok(report),
         Err(err) => Err(err),
     }
 }
@@ -1977,13 +2725,20 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     );
     let _ = writeln!(
         &mut out,
-        "Workload:  100 small (1-10 KiB), 100 medium ({}), 100 large ({}), read {}, concurrency {}, io-depth {}, pattern {}",
-        format_bytes(report.block_size),
-        format_bytes(report.block_size.saturating_mul(LARGE_FILE_MULTIPLIER)),
+        "Workload:  {} files (small {}, medium {}, large {}), read {}, concurrency {}, io-depth {}, pattern {}",
+        report.workload_files,
+        report.workload_small_files,
+        report.workload_medium_files,
+        report.workload_large_files,
         format_bytes(report.read_size),
         report.concurrency,
         report.io_depth,
         report.access_pattern,
+    );
+    let _ = writeln!(
+        &mut out,
+        "Config:    sizes {}, warmups {}, sequential-streams {}",
+        report.sizes, report.warmup_runs, report.sequential_streams
     );
     if let Some(advanced) = &report.advanced_metrics {
         let _ = writeln!(
@@ -2146,6 +2901,42 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         }
     }
 
+    if let Some(streams) = &report.stream_results {
+        out.push('\n');
+        let _ = writeln!(&mut out, "Per-stream results");
+        let rows: Vec<Vec<String>> = streams
+            .iter()
+            .flat_map(|stream| {
+                [
+                    vec![
+                        "Write".to_string(),
+                        stream.stream_id.to_string(),
+                        stream.writes.operations.to_string(),
+                        format_bytes(stream.writes.bytes),
+                        format_throughput(stream.writes.throughput_bytes_per_sec),
+                        format_duration_ms(stream.writes.p95_ms),
+                    ],
+                    vec![
+                        "Read".to_string(),
+                        stream.stream_id.to_string(),
+                        stream.reads.operations.to_string(),
+                        format_bytes(stream.reads.bytes),
+                        format_throughput(stream.reads.throughput_bytes_per_sec),
+                        format_duration_ms(stream.reads.p95_ms),
+                    ],
+                ]
+            })
+            .collect();
+        let _ = write!(
+            &mut out,
+            "{}",
+            format_table(
+                &["Phase", "Stream", "Ops", "Data", "Throughput", "P95"],
+                &rows
+            )
+        );
+    }
+
     if let Some(pipeline) = &report.cache_pipeline {
         out.push('\n');
         let _ = writeln!(&mut out, "Cache pipeline");
@@ -2277,7 +3068,10 @@ pub fn run(
     small_max: Option<String>,
     medium_max: Option<String>,
     concurrency: usize,
+    sequential_streams: bool,
     io_depth: usize,
+    warmup_runs: u32,
+    sizes: Option<String>,
     access_pattern: TestCacheAccessPattern,
     l1_limit: Option<String>,
     l2_limit: Option<String>,
@@ -2320,6 +3114,7 @@ pub fn run(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(&medium_max_default),
     )?;
+    let sizes = parse_sizes_arg(sizes.as_deref())?;
 
     if l1_limit < 1 || l2_limit < 1 {
         return Err(anyhow!("cache limits must be > 0"));
@@ -2345,7 +3140,10 @@ pub fn run(
         size_class_small_max,
         size_class_medium_max,
         concurrency,
+        sequential_streams,
         io_depth,
+        warmup_runs,
+        sizes,
         access_pattern,
         l1_limit,
         l2_limit,
@@ -2395,8 +3193,15 @@ mod tests {
             total_elapsed_ms: 93.05,
             block_size: 8 * 1024 * 1024,
             read_size: 8 * 1024 * 1024,
-            concurrency: 4,
+            concurrency: 1,
+            sequential_streams: false,
             io_depth: 32,
+            warmup_runs: 0,
+            sizes: "default".to_string(),
+            workload_files: DEFAULT_WORKLOAD_FILES,
+            workload_small_files: WORKLOAD_FILES_PER_TIER,
+            workload_medium_files: WORKLOAD_FILES_PER_TIER,
+            workload_large_files: WORKLOAD_FILES_PER_TIER,
             access_pattern: "sequential".to_string(),
             l1_limit: 2 * 1024 * 1024 * 1024,
             l2_limit: 100 * 1024 * 1024 * 1024,
@@ -2650,6 +3455,7 @@ mod tests {
                     },
                 }),
             }),
+            stream_results: None,
             writes: OpReport {
                 operations: 16,
                 bytes: 128 * 1024 * 1024,
@@ -2676,7 +3482,8 @@ mod tests {
     #[test]
     fn workload_profile_has_expected_tiers() {
         let block_size = 8 * 1024 * 1024;
-        let sizes = build_work_sizes(block_size);
+        let plan = build_work_sizes(block_size, &WorkloadSizeInput::Default);
+        let sizes = plan.sizes;
         assert_eq!(sizes.len(), WORKLOAD_FILES_PER_TIER * 3);
 
         let small = &sizes[..WORKLOAD_FILES_PER_TIER];
@@ -2694,6 +3501,34 @@ mod tests {
                 .iter()
                 .all(|size| *size == block_size * LARGE_FILE_MULTIPLIER)
         );
+    }
+
+    #[test]
+    fn sizes_percentages_parse_and_sum_validation() {
+        let parsed = parse_sizes_arg(Some("small=60,medium=30,large=10")).unwrap();
+        assert!(matches!(
+            parsed,
+            WorkloadSizeInput::Percentages {
+                small: 60,
+                medium: 30,
+                large: 10
+            }
+        ));
+        assert!(parse_sizes_arg(Some("small=40,medium=40,large=10")).is_err());
+    }
+
+    #[test]
+    fn sizes_explicit_list_parses() {
+        let parsed = parse_sizes_arg(Some("4KB,1MB,8MB")).unwrap();
+        match parsed {
+            WorkloadSizeInput::ExplicitList(values) => {
+                assert_eq!(values.len(), 3);
+                assert_eq!(values[0], 4 * 1024);
+                assert_eq!(values[1], 1024 * 1024);
+                assert_eq!(values[2], 8 * 1024 * 1024);
+            }
+            other => panic!("expected explicit list, got {other:?}"),
+        }
     }
 
     #[test]
