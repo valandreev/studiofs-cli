@@ -108,6 +108,20 @@ struct L2CommitJob {
     data: Bytes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheReadLevel {
+    L1,
+    L2,
+    Miss,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CacheReadTrace {
+    pub level: CacheReadLevel,
+    pub l1_lookup_latency: Duration,
+    pub l2_lookup_latency: Option<Duration>,
+}
+
 #[derive(Debug)]
 struct L2CommitScheduler {
     tx: mpsc::Sender<L2CommitJob>,
@@ -306,24 +320,54 @@ impl BlockCache {
     ///
     /// Lookup: L1 (RAM) → L2 (NVMe file) → None.
     pub async fn get(&self, object_id: ObjectId) -> Option<Bytes> {
-        // L1 hit?
-        if let Some(data) = self.l1.get(object_id) {
-            self.lru.touch(object_id);
-            return Some(data);
-        }
+        self.get_with_trace(object_id).await.0
+    }
 
-        // L2 hit?
-        let started = Instant::now();
-        let data = self.l2.get(object_id).await?;
+    /// Read a block and return per-level lookup trace for observability.
+    ///
+    /// This does not change cache behavior; it only exposes lookup timing and
+    /// the level that served the payload.
+    pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
+        let l1_started = Instant::now();
+        if let Some(data) = self.l1.get(object_id) {
+            let trace = CacheReadTrace {
+                level: CacheReadLevel::L1,
+                l1_lookup_latency: l1_started.elapsed(),
+                l2_lookup_latency: None,
+            };
+            self.lru.touch(object_id);
+            return (Some(data), trace);
+        }
+        let l1_lookup_latency = l1_started.elapsed();
+
+        let l2_started = Instant::now();
+        let Some(data) = self.l2.get(object_id).await else {
+            return (
+                None,
+                CacheReadTrace {
+                    level: CacheReadLevel::Miss,
+                    l1_lookup_latency,
+                    l2_lookup_latency: Some(l2_started.elapsed()),
+                },
+            );
+        };
+        let l2_lookup_latency = l2_started.elapsed();
         self.metrics
             .l2_read
-            .record(data.len() as u64, started.elapsed());
+            .record(data.len() as u64, l2_lookup_latency);
 
         // Promote to L1 if budget allows (or near budget).
         self.promote_to_l1(object_id, data.clone());
         self.lru.touch(object_id);
 
-        Some(data)
+        (
+            Some(data),
+            CacheReadTrace {
+                level: CacheReadLevel::L2,
+                l1_lookup_latency,
+                l2_lookup_latency: Some(l2_lookup_latency),
+            },
+        )
     }
 
     /// Read a block synchronously (for upload workers that need re-read).

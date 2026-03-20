@@ -1,0 +1,1 @@
+fn main() { let x: Option<&str> = None; let s = 10u64; let _ = x.unwrap_or(&s.to_string()); }

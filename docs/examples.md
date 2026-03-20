@@ -132,6 +132,8 @@ studiofs test-cache \
   /tmp/studiofs-cache-bench \
   --block-size 8MB \
   --read-size 1MB \
+  --small-max 10KB \
+  --medium-max 8MB \
   --concurrency 16 \
   --io-depth 64 \
   --access-pattern mixed \
@@ -158,11 +160,18 @@ Notes:
   using an auto-generated file name unless `--json-output <path>` is provided.
 - JSON report contains a `run_id` field to correlate benchmark output with
   tracing/profile events.
+- JSON report contains an `advanced_metrics` section with:
+  - size-class boundaries (`small_max_bytes`, `medium_max_bytes`)
+  - per-size-class throughput and latency percentiles (p50/p95/p99)
+  - L2 commit queue and upload queue backpressure/depth counters
 - `direct-l2` JSON output includes a `cache_pipeline` section with:
   - `l2_read` / `l2_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
   - `l2_commit_scheduler` queue depth / worker activity / backpressure counters
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
+- `direct-l2` `advanced_metrics.cache_levels` adds explicit L1/L2 hit/miss
+  counters, bytes served from each level, and per-level lookup latency
+  distributions.
 - `e2e` mode keeps filesystem-level read/write reports; cache internals are
   emitted through mount logs (`upload pipeline counters`).

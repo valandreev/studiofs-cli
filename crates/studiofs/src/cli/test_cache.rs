@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use studiofs_cache::block_cache::{DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
+use studiofs_cache::block_cache::{CacheReadLevel, DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_cache::{BlockCache, BlockCacheConfig};
 use studiofs_vfs::parse_size_bytes;
@@ -31,6 +31,7 @@ const WORKLOAD_FILES_PER_TIER: usize = 100;
 const SMALL_FILE_MIN_BYTES: u64 = 1024;
 const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
+const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -47,6 +48,8 @@ struct TestCacheParams {
     target: PathBuf,
     block_size: u64,
     read_size: u64,
+    size_class_small_max: u64,
+    size_class_medium_max: u64,
     concurrency: usize,
     io_depth: usize,
     access_pattern: TestCacheAccessPattern,
@@ -72,6 +75,29 @@ enum ResolvedRunMode {
         mount_point: PathBuf,
         work_root: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeClass {
+    Small,
+    Medium,
+    Large,
+}
+
+impl SizeClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SizeClassBounds {
+    small_max: u64,
+    medium_max: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,11 +141,92 @@ struct BenchmarkReport {
     cache_pipeline: Option<CachePipelineReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<BenchmarkProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advanced_metrics: Option<AdvancedMetricsReport>,
     writes: OpReport,
     reads: OpReport,
 }
 
 #[derive(Debug, Serialize)]
+struct AdvancedMetricsReport {
+    size_class_boundaries: SizeClassBoundaryReport,
+    size_class_stats: SizeClassStatsReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_levels: Option<CacheLevelsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_backpressure: Option<QueueBackpressureReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SizeClassBoundaryReport {
+    small_max_bytes: u64,
+    medium_max_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SizeClassStatsReport {
+    writes: Vec<SizeClassOpReport>,
+    reads: Vec<SizeClassOpReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SizeClassOpReport {
+    class: String,
+    operations: u64,
+    bytes: u64,
+    avg_latency_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    throughput_bytes_per_sec: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheLevelsReport {
+    l1: CacheLevelReport,
+    l2: CacheLevelReport,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheLevelReport {
+    hits: u64,
+    misses: u64,
+    bytes_served: u64,
+    throughput_bytes_per_sec: f64,
+    avg_latency_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    latency_histogram: LatencyHistogramReport,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueBackpressureReport {
+    l2_commit_queue: L2CommitQueueAdvancedReport,
+    upload_queue: UploadQueueStatsReport,
+}
+
+#[derive(Debug, Serialize)]
+struct L2CommitQueueAdvancedReport {
+    queue_depth: usize,
+    queue_depth_peak: usize,
+    queue_capacity: usize,
+    configured_workers: usize,
+    active_workers: usize,
+    active_workers_peak: usize,
+    submitted: u64,
+    completed: u64,
+    failed: u64,
+    backpressure_events: u64,
+    backpressure_wait_avg_ms: f64,
+    backpressure_wait_max_ms: f64,
+    backpressure_wait_p50_ms: f64,
+    backpressure_wait_p95_ms: f64,
+    backpressure_wait_p99_ms: f64,
+    backpressure_wait_histogram: LatencyHistogramReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct LatencyHistogramReport {
     bucket_upper_bounds_ns: Vec<u64>,
     bucket_counts: Vec<u64>,
@@ -144,7 +251,7 @@ struct MaterializeBatchStatsReport {
     duration_histogram: LatencyHistogramReport,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct UploadQueueStatsReport {
     pending_depth: usize,
     pending_depth_peak: usize,
@@ -168,6 +275,7 @@ struct L2CommitSchedulerStatsReport {
     backpressure_events: u64,
     backpressure_wait_avg_ms: f64,
     backpressure_wait_max_ms: f64,
+    backpressure_wait_histogram: LatencyHistogramReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,6 +398,7 @@ impl From<studiofs_cache::metrics::L2CommitSchedulerStatsSnapshot>
                     / 1_000_000.0
             },
             backpressure_wait_max_ms: snapshot.backpressure_wait_max_ns as f64 / 1_000_000.0,
+            backpressure_wait_histogram: snapshot.backpressure_wait_histogram.into(),
         }
     }
 }
@@ -416,6 +525,217 @@ impl LatencySamples {
             throughput_bytes_per_sec,
         }
     }
+
+    fn to_size_class_report(&self, class: SizeClass, wall_elapsed_ms: f64) -> SizeClassOpReport {
+        let report = self.to_report(wall_elapsed_ms);
+        SizeClassOpReport {
+            class: class.label().to_string(),
+            operations: report.operations,
+            bytes: report.bytes,
+            avg_latency_ms: report.avg_latency_ms,
+            p50_ms: report.p50_ms,
+            p95_ms: report.p95_ms,
+            p99_ms: report.p99_ms,
+            throughput_bytes_per_sec: report.throughput_bytes_per_sec,
+        }
+    }
+
+    fn to_histogram_report(&self) -> LatencyHistogramReport {
+        let bucket_upper_bounds_ns = vec![
+            50_000,
+            100_000,
+            250_000,
+            500_000,
+            1_000_000,
+            2_000_000,
+            5_000_000,
+            10_000_000,
+            25_000_000,
+            50_000_000,
+            100_000_000,
+            250_000_000,
+            500_000_000,
+            1_000_000_000,
+            2_000_000_000,
+            5_000_000_000,
+        ];
+        let mut bucket_counts = vec![0u64; bucket_upper_bounds_ns.len() + 1];
+        for sample in &self.samples_ns {
+            let idx = bucket_upper_bounds_ns
+                .iter()
+                .position(|upper| sample <= upper)
+                .unwrap_or(bucket_counts.len() - 1);
+            bucket_counts[idx] = bucket_counts[idx].saturating_add(1);
+        }
+        LatencyHistogramReport {
+            bucket_upper_bounds_ns,
+            bucket_counts,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SizeClassLatencySamples {
+    small: LatencySamples,
+    medium: LatencySamples,
+    large: LatencySamples,
+}
+
+impl SizeClassLatencySamples {
+    fn get_mut(&mut self, class: SizeClass) -> &mut LatencySamples {
+        match class {
+            SizeClass::Small => &mut self.small,
+            SizeClass::Medium => &mut self.medium,
+            SizeClass::Large => &mut self.large,
+        }
+    }
+
+    fn to_reports(&self, wall_elapsed_ms: f64) -> Vec<SizeClassOpReport> {
+        vec![
+            self.small
+                .to_size_class_report(SizeClass::Small, wall_elapsed_ms),
+            self.medium
+                .to_size_class_report(SizeClass::Medium, wall_elapsed_ms),
+            self.large
+                .to_size_class_report(SizeClass::Large, wall_elapsed_ms),
+        ]
+    }
+}
+
+#[derive(Default)]
+struct PhaseTelemetry {
+    overall: LatencySamples,
+    by_size: SizeClassLatencySamples,
+}
+
+impl PhaseTelemetry {
+    fn record(&mut self, class: SizeClass, elapsed: Duration, bytes: u64) {
+        self.overall.record(elapsed, bytes);
+        self.by_size.get_mut(class).record(elapsed, bytes);
+    }
+}
+
+#[derive(Default)]
+struct CacheLevelTelemetryAccumulator {
+    l1_hits: u64,
+    l1_misses: u64,
+    l1_bytes_served: u64,
+    l1_lookup_latency: LatencySamples,
+    l2_hits: u64,
+    l2_misses: u64,
+    l2_bytes_served: u64,
+    l2_lookup_latency: LatencySamples,
+}
+
+impl CacheLevelTelemetryAccumulator {
+    fn record_l1(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
+        self.l1_lookup_latency.record(elapsed, bytes_served);
+        if hit {
+            self.l1_hits = self.l1_hits.saturating_add(1);
+            self.l1_bytes_served = self.l1_bytes_served.saturating_add(bytes_served);
+        } else {
+            self.l1_misses = self.l1_misses.saturating_add(1);
+        }
+    }
+
+    fn record_l2(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
+        self.l2_lookup_latency.record(elapsed, bytes_served);
+        if hit {
+            self.l2_hits = self.l2_hits.saturating_add(1);
+            self.l2_bytes_served = self.l2_bytes_served.saturating_add(bytes_served);
+        } else {
+            self.l2_misses = self.l2_misses.saturating_add(1);
+        }
+    }
+
+    fn to_report(&self, wall_elapsed_ms: f64) -> CacheLevelsReport {
+        let l1_report = self.l1_lookup_latency.to_report(wall_elapsed_ms);
+        let l2_report = self.l2_lookup_latency.to_report(wall_elapsed_ms);
+        CacheLevelsReport {
+            l1: CacheLevelReport {
+                hits: self.l1_hits,
+                misses: self.l1_misses,
+                bytes_served: self.l1_bytes_served,
+                throughput_bytes_per_sec: l1_report.throughput_bytes_per_sec,
+                avg_latency_ms: l1_report.avg_latency_ms,
+                p50_ms: l1_report.p50_ms,
+                p95_ms: l1_report.p95_ms,
+                p99_ms: l1_report.p99_ms,
+                latency_histogram: self.l1_lookup_latency.to_histogram_report(),
+            },
+            l2: CacheLevelReport {
+                hits: self.l2_hits,
+                misses: self.l2_misses,
+                bytes_served: self.l2_bytes_served,
+                throughput_bytes_per_sec: l2_report.throughput_bytes_per_sec,
+                avg_latency_ms: l2_report.avg_latency_ms,
+                p50_ms: l2_report.p50_ms,
+                p95_ms: l2_report.p95_ms,
+                p99_ms: l2_report.p99_ms,
+                latency_histogram: self.l2_lookup_latency.to_histogram_report(),
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct DirectReadTelemetry {
+    phase: PhaseTelemetry,
+    cache_levels: CacheLevelTelemetryAccumulator,
+}
+
+fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeClass {
+    if size <= small_max {
+        SizeClass::Small
+    } else if size <= medium_max {
+        SizeClass::Medium
+    } else {
+        SizeClass::Large
+    }
+}
+
+fn histogram_percentile_ms(histogram: &LatencyHistogramReport, p: f64) -> f64 {
+    if histogram.bucket_counts.is_empty() {
+        return 0.0;
+    }
+    let total: u64 = histogram.bucket_counts.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let target = ((total as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as u64;
+    let mut acc = 0u64;
+    for (idx, count) in histogram.bucket_counts.iter().enumerate() {
+        acc = acc.saturating_add(*count);
+        if acc > target {
+            let lower_ns = if idx == 0 {
+                0.0
+            } else {
+                histogram.bucket_upper_bounds_ns[idx.saturating_sub(1)] as f64
+            };
+            let upper_ns = if idx < histogram.bucket_upper_bounds_ns.len() {
+                histogram.bucket_upper_bounds_ns[idx] as f64
+            } else {
+                let tail = histogram
+                    .bucket_upper_bounds_ns
+                    .last()
+                    .copied()
+                    .unwrap_or(0) as f64;
+                (tail * 1.25).max(lower_ns + 1.0)
+            };
+            let bucket_start = acc.saturating_sub(*count);
+            let in_bucket_rank = target.saturating_sub(bucket_start) as f64;
+            let bucket_count = (*count).max(1) as f64;
+            let ratio = (in_bucket_rank / bucket_count).clamp(0.0, 1.0);
+            let estimate_ns = lower_ns + (upper_ns - lower_ns) * ratio;
+            return estimate_ns / 1_000_000.0;
+        }
+    }
+    histogram
+        .bucket_upper_bounds_ns
+        .last()
+        .copied()
+        .unwrap_or(0) as f64
+        / 1_000_000.0
 }
 
 #[derive(Clone, Debug)]
@@ -547,10 +867,11 @@ async fn run_l2_writes(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
-) -> Result<LatencySamples> {
+    size_class_bounds: SizeClassBounds,
+) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
-    let stats = Arc::new(Mutex::new(LatencySamples::default()));
+    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
@@ -592,11 +913,16 @@ async fn run_l2_writes(
                     .await
                     .context("L2 put failed")?;
                 let elapsed = start.elapsed();
+                let class = classify_size(
+                    sizes[work_index],
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
 
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("L2 write latency stats lock poisoned"))?;
-                s.record(elapsed, sizes[work_index]);
+                s.record(class, elapsed, sizes[work_index]);
             }
         }));
     }
@@ -621,10 +947,11 @@ async fn run_l2_reads(
     io_depth: usize,
     concurrency: usize,
     read_size: u64,
-) -> Result<LatencySamples> {
+    size_class_bounds: SizeClassBounds,
+) -> Result<DirectReadTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
-    let stats = Arc::new(Mutex::new(LatencySamples::default()));
+    let stats = Arc::new(Mutex::new(DirectReadTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
@@ -651,11 +978,10 @@ async fn run_l2_reads(
                 let _permit = permit;
 
                 let object_id = (work_index as u64) + 1;
-                let start = Instant::now();
-                let payload = cache
-                    .get(object_id)
-                    .await
-                    .with_context(|| format!("L2 read missed object id {object_id}"))?;
+                let op_start = Instant::now();
+                let (payload, trace) = cache.get_with_trace(object_id).await;
+                let payload =
+                    payload.with_context(|| format!("L2 read missed object id {object_id}"))?;
                 let read = usize::try_from(read_size.min(sizes[work_index]).max(1))
                     .context("L2 read size overflow")?;
                 if payload.is_empty() {
@@ -672,11 +998,34 @@ async fn run_l2_reads(
                     ));
                 }
 
-                let elapsed = start.elapsed();
+                let elapsed = op_start.elapsed();
+                let class = classify_size(
+                    sizes[work_index],
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("L2 read latency stats lock poisoned"))?;
-                s.record(elapsed, read as u64);
+                s.phase.record(class, elapsed, read as u64);
+                match trace.level {
+                    CacheReadLevel::L1 => {
+                        s.cache_levels
+                            .record_l1(true, trace.l1_lookup_latency, read as u64);
+                    }
+                    CacheReadLevel::L2 => {
+                        s.cache_levels.record_l1(false, trace.l1_lookup_latency, 0);
+                        if let Some(l2_latency) = trace.l2_lookup_latency {
+                            s.cache_levels.record_l2(true, l2_latency, read as u64);
+                        }
+                    }
+                    CacheReadLevel::Miss => {
+                        s.cache_levels.record_l1(false, trace.l1_lookup_latency, 0);
+                        if let Some(l2_latency) = trace.l2_lookup_latency {
+                            s.cache_levels.record_l2(false, l2_latency, 0);
+                        }
+                    }
+                }
             }
         }));
     }
@@ -699,10 +1048,11 @@ async fn run_filesystem_writes(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
-) -> Result<LatencySamples> {
+    size_class_bounds: SizeClassBounds,
+) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
-    let stats = Arc::new(Mutex::new(LatencySamples::default()));
+    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
@@ -742,10 +1092,15 @@ async fn run_filesystem_writes(
                 out.flush().await?;
 
                 let elapsed = start.elapsed();
+                let class = classify_size(
+                    item.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem write latency stats lock poisoned"))?;
-                s.record(elapsed, item.size);
+                s.record(class, elapsed, item.size);
             }
         }));
     }
@@ -769,10 +1124,11 @@ async fn run_filesystem_reads(
     io_depth: usize,
     concurrency: usize,
     read_size: u64,
-) -> Result<LatencySamples> {
+    size_class_bounds: SizeClassBounds,
+) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
-    let stats = Arc::new(Mutex::new(LatencySamples::default()));
+    let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
@@ -809,11 +1165,16 @@ async fn run_filesystem_reads(
                     .await
                     .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
+                let class = classify_size(
+                    item.size,
+                    size_class_bounds.small_max,
+                    size_class_bounds.medium_max,
+                );
 
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))?;
-                s.record(elapsed, read_len as u64);
+                s.record(class, elapsed, read_len as u64);
             }
         }));
     }
@@ -1058,6 +1419,10 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     let cache = Arc::new(cache);
 
     let work_sizes = build_work_sizes(params.block_size);
+    let size_class_bounds = SizeClassBounds {
+        small_max: params.size_class_small_max,
+        medium_max: params.size_class_medium_max,
+    };
     let order = build_access_sequence(
         work_sizes.len(),
         params.access_pattern,
@@ -1078,6 +1443,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         &order,
         params.io_depth,
         params.concurrency,
+        size_class_bounds,
     )
     .await?;
     let writes_wall = writes_wall_start.elapsed();
@@ -1100,6 +1466,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         params.io_depth,
         params.concurrency,
         params.read_size,
+        size_class_bounds,
     )
     .await?;
     let reads_wall = reads_wall_start.elapsed();
@@ -1124,6 +1491,16 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
             read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
         },
     });
+    let cache_pipeline: CachePipelineReport = cache.cache_pipeline_metrics().into();
+    let advanced_metrics = build_advanced_metrics(
+        params.size_class_small_max,
+        params.size_class_medium_max,
+        &writes,
+        &reads.phase,
+        Some(&reads.cache_levels),
+        Some(&cache_pipeline),
+        total_elapsed_ms,
+    );
 
     Ok(BenchmarkReport {
         run_id: params.run_id.clone(),
@@ -1143,11 +1520,12 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),
         l2_bytes: Some(cache_stats.l2_bytes),
-        cache_pipeline: Some(cache.cache_pipeline_metrics().into()),
+        cache_pipeline: Some(cache_pipeline),
         profile,
+        advanced_metrics: Some(advanced_metrics),
         work_root: None,
-        writes: writes.to_report(total_elapsed_ms),
-        reads: reads.to_report(total_elapsed_ms),
+        writes: writes.overall.to_report(total_elapsed_ms),
+        reads: reads.phase.overall.to_report(total_elapsed_ms),
     })
 }
 
@@ -1167,6 +1545,10 @@ async fn run_mounted_end_to_end(
         if files.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
+        let size_class_bounds = SizeClassBounds {
+            small_max: params.size_class_small_max,
+            medium_max: params.size_class_medium_max,
+        };
         let order =
             build_access_sequence(files.len(), params.access_pattern, 0x55aa_55aa_d00d_f00d);
 
@@ -1178,8 +1560,14 @@ async fn run_mounted_end_to_end(
         );
         let writes_wall_start = Instant::now();
         let writes_cpu_start = process_cpu_time();
-        let writes =
-            run_filesystem_writes(&files, &order, params.io_depth, params.concurrency).await?;
+        let writes = run_filesystem_writes(
+            &files,
+            &order,
+            params.io_depth,
+            params.concurrency,
+            size_class_bounds,
+        )
+        .await?;
         let writes_wall = writes_wall_start.elapsed();
         let writes_cpu = writes_cpu_start
             .and_then(|start_cpu| {
@@ -1201,6 +1589,7 @@ async fn run_mounted_end_to_end(
             params.io_depth,
             params.concurrency,
             params.read_size,
+            size_class_bounds,
         )
         .await?;
         let reads_wall = reads_wall_start.elapsed();
@@ -1227,6 +1616,15 @@ async fn run_mounted_end_to_end(
                 read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
             },
         });
+        let advanced_metrics = build_advanced_metrics(
+            params.size_class_small_max,
+            params.size_class_medium_max,
+            &writes,
+            &reads,
+            None,
+            None,
+            total_elapsed_ms,
+        );
 
         let _ = fs::remove_dir_all(work_root).await;
 
@@ -1251,8 +1649,9 @@ async fn run_mounted_end_to_end(
             l2_bytes: None,
             cache_pipeline: None,
             profile,
-            writes: writes.to_report(total_elapsed_ms),
-            reads: reads.to_report(total_elapsed_ms),
+            advanced_metrics: Some(advanced_metrics),
+            writes: writes.overall.to_report(total_elapsed_ms),
+            reads: reads.overall.to_report(total_elapsed_ms),
         })
     }
     .await;
@@ -1311,6 +1710,68 @@ fn avg_latency_ms(total_latency_ns: u64, ops: u64) -> f64 {
         0.0
     } else {
         total_latency_ns as f64 / ops as f64 / 1_000_000.0
+    }
+}
+
+fn build_advanced_metrics(
+    size_class_small_max: u64,
+    size_class_medium_max: u64,
+    writes: &PhaseTelemetry,
+    reads: &PhaseTelemetry,
+    cache_levels: Option<&CacheLevelTelemetryAccumulator>,
+    cache_pipeline: Option<&CachePipelineReport>,
+    wall_elapsed_ms: f64,
+) -> AdvancedMetricsReport {
+    let queue_backpressure = cache_pipeline.map(|pipeline| {
+        let p50_ms = histogram_percentile_ms(
+            &pipeline.l2_commit_scheduler.backpressure_wait_histogram,
+            0.50,
+        );
+        let p95_ms = histogram_percentile_ms(
+            &pipeline.l2_commit_scheduler.backpressure_wait_histogram,
+            0.95,
+        );
+        let p99_ms = histogram_percentile_ms(
+            &pipeline.l2_commit_scheduler.backpressure_wait_histogram,
+            0.99,
+        );
+        QueueBackpressureReport {
+            l2_commit_queue: L2CommitQueueAdvancedReport {
+                queue_depth: pipeline.l2_commit_scheduler.queue_depth,
+                queue_depth_peak: pipeline.l2_commit_scheduler.queue_depth_peak,
+                queue_capacity: pipeline.l2_commit_scheduler.queue_capacity,
+                configured_workers: pipeline.l2_commit_scheduler.configured_workers,
+                active_workers: pipeline.l2_commit_scheduler.active_workers,
+                active_workers_peak: pipeline.l2_commit_scheduler.active_workers_peak,
+                submitted: pipeline.l2_commit_scheduler.submitted,
+                completed: pipeline.l2_commit_scheduler.completed,
+                failed: pipeline.l2_commit_scheduler.failed,
+                backpressure_events: pipeline.l2_commit_scheduler.backpressure_events,
+                backpressure_wait_avg_ms: pipeline.l2_commit_scheduler.backpressure_wait_avg_ms,
+                backpressure_wait_max_ms: pipeline.l2_commit_scheduler.backpressure_wait_max_ms,
+                backpressure_wait_p50_ms: p50_ms,
+                backpressure_wait_p95_ms: p95_ms,
+                backpressure_wait_p99_ms: p99_ms,
+                backpressure_wait_histogram: pipeline
+                    .l2_commit_scheduler
+                    .backpressure_wait_histogram
+                    .clone(),
+            },
+            upload_queue: pipeline.upload_queue.clone(),
+        }
+    });
+
+    AdvancedMetricsReport {
+        size_class_boundaries: SizeClassBoundaryReport {
+            small_max_bytes: size_class_small_max,
+            medium_max_bytes: size_class_medium_max,
+        },
+        size_class_stats: SizeClassStatsReport {
+            writes: writes.by_size.to_reports(wall_elapsed_ms),
+            reads: reads.by_size.to_reports(wall_elapsed_ms),
+        },
+        cache_levels: cache_levels.map(|levels| levels.to_report(wall_elapsed_ms)),
+        queue_backpressure,
     }
 }
 
@@ -1524,6 +1985,15 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         report.io_depth,
         report.access_pattern,
     );
+    if let Some(advanced) = &report.advanced_metrics {
+        let _ = writeln!(
+            &mut out,
+            "Size classes: small <= {}, medium <= {}, large > {}",
+            format_bytes(advanced.size_class_boundaries.small_max_bytes),
+            format_bytes(advanced.size_class_boundaries.medium_max_bytes),
+            format_bytes(advanced.size_class_boundaries.medium_max_bytes),
+        );
+    }
     let _ = writeln!(
         &mut out,
         "Limits:    L1 {}, L2 {}",
@@ -1553,6 +2023,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             format_bytes(report.writes.bytes),
             format_throughput(report.writes.throughput_bytes_per_sec),
             format_duration_ms(report.writes.avg_latency_ms),
+            format_duration_ms(report.writes.p50_ms),
             format_duration_ms(report.writes.p95_ms),
             format_duration_ms(report.writes.p99_ms),
         ],
@@ -1562,6 +2033,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             format_bytes(report.reads.bytes),
             format_throughput(report.reads.throughput_bytes_per_sec),
             format_duration_ms(report.reads.avg_latency_ms),
+            format_duration_ms(report.reads.p50_ms),
             format_duration_ms(report.reads.p95_ms),
             format_duration_ms(report.reads.p99_ms),
         ],
@@ -1570,10 +2042,109 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         &mut out,
         "{}",
         format_table(
-            &["Phase", "Ops", "Data", "Throughput", "Avg", "P95", "P99"],
+            &[
+                "Phase",
+                "Ops",
+                "Data",
+                "Throughput",
+                "Avg",
+                "P50",
+                "P95",
+                "P99"
+            ],
             &operation_rows,
         )
     );
+
+    if let Some(advanced) = &report.advanced_metrics {
+        out.push('\n');
+        let _ = writeln!(&mut out, "Size-class latency and throughput");
+        let mut rows = Vec::new();
+        for item in &advanced.size_class_stats.writes {
+            rows.push(vec![
+                "Write".to_string(),
+                item.class.clone(),
+                item.operations.to_string(),
+                format_bytes(item.bytes),
+                format_throughput(item.throughput_bytes_per_sec),
+                format_duration_ms(item.p50_ms),
+                format_duration_ms(item.p95_ms),
+                format_duration_ms(item.p99_ms),
+            ]);
+        }
+        for item in &advanced.size_class_stats.reads {
+            rows.push(vec![
+                "Read".to_string(),
+                item.class.clone(),
+                item.operations.to_string(),
+                format_bytes(item.bytes),
+                format_throughput(item.throughput_bytes_per_sec),
+                format_duration_ms(item.p50_ms),
+                format_duration_ms(item.p95_ms),
+                format_duration_ms(item.p99_ms),
+            ]);
+        }
+        let _ = write!(
+            &mut out,
+            "{}",
+            format_table(
+                &[
+                    "Phase",
+                    "Class",
+                    "Ops",
+                    "Data",
+                    "Throughput",
+                    "P50",
+                    "P95",
+                    "P99"
+                ],
+                &rows,
+            )
+        );
+
+        if let Some(levels) = &advanced.cache_levels {
+            let _ = writeln!(&mut out, "Cache levels");
+            let level_rows = vec![
+                vec![
+                    "L1".to_string(),
+                    levels.l1.hits.to_string(),
+                    levels.l1.misses.to_string(),
+                    format_bytes(levels.l1.bytes_served),
+                    format_throughput(levels.l1.throughput_bytes_per_sec),
+                    format_duration_ms(levels.l1.p50_ms),
+                    format_duration_ms(levels.l1.p95_ms),
+                    format_duration_ms(levels.l1.p99_ms),
+                ],
+                vec![
+                    "L2".to_string(),
+                    levels.l2.hits.to_string(),
+                    levels.l2.misses.to_string(),
+                    format_bytes(levels.l2.bytes_served),
+                    format_throughput(levels.l2.throughput_bytes_per_sec),
+                    format_duration_ms(levels.l2.p50_ms),
+                    format_duration_ms(levels.l2.p95_ms),
+                    format_duration_ms(levels.l2.p99_ms),
+                ],
+            ];
+            let _ = write!(
+                &mut out,
+                "{}",
+                format_table(
+                    &[
+                        "Level",
+                        "Hits",
+                        "Misses",
+                        "Bytes served",
+                        "Throughput",
+                        "P50",
+                        "P95",
+                        "P99"
+                    ],
+                    &level_rows,
+                )
+            );
+        }
+    }
 
     if let Some(pipeline) = &report.cache_pipeline {
         out.push('\n');
@@ -1640,6 +2211,19 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             format_duration_ms(pipeline.l2_commit_scheduler.backpressure_wait_avg_ms),
             format_duration_ms(pipeline.l2_commit_scheduler.backpressure_wait_max_ms),
         );
+        if let Some(backpressure) = report
+            .advanced_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.queue_backpressure.as_ref())
+        {
+            let _ = writeln!(
+                &mut out,
+                "L2 backpressure percentiles: p50 {}, p95 {}, p99 {}",
+                format_duration_ms(backpressure.l2_commit_queue.backpressure_wait_p50_ms),
+                format_duration_ms(backpressure.l2_commit_queue.backpressure_wait_p95_ms),
+                format_duration_ms(backpressure.l2_commit_queue.backpressure_wait_p99_ms),
+            );
+        }
         let _ = writeln!(
             &mut out,
             "Blocking tasks: active {} (peak {}), submitted {}, started {}, completed {}, queue wait avg {}, max {}, exec avg {}, max {}",
@@ -1690,6 +2274,8 @@ pub fn run(
     target: PathBuf,
     block_size: Option<String>,
     read_size: Option<String>,
+    small_max: Option<String>,
+    medium_max: Option<String>,
     concurrency: usize,
     io_depth: usize,
     access_pattern: TestCacheAccessPattern,
@@ -1705,25 +2291,44 @@ pub fn run(
         return Err(anyhow!("--concurrency must be >= 1"));
     }
     let block_size = parse_size_arg("block-size", block_size.as_deref().unwrap_or("8MB"))?;
+    let block_size_default = block_size.to_string();
+    let l1_limit_default = DEFAULT_L1_SIZE.to_string();
+    let l2_limit_default = DEFAULT_L2_SIZE.to_string();
+    let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
+    let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(
         "read-size",
         read_size
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&block_size.to_string()),
+            .unwrap_or(&block_size_default),
     )?
     .max(1);
-    let l1_limit = parse_size_arg(
-        "l1-limit",
-        l1_limit.as_deref().unwrap_or(&DEFAULT_L1_SIZE.to_string()),
+    let l1_limit = parse_size_arg("l1-limit", l1_limit.as_deref().unwrap_or(&l1_limit_default))?;
+    let l2_limit = parse_size_arg("l2-limit", l2_limit.as_deref().unwrap_or(&l2_limit_default))?;
+    let size_class_small_max = parse_size_arg(
+        "small-max",
+        small_max
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&small_max_default),
     )?;
-    let l2_limit = parse_size_arg(
-        "l2-limit",
-        l2_limit.as_deref().unwrap_or(&DEFAULT_L2_SIZE.to_string()),
+    let size_class_medium_max = parse_size_arg(
+        "medium-max",
+        medium_max
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&medium_max_default),
     )?;
 
     if l1_limit < 1 || l2_limit < 1 {
         return Err(anyhow!("cache limits must be > 0"));
+    }
+    if size_class_small_max == 0 {
+        return Err(anyhow!("--small-max must be > 0"));
+    }
+    if size_class_medium_max <= size_class_small_max {
+        return Err(anyhow!("--medium-max must be greater than --small-max"));
     }
 
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -1737,6 +2342,8 @@ pub fn run(
         target: target.clone(),
         block_size,
         read_size,
+        size_class_small_max,
+        size_class_medium_max,
         concurrency,
         io_depth,
         access_pattern,
@@ -1843,6 +2450,10 @@ mod tests {
                     backpressure_events: 2,
                     backpressure_wait_avg_ms: 0.4,
                     backpressure_wait_max_ms: 1.3,
+                    backpressure_wait_histogram: LatencyHistogramReport {
+                        bucket_upper_bounds_ns: vec![50_000, 100_000],
+                        bucket_counts: vec![1, 1, 0],
+                    },
                 },
                 upload_queue: UploadQueueStatsReport {
                     pending_depth: 0,
@@ -1905,6 +2516,139 @@ mod tests {
                     write_phase_cpu_percent: 92.0,
                     read_phase_cpu_percent: 90.4,
                 },
+            }),
+            advanced_metrics: Some(AdvancedMetricsReport {
+                size_class_boundaries: SizeClassBoundaryReport {
+                    small_max_bytes: 10 * 1024,
+                    medium_max_bytes: 8 * 1024 * 1024,
+                },
+                size_class_stats: SizeClassStatsReport {
+                    writes: vec![
+                        SizeClassOpReport {
+                            class: "small".to_string(),
+                            operations: 6,
+                            bytes: 48 * 1024,
+                            avg_latency_ms: 0.8,
+                            p50_ms: 0.7,
+                            p95_ms: 1.1,
+                            p99_ms: 1.3,
+                            throughput_bytes_per_sec: 64.0 * 1024.0 * 1024.0,
+                        },
+                        SizeClassOpReport {
+                            class: "medium".to_string(),
+                            operations: 5,
+                            bytes: 40 * 1024 * 1024,
+                            avg_latency_ms: 4.0,
+                            p50_ms: 3.8,
+                            p95_ms: 6.2,
+                            p99_ms: 6.8,
+                            throughput_bytes_per_sec: 512.0 * 1024.0 * 1024.0,
+                        },
+                        SizeClassOpReport {
+                            class: "large".to_string(),
+                            operations: 5,
+                            bytes: 88 * 1024 * 1024,
+                            avg_latency_ms: 8.4,
+                            p50_ms: 8.0,
+                            p95_ms: 11.4,
+                            p99_ms: 12.2,
+                            throughput_bytes_per_sec: 768.0 * 1024.0 * 1024.0,
+                        },
+                    ],
+                    reads: vec![
+                        SizeClassOpReport {
+                            class: "small".to_string(),
+                            operations: 6,
+                            bytes: 48 * 1024,
+                            avg_latency_ms: 0.7,
+                            p50_ms: 0.6,
+                            p95_ms: 1.0,
+                            p99_ms: 1.2,
+                            throughput_bytes_per_sec: 70.0 * 1024.0 * 1024.0,
+                        },
+                        SizeClassOpReport {
+                            class: "medium".to_string(),
+                            operations: 5,
+                            bytes: 40 * 1024 * 1024,
+                            avg_latency_ms: 3.8,
+                            p50_ms: 3.6,
+                            p95_ms: 6.0,
+                            p99_ms: 6.6,
+                            throughput_bytes_per_sec: 540.0 * 1024.0 * 1024.0,
+                        },
+                        SizeClassOpReport {
+                            class: "large".to_string(),
+                            operations: 5,
+                            bytes: 88 * 1024 * 1024,
+                            avg_latency_ms: 8.0,
+                            p50_ms: 7.8,
+                            p95_ms: 11.0,
+                            p99_ms: 11.8,
+                            throughput_bytes_per_sec: 790.0 * 1024.0 * 1024.0,
+                        },
+                    ],
+                },
+                cache_levels: Some(CacheLevelsReport {
+                    l1: CacheLevelReport {
+                        hits: 9,
+                        misses: 7,
+                        bytes_served: 72 * 1024 * 1024,
+                        throughput_bytes_per_sec: 774.0 * 1024.0 * 1024.0,
+                        avg_latency_ms: 0.15,
+                        p50_ms: 0.12,
+                        p95_ms: 0.30,
+                        p99_ms: 0.42,
+                        latency_histogram: LatencyHistogramReport {
+                            bucket_upper_bounds_ns: vec![50_000, 100_000],
+                            bucket_counts: vec![3, 6, 7],
+                        },
+                    },
+                    l2: CacheLevelReport {
+                        hits: 7,
+                        misses: 0,
+                        bytes_served: 56 * 1024 * 1024,
+                        throughput_bytes_per_sec: 602.0 * 1024.0 * 1024.0,
+                        avg_latency_ms: 4.8,
+                        p50_ms: 4.4,
+                        p95_ms: 7.9,
+                        p99_ms: 8.4,
+                        latency_histogram: LatencyHistogramReport {
+                            bucket_upper_bounds_ns: vec![50_000, 100_000],
+                            bucket_counts: vec![0, 1, 6],
+                        },
+                    },
+                }),
+                queue_backpressure: Some(QueueBackpressureReport {
+                    l2_commit_queue: L2CommitQueueAdvancedReport {
+                        queue_depth: 0,
+                        queue_depth_peak: 8,
+                        queue_capacity: 512,
+                        configured_workers: 4,
+                        active_workers: 0,
+                        active_workers_peak: 4,
+                        submitted: 16,
+                        completed: 16,
+                        failed: 0,
+                        backpressure_events: 2,
+                        backpressure_wait_avg_ms: 0.4,
+                        backpressure_wait_max_ms: 1.3,
+                        backpressure_wait_p50_ms: 0.1,
+                        backpressure_wait_p95_ms: 0.1,
+                        backpressure_wait_p99_ms: 0.1,
+                        backpressure_wait_histogram: LatencyHistogramReport {
+                            bucket_upper_bounds_ns: vec![50_000, 100_000],
+                            bucket_counts: vec![1, 1, 0],
+                        },
+                    },
+                    upload_queue: UploadQueueStatsReport {
+                        pending_depth: 0,
+                        pending_depth_peak: 3,
+                        submitted: 16,
+                        completed: 16,
+                        requeued: 0,
+                        canceled: 0,
+                    },
+                }),
             }),
             writes: OpReport {
                 operations: 16,
@@ -2036,6 +2780,8 @@ mod tests {
         let summary = render_human_summary(&sample_report());
         assert!(summary.contains("Operation results"));
         assert!(summary.contains("| Phase |"));
+        assert!(summary.contains("Size-class latency and throughput"));
+        assert!(summary.contains("Cache levels"));
         assert!(summary.contains("Cache pipeline"));
         assert!(summary.contains("Upload queue:"));
         assert!(!summary.contains("\"cache_pipeline\""));

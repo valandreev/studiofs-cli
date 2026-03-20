@@ -229,6 +229,27 @@ results. Each `test-cache` report now also includes a `run_id` for correlation
 with profile/tracing events, and optional on-demand CPU profile output when
 running `studiofs test-cache ... --profile`.
 
+`test-cache` reports now also include an `advanced_metrics` section:
+
+- `size_class_boundaries`: configurable class boundaries used for aggregation
+  (`small_max_bytes`, `medium_max_bytes`)
+- `size_class_stats`: write/read throughput and latency percentiles (p50/p95/p99)
+  for `small`, `medium`, and `large`
+- `cache_levels` (direct-L2 mode): L1/L2 hit and miss counters, bytes served
+  from each level, and per-level lookup latency percentiles + histogram
+- `queue_backpressure`: L2 commit queue depth, worker utilization, backpressure
+  count, backpressure wait percentiles (p50/p95/p99), plus upload queue depth
+  and lifecycle counters
+
+Size classes are configurable from the CLI:
+
+- `--small-max <size>`: inclusive upper bound for the small class (default `10KB`)
+- `--medium-max <size>`: inclusive upper bound for the medium class
+  (default `--block-size`)
+
+The terminal summary now shows p50/p95/p99 + throughput for overall write/read
+results and for each size class.
+
 ## Crash Recovery
 
 On startup:

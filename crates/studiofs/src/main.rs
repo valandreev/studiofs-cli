@@ -579,6 +579,14 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         read_size: Option<String>,
 
+        /// Upper bound for the `small` size class (inclusive), e.g. 10KB.
+        #[arg(long)]
+        small_max: Option<String>,
+
+        /// Upper bound for the `medium` size class (inclusive), e.g. 8MB.
+        #[arg(long)]
+        medium_max: Option<String>,
+
         /// Concurrent workload workers.
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
@@ -754,6 +762,8 @@ fn main() -> anyhow::Result<()> {
             path,
             block_size,
             read_size,
+            small_max,
+            medium_max,
             concurrency,
             io_depth,
             access_pattern,
@@ -766,6 +776,8 @@ fn main() -> anyhow::Result<()> {
                 path,
                 block_size,
                 read_size,
+                small_max,
+                medium_max,
                 concurrency,
                 io_depth,
                 access_pattern,
@@ -1037,6 +1049,8 @@ mod tests {
                 io_depth,
                 block_size,
                 read_size,
+                small_max,
+                medium_max,
                 access_pattern,
                 l1_limit,
                 l2_limit,
@@ -1049,6 +1063,8 @@ mod tests {
                 assert_eq!(io_depth, 32);
                 assert_eq!(block_size.as_deref(), None);
                 assert_eq!(read_size.as_deref(), None);
+                assert_eq!(small_max.as_deref(), None);
+                assert_eq!(medium_max.as_deref(), None);
                 assert!(matches!(
                     access_pattern,
                     cli::test_cache::TestCacheAccessPattern::Sequential
@@ -1071,6 +1087,10 @@ mod tests {
             "4MB",
             "--read-size",
             "1MB",
+            "--small-max",
+            "64KB",
+            "--medium-max",
+            "16MB",
             "--concurrency",
             "16",
             "--io-depth",
@@ -1092,6 +1112,8 @@ mod tests {
                 path,
                 block_size,
                 read_size,
+                small_max,
+                medium_max,
                 access_pattern,
                 concurrency,
                 io_depth,
@@ -1104,6 +1126,8 @@ mod tests {
                 assert_eq!(path, PathBuf::from("Z:\\bench"));
                 assert_eq!(block_size.unwrap(), "4MB");
                 assert_eq!(read_size.unwrap(), "1MB");
+                assert_eq!(small_max.unwrap(), "64KB");
+                assert_eq!(medium_max.unwrap(), "16MB");
                 assert!(matches!(
                     access_pattern,
                     cli::test_cache::TestCacheAccessPattern::Random
