@@ -226,8 +226,8 @@ while the pipeline is active. `studiofs test-cache <cache-dir>` also emits
 the cache pipeline snapshot in its saved JSON report under `cache_pipeline`,
 while the terminal keeps a human-readable summary focused on the benchmark
 results. Each `test-cache` report now also includes a `run_id` for correlation
-with profile/tracing events, and optional on-demand CPU profile output when
-running `studiofs test-cache ... --profile`.
+with profile/tracing events, and optional on-demand Pyroscope profiling when
+running `studiofs test-cache ... --profile=pyroscope`.
 
 `test-cache` reports now also include an `advanced_metrics` section:
 
@@ -240,6 +240,54 @@ running `studiofs test-cache ... --profile`.
 - `queue_backpressure`: L2 commit queue depth, worker utilization, backpressure
   count, backpressure wait percentiles (p50/p95/p99), plus upload queue depth
   and lifecycle counters
+
+## Pyroscope Profiling
+
+`test-cache` can publish CPU and memory profiles in pprof format while the
+benchmark is running.
+
+1. Install Grafana Pyroscope or use an existing Grafana Cloud / Pyroscope
+   endpoint. For a local instance, one simple option is:
+
+   ```bash
+   docker run --rm -p 4040:4040 grafana/pyroscope:latest
+   ```
+
+2. Set the endpoint before running the benchmark:
+
+   ```bash
+   export STUDIOFS_PYROSCOPE_URL=http://localhost:4040
+   export STUDIOFS_PYROSCOPE_APP_NAME=studiofs.test-cache
+   ```
+
+   Optional extras:
+
+   - `STUDIOFS_PYROSCOPE_SAMPLE_RATE=100`
+   - `STUDIOFS_PYROSCOPE_USERNAME=...`
+   - `STUDIOFS_PYROSCOPE_PASSWORD=...`
+   - `STUDIOFS_PYROSCOPE_TENANT_ID=...`
+
+3. Run the benchmark with profiling enabled:
+
+   ```bash
+   studiofs test-cache /path/to/cache --profile=pyroscope
+   ```
+
+4. At completion, `test-cache` writes local pprof artifacts next to the JSON
+   report:
+
+   - `studiofs-test-cache-<mode>-<run_id>-cpu.pprof.gz`
+   - `studiofs-test-cache-<mode>-<run_id>-memory.pprof.gz`
+
+   If an endpoint is configured, those same profiles are also pushed to
+   Pyroscope.
+
+5. In Grafana, open the Pyroscope data source, choose the `studiofs.test-cache`
+   service, and switch between the CPU and memory views to inspect flame graphs
+   for cache hot paths, scheduler contention, and allocation pressure.
+
+If the profiling backend or endpoint is unavailable, the benchmark prints a
+warning and still produces the normal benchmark report.
 
 Size classes are configurable from the CLI:
 

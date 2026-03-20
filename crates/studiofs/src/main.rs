@@ -626,9 +626,9 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         json_output: Option<PathBuf>,
 
-        /// Enable on-demand CPU/profile hooks for this benchmark run.
-        #[arg(long)]
-        profile: bool,
+        /// Enable on-demand profiling for this benchmark run.
+        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "pyroscope")]
+        profile: Option<cli::test_cache_profile::TestCacheProfileMode>,
     },
 
     /// Create or list immutable metadata snapshots
@@ -1098,7 +1098,7 @@ mod tests {
                 assert!(l1_limit.is_none());
                 assert!(l2_limit.is_none());
                 assert!(json_output.is_none());
-                assert!(!profile);
+                assert!(profile.is_none());
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
@@ -1134,7 +1134,7 @@ mod tests {
             "1TB",
             "--json-output",
             "reports/cache-run.json",
-            "--profile",
+            "--profile=pyroscope",
         ])
         .unwrap();
 
@@ -1177,8 +1177,24 @@ mod tests {
                     json_output.unwrap(),
                     PathBuf::from("reports/cache-run.json")
                 );
-                assert!(profile);
+                assert!(matches!(
+                    profile,
+                    Some(cli::test_cache_profile::TestCacheProfileMode::Pyroscope)
+                ));
             }
+            other => panic!("expected TestCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_parses_profile_shorthand() {
+        let cli = parse(&["test-cache", "/tmp/studiofs-cache", "--profile"]).unwrap();
+
+        match cli.command {
+            Commands::TestCache { profile, .. } => assert!(matches!(
+                profile,
+                Some(cli::test_cache_profile::TestCacheProfileMode::Pyroscope)
+            )),
             other => panic!("expected TestCache, got {other:?}"),
         }
     }
