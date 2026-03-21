@@ -104,6 +104,7 @@ fn winfsp_mount_unmount_smoke() {
             true,
             false,
             Some(&event_for_thread),
+            None,
         )
         .map_err(|e| e.to_string())
     });

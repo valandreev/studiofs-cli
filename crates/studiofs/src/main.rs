@@ -955,7 +955,7 @@ mod tests {
         match cli.command {
             Commands::Mount { profile, .. } => assert!(matches!(
                 profile,
-                Some(cli::mount_profile::MountProfileMode::Pyroscope)
+                Some(cli::mount_profile_types::MountProfileMode::Pyroscope)
             )),
             other => panic!("expected Mount, got {other:?}"),
         }
@@ -967,7 +967,7 @@ mod tests {
         match cli.command {
             Commands::Mount { profile, .. } => assert!(matches!(
                 profile,
-                Some(cli::mount_profile::MountProfileMode::Off)
+                Some(cli::mount_profile_types::MountProfileMode::Off)
             )),
             other => panic!("expected Mount, got {other:?}"),
         }
@@ -1218,7 +1218,7 @@ mod tests {
                 );
                 assert!(matches!(
                     profile,
-                    Some(cli::test_cache_profile::TestCacheProfileMode::Pyroscope)
+                    Some(cli::test_cache_profile_types::TestCacheProfileMode::Pyroscope)
                 ));
             }
             other => panic!("expected TestCache, got {other:?}"),
@@ -1232,7 +1232,7 @@ mod tests {
         match cli.command {
             Commands::TestCache { profile, .. } => assert!(matches!(
                 profile,
-                Some(cli::test_cache_profile::TestCacheProfileMode::Pyroscope)
+                Some(cli::test_cache_profile_types::TestCacheProfileMode::Pyroscope)
             )),
             other => panic!("expected TestCache, got {other:?}"),
         }
