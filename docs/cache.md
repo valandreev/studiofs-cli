@@ -217,7 +217,7 @@ The background flusher runs every 10ms and drains continuously (keeps processing
 |-----------|-------------------|-------|
 | L1 read | ~10 GB/s | Memory speed, contention on shard lock |
 | L1 write | ~8 GB/s | Same as read + hash map insert |
-| L2 read (single) | depends on FS/device | Linux `O_DIRECT`, Windows NO_BUFFERING+OVERLAPPED, macOS `F_NOCACHE`; fallback to async buffered read |
+| L2 read (single) | depends on FS/device | Linux `O_DIRECT`, Windows `NO_BUFFERING`, macOS `F_NOCACHE`; fallback to async buffered read |
 | L2 read (batch) | depends on FS/device + queue depth | Parallel async reads with the same direct-I/O-first policy |
 | L2 write (single) | depends on FS/device | direct-I/O write attempt (platform-specific) + buffered fallback, then atomic rename |
 | L2 write (batch) | depends on FS/device + queue depth | Parallel writes through same direct-I/O-first policy |
