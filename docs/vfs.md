@@ -182,7 +182,7 @@ Handle-aware read path:
 - `read_into_fh(fh, ino, ...)` checks `OpenFlags` from the handle table.
 - If `DIRECT_IO` or `WRITE_THROUGH` is set, VFS uses unbuffered mode:
   - disables best-effort prefetch for that read,
-  - resolves committed blocks through the direct path that avoids L1 promotion.
+  - resolves committed blocks through an L2-only direct path (no L1 lookup/promotion).
 
 ## FetchScheduler (`fetch.rs`)
 

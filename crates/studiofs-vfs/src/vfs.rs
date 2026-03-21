@@ -583,7 +583,15 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const DIRECT_IO_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS: u64 = 120;
+
+fn direct_io_sync_timeout() -> Duration {
+    let secs = std::env::var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS);
+    Duration::from_secs(secs.max(1))
+}
 #[derive(Clone)]
 struct DistributedFlock {
     op: Operator,
@@ -2255,6 +2263,7 @@ struct SpillEntry {
 #[derive(Debug, Default)]
 struct IngressLiveIndex {
     entries: HashMap<(Ino, u32), SpillEntry>,
+    by_ino_counts: HashMap<Ino, usize>,
 }
 
 impl IngressLiveIndex {
@@ -2271,11 +2280,35 @@ impl IngressLiveIndex {
     }
 
     fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
-        self.entries.insert(key, entry)
+        let old = self.entries.insert(key, entry);
+        let ino = key.0;
+        *self.by_ino_counts.entry(ino).or_insert(0) += 1;
+        if old.is_some() {
+            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
+            if count > 0 {
+                let new_count = count - 1;
+                if new_count == 0 {
+                    self.by_ino_counts.remove(&ino);
+                } else {
+                    self.by_ino_counts.insert(ino, new_count);
+                }
+            }
+        }
+        old
     }
 
     fn remove(&mut self, key: &(Ino, u32)) -> Option<SpillEntry> {
-        self.entries.remove(key)
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            let ino = key.0;
+            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
+            if count <= 1 {
+                self.by_ino_counts.remove(&ino);
+            } else {
+                self.by_ino_counts.insert(ino, count - 1);
+            }
+        }
+        removed
     }
 
     fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
@@ -2294,6 +2327,10 @@ impl IngressLiveIndex {
             }
         }
         ids.len() as u64
+    }
+
+    fn has_ino(&self, ino: Ino) -> bool {
+        self.by_ino_counts.contains_key(&ino)
     }
 }
 
@@ -2913,6 +2950,8 @@ struct VfsState {
     /// disk by the background flusher.  Reads must consult this buffer
     /// BEFORE falling through to the block cache or S3.
     dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
+    /// Per-inode dirty block counters for O(1) pending checks.
+    dirty_inodes: Mutex<std::collections::HashMap<Ino, usize>>,
     /// Live accepted ingress records keyed by `(ino, block_index)`.
     ingress_live: Mutex<IngressLiveIndex>,
     /// Serialize append/rotation decisions for ingress segment writes.
@@ -3129,6 +3168,29 @@ pub struct StudioVfs {
 }
 
 impl StudioVfs {
+    fn dirty_index_inc(&self, ino: Ino) {
+        let mut idx = self.state.dirty_inodes.lock();
+        *idx.entry(ino).or_insert(0) += 1;
+    }
+
+    fn dirty_index_dec(&self, ino: Ino) {
+        let mut idx = self.state.dirty_inodes.lock();
+        let count = idx.get(&ino).copied().unwrap_or(0);
+        if count <= 1 {
+            idx.remove(&ino);
+        } else {
+            idx.insert(ino, count - 1);
+        }
+    }
+
+    fn dirty_index_clear_inode(&self, ino: Ino) {
+        self.state.dirty_inodes.lock().remove(&ino);
+    }
+
+    fn dirty_index_has(&self, ino: Ino) -> bool {
+        self.state.dirty_inodes.lock().contains_key(&ino)
+    }
+
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
     }
@@ -3774,6 +3836,10 @@ impl StudioVfs {
                 &ingress_checkpoint_dir,
                 &ingress_segment_dir,
             )?;
+            let mut recovered_spill_by_ino = std::collections::HashMap::new();
+            for (ino, _) in recovered_spill.keys() {
+                *recovered_spill_by_ino.entry(*ino).or_insert(0) += 1;
+            }
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
@@ -4004,8 +4070,10 @@ impl StudioVfs {
                     acl_epoch: AtomicU64::new(0),
                     acl_namespace_epoch: AtomicU64::new(0),
                     dirty_mem: Mutex::new(std::collections::HashMap::new()),
+                    dirty_inodes: Mutex::new(std::collections::HashMap::new()),
                     ingress_live: Mutex::new(IngressLiveIndex {
                         entries: recovered_spill,
+                        by_ino_counts: recovered_spill_by_ino,
                     }),
                     ingress_segment_write_lock: Mutex::new(()),
                     dirty_bytes: AtomicUsize::new(0),
@@ -5192,7 +5260,9 @@ impl StudioVfs {
                     })
                     .ok();
                 if new_len == 0 {
-                    let _ = dirty.remove(&(ino, block_index));
+                    if dirty.remove(&(ino, block_index)).is_some() {
+                        self.dirty_index_dec(ino);
+                    }
                 } else {
                     dirty.insert((ino, block_index), current.slice(0..new_len));
                     self.state.dirty_bytes.fetch_add(new_len, Ordering::Relaxed);
@@ -5282,6 +5352,8 @@ impl StudioVfs {
                                     Some(v.saturating_sub(old.len()))
                                 })
                                 .ok();
+                        } else {
+                            self.dirty_index_inc(ino);
                         }
                     }
                 }
@@ -5297,6 +5369,7 @@ impl StudioVfs {
                         {
                             let mut dirty = self.state.dirty_mem.lock();
                             if let Some(old) = dirty.remove(&(ino, block_index)) {
+                                self.dirty_index_dec(ino);
                                 self.state
                                     .dirty_bytes
                                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -6159,6 +6232,7 @@ impl StudioVfs {
                 let _ = self.remove_spill_entry((ino, block_idx));
                 let mut dirty = self.state.dirty_mem.lock();
                 if let Some(data) = dirty.remove(&(ino, block_idx)) {
+                    self.dirty_index_dec(ino);
                     self.state
                         .dirty_bytes
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -6632,7 +6706,7 @@ impl StudioVfs {
 
     async fn flush_direct_write(&self, ino: Ino) -> VfsResult<()> {
         self.flush(ino).await?;
-        self.sync_inode_to_backend(ino, DIRECT_IO_SYNC_TIMEOUT)
+        self.sync_inode_to_backend(ino, direct_io_sync_timeout())
             .await
     }
 
@@ -6645,27 +6719,34 @@ impl StudioVfs {
                 return Ok(());
             }
 
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(VfsError::Other(format!(
                     "timed out after {:?} waiting for direct I/O flush on inode {}",
                     timeout, ino
                 )));
             }
 
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let has_pending_ingress = self.inode_has_pending_ingress(ino);
+            let max_sleep = if has_pending_ingress {
+                Duration::from_millis(25)
+            } else {
+                Duration::from_millis(100)
+            };
+            let sleep_for = std::cmp::min(deadline.saturating_duration_since(now), max_sleep);
+            let progress = self.state.dirty_drained_notify.notified();
+            tokio::select! {
+                _ = progress => {}
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
         }
     }
 
     fn inode_has_pending_ingress(&self, ino: Ino) -> bool {
-        {
-            let dirty = self.state.dirty_mem.lock();
-            if dirty.keys().any(|(candidate, _)| *candidate == ino) {
-                return true;
-            }
+        if self.dirty_index_has(ino) {
+            return true;
         }
-
-        let spill = self.state.ingress_live.lock();
-        spill.keys().any(|(candidate, _)| *candidate == ino)
+        self.state.ingress_live.lock().has_ino(ino)
     }
 
     // =========================================================================
@@ -7326,6 +7407,7 @@ impl StudioVfs {
                 .sum();
             dirty.retain(|(i, _), _| *i != ino);
             if removed_bytes > 0 {
+                self.dirty_index_clear_inode(ino);
                 self.state
                     .dirty_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -7476,6 +7558,7 @@ impl StudioVfs {
         {
             let mut dirty = self.state.dirty_mem.lock();
             if let Some(data) = dirty.remove(&(ino, block_index)) {
+                self.dirty_index_dec(ino);
                 self.state
                     .dirty_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -7866,7 +7949,7 @@ impl StudioVfs {
             .await?
             .ok_or(VfsError::BlockNotFound(ino, block_index))?;
 
-        if let Some(cached) = self.block_cache.get_sync(block_ref.object_id) {
+        if let Some(cached) = self.block_cache.get_sync_l2_only(block_ref.object_id) {
             return Ok(cached);
         }
 

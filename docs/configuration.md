@@ -111,6 +111,7 @@ Notes:
   - WinFSP metadata cache timeouts are forced to `0` (`FileInfoTimeout`, `DirInfoTimeout`, `VolumeInfoTimeout`).
   - handles opened with `FILE_NO_INTERMEDIATE_BUFFERING`/`FILE_WRITE_THROUGH` are treated as unbuffered in VFS.
   - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; writes wait for a synchronous drain to backend visibility before returning.
+  - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write backend wait timeout (default `120` seconds).
   - this mode is intended for storage benchmarking and strict write-through workflows and can reduce Explorer browsing smoothness due to disabled metadata caching.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.

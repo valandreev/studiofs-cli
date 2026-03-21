@@ -162,6 +162,11 @@ pub fn mount_and_serve(
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     let options = parse_mount_options(volume_label, direct_io)?;
+    if direct_io {
+        tracing::warn!(
+            "direct-io mode enabled: WinFSP metadata cache timeouts are forced to 0; Explorer metadata operations may feel slower"
+        );
+    }
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
