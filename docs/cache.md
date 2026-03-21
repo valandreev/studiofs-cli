@@ -179,6 +179,7 @@ Unified API combining all components above.
 
 Timeout behavior:
 - L2 read timeout is treated as a cache miss (`get*` returns `None`) so callers can continue to remote/object-store fetch paths.
+- Repeated L2 read timeouts open a short-lived read circuit breaker (default: 3 consecutive timeouts, 5s cooldown), temporarily bypassing L2 reads to avoid piling additional blocking disk tasks during device stalls.
 - L2 write timeout fails the direct write path and is retried by background commit workers up to the configured attempt cap before dropping the local commit job.
 
 **Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.

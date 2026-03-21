@@ -18,9 +18,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, info, warn};
 
@@ -66,6 +66,12 @@ pub const DEFAULT_L2_READ_TIMEOUT_MS: u64 = 5_000;
 /// Default timeout for L2 write operations.
 pub const DEFAULT_L2_WRITE_TIMEOUT_MS: u64 = 5_000;
 
+/// Consecutive L2 read timeouts required to open the read circuit breaker.
+pub const DEFAULT_L2_READ_BREAKER_TIMEOUT_THRESHOLD: u32 = 3;
+
+/// L2 read circuit-breaker cooldown after repeated read timeouts.
+pub const DEFAULT_L2_READ_BREAKER_COOLDOWN_MS: u64 = 5_000;
+
 /// Maximum attempts per L2 commit job (initial try + retries).
 const L2_COMMIT_MAX_ATTEMPTS: u32 = 3;
 
@@ -97,6 +103,10 @@ pub struct BlockCacheConfig {
     pub l2_read_timeout: Duration,
     /// Max time to wait for an L2 write before failing the operation.
     pub l2_write_timeout: Duration,
+    /// Number of consecutive L2 read timeouts before bypassing L2 temporarily.
+    pub l2_read_breaker_timeout_threshold: u32,
+    /// How long L2 reads are bypassed once the breaker opens.
+    pub l2_read_breaker_cooldown: Duration,
 }
 
 impl BlockCacheConfig {
@@ -110,6 +120,8 @@ impl BlockCacheConfig {
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
             l2_read_timeout: Duration::from_millis(DEFAULT_L2_READ_TIMEOUT_MS),
             l2_write_timeout: Duration::from_millis(DEFAULT_L2_WRITE_TIMEOUT_MS),
+            l2_read_breaker_timeout_threshold: DEFAULT_L2_READ_BREAKER_TIMEOUT_THRESHOLD,
+            l2_read_breaker_cooldown: Duration::from_millis(DEFAULT_L2_READ_BREAKER_COOLDOWN_MS),
         }
     }
 }
@@ -207,6 +219,10 @@ pub struct BlockCache {
     /// Last persisted checkpoint signature: `(entry_count, crc32(entries))`.
     /// Used to skip redundant tmp+rename cycles when metadata is unchanged.
     last_checkpoint_signature: std::sync::Mutex<Option<(u32, u32)>>,
+    /// Monotonic-ish timestamp (unix ms) until which L2 reads are bypassed.
+    l2_read_breaker_open_until_ms: AtomicU64,
+    /// Number of consecutive L2 read timeout events.
+    l2_read_timeout_streak: AtomicU32,
 }
 
 impl BlockCache {
@@ -295,6 +311,8 @@ impl BlockCache {
             l2_commit_scheduler,
             metrics,
             last_checkpoint_signature: std::sync::Mutex::new(initial_checkpoint_signature),
+            l2_read_breaker_open_until_ms: AtomicU64::new(0),
+            l2_read_timeout_streak: AtomicU32::new(0),
         });
 
         Ok((cache, upload_rx))
@@ -353,6 +371,17 @@ impl BlockCache {
         let l1_lookup_latency = l1_started.elapsed();
 
         let l2_started = Instant::now();
+        if self.is_l2_read_breaker_open() {
+            return (
+                None,
+                CacheReadTrace {
+                    level: CacheReadLevel::Miss,
+                    l1_lookup_latency,
+                    l2_lookup_latency: Some(l2_started.elapsed()),
+                },
+            );
+        }
+
         let expected_size = self.lru.size(object_id);
         let l2_result = tokio::time::timeout(
             self.config.l2_read_timeout,
@@ -360,8 +389,12 @@ impl BlockCache {
         )
         .await;
         let data_opt = match l2_result {
-            Ok(data) => data,
+            Ok(data) => {
+                self.record_l2_read_completion();
+                data
+            }
             Err(_) => {
+                self.record_l2_read_timeout(object_id);
                 warn!(
                     object_id,
                     timeout_ms = self.config.l2_read_timeout.as_millis(),
@@ -397,6 +430,44 @@ impl BlockCache {
                 l2_lookup_latency: Some(l2_lookup_latency),
             },
         )
+    }
+
+    #[inline]
+    fn now_unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn is_l2_read_breaker_open(&self) -> bool {
+        self.l2_read_breaker_open_until_ms.load(Ordering::Relaxed) > Self::now_unix_ms()
+    }
+
+    fn record_l2_read_completion(&self) {
+        self.l2_read_timeout_streak.store(0, Ordering::Relaxed);
+    }
+
+    fn record_l2_read_timeout(&self, object_id: ObjectId) {
+        let streak = self.l2_read_timeout_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        let threshold = self.config.l2_read_breaker_timeout_threshold.max(1);
+        if streak < threshold {
+            return;
+        }
+        self.l2_read_timeout_streak.store(0, Ordering::Relaxed);
+        let now = Self::now_unix_ms();
+        let cooldown_ms = self
+            .config
+            .l2_read_breaker_cooldown
+            .as_millis()
+            .clamp(1, u64::MAX as u128) as u64;
+        let open_until = now.saturating_add(cooldown_ms);
+        self.l2_read_breaker_open_until_ms
+            .store(open_until, Ordering::Relaxed);
+        warn!(
+            object_id,
+            threshold, cooldown_ms, "L2 read circuit breaker opened after repeated read timeouts"
+        );
     }
 
     /// Read a block synchronously (for upload workers that need re-read).
@@ -1145,6 +1216,8 @@ mod tests {
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
             l2_read_timeout: Duration::from_millis(DEFAULT_L2_READ_TIMEOUT_MS),
             l2_write_timeout: Duration::from_millis(DEFAULT_L2_WRITE_TIMEOUT_MS),
+            l2_read_breaker_timeout_threshold: DEFAULT_L2_READ_BREAKER_TIMEOUT_THRESHOLD,
+            l2_read_breaker_cooldown: Duration::from_millis(DEFAULT_L2_READ_BREAKER_COOLDOWN_MS),
         }
     }
 
@@ -1208,6 +1281,23 @@ mod tests {
             let got = cache.get(2).await.unwrap();
             assert_eq!(got, Bytes::from_static(b"bbb"));
         }
+    }
+
+    #[tokio::test]
+    async fn l2_read_breaker_opens_after_threshold_timeouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.l2_read_breaker_timeout_threshold = 2;
+        config.l2_read_breaker_cooldown = Duration::from_secs(2);
+
+        let (cache, _rx) = BlockCache::open(config).unwrap();
+        assert!(!cache.is_l2_read_breaker_open());
+
+        cache.record_l2_read_timeout(7);
+        assert!(!cache.is_l2_read_breaker_open());
+
+        cache.record_l2_read_timeout(7);
+        assert!(cache.is_l2_read_breaker_open());
     }
 
     #[tokio::test]
