@@ -103,11 +103,10 @@ fn canonical_drive_mount_point(mount_point: &str) -> Result<String, MountOptionE
     }
 
     let letter = mount_point
-        .as_bytes()
-        .first()
-        .copied()
+        .chars()
+        .next()
         .ok_or_else(|| MountOptionError::InvalidDriveMountPoint(mount_point.to_string()))?
-        .to_ascii_uppercase() as char;
+        .to_ascii_uppercase();
     Ok(format!("{letter}:"))
 }
 

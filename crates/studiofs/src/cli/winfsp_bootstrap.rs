@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::io::IsTerminal;
 use std::process::Command;
 use winreg::RegKey;
 use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -37,7 +38,14 @@ fn run_elevated_bootstrap_process() -> anyhow::Result<()> {
     let exe = ps_single_quote(&exe.to_string_lossy());
 
     let script = format!(
-        "$p = Start-Process -FilePath '{exe}' -ArgumentList @('internal','winfsp-bootstrap-mountmgr') -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+        "$ErrorActionPreference = 'Stop'; \
+try {{ \
+  $p = Start-Process -FilePath '{exe}' -ArgumentList @('internal','winfsp-bootstrap-mountmgr') -Verb RunAs -Wait -PassThru -ErrorAction Stop; \
+  if ($null -eq $p -or $null -eq $p.ExitCode) {{ exit 1 }}; \
+  exit $p.ExitCode \
+}} catch {{ \
+  exit 1 \
+}}"
     );
 
     let status = Command::new("powershell")
@@ -65,6 +73,16 @@ fn run_elevated_bootstrap_process() -> anyhow::Result<()> {
 pub fn ensure_mountmgr_bootstrap() -> anyhow::Result<()> {
     if mountmgr_from_fsd_enabled() {
         return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal()
+        && !std::io::stdout().is_terminal()
+        && !std::io::stderr().is_terminal()
+    {
+        anyhow::bail!(
+            "WinFSP one-time bootstrap requires an interactive terminal for UAC approval. \
+please run `studiofs mount` once in an interactive Administrator session, or set MountUseMountmgrFromFSD=1 manually in the registry."
+        );
     }
 
     eprintln!(
