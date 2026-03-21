@@ -48,17 +48,17 @@ type CheckpointWrite = (Vec<u8>, CheckpointSignature);
 /// Default L1 (RAM) size: 2 GiB.
 pub const DEFAULT_L1_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Default L2 (NVMe) size: 100 GiB.
-pub const DEFAULT_L2_SIZE: u64 = 100 * 1024 * 1024 * 1024;
+/// Default L2 (NVMe) size: 1 TiB.
+pub const DEFAULT_L2_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 
 /// Default free-disk-space ratio threshold for emergency eviction.
 pub const DEFAULT_DISK_FREE_RATIO: f64 = 0.10;
 
 /// Fixed worker count for bounded background L2 commits.
-pub const DEFAULT_L2_COMMIT_WORKERS: usize = 4;
+pub const DEFAULT_L2_COMMIT_WORKERS: usize = 32;
 
 /// Bounded queue depth for background L2 commit scheduling.
-pub const DEFAULT_L2_COMMIT_QUEUE_CAPACITY: usize = 512;
+pub const DEFAULT_L2_COMMIT_QUEUE_CAPACITY: usize = 4096;
 
 /// Maximum attempts per L2 commit job (initial try + retries).
 const L2_COMMIT_MAX_ATTEMPTS: u32 = 3;

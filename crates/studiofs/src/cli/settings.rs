@@ -8,7 +8,7 @@ use studiofs_vfs::{CacheSafetyMode, VfsConfig};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_CACHE_SIZE: &str = "100GB";
-const DEFAULT_MEMORY_LIMIT: &str = "2GB";
+const DEFAULT_MEMORY_LIMIT_DISPLAY: &str = "<dynamic: 25% of total RAM>";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StudioFsConfig {
@@ -138,7 +138,7 @@ pub fn resolve_studiofs_config_for_mount(
     cli_cache_dir: Option<&Path>,
     cli_memory_limit: Option<&str>,
     cli_cache_size: Option<&str>,
-) -> anyhow::Result<(String, Option<PathBuf>, String, String)> {
+) -> anyhow::Result<(String, Option<PathBuf>, Option<String>, String)> {
     let config = load_studiofs_config()?;
 
     let mount_point = cli_mount_point
@@ -196,8 +196,7 @@ pub fn resolve_studiofs_config_for_mount(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         })
-        .unwrap_or(DEFAULT_MEMORY_LIMIT)
-        .to_string();
+        .map(str::to_string);
 
     let cache_size = cli_cache_size
         .map(str::trim)
@@ -306,7 +305,8 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         "  memory-limit: {}",
         config
             .memory_limit
-            .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string())
+            .as_deref()
+            .unwrap_or(DEFAULT_MEMORY_LIMIT_DISPLAY)
     );
     println!(
         "  cache-size: {}",

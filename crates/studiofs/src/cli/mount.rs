@@ -7,6 +7,7 @@ use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfig, parse_size_bytes};
+use sysinfo::System;
 use tracing::{debug, info};
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
@@ -25,6 +26,27 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
     };
     let num: u64 = num_str.trim().parse()?;
     Ok(num * multiplier)
+}
+
+fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        total_memory_bytes > 0,
+        "failed to detect total system memory; pass --memory-limit explicitly"
+    );
+    Ok((total_memory_bytes / 4).max(1))
+}
+
+fn detect_dynamic_l1_limit() -> anyhow::Result<u64> {
+    let mut system = System::new();
+    system.refresh_memory();
+    let total_memory_bytes = system.total_memory();
+    let dynamic_limit_bytes = calculate_dynamic_l1_limit(total_memory_bytes)?;
+    let dynamic_limit_gib = dynamic_limit_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    info!(
+        total_memory_bytes,
+        dynamic_limit_bytes, dynamic_limit_gib, "Utilizing 25% of total RAM for L1 cache limit"
+    );
+    Ok(dynamic_limit_bytes)
 }
 
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
@@ -507,7 +529,15 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let mem_limit = parse_size(&memory_limit)?;
+    let (mem_limit, memory_limit_display) = if let Some(memory_limit) = memory_limit.as_deref() {
+        (parse_size(memory_limit)?, memory_limit.to_string())
+    } else {
+        let dynamic_limit = detect_dynamic_l1_limit()?;
+        (
+            dynamic_limit,
+            format!("{dynamic_limit}B (dynamic: 25% of total RAM)"),
+        )
+    };
     let cache_size_bytes = parse_size(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
@@ -559,7 +589,7 @@ pub fn run(
         "✓ Volume '{}' ready to mount at '{}'",
         name, actual_mount_path
     );
-    println!("  Memory limit: {}", memory_limit);
+    println!("  Memory limit: {}", memory_limit_display);
     println!("  Cache size:   {}", cache_size);
     println!(
         "  Storage:      {} / {}",
@@ -726,6 +756,17 @@ mod tests {
         assert_eq!(parse_size("512MB").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_size("1TB").unwrap(), 1024 * 1024 * 1024 * 1024);
         assert_eq!(parse_size("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_l1_limit_uses_quarter_of_total_memory() {
+        let total = 64 * 1024 * 1024 * 1024u64;
+        assert_eq!(calculate_dynamic_l1_limit(total).unwrap(), total / 4);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_l1_limit_rejects_zero_total_memory() {
+        assert!(calculate_dynamic_l1_limit(0).is_err());
     }
 
     #[test]

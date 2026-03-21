@@ -3418,9 +3418,11 @@ fn committed_file_mutation_enters_updating_state() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
     }
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
@@ -3482,6 +3484,7 @@ fn committed_file_mutation_enters_updating_state() {
 
     unsafe {
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
     }
 
     {
