@@ -38,7 +38,9 @@ Path walks are centralized in VFS `NamespaceResolver`:
 
 | Parameter | Value |
 |-----------|-------|
+| Mount type | Local disk device (drive-letter mount, no network prefix) |
 | Sector size | 512 bytes |
+| Allocation unit size | 16384 bytes |
 | Max component length | 255 |
 | File info timeout | 1000 ms |
 | Dir info timeout | 1000 ms |
@@ -48,6 +50,11 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Reparse points | Yes |
 | Volume serial | `0x5354_4644` ("STFD") |
 | Filesystem name | "StudioFS" |
+
+Windows mount-point handling:
+- StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
+- If Mount Manager access is denied, mount fails with an explicit error (instead of silently falling back to `DefineDosDevice` semantics).
+- Typical requirement: run with elevated privileges, or configure WinFSP `MountUseMountmgrFromFSD=1`.
 
 ### Implementation: `StudioFsContext`
 

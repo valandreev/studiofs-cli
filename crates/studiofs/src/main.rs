@@ -660,6 +660,12 @@ WARNING: This action is irreversible.")]
         #[command(subcommand)]
         action: SnapshotAction,
     },
+
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        action: InternalAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -672,6 +678,12 @@ enum SnapshotAction {
     },
     /// List known snapshots
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum InternalAction {
+    #[command(name = "winfsp-bootstrap-mountmgr", hide = true)]
+    WinfspBootstrapMountmgr,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -735,6 +747,9 @@ fn main() -> anyhow::Result<()> {
             profile,
             snapshot_id,
         } => {
+            #[cfg(windows)]
+            cli::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
+
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::mount::run(
                 &name,
@@ -842,6 +857,18 @@ fn main() -> anyhow::Result<()> {
                 SnapshotAction::List => cli::snapshot::list(&name, &meta_dir)?,
             }
         }
+        Commands::Internal { action } => match action {
+            InternalAction::WinfspBootstrapMountmgr => {
+                #[cfg(windows)]
+                {
+                    cli::winfsp_bootstrap::run_internal_bootstrap_mountmgr()?;
+                }
+                #[cfg(not(windows))]
+                {
+                    anyhow::bail!("internal WinFSP bootstrap is only supported on Windows");
+                }
+            }
+        },
     }
 
     Ok(())

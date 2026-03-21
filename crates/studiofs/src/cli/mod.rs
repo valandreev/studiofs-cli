@@ -26,3 +26,5 @@ pub mod test_cache_profile;
 pub mod test_cache_profile_types;
 pub mod umount;
 pub mod utils;
+#[cfg(windows)]
+pub mod winfsp_bootstrap;

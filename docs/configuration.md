@@ -99,6 +99,8 @@ Notes:
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.
 - On Windows, `<mount-point>` must be a drive letter (for example `Z:`). Directory mount points are not supported.
+- On Windows, StudioFS mounts drive letters through WinFSP Mount Manager syntax (`\\.\X:`). If Mount Manager access is denied, mount fails with an explicit error (run elevated or configure WinFSP `MountUseMountmgrFromFSD=1`).
+- On Windows, `studiofs mount` now performs a one-time bootstrap: if `MountUseMountmgrFromFSD=1` is missing, StudioFS requests UAC elevation once to set it automatically. After that, regular mounts can run from non-elevated terminals.
 - `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
@@ -114,6 +116,35 @@ Notes:
 - Default mount tags include platform, volume name, mount mode, cache mode, bridge, and `runtime=mount`.
 - When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
+
+Windows one-time registry setup (manual alternative):
+
+Set `MountUseMountmgrFromFSD=1` manually (run in elevated PowerShell):
+
+```powershell
+$paths = @(
+  'HKLM:\SOFTWARE\WOW6432Node\WinFsp',
+  'HKLM:\SOFTWARE\WinFsp'
+)
+foreach ($p in $paths) {
+  New-Item -Path $p -Force | Out-Null
+  New-ItemProperty -Path $p -Name 'MountUseMountmgrFromFSD' -PropertyType DWord -Value 1 -Force | Out-Null
+}
+```
+
+Verify value:
+
+```powershell
+Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name 'MountUseMountmgrFromFSD' -ErrorAction SilentlyContinue
+Get-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD' -ErrorAction SilentlyContinue
+```
+
+Remove value (rollback):
+
+```powershell
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name 'MountUseMountmgrFromFSD' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD' -ErrorAction SilentlyContinue
+```
 
 ### `settings`
 
