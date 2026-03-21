@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{
     BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
+    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
@@ -768,6 +769,10 @@ pub struct VfsConfig {
     pub l2_commit_workers: usize,
     /// Queue capacity for pending L2 commit jobs.
     pub l2_commit_queue_capacity: usize,
+    /// Timeout for L2 disk reads.
+    pub l2_read_timeout_ms: u64,
+    /// Timeout for L2 disk writes.
+    pub l2_write_timeout_ms: u64,
     /// Time to wait for remote visibility before publishing a manifest.
     pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
@@ -861,6 +866,8 @@ impl Default for VfsConfig {
             max_drain_batch: 1024,
             l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
+            l2_read_timeout_ms: DEFAULT_L2_READ_TIMEOUT_MS,
+            l2_write_timeout_ms: DEFAULT_L2_WRITE_TIMEOUT_MS,
             publish_visibility_timeout_secs: 30,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: 64,
@@ -3763,6 +3770,9 @@ impl StudioVfs {
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
             cache_config.l2_commit_workers = config.l2_commit_workers.max(1);
             cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity.max(1);
+            cache_config.l2_read_timeout = Duration::from_millis(config.l2_read_timeout_ms.max(1));
+            cache_config.l2_write_timeout =
+                Duration::from_millis(config.l2_write_timeout_ms.max(1));
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
             block_cache.spawn_background_tasks();
 

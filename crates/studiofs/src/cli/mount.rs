@@ -1,6 +1,7 @@
 //! `studiofs mount` — mount a filesystem volume.
 
 use chrono::Utc;
+use clap::ValueEnum;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
@@ -11,6 +12,17 @@ use sysinfo::System;
 use tracing::{debug, info};
 
 const DYNAMIC_L1_LIMIT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const USB_L2_COMMIT_WORKERS: usize = 4;
+const USB_L2_COMMIT_WORKERS_MAX: usize = 8;
+const USB_L2_COMMIT_QUEUE_CAPACITY: usize = 256;
+const USB_L2_IO_TIMEOUT_MS: u64 = 500;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
+pub enum L2Profile {
+    #[default]
+    Default,
+    Usb,
+}
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
@@ -104,6 +116,19 @@ fn parse_env_u64(key: &str) -> Option<u64> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
+}
+
+fn apply_l2_profile(mut config: VfsConfig, profile: L2Profile) -> VfsConfig {
+    match profile {
+        L2Profile::Default => config,
+        L2Profile::Usb => {
+            config.l2_commit_workers = USB_L2_COMMIT_WORKERS.min(USB_L2_COMMIT_WORKERS_MAX);
+            config.l2_commit_queue_capacity = USB_L2_COMMIT_QUEUE_CAPACITY;
+            config.l2_read_timeout_ms = USB_L2_IO_TIMEOUT_MS;
+            config.l2_write_timeout_ms = USB_L2_IO_TIMEOUT_MS;
+            config
+        }
+    }
 }
 
 fn parse_env_u64_any(key: &str) -> Option<u64> {
@@ -217,6 +242,8 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         "STUDIOFS_L2_COMMIT_QUEUE_CAPACITY",
         l2_commit_queue_capacity
     );
+    set_u64!("STUDIOFS_L2_READ_TIMEOUT_MS", l2_read_timeout_ms);
+    set_u64!("STUDIOFS_L2_WRITE_TIMEOUT_MS", l2_write_timeout_ms);
     set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
     set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
     set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);
@@ -371,6 +398,7 @@ pub fn run(
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
+    l2_profile: L2Profile,
     profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -385,6 +413,15 @@ pub fn run(
     let cache_dir = resolved_cache_dir;
     let mut vfs_config = super::settings::load_studiofs_config()?.vfs;
     vfs_config = overlay_vfs_env(vfs_config);
+    vfs_config = apply_l2_profile(vfs_config, l2_profile);
+    info!(
+        l2_profile = ?l2_profile,
+        l2_commit_workers = vfs_config.l2_commit_workers,
+        l2_commit_queue_capacity = vfs_config.l2_commit_queue_capacity,
+        l2_read_timeout_ms = vfs_config.l2_read_timeout_ms,
+        l2_write_timeout_ms = vfs_config.l2_write_timeout_ms,
+        "configured L2 cache profile"
+    );
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
 
     #[cfg(windows)]

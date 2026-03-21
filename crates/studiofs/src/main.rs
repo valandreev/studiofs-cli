@@ -451,6 +451,10 @@ ACL PRINCIPAL:
         #[arg(long, num_args = 0..=1, default_missing_value = "pyroscope", value_enum)]
         profile: Option<cli::mount_profile_types::MountProfileMode>,
 
+        /// L2 disk-cache profile. Use `usb` for external USB SSDs.
+        #[arg(long, value_enum, default_value_t = cli::mount::L2Profile::Default)]
+        l2_profile: cli::mount::L2Profile,
+
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
         snapshot_id: Option<String>,
@@ -722,6 +726,7 @@ fn main() -> anyhow::Result<()> {
             principal,
             foreground,
             detach,
+            l2_profile,
             profile,
             snapshot_id,
         } => {
@@ -736,6 +741,7 @@ fn main() -> anyhow::Result<()> {
                 principal.as_deref(),
                 foreground,
                 detach,
+                l2_profile,
                 profile,
                 snapshot_id.as_deref(),
             )?;
@@ -969,6 +975,17 @@ mod tests {
                 profile,
                 Some(cli::mount_profile_types::MountProfileMode::Off)
             )),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_l2_profile_usb() {
+        let cli = parse(&["mount", "vol", "Z:", "--l2-profile", "usb"]).unwrap();
+        match cli.command {
+            Commands::Mount { l2_profile, .. } => {
+                assert_eq!(l2_profile, cli::mount::L2Profile::Usb);
+            }
             other => panic!("expected Mount, got {other:?}"),
         }
     }

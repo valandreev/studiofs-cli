@@ -60,6 +60,12 @@ pub const DEFAULT_L2_COMMIT_WORKERS: usize = 32;
 /// Bounded queue depth for background L2 commit scheduling.
 pub const DEFAULT_L2_COMMIT_QUEUE_CAPACITY: usize = 4096;
 
+/// Default timeout for L2 read operations.
+pub const DEFAULT_L2_READ_TIMEOUT_MS: u64 = 5_000;
+
+/// Default timeout for L2 write operations.
+pub const DEFAULT_L2_WRITE_TIMEOUT_MS: u64 = 5_000;
+
 /// Maximum attempts per L2 commit job (initial try + retries).
 const L2_COMMIT_MAX_ATTEMPTS: u32 = 3;
 
@@ -87,6 +93,10 @@ pub struct BlockCacheConfig {
     pub l2_commit_workers: usize,
     /// Queue capacity for pending L2 commits (backpressure when full).
     pub l2_commit_queue_capacity: usize,
+    /// Max time to wait for an L2 read before treating it as a cache miss.
+    pub l2_read_timeout: Duration,
+    /// Max time to wait for an L2 write before failing the operation.
+    pub l2_write_timeout: Duration,
 }
 
 impl BlockCacheConfig {
@@ -98,6 +108,8 @@ impl BlockCacheConfig {
             disk_free_ratio: DEFAULT_DISK_FREE_RATIO,
             l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
+            l2_read_timeout: Duration::from_millis(DEFAULT_L2_READ_TIMEOUT_MS),
+            l2_write_timeout: Duration::from_millis(DEFAULT_L2_WRITE_TIMEOUT_MS),
         }
     }
 }
@@ -342,7 +354,22 @@ impl BlockCache {
 
         let l2_started = Instant::now();
         let expected_size = self.lru.size(object_id);
-        let Some(data) = self.l2.get_with_size_hint(object_id, expected_size).await else {
+        let l2_result = tokio::time::timeout(
+            self.config.l2_read_timeout,
+            self.l2.get_with_size_hint(object_id, expected_size),
+        )
+        .await;
+        let Some(data) = (match l2_result {
+            Ok(data) => data,
+            Err(_) => {
+                warn!(
+                    object_id,
+                    timeout_ms = self.config.l2_read_timeout.as_millis(),
+                    "L2 read timed out; falling back to cache miss"
+                );
+                None
+            }
+        }) else {
             return (
                 None,
                 CacheReadTrace {
@@ -387,7 +414,23 @@ impl BlockCache {
 
         // Write to L2 (NVMe file) — async, non-blocking.
         let started = Instant::now();
-        self.l2.put_bytes(object_id, data.clone()).await?;
+        match tokio::time::timeout(
+            self.config.l2_write_timeout,
+            self.l2.put_bytes(object_id, data.clone()),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "L2 write timed out after {}ms",
+                        self.config.l2_write_timeout.as_millis()
+                    ),
+                ));
+            }
+        }
         self.metrics
             .l2_write
             .record(data.len() as u64, started.elapsed());
@@ -772,7 +815,23 @@ impl BlockCache {
             let mut completed = false;
             while attempts < L2_COMMIT_MAX_ATTEMPTS {
                 attempts += 1;
-                match self.l2.put_bytes(job.object_id, job.data.clone()).await {
+                let write_result: io::Result<()> = match tokio::time::timeout(
+                    self.config.l2_write_timeout,
+                    self.l2.put_bytes(job.object_id, job.data.clone()),
+                )
+                .await
+                {
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "L2 commit timed out after {}ms",
+                            self.config.l2_write_timeout.as_millis()
+                        ),
+                    )),
+                    Ok(result) => result,
+                };
+
+                match write_result {
                     Ok(()) => {
                         self.metrics
                             .l2_write
@@ -1072,6 +1131,8 @@ mod tests {
             disk_free_ratio: 0.01,
             l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
+            l2_read_timeout: Duration::from_millis(DEFAULT_L2_READ_TIMEOUT_MS),
+            l2_write_timeout: Duration::from_millis(DEFAULT_L2_WRITE_TIMEOUT_MS),
         }
     }
 
