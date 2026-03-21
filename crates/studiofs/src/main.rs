@@ -207,6 +207,8 @@ ENV TUNING:
   STUDIOFS_MAX_DRAIN_BATCH          Max staged blocks drained per flusher cycle (default: 1024).
   STUDIOFS_L2_COMMIT_WORKERS        L2 commit scheduler workers (default: 32).
   STUDIOFS_L2_COMMIT_QUEUE_CAPACITY L2 commit scheduler queue depth before backpressure (default: 4096).
+  STUDIOFS_L2_READ_TIMEOUT_MS       L2 local-read timeout before cache-miss fallback (default: 5000).
+  STUDIOFS_L2_WRITE_TIMEOUT_MS      L2 local-write timeout per attempt (default: 5000).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
   STUDIOFS_CACHE_SAFETY_MODE         Local cache durability policy: fast|durable (default: fast).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).
@@ -386,6 +388,9 @@ EXAMPLES:
   High-performance mount (4 GB memory cache, 500 GB disk cache):
     studiofs mount myvolume Z: --memory-limit 4GB --cache-size 500GB \\
       --cache-dir D:\\cache\\studiofs
+
+  External USB SSD profile (lower L2 concurrency + tighter local L2 I/O timeouts):
+    studiofs mount myvolume Z: --l2-profile usb
 
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio

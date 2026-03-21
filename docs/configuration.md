@@ -84,6 +84,7 @@ studiofs mount <name> [<mount-point>] \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
+  [--l2-profile <default|usb>] \
   [--principal <name>] \
   [--snapshot-id <uuid>] \
   [--foreground] \
@@ -101,6 +102,7 @@ Notes:
 - `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
+- `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
 - `--profile=off` disables profiling explicitly, even if `STUDIOFS_PROFILE` is set.
@@ -364,6 +366,8 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
 | `STUDIOFS_L2_COMMIT_WORKERS` | `32` | Number of bounded L2 commit scheduler workers |
 | `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `4096` | L2 commit queue capacity before enqueue backpressure |
+| `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
+| `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |

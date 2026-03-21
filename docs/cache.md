@@ -95,8 +95,8 @@ Bounded scheduler for asynchronous L2 commits from the materializer path.
 
 | Property | Value |
 |----------|-------|
-| Workers | 4 (internal default) |
-| Queue capacity | 512 (internal default) |
+| Workers | 32 (default profile), 4 (`--l2-profile usb`) |
+| Queue capacity | 4096 (default profile), 256 (`--l2-profile usb`) |
 | Backpressure | `commit_l2_batch` awaits when queue is full |
 | Worker behavior | each worker writes sequentially via `l2.put_bytes()` |
 
@@ -104,6 +104,8 @@ This replaces the previous fire-and-forget fan-out model and caps concurrent
 L2 write operations to the worker count.
 Runtime tuning is available through `STUDIOFS_L2_COMMIT_WORKERS` and
 `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY`.
+For external USB SSDs, `studiofs mount --l2-profile usb` applies a conservative
+preset to avoid bridge/controller saturation.
 
 ### LRU Tracker (`lru_tracker.rs`)
 
@@ -158,6 +160,8 @@ Unified API combining all components above.
 | `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
 | `l2_commit_workers` | 32 | L2 commit worker count |
 | `l2_commit_queue_capacity` | 4096 | Max queued L2 commit jobs before backpressure |
+| `l2_read_timeout` | 5000ms | L2 read timeout before fallback to cache miss |
+| `l2_write_timeout` | 5000ms | L2 write timeout per attempt |
 
 **Key methods:**
 
@@ -172,6 +176,10 @@ Unified API combining all components above.
 | `complete_upload(pending)` | Unpin block in LRU |
 | `evict_one_l1()` | Demote one block from L1 |
 | `evict_one_l2()` | Remove one block from L2 |
+
+Timeout behavior:
+- L2 read timeout is treated as a cache miss (`get*` returns `None`) so callers can continue to remote/object-store fetch paths.
+- L2 write timeout fails the direct write path and is retried by background commit workers up to the configured attempt cap before dropping the local commit job.
 
 **Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.
 If the serialized checkpoint payload is unchanged (same entry count + CRC), the

@@ -48,6 +48,12 @@ STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable \
 studiofs mount myvolume Z: --profile
 ```
 
+Mount using the conservative USB L2 cache profile (for external USB SSDs):
+
+```bash
+studiofs mount myvolume Z: --l2-profile usb
+```
+
 To unmount a volume running in the background:
 
 ```bash
