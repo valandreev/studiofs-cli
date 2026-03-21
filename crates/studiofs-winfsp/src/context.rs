@@ -24,6 +24,9 @@ use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
+const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
+const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -47,19 +50,33 @@ pub struct StudioFileHandle {
     is_dir: bool,
     /// VFS file handle (0 for directories).
     fh: u64,
+    /// Open flags derived from WinFSP `CreateOptions`.
+    open_flags: OpenFlags,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
 }
 
 impl StudioFileHandle {
-    fn new(ino: Ino, is_dir: bool, fh: u64) -> Self {
+    fn new(ino: Ino, is_dir: bool, fh: u64, open_flags: OpenFlags) -> Self {
         Self {
             ino,
             is_dir,
             fh,
+            open_flags,
             dir_buffer: DirBuffer::new(),
         }
     }
+}
+
+fn open_flags_from_create_options(create_options: u32) -> OpenFlags {
+    let mut flags = OpenFlags::RDWR;
+    if create_options & FILE_NO_INTERMEDIATE_BUFFERING_OPTION != 0 {
+        flags = flags | OpenFlags::DIRECT_IO;
+    }
+    if create_options & FILE_WRITE_THROUGH_OPTION != 0 {
+        flags = flags | OpenFlags::WRITE_THROUGH;
+    }
+    flags
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -451,24 +468,32 @@ impl FileSystemContext for StudioFsContext {
     fn open(
         &self,
         file_name: &U16CStr,
-        _create_options: u32,
+        create_options: u32,
         _granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let attr = resolve_path(&self.vfs, file_name)?;
         *file_info.as_mut() = attr_to_file_info(&attr);
+        let open_flags = open_flags_from_create_options(create_options);
 
         let is_dir = attr.kind == FileType::Directory;
         let fh = if is_dir {
             0
         } else {
             self.vfs
-                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .open_file(attr.ino, open_flags, false)
                 .map_err(vfs_to_winfsp_err)?
         };
 
-        debug!(ino = attr.ino, fh, is_dir, "open");
-        Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
+        debug!(
+            ino = attr.ino,
+            fh,
+            is_dir,
+            open_flags = open_flags.bits(),
+            unbuffered = open_flags.requests_unbuffered_io(),
+            "open"
+        );
+        Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
     }
 
     fn close(&self, context: Self::FileContext) {
@@ -514,10 +539,16 @@ impl FileSystemContext for StudioFsContext {
                 "create symlink {:?}",
                 file_name.to_string_lossy()
             );
-            return Ok(StudioFileHandle::new(attr.ino, false, 0));
+            return Ok(StudioFileHandle::new(
+                attr.ino,
+                false,
+                0,
+                open_flags_from_create_options(create_options),
+            ));
         }
 
-        let is_dir = (create_options & 0x01) != 0; // FILE_DIRECTORY_FILE
+        let is_dir = (create_options & FILE_DIRECTORY_FILE_OPTION) != 0;
+        let open_flags = open_flags_from_create_options(create_options);
         let attr = if is_dir {
             self.vfs
                 .mkdir(parent_ino, &name, 0, 0, 0o755)
@@ -532,7 +563,7 @@ impl FileSystemContext for StudioFsContext {
             0
         } else {
             self.vfs
-                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .open_file(attr.ino, open_flags, false)
                 .map_err(vfs_to_winfsp_err)?
         };
 
@@ -543,10 +574,12 @@ impl FileSystemContext for StudioFsContext {
             ino = attr.ino,
             is_dir,
             fh,
+            open_flags = open_flags.bits(),
+            unbuffered = open_flags.requests_unbuffered_io(),
             "create {:?}",
             file_name.to_string_lossy()
         );
-        Ok(StudioFileHandle::new(attr.ino, is_dir, fh))
+        Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
     }
 
     fn get_file_info(
@@ -570,12 +603,13 @@ impl FileSystemContext for StudioFsContext {
         // dispatch thread doesn't participate in IO polling.  We allocate
         // an owned buffer, copy the result back.
         let ino = context.ino;
+        let fh = context.fh;
         let buf_len = buffer.len();
         let vfs = self.vfs.clone();
 
         let result: Result<(u32, Vec<u8>), _> = self.spawn_wait(async move {
             let mut owned = vec![0u8; buf_len];
-            let n = vfs.read_into(ino, offset, &mut owned).await?;
+            let n = vfs.read_into_fh(fh, ino, offset, &mut owned).await?;
             owned.truncate(n as usize);
             Ok((n, owned))
         });
@@ -583,7 +617,15 @@ impl FileSystemContext for StudioFsContext {
         match result {
             Ok((n, data)) => {
                 buffer[..n as usize].copy_from_slice(&data);
-                trace!(ino, offset, n, "read");
+                trace!(
+                    ino,
+                    fh,
+                    offset,
+                    n,
+                    open_flags = context.open_flags.bits(),
+                    unbuffered = context.open_flags.requests_unbuffered_io(),
+                    "read"
+                );
                 Ok(n)
             }
             Err(e) => Err(vfs_to_winfsp_err(e)),
@@ -621,16 +663,25 @@ impl FileSystemContext for StudioFsContext {
         }
 
         let ino = context.ino;
+        let fh = context.fh;
         let data = buffer.to_vec();
         let vfs = self.vfs.clone();
         let written = self
-            .spawn_wait(async move { vfs.write(ino, actual_offset, &data).await })
+            .spawn_wait(async move { vfs.write_fh(fh, ino, actual_offset, &data).await })
             .map_err(vfs_to_winfsp_err)?;
 
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
 
-        trace!(ino = context.ino, offset = actual_offset, written, "write");
+        trace!(
+            ino = context.ino,
+            fh = context.fh,
+            offset = actual_offset,
+            written,
+            open_flags = context.open_flags.bits(),
+            unbuffered = context.open_flags.requests_unbuffered_io(),
+            "write"
+        );
         Ok(written)
     }
 
@@ -1048,11 +1099,12 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-        STATUS_ACCESS_DENIED, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator, build_notify_info,
-        ino_to_windows_path, notify_filter_for_kind, vfs_to_winfsp_err,
+        FILE_ACTION_MODIFIED, FILE_NO_INTERMEDIATE_BUFFERING_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+        FILE_NOTIFY_CHANGE_SIZE, FILE_WRITE_THROUGH_OPTION, STATUS_ACCESS_DENIED,
+        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_NOT_FOUND,
+        StudioFsContext, WinfspKernelInvalidator, build_notify_info, ino_to_windows_path,
+        notify_filter_for_kind, open_flags_from_create_options, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1062,7 +1114,7 @@ mod tests {
         CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataConfig, ROOT_INO, RedbMetaEngine,
     };
     use studiofs_vfs::VfsError;
-    use studiofs_vfs::{KernelInvalidator, StudioVfs, VfsConfig};
+    use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs, VfsConfig};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -1129,6 +1181,21 @@ mod tests {
         });
         assert!(is_benign_cleanup_delete_error(&err, false));
         assert!(is_benign_cleanup_delete_error(&err, true));
+    }
+
+    #[test]
+    fn create_options_map_to_unbuffered_open_flags() {
+        let plain = open_flags_from_create_options(0);
+        assert!(!plain.contains(OpenFlags::DIRECT_IO));
+        assert!(!plain.contains(OpenFlags::WRITE_THROUGH));
+        assert!(!plain.requests_unbuffered_io());
+
+        let unbuffered = open_flags_from_create_options(
+            FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
+        );
+        assert!(unbuffered.contains(OpenFlags::DIRECT_IO));
+        assert!(unbuffered.contains(OpenFlags::WRITE_THROUGH));
+        assert!(unbuffered.requests_unbuffered_io());
     }
 
     #[test]

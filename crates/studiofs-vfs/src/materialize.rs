@@ -144,6 +144,8 @@ impl Materializer {
         let mut work: Vec<(Ino, u32, Bytes, bool)> = Vec::with_capacity(keys.len());
         for (ino, block_index) in keys {
             if vfs.state.deleted_inodes.lock().contains(&ino) {
+                // `dirty_mem` is `DirtyMemIndex`: remove() updates both payload map
+                // and per-inode counters atomically.
                 let removed = vfs.state.dirty_mem.lock().remove(&(ino, block_index));
                 if let Some(data) = removed {
                     vfs.state
@@ -335,6 +337,8 @@ impl Materializer {
                 let remove_match = dirty
                     .get(&key)
                     .is_some_and(|current| current.as_ref() == extent.data.as_ref());
+                // `dirty_mem` is `DirtyMemIndex`: remove() updates both payload map
+                // and per-inode counters atomically.
                 if remove_match && let Some(removed) = dirty.remove(&key) {
                     freed_bytes += removed.len();
                 }

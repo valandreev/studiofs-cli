@@ -50,7 +50,9 @@ use studiofs_cache::block_cache::{
 };
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_data::object::{create_object, format_object_key, parse_object_id_from_key};
+use studiofs_data::object::{
+    create_object, format_object_key, parse_object_id_from_key, read_object,
+};
 use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
@@ -581,6 +583,17 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
+const DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS: u64 = 120;
+const DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS: u64 = 25;
+const DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS: u64 = 100;
+
+fn direct_io_sync_timeout() -> Duration {
+    let secs = std::env::var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS);
+    Duration::from_secs(secs.max(1))
+}
 #[derive(Clone)]
 struct DistributedFlock {
     op: Operator,
@@ -892,6 +905,8 @@ impl OpenFlags {
     pub const WRONLY: Self = Self(0x02);
     pub const RDWR: Self = Self(0x04);
     pub const APPEND: Self = Self(0x08);
+    pub const DIRECT_IO: Self = Self(0x10);
+    pub const WRITE_THROUGH: Self = Self(0x20);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -907,6 +922,10 @@ impl OpenFlags {
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    pub const fn requests_unbuffered_io(self) -> bool {
+        self.contains(Self::DIRECT_IO) || self.contains(Self::WRITE_THROUGH)
     }
 }
 
@@ -2246,9 +2265,21 @@ struct SpillEntry {
 #[derive(Debug, Default)]
 struct IngressLiveIndex {
     entries: HashMap<(Ino, u32), SpillEntry>,
+    by_ino_counts: HashMap<Ino, usize>,
 }
 
 impl IngressLiveIndex {
+    fn from_entries(entries: HashMap<(Ino, u32), SpillEntry>) -> Self {
+        let mut by_ino_counts = HashMap::new();
+        for (ino, _) in entries.keys() {
+            *by_ino_counts.entry(*ino).or_insert(0) += 1;
+        }
+        Self {
+            entries,
+            by_ino_counts,
+        }
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -2262,11 +2293,25 @@ impl IngressLiveIndex {
     }
 
     fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
-        self.entries.insert(key, entry)
+        let old = self.entries.insert(key, entry);
+        if old.is_none() {
+            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
+        }
+        old
     }
 
     fn remove(&mut self, key: &(Ino, u32)) -> Option<SpillEntry> {
-        self.entries.remove(key)
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            let ino = key.0;
+            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
+            if count <= 1 {
+                self.by_ino_counts.remove(&ino);
+            } else {
+                self.by_ino_counts.insert(ino, count - 1);
+            }
+        }
+        removed
     }
 
     fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
@@ -2285,6 +2330,78 @@ impl IngressLiveIndex {
             }
         }
         ids.len() as u64
+    }
+
+    fn has_ino(&self, ino: Ino) -> bool {
+        self.by_ino_counts.contains_key(&ino)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirtyMemIndex {
+    entries: HashMap<(Ino, u32), Bytes>,
+    by_ino_counts: HashMap<Ino, usize>,
+}
+
+impl DirtyMemIndex {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Bytes> {
+        self.entries.values()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
+        self.entries.keys()
+    }
+
+    fn get(&self, key: &(Ino, u32)) -> Option<&Bytes> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: (Ino, u32), value: Bytes) -> Option<Bytes> {
+        let old = self.entries.insert(key, value);
+        if old.is_none() {
+            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
+        }
+        old
+    }
+
+    fn remove(&mut self, key: &(Ino, u32)) -> Option<Bytes> {
+        let old = self.entries.remove(key);
+        if old.is_some() {
+            let ino = key.0;
+            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
+            if count <= 1 {
+                self.by_ino_counts.remove(&ino);
+            } else {
+                self.by_ino_counts.insert(ino, count - 1);
+            }
+        }
+        old
+    }
+
+    fn has_ino(&self, ino: Ino) -> bool {
+        self.by_ino_counts.contains_key(&ino)
+    }
+
+    fn remove_inode(&mut self, ino: Ino) -> usize {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|(i, _), data| {
+            if *i == ino {
+                removed_bytes = removed_bytes.saturating_add(data.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.by_ino_counts.remove(&ino);
+        removed_bytes
     }
 }
 
@@ -2903,7 +3020,7 @@ struct VfsState {
     /// Dirty blocks accepted by `flush()` that have not yet been written to
     /// disk by the background flusher.  Reads must consult this buffer
     /// BEFORE falling through to the block cache or S3.
-    dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
+    dirty_mem: Mutex<DirtyMemIndex>,
     /// Live accepted ingress records keyed by `(ino, block_index)`.
     ingress_live: Mutex<IngressLiveIndex>,
     /// Serialize append/rotation decisions for ingress segment writes.
@@ -3994,10 +4111,8 @@ impl StudioVfs {
                     effective_acl_cache: Mutex::new(std::collections::HashMap::new()),
                     acl_epoch: AtomicU64::new(0),
                     acl_namespace_epoch: AtomicU64::new(0),
-                    dirty_mem: Mutex::new(std::collections::HashMap::new()),
-                    ingress_live: Mutex::new(IngressLiveIndex {
-                        entries: recovered_spill,
-                    }),
+                    dirty_mem: Mutex::new(DirtyMemIndex::default()),
+                    ingress_live: Mutex::new(IngressLiveIndex::from_entries(recovered_spill)),
                     ingress_segment_write_lock: Mutex::new(()),
                     dirty_bytes: AtomicUsize::new(0),
                     dirty_spill_bytes: AtomicUsize::new(recovered_spill_bytes),
@@ -6584,6 +6699,89 @@ impl StudioVfs {
         self.handle_table.open_count(ino)
     }
 
+    /// Read file data into `buffer` using per-handle I/O flags.
+    ///
+    /// For handles opened with `DIRECT_IO`/`WRITE_THROUGH`, this path avoids
+    /// best-effort prefetch and bypasses L1 RAM cache lookups for committed blocks.
+    pub async fn read_into_fh(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<u32> {
+        let unbuffered = self
+            .handle_table
+            .get(fh)
+            .map(|open| open.flags.requests_unbuffered_io())
+            .unwrap_or(false);
+        self.read_into_with_mode(ino, offset, buffer, unbuffered)
+            .await
+    }
+
+    /// Write file data using per-handle I/O flags.
+    ///
+    /// For `DIRECT_IO`/`WRITE_THROUGH`, writes are followed by a synchronous
+    /// drain to local ingress + upload queue completion for the target inode.
+    pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
+        let open_flags = self
+            .handle_table
+            .get(fh)
+            .map(|open| open.flags)
+            .unwrap_or(OpenFlags::empty());
+        let written = self.write(ino, offset, data).await?;
+        if written > 0 && open_flags.requests_unbuffered_io() {
+            self.flush_direct_write(ino).await?;
+        }
+        Ok(written)
+    }
+
+    async fn flush_direct_write(&self, ino: Ino) -> VfsResult<()> {
+        self.flush(ino).await?;
+        self.sync_inode_to_backend(ino, direct_io_sync_timeout())
+            .await
+    }
+
+    async fn sync_inode_to_backend(&self, ino: Ino, timeout: Duration) -> VfsResult<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain_dirty_mem().await;
+            let has_pending_ingress = self.inode_has_pending_ingress(ino);
+            let has_pending_uploads = self.inode_has_pending_uploads(ino);
+
+            if !has_pending_ingress && !has_pending_uploads {
+                return Ok(());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(VfsError::Other(format!(
+                    "timed out after {:?} waiting for direct I/O flush on inode {}",
+                    timeout, ino
+                )));
+            }
+
+            let max_sleep = if has_pending_ingress {
+                Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS)
+            } else {
+                Duration::from_millis(DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS)
+            };
+            let sleep_for = std::cmp::min(deadline.saturating_duration_since(now), max_sleep);
+            let progress = self.state.dirty_drained_notify.notified();
+            tokio::select! {
+                _ = progress => {}
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
+        }
+    }
+
+    fn inode_has_pending_ingress(&self, ino: Ino) -> bool {
+        if self.state.dirty_mem.lock().has_ino(ino) {
+            return true;
+        }
+        self.state.ingress_live.lock().has_ino(ino)
+    }
+
     // =========================================================================
     // File Locking (flock)
     // =========================================================================
@@ -7235,12 +7433,7 @@ impl StudioVfs {
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
         {
             let mut dirty = self.state.dirty_mem.lock();
-            let removed_bytes: usize = dirty
-                .iter()
-                .filter(|((i, _), _)| *i == ino)
-                .map(|(_, d)| d.len())
-                .sum();
-            dirty.retain(|(i, _), _| *i != ino);
+            let removed_bytes = dirty.remove_inode(ino);
             if removed_bytes > 0 {
                 self.state
                     .dirty_bytes
@@ -7449,6 +7642,16 @@ impl StudioVfs {
     /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
     /// Returns the number of bytes written.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
+        self.read_into_with_mode(ino, offset, buffer, false).await
+    }
+
+    async fn read_into_with_mode(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+        unbuffered: bool,
+    ) -> VfsResult<u32> {
         if let Some(attr) = self.ignored_entry_attr(ino) {
             let end = (offset + buffer.len() as u64).min(attr.size);
             let len = end.saturating_sub(offset) as usize;
@@ -7498,10 +7701,13 @@ impl StudioVfs {
         // If only one block, read sequentially to avoid overhead
         if blocks_needed.len() == 1 {
             let (block_idx, off_in, to_copy) = blocks_needed[0];
-            return match self
-                .read_block_or_pending(ino, block_idx, pending_content_epoch)
-                .await
-            {
+            return match if unbuffered {
+                self.read_block_or_pending_direct(ino, block_idx, pending_content_epoch)
+                    .await
+            } else {
+                self.read_block_or_pending(ino, block_idx, pending_content_epoch)
+                    .await
+            } {
                 Ok(block_data) => {
                     let copy_len = if to_copy == 0 || off_in >= block_data.len() {
                         0
@@ -7511,12 +7717,16 @@ impl StudioVfs {
                     if copy_len > 0 {
                         buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
                     }
-                    self.maybe_prefetch(ino, &blocks_needed);
+                    if !unbuffered {
+                        self.maybe_prefetch(ino, &blocks_needed);
+                    }
                     Ok(copy_len as u32)
                 }
                 Err(VfsError::BlockNotFound(_, _)) => {
                     buffer[..to_copy].fill(0u8);
-                    self.maybe_prefetch(ino, &blocks_needed);
+                    if !unbuffered {
+                        self.maybe_prefetch(ino, &blocks_needed);
+                    }
                     Ok(to_copy as u32)
                 }
                 Err(e) => Err(e),
@@ -7530,8 +7740,13 @@ impl StudioVfs {
             .map(|(idx, _, _)| {
                 let block_idx = *idx;
                 async move {
-                    self.read_block_or_pending(ino, block_idx, pending_content_epoch)
-                        .await
+                    if unbuffered {
+                        self.read_block_or_pending_direct(ino, block_idx, pending_content_epoch)
+                            .await
+                    } else {
+                        self.read_block_or_pending(ino, block_idx, pending_content_epoch)
+                            .await
+                    }
                 }
             })
             .collect();
@@ -7565,7 +7780,9 @@ impl StudioVfs {
             }
         }
 
-        self.maybe_prefetch(ino, &blocks_needed);
+        if !unbuffered {
+            self.maybe_prefetch(ino, &blocks_needed);
+        }
         Ok(written as u32)
     }
 
@@ -7638,6 +7855,22 @@ impl StudioVfs {
         }
 
         self.read_block(ino, block_index).await
+    }
+
+    async fn read_block_or_pending_direct(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+    ) -> VfsResult<Bytes> {
+        if let Some(data) = self
+            .read_pending_overlay_block_async(ino, block_index, pending_content_epoch)
+            .await?
+        {
+            return Ok(data);
+        }
+
+        self.read_block_direct(ino, block_index).await
     }
 
     async fn get_file_block_async(
@@ -7730,6 +7963,38 @@ impl StudioVfs {
                 }
                 other => VfsError::Other(other.to_string()),
             })
+    }
+
+    /// Read a single block while bypassing L1 RAM cache.
+    ///
+    /// This uses L2 disk cache as the only local cache tier and otherwise
+    /// fetches directly from remote storage without promoting into L1.
+    async fn read_block_direct(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
+        let block_ref = self
+            .get_file_block_async(ino, block_index)
+            .await?
+            .ok_or(VfsError::BlockNotFound(ino, block_index))?;
+
+        if let Some(cached) = self.block_cache.get_sync_l2_only(block_ref.object_id) {
+            return Ok(cached);
+        }
+
+        let key = format_object_key(&self.data_prefix, block_ref.object_id);
+        let compressed = self
+            .fetch_scheduler
+            .data_store()
+            .get_by_key(&key)
+            .await
+            .map_err(|e| match e {
+                studiofs_data::store::DataError::OpenDal(oe)
+                    if oe.kind() == ErrorKind::NotFound =>
+                {
+                    VfsError::BlockNotFound(ino, block_index)
+                }
+                other => VfsError::Other(other.to_string()),
+            })?;
+        let payload = read_object(&compressed).map_err(|e| VfsError::Other(e.to_string()))?;
+        Ok(Bytes::from(payload))
     }
 
     // =========================================================================
@@ -9529,9 +9794,16 @@ mod tests {
         assert!(f.contains(OpenFlags::RDWR));
         assert!(f.contains(OpenFlags::APPEND));
         assert!(!f.contains(OpenFlags::WRONLY));
+        assert!(!f.requests_unbuffered_io());
 
-        let f2 = f.union(OpenFlags::WRONLY);
+        let f2 = f
+            .union(OpenFlags::WRONLY)
+            .union(OpenFlags::DIRECT_IO)
+            .union(OpenFlags::WRITE_THROUGH);
         assert!(f2.contains(OpenFlags::WRONLY));
+        assert!(f2.contains(OpenFlags::DIRECT_IO));
+        assert!(f2.contains(OpenFlags::WRITE_THROUGH));
+        assert!(f2.requests_unbuffered_io());
     }
 
     #[test]

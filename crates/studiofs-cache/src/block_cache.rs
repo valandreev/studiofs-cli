@@ -482,6 +482,11 @@ impl BlockCache {
         self.l2.get_sync(object_id)
     }
 
+    /// Read a block synchronously from L2 only (never from L1).
+    pub fn get_sync_l2_only(&self, object_id: ObjectId) -> Option<Bytes> {
+        self.l2.get_sync(object_id)
+    }
+
     /// Write a block to cache (L1 + L2).
     ///
     /// The block is written to the NVMe file and kept in RAM.

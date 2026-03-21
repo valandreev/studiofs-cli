@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
+const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 512;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 16 * 1024;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
@@ -29,6 +30,7 @@ struct WinfspMountOptions {
     volume_label: String,
     file_info_timeout_ms: u32,
     dir_info_timeout_ms: u32,
+    volume_info_timeout_ms: u32,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -41,7 +43,10 @@ enum MountOptionError {
     InvalidDriveMountPoint(String),
 }
 
-fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOptionError> {
+fn parse_mount_options(
+    volume_label: &str,
+    direct_io: bool,
+) -> Result<WinfspMountOptions, MountOptionError> {
     let trimmed = volume_label.trim();
     if trimmed.is_empty() {
         return Err(MountOptionError::EmptyVolumeLabel);
@@ -52,8 +57,21 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
-        file_info_timeout_ms: DEFAULT_FILE_INFO_TIMEOUT_MS,
-        dir_info_timeout_ms: DEFAULT_DIR_INFO_TIMEOUT_MS,
+        file_info_timeout_ms: if direct_io {
+            0
+        } else {
+            DEFAULT_FILE_INFO_TIMEOUT_MS
+        },
+        dir_info_timeout_ms: if direct_io {
+            0
+        } else {
+            DEFAULT_DIR_INFO_TIMEOUT_MS
+        },
+        volume_info_timeout_ms: if direct_io {
+            0
+        } else {
+            DEFAULT_VOLUME_INFO_TIMEOUT_MS
+        },
     })
 }
 
@@ -71,6 +89,7 @@ fn apply_volume_params(
     volume_params.sectors_per_allocation_unit(DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
+    volume_params.volume_info_timeout(options.volume_info_timeout_ms);
     Ok(())
 }
 
@@ -135,13 +154,19 @@ pub fn mount_and_serve(
     volume_label: &str,
     _foreground: bool,
     read_only: bool,
+    direct_io: bool,
     shutdown_event_name: Option<&str>,
     profiling: Option<Box<dyn FnMut()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
-    let options = parse_mount_options(volume_label)?;
+    let options = parse_mount_options(volume_label, direct_io)?;
+    if direct_io {
+        tracing::warn!(
+            "direct-io mode enabled: WinFSP metadata cache timeouts are forced to 0; Explorer metadata operations may feel slower"
+        );
+    }
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
@@ -157,6 +182,7 @@ pub fn mount_and_serve(
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
     // WinFSP layer tuning:
     // - file_info_timeout and dir_info_timeout tuned for fast metadata refresh.
+    // - in direct-io mode, metadata caching timeouts are forced to 0.
     // - local-drive geometry is explicit for tooling that queries sector info.
     apply_volume_params(&mut volume_params, &options, mount_point)?;
 
@@ -289,29 +315,38 @@ unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
 mod tests {
     use super::{
         DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
-        DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT, MountOptionError,
-        canonical_drive_mount_point, is_drive_root_mount_point, mount_manager_mount_point,
-        parse_mount_options,
+        DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS,
+        MountOptionError, canonical_drive_mount_point, is_drive_root_mount_point,
+        mount_manager_mount_point, parse_mount_options,
     };
 
     #[test]
     fn parse_mount_options_rejects_invalid_labels() {
         assert_eq!(
-            parse_mount_options("   ").unwrap_err(),
+            parse_mount_options("   ", false).unwrap_err(),
             MountOptionError::EmptyVolumeLabel
         );
         assert_eq!(
-            parse_mount_options("bad\0label").unwrap_err(),
+            parse_mount_options("bad\0label", false).unwrap_err(),
             MountOptionError::VolumeLabelContainsNul
         );
     }
 
     #[test]
     fn parse_mount_options_normalizes_and_sets_defaults() {
-        let opts = parse_mount_options("  StudioFS  ").expect("options");
+        let opts = parse_mount_options("  StudioFS  ", false).expect("options");
         assert_eq!(opts.volume_label, "StudioFS");
         assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
         assert_eq!(opts.dir_info_timeout_ms, DEFAULT_DIR_INFO_TIMEOUT_MS);
+        assert_eq!(opts.volume_info_timeout_ms, DEFAULT_VOLUME_INFO_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn parse_mount_options_direct_io_disables_metadata_timeouts() {
+        let opts = parse_mount_options("StudioFS", true).expect("options");
+        assert_eq!(opts.file_info_timeout_ms, 0);
+        assert_eq!(opts.dir_info_timeout_ms, 0);
+        assert_eq!(opts.volume_info_timeout_ms, 0);
     }
 
     #[test]
