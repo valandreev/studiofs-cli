@@ -60,7 +60,7 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   payloads without an extra `to_vec()` clone in the async L2 write path
 - **Direct-read path by platform**:
   - Linux: `O_DIRECT`
-  - Windows: `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`
+  - Windows: `FILE_FLAG_NO_BUFFERING`
   - macOS: `fcntl(F_NOCACHE, 1)`
   All direct-read paths use page-aligned `BytesMut` and freeze into `Bytes`
   without secondary `copy_from_slice()`.
