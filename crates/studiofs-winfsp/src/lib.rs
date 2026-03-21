@@ -92,6 +92,7 @@ fn shutdown_upload_drain_timeout() -> std::time::Duration {
 ///
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
+#[allow(clippy::too_many_arguments)]
 pub fn mount_and_serve(
     vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
     rt: std::sync::Arc<tokio::runtime::Runtime>,
