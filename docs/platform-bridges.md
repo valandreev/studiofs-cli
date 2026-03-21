@@ -42,8 +42,9 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | 512 bytes |
 | Allocation unit size | 16384 bytes |
 | Max component length | 255 |
-| File info timeout | 1000 ms |
-| Dir info timeout | 1000 ms |
+| File info timeout | 1000 ms (0 with `--direct-io`) |
+| Dir info timeout | 1000 ms (0 with `--direct-io`) |
+| Volume info timeout | 1000 ms (0 with `--direct-io`) |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
 | Persistent ACLs | Yes |
@@ -64,6 +65,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 - `ino` — inode number
 - `is_dir` — directory flag
 - `fh` — VFS file handle
+- `open_flags` — VFS open flags derived from WinFSP `CreateOptions`
 - `dir_buffer` — WinFSP directory buffer for readdir
 
 **Key mappings:**
@@ -72,10 +74,10 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 |-----------------|------------|
 | `get_volume_info` | `statfs()` |
 | `get_security_by_name` | `NamespaceResolver::resolve_path()` |
-| `open` | `NamespaceResolver::resolve_path()` + `open()` |
+| `open` | `NamespaceResolver::resolve_path()` + `open()` (records `DIRECT_IO` / `WRITE_THROUGH` intent) |
 | `close` | `release()` |
-| `read` | `read()` |
-| `write` | `write()` |
+| `read` | `read_into_fh()` (per-handle unbuffered path when requested) |
+| `write` | `write_fh()` (sync backend drain for unbuffered handles) |
 | `cleanup` | `flush()` |
 | `flush` | `flush()` |
 | `get_file_info` | `getattr()` |
@@ -103,7 +105,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 ### Mount Lifecycle
 
 ```
-mount_and_serve(vfs, rt, mount_point, volume_label, foreground)
+mount_and_serve(vfs, rt, mount_point, volume_label, foreground, read_only, direct_io, shutdown_event_name, profiling)
   │
   ├─ Configure VolumeParams
   ├─ Create FileSystemHost
@@ -115,6 +117,11 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground)
        ├─ host.unmount()
        └─ vfs.shutdown() — drain uploads, persist checkpoint
 ```
+
+Current signature includes additional policy controls:
+- `read_only` toggles read-only mount behavior.
+- `direct_io` enables aggressive metadata timeout zeroing and per-handle unbuffered I/O path on Windows.
+- `shutdown_event_name` allows external graceful shutdown signal integration.
 
 ## FUSE Bridge (`studiofs-fuse`)
 

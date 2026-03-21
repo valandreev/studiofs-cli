@@ -78,6 +78,13 @@ data arrives
   └─ Full blocks can be moved immediately into dirty staging
 ```
 
+Handle-aware write path:
+- `write_fh(fh, ino, offset, data)` checks handle `OpenFlags`.
+- For `DIRECT_IO` / `WRITE_THROUGH`, after a successful write VFS performs:
+  - `flush(ino)` to stage accepted data,
+  - `sync_inode_to_backend(ino, timeout)` which waits until both ingress and upload queues are clear for that inode.
+- This provides a synchronous write-through confirmation path for unbuffered callers.
+
 ### 2. `flush(ino)` / `close(ino)`
 
 ```
@@ -170,6 +177,12 @@ local metadata view ──┬─ pending incarnation extents
          ▼
   assemble response bytes
 ```
+
+Handle-aware read path:
+- `read_into_fh(fh, ino, ...)` checks `OpenFlags` from the handle table.
+- If `DIRECT_IO` or `WRITE_THROUGH` is set, VFS uses unbuffered mode:
+  - disables best-effort prefetch for that read,
+  - resolves committed blocks through the direct path that avoids L1 promotion.
 
 ## FetchScheduler (`fetch.rs`)
 
