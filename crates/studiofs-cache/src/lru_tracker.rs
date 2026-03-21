@@ -251,6 +251,12 @@ impl LruTracker {
             .map(|e| e.location)
     }
 
+    /// Get known cached payload size for an entry.
+    pub fn size(&self, object_id: ObjectId) -> Option<u32> {
+        let shard_idx = (object_id as usize) % SHARD_COUNT;
+        self.shards[shard_idx].lock().get(object_id).map(|e| e.size)
+    }
+
     /// Pin an entry (prevent eviction).
     pub fn pin(&self, object_id: ObjectId) {
         let shard_idx = (object_id as usize) % SHARD_COUNT;

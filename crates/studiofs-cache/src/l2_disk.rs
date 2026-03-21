@@ -29,6 +29,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
+use crate::platform_direct_io;
+
 // =============================================================================
 // L2DiskCache
 // =============================================================================
@@ -48,13 +50,13 @@ pub struct L2DiskCache {
 
 impl L2DiskCache {
     fn write_block_file(path: &Path, tmp_path: &Path, data: &[u8]) -> io::Result<()> {
-        match std::fs::write(tmp_path, data) {
+        match platform_direct_io::write_file(tmp_path, data) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(tmp_path, data)?;
+                platform_direct_io::write_file(tmp_path, data)?;
             }
             Err(e) => return Err(e),
         }
@@ -65,7 +67,7 @@ impl L2DiskCache {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(tmp_path, data)?;
+                platform_direct_io::write_file(tmp_path, data)?;
                 std::fs::rename(tmp_path, path)
             }
             Err(e) => Err(e),
@@ -153,21 +155,47 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    /// Read a block from disk.  Returns `None` if not cached.
-    ///
-    /// Uses a single `spawn_blocking` so this never blocks the tokio runtime.
-    pub async fn get(&self, object_id: u64) -> Option<Bytes> {
-        let path = self.block_path(object_id);
-        match crate::runtime::spawn_blocking_profiled("l2_get", move || std::fs::read(&path)).await
+    async fn read_block_buffered(path: PathBuf) -> io::Result<Bytes> {
+        tokio::fs::read(path).await.map(Bytes::from)
+    }
+
+    async fn read_block_bytes(
+        path: PathBuf,
+        expected_len_hint: Option<usize>,
+    ) -> io::Result<Bytes> {
+        if let Some(bytes) =
+            platform_direct_io::read_block_direct(path.clone(), expected_len_hint).await?
         {
-            Ok(Ok(data)) => Some(Bytes::from(data)),
-            Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
-            Ok(Err(e)) => {
-                warn!(object_id, error = %e, "L2DiskCache read error");
-                None
-            }
+            return Ok(bytes);
+        }
+
+        Self::read_block_buffered(path).await
+    }
+
+    /// Read a block from disk. Returns `None` if not cached.
+    ///
+    /// Direct-I/O probing is delegated to `platform_direct_io`.
+    /// If a platform/filesystem rejects direct mode for this block, read falls
+    /// back to async buffered I/O.
+    pub async fn get(&self, object_id: u64) -> Option<Bytes> {
+        self.get_with_size_hint(object_id, None).await
+    }
+
+    /// Read a block using a known payload size hint from cache metadata.
+    ///
+    /// When `size_hint` is present, platform direct-I/O can skip per-read
+    /// metadata/stat calls on the hot path.
+    pub async fn get_with_size_hint(
+        &self,
+        object_id: u64,
+        size_hint: Option<u32>,
+    ) -> Option<Bytes> {
+        let path = self.block_path(object_id);
+        match Self::read_block_bytes(path, size_hint.map(|v| v as usize)).await {
+            Ok(data) => Some(data),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
-                warn!(object_id, error = %e, "L2DiskCache join error");
+                warn!(object_id, error = %e, "L2DiskCache read error");
                 None
             }
         }
@@ -176,23 +204,18 @@ impl L2DiskCache {
     /// Read multiple blocks from disk in parallel.
     ///
     /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
-    /// the input.  Each block is read in its own `spawn_blocking` task so the
-    /// OS can schedule them across multiple NVMe queues.
+    /// the input.
     pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
         let mut handles = Vec::with_capacity(ids.len());
         for &id in ids {
             let path = self.block_path(id);
-            handles.push((
-                id,
-                crate::runtime::spawn_blocking_profiled("l2_get_batch", move || {
-                    std::fs::read(&path)
-                }),
-            ));
+            handles.push((id, tokio::spawn(Self::read_block_bytes(path, None))));
         }
+
         let mut results = Vec::with_capacity(handles.len());
         for (id, handle) in handles {
             let data = match handle.await {
-                Ok(Ok(data)) => Some(Bytes::from(data)),
+                Ok(Ok(data)) => Some(data),
                 Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
                 Ok(Err(e)) => {
                     warn!(id, error = %e, "L2DiskCache batch read error");

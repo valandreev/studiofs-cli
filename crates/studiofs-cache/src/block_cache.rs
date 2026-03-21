@@ -341,7 +341,8 @@ impl BlockCache {
         let l1_lookup_latency = l1_started.elapsed();
 
         let l2_started = Instant::now();
-        let Some(data) = self.l2.get(object_id).await else {
+        let expected_size = self.lru.size(object_id);
+        let Some(data) = self.l2.get_with_size_hint(object_id, expected_size).await else {
             return (
                 None,
                 CacheReadTrace {
