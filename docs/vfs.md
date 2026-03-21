@@ -58,7 +58,7 @@ the capacity limit is reached.
 | `l2_write_timeout_ms` | 5000 | Max wait for local L2 write attempt |
 
 Mount profile note:
-- `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=500ms).
+- `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
 
 Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on

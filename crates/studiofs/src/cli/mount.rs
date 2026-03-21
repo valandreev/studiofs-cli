@@ -14,7 +14,7 @@ use tracing::{debug, info};
 const DYNAMIC_L1_LIMIT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const USB_L2_COMMIT_WORKERS: usize = 4;
 const USB_L2_COMMIT_QUEUE_CAPACITY: usize = 256;
-const USB_L2_IO_TIMEOUT_MS: u64 = 500;
+const USB_L2_IO_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
 pub enum L2Profile {

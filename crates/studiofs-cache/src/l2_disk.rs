@@ -27,6 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 use crate::platform_direct_io;
@@ -49,6 +50,19 @@ pub struct L2DiskCache {
 }
 
 impl L2DiskCache {
+    fn unique_tmp_path(path: &Path) -> PathBuf {
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id() as u64;
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("block");
+        let tmp_name = format!("{file_name}.tmp-{pid:08x}-{now_nanos:016x}-{seq:016x}");
+        path.with_file_name(tmp_name)
+    }
+
     fn write_block_file(path: &Path, tmp_path: &Path, data: &[u8]) -> io::Result<()> {
         match platform_direct_io::write_file(tmp_path, data) {
             Ok(()) => {}
@@ -129,7 +143,13 @@ impl L2DiskCache {
                 };
                 if ext != "block" {
                     // Clean up stale tmp files from interrupted writes.
-                    if ext == "tmp" {
+                    let is_stale_tmp = ext == "tmp"
+                        || path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| name.contains(".tmp-"))
+                            .unwrap_or(false);
+                    if is_stale_tmp {
                         let _ = std::fs::remove_file(&path);
                     }
                     continue;
@@ -253,7 +273,7 @@ impl L2DiskCache {
     /// call on the hot path.
     pub async fn put_bytes(&self, object_id: u64, data: Bytes) -> io::Result<()> {
         let path = self.block_path(object_id);
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = Self::unique_tmp_path(&path);
         let len = data.len() as u64;
 
         crate::runtime::spawn_blocking_profiled("l2_put", move || -> io::Result<()> {
@@ -284,7 +304,7 @@ impl L2DiskCache {
         let mut handles = Vec::with_capacity(blocks.len());
         for (id, data) in blocks {
             let path = self.block_path(*id);
-            let tmp_path = path.with_extension("tmp");
+            let tmp_path = Self::unique_tmp_path(&path);
             let owned = data.clone();
             let object_id = *id;
             handles.push((
@@ -323,7 +343,7 @@ impl L2DiskCache {
     /// Shard directories are pre-created by `open()`.
     pub fn put_sync(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
         let path = self.block_path(object_id);
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = Self::unique_tmp_path(&path);
 
         Self::write_block_file(&path, &tmp_path, data)?;
 

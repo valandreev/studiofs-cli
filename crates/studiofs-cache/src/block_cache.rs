@@ -359,7 +359,7 @@ impl BlockCache {
             self.l2.get_with_size_hint(object_id, expected_size),
         )
         .await;
-        let Some(data) = (match l2_result {
+        let data_opt = match l2_result {
             Ok(data) => data,
             Err(_) => {
                 warn!(
@@ -369,7 +369,8 @@ impl BlockCache {
                 );
                 None
             }
-        }) else {
+        };
+        let Some(data) = data_opt else {
             return (
                 None,
                 CacheReadTrace {
@@ -843,6 +844,17 @@ impl BlockCache {
                         break;
                     }
                     Err(e) => {
+                        if e.kind() == io::ErrorKind::TimedOut {
+                            self.metrics.l2_commit_scheduler.record_failed();
+                            warn!(
+                                worker_id,
+                                object_id = job.object_id,
+                                attempts,
+                                error = %e,
+                                "L2 commit timed out; dropping job without retry"
+                            );
+                            break;
+                        }
                         if attempts >= L2_COMMIT_MAX_ATTEMPTS {
                             self.metrics.l2_commit_scheduler.record_failed();
                             warn!(
