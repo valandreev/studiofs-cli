@@ -71,6 +71,9 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 - **Direct-write attempt by platform** — temporary block files use the same
   platform direct-I/O strategy when supported, with buffered fallback when
   alignment or filesystem constraints reject direct mode
+- **Write alignment guard** — non-aligned payload sizes use buffered writes
+  directly (no direct-write + truncate roundtrip), reducing metadata churn risk
+  on filesystems where `ftruncate` can be expensive
 - **Reduced zero-fill overhead** — aligned direct-I/O buffers are allocated
   without full upfront zeroing; only payload bytes (and required tail padding)
   are initialized

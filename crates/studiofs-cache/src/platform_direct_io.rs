@@ -76,19 +76,18 @@ fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Res
         return Ok(());
     }
 
-    let aligned_len = data.len().next_multiple_of(DIRECT_IO_ALIGNMENT);
-    let mut buf = aligned_uninit_bytes_mut(aligned_len, DIRECT_IO_ALIGNMENT);
+    if data.len() % DIRECT_IO_ALIGNMENT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "payload size is not direct-I/O aligned",
+        ));
+    }
+
+    let mut buf = aligned_uninit_bytes_mut(data.len(), DIRECT_IO_ALIGNMENT);
 
     buf[..data.len()].copy_from_slice(data);
-    if aligned_len > data.len() {
-        buf[data.len()..].fill(0);
-    }
 
     std_file.write_all(&buf)?;
-
-    if aligned_len != data.len() {
-        std_file.set_len(data.len() as u64)?;
-    }
 
     Ok(())
 }
