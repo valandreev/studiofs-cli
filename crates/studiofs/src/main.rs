@@ -207,6 +207,8 @@ ENV TUNING:
   STUDIOFS_MAX_DRAIN_BATCH          Max staged blocks drained per flusher cycle (default: 1024).
   STUDIOFS_L2_COMMIT_WORKERS        L2 commit scheduler workers (default: 32).
   STUDIOFS_L2_COMMIT_QUEUE_CAPACITY L2 commit scheduler queue depth before backpressure (default: 4096).
+  STUDIOFS_L2_READ_TIMEOUT_MS       L2 local-read timeout before cache-miss fallback (default: 5000).
+  STUDIOFS_L2_WRITE_TIMEOUT_MS      L2 local-write timeout per attempt (default: 5000).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
   STUDIOFS_CACHE_SAFETY_MODE         Local cache durability policy: fast|durable (default: fast).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).
@@ -387,6 +389,9 @@ EXAMPLES:
     studiofs mount myvolume Z: --memory-limit 4GB --cache-size 500GB \\
       --cache-dir D:\\cache\\studiofs
 
+  External USB SSD profile (lower L2 concurrency + tighter local L2 I/O timeouts):
+    studiofs mount myvolume Z: --l2-profile usb
+
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
 
@@ -450,6 +455,10 @@ ACL PRINCIPAL:
         /// Enable or disable Pyroscope profiling for the mount runtime.
         #[arg(long, num_args = 0..=1, default_missing_value = "pyroscope", value_enum)]
         profile: Option<cli::mount_profile_types::MountProfileMode>,
+
+        /// L2 disk-cache profile. Use `usb` for external USB SSDs.
+        #[arg(long, value_enum, default_value_t = cli::mount::L2Profile::Default)]
+        l2_profile: cli::mount::L2Profile,
 
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
@@ -722,6 +731,7 @@ fn main() -> anyhow::Result<()> {
             principal,
             foreground,
             detach,
+            l2_profile,
             profile,
             snapshot_id,
         } => {
@@ -736,6 +746,7 @@ fn main() -> anyhow::Result<()> {
                 principal.as_deref(),
                 foreground,
                 detach,
+                l2_profile,
                 profile,
                 snapshot_id.as_deref(),
             )?;
@@ -969,6 +980,17 @@ mod tests {
                 profile,
                 Some(cli::mount_profile_types::MountProfileMode::Off)
             )),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_l2_profile_usb() {
+        let cli = parse(&["mount", "vol", "Z:", "--l2-profile", "usb"]).unwrap();
+        match cli.command {
+            Commands::Mount { l2_profile, .. } => {
+                assert_eq!(l2_profile, cli::mount::L2Profile::Usb);
+            }
             other => panic!("expected Mount, got {other:?}"),
         }
     }

@@ -54,6 +54,11 @@ the capacity limit is reached.
 | `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
 | `l2_commit_workers` | 32 | Bounded L2 commit scheduler workers |
 | `l2_commit_queue_capacity` | 4096 | Bounded L2 commit queue capacity |
+| `l2_read_timeout_ms` | 5000 | Max wait for local L2 read before cache-miss fallback |
+| `l2_write_timeout_ms` | 5000 | Max wait for local L2 write attempt |
+
+Mount profile note:
+- `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
 
 Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on
