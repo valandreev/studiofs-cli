@@ -460,6 +460,12 @@ ACL PRINCIPAL:
         #[arg(long, value_enum, default_value_t = cli::mount::L2Profile::Default)]
         l2_profile: cli::mount::L2Profile,
 
+        /// Enable direct I/O semantics for WinFSP (unbuffered/write-through handling and zero metadata cache timeouts).
+        ///
+        /// Useful for performance validation tools that require backend-realistic I/O latency.
+        #[arg(long)]
+        direct_io: bool,
+
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
         snapshot_id: Option<String>,
@@ -744,6 +750,7 @@ fn main() -> anyhow::Result<()> {
             foreground,
             detach,
             l2_profile,
+            direct_io,
             profile,
             snapshot_id,
         } => {
@@ -762,6 +769,7 @@ fn main() -> anyhow::Result<()> {
                 foreground,
                 detach,
                 l2_profile,
+                direct_io,
                 profile,
                 snapshot_id.as_deref(),
             )?;
@@ -1017,6 +1025,17 @@ mod tests {
         match cli.command {
             Commands::Mount { l2_profile, .. } => {
                 assert_eq!(l2_profile, cli::mount::L2Profile::Usb);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_direct_io_flag() {
+        let cli = parse(&["mount", "vol", "Z:", "--direct-io"]).unwrap();
+        match cli.command {
+            Commands::Mount { direct_io, .. } => {
+                assert!(direct_io);
             }
             other => panic!("expected Mount, got {other:?}"),
         }
