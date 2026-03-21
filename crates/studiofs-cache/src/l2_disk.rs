@@ -23,13 +23,13 @@
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
 use bytes::Bytes;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use bytes::BytesMut;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use tokio::io::AsyncReadExt;
 use tracing::{debug, warn};
 
@@ -51,7 +51,7 @@ pub struct L2DiskCache {
 }
 
 impl L2DiskCache {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     const DIRECT_IO_ALIGNMENT: usize = 4096;
 
     fn write_block_file(path: &Path, tmp_path: &Path, data: &[u8]) -> io::Result<()> {
@@ -160,10 +160,10 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     fn aligned_bytes_mut(len: usize, alignment: usize) -> BytesMut {
         // Over-allocate, then trim a prefix so the active slice starts at a
-        // page-aligned address suitable for O_DIRECT buffers.
+        // page-aligned address suitable for direct-I/O buffers.
         let mut raw = BytesMut::with_capacity(len + alignment);
         raw.resize(len + alignment, 0);
         let misalignment = (raw.as_ptr() as usize) % alignment;
@@ -234,6 +234,125 @@ impl L2DiskCache {
         Ok(buf.freeze())
     }
 
+    #[cfg(target_os = "windows")]
+    fn should_fallback_from_direct_io(e: &io::Error) -> bool {
+        // Common Win32 codes for unsupported/invalid unbuffered requests.
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_NOT_SUPPORTED: i32 = 50;
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        matches!(
+            e.raw_os_error(),
+            Some(ERROR_INVALID_FUNCTION)
+                | Some(ERROR_ACCESS_DENIED)
+                | Some(ERROR_NOT_SUPPORTED)
+                | Some(ERROR_INVALID_PARAMETER)
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn read_block_direct_windows(path: PathBuf) -> io::Result<Bytes> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+        let (std_file, expected_len) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let std_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
+                .open(&path)?;
+            let expected_len = std_file.metadata()?.len() as usize;
+            Ok((std_file, expected_len))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        if expected_len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let aligned_len = expected_len.next_multiple_of(Self::DIRECT_IO_ALIGNMENT);
+        let mut buf = Self::aligned_bytes_mut(aligned_len, Self::DIRECT_IO_ALIGNMENT);
+        let mut file = tokio::fs::File::from_std(std_file);
+
+        let mut filled = 0usize;
+        while filled < aligned_len {
+            match file.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if filled == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "direct read returned EOF before data",
+            ));
+        }
+
+        let actual_len = expected_len.min(filled);
+        buf.truncate(actual_len);
+        Ok(buf.freeze())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn should_fallback_from_direct_io(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOTSUP)
+                | Some(libc::EPERM)
+                | Some(libc::ENOTTY)
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn read_block_direct_macos(path: PathBuf) -> io::Result<Bytes> {
+        use std::os::fd::AsRawFd;
+
+        let (std_file, expected_len) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let std_file = std::fs::OpenOptions::new().read(true).open(&path)?;
+            let fd = std_file.as_raw_fd();
+            let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+            if rc == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let expected_len = std_file.metadata()?.len() as usize;
+            Ok((std_file, expected_len))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        if expected_len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let aligned_len = expected_len.next_multiple_of(Self::DIRECT_IO_ALIGNMENT);
+        let mut buf = Self::aligned_bytes_mut(aligned_len, Self::DIRECT_IO_ALIGNMENT);
+        let mut file = tokio::fs::File::from_std(std_file);
+
+        let mut filled = 0usize;
+        while filled < aligned_len {
+            match file.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if filled == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "direct read returned EOF before data",
+            ));
+        }
+
+        let actual_len = expected_len.min(filled);
+        buf.truncate(actual_len);
+        Ok(buf.freeze())
+    }
+
     async fn read_block_bytes(path: PathBuf) -> io::Result<Bytes> {
         #[cfg(target_os = "linux")]
         {
@@ -245,14 +364,38 @@ impl L2DiskCache {
                 Err(e) => return Err(e),
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            match Self::read_block_direct_windows(path.clone()).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) if Self::should_fallback_from_direct_io(&e) => {
+                    debug!(error = %e, "Windows direct I/O unavailable for block; falling back to buffered read");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match Self::read_block_direct_macos(path.clone()).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) if Self::should_fallback_from_direct_io(&e) => {
+                    debug!(error = %e, "F_NOCACHE unavailable for block; falling back to buffered read");
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         Self::read_block_buffered(path).await
     }
 
     /// Read a block from disk. Returns `None` if not cached.
     ///
-    /// Linux path attempts `O_DIRECT` into an aligned `BytesMut` and freezes
-    /// it into `Bytes` without copy; other platforms use async buffered read.
+    /// Platform direct-I/O path attempts:
+    /// - Linux: `O_DIRECT`
+    /// - Windows: `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`
+    /// - macOS: `fcntl(F_NOCACHE, 1)`
+    ///
+    /// In all cases, direct-I/O rejection falls back to async buffered read.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.block_path(object_id);
         match Self::read_block_bytes(path).await {
