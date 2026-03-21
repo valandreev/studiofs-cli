@@ -49,6 +49,26 @@ fn detect_dynamic_l1_limit() -> anyhow::Result<u64> {
     Ok(dynamic_limit_bytes)
 }
 
+fn format_binary_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= TIB {
+        format!("{:.2}TiB", b / TIB)
+    } else if b >= GIB {
+        format!("{:.2}GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2}MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2}KiB", b / KIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     let mount_path = Path::new(mount_point);
     #[cfg(windows)]
@@ -535,7 +555,10 @@ pub fn run(
         let dynamic_limit = detect_dynamic_l1_limit()?;
         (
             dynamic_limit,
-            format!("{dynamic_limit}B (dynamic: 25% of total RAM)"),
+            format!(
+                "{} (dynamic: 25% of total RAM)",
+                format_binary_size(dynamic_limit)
+            ),
         )
     };
     let cache_size_bytes = parse_size(&cache_size)?;
@@ -767,6 +790,14 @@ mod tests {
     #[test]
     fn test_calculate_dynamic_l1_limit_rejects_zero_total_memory() {
         assert!(calculate_dynamic_l1_limit(0).is_err());
+    }
+
+    #[test]
+    fn test_format_binary_size() {
+        assert_eq!(format_binary_size(1023), "1023B");
+        assert_eq!(format_binary_size(1024), "1.00KiB");
+        assert_eq!(format_binary_size(1024 * 1024), "1.00MiB");
+        assert_eq!(format_binary_size(16 * 1024 * 1024 * 1024), "16.00GiB");
     }
 
     #[test]
