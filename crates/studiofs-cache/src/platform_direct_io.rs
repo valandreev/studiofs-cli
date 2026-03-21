@@ -18,6 +18,13 @@ fn aligned_uninit_bytes_mut(len: usize, alignment: usize) -> BytesMut {
         alignment - misalignment
     };
 
+    // SAFETY:
+    // - We immediately restrict the exposed initialized region to either:
+    //   1) bytes read from the kernel (`read_from_std_file_direct` truncates to
+    //      the actual filled length before freeze), or
+    //   2) bytes we explicitly initialize (`write_to_std_file_direct` payload
+    //      copy + optional zero tail) before writing.
+    // - This buffer never leaves the module in an uninitialized state.
     unsafe {
         raw.set_len(prefix + len);
     }
@@ -181,12 +188,11 @@ pub(crate) async fn read_block_direct(
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
         let std_file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
+            .custom_flags(FILE_FLAG_NO_BUFFERING)
             .open(&path)?;
         let expected_len = match expected_len_hint {
             Some(len) => len,
@@ -215,14 +221,13 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
     let direct = (|| -> io::Result<()> {
         let std_file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
+            .custom_flags(FILE_FLAG_NO_BUFFERING)
             .open(path)?;
         write_to_std_file_direct(std_file, data)
     })();
