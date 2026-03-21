@@ -50,20 +50,19 @@ fn detect_dynamic_l1_limit() -> anyhow::Result<u64> {
 }
 
 fn format_binary_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    const TIB: f64 = GIB * 1024.0;
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
 
-    let b = bytes as f64;
-    if b >= TIB {
-        format!("{:.2}TiB", b / TIB)
-    } else if b >= GIB {
-        format!("{:.2}GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.2}MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.2}KiB", b / KIB)
+    if bytes >= TIB {
+        format!("{:.2}TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2}GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2}MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2}KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes}B")
     }
