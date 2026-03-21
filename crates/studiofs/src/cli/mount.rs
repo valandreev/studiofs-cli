@@ -13,7 +13,6 @@ use tracing::{debug, info};
 
 const DYNAMIC_L1_LIMIT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const USB_L2_COMMIT_WORKERS: usize = 4;
-const USB_L2_COMMIT_WORKERS_MAX: usize = 8;
 const USB_L2_COMMIT_QUEUE_CAPACITY: usize = 256;
 const USB_L2_IO_TIMEOUT_MS: u64 = 500;
 
@@ -122,7 +121,7 @@ fn apply_l2_profile(mut config: VfsConfig, profile: L2Profile) -> VfsConfig {
     match profile {
         L2Profile::Default => config,
         L2Profile::Usb => {
-            config.l2_commit_workers = USB_L2_COMMIT_WORKERS.min(USB_L2_COMMIT_WORKERS_MAX);
+            config.l2_commit_workers = USB_L2_COMMIT_WORKERS;
             config.l2_commit_queue_capacity = USB_L2_COMMIT_QUEUE_CAPACITY;
             config.l2_read_timeout_ms = USB_L2_IO_TIMEOUT_MS;
             config.l2_write_timeout_ms = USB_L2_IO_TIMEOUT_MS;
