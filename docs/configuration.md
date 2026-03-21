@@ -33,7 +33,7 @@ Priority for each setting:
 
 1. CLI flag (`--mount-point`, `--cache-dir`, `--memory-limit`, `--cache-size`)
 2. Value from `config.toml`
-3. Legacy default (`memory-limit=2GB`, `cache-size=100GB`)
+3. Built-in default (`memory-limit=25% of total RAM`, `cache-size=100GB`)
 4. For `mount-point`, no implicit default is used; `cache-dir` still falls back to `<meta-dir>/cache` when neither CLI nor config provides a value.
 
 ## Commands
@@ -362,8 +362,8 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
-| `STUDIOFS_L2_COMMIT_WORKERS` | `4` | Number of bounded L2 commit scheduler workers |
-| `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `512` | L2 commit queue capacity before enqueue backpressure |
+| `STUDIOFS_L2_COMMIT_WORKERS` | `32` | Number of bounded L2 commit scheduler workers |
+| `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `4096` | L2 commit queue capacity before enqueue backpressure |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |

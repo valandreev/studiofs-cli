@@ -2280,9 +2280,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         advanced_metrics: Some(advanced_metrics),
         stream_results,
         work_root: None,
-        writes: writes
-            .overall
-            .to_report(writes_wall.as_secs_f64() * 1000.0),
+        writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
         reads: reads
             .phase
             .overall
@@ -2518,12 +2516,8 @@ async fn run_mounted_end_to_end(
             profile,
             advanced_metrics: Some(advanced_metrics),
             stream_results,
-            writes: writes
-                .overall
-                .to_report(writes_wall.as_secs_f64() * 1000.0),
-            reads: reads
-                .overall
-                .to_report(reads_wall.as_secs_f64() * 1000.0),
+            writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
+            reads: reads.overall.to_report(reads_wall.as_secs_f64() * 1000.0),
         })
     }
     .await;

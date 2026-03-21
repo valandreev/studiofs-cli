@@ -129,11 +129,11 @@ Unified API combining all components above.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `l1_size` | 2 GiB | Maximum L1 memory |
-| `l2_size` | 100 GiB | Maximum L2 disk |
+| `l2_size` | 1 TiB | Maximum L2 disk |
 | `cache_dir` | — | Root directory for L2 + journals |
 | `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
-| `l2_commit_workers` | 4 | L2 commit worker count |
-| `l2_commit_queue_capacity` | 512 | Max queued L2 commit jobs before backpressure |
+| `l2_commit_workers` | 32 | L2 commit worker count |
+| `l2_commit_queue_capacity` | 4096 | Max queued L2 commit jobs before backpressure |
 
 **Key methods:**
 
