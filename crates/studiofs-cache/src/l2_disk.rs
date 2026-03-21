@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncReadExt;
-use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 // =============================================================================
@@ -196,12 +195,16 @@ impl L2DiskCache {
     async fn read_block_direct_linux(path: PathBuf) -> io::Result<Bytes> {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let std_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
-            .open(&path)?;
-
-        let expected_len = std_file.metadata()?.len() as usize;
+        let (std_file, expected_len) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let std_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+                .open(&path)?;
+            let expected_len = std_file.metadata()?.len() as usize;
+            Ok((std_file, expected_len))
+        })
+        .await
+        .map_err(io::Error::other)??;
         if expected_len == 0 {
             return Ok(Bytes::new());
         }
@@ -267,28 +270,27 @@ impl L2DiskCache {
     /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
     /// the input.
     pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
-        let mut join_set = JoinSet::new();
-        for (idx, &id) in ids.iter().enumerate() {
+        let mut handles = Vec::with_capacity(ids.len());
+        for &id in ids {
             let path = self.block_path(id);
-            join_set.spawn(async move { (idx, id, Self::read_block_bytes(path).await) });
+            handles.push((id, tokio::spawn(Self::read_block_bytes(path))));
         }
 
-        let mut results: Vec<(u64, Option<Bytes>)> = ids.iter().map(|&id| (id, None)).collect();
-
-        while let Some(joined) = join_set.join_next().await {
-            match joined {
-                Ok((idx, id, Ok(data))) => results[idx] = (id, Some(data)),
-                Ok((idx, id, Err(e))) if e.kind() == io::ErrorKind::NotFound => {
-                    results[idx] = (id, None)
-                }
-                Ok((idx, id, Err(e))) => {
+        let mut results = Vec::with_capacity(handles.len());
+        for (id, handle) in handles {
+            let data = match handle.await {
+                Ok(Ok(data)) => Some(data),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
+                Ok(Err(e)) => {
                     warn!(id, error = %e, "L2DiskCache batch read error");
-                    results[idx] = (id, None);
+                    None
                 }
                 Err(e) => {
-                    warn!(error = %e, "L2DiskCache batch join error");
+                    warn!(id, error = %e, "L2DiskCache batch join error");
+                    None
                 }
-            }
+            };
+            results.push((id, data));
         }
         results
     }
