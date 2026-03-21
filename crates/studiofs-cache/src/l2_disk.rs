@@ -23,10 +23,15 @@
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
 use bytes::Bytes;
+#[cfg(target_os = "linux")]
+use bytes::BytesMut;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncReadExt;
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 // =============================================================================
@@ -47,6 +52,9 @@ pub struct L2DiskCache {
 }
 
 impl L2DiskCache {
+    #[cfg(target_os = "linux")]
+    const DIRECT_IO_ALIGNMENT: usize = 4096;
+
     fn write_block_file(path: &Path, tmp_path: &Path, data: &[u8]) -> io::Result<()> {
         match std::fs::write(tmp_path, data) {
             Ok(()) => {}
@@ -153,21 +161,102 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    /// Read a block from disk.  Returns `None` if not cached.
+    #[cfg(target_os = "linux")]
+    fn aligned_bytes_mut(len: usize, alignment: usize) -> BytesMut {
+        // Over-allocate, then trim a prefix so the active slice starts at a
+        // page-aligned address suitable for O_DIRECT buffers.
+        let mut raw = BytesMut::with_capacity(len + alignment);
+        raw.resize(len + alignment, 0);
+        let misalignment = (raw.as_ptr() as usize) % alignment;
+        if misalignment != 0 {
+            let prefix = alignment - misalignment;
+            let _ = raw.split_to(prefix);
+        }
+        raw.truncate(len);
+        raw
+    }
+
+    async fn read_block_buffered(path: PathBuf) -> io::Result<Bytes> {
+        tokio::fs::read(path).await.map(Bytes::from)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn should_fallback_from_direct_io(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOTSUP)
+                | Some(libc::EPERM)
+                | Some(libc::ENOSYS)
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn read_block_direct_linux(path: PathBuf) -> io::Result<Bytes> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let std_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+            .open(&path)?;
+
+        let expected_len = std_file.metadata()?.len() as usize;
+        if expected_len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let aligned_len = expected_len.next_multiple_of(Self::DIRECT_IO_ALIGNMENT);
+        let mut buf = Self::aligned_bytes_mut(aligned_len, Self::DIRECT_IO_ALIGNMENT);
+        let mut file = tokio::fs::File::from_std(std_file);
+
+        let mut filled = 0usize;
+        while filled < aligned_len {
+            match file.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if filled == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "direct read returned EOF before data",
+            ));
+        }
+
+        let actual_len = expected_len.min(filled);
+        buf.truncate(actual_len);
+        Ok(buf.freeze())
+    }
+
+    async fn read_block_bytes(path: PathBuf) -> io::Result<Bytes> {
+        #[cfg(target_os = "linux")]
+        {
+            match Self::read_block_direct_linux(path.clone()).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) if Self::should_fallback_from_direct_io(&e) => {
+                    debug!(error = %e, "O_DIRECT unavailable for block; falling back to buffered read");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Self::read_block_buffered(path).await
+    }
+
+    /// Read a block from disk. Returns `None` if not cached.
     ///
-    /// Uses a single `spawn_blocking` so this never blocks the tokio runtime.
+    /// Linux path attempts `O_DIRECT` into an aligned `BytesMut` and freezes
+    /// it into `Bytes` without copy; other platforms use async buffered read.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match crate::runtime::spawn_blocking_profiled("l2_get", move || std::fs::read(&path)).await
-        {
-            Ok(Ok(data)) => Some(Bytes::from(data)),
-            Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
-            Ok(Err(e)) => {
-                warn!(object_id, error = %e, "L2DiskCache read error");
-                None
-            }
+        match Self::read_block_bytes(path).await {
+            Ok(data) => Some(data),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
-                warn!(object_id, error = %e, "L2DiskCache join error");
+                warn!(object_id, error = %e, "L2DiskCache read error");
                 None
             }
         }
@@ -176,34 +265,30 @@ impl L2DiskCache {
     /// Read multiple blocks from disk in parallel.
     ///
     /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
-    /// the input.  Each block is read in its own `spawn_blocking` task so the
-    /// OS can schedule them across multiple NVMe queues.
+    /// the input.
     pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
-        let mut handles = Vec::with_capacity(ids.len());
-        for &id in ids {
+        let mut join_set = JoinSet::new();
+        for (idx, &id) in ids.iter().enumerate() {
             let path = self.block_path(id);
-            handles.push((
-                id,
-                crate::runtime::spawn_blocking_profiled("l2_get_batch", move || {
-                    std::fs::read(&path)
-                }),
-            ));
+            join_set.spawn(async move { (idx, id, Self::read_block_bytes(path).await) });
         }
-        let mut results = Vec::with_capacity(handles.len());
-        for (id, handle) in handles {
-            let data = match handle.await {
-                Ok(Ok(data)) => Some(Bytes::from(data)),
-                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
-                Ok(Err(e)) => {
+
+        let mut results: Vec<(u64, Option<Bytes>)> = ids.iter().map(|&id| (id, None)).collect();
+
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, id, Ok(data))) => results[idx] = (id, Some(data)),
+                Ok((idx, id, Err(e))) if e.kind() == io::ErrorKind::NotFound => {
+                    results[idx] = (id, None)
+                }
+                Ok((idx, id, Err(e))) => {
                     warn!(id, error = %e, "L2DiskCache batch read error");
-                    None
+                    results[idx] = (id, None);
                 }
                 Err(e) => {
-                    warn!(id, error = %e, "L2DiskCache batch join error");
-                    None
+                    warn!(error = %e, "L2DiskCache batch join error");
                 }
-            };
-            results.push((id, data));
+            }
         }
         results
     }
