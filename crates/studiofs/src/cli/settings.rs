@@ -8,7 +8,7 @@ use studiofs_vfs::{CacheSafetyMode, VfsConfig};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_CACHE_SIZE: &str = "100GB";
-const DEFAULT_MEMORY_LIMIT_DISPLAY: &str = "<dynamic: 25% of total RAM>";
+const DEFAULT_MEMORY_LIMIT_DISPLAY: &str = "<dynamic: 25% of total RAM, capped at 4GiB>";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StudioFsConfig {

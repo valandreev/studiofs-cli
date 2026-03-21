@@ -10,6 +10,8 @@ use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfig, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
 
+const DYNAMIC_L1_LIMIT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_uppercase();
@@ -33,7 +35,7 @@ fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {
         total_memory_bytes > 0,
         "failed to detect total system memory; pass --memory-limit explicitly"
     );
-    Ok((total_memory_bytes / 4).max(1))
+    Ok((total_memory_bytes / 4).clamp(1, DYNAMIC_L1_LIMIT_CAP_BYTES))
 }
 
 fn detect_dynamic_l1_limit() -> anyhow::Result<u64> {
@@ -44,7 +46,10 @@ fn detect_dynamic_l1_limit() -> anyhow::Result<u64> {
     let dynamic_limit_gib = dynamic_limit_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     info!(
         total_memory_bytes,
-        dynamic_limit_bytes, dynamic_limit_gib, "Utilizing 25% of total RAM for L1 cache limit"
+        dynamic_limit_bytes,
+        dynamic_limit_gib,
+        cap_bytes = DYNAMIC_L1_LIMIT_CAP_BYTES,
+        "Utilizing 25% of total RAM for L1 cache limit (capped at 4GiB)"
     );
     Ok(dynamic_limit_bytes)
 }
@@ -555,7 +560,7 @@ pub fn run(
         (
             dynamic_limit,
             format!(
-                "{} (dynamic: 25% of total RAM)",
+                "{} (dynamic: 25% of total RAM, capped at 4GiB)",
                 format_binary_size(dynamic_limit)
             ),
         )
@@ -782,8 +787,17 @@ mod tests {
 
     #[test]
     fn test_calculate_dynamic_l1_limit_uses_quarter_of_total_memory() {
-        let total = 64 * 1024 * 1024 * 1024u64;
+        let total = 8 * 1024 * 1024 * 1024u64;
         assert_eq!(calculate_dynamic_l1_limit(total).unwrap(), total / 4);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_l1_limit_caps_at_4_gib() {
+        let total = 64 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            calculate_dynamic_l1_limit(total).unwrap(),
+            DYNAMIC_L1_LIMIT_CAP_BYTES
+        );
     }
 
     #[test]
