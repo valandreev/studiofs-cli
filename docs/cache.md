@@ -74,6 +74,9 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 - **Reduced zero-fill overhead** — aligned direct-I/O buffers are allocated
   without full upfront zeroing; only payload bytes (and required tail padding)
   are initialized
+- **Fewer stat syscalls on hot reads** — `BlockCache` now passes known block
+  size from LRU/cache metadata into L2 direct-read path, avoiding per-read
+  `metadata()` in the common case
 - **Current Linux runtime note** — this path does not use `io_uring` yet; it
   uses Tokio file APIs and direct-open flags with async fallback behavior
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`

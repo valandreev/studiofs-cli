@@ -100,7 +100,10 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>> {
+pub(crate) async fn read_block_direct(
+    path: PathBuf,
+    expected_len_hint: Option<usize>,
+) -> io::Result<Option<Bytes>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
@@ -108,7 +111,10 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
             .read(true)
             .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
             .open(&path)?;
-        let expected_len = std_file.metadata()?.len() as usize;
+        let expected_len = match expected_len_hint {
+            Some(len) => len,
+            None => std_file.metadata()?.len() as usize,
+        };
         read_from_std_file_direct(std_file, expected_len)
     })
     .await
@@ -168,7 +174,10 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>> {
+pub(crate) async fn read_block_direct(
+    path: PathBuf,
+    expected_len_hint: Option<usize>,
+) -> io::Result<Option<Bytes>> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
@@ -179,7 +188,10 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
             .read(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
             .open(&path)?;
-        let expected_len = std_file.metadata()?.len() as usize;
+        let expected_len = match expected_len_hint {
+            Some(len) => len,
+            None => std_file.metadata()?.len() as usize,
+        };
         read_from_std_file_direct(std_file, expected_len)
     })
     .await
@@ -242,7 +254,10 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>> {
+pub(crate) async fn read_block_direct(
+    path: PathBuf,
+    expected_len_hint: Option<usize>,
+) -> io::Result<Option<Bytes>> {
     use std::os::fd::AsRawFd;
 
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
@@ -252,7 +267,10 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
         if rc == -1 {
             return Err(io::Error::last_os_error());
         }
-        let expected_len = std_file.metadata()?.len() as usize;
+        let expected_len = match expected_len_hint {
+            Some(len) => len,
+            None => std_file.metadata()?.len() as usize,
+        };
         read_from_std_file_direct(std_file, expected_len)
     })
     .await
@@ -297,7 +315,10 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-pub(crate) async fn read_block_direct(_path: PathBuf) -> io::Result<Option<Bytes>> {
+pub(crate) async fn read_block_direct(
+    _path: PathBuf,
+    _expected_len_hint: Option<usize>,
+) -> io::Result<Option<Bytes>> {
     Ok(None)
 }
 

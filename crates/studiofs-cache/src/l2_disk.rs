@@ -159,8 +159,13 @@ impl L2DiskCache {
         tokio::fs::read(path).await.map(Bytes::from)
     }
 
-    async fn read_block_bytes(path: PathBuf) -> io::Result<Bytes> {
-        if let Some(bytes) = platform_direct_io::read_block_direct(path.clone()).await? {
+    async fn read_block_bytes(
+        path: PathBuf,
+        expected_len_hint: Option<usize>,
+    ) -> io::Result<Bytes> {
+        if let Some(bytes) =
+            platform_direct_io::read_block_direct(path.clone(), expected_len_hint).await?
+        {
             return Ok(bytes);
         }
 
@@ -173,8 +178,20 @@ impl L2DiskCache {
     /// If a platform/filesystem rejects direct mode for this block, read falls
     /// back to async buffered I/O.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
+        self.get_with_size_hint(object_id, None).await
+    }
+
+    /// Read a block using a known payload size hint from cache metadata.
+    ///
+    /// When `size_hint` is present, platform direct-I/O can skip per-read
+    /// metadata/stat calls on the hot path.
+    pub async fn get_with_size_hint(
+        &self,
+        object_id: u64,
+        size_hint: Option<u32>,
+    ) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match Self::read_block_bytes(path).await {
+        match Self::read_block_bytes(path, size_hint.map(|v| v as usize)).await {
             Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -192,7 +209,7 @@ impl L2DiskCache {
         let mut handles = Vec::with_capacity(ids.len());
         for &id in ids {
             let path = self.block_path(id);
-            handles.push((id, tokio::spawn(Self::read_block_bytes(path))));
+            handles.push((id, tokio::spawn(Self::read_block_bytes(path, None))));
         }
 
         let mut results = Vec::with_capacity(handles.len());
