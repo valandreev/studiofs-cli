@@ -68,6 +68,12 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   file, read path transparently falls back to async buffered file reads
 - **Alignment safety** — files whose length is not direct-I/O aligned also
   fall back to buffered reads to avoid `EINVAL`-style failures on strict filesystems
+- **Direct-write attempt by platform** — temporary block files use the same
+  platform direct-I/O strategy when supported, with buffered fallback when
+  alignment or filesystem constraints reject direct mode
+- **Reduced zero-fill overhead** — aligned direct-I/O buffers are allocated
+  without full upfront zeroing; only payload bytes (and required tail padding)
+  are initialized
 - **Current Linux runtime note** — this path does not use `io_uring` yet; it
   uses Tokio file APIs and direct-open flags with async fallback behavior
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
@@ -207,8 +213,8 @@ The background flusher runs every 10ms and drains continuously (keeps processing
 | L1 write | ~8 GB/s | Same as read + hash map insert |
 | L2 read (single) | depends on FS/device | Linux `O_DIRECT`, Windows NO_BUFFERING+OVERLAPPED, macOS `F_NOCACHE`; fallback to async buffered read |
 | L2 read (batch) | depends on FS/device + queue depth | Parallel async reads with the same direct-I/O-first policy |
-| L2 write (single) | ~1.5 GB/s | `spawn_blocking` + write + rename |
-| L2 write (batch) | ~3 GB/s | Parallel `spawn_blocking` |
+| L2 write (single) | depends on FS/device | direct-I/O write attempt (platform-specific) + buffered fallback, then atomic rename |
+| L2 write (batch) | depends on FS/device + queue depth | Parallel writes through same direct-I/O-first policy |
 | S3 upload | Variable | AIMD-controlled, raw payload in STFS object |
 
 ## Cache Pipeline Observability

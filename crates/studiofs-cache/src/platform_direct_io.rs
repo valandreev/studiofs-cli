@@ -1,22 +1,29 @@
 use bytes::{Bytes, BytesMut};
 use std::io;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 const DIRECT_IO_ALIGNMENT: usize = 4096;
 
-fn aligned_bytes_mut(len: usize, alignment: usize) -> BytesMut {
-    // Over-allocate, then trim a prefix so the active slice starts at an
-    // alignment-compatible address for direct-I/O buffers.
+fn aligned_uninit_bytes_mut(len: usize, alignment: usize) -> BytesMut {
+    // Avoid zero-filling the entire read/write buffer. We only initialize the
+    // exact slices that must be written (payload + optional tail padding).
     let mut raw = BytesMut::with_capacity(len + alignment);
-    raw.resize(len + alignment, 0);
-    let misalignment = (raw.as_ptr() as usize) % alignment;
-    if misalignment != 0 {
-        let prefix = alignment - misalignment;
+    let base = raw.as_ptr() as usize;
+    let misalignment = base % alignment;
+    let prefix = if misalignment == 0 {
+        0
+    } else {
+        alignment - misalignment
+    };
+
+    unsafe {
+        raw.set_len(prefix + len);
+    }
+    if prefix != 0 {
         let _ = raw.split_to(prefix);
     }
-    raw.truncate(len);
     raw
 }
 
@@ -35,11 +42,9 @@ fn read_from_std_file_direct(
         ));
     }
 
-    let aligned_len = expected_len.next_multiple_of(DIRECT_IO_ALIGNMENT);
-    let mut buf = aligned_bytes_mut(aligned_len, DIRECT_IO_ALIGNMENT);
-
-    let mut filled = 0;
-    while filled < aligned_len {
+    let mut buf = aligned_uninit_bytes_mut(expected_len, DIRECT_IO_ALIGNMENT);
+    let mut filled = 0usize;
+    while filled < expected_len {
         match std_file.read(&mut buf[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
@@ -57,6 +62,28 @@ fn read_from_std_file_direct(
     let actual_len = expected_len.min(filled);
     buf.truncate(actual_len);
     Ok(buf.freeze())
+}
+
+fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let aligned_len = data.len().next_multiple_of(DIRECT_IO_ALIGNMENT);
+    let mut buf = aligned_uninit_bytes_mut(aligned_len, DIRECT_IO_ALIGNMENT);
+
+    buf[..data.len()].copy_from_slice(data);
+    if aligned_len > data.len() {
+        buf[data.len()..].fill(0);
+    }
+
+    std_file.write_all(&buf)?;
+
+    if aligned_len != data.len() {
+        std_file.set_len(data.len() as u64)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -97,9 +124,35 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let direct = (|| -> io::Result<()> {
+        let std_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+            .open(path)?;
+        write_to_std_file_direct(std_file, data)
+    })();
+
+    match direct {
+        Ok(()) => Ok(()),
+        Err(e) if should_fallback_from_direct_io(&e) => {
+            debug!(
+                error = %e,
+                "O_DIRECT unavailable for write; falling back to buffered write"
+            );
+            std::fs::write(path, data)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn should_fallback_from_direct_io(e: &io::Error) -> bool {
-    // Common Win32 codes for unsupported/invalid unbuffered requests.
     const ERROR_INVALID_FUNCTION: i32 = 1;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_NOT_SUPPORTED: i32 = 50;
@@ -145,6 +198,36 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
     }
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+    let direct = (|| -> io::Result<()> {
+        let std_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
+            .open(path)?;
+        write_to_std_file_direct(std_file, data)
+    })();
+
+    match direct {
+        Ok(()) => Ok(()),
+        Err(e) if should_fallback_from_direct_io(&e) => {
+            debug!(
+                error = %e,
+                "Windows direct I/O unavailable for write; falling back to buffered write"
+            );
+            std::fs::write(path, data)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn should_fallback_from_direct_io(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::InvalidInput)
@@ -185,7 +268,40 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let direct = (|| -> io::Result<()> {
+        let std_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        let fd = std_file.as_raw_fd();
+        let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        write_to_std_file_direct(std_file, data)
+    })();
+
+    match direct {
+        Ok(()) => Ok(()),
+        Err(e) if should_fallback_from_direct_io(&e) => {
+            debug!(error = %e, "F_NOCACHE unavailable for write; falling back to buffered write");
+            std::fs::write(path, data)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub(crate) async fn read_block_direct(_path: PathBuf) -> io::Result<Option<Bytes>> {
     Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    std::fs::write(path, data)
 }

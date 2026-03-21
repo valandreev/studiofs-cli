@@ -50,13 +50,13 @@ pub struct L2DiskCache {
 
 impl L2DiskCache {
     fn write_block_file(path: &Path, tmp_path: &Path, data: &[u8]) -> io::Result<()> {
-        match std::fs::write(tmp_path, data) {
+        match platform_direct_io::write_file(tmp_path, data) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(tmp_path, data)?;
+                platform_direct_io::write_file(tmp_path, data)?;
             }
             Err(e) => return Err(e),
         }
@@ -67,7 +67,7 @@ impl L2DiskCache {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(tmp_path, data)?;
+                platform_direct_io::write_file(tmp_path, data)?;
                 std::fs::rename(tmp_path, path)
             }
             Err(e) => Err(e),
