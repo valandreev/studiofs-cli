@@ -463,6 +463,8 @@ ACL PRINCIPAL:
         /// Enable direct I/O semantics for WinFSP (unbuffered/write-through handling and zero metadata cache timeouts).
         ///
         /// Useful for performance validation tools that require backend-realistic I/O latency.
+        /// Direct-write backend wait timeout can be tuned with
+        /// `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` (default: 120).
         #[arg(long)]
         direct_io: bool,
 
