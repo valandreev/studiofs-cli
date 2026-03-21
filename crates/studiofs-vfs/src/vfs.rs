@@ -584,6 +584,8 @@ const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS: u64 = 120;
+const DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS: u64 = 25;
+const DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS: u64 = 100;
 
 fn direct_io_sync_timeout() -> Duration {
     let secs = std::env::var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS")
@@ -2267,6 +2269,17 @@ struct IngressLiveIndex {
 }
 
 impl IngressLiveIndex {
+    fn from_entries(entries: HashMap<(Ino, u32), SpillEntry>) -> Self {
+        let mut by_ino_counts = HashMap::new();
+        for (ino, _) in entries.keys() {
+            *by_ino_counts.entry(*ino).or_insert(0) += 1;
+        }
+        Self {
+            entries,
+            by_ino_counts,
+        }
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -2281,18 +2294,8 @@ impl IngressLiveIndex {
 
     fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
         let old = self.entries.insert(key, entry);
-        let ino = key.0;
-        *self.by_ino_counts.entry(ino).or_insert(0) += 1;
-        if old.is_some() {
-            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
-            if count > 0 {
-                let new_count = count - 1;
-                if new_count == 0 {
-                    self.by_ino_counts.remove(&ino);
-                } else {
-                    self.by_ino_counts.insert(ino, new_count);
-                }
-            }
+        if old.is_none() {
+            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
         }
         old
     }
@@ -2331,6 +2334,74 @@ impl IngressLiveIndex {
 
     fn has_ino(&self, ino: Ino) -> bool {
         self.by_ino_counts.contains_key(&ino)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirtyMemIndex {
+    entries: HashMap<(Ino, u32), Bytes>,
+    by_ino_counts: HashMap<Ino, usize>,
+}
+
+impl DirtyMemIndex {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Bytes> {
+        self.entries.values()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
+        self.entries.keys()
+    }
+
+    fn get(&self, key: &(Ino, u32)) -> Option<&Bytes> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: (Ino, u32), value: Bytes) -> Option<Bytes> {
+        let old = self.entries.insert(key, value);
+        if old.is_none() {
+            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
+        }
+        old
+    }
+
+    fn remove(&mut self, key: &(Ino, u32)) -> Option<Bytes> {
+        let old = self.entries.remove(key);
+        if old.is_some() {
+            let ino = key.0;
+            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
+            if count <= 1 {
+                self.by_ino_counts.remove(&ino);
+            } else {
+                self.by_ino_counts.insert(ino, count - 1);
+            }
+        }
+        old
+    }
+
+    fn has_ino(&self, ino: Ino) -> bool {
+        self.by_ino_counts.contains_key(&ino)
+    }
+
+    fn remove_inode(&mut self, ino: Ino) -> usize {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|(i, _), data| {
+            if *i == ino {
+                removed_bytes = removed_bytes.saturating_add(data.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.by_ino_counts.remove(&ino);
+        removed_bytes
     }
 }
 
@@ -2949,9 +3020,7 @@ struct VfsState {
     /// Dirty blocks accepted by `flush()` that have not yet been written to
     /// disk by the background flusher.  Reads must consult this buffer
     /// BEFORE falling through to the block cache or S3.
-    dirty_mem: Mutex<std::collections::HashMap<(Ino, u32), Bytes>>,
-    /// Per-inode dirty block counters for O(1) pending checks.
-    dirty_inodes: Mutex<std::collections::HashMap<Ino, usize>>,
+    dirty_mem: Mutex<DirtyMemIndex>,
     /// Live accepted ingress records keyed by `(ino, block_index)`.
     ingress_live: Mutex<IngressLiveIndex>,
     /// Serialize append/rotation decisions for ingress segment writes.
@@ -3168,29 +3237,6 @@ pub struct StudioVfs {
 }
 
 impl StudioVfs {
-    fn dirty_index_inc(&self, ino: Ino) {
-        let mut idx = self.state.dirty_inodes.lock();
-        *idx.entry(ino).or_insert(0) += 1;
-    }
-
-    fn dirty_index_dec(&self, ino: Ino) {
-        let mut idx = self.state.dirty_inodes.lock();
-        let count = idx.get(&ino).copied().unwrap_or(0);
-        if count <= 1 {
-            idx.remove(&ino);
-        } else {
-            idx.insert(ino, count - 1);
-        }
-    }
-
-    fn dirty_index_clear_inode(&self, ino: Ino) {
-        self.state.dirty_inodes.lock().remove(&ino);
-    }
-
-    fn dirty_index_has(&self, ino: Ino) -> bool {
-        self.state.dirty_inodes.lock().contains_key(&ino)
-    }
-
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
     }
@@ -3836,10 +3882,6 @@ impl StudioVfs {
                 &ingress_checkpoint_dir,
                 &ingress_segment_dir,
             )?;
-            let mut recovered_spill_by_ino = std::collections::HashMap::new();
-            for (ino, _) in recovered_spill.keys() {
-                *recovered_spill_by_ino.entry(*ino).or_insert(0) += 1;
-            }
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
@@ -4069,12 +4111,8 @@ impl StudioVfs {
                     effective_acl_cache: Mutex::new(std::collections::HashMap::new()),
                     acl_epoch: AtomicU64::new(0),
                     acl_namespace_epoch: AtomicU64::new(0),
-                    dirty_mem: Mutex::new(std::collections::HashMap::new()),
-                    dirty_inodes: Mutex::new(std::collections::HashMap::new()),
-                    ingress_live: Mutex::new(IngressLiveIndex {
-                        entries: recovered_spill,
-                        by_ino_counts: recovered_spill_by_ino,
-                    }),
+                    dirty_mem: Mutex::new(DirtyMemIndex::default()),
+                    ingress_live: Mutex::new(IngressLiveIndex::from_entries(recovered_spill)),
                     ingress_segment_write_lock: Mutex::new(()),
                     dirty_bytes: AtomicUsize::new(0),
                     dirty_spill_bytes: AtomicUsize::new(recovered_spill_bytes),
@@ -5260,9 +5298,7 @@ impl StudioVfs {
                     })
                     .ok();
                 if new_len == 0 {
-                    if dirty.remove(&(ino, block_index)).is_some() {
-                        self.dirty_index_dec(ino);
-                    }
+                    let _ = dirty.remove(&(ino, block_index));
                 } else {
                     dirty.insert((ino, block_index), current.slice(0..new_len));
                     self.state.dirty_bytes.fetch_add(new_len, Ordering::Relaxed);
@@ -5352,8 +5388,6 @@ impl StudioVfs {
                                     Some(v.saturating_sub(old.len()))
                                 })
                                 .ok();
-                        } else {
-                            self.dirty_index_inc(ino);
                         }
                     }
                 }
@@ -5369,7 +5403,6 @@ impl StudioVfs {
                         {
                             let mut dirty = self.state.dirty_mem.lock();
                             if let Some(old) = dirty.remove(&(ino, block_index)) {
-                                self.dirty_index_dec(ino);
                                 self.state
                                     .dirty_bytes
                                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -6232,7 +6265,6 @@ impl StudioVfs {
                 let _ = self.remove_spill_entry((ino, block_idx));
                 let mut dirty = self.state.dirty_mem.lock();
                 if let Some(data) = dirty.remove(&(ino, block_idx)) {
-                    self.dirty_index_dec(ino);
                     self.state
                         .dirty_bytes
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -6729,9 +6761,9 @@ impl StudioVfs {
 
             let has_pending_ingress = self.inode_has_pending_ingress(ino);
             let max_sleep = if has_pending_ingress {
-                Duration::from_millis(25)
+                Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS)
             } else {
-                Duration::from_millis(100)
+                Duration::from_millis(DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS)
             };
             let sleep_for = std::cmp::min(deadline.saturating_duration_since(now), max_sleep);
             let progress = self.state.dirty_drained_notify.notified();
@@ -6743,7 +6775,7 @@ impl StudioVfs {
     }
 
     fn inode_has_pending_ingress(&self, ino: Ino) -> bool {
-        if self.dirty_index_has(ino) {
+        if self.state.dirty_mem.lock().has_ino(ino) {
             return true;
         }
         self.state.ingress_live.lock().has_ino(ino)
@@ -7400,14 +7432,8 @@ impl StudioVfs {
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
         {
             let mut dirty = self.state.dirty_mem.lock();
-            let removed_bytes: usize = dirty
-                .iter()
-                .filter(|((i, _), _)| *i == ino)
-                .map(|(_, d)| d.len())
-                .sum();
-            dirty.retain(|(i, _), _| *i != ino);
+            let removed_bytes = dirty.remove_inode(ino);
             if removed_bytes > 0 {
-                self.dirty_index_clear_inode(ino);
                 self.state
                     .dirty_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -7558,7 +7584,6 @@ impl StudioVfs {
         {
             let mut dirty = self.state.dirty_mem.lock();
             if let Some(data) = dirty.remove(&(ino, block_index)) {
-                self.dirty_index_dec(ino);
                 self.state
                     .dirty_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
