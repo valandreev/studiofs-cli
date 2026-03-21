@@ -233,6 +233,9 @@ Notes:
   through the already running mounted process and uses
   `<path>/.studiofs-test-cache` for temporary workload files.
 - `--warmup-runs` executes write+read cycles before measured phases; warm-up cycles are excluded from reported metrics.
+- Throughput in top-level `writes` and `reads` is phase-scoped: each value is
+  computed using wall time from that specific phase instead of total benchmark
+  runtime.
 - `--sizes` accepts either class percentages (`small=60,medium=30,large=10`) or an explicit list (`4KB,128KB,1MB,8MB`).
 - `--sequential-streams` runs each stream over its own segment in order and emits per-stream read/write metrics in JSON and terminal output.
 - In `--sequential-streams` mode, effective in-flight I/O is bounded by `min(--concurrency, --io-depth)` because each stream executes I/O serially.
