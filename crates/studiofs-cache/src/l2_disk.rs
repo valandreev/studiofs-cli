@@ -182,8 +182,18 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    async fn read_block_buffered(path: PathBuf) -> io::Result<Bytes> {
-        tokio::fs::read(path).await.map(Bytes::from)
+    async fn read_block_buffered(path: PathBuf, semaphore: Arc<Semaphore>) -> io::Result<Bytes> {
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))?;
+
+        crate::runtime::spawn_blocking_profiled("l2_read_buffered", move || -> io::Result<Bytes> {
+            let _permit = permit;
+            std::fs::read(path).map(Bytes::from)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn acquire_io_permit(&self) -> io::Result<OwnedSemaphorePermit> {
@@ -209,7 +219,7 @@ impl L2DiskCache {
             }
         }
 
-        Self::read_block_buffered(path).await
+        Self::read_block_buffered(path, self.io_semaphore.clone()).await
     }
 
     /// Read a block from disk. Returns `None` if not cached.
@@ -256,7 +266,7 @@ impl L2DiskCache {
             handles.push((
                 id,
                 tokio::spawn(async move {
-                    let permit = semaphore.acquire_owned().await.map_err(|_| {
+                    let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
                     })?;
                     if let Some(bytes) =
@@ -264,7 +274,7 @@ impl L2DiskCache {
                     {
                         Ok(bytes)
                     } else {
-                        Self::read_block_buffered(path).await
+                        Self::read_block_buffered(path, semaphore.clone()).await
                     }
                 }),
             ));
