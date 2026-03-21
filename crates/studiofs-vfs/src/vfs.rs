@@ -6746,8 +6746,10 @@ impl StudioVfs {
         let deadline = Instant::now() + timeout;
         loop {
             self.drain_dirty_mem().await;
+            let has_pending_ingress = self.inode_has_pending_ingress(ino);
+            let has_pending_uploads = self.inode_has_pending_uploads(ino);
 
-            if !self.inode_has_pending_ingress(ino) && !self.inode_has_pending_uploads(ino) {
+            if !has_pending_ingress && !has_pending_uploads {
                 return Ok(());
             }
 
@@ -6759,7 +6761,6 @@ impl StudioVfs {
                 )));
             }
 
-            let has_pending_ingress = self.inode_has_pending_ingress(ino);
             let max_sleep = if has_pending_ingress {
                 Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS)
             } else {
