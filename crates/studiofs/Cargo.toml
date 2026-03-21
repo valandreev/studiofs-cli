@@ -39,11 +39,11 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 prost = "0.14"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-pyroscope = { version = "2", features = ["backend-pprof-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 studiofs-fuse.workspace = true
-pyroscope = { version = "2", features = ["backend-jemalloc", "backend-pprof-rs"] }
+pyroscope = { version = "2", default-features = false, features = ["backend-jemalloc"] }
+pyroscope_pprofrs = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 studiofs-winfsp.workspace = true

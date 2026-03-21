@@ -449,7 +449,7 @@ ACL PRINCIPAL:
 
         /// Enable or disable Pyroscope profiling for the mount runtime.
         #[arg(long, num_args = 0..=1, default_missing_value = "pyroscope", value_enum)]
-        profile: Option<cli::mount_profile::MountProfileMode>,
+        profile: Option<cli::mount_profile_types::MountProfileMode>,
 
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
@@ -641,7 +641,7 @@ WARNING: This action is irreversible.")]
 
         /// Enable on-demand profiling for this benchmark run.
         #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "pyroscope")]
-        profile: Option<cli::test_cache_profile::TestCacheProfileMode>,
+        profile: Option<cli::test_cache_profile_types::TestCacheProfileMode>,
     },
 
     /// Create or list immutable metadata snapshots

@@ -325,7 +325,7 @@ pub fn run(
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
-    profile: Option<super::mount_profile::MountProfileMode>,
+    profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mount_point, resolved_cache_dir, memory_limit, cache_size) =

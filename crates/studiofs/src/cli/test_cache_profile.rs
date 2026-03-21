@@ -1,17 +1,17 @@
+use crate::cli::test_cache_profile_types::{
+    ProfileArtifactReport, ProfileEndpointReport, TestCacheProfileMode, TestCacheProfileResult,
+};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use clap::ValueEnum;
 use flate2::{Compression, write::GzEncoder};
 use prost::Message as _;
-use pyroscope::backend::{
-    BackendConfig, BackendReady, PprofConfig, ReportBatch, ReportData, jemalloc_backend,
-    pprof_backend,
-};
+use pyroscope::backend::{BackendConfig, BackendImpl, BackendReady, ReportBatch, ReportData};
 use pyroscope::encode::r#gen::push::{PushRequest, RawProfileSeries, RawSample};
+use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+
 use pyroscope::encode::r#gen::types::LabelPair;
 use pyroscope::encode::pprof;
 use reqwest::Url;
-use serde::Serialize;
 use std::env;
 use std::fs;
 use std::io::Write as _;
@@ -20,26 +20,6 @@ use std::time::Duration;
 
 const DEFAULT_APP_NAME: &str = "studiofs.test-cache";
 const DEFAULT_SAMPLE_RATE: u32 = 100;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum TestCacheProfileMode {
-    Pyroscope,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProfileArtifactReport {
-    pub kind: String,
-    pub path: String,
-    pub bytes: u64,
-    pub sent_to_endpoint: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProfileEndpointReport {
-    pub url: String,
-    pub application_name: String,
-}
 
 pub struct TestCacheProfileSession {
     run_id: String,
@@ -59,13 +39,6 @@ struct ProfileEndpoint {
     username: Option<String>,
     password: Option<String>,
     tenant_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TestCacheProfileResult {
-    pub endpoint: Option<ProfileEndpointReport>,
-    pub artifacts: Vec<ProfileArtifactReport>,
-    pub warnings: Vec<String>,
 }
 
 impl TestCacheProfileSession {
@@ -93,7 +66,7 @@ impl TestCacheProfileSession {
             }
         };
 
-        let memory_backend = match jemalloc_backend().initialize() {
+        let memory_backend = match pyroscope::backend::jemalloc_backend().initialize() {
             Ok(backend) => Some(backend),
             Err(err) => {
                 warnings.push(format!("Memory profile unavailable: {err}"));

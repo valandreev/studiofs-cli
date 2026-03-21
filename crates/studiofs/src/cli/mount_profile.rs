@@ -1,14 +1,13 @@
+use crate::cli::mount_profile_types::MountProfileMode;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use clap::ValueEnum;
 use flate2::{Compression, write::GzEncoder};
 use prost::Message as _;
-use pyroscope::backend::{
-    BackendConfig, BackendImpl, BackendReady, PprofConfig, ReportBatch, ReportData, pprof_backend,
-};
+use pyroscope::backend::{BackendConfig, BackendImpl, BackendReady, ReportBatch, ReportData};
 use pyroscope::encode::r#gen::push::{PushRequest, RawProfileSeries, RawSample};
 use pyroscope::encode::r#gen::types::LabelPair;
 use pyroscope::encode::pprof;
+use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 use reqwest::Url;
 use std::env;
 use std::fs;
@@ -20,12 +19,6 @@ use tracing::{info, warn};
 const DEFAULT_APP_NAME: &str = "studiofs.mount";
 const DEFAULT_SAMPLE_RATE: u32 = 100;
 const PROFILE_DIR_NAME: &str = "profiles";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum MountProfileMode {
-    Pyroscope,
-    Off,
-}
 
 #[derive(Debug, Clone)]
 struct ProfileEndpoint {

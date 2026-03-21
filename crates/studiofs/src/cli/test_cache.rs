@@ -4,9 +4,8 @@
 //! - direct L2 benchmark mode (`direct-l2`) that bypasses VFS
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
-use crate::cli::test_cache_profile::{
-    TestCacheProfileMode, TestCacheProfileResult, TestCacheProfileSession,
-};
+use crate::cli::test_cache_profile::TestCacheProfileSession;
+use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
