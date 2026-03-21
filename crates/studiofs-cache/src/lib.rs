@@ -19,6 +19,7 @@ pub mod l1_mem;
 pub mod l2_disk;
 pub mod lru_tracker;
 pub mod metrics;
+mod platform_direct_io;
 pub mod runtime;
 pub mod upload_queue;
 
