@@ -5,9 +5,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
 use prost::Message as _;
-use pyroscope::backend::{BackendConfig, BackendImpl, BackendReady, ReportBatch, ReportData};
+use pyroscope::backend::pprof::PprofConfig;
+use pyroscope::backend::{BackendConfig, BackendReady, ReportBatch, ReportData, pprof_backend};
 use pyroscope::encode::r#gen::push::{PushRequest, RawProfileSeries, RawSample};
-use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 
 use pyroscope::encode::r#gen::types::LabelPair;
 use pyroscope::encode::pprof;

@@ -43,8 +43,7 @@ sysinfo.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 studiofs-fuse.workspace = true
-pyroscope = { version = "2", default-features = false, features = ["backend-jemalloc"] }
-pyroscope_pprofrs = "0.2"
+pyroscope = { version = "2", default-features = false, features = ["backend-jemalloc", "backend-pprof-rs"] }
 
 [target.'cfg(windows)'.dependencies]
 studiofs-winfsp.workspace = true
