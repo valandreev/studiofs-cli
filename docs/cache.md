@@ -58,12 +58,18 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 - **Atomic writes** — prevents partial reads on crash via write-to-temp + rename
 - **Owned-buffer hot path** — `put_bytes(object_id, Bytes)` writes already-owned
   payloads without an extra `to_vec()` clone in the async L2 write path
+- **Linux direct-read path** — read path first attempts `O_DIRECT` with a
+  page-aligned `BytesMut`, then freezes it into `Bytes` without a secondary
+  `copy_from_slice()`
+- **Cross-platform compatibility** — non-Linux targets (and Linux filesystems
+  that reject direct I/O for a given file/offset/size) transparently fall back
+  to async buffered file reads
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
 
 **Batch operations:**
 - `put_batch(blocks)` — parallel `spawn_blocking` per block
-- `get_batch(ids)` — parallel `spawn_blocking` per block
+- `get_batch(ids)` — parallel async fan-out with preserved input order
 
 ### L2 Commit Scheduler (`block_cache.rs`)
 
@@ -193,8 +199,8 @@ The background flusher runs every 10ms and drains continuously (keeps processing
 |-----------|-------------------|-------|
 | L1 read | ~10 GB/s | Memory speed, contention on shard lock |
 | L1 write | ~8 GB/s | Same as read + hash map insert |
-| L2 read (single) | ~2 GB/s | `spawn_blocking` + `std::fs::read` |
-| L2 read (batch) | ~3 GB/s | Parallel `spawn_blocking` |
+| L2 read (single) | depends on FS/device | Linux: async `O_DIRECT` attempt into aligned buffer, fallback to async buffered read |
+| L2 read (batch) | depends on FS/device + queue depth | Parallel async reads with the same direct-I/O-first policy |
 | L2 write (single) | ~1.5 GB/s | `spawn_blocking` + write + rename |
 | L2 write (batch) | ~3 GB/s | Parallel `spawn_blocking` |
 | S3 upload | Variable | AIMD-controlled, raw payload in STFS object |
