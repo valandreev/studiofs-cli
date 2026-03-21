@@ -2,6 +2,7 @@ use bytes::{Bytes, BytesMut};
 use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 
 const DIRECT_IO_ALIGNMENT: usize = 4096;
@@ -109,10 +110,12 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 pub(crate) async fn read_block_direct(
     path: PathBuf,
     expected_len_hint: Option<usize>,
+    permit: OwnedSemaphorePermit,
 ) -> io::Result<Option<Bytes>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
+        let _permit = permit;
         let std_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
@@ -183,12 +186,14 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 pub(crate) async fn read_block_direct(
     path: PathBuf,
     expected_len_hint: Option<usize>,
+    permit: OwnedSemaphorePermit,
 ) -> io::Result<Option<Bytes>> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
+        let _permit = permit;
         let std_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING)
@@ -261,10 +266,12 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 pub(crate) async fn read_block_direct(
     path: PathBuf,
     expected_len_hint: Option<usize>,
+    permit: OwnedSemaphorePermit,
 ) -> io::Result<Option<Bytes>> {
     use std::os::fd::AsRawFd;
 
     let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
+        let _permit = permit;
         let std_file = std::fs::OpenOptions::new().read(true).open(&path)?;
         let fd = std_file.as_raw_fd();
         let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
@@ -322,6 +329,7 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
 pub(crate) async fn read_block_direct(
     _path: PathBuf,
     _expected_len_hint: Option<usize>,
+    _permit: OwnedSemaphorePermit,
 ) -> io::Result<Option<Bytes>> {
     Ok(None)
 }

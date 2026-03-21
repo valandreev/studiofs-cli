@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::platform_direct_io;
@@ -35,6 +36,9 @@ use crate::platform_direct_io;
 // =============================================================================
 // L2DiskCache
 // =============================================================================
+
+/// Upper bound for active L2 blocking-I/O tasks.
+const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 
 /// File-per-block disk cache on NVMe.
 pub struct L2DiskCache {
@@ -47,6 +51,8 @@ pub struct L2DiskCache {
     total_bytes: AtomicU64,
     /// Maximum allowed bytes.
     max_bytes: AtomicU64,
+    /// Limits active blocking L2 I/O to avoid exhausting Tokio's blocking pool.
+    io_semaphore: Arc<Semaphore>,
 }
 
 impl L2DiskCache {
@@ -112,6 +118,7 @@ impl L2DiskCache {
             shard_dirs: Arc::new(shard_dirs),
             total_bytes: AtomicU64::new(0),
             max_bytes: AtomicU64::new(max_bytes),
+            io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
         };
 
         Ok(this)
@@ -179,14 +186,27 @@ impl L2DiskCache {
         tokio::fs::read(path).await.map(Bytes::from)
     }
 
+    async fn acquire_io_permit(&self) -> io::Result<OwnedSemaphorePermit> {
+        self.io_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))
+    }
+
     async fn read_block_bytes(
+        &self,
         path: PathBuf,
         expected_len_hint: Option<usize>,
     ) -> io::Result<Bytes> {
-        if let Some(bytes) =
-            platform_direct_io::read_block_direct(path.clone(), expected_len_hint).await?
         {
-            return Ok(bytes);
+            let permit = self.acquire_io_permit().await?;
+            if let Some(bytes) =
+                platform_direct_io::read_block_direct(path.clone(), expected_len_hint, permit)
+                    .await?
+            {
+                return Ok(bytes);
+            }
         }
 
         Self::read_block_buffered(path).await
@@ -211,7 +231,10 @@ impl L2DiskCache {
         size_hint: Option<u32>,
     ) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match Self::read_block_bytes(path, size_hint.map(|v| v as usize)).await {
+        match self
+            .read_block_bytes(path, size_hint.map(|v| v as usize))
+            .await
+        {
             Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -229,7 +252,22 @@ impl L2DiskCache {
         let mut handles = Vec::with_capacity(ids.len());
         for &id in ids {
             let path = self.block_path(id);
-            handles.push((id, tokio::spawn(Self::read_block_bytes(path, None))));
+            let semaphore = self.io_semaphore.clone();
+            handles.push((
+                id,
+                tokio::spawn(async move {
+                    let permit = semaphore.acquire_owned().await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
+                    })?;
+                    if let Some(bytes) =
+                        platform_direct_io::read_block_direct(path.clone(), None, permit).await?
+                    {
+                        Ok(bytes)
+                    } else {
+                        Self::read_block_buffered(path).await
+                    }
+                }),
+            ));
         }
 
         let mut results = Vec::with_capacity(handles.len());
@@ -275,8 +313,10 @@ impl L2DiskCache {
         let path = self.block_path(object_id);
         let tmp_path = Self::unique_tmp_path(&path);
         let len = data.len() as u64;
+        let permit = self.acquire_io_permit().await?;
 
         crate::runtime::spawn_blocking_profiled("l2_put", move || -> io::Result<()> {
+            let _permit = permit;
             Self::write_block_file(&path, &tmp_path, &data)
         })
         .await
@@ -307,30 +347,41 @@ impl L2DiskCache {
             let tmp_path = Self::unique_tmp_path(&path);
             let owned = data.clone();
             let object_id = *id;
+            let semaphore = self.io_semaphore.clone();
             handles.push((
                 object_id,
                 data.len() as u64,
-                crate::runtime::spawn_blocking_profiled(
-                    "l2_put_batch",
-                    move || -> (io::Result<()>, u64) {
-                        // Intentionally measure on-worker disk write latency only.
-                        // Queueing delay before worker pickup is excluded.
-                        let started = std::time::Instant::now();
-                        let result = Self::write_block_file(&path, &tmp_path, &owned);
-                        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                        (result, elapsed_ns)
-                    },
-                ),
+                tokio::spawn(async move {
+                    let permit = semaphore.acquire_owned().await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
+                    })?;
+                    crate::runtime::spawn_blocking_profiled(
+                        "l2_put_batch",
+                        move || -> (io::Result<()>, u64) {
+                            // Intentionally measure on-worker disk write latency only.
+                            // Queueing delay before worker pickup is excluded.
+                            let _permit = permit;
+                            let started = std::time::Instant::now();
+                            let result = Self::write_block_file(&path, &tmp_path, &owned);
+                            let elapsed_ns =
+                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                            (result, elapsed_ns)
+                        },
+                    )
+                    .await
+                    .map_err(io::Error::other)
+                }),
             ));
         }
         let mut results = Vec::with_capacity(handles.len());
         for (id, len, handle) in handles {
             let (res, elapsed_ns) = match handle.await {
-                Ok((Ok(()), elapsed_ns)) => {
+                Ok(Ok((Ok(()), elapsed_ns))) => {
                     self.total_bytes.fetch_add(len, Ordering::Relaxed);
                     (Ok(()), elapsed_ns)
                 }
-                Ok((Err(e), elapsed_ns)) => (Err(e), elapsed_ns),
+                Ok(Ok((Err(e), elapsed_ns))) => (Err(e), elapsed_ns),
+                Ok(Err(e)) => (Err(e), 0),
                 Err(e) => (Err(io::Error::other(e)), 0),
             };
             results.push((id, res, elapsed_ns));
@@ -355,8 +406,16 @@ impl L2DiskCache {
     /// Remove a block from disk.
     pub async fn remove(&self, object_id: u64) {
         let path = self.block_path(object_id);
+        let permit = match self.acquire_io_permit().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                warn!(object_id, error = %e, "L2DiskCache remove permit error");
+                return;
+            }
+        };
         // Single spawn_blocking for metadata + remove.
         let removed_size = crate::runtime::spawn_blocking_profiled("l2_remove", move || -> u64 {
+            let _permit = permit;
             match std::fs::metadata(&path) {
                 Ok(meta) => {
                     let size = meta.len();

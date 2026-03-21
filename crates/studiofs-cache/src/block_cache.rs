@@ -18,9 +18,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, info, warn};
 
@@ -219,8 +219,8 @@ pub struct BlockCache {
     /// Last persisted checkpoint signature: `(entry_count, crc32(entries))`.
     /// Used to skip redundant tmp+rename cycles when metadata is unchanged.
     last_checkpoint_signature: std::sync::Mutex<Option<(u32, u32)>>,
-    /// Monotonic-ish timestamp (unix ms) until which L2 reads are bypassed.
-    l2_read_breaker_open_until_ms: AtomicU64,
+    /// Monotonic deadline until which L2 reads are bypassed.
+    l2_read_breaker_open_until: std::sync::Mutex<Option<Instant>>,
     /// Number of consecutive L2 read timeout events.
     l2_read_timeout_streak: AtomicU32,
 }
@@ -311,7 +311,7 @@ impl BlockCache {
             l2_commit_scheduler,
             metrics,
             last_checkpoint_signature: std::sync::Mutex::new(initial_checkpoint_signature),
-            l2_read_breaker_open_until_ms: AtomicU64::new(0),
+            l2_read_breaker_open_until: std::sync::Mutex::new(None),
             l2_read_timeout_streak: AtomicU32::new(0),
         });
 
@@ -432,16 +432,20 @@ impl BlockCache {
         )
     }
 
-    #[inline]
-    fn now_unix_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
     fn is_l2_read_breaker_open(&self) -> bool {
-        self.l2_read_breaker_open_until_ms.load(Ordering::Relaxed) > Self::now_unix_ms()
+        let now = Instant::now();
+        let mut guard = match self.l2_read_breaker_open_until.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        match *guard {
+            Some(until) if now < until => true,
+            Some(_) => {
+                *guard = None;
+                false
+            }
+            None => false,
+        }
     }
 
     fn record_l2_read_completion(&self) {
@@ -455,15 +459,15 @@ impl BlockCache {
             return;
         }
         self.l2_read_timeout_streak.store(0, Ordering::Relaxed);
-        let now = Self::now_unix_ms();
         let cooldown_ms = self
             .config
             .l2_read_breaker_cooldown
             .as_millis()
             .clamp(1, u64::MAX as u128) as u64;
-        let open_until = now.saturating_add(cooldown_ms);
-        self.l2_read_breaker_open_until_ms
-            .store(open_until, Ordering::Relaxed);
+        let open_until = Instant::now() + Duration::from_millis(cooldown_ms);
+        if let Ok(mut guard) = self.l2_read_breaker_open_until.lock() {
+            *guard = Some(open_until);
+        }
         warn!(
             object_id,
             threshold, cooldown_ms, "L2 read circuit breaker opened after repeated read timeouts"
