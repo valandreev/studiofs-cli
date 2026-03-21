@@ -1211,7 +1211,8 @@ fn split_stream_segments(order: &[usize], stream_count: usize) -> Vec<Vec<usize>
 fn stream_reports_from_telemetry(
     writes_by_stream: &[PhaseTelemetry],
     reads_by_stream: &[PhaseTelemetry],
-    wall_elapsed_ms: f64,
+    writes_wall_elapsed_ms: f64,
+    reads_wall_elapsed_ms: f64,
 ) -> Option<Vec<StreamResultReport>> {
     if writes_by_stream.len() <= 1 || writes_by_stream.len() != reads_by_stream.len() {
         return None;
@@ -1223,8 +1224,8 @@ fn stream_reports_from_telemetry(
             .enumerate()
             .map(|(idx, (writes, reads))| StreamResultReport {
                 stream_id: idx,
-                writes: writes.overall.to_report(wall_elapsed_ms),
-                reads: reads.overall.to_report(wall_elapsed_ms),
+                writes: writes.overall.to_report(writes_wall_elapsed_ms),
+                reads: reads.overall.to_report(reads_wall_elapsed_ms),
             })
             .collect(),
     )
@@ -2230,20 +2231,24 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     });
     let cache_pipeline: CachePipelineReport = cache.cache_pipeline_metrics().into();
     let advanced_metrics = build_advanced_metrics(
-        params.size_class_small_max,
-        params.size_class_medium_max,
+        size_class_bounds,
         &writes,
         &reads.phase,
         Some(&reads.cache_levels),
         Some(&cache_pipeline),
-        total_elapsed_ms,
+        writes_wall.as_secs_f64() * 1000.0,
+        reads_wall.as_secs_f64() * 1000.0,
     );
     let reads_phase_by_stream: Vec<PhaseTelemetry> = reads_by_stream
         .iter()
         .map(|item| item.phase.clone())
         .collect();
-    let stream_results =
-        stream_reports_from_telemetry(&writes_by_stream, &reads_phase_by_stream, total_elapsed_ms);
+    let stream_results = stream_reports_from_telemetry(
+        &writes_by_stream,
+        &reads_phase_by_stream,
+        writes_wall.as_secs_f64() * 1000.0,
+        reads_wall.as_secs_f64() * 1000.0,
+    );
 
     Ok(BenchmarkReport {
         run_id: params.run_id.clone(),
@@ -2443,7 +2448,6 @@ async fn run_mounted_end_to_end(
             })
             .unwrap_or_default();
 
-        let measured_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
         let total_wall = Instant::now() - started;
         let total_cpu = started_cpu
             .and_then(|cpu_start| {
@@ -2465,16 +2469,20 @@ async fn run_mounted_end_to_end(
             warnings: Vec::new(),
         });
         let advanced_metrics = build_advanced_metrics(
-            params.size_class_small_max,
-            params.size_class_medium_max,
+            size_class_bounds,
             &writes,
             &reads,
             None,
             None,
-            measured_elapsed_ms,
+            writes_wall.as_secs_f64() * 1000.0,
+            reads_wall.as_secs_f64() * 1000.0,
         );
-        let stream_results =
-            stream_reports_from_telemetry(&writes_by_stream, &reads_by_stream, measured_elapsed_ms);
+        let stream_results = stream_reports_from_telemetry(
+            &writes_by_stream,
+            &reads_by_stream,
+            writes_wall.as_secs_f64() * 1000.0,
+            reads_wall.as_secs_f64() * 1000.0,
+        );
 
         let _ = fs::remove_dir_all(work_root).await;
         let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
@@ -2573,13 +2581,13 @@ fn avg_latency_ms(total_latency_ns: u64, ops: u64) -> f64 {
 }
 
 fn build_advanced_metrics(
-    size_class_small_max: u64,
-    size_class_medium_max: u64,
+    size_class_bounds: SizeClassBounds,
     writes: &PhaseTelemetry,
     reads: &PhaseTelemetry,
     cache_levels: Option<&CacheLevelTelemetryAccumulator>,
     cache_pipeline: Option<&CachePipelineReport>,
-    wall_elapsed_ms: f64,
+    writes_wall_elapsed_ms: f64,
+    reads_wall_elapsed_ms: f64,
 ) -> AdvancedMetricsReport {
     let queue_backpressure = cache_pipeline.map(|pipeline| {
         let p50_ms = histogram_percentile_ms(
@@ -2622,14 +2630,14 @@ fn build_advanced_metrics(
 
     AdvancedMetricsReport {
         size_class_boundaries: SizeClassBoundaryReport {
-            small_max_bytes: size_class_small_max,
-            medium_max_bytes: size_class_medium_max,
+            small_max_bytes: size_class_bounds.small_max,
+            medium_max_bytes: size_class_bounds.medium_max,
         },
         size_class_stats: SizeClassStatsReport {
-            writes: writes.by_size.to_reports(wall_elapsed_ms),
-            reads: reads.by_size.to_reports(wall_elapsed_ms),
+            writes: writes.by_size.to_reports(writes_wall_elapsed_ms),
+            reads: reads.by_size.to_reports(reads_wall_elapsed_ms),
         },
-        cache_levels: cache_levels.map(|levels| levels.to_report(wall_elapsed_ms)),
+        cache_levels: cache_levels.map(|levels| levels.to_report(reads_wall_elapsed_ms)),
         queue_backpressure,
     }
 }

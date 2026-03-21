@@ -304,9 +304,9 @@ Warm-cache measurement controls:
 - `--concurrency <n>` controls number of streams (default `1`)
 - in sequential mode, effective in-flight I/O is bounded by
   `min(--concurrency, --io-depth)`
-- top-level `writes` and `reads` throughput values are phase-local: each is
-  computed from the corresponding phase wall time rather than total benchmark
-  wall time
+- throughput values are phase-local: write-side metrics use write-phase wall
+  time and read-side metrics use read-phase wall time, rather than total
+  benchmark wall time
 
 The terminal summary now shows p50/p95/p99 + throughput for overall write/read
 results and for each size class.

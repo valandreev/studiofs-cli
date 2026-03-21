@@ -174,9 +174,9 @@ Notes:
   lists (`4KB,64KB,1MB,8MB`).
 - `--warmup-runs` runs prefill cycles that are not included in measured
   metrics.
-- Throughput in final `writes`/`reads` reports is calculated from each phase's
-  own wall time (write phase for writes, read phase for reads), not from total
-  benchmark wall time.
+- Throughput in benchmark reports is phase-scoped: write-side metrics use
+  write-phase wall time, and read-side metrics use read-phase wall time (not
+  total benchmark wall time).
 - `--sequential-streams` runs each stream in-order and emits per-stream results
   in both terminal and JSON output.
 - in `--sequential-streams` mode, effective in-flight I/O is
