@@ -42,7 +42,7 @@ fn read_from_std_file_direct(
         return Ok(Bytes::new());
     }
 
-    if expected_len % DIRECT_IO_ALIGNMENT != 0 {
+    if !expected_len.is_multiple_of(DIRECT_IO_ALIGNMENT) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "file size is not direct-I/O aligned",
@@ -76,7 +76,7 @@ fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Res
         return Ok(());
     }
 
-    if data.len() % DIRECT_IO_ALIGNMENT != 0 {
+    if !data.len().is_multiple_of(DIRECT_IO_ALIGNMENT) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "payload size is not direct-I/O aligned",
