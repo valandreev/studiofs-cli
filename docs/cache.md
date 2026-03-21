@@ -66,6 +66,8 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   without secondary `copy_from_slice()`.
 - **Robust fallback** — when a platform/filesystem rejects direct I/O for a
   file, read path transparently falls back to async buffered file reads
+- **Alignment safety** — files whose length is not direct-I/O aligned also
+  fall back to buffered reads to avoid `EINVAL`-style failures on strict filesystems
 - **Current Linux runtime note** — this path does not use `io_uring` yet; it
   uses Tokio file APIs and direct-open flags with async fallback behavior
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`

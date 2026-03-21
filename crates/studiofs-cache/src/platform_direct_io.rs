@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use std::io;
+use std::io::Read;
 use std::path::PathBuf;
-use tokio::io::AsyncReadExt;
 use tracing::debug;
 
 const DIRECT_IO_ALIGNMENT: usize = 4096;
@@ -20,21 +20,27 @@ fn aligned_bytes_mut(len: usize, alignment: usize) -> BytesMut {
     raw
 }
 
-async fn read_from_std_file_direct(
-    std_file: std::fs::File,
+fn read_from_std_file_direct(
+    mut std_file: std::fs::File,
     expected_len: usize,
 ) -> io::Result<Bytes> {
     if expected_len == 0 {
         return Ok(Bytes::new());
     }
 
+    if expected_len % DIRECT_IO_ALIGNMENT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file size is not direct-I/O aligned",
+        ));
+    }
+
     let aligned_len = expected_len.next_multiple_of(DIRECT_IO_ALIGNMENT);
     let mut buf = aligned_bytes_mut(aligned_len, DIRECT_IO_ALIGNMENT);
-    let mut file = tokio::fs::File::from_std(std_file);
 
-    let mut filled = 0usize;
+    let mut filled = 0;
     while filled < aligned_len {
-        match file.read(&mut buf[filled..]).await {
+        match std_file.read(&mut buf[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) => return Err(e),
@@ -55,44 +61,36 @@ async fn read_from_std_file_direct(
 
 #[cfg(target_os = "linux")]
 fn should_fallback_from_direct_io(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL)
-            | Some(libc::EOPNOTSUPP)
-            | Some(libc::ENOTSUP)
-            | Some(libc::EPERM)
-            | Some(libc::ENOSYS)
-    )
+    matches!(e.kind(), io::ErrorKind::InvalidInput)
+        || matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOTSUP)
+                | Some(libc::EPERM)
+                | Some(libc::ENOSYS)
+        )
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let opened = tokio::task::spawn_blocking(move || -> io::Result<(std::fs::File, usize)> {
+    let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
         let std_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
             .open(&path)?;
         let expected_len = std_file.metadata()?.len() as usize;
-        Ok((std_file, expected_len))
+        read_from_std_file_direct(std_file, expected_len)
     })
     .await
     .map_err(io::Error::other)?;
 
-    let (std_file, expected_len) = match opened {
-        Ok(v) => v,
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "O_DIRECT unavailable for block; falling back to buffered read");
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-
-    match read_from_std_file_direct(std_file, expected_len).await {
+    match outcome {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "O_DIRECT read failed; falling back to buffered read");
+            debug!(error = %e, "O_DIRECT unavailable for block; falling back to buffered read");
             Ok(None)
         }
         Err(e) => Err(e),
@@ -106,13 +104,14 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_NOT_SUPPORTED: i32 = 50;
     const ERROR_INVALID_PARAMETER: i32 = 87;
-    matches!(
-        e.raw_os_error(),
-        Some(ERROR_INVALID_FUNCTION)
-            | Some(ERROR_ACCESS_DENIED)
-            | Some(ERROR_NOT_SUPPORTED)
-            | Some(ERROR_INVALID_PARAMETER)
-    )
+    matches!(e.kind(), io::ErrorKind::InvalidInput)
+        || matches!(
+            e.raw_os_error(),
+            Some(ERROR_INVALID_FUNCTION)
+                | Some(ERROR_ACCESS_DENIED)
+                | Some(ERROR_NOT_SUPPORTED)
+                | Some(ERROR_INVALID_PARAMETER)
+        )
 }
 
 #[cfg(target_os = "windows")]
@@ -122,35 +121,23 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
     const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
-    let opened = tokio::task::spawn_blocking(move || -> io::Result<(std::fs::File, usize)> {
+    let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
         let std_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
             .open(&path)?;
         let expected_len = std_file.metadata()?.len() as usize;
-        Ok((std_file, expected_len))
+        read_from_std_file_direct(std_file, expected_len)
     })
     .await
     .map_err(io::Error::other)?;
 
-    let (std_file, expected_len) = match opened {
-        Ok(v) => v,
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(
-                error = %e,
-                "Windows direct I/O unavailable for block; falling back to buffered read"
-            );
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-
-    match read_from_std_file_direct(std_file, expected_len).await {
+    match outcome {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if should_fallback_from_direct_io(&e) => {
             debug!(
                 error = %e,
-                "Windows direct I/O read failed; falling back to buffered read"
+                "Windows direct I/O unavailable for block; falling back to buffered read"
             );
             Ok(None)
         }
@@ -160,21 +147,22 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
 
 #[cfg(target_os = "macos")]
 fn should_fallback_from_direct_io(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL)
-            | Some(libc::EOPNOTSUPP)
-            | Some(libc::ENOTSUP)
-            | Some(libc::EPERM)
-            | Some(libc::ENOTTY)
-    )
+    matches!(e.kind(), io::ErrorKind::InvalidInput)
+        || matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOTSUP)
+                | Some(libc::EPERM)
+                | Some(libc::ENOTTY)
+        )
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>> {
     use std::os::fd::AsRawFd;
 
-    let opened = tokio::task::spawn_blocking(move || -> io::Result<(std::fs::File, usize)> {
+    let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
         let std_file = std::fs::OpenOptions::new().read(true).open(&path)?;
         let fd = std_file.as_raw_fd();
         let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
@@ -182,24 +170,15 @@ pub(crate) async fn read_block_direct(path: PathBuf) -> io::Result<Option<Bytes>
             return Err(io::Error::last_os_error());
         }
         let expected_len = std_file.metadata()?.len() as usize;
-        Ok((std_file, expected_len))
+        read_from_std_file_direct(std_file, expected_len)
     })
     .await
     .map_err(io::Error::other)?;
 
-    let (std_file, expected_len) = match opened {
-        Ok(v) => v,
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "F_NOCACHE unavailable for block; falling back to buffered read");
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-
-    match read_from_std_file_direct(std_file, expected_len).await {
+    match outcome {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "F_NOCACHE read failed; falling back to buffered read");
+            debug!(error = %e, "F_NOCACHE unavailable for block; falling back to buffered read");
             Ok(None)
         }
         Err(e) => Err(e),
