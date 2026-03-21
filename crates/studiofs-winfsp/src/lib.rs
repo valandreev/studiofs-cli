@@ -11,6 +11,18 @@ use thiserror::Error;
 
 const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
+const DEFAULT_SECTOR_SIZE: u16 = 512;
+const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 16 * 1024;
+const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
+    (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
+const _: () = {
+    assert!(DEFAULT_SECTOR_SIZE > 0);
+    assert!(DEFAULT_ALLOCATION_UNIT_SIZE > 0);
+    assert!(
+        (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) * DEFAULT_SECTOR_SIZE as u32
+            == DEFAULT_ALLOCATION_UNIT_SIZE
+    );
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WinfspMountOptions {
@@ -25,6 +37,8 @@ enum MountOptionError {
     EmptyVolumeLabel,
     #[error("volume label cannot contain NUL")]
     VolumeLabelContainsNul,
+    #[error("invalid mount point '{0}': WinFSP requires a drive letter (for example `Z:`)")]
+    InvalidDriveMountPoint(String),
 }
 
 fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOptionError> {
@@ -47,16 +61,17 @@ fn apply_volume_params(
     volume_params: &mut winfsp::host::VolumeParams,
     options: &WinfspMountOptions,
     mount_point: &str,
-) {
+) -> Result<(), MountOptionError> {
+    let _ = canonical_drive_mount_point(mount_point)?;
+
     volume_params.filesystem_name("StudioFS");
-    // `Prefix` switches WinFSP to network-device mode (WinFsp.Net). When
-    // mounting into a directory, we need that mode to avoid object namespace
-    // collisions with the default local-disk device name.
-    if !is_drive_root_mount_point(mount_point) {
-        volume_params.prefix("studiofs");
-    }
+    // Intentionally avoid setting `Prefix` so WinFSP uses local disk-device
+    // semantics for drive-letter mounts (not network redirector mode).
+    volume_params.sector_size(DEFAULT_SECTOR_SIZE);
+    volume_params.sectors_per_allocation_unit(DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
+    Ok(())
 }
 
 fn is_drive_root_mount_point(mount_point: &str) -> bool {
@@ -78,6 +93,26 @@ fn is_drive_root_mount_point(mount_point: &str) -> bool {
     }
 
     false
+}
+
+fn canonical_drive_mount_point(mount_point: &str) -> Result<String, MountOptionError> {
+    if !is_drive_root_mount_point(mount_point) {
+        return Err(MountOptionError::InvalidDriveMountPoint(
+            mount_point.to_string(),
+        ));
+    }
+
+    let letter = mount_point
+        .chars()
+        .next()
+        .ok_or_else(|| MountOptionError::InvalidDriveMountPoint(mount_point.to_string()))?
+        .to_ascii_uppercase();
+    Ok(format!("{letter}:"))
+}
+
+fn mount_manager_mount_point(mount_point: &str) -> Result<String, MountOptionError> {
+    let drive = canonical_drive_mount_point(mount_point)?;
+    Ok(format!(r"\\.\{drive}"))
 }
 
 fn shutdown_upload_drain_timeout() -> std::time::Duration {
@@ -118,13 +153,12 @@ pub fn mount_and_serve(
     volume_params.post_cleanup_when_modified_only(true);
     // Allow kernel-mode opens — required for shell extensions (7-zip, etc.)
     volume_params.allow_open_in_kernel_mode(true);
-    volume_params.sector_size(512);
-    volume_params.sectors_per_allocation_unit(1);
     volume_params.max_component_length(255);
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
     // WinFSP layer tuning:
     // - file_info_timeout and dir_info_timeout tuned for fast metadata refresh.
-    apply_volume_params(&mut volume_params, &options, mount_point);
+    // - local-drive geometry is explicit for tooling that queries sector info.
+    apply_volume_params(&mut volume_params, &options, mount_point)?;
 
     // Keep a reference for shutdown() (vfs is moved into context).
     let vfs_ref = vfs.clone();
@@ -144,7 +178,13 @@ pub fn mount_and_serve(
         FileSystemParams::default_params(volume_params),
         context,
     )?;
-    host.mount(mount_point)?;
+    let mount_manager_path = mount_manager_mount_point(mount_point)?;
+    host.mount(&mount_manager_path).map_err(|err| {
+        std::io::Error::other(format!(
+            "failed to mount '{mount_point}' via WinFSP Mount Manager path '{mount_manager_path}': {err}. \
+this usually means Administrator privileges are required, or WinFSP must be configured with MountUseMountmgrFromFSD=1"
+        ))
+    })?;
 
     // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
@@ -248,7 +288,9 @@ unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS, MountOptionError,
+        DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
+        DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT, MountOptionError,
+        canonical_drive_mount_point, is_drive_root_mount_point, mount_manager_mount_point,
         parse_mount_options,
     };
 
@@ -270,5 +312,35 @@ mod tests {
         assert_eq!(opts.volume_label, "StudioFS");
         assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
         assert_eq!(opts.dir_info_timeout_ms, DEFAULT_DIR_INFO_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn winfsp_drive_mount_point_validation() {
+        assert!(is_drive_root_mount_point("Z:"));
+        assert!(is_drive_root_mount_point("Z:\\"));
+        assert!(!is_drive_root_mount_point(r"C:\mounts\studiofs"));
+        assert!(!is_drive_root_mount_point(r"\\server\share\studiofs"));
+    }
+
+    #[test]
+    fn canonical_drive_mount_point_normalizes_case_and_separator() {
+        assert_eq!(canonical_drive_mount_point("z:").unwrap(), "Z:");
+        assert_eq!(canonical_drive_mount_point("z:\\").unwrap(), "Z:");
+        assert!(canonical_drive_mount_point(r"C:\mounts\studiofs").is_err());
+    }
+
+    #[test]
+    fn mount_manager_mount_point_builds_device_path() {
+        assert_eq!(mount_manager_mount_point("z:").unwrap(), r"\\.\Z:");
+        assert_eq!(mount_manager_mount_point("z:\\").unwrap(), r"\\.\Z:");
+    }
+
+    #[test]
+    fn winfsp_geometry_defaults_are_explicit_and_non_zero() {
+        assert_eq!(DEFAULT_SECTORS_PER_ALLOCATION_UNIT, 32);
+        assert_eq!(
+            u32::from(DEFAULT_SECTORS_PER_ALLOCATION_UNIT) * u32::from(DEFAULT_SECTOR_SIZE),
+            DEFAULT_ALLOCATION_UNIT_SIZE
+        );
     }
 }

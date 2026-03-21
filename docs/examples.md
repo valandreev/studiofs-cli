@@ -17,7 +17,7 @@ studiofs init myvolume \
 
 ### On Windows
 
-Mount as drive base `Z:` (resulting mount point `Z:\myvolume`):
+Mount directly to a drive letter (for example `Z:`):
 
 ```bash
 studiofs mount myvolume Z:

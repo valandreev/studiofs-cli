@@ -82,17 +82,20 @@ fn winfsp_mount_unmount_smoke() {
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
     }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP mount smoke test: set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mount_dir = tempfile::tempdir().expect("mountdir");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let event_name = format!("Local\\StudioFsMountSmoke-{}", std::process::id());
-    let mount_point = mount_dir
-        .path()
-        .to_str()
-        .expect("mount point utf8")
-        .to_string();
     let event_for_thread = event_name.clone();
 
     let handle = std::thread::spawn(move || {
