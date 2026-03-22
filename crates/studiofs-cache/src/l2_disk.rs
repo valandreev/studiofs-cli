@@ -41,6 +41,12 @@ use crate::platform_direct_io;
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
+    if alignment == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alignment must be non-zero",
+        ));
+    }
     if len == 0 {
         return Ok(BytesMut::new());
     }
@@ -56,12 +62,20 @@ fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut
     } else {
         alignment - misalignment
     };
+    let target_len = prefix
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflow"))?;
+    if raw.capacity() < target_len {
+        return Err(io::Error::other(
+            "allocator returned insufficient capacity for aligned buffer",
+        ));
+    }
 
-    // SAFETY: `raw` has capacity >= `prefix + len` by construction. This
+    // SAFETY: `raw` has capacity >= `target_len` by construction. This
     // helper is only used for direct I/O read targets that are fully written
     // by OS read calls before any initialized bytes are observed.
     unsafe {
-        raw.set_len(prefix + len);
+        raw.set_len(target_len);
     }
     if prefix != 0 {
         let _ = raw.split_to(prefix);
@@ -263,6 +277,20 @@ impl L2DiskCache {
                     if let Some(read_len) =
                         platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf)?
                     {
+                        if read_len > expected_len {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "direct read returned more bytes than requested",
+                            ));
+                        }
+                        if expected_len_hint.is_some() && read_len != expected_len {
+                            debug!(
+                                expected_len,
+                                read_len,
+                                "direct read size mismatch for hinted block; falling back"
+                            );
+                            return Ok(None);
+                        }
                         direct_buf.truncate(read_len);
                         Ok(Some(direct_buf.freeze()))
                     } else {
@@ -318,8 +346,19 @@ impl L2DiskCache {
     /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
     /// the input.
     pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
+        let sized_ids: Vec<(u64, Option<u32>)> = ids.iter().copied().map(|id| (id, None)).collect();
+        self.get_batch_with_size_hints(&sized_ids).await
+    }
+
+    /// Read multiple blocks from disk in parallel with optional size hints.
+    ///
+    /// If a size hint is provided for an item, path metadata reads can be skipped.
+    pub async fn get_batch_with_size_hints(
+        &self,
+        ids: &[(u64, Option<u32>)],
+    ) -> Vec<(u64, Option<Bytes>)> {
         let mut handles = Vec::with_capacity(ids.len());
-        for &id in ids {
+        for &(id, size_hint) in ids {
             let path = self.block_path(id);
             let semaphore = self.io_semaphore.clone();
             handles.push((
@@ -338,7 +377,10 @@ impl L2DiskCache {
                             else {
                                 return Ok(None);
                             };
-                            let expected_len = std_file.metadata()?.len() as usize;
+                            let expected_len = match size_hint {
+                                Some(len) => len as usize,
+                                None => std_file.metadata()?.len() as usize,
+                            };
                             let mut direct_buf = aligned_bytes_mut_uninit(
                                 expected_len,
                                 platform_direct_io::DIRECT_IO_ALIGNMENT,
@@ -347,6 +389,20 @@ impl L2DiskCache {
                                 std_file,
                                 &mut direct_buf,
                             )? {
+                                if read_len > expected_len {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "direct read returned more bytes than requested",
+                                    ));
+                                }
+                                if size_hint.is_some() && read_len != expected_len {
+                                    debug!(
+                                        expected_len,
+                                        read_len,
+                                        "direct batch read size mismatch for hinted block; falling back"
+                                    );
+                                    return Ok(None);
+                                }
                                 direct_buf.truncate(read_len);
                                 Ok(Some(direct_buf.freeze()))
                             } else {
