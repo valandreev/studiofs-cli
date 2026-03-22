@@ -1,64 +1,69 @@
-use bytes::{Bytes, BytesMut};
 use std::io;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use tokio::sync::OwnedSemaphorePermit;
+use std::path::Path;
 use tracing::debug;
 
-const DIRECT_IO_ALIGNMENT: usize = 4096;
+pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 
-fn aligned_uninit_bytes_mut(len: usize, alignment: usize) -> BytesMut {
-    // Avoid zero-filling the entire read/write buffer. We only initialize the
-    // exact slices that must be written (payload + optional tail padding).
-    let mut raw = BytesMut::with_capacity(len + alignment);
-    let base = raw.as_ptr() as usize;
-    let misalignment = base % alignment;
-    let prefix = if misalignment == 0 {
-        0
-    } else {
-        alignment - misalignment
-    };
-
-    // SAFETY:
-    // - We immediately restrict the exposed initialized region to either:
-    //   1) bytes read from the kernel (`read_from_std_file_direct` truncates to
-    //      the actual filled length before freeze), or
-    //   2) bytes we explicitly initialize (`write_to_std_file_direct` payload
-    //      copy + optional zero tail) before writing.
-    // - This buffer never leaves the module in an uninitialized state.
-    unsafe {
-        raw.set_len(prefix + len);
+fn round_up_to_alignment(len: usize, alignment: usize) -> usize {
+    if len == 0 {
+        return 0;
     }
-    if prefix != 0 {
-        let _ = raw.split_to(prefix);
-    }
-    raw
+    len.div_ceil(alignment) * alignment
 }
 
-fn read_from_std_file_direct(
-    mut std_file: std::fs::File,
-    expected_len: usize,
-) -> io::Result<Bytes> {
-    if expected_len == 0 {
-        return Ok(Bytes::new());
-    }
+fn is_aligned(ptr: *const (), alignment: usize) -> bool {
+    (ptr as usize).is_multiple_of(alignment)
+}
 
-    if !expected_len.is_multiple_of(DIRECT_IO_ALIGNMENT) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file size is not direct-I/O aligned",
-        ));
+fn make_aligned_buffer(len: usize, alignment: usize) -> (Vec<u8>, usize) {
+    if len == 0 {
+        return (Vec::new(), 0);
     }
+    let raw = vec![0u8; len + alignment - 1];
+    let base = raw.as_ptr() as usize;
+    let offset = (alignment - (base % alignment)) % alignment;
+    (raw, offset)
+}
 
-    let mut buf = aligned_uninit_bytes_mut(expected_len, DIRECT_IO_ALIGNMENT);
+fn read_all(mut std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0usize;
-    while filled < expected_len {
-        match std_file.read(&mut buf[filled..]) {
+    while filled < dst.len() {
+        match std_file.read(&mut dst[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) => return Err(e),
         }
     }
+    Ok(filled)
+}
+
+fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    let dst_aligned = is_aligned(dst.as_ptr().cast::<()>(), DIRECT_IO_ALIGNMENT);
+    let len_aligned = dst.len().is_multiple_of(DIRECT_IO_ALIGNMENT);
+
+    if dst_aligned && len_aligned {
+        let filled = read_all(std_file, dst)?;
+        if filled == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "direct read returned EOF before data",
+            ));
+        }
+        return Ok(filled);
+    }
+
+    // O_DIRECT requires aligned user pointers and aligned transfer lengths.
+    // When the caller buffer is not suitable, read into a temporary aligned
+    // bounce buffer and copy only the requested payload back to `dst`.
+    let io_len = round_up_to_alignment(dst.len(), DIRECT_IO_ALIGNMENT);
+    let (mut raw, offset) = make_aligned_buffer(io_len, DIRECT_IO_ALIGNMENT);
+    let bounce = &mut raw[offset..offset + io_len];
+    let filled = read_all(std_file, bounce)?;
 
     if filled == 0 {
         return Err(io::Error::new(
@@ -67,9 +72,9 @@ fn read_from_std_file_direct(
         ));
     }
 
-    let actual_len = expected_len.min(filled);
-    buf.truncate(actual_len);
-    Ok(buf.freeze())
+    let copy_len = dst.len().min(filled);
+    dst[..copy_len].copy_from_slice(&bounce[..copy_len]);
+    Ok(copy_len)
 }
 
 fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Result<()> {
@@ -77,18 +82,24 @@ fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Res
         return Ok(());
     }
 
-    if !data.len().is_multiple_of(DIRECT_IO_ALIGNMENT) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "payload size is not direct-I/O aligned",
-        ));
+    let data_aligned = is_aligned(data.as_ptr().cast::<()>(), DIRECT_IO_ALIGNMENT);
+    let len_aligned = data.len().is_multiple_of(DIRECT_IO_ALIGNMENT);
+
+    if data_aligned && len_aligned {
+        std_file.write_all(data)?;
+        return Ok(());
     }
 
-    let mut buf = aligned_uninit_bytes_mut(data.len(), DIRECT_IO_ALIGNMENT);
+    let io_len = round_up_to_alignment(data.len(), DIRECT_IO_ALIGNMENT);
+    let (mut raw, offset) = make_aligned_buffer(io_len, DIRECT_IO_ALIGNMENT);
+    let bounce = &mut raw[offset..offset + io_len];
+    bounce[..data.len()].copy_from_slice(data);
+    std_file.write_all(bounce)?;
 
-    buf[..data.len()].copy_from_slice(data);
-
-    std_file.write_all(&buf)?;
+    // Keep observable file size equal to payload length for unaligned tails.
+    if io_len != data.len() {
+        std_file.set_len(data.len() as u64)?;
+    }
 
     Ok(())
 }
@@ -107,36 +118,12 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) async fn read_block_direct(
-    path: PathBuf,
-    expected_len_hint: Option<usize>,
-    permit: OwnedSemaphorePermit,
-) -> io::Result<Option<Bytes>> {
+fn open_read_file_direct(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-
-    let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
-        let _permit = permit;
-        let std_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
-            .open(&path)?;
-        let expected_len = match expected_len_hint {
-            Some(len) => len,
-            None => std_file.metadata()?.len() as usize,
-        };
-        read_from_std_file_direct(std_file, expected_len)
-    })
-    .await
-    .map_err(io::Error::other)?;
-
-    match outcome {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "O_DIRECT unavailable for block; falling back to buffered read");
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+        .open(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -183,41 +170,14 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) async fn read_block_direct(
-    path: PathBuf,
-    expected_len_hint: Option<usize>,
-    permit: OwnedSemaphorePermit,
-) -> io::Result<Option<Bytes>> {
+fn open_read_file_direct(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-
-    let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
-        let _permit = permit;
-        let std_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(&path)?;
-        let expected_len = match expected_len_hint {
-            Some(len) => len,
-            None => std_file.metadata()?.len() as usize,
-        };
-        read_from_std_file_direct(std_file, expected_len)
-    })
-    .await
-    .map_err(io::Error::other)?;
-
-    match outcome {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(
-                error = %e,
-                "Windows direct I/O unavailable for block; falling back to buffered read"
-            );
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .open(path)
 }
 
 #[cfg(target_os = "windows")]
@@ -263,34 +223,45 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) async fn read_block_direct(
-    path: PathBuf,
-    expected_len_hint: Option<usize>,
-    permit: OwnedSemaphorePermit,
-) -> io::Result<Option<Bytes>> {
+fn open_read_file_direct(path: &Path) -> io::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
 
-    let outcome = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
-        let _permit = permit;
-        let std_file = std::fs::OpenOptions::new().read(true).open(&path)?;
-        let fd = std_file.as_raw_fd();
-        let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let expected_len = match expected_len_hint {
-            Some(len) => len,
-            None => std_file.metadata()?.len() as usize,
-        };
-        read_from_std_file_direct(std_file, expected_len)
-    })
-    .await
-    .map_err(io::Error::other)?;
+    let std_file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let fd = std_file.as_raw_fd();
+    let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std_file)
+}
 
-    match outcome {
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub(crate) fn open_block_direct_read(path: &Path) -> io::Result<Option<std::fs::File>> {
+    match open_read_file_direct(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if should_fallback_from_direct_io(&e) => {
+            debug!(
+                error = %e,
+                "direct I/O unavailable for block open; falling back to buffered read"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub(crate) fn read_block_direct_from_file(
+    std_file: std::fs::File,
+    dst: &mut [u8],
+) -> io::Result<Option<usize>> {
+    match read_from_std_file_direct_into(std_file, dst) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "F_NOCACHE unavailable for block; falling back to buffered read");
+            debug!(
+                error = %e,
+                "direct I/O unavailable for block read; falling back to buffered read"
+            );
             Ok(None)
         }
         Err(e) => Err(e),
@@ -326,11 +297,15 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-pub(crate) async fn read_block_direct(
-    _path: PathBuf,
-    _expected_len_hint: Option<usize>,
-    _permit: OwnedSemaphorePermit,
-) -> io::Result<Option<Bytes>> {
+pub(crate) fn open_block_direct_read(_path: &Path) -> io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+pub(crate) fn read_block_direct_from_file(
+    _std_file: std::fs::File,
+    _dst: &mut [u8],
+) -> io::Result<Option<usize>> {
     Ok(None)
 }
 

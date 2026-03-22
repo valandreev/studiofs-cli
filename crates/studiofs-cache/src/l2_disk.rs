@@ -22,7 +22,7 @@
 //! - **Batch put/get:** `put_batch` and `get_batch` amortise thread-pool
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +39,88 @@ use crate::platform_direct_io;
 
 /// Upper bound for active L2 blocking-I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
+
+fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
+    if alignment == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alignment must be non-zero",
+        ));
+    }
+    if len == 0 {
+        return Ok(BytesMut::new());
+    }
+
+    let total = len
+        .checked_add(alignment)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflow"))?;
+    let mut raw = BytesMut::with_capacity(total);
+    let base = raw.as_ptr() as usize;
+    let misalignment = base % alignment;
+    let prefix = if misalignment == 0 {
+        0
+    } else {
+        alignment - misalignment
+    };
+    let target_len = prefix
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflow"))?;
+    if raw.capacity() < target_len {
+        return Err(io::Error::other(
+            "allocator returned insufficient capacity for aligned buffer",
+        ));
+    }
+
+    // SAFETY: `raw` has capacity >= `target_len` by construction. This
+    // helper is only used for direct I/O read targets that are fully written
+    // by OS read calls before any initialized bytes are observed.
+    unsafe {
+        raw.set_len(target_len);
+    }
+    if prefix != 0 {
+        let _ = raw.split_to(prefix);
+    }
+    debug_assert_eq!(raw.len(), len);
+    debug_assert!((raw.as_ptr() as usize).is_multiple_of(alignment));
+    Ok(raw)
+}
+
+fn try_read_direct_block(
+    path: &Path,
+    expected_len_hint: Option<usize>,
+) -> io::Result<Option<Bytes>> {
+    let Some(std_file) = platform_direct_io::open_block_direct_read(path)? else {
+        return Ok(None);
+    };
+
+    let expected_len = match expected_len_hint {
+        Some(len) => len,
+        None => std_file.metadata()?.len() as usize,
+    };
+    let mut direct_buf =
+        aligned_bytes_mut_uninit(expected_len, platform_direct_io::DIRECT_IO_ALIGNMENT)?;
+    if let Some(read_len) =
+        platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf)?
+    {
+        if read_len > expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "direct read returned more bytes than requested",
+            ));
+        }
+        if expected_len_hint.is_some() && read_len != expected_len {
+            debug!(
+                expected_len,
+                read_len, "direct read size mismatch for hinted block; falling back"
+            );
+            return Ok(None);
+        }
+        direct_buf.truncate(read_len);
+        Ok(Some(direct_buf.freeze()))
+    } else {
+        Ok(None)
+    }
+}
 
 /// File-per-block disk cache on NVMe.
 pub struct L2DiskCache {
@@ -211,10 +293,18 @@ impl L2DiskCache {
     ) -> io::Result<Bytes> {
         {
             let permit = self.acquire_io_permit().await?;
-            if let Some(bytes) =
-                platform_direct_io::read_block_direct(path.clone(), expected_len_hint, permit)
-                    .await?
-            {
+            let path_for_direct = path.clone();
+            let direct = crate::runtime::spawn_blocking_profiled(
+                "l2_read_direct",
+                move || -> io::Result<Option<Bytes>> {
+                    let _permit = permit;
+                    try_read_direct_block(&path_for_direct, expected_len_hint)
+                },
+            )
+            .await
+            .map_err(io::Error::other)??;
+
+            if let Some(bytes) = direct {
                 return Ok(bytes);
             }
         }
@@ -259,8 +349,19 @@ impl L2DiskCache {
     /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
     /// the input.
     pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
+        let sized_ids: Vec<(u64, Option<u32>)> = ids.iter().copied().map(|id| (id, None)).collect();
+        self.get_batch_with_size_hints(&sized_ids).await
+    }
+
+    /// Read multiple blocks from disk in parallel with optional size hints.
+    ///
+    /// If a size hint is provided for an item, path metadata reads can be skipped.
+    pub async fn get_batch_with_size_hints(
+        &self,
+        ids: &[(u64, Option<u32>)],
+    ) -> Vec<(u64, Option<Bytes>)> {
         let mut handles = Vec::with_capacity(ids.len());
-        for &id in ids {
+        for &(id, size_hint) in ids {
             let path = self.block_path(id);
             let semaphore = self.io_semaphore.clone();
             handles.push((
@@ -269,12 +370,23 @@ impl L2DiskCache {
                     let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
                     })?;
-                    if let Some(bytes) =
-                        platform_direct_io::read_block_direct(path.clone(), None, permit).await?
-                    {
-                        Ok(bytes)
-                    } else {
-                        Self::read_block_buffered(path, semaphore.clone()).await
+                    let path_for_direct = path.clone();
+                    let direct = crate::runtime::spawn_blocking_profiled(
+                        "l2_read_batch_direct",
+                        move || -> io::Result<Option<Bytes>> {
+                            let _permit = permit;
+                            try_read_direct_block(
+                                &path_for_direct,
+                                size_hint.map(|len| len as usize),
+                            )
+                        },
+                    )
+                    .await
+                    .map_err(io::Error::other)??;
+
+                    match direct {
+                        Some(bytes) => Ok(bytes),
+                        None => Self::read_block_buffered(path, semaphore.clone()).await,
                     }
                 }),
             ));
