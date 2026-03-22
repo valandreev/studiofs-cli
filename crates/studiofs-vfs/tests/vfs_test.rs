@@ -6295,8 +6295,8 @@ async fn test_object_format() {
     let object = create_object(original_data).unwrap();
 
     // Verify we can read it back
-    let decompressed = read_object(&object).unwrap();
-    assert_eq!(decompressed.as_slice(), original_data);
+    let decompressed = read_object(bytes::Bytes::from(object)).unwrap();
+    assert_eq!(decompressed.as_ref(), original_data);
 }
 
 #[tokio::test]

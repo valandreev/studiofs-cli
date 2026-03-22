@@ -221,7 +221,7 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
         let raw = rt
             .block_on(async { store.get_by_key(&key).await })
             .expect("get object");
-        let decoded = read_object(&raw).expect("decode object");
+        let decoded = read_object(raw).expect("decode object");
         assert_eq!(decoded, expected);
         drop(meta);
     }

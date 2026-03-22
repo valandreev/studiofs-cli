@@ -7992,18 +7992,13 @@ impl StudioVfs {
                 }
                 other => VfsError::Other(other.to_string()),
             })?;
-        let payload = read_object(&compressed).map_err(|e| VfsError::Other(e.to_string()))?;
-        let data = Bytes::from(payload);
+        let data = read_object(compressed).map_err(|e| VfsError::Other(e.to_string()))?;
 
         // Warm L2 (disk cache) so subsequent reads of the same block avoid
         // another S3 round-trip.  L1 (RAM) promotion is intentionally skipped
         // to prevent streaming direct-IO reads from evicting hot working-set
         // entries.
-        if let Err(e) = self
-            .block_cache
-            .commit_l2(block_ref.object_id, &data)
-            .await
-        {
+        if let Err(e) = self.block_cache.commit_l2(block_ref.object_id, &data).await {
             tracing::debug!(
                 ino,
                 block_index,

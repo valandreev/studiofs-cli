@@ -9,7 +9,7 @@
 //! - Version bumped to 2
 //! - Objects are immutable and content-addressable by sequential ID
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 use std::io::{self, Cursor};
 use thiserror::Error;
 use xxhash_rust::xxh64::xxh64;
@@ -291,7 +291,7 @@ pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u
 ///
 /// # Returns
 /// Original payload data
-pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
+pub fn read_object(data: Bytes) -> Result<Bytes, ObjectError> {
     if data.len() < ObjectHeader::SIZE {
         return Err(
             io::Error::new(io::ErrorKind::UnexpectedEof, "file too short for header").into(),
@@ -299,8 +299,8 @@ pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     }
 
     // Parse header
-    let (header_bytes, payload) = data.split_at(ObjectHeader::SIZE);
-    let header = ObjectHeader::from_bytes(header_bytes)?;
+    let header = ObjectHeader::from_bytes(&data[..ObjectHeader::SIZE])?;
+    let payload = data.slice(ObjectHeader::SIZE..);
 
     // Validate payload size
     if payload.len() != header.compressed_size as usize {
@@ -314,10 +314,9 @@ pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     if header.is_compressed() {
         return Err(ObjectError::LegacyCompressionUnsupported);
     }
-    let raw = payload.to_vec();
 
     // Verify checksum
-    let computed_checksum = xxh64(&raw, 0);
+    let computed_checksum = xxh64(payload.as_ref(), 0);
     if computed_checksum != header.checksum {
         return Err(ObjectError::ChecksumMismatch {
             expected: header.checksum,
@@ -325,7 +324,7 @@ pub fn read_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
         });
     }
 
-    Ok(raw)
+    Ok(payload)
 }
 
 /// Read object header only (without loading payload bytes into a second buffer).
@@ -531,9 +530,9 @@ mod tests {
         let original_data = b"Hello, StudioFS! This is a test of the object format.";
 
         let object = create_object(original_data).unwrap();
-        let decoded = read_object(&object).unwrap();
+        let decoded = read_object(Bytes::from(object)).unwrap();
 
-        assert_eq!(original_data.as_slice(), decoded.as_slice());
+        assert_eq!(original_data.as_slice(), decoded.as_ref());
     }
 
     #[test]
@@ -542,9 +541,9 @@ mod tests {
         let original_data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
 
         let object = create_object(&original_data).unwrap();
-        let decoded = read_object(&object).unwrap();
+        let decoded = read_object(Bytes::from(object)).unwrap();
 
-        assert_eq!(original_data, decoded);
+        assert_eq!(original_data.as_slice(), decoded.as_ref());
     }
 
     #[test]
@@ -555,7 +554,7 @@ mod tests {
         // Corrupt the checksum in the header
         object[20] ^= 0xFF; // Flip some bits in checksum
 
-        let result = read_object(&object);
+        let result = read_object(Bytes::from(object));
         assert!(matches!(result, Err(ObjectError::ChecksumMismatch { .. })));
     }
 
@@ -617,9 +616,9 @@ mod tests {
         let flags = ObjectFlags::empty();
 
         let object = create_object_with_flags(data, flags).unwrap();
-        let decoded = read_object(&object).unwrap();
+        let decoded = read_object(Bytes::from(object)).unwrap();
 
-        assert_eq!(data.as_slice(), decoded.as_slice());
+        assert_eq!(data.as_slice(), decoded.as_ref());
     }
 
     #[test]
@@ -636,7 +635,7 @@ mod tests {
         object.extend_from_slice(&header.to_bytes());
         object.extend_from_slice(data);
 
-        let result = read_object(&object);
+        let result = read_object(Bytes::from(object));
         assert!(matches!(
             result,
             Err(ObjectError::LegacyCompressionUnsupported)
