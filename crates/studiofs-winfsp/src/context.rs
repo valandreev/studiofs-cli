@@ -68,6 +68,52 @@ impl StudioFileHandle {
     }
 }
 
+#[derive(Copy, Clone)]
+struct SendMutBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: The wrapper only marks transport capability across threads.
+// Call sites must guarantee pointer validity, exclusivity, and lifetime.
+unsafe impl Send for SendMutBuffer {}
+
+impl SendMutBuffer {
+    fn from_slice(slice: &mut [u8]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct SendConstBuffer {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: The wrapper only marks transport capability across threads.
+// Call sites must guarantee pointer validity and lifetime.
+unsafe impl Send for SendConstBuffer {}
+
+impl SendConstBuffer {
+    fn from_slice(slice: &[u8]) -> Self {
+        Self {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    unsafe fn as_slice<'a>(self) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 fn open_flags_from_create_options(create_options: u32) -> OpenFlags {
     let mut flags = OpenFlags::RDWR;
     if create_options & FILE_NO_INTERMEDIATE_BUFFERING_OPTION != 0 {
@@ -416,6 +462,7 @@ impl StudioFsContext {
     /// This is important because WinFSP uses IOCP with a limited concurrency.
     /// `block_on` makes the current thread drive the future, which can interact
     /// poorly with the tokio IO reactor when called from non-runtime threads.
+    /// Expected operational failures must be propagated as `Result`, not panics.
     fn spawn_wait<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T> + Send + 'static,
@@ -603,17 +650,17 @@ impl FileSystemContext for StudioFsContext {
         // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
         let fh = context.fh;
-        let buf_len = buffer.len();
-        let buffer_addr = buffer.as_mut_ptr() as usize;
+        let out_buf = SendMutBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
 
         let result: Result<u32, _> = self.spawn_wait(async move {
             // SAFETY:
-            // - `buffer_addr` originates from the WinFSP-provided `buffer` and remains
+            // - `out_buf` originates from the WinFSP-provided `buffer` and remains
             //   valid for the duration of this callback.
             // - `spawn_wait` blocks until this task completes, so the caller cannot
             //   observe or alias `buffer` concurrently while this mutable slice exists.
-            let out = unsafe { std::slice::from_raw_parts_mut(buffer_addr as *mut u8, buf_len) };
+            // - `u8` alignment is always valid (alignment = 1).
+            let out = unsafe { out_buf.as_mut_slice() };
             vfs.read_into_fh(fh, ino, offset, out).await
         });
 
@@ -666,10 +713,19 @@ impl FileSystemContext for StudioFsContext {
 
         let ino = context.ino;
         let fh = context.fh;
-        let data = buffer.to_vec();
+        let in_buf = SendConstBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
         let written = self
-            .spawn_wait(async move { vfs.write_fh(fh, ino, actual_offset, &data).await })
+            .spawn_wait(async move {
+                // SAFETY:
+                // - `in_buf` points at WinFSP-provided request bytes that stay valid
+                //   for the duration of this callback.
+                // - `spawn_wait` blocks until completion, so the source memory
+                //   is not accessed after this callback returns.
+                // - `u8` alignment is always valid (alignment = 1).
+                let data = unsafe { in_buf.as_slice() };
+                vfs.write_fh(fh, ino, actual_offset, data).await
+            })
             .map_err(vfs_to_winfsp_err)?;
 
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -724,10 +780,12 @@ impl FileSystemContext for StudioFsContext {
             // Add all directory entries
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
             debug!(ino = context.ino, count = entries.len(), "read_directory");
+            let mut name_u16 = Vec::<u16>::new();
 
             for entry in &entries {
                 let name_cow = String::from_utf8_lossy(&entry.name);
-                let name_u16: Vec<u16> = name_cow.encode_utf16().collect();
+                name_u16.clear();
+                name_u16.extend(name_cow.encode_utf16());
                 let mut dir_info = DirInfo::<255>::new();
                 if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
                     warn!("failed to set name for entry: {}", name_cow);
