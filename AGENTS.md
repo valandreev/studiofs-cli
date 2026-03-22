@@ -11,6 +11,15 @@ StudioFS is a Rust workspace (`Cargo.toml`) with crates under `crates/`:
 
 Documentation lives in `docs/` (architecture, config, tests, development). Integration tests are primarily in `crates/studiofs-data/tests/` and `crates/studiofs-vfs/tests/`; many crate-level unit tests are inline in `src/*.rs`.
 
+## Exa Search (Direct Use) - Codex & Specialized Agents
+- **Codex (`codebase_investigator`)** and other specialized agents MUST use `mcp_exa_get_code_context_exa` directly when external knowledge (APIs, libraries, documentation) is needed.
+- **Direct Action:** Do not delegate to sub-agents; use the tool within the agent's own context to maintain reasoning chain.
+- **Workflow:**
+  1. Identify the need for external documentation (e.g., "WinFSP API for file locking", "Tokio readahead patterns").
+  2. Call `mcp_exa_get_code_context_exa` with `tokensNum: 5000` (default) or up to `20000` for complex integrations.
+  3. **Strict Filter:** Immediately extract and use only the relevant code snippets and constraints. Deduplicate results before incorporating them into the final analysis or code generation.
+  4. Ensure the query includes the programming language and specific version/library (e.g., "Rust opendal s3 configuration").
+
 ## Codebase Memory MCP Usage
 - This repository uses `codebase-memory-mcp` for semantic code search, call graph analysis, and architectural mapping.
 - Policy line: always verify `codebase-memory-mcp` availability and repo indexing before any codebase exploration; use graph tools first when both are available.
