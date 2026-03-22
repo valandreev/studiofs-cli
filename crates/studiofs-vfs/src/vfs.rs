@@ -7998,7 +7998,11 @@ impl StudioVfs {
         // another S3 round-trip.  L1 (RAM) promotion is intentionally skipped
         // to prevent streaming direct-IO reads from evicting hot working-set
         // entries.
-        if let Err(e) = self.block_cache.commit_l2(block_ref.object_id, &data).await {
+        if let Err(e) = self
+            .block_cache
+            .commit_l2(block_ref.object_id, data.clone())
+            .await
+        {
             tracing::debug!(
                 ino,
                 block_index,

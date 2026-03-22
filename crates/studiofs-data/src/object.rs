@@ -80,7 +80,7 @@ impl Default for ObjectFlags {
 // Object Header
 // =============================================================================
 
-/// S3 Object Header - 32 bytes fixed.
+/// S3 Object Header - 30 bytes fixed on wire.
 ///
 /// Little-endian encoding for all multi-byte fields.
 /// Designed for efficient parsing and forward compatibility.
@@ -137,7 +137,7 @@ impl Default for ObjectHeader {
 
 impl ObjectHeader {
     /// Total header size in bytes.
-    pub const SIZE: usize = 4 + 2 + 2 + 4 + 4 + 8 + 6; // 30 bytes
+    pub const SIZE: usize = 4 + 2 + 2 + 4 + 4 + 8 + 6; // 30 bytes wire format
 
     /// Create a new header with the given parameters.
     pub fn new(original_size: u32, compressed_size: u32, checksum: u64) -> Self {
@@ -507,7 +507,8 @@ mod tests {
         assert_eq!(ObjectHeader::SIZE, 30);
 
         // Note: Without #[repr(packed)], the struct may have padding.
-        // The actual struct size may be larger, but we serialize to exactly 32 bytes.
+        // The actual struct size may be larger due to alignment,
+        // but wire serialization is exactly 30 bytes.
         // This is acceptable since we use to_bytes() for serialization.
     }
 

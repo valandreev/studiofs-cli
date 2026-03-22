@@ -589,9 +589,8 @@ impl BlockCache {
     /// The write is routed through the bounded L2 scheduler; this method
     /// applies backpressure when the scheduler queue is saturated.
     /// Does NOT unpin — the block stays pinned until the S3 upload completes.
-    pub async fn commit_l2(&self, object_id: ObjectId, data: &[u8]) -> io::Result<()> {
-        self.enqueue_l2_commit(object_id, Bytes::copy_from_slice(data))
-            .await
+    pub async fn commit_l2(&self, object_id: ObjectId, data: Bytes) -> io::Result<()> {
+        self.enqueue_l2_commit(object_id, data).await
     }
 
     /// **Phase 2 — background batch.** Enqueue multiple L2 commits through the
