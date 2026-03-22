@@ -73,8 +73,18 @@ pub struct UploadQueue {
     sender: mpsc::UnboundedSender<PendingUpload>,
     journal_tx: mpsc::UnboundedSender<JournalOp>,
     pending_count: AtomicUsize,
-    pending_index: Mutex<HashMap<u64, PendingUpload>>,
+    pending_state: Mutex<PendingState>,
     idle_notify: Arc<Notify>,
+}
+
+/// Atomically-consistent index of in-flight uploads.
+///
+/// Both maps are guarded by the same mutex so that `has_pending_for_ino`
+/// never observes an inconsistent state where a block exists in the
+/// object-id index but the per-inode counter has not yet been bumped.
+struct PendingState {
+    by_object: HashMap<u64, PendingUpload>,
+    ino_counts: HashMap<Ino, usize>,
 }
 
 enum JournalOp {
@@ -114,7 +124,10 @@ impl UploadQueue {
             sender: tx,
             journal_tx,
             pending_count: AtomicUsize::new(0),
-            pending_index: Mutex::new(HashMap::new()),
+            pending_state: Mutex::new(PendingState {
+                by_object: HashMap::new(),
+                ino_counts: HashMap::new(),
+            }),
             idle_notify,
         });
 
@@ -244,7 +257,8 @@ impl UploadQueue {
 
     /// Snapshot all currently pending upload ops from the live in-memory index.
     pub fn snapshot_pending(&self) -> Vec<PendingUpload> {
-        let mut ops: Vec<_> = self.pending_index.lock().values().cloned().collect();
+        let state = self.pending_state.lock();
+        let mut ops: Vec<_> = state.by_object.values().cloned().collect();
         ops.sort_by_key(|op| (op.created_unix_ms, op.object_id));
         ops
     }
@@ -276,11 +290,32 @@ impl UploadQueue {
     }
 
     fn record_pending(&self, op: PendingUpload) {
-        self.pending_index.lock().insert(op.object_id, op);
+        let mut state = self.pending_state.lock();
+        let ino = op.ino;
+        let old = state.by_object.insert(op.object_id, op);
+        // Only bump the ino counter when inserting a genuinely new object_id.
+        if old.is_none() {
+            *state.ino_counts.entry(ino).or_insert(0) += 1;
+        }
     }
 
     fn remove_pending(&self, object_id: u64) {
-        self.pending_index.lock().remove(&object_id);
+        let mut state = self.pending_state.lock();
+        if let Some(removed) = state.by_object.remove(&object_id) {
+            if let std::collections::hash_map::Entry::Occupied(mut e) =
+                state.ino_counts.entry(removed.ino)
+            {
+                *e.get_mut() -= 1;
+                if *e.get() == 0 {
+                    e.remove_entry();
+                }
+            }
+        }
+    }
+
+    /// O(1) check whether any pending uploads reference the given inode.
+    pub fn has_pending_for_ino(&self, ino: Ino) -> bool {
+        self.pending_state.lock().ino_counts.contains_key(&ino)
     }
 
     fn parse_journal(&self, path: &Path) -> io::Result<PendingUpload> {
@@ -578,5 +613,46 @@ mod tests {
 
         // No pending ops — should return immediately.
         assert!(queue.wait_for_idle(Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn has_pending_for_ino_tracks_inserts_and_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        assert!(!queue.has_pending_for_ino(1));
+        assert!(!queue.has_pending_for_ino(2));
+
+        // Submit two blocks for ino 1 and one for ino 2.
+        queue.submit(1, 0, 100, 1);
+        queue.submit(1, 4096, 101, 1);
+        queue.submit(2, 0, 200, 1);
+        queue.flush_journal().await;
+
+        assert!(queue.has_pending_for_ino(1));
+        assert!(queue.has_pending_for_ino(2));
+        assert!(!queue.has_pending_for_ino(3));
+
+        // Complete one of the two blocks for ino 1.
+        let op = rx.recv().await.unwrap();
+        assert_eq!(op.ino, 1);
+        queue.complete(&op);
+
+        // ino 1 still has the second block pending.
+        assert!(queue.has_pending_for_ino(1));
+
+        // Complete the second block for ino 1.
+        let op = rx.recv().await.unwrap();
+        assert_eq!(op.ino, 1);
+        queue.complete(&op);
+        assert!(!queue.has_pending_for_ino(1));
+
+        // ino 2 still pending.
+        assert!(queue.has_pending_for_ino(2));
+
+        // Complete ino 2.
+        let op = rx.recv().await.unwrap();
+        queue.complete(&op);
+        assert!(!queue.has_pending_for_ino(2));
     }
 }

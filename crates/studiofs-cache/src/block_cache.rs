@@ -730,6 +730,11 @@ impl BlockCache {
         self.upload_queue.snapshot_pending()
     }
 
+    /// O(1) check whether any pending uploads reference the given inode.
+    pub fn has_pending_uploads_for_ino(&self, ino: u64) -> bool {
+        self.upload_queue.has_pending_for_ino(ino)
+    }
+
     pub async fn flush_upload_journal(&self) {
         self.upload_queue.flush_journal().await;
     }

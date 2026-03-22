@@ -108,11 +108,11 @@ Notes:
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--direct-io` enables unbuffered I/O behavior for Windows WinFSP mounts:
-  - WinFSP metadata cache timeouts are forced to `0` (`FileInfoTimeout`, `DirInfoTimeout`, `VolumeInfoTimeout`).
   - handles opened with `FILE_NO_INTERMEDIATE_BUFFERING`/`FILE_WRITE_THROUGH` are treated as unbuffered in VFS.
-  - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; writes wait for a synchronous drain to backend visibility before returning.
+  - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; fetched blocks are cached in L2 for potential re-reads.
+  - writes buffer data as normal; the synchronous drain to backend visibility is deferred to `flush()`/`close()` for the handle.
   - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write backend wait timeout (default `120` seconds).
-  - this mode is intended for storage benchmarking and strict write-through workflows and can reduce Explorer browsing smoothness due to disabled metadata caching.
+  - this mode is intended for storage benchmarking and strict write-through workflows.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
 - `--profile=off` disables profiling explicitly, even if `STUDIOFS_PROFILE` is set.

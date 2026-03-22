@@ -42,9 +42,9 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | 512 bytes |
 | Allocation unit size | 16384 bytes |
 | Max component length | 255 |
-| File info timeout | 1000 ms (0 with `--direct-io`) |
-| Dir info timeout | 1000 ms (0 with `--direct-io`) |
-| Volume info timeout | 1000 ms (0 with `--direct-io`) |
+| File info timeout | 1000 ms |
+| Dir info timeout | 1000 ms |
+| Volume info timeout | 1000 ms |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
 | Persistent ACLs | Yes |
@@ -77,7 +77,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `open` | `NamespaceResolver::resolve_path()` + `open()` (records `DIRECT_IO` / `WRITE_THROUGH` intent) |
 | `close` | `release()` |
 | `read` | `read_into_fh()` (per-handle unbuffered path when requested) |
-| `write` | `write_fh()` (sync backend drain for unbuffered handles) |
+| `write` | `write_fh()` (unbuffered backend drain deferred to flush/close) |
 | `cleanup` | `flush()` |
 | `flush` | `flush()` |
 | `get_file_info` | `getattr()` |
@@ -120,7 +120,7 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground, read_only, direc
 
 Current signature includes additional policy controls:
 - `read_only` toggles read-only mount behavior.
-- `direct_io` enables aggressive metadata timeout zeroing and per-handle unbuffered I/O path on Windows.
+- `direct_io` enables per-handle unbuffered I/O path on Windows (write-through drain moved to flush/close).
 - `shutdown_event_name` allows external graceful shutdown signal integration.
 
 ## FUSE Bridge (`studiofs-fuse`)

@@ -79,11 +79,13 @@ data arrives
 ```
 
 Handle-aware write path:
-- `write_fh(fh, ino, offset, data)` checks handle `OpenFlags`.
-- For `DIRECT_IO` / `WRITE_THROUGH`, after a successful write VFS performs:
+- `write_fh(fh, ino, offset, data)` buffers data identically to `write()`.
+- The synchronous backend drain for `DIRECT_IO` / `WRITE_THROUGH` handles is
+  deferred to `flush_fh()` / `close()`, so individual writes do not block on S3 round-trips.
+- At flush/close time, `flush_fh()` calls:
   - `flush(ino)` to stage accepted data,
   - `sync_inode_to_backend(ino, timeout)` which waits until both ingress and upload queues are clear for that inode.
-- This provides a synchronous write-through confirmation path for unbuffered callers.
+- This provides a synchronous write-through confirmation path for unbuffered callers at natural sync boundaries.
 
 ### 2. `flush(ino)` / `close(ino)`
 
@@ -182,7 +184,8 @@ Handle-aware read path:
 - `read_into_fh(fh, ino, ...)` checks `OpenFlags` from the handle table.
 - If `DIRECT_IO` or `WRITE_THROUGH` is set, VFS uses unbuffered mode:
   - disables best-effort prefetch for that read,
-  - resolves committed blocks through an L2-only direct path (no L1 lookup/promotion).
+  - resolves committed blocks through an L2-only direct path (no L1 lookup/promotion),
+  - blocks fetched from S3 are cached in L2 (disk cache) to avoid repeat remote fetches.
 
 ## FetchScheduler (`fetch.rs`)
 

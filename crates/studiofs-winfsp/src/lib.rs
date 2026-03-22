@@ -45,7 +45,7 @@ enum MountOptionError {
 
 fn parse_mount_options(
     volume_label: &str,
-    direct_io: bool,
+    _direct_io: bool,
 ) -> Result<WinfspMountOptions, MountOptionError> {
     let trimmed = volume_label.trim();
     if trimmed.is_empty() {
@@ -57,21 +57,9 @@ fn parse_mount_options(
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
-        file_info_timeout_ms: if direct_io {
-            0
-        } else {
-            DEFAULT_FILE_INFO_TIMEOUT_MS
-        },
-        dir_info_timeout_ms: if direct_io {
-            0
-        } else {
-            DEFAULT_DIR_INFO_TIMEOUT_MS
-        },
-        volume_info_timeout_ms: if direct_io {
-            0
-        } else {
-            DEFAULT_VOLUME_INFO_TIMEOUT_MS
-        },
+        file_info_timeout_ms: DEFAULT_FILE_INFO_TIMEOUT_MS,
+        dir_info_timeout_ms: DEFAULT_DIR_INFO_TIMEOUT_MS,
+        volume_info_timeout_ms: DEFAULT_VOLUME_INFO_TIMEOUT_MS,
     })
 }
 
@@ -163,8 +151,8 @@ pub fn mount_and_serve(
 
     let options = parse_mount_options(volume_label, direct_io)?;
     if direct_io {
-        tracing::warn!(
-            "direct-io mode enabled: WinFSP metadata cache timeouts are forced to 0; Explorer metadata operations may feel slower"
+        tracing::info!(
+            "direct-io mode enabled: unbuffered handles use write-through data path"
         );
     }
     let mut volume_params = VolumeParams::new();
@@ -342,11 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_mount_options_direct_io_disables_metadata_timeouts() {
+    fn parse_mount_options_direct_io_keeps_metadata_timeouts() {
         let opts = parse_mount_options("StudioFS", true).expect("options");
-        assert_eq!(opts.file_info_timeout_ms, 0);
-        assert_eq!(opts.dir_info_timeout_ms, 0);
-        assert_eq!(opts.volume_info_timeout_ms, 0);
+        assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
+        assert_eq!(opts.dir_info_timeout_ms, DEFAULT_DIR_INFO_TIMEOUT_MS);
+        assert_eq!(opts.volume_info_timeout_ms, DEFAULT_VOLUME_INFO_TIMEOUT_MS);
     }
 
     #[test]

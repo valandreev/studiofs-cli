@@ -4962,10 +4962,7 @@ impl StudioVfs {
     }
 
     fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
-        self.block_cache
-            .snapshot_pending_uploads()
-            .iter()
-            .any(|op| op.ino == ino)
+        self.block_cache.has_pending_uploads_for_ino(ino)
     }
 
     fn derive_committed_incarnation_from_attr(
@@ -6650,9 +6647,18 @@ impl StudioVfs {
     /// Flush data for a file handle (per-fd close in POSIX).
     ///
     /// Called by FUSE `flush()`.  Flushes pending writes for the inode.
+    /// For handles opened with `DIRECT_IO`/`WRITE_THROUGH`, this also
+    /// waits until all ingress and upload-queue entries for the inode
+    /// have drained to the backend (synchronous write-through guarantee).
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
-            self.flush(open_file.ino).await?;
+            let ino = open_file.ino;
+            let unbuffered = open_file.flags.requests_unbuffered_io();
+            self.flush(ino).await?;
+            if unbuffered {
+                self.sync_inode_to_backend(ino, direct_io_sync_timeout())
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -6721,30 +6727,23 @@ impl StudioVfs {
 
     /// Write file data using per-handle I/O flags.
     ///
-    /// For `DIRECT_IO`/`WRITE_THROUGH`, writes are followed by a synchronous
-    /// drain to local ingress + upload queue completion for the target inode.
+    /// Writes are buffered identically to `write()`.  The synchronous
+    /// backend drain for `DIRECT_IO`/`WRITE_THROUGH` handles is deferred
+    /// to `flush_fh()` / `close()` so individual writes do not block on
+    /// S3 round-trips.
     pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        let open_flags = self
-            .handle_table
-            .get(fh)
-            .map(|open| open.flags)
-            .unwrap_or(OpenFlags::empty());
-        let written = self.write(ino, offset, data).await?;
-        if written > 0 && open_flags.requests_unbuffered_io() {
-            self.flush_direct_write(ino).await?;
-        }
-        Ok(written)
-    }
-
-    async fn flush_direct_write(&self, ino: Ino) -> VfsResult<()> {
-        self.flush(ino).await?;
-        self.sync_inode_to_backend(ino, direct_io_sync_timeout())
-            .await
+        let _ = fh; // reserved for future per-handle write policy
+        self.write(ino, offset, data).await
     }
 
     async fn sync_inode_to_backend(&self, ino: Ino, timeout: Duration) -> VfsResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
+            // Always drain: a block may be in transit between dirty_mem and
+            // ingress_live (removed from one stage but not yet inserted into
+            // the next).  Skipping the drain when dirty_mem.has_ino is false
+            // could let the loop exit prematurely while the block is still
+            // "in the air" between pipeline stages.
             self.drain_dirty_mem().await;
             let has_pending_ingress = self.inode_has_pending_ingress(ino);
             let has_pending_uploads = self.inode_has_pending_uploads(ino);
@@ -7994,7 +7993,27 @@ impl StudioVfs {
                 other => VfsError::Other(other.to_string()),
             })?;
         let payload = read_object(&compressed).map_err(|e| VfsError::Other(e.to_string()))?;
-        Ok(Bytes::from(payload))
+        let data = Bytes::from(payload);
+
+        // Warm L2 (disk cache) so subsequent reads of the same block avoid
+        // another S3 round-trip.  L1 (RAM) promotion is intentionally skipped
+        // to prevent streaming direct-IO reads from evicting hot working-set
+        // entries.
+        if let Err(e) = self
+            .block_cache
+            .commit_l2(block_ref.object_id, &data)
+            .await
+        {
+            tracing::debug!(
+                ino,
+                block_index,
+                object_id = block_ref.object_id,
+                error = %e,
+                "failed to warm L2 cache for direct-io read"
+            );
+        }
+
+        Ok(data)
     }
 
     // =========================================================================
