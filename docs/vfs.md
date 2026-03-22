@@ -192,6 +192,7 @@ Handle-aware read path:
   - disables best-effort prefetch for that read,
   - resolves committed blocks through an L2-only direct path (no L1 lookup/promotion),
   - blocks fetched from S3 are cached in L2 (disk cache) to avoid repeat remote fetches.
+- WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
 
 ## FetchScheduler (`fetch.rs`)
 

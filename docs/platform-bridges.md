@@ -89,6 +89,11 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `set_delete` | _(mark for delete)_ |
 | `cleanup` + delete flag | `unlink()` / `rmdir()` |
 
+I/O buffer behavior on Windows callbacks:
+- `read`: WinFSP-provided output buffer is filled directly by `read_into_fh()` (no intermediate `Vec<u8>` and no extra memcpy in `StudioFsContext`).
+- `write`: WinFSP-provided input buffer is forwarded directly to `write_fh()` (no intermediate `to_vec()` copy in `StudioFsContext`).
+- `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
+
 **Attribute mapping:**
 - `InodeAttr.win_attrs` → Win32 `FILE_ATTRIBUTE_*` flags
 - Directories always have `FILE_ATTRIBUTE_DIRECTORY`
