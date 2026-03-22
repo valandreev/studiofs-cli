@@ -41,6 +41,7 @@ const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
 const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 const STATUS_EA_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0050_u32 as i32);
+const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
 
@@ -65,6 +66,52 @@ impl StudioFileHandle {
             open_flags,
             dir_buffer: DirBuffer::new(),
         }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct SendMutBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: The wrapper only marks transport capability across threads.
+// Call sites must guarantee pointer validity, exclusivity, and lifetime.
+unsafe impl Send for SendMutBuffer {}
+
+impl SendMutBuffer {
+    fn from_slice(slice: &mut [u8]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct SendConstBuffer {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: The wrapper only marks transport capability across threads.
+// Call sites must guarantee pointer validity and lifetime.
+unsafe impl Send for SendConstBuffer {}
+
+impl SendConstBuffer {
+    fn from_slice(slice: &[u8]) -> Self {
+        Self {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    unsafe fn as_slice<'a>(self) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -364,6 +411,42 @@ fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool
     }
 }
 
+fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool {
+    const REPLACEMENT_CHAR: u16 = 0xFFFD;
+    out.clear();
+    let mut had_invalid_utf8 = false;
+    let mut rest = entry_name;
+
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.extend(valid.encode_utf16());
+                break;
+            }
+            Err(err) => {
+                had_invalid_utf8 = true;
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    // SAFETY: `valid_up_to` prefix is guaranteed valid UTF-8 by `Utf8Error`.
+                    let valid = unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) };
+                    out.extend(valid.encode_utf16());
+                }
+
+                // Invalid sequence maps to U+FFFD in lossy conversion semantics.
+                out.push(REPLACEMENT_CHAR);
+
+                let skip = err.error_len().unwrap_or(1);
+                if valid_up_to + skip > rest.len() {
+                    break;
+                }
+                rest = &rest[valid_up_to + skip..];
+            }
+        }
+    }
+
+    had_invalid_utf8
+}
+
 // ─── FileSystemContext ───────────────────────────────────────────────────────
 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
@@ -416,6 +499,7 @@ impl StudioFsContext {
     /// This is important because WinFSP uses IOCP with a limited concurrency.
     /// `block_on` makes the current thread drive the future, which can interact
     /// poorly with the tokio IO reactor when called from non-runtime threads.
+    /// Expected operational failures must be propagated as `Result`, not panics.
     fn spawn_wait<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T> + Send + 'static,
@@ -600,23 +684,25 @@ impl FileSystemContext for StudioFsContext {
         offset: u64,
     ) -> winfsp::Result<u32> {
         // Spawn the async read on a tokio worker thread so the WinFSP
-        // dispatch thread doesn't participate in IO polling.  We allocate
-        // an owned buffer, copy the result back.
+        // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
         let fh = context.fh;
-        let buf_len = buffer.len();
+        let out_buf = SendMutBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
 
-        let result: Result<(u32, Vec<u8>), _> = self.spawn_wait(async move {
-            let mut owned = vec![0u8; buf_len];
-            let n = vfs.read_into_fh(fh, ino, offset, &mut owned).await?;
-            owned.truncate(n as usize);
-            Ok((n, owned))
+        let result: Result<u32, _> = self.spawn_wait(async move {
+            // SAFETY:
+            // - `out_buf` originates from the WinFSP-provided `buffer` and remains
+            //   valid for the duration of this callback.
+            // - `spawn_wait` blocks until this task completes, so the caller cannot
+            //   observe or alias `buffer` concurrently while this mutable slice exists.
+            // - `u8` alignment is always valid (alignment = 1).
+            let out = unsafe { out_buf.as_mut_slice() };
+            vfs.read_into_fh(fh, ino, offset, out).await
         });
 
         match result {
-            Ok((n, data)) => {
-                buffer[..n as usize].copy_from_slice(&data);
+            Ok(n) => {
                 trace!(
                     ino,
                     fh,
@@ -664,10 +750,19 @@ impl FileSystemContext for StudioFsContext {
 
         let ino = context.ino;
         let fh = context.fh;
-        let data = buffer.to_vec();
+        let in_buf = SendConstBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
         let written = self
-            .spawn_wait(async move { vfs.write_fh(fh, ino, actual_offset, &data).await })
+            .spawn_wait(async move {
+                // SAFETY:
+                // - `in_buf` points at WinFSP-provided request bytes that stay valid
+                //   for the duration of this callback.
+                // - `spawn_wait` blocks until completion, so the source memory
+                //   is not accessed after this callback returns.
+                // - `u8` alignment is always valid (alignment = 1).
+                let data = unsafe { in_buf.as_slice() };
+                vfs.write_fh(fh, ino, actual_offset, data).await
+            })
             .map_err(vfs_to_winfsp_err)?;
 
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -702,7 +797,7 @@ impl FileSystemContext for StudioFsContext {
 
             // Add "." entry
             {
-                let mut dot = DirInfo::<255>::new();
+                let mut dot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
                 dot.set_name_raw(DOT)?;
                 let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
                 *dot.file_info_mut() = attr_to_file_info(&attr);
@@ -711,7 +806,7 @@ impl FileSystemContext for StudioFsContext {
 
             // Add ".." entry
             {
-                let mut dotdot = DirInfo::<255>::new();
+                let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
                 dotdot.set_name_raw(DOTDOT)?;
                 if let Ok(attr) = self.vfs.getattr(context.ino) {
                     *dotdot.file_info_mut() = attr_to_file_info(&attr);
@@ -722,27 +817,49 @@ impl FileSystemContext for StudioFsContext {
             // Add all directory entries
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
             debug!(ino = context.ino, count = entries.len(), "read_directory");
+            let mut name_u16 = Vec::<u16>::new();
 
             for entry in &entries {
-                let name_cow = String::from_utf8_lossy(&entry.name);
-                let name_u16: Vec<u16> = name_cow.encode_utf16().collect();
-                let mut dir_info = DirInfo::<255>::new();
+                let had_invalid_utf8 = encode_entry_name_utf16_lossy(&entry.name, &mut name_u16);
+                if name_u16.len() > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
+                    warn!(
+                        ino = context.ino,
+                        entry_ino = entry.ino,
+                        utf16_len = name_u16.len(),
+                        max_utf16_len = MAX_WINDOWS_COMPONENT_UTF16_UNITS,
+                        "read_directory skipping overlong entry name"
+                    );
+                    continue;
+                }
+
+                let mut dir_info = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
                 if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
-                    warn!("failed to set name for entry: {}", name_cow);
+                    let display_name = String::from_utf8_lossy(&entry.name);
+                    warn!(
+                        "failed to set name for entry '{}': bytes={} utf16_len={}",
+                        display_name,
+                        entry.name.len(),
+                        name_u16.len()
+                    );
                     continue;
                 }
 
                 let child_attr = match self.vfs.getattr(entry.ino) {
                     Ok(a) => a,
                     Err(e) => {
-                        warn!("failed to get attr for {}: {:?}", name_cow, e);
+                        let display_name = String::from_utf8_lossy(&entry.name);
+                        warn!(
+                            "failed to get attr for '{}': {:?} (had_invalid_utf8={})",
+                            display_name, e, had_invalid_utf8
+                        );
                         continue;
                     }
                 };
                 *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
                 if let Err(e) = lock.write(&mut dir_info) {
-                    warn!("DirBuffer write failed for '{}': {:?}", name_cow, e);
+                    let display_name = String::from_utf8_lossy(&entry.name);
+                    warn!("DirBuffer write failed for '{}': {:?}", display_name, e);
                     break;
                 }
             }
