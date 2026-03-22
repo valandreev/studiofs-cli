@@ -62,32 +62,40 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   - Linux: `O_DIRECT`
   - Windows: `FILE_FLAG_NO_BUFFERING`
   - macOS: `fcntl(F_NOCACHE, 1)`
-  All direct-read paths use page-aligned `BytesMut` and freeze into `Bytes`
-  without secondary `copy_from_slice()`.
+  Direct-read opens the file in direct mode, then derives block size from
+  either size hint or opened-file metadata (`std_file.metadata()`), avoiding
+  extra path-based `stat` races.
 - **Robust fallback** — when a platform/filesystem rejects direct I/O for a
   file, read path transparently falls back to async buffered file reads
-- **Alignment safety** — files whose length is not direct-I/O aligned also
-  fall back to buffered reads to avoid `EINVAL`-style failures on strict filesystems
+- **Alignment strategy** — L2 direct-read targets use a 4 KiB-aligned
+  `BytesMut` allocation helper; if caller buffer/length is still unsuitable
+  for direct mode, platform layer uses a temporary aligned bounce buffer
 - **Direct-write attempt by platform** — temporary block files use the same
   platform direct-I/O strategy when supported, with buffered fallback when
   alignment or filesystem constraints reject direct mode
-- **Write alignment guard** — non-aligned payload sizes use buffered writes
-  directly (no direct-write + truncate roundtrip), reducing metadata churn risk
-  on filesystems where `ftruncate` can be expensive
+- **Write alignment guard** — for non-aligned payload sizes, direct-write path
+  pads to aligned length and truncates to payload size to preserve on-disk
+  visible length
 - **Reduced zero-fill overhead** — aligned direct-I/O buffers are allocated
   without full upfront zeroing; only payload bytes (and required tail padding)
   are initialized
 - **Fewer stat syscalls on hot reads** — `BlockCache` now passes known block
   size from LRU/cache metadata into L2 direct-read path, avoiding per-read
   `metadata()` in the common case
+- **Hinted-size validation** — if a hinted direct-read returns a different
+  payload length than expected, the direct path is discarded and read retries
+  via buffered fallback for correctness
 - **Current Linux runtime note** — this path does not use `io_uring` yet; it
-  uses Tokio file APIs and direct-open flags with async fallback behavior
+  runs direct reads/writes in bounded `spawn_blocking` workers with
+  `std::fs::OpenOptions` + direct-open flags and async buffered fallback
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
 
 **Batch operations:**
 - `put_batch(blocks)` — parallel `spawn_blocking` per block
 - `get_batch(ids)` — parallel async fan-out with preserved input order
+- `get_batch_with_size_hints([(id, Option<size>)])` — same as `get_batch`, but
+  can skip per-item `metadata()` when caller already knows block lengths
 
 ### L2 Commit Scheduler (`block_cache.rs`)
 
