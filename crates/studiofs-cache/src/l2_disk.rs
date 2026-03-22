@@ -22,7 +22,7 @@
 //! - **Batch put/get:** `put_batch` and `get_batch` amortise thread-pool
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -209,13 +209,19 @@ impl L2DiskCache {
         path: PathBuf,
         expected_len_hint: Option<usize>,
     ) -> io::Result<Bytes> {
+        let expected_len = match expected_len_hint {
+            Some(len) => len,
+            None => tokio::fs::metadata(&path).await?.len() as usize,
+        };
+
+        let mut direct_buf = BytesMut::zeroed(expected_len);
         {
             let permit = self.acquire_io_permit().await?;
-            if let Some(bytes) =
-                platform_direct_io::read_block_direct(path.clone(), expected_len_hint, permit)
-                    .await?
+            if let Some(read_len) =
+                platform_direct_io::read_block_direct(path.clone(), &mut direct_buf, permit).await?
             {
-                return Ok(bytes);
+                direct_buf.truncate(read_len);
+                return Ok(direct_buf.freeze());
             }
         }
 
@@ -266,13 +272,17 @@ impl L2DiskCache {
             handles.push((
                 id,
                 tokio::spawn(async move {
+                    let expected_len = tokio::fs::metadata(&path).await?.len() as usize;
+                    let mut direct_buf = BytesMut::zeroed(expected_len);
                     let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
                     })?;
-                    if let Some(bytes) =
-                        platform_direct_io::read_block_direct(path.clone(), None, permit).await?
+                    if let Some(read_len) =
+                        platform_direct_io::read_block_direct(path.clone(), &mut direct_buf, permit)
+                            .await?
                     {
-                        Ok(bytes)
+                        direct_buf.truncate(read_len);
+                        Ok(direct_buf.freeze())
                     } else {
                         Self::read_block_buffered(path, semaphore.clone()).await
                     }
