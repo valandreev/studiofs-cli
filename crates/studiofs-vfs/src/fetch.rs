@@ -482,7 +482,7 @@ impl FetchScheduler {
                     );
 
                     // Decode STFS object payload.
-                    let payload = Bytes::from(read_object(&compressed)?);
+                    let payload = read_object(compressed)?;
 
                     // Populate cache (L1 + L2).
                     self.cache

@@ -312,10 +312,9 @@ impl Materializer {
         let mut drained_spill_blocks = 0u64;
         let mut drained_spill_bytes = 0u64;
 
-        for (idx, extent) in extents.iter().enumerate() {
-            vfs.block_cache
-                .stage_l1(extent.object_id, extent.data.clone());
-            l2_work.push((extent.object_id, extent.data.clone()));
+        for (idx, extent) in extents.into_iter().enumerate() {
+            let data = extent.data;
+            vfs.block_cache.stage_l1(extent.object_id, data.clone());
 
             let file_offset = (extent.block_index as u64) * vfs.block_size as u64;
             upload_ops.push((
@@ -336,7 +335,7 @@ impl Materializer {
                 let key = (extent.ino, extent.block_index);
                 let remove_match = dirty
                     .get(&key)
-                    .is_some_and(|current| current.as_ref() == extent.data.as_ref());
+                    .is_some_and(|current| current.as_ref() == data.as_ref());
                 // `dirty_mem` is `DirtyMemIndex`: remove() updates both payload map
                 // and per-inode counters atomically.
                 if remove_match && let Some(removed) = dirty.remove(&key) {
@@ -352,18 +351,19 @@ impl Materializer {
             let should_remove_spill = spill_entry
                 .as_ref()
                 .and_then(|entry| read_ingress_entry_bytes(entry).ok())
-                .is_some_and(|current| current.as_ref() == extent.data.as_ref());
+                .is_some_and(|current| current.as_ref() == data.as_ref());
             if should_remove_spill {
                 let _ = vfs.remove_spill_entry((extent.ino, extent.block_index));
             }
 
             if extent.from_spill {
                 drained_spill_blocks = drained_spill_blocks.saturating_add(1);
-                drained_spill_bytes = drained_spill_bytes.saturating_add(extent.data.len() as u64);
+                drained_spill_bytes = drained_spill_bytes.saturating_add(data.len() as u64);
             } else {
                 drained_mem_blocks = drained_mem_blocks.saturating_add(1);
-                drained_mem_bytes = drained_mem_bytes.saturating_add(extent.data.len() as u64);
+                drained_mem_bytes = drained_mem_bytes.saturating_add(data.len() as u64);
             }
+            l2_work.push((extent.object_id, data));
 
             if let Some(ref old_block) = results[idx].old_block {
                 debug!(
@@ -419,7 +419,7 @@ impl Materializer {
             drained_spill_bytes,
         );
 
-        if let Err(e) = vfs.block_cache.commit_l2_batch(&l2_work).await {
+        if let Err(e) = vfs.block_cache.commit_l2_batch(l2_work).await {
             warn!(error = %e, blocks = batch_len, "materializer: failed to enqueue L2 batch");
         }
 

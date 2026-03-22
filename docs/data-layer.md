@@ -32,7 +32,8 @@ Objects are routed to S3 using the following paths:
 
 Objects are immutable and content-addressable by their sequential ID, not content hash (deduplication is removed in the current VFS architecture).
 
-Every object consists of a **fixed 32-byte header** followed by the raw payload.
+Every object consists of a **fixed 30-byte wire-format header** followed by the raw payload.
+In-memory Rust struct layout can be larger due to alignment, but serialized bytes on disk/S3 are exactly 30 bytes.
 
 ### Header Layout
 Little-endian encoding is used for all multi-byte fields.
@@ -54,6 +55,8 @@ Little-endian encoding is used for all multi-byte fields.
 | Reserved         |  6 bytes (future use)
 +------------------+
 ```
+
+On read, payload decode uses `bytes::Bytes` slicing (`Bytes::slice`) so the payload view is returned without an additional full-buffer copy.
 
 ### Flags
 

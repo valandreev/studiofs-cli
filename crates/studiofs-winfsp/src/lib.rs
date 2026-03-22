@@ -151,9 +151,7 @@ pub fn mount_and_serve(
 
     let options = parse_mount_options(volume_label, direct_io)?;
     if direct_io {
-        tracing::info!(
-            "direct-io mode enabled: unbuffered handles use write-through data path"
-        );
+        tracing::info!("direct-io mode enabled: unbuffered handles use write-through data path");
     }
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
