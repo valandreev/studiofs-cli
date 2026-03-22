@@ -134,6 +134,9 @@ pub(crate) async fn read_block_direct(
             .read(true)
             .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
             .open(&path)?;
+        // SAFETY: `dst_addr`/`dst_len` come from a live `&mut [u8]` in the
+        // async caller. We await this task before returning, so the buffer
+        // outlives the blocking read and is not aliased.
         let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, dst_len) };
         read_from_std_file_direct_into(std_file, dst_slice)
     })
@@ -211,6 +214,9 @@ pub(crate) async fn read_block_direct(
             .read(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING)
             .open(&path)?;
+        // SAFETY: `dst_addr`/`dst_len` come from a live `&mut [u8]` in the
+        // async caller. We await this task before returning, so the buffer
+        // outlives the blocking read and is not aliased.
         let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, dst_len) };
         read_from_std_file_direct_into(std_file, dst_slice)
     })
@@ -290,6 +296,9 @@ pub(crate) async fn read_block_direct(
         if rc == -1 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `dst_addr`/`dst_len` come from a live `&mut [u8]` in the
+        // async caller. We await this task before returning, so the buffer
+        // outlives the blocking read and is not aliased.
         let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, dst_len) };
         read_from_std_file_direct_into(std_file, dst_slice)
     })
