@@ -169,10 +169,14 @@ impl AimdController {
         }
     }
 
-    /// Return a future that resolves when AIMD concurrency state changes.
+    /// Return a future that resolves when AIMD state changes and waiters are notified.
     ///
-    /// Callers should register this before checking admission conditions to
-    /// avoid missed wakeups.
+    /// This is a low-level wake signal: it does **not** guarantee that a slot
+    /// is now available. Callers must re-check their admission condition after
+    /// awaiting it.
+    ///
+    /// Register the future *before* checking admission conditions to avoid
+    /// missed wakeups.
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
