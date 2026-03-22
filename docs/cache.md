@@ -98,6 +98,7 @@ Bounded scheduler for asynchronous L2 commits from the materializer path.
 | Workers | 32 (default profile), 4 (`--l2-profile usb`) |
 | Queue capacity | 4096 (default profile), 256 (`--l2-profile usb`) |
 | Backpressure | `commit_l2_batch` awaits when queue is full |
+| Batch ownership | `commit_l2_batch` consumes `Vec<(ObjectId, Bytes)>` and moves buffers into the scheduler without per-item clone in the cache layer |
 | Worker behavior | each worker writes sequentially via `l2.put_bytes()` |
 
 This replaces the previous fire-and-forget fan-out model and caps concurrent
@@ -171,7 +172,7 @@ Unified API combining all components above.
 | `get(id)` | L1 → L2 → miss (returns None) |
 | `stage_l1(id, data)` | Insert into L1 + LRU as `MemoryOnly` |
 | `commit_l2(id, data)` | Enqueue one L2 commit into bounded scheduler |
-| `commit_l2_batch(blocks)` | Enqueue batch into bounded scheduler (applies backpressure on full queue) |
+| `commit_l2_batch(blocks)` | Consume and enqueue `Vec<(ObjectId, Bytes)>` into bounded scheduler (applies backpressure on full queue) |
 | `submit_upload(ino, offset, id)` | Enqueue for S3 upload via journal |
 | `complete_upload(pending)` | Unpin block in LRU |
 | `evict_one_l1()` | Demote one block from L1 |
@@ -215,7 +216,7 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   ├─ Take batch of up to 1024 blocks
   ├─ stage_l1() for each block          ← immediate L1 insert
   ├─ Batch metadata commit (local staged refs only)
-  ├─ commit_l2_batch() enqueue          ← bounded queue + fixed workers
+  ├─ commit_l2_batch() enqueue          ← consumes owned batch, bounded queue + fixed workers
   └─ submit_upload(..., content_epoch)  ← journal + S3 queue
 ```
 

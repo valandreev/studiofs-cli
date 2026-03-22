@@ -124,7 +124,7 @@ dirty_mem + ingress_spill
   │    └─ meta.flush_blocks_batch()   ← local pending refs only
   │
   ├─ Phase 2: L2 commit scheduling (bounded)
-  │    └─ cache.commit_l2_batch(blocks) — bounded queue + fixed worker pool
+  │    └─ cache.commit_l2_batch(blocks) — consumes owned `Vec<(ObjectId, Bytes)>`, bounded queue + fixed worker pool
   │
   ├─ Phase 3: Upload enqueue for accepted incarnation extents
   │    └─ cache.submit_upload(..., content_epoch) for each
@@ -213,7 +213,7 @@ fetch_block(object_id)
   ├─ Acquire AIMD permit (may block if at capacity)
   │
   ├─ S3 GET with configurable timeout (default 45s)
-  ├─ Decode object + verify checksum
+  ├─ Decode object + verify checksum (zero-copy `Bytes` slice payload)
   ├─ Populate L1 + L2 cache
   ├─ Resolve AIMD permit (success/failure)
   │
