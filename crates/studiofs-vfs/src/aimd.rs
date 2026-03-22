@@ -169,6 +169,18 @@ impl AimdController {
         }
     }
 
+    /// Return a future that resolves when AIMD state changes and waiters are notified.
+    ///
+    /// This is a low-level wake signal: it does **not** guarantee that a slot
+    /// is now available. Callers must re-check their admission condition after
+    /// awaiting it.
+    ///
+    /// Register the future *before* checking admission conditions to avoid
+    /// missed wakeups.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
     /// Record a successful completion and release one in-flight slot.
     fn on_success(&self) {
         self.successes.fetch_add(1, Ordering::Relaxed);
