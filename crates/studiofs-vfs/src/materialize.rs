@@ -22,6 +22,7 @@ struct MaterializedExtent {
     block_index: u32,
     data: Bytes,
     from_spill: bool,
+    spill_seq: Option<u64>,
     object_id: u64,
     content_epoch: u64,
 }
@@ -141,7 +142,20 @@ impl Materializer {
             return None;
         }
 
-        let mut work: Vec<(Ino, u32, Bytes, bool)> = Vec::with_capacity(keys.len());
+        let mut dirty_snapshot: HashMap<(Ino, u32), Bytes> = {
+            let dirty = vfs.state.dirty_mem.lock();
+            keys.iter()
+                .filter_map(|key| dirty.get(key).cloned().map(|data| (*key, data)))
+                .collect()
+        };
+        let mut ingress_snapshot: HashMap<(Ino, u32), SpillEntry> = {
+            let ingress = vfs.state.ingress_live.lock();
+            keys.iter()
+                .filter_map(|key| ingress.get_cloned(key).map(|entry| (*key, entry)))
+                .collect()
+        };
+
+        let mut work: Vec<(Ino, u32, Bytes, bool, Option<u64>)> = Vec::with_capacity(keys.len());
         for (ino, block_index) in keys {
             if vfs.state.deleted_inodes.lock().contains(&ino) {
                 // `dirty_mem` is `DirtyMemIndex`: remove() updates both payload map
@@ -164,26 +178,31 @@ impl Materializer {
                 continue;
             }
 
-            let (data, from_spill) = {
-                let dirty = vfs.state.dirty_mem.lock();
-                match dirty.get(&(ino, block_index)) {
-                    Some(d) => (d.clone(), false),
-                    None => match vfs.load_spill_block((ino, block_index)) {
-                        Ok(Some(d)) => (d, true),
-                        Ok(None) => continue,
-                        Err(e) => {
-                            error!(
-                                ino,
-                                block_index,
-                                error = %e,
-                                "materializer: failed to load spill block"
-                            );
-                            return None;
-                        }
-                    },
+            let dirty_data = dirty_snapshot.remove(&(ino, block_index));
+            let (data, from_spill, spill_seq) = if let Some(d) = dirty_data {
+                let spill_seq = ingress_snapshot
+                    .remove(&(ino, block_index))
+                    .map(|entry| entry.seq);
+                (d, false, spill_seq)
+            } else {
+                let spill_entry = ingress_snapshot.remove(&(ino, block_index));
+                let Some(spill_entry) = spill_entry else {
+                    continue;
+                };
+                match read_ingress_entry_bytes(&spill_entry) {
+                    Ok(d) => (d, true, Some(spill_entry.seq)),
+                    Err(e) => {
+                        error!(
+                            ino,
+                            block_index,
+                            error = %e,
+                            "materializer: failed to load spill block"
+                        );
+                        return None;
+                    }
                 }
             };
-            work.push((ino, block_index, data, from_spill));
+            work.push((ino, block_index, data, from_spill, spill_seq));
         }
 
         if work.is_empty() {
@@ -206,7 +225,7 @@ impl Materializer {
         let entries: Vec<BatchFlushEntry> = work
             .iter()
             .zip(ids.iter())
-            .map(|((ino, block_index, data, _from_spill), &object_id)| {
+            .map(|((ino, block_index, data, _from_spill, _spill_seq), &object_id)| {
                 let length = data.len() as u32;
                 let flags = if length < vfs.block_size {
                     BlockFlags::PARTIAL_BLOCK
@@ -237,7 +256,8 @@ impl Materializer {
 
         let mut epoch_cache = HashMap::<Ino, u64>::new();
         let mut extents = Vec::with_capacity(work.len());
-        for (idx, (ino, block_index, data, from_spill)) in work.into_iter().enumerate() {
+        for (idx, (ino, block_index, data, from_spill, spill_seq)) in work.into_iter().enumerate()
+        {
             let content_epoch = if let Some(epoch) = epoch_cache.get(&ino) {
                 *epoch
             } else {
@@ -256,6 +276,7 @@ impl Materializer {
                 block_index,
                 data,
                 from_spill,
+                spill_seq,
                 object_id: ids[idx],
                 content_epoch,
             });
@@ -343,15 +364,13 @@ impl Materializer {
                 }
             }
 
-            let spill_entry = vfs
-                .state
-                .ingress_live
-                .lock()
-                .get_cloned(&(extent.ino, extent.block_index));
-            let should_remove_spill = spill_entry
-                .as_ref()
-                .and_then(|entry| read_ingress_entry_bytes(entry).ok())
-                .is_some_and(|current| current.as_ref() == data.as_ref());
+            let should_remove_spill = extent.spill_seq.is_some_and(|expected_seq| {
+                vfs.state
+                    .ingress_live
+                    .lock()
+                    .get_cloned(&(extent.ino, extent.block_index))
+                    .is_some_and(|entry| entry.seq == expected_seq)
+            });
             if should_remove_spill {
                 let _ = vfs.remove_spill_entry((extent.ino, extent.block_index));
             }

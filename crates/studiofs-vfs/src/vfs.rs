@@ -33,7 +33,7 @@ use crate::qos::{FairInodeScheduler, QosController};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{run_blocking, run_meta};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use opendal::options::WriteOptions;
 use opendal::{EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
@@ -5447,7 +5447,6 @@ impl StudioVfs {
         let state = self.state.clone();
         let ingress_segment_dir = self.ingress_segment_dir.clone();
         let max_ingress_segment_bytes = self.max_ingress_segment_bytes;
-        let data = data.as_ref().to_vec();
         run_blocking(move || {
             let (seq, created_unix_ms, segment_id, offset) = {
                 let _guard = state.ingress_segment_write_lock.lock();
@@ -5607,8 +5606,16 @@ impl StudioVfs {
                 return false;
             }
         };
-        let (owner, current_until, fencing) = match Self::decode_lease_record(&current_raw.to_vec())
-        {
+        let decoded_lease = {
+            let raw_chunk = current_raw.chunk();
+            if raw_chunk.len() == current_raw.remaining() {
+                Self::decode_lease_record(raw_chunk)
+            } else {
+                let current_raw = current_raw.to_bytes();
+                Self::decode_lease_record(&current_raw)
+            }
+        };
+        let (owner, current_until, fencing) = match decoded_lease {
             Some(v) => v,
             None => ("".to_string(), 0, 0),
         };
@@ -5723,8 +5730,16 @@ impl StudioVfs {
                     let etag = meta.etag().map(ToString::to_string);
                     match cfg.op.read(&path).await {
                         Ok(raw) => {
-                            let parsed =
-                                Self::decode_remote_lock_record(&raw.to_vec()).unwrap_or_default();
+                            let parsed = {
+                                let raw_chunk = raw.chunk();
+                                if raw_chunk.len() == raw.remaining() {
+                                    Self::decode_remote_lock_record(raw_chunk)
+                                } else {
+                                    let raw = raw.to_bytes();
+                                    Self::decode_remote_lock_record(&raw)
+                                }
+                            }
+                            .unwrap_or_default();
                             (parsed, etag)
                         }
                         Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
