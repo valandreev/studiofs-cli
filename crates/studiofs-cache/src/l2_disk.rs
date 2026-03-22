@@ -85,6 +85,43 @@ fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut
     Ok(raw)
 }
 
+fn try_read_direct_block(
+    path: &Path,
+    expected_len_hint: Option<usize>,
+) -> io::Result<Option<Bytes>> {
+    let Some(std_file) = platform_direct_io::open_block_direct_read(path)? else {
+        return Ok(None);
+    };
+
+    let expected_len = match expected_len_hint {
+        Some(len) => len,
+        None => std_file.metadata()?.len() as usize,
+    };
+    let mut direct_buf =
+        aligned_bytes_mut_uninit(expected_len, platform_direct_io::DIRECT_IO_ALIGNMENT)?;
+    if let Some(read_len) =
+        platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf)?
+    {
+        if read_len > expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "direct read returned more bytes than requested",
+            ));
+        }
+        if expected_len_hint.is_some() && read_len != expected_len {
+            debug!(
+                expected_len,
+                read_len, "direct read size mismatch for hinted block; falling back"
+            );
+            return Ok(None);
+        }
+        direct_buf.truncate(read_len);
+        Ok(Some(direct_buf.freeze()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// File-per-block disk cache on NVMe.
 pub struct L2DiskCache {
     /// Root cache directory (contains `blocks/` subdirectory).
@@ -261,41 +298,7 @@ impl L2DiskCache {
                 "l2_read_direct",
                 move || -> io::Result<Option<Bytes>> {
                     let _permit = permit;
-                    let Some(std_file) =
-                        platform_direct_io::open_block_direct_read(&path_for_direct)?
-                    else {
-                        return Ok(None);
-                    };
-                    let expected_len = match expected_len_hint {
-                        Some(len) => len,
-                        None => std_file.metadata()?.len() as usize,
-                    };
-                    let mut direct_buf = aligned_bytes_mut_uninit(
-                        expected_len,
-                        platform_direct_io::DIRECT_IO_ALIGNMENT,
-                    )?;
-                    if let Some(read_len) =
-                        platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf)?
-                    {
-                        if read_len > expected_len {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "direct read returned more bytes than requested",
-                            ));
-                        }
-                        if expected_len_hint.is_some() && read_len != expected_len {
-                            debug!(
-                                expected_len,
-                                read_len,
-                                "direct read size mismatch for hinted block; falling back"
-                            );
-                            return Ok(None);
-                        }
-                        direct_buf.truncate(read_len);
-                        Ok(Some(direct_buf.freeze()))
-                    } else {
-                        Ok(None)
-                    }
+                    try_read_direct_block(&path_for_direct, expected_len_hint)
                 },
             )
             .await
@@ -372,42 +375,10 @@ impl L2DiskCache {
                         "l2_read_batch_direct",
                         move || -> io::Result<Option<Bytes>> {
                             let _permit = permit;
-                            let Some(std_file) =
-                                platform_direct_io::open_block_direct_read(&path_for_direct)?
-                            else {
-                                return Ok(None);
-                            };
-                            let expected_len = match size_hint {
-                                Some(len) => len as usize,
-                                None => std_file.metadata()?.len() as usize,
-                            };
-                            let mut direct_buf = aligned_bytes_mut_uninit(
-                                expected_len,
-                                platform_direct_io::DIRECT_IO_ALIGNMENT,
-                            )?;
-                            if let Some(read_len) = platform_direct_io::read_block_direct_from_file(
-                                std_file,
-                                &mut direct_buf,
-                            )? {
-                                if read_len > expected_len {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "direct read returned more bytes than requested",
-                                    ));
-                                }
-                                if size_hint.is_some() && read_len != expected_len {
-                                    debug!(
-                                        expected_len,
-                                        read_len,
-                                        "direct batch read size mismatch for hinted block; falling back"
-                                    );
-                                    return Ok(None);
-                                }
-                                direct_buf.truncate(read_len);
-                                Ok(Some(direct_buf.freeze()))
-                            } else {
-                                Ok(None)
-                            }
+                            try_read_direct_block(
+                                &path_for_direct,
+                                size_hint.map(|len| len as usize),
+                            )
                         },
                     )
                     .await

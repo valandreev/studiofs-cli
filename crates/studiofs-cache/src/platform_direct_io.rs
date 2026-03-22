@@ -12,7 +12,7 @@ fn round_up_to_alignment(len: usize, alignment: usize) -> usize {
     len.div_ceil(alignment) * alignment
 }
 
-fn is_aligned(ptr: *const u8, alignment: usize) -> bool {
+fn is_aligned(ptr: *const (), alignment: usize) -> bool {
     (ptr as usize).is_multiple_of(alignment)
 }
 
@@ -43,7 +43,7 @@ fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io
         return Ok(0);
     }
 
-    let dst_aligned = is_aligned(dst.as_ptr(), DIRECT_IO_ALIGNMENT);
+    let dst_aligned = is_aligned(dst.as_ptr().cast::<()>(), DIRECT_IO_ALIGNMENT);
     let len_aligned = dst.len().is_multiple_of(DIRECT_IO_ALIGNMENT);
 
     if dst_aligned && len_aligned {
@@ -82,7 +82,7 @@ fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Res
         return Ok(());
     }
 
-    let data_aligned = is_aligned(data.as_ptr(), DIRECT_IO_ALIGNMENT);
+    let data_aligned = is_aligned(data.as_ptr().cast::<()>(), DIRECT_IO_ALIGNMENT);
     let len_aligned = data.len().is_multiple_of(DIRECT_IO_ALIGNMENT);
 
     if data_aligned && len_aligned {
