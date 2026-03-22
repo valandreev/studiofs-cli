@@ -224,6 +224,8 @@ fetch_block(object_id)
 Prefetch reads use `fetch_block_prefetch()`:
 - shares the same singleflight map and cache population path
 - keeps reserved AIMD headroom for foreground reads
+- waits asynchronously on AIMD notify events when no permit is available (no CPU spin loop)
+- bounds permit wait by `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS`, then skips prefetch
 - uses shorter retry policy (best-effort behavior)
 
 ### Fetch Metrics
