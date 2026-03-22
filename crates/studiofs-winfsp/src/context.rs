@@ -412,18 +412,39 @@ fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool
 }
 
 fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool {
+    const REPLACEMENT_CHAR: u16 = 0xFFFD;
     out.clear();
-    match std::str::from_utf8(entry_name) {
-        Ok(name) => {
-            out.extend(name.encode_utf16());
-            false
-        }
-        Err(_) => {
-            let lossy = String::from_utf8_lossy(entry_name);
-            out.extend(lossy.encode_utf16());
-            true
+    let mut had_invalid_utf8 = false;
+    let mut rest = entry_name;
+
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.extend(valid.encode_utf16());
+                break;
+            }
+            Err(err) => {
+                had_invalid_utf8 = true;
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    // SAFETY: `valid_up_to` prefix is guaranteed valid UTF-8 by `Utf8Error`.
+                    let valid = unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) };
+                    out.extend(valid.encode_utf16());
+                }
+
+                // Invalid sequence maps to U+FFFD in lossy conversion semantics.
+                out.push(REPLACEMENT_CHAR);
+
+                let skip = err.error_len().unwrap_or(1);
+                if valid_up_to + skip > rest.len() {
+                    break;
+                }
+                rest = &rest[valid_up_to + skip..];
+            }
         }
     }
+
+    had_invalid_utf8
 }
 
 // ─── FileSystemContext ───────────────────────────────────────────────────────
