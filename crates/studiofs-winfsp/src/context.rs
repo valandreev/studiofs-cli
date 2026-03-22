@@ -41,6 +41,7 @@ const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
 const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 const STATUS_EA_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0050_u32 as i32);
+const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
 
@@ -410,6 +411,21 @@ fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool
     }
 }
 
+fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool {
+    out.clear();
+    match std::str::from_utf8(entry_name) {
+        Ok(name) => {
+            out.extend(name.encode_utf16());
+            false
+        }
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(entry_name);
+            out.extend(lossy.encode_utf16());
+            true
+        }
+    }
+}
+
 // ─── FileSystemContext ───────────────────────────────────────────────────────
 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
@@ -760,7 +776,7 @@ impl FileSystemContext for StudioFsContext {
 
             // Add "." entry
             {
-                let mut dot = DirInfo::<255>::new();
+                let mut dot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
                 dot.set_name_raw(DOT)?;
                 let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
                 *dot.file_info_mut() = attr_to_file_info(&attr);
@@ -769,7 +785,7 @@ impl FileSystemContext for StudioFsContext {
 
             // Add ".." entry
             {
-                let mut dotdot = DirInfo::<255>::new();
+                let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
                 dotdot.set_name_raw(DOTDOT)?;
                 if let Ok(attr) = self.vfs.getattr(context.ino) {
                     *dotdot.file_info_mut() = attr_to_file_info(&attr);
@@ -783,26 +799,46 @@ impl FileSystemContext for StudioFsContext {
             let mut name_u16 = Vec::<u16>::new();
 
             for entry in &entries {
-                let name_cow = String::from_utf8_lossy(&entry.name);
-                name_u16.clear();
-                name_u16.extend(name_cow.encode_utf16());
-                let mut dir_info = DirInfo::<255>::new();
+                let had_invalid_utf8 = encode_entry_name_utf16_lossy(&entry.name, &mut name_u16);
+                if name_u16.len() > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
+                    warn!(
+                        ino = context.ino,
+                        entry_ino = entry.ino,
+                        utf16_len = name_u16.len(),
+                        max_utf16_len = MAX_WINDOWS_COMPONENT_UTF16_UNITS,
+                        "read_directory skipping overlong entry name"
+                    );
+                    continue;
+                }
+
+                let mut dir_info = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
                 if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
-                    warn!("failed to set name for entry: {}", name_cow);
+                    let display_name = String::from_utf8_lossy(&entry.name);
+                    warn!(
+                        "failed to set name for entry '{}': bytes={} utf16_len={}",
+                        display_name,
+                        entry.name.len(),
+                        name_u16.len()
+                    );
                     continue;
                 }
 
                 let child_attr = match self.vfs.getattr(entry.ino) {
                     Ok(a) => a,
                     Err(e) => {
-                        warn!("failed to get attr for {}: {:?}", name_cow, e);
+                        let display_name = String::from_utf8_lossy(&entry.name);
+                        warn!(
+                            "failed to get attr for '{}': {:?} (had_invalid_utf8={})",
+                            display_name, e, had_invalid_utf8
+                        );
                         continue;
                     }
                 };
                 *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
                 if let Err(e) = lock.write(&mut dir_info) {
-                    warn!("DirBuffer write failed for '{}': {:?}", name_cow, e);
+                    let display_name = String::from_utf8_lossy(&entry.name);
+                    warn!("DirBuffer write failed for '{}': {:?}", display_name, e);
                     break;
                 }
             }
