@@ -94,6 +94,8 @@ pending_blocks for this inode
   │
   ├─ `cache_safety_mode=durable`: append accepted records to ingress segments
   │   (durable local accept + startup replay)
+  │   - payload is passed as `Bytes` directly into the blocking spill writer
+  │     (no `to_vec()` deep-copy on the hot path)
   ├─ `cache_safety_mode=fast`: keep accepted payloads in RAM only and avoid
   │   duplicate ingress payload writes
   ├─ Update live ingress index / pending incarnation state
@@ -117,6 +119,8 @@ Runs every 10ms, processes continuously while data exists:
 dirty_mem + ingress_spill
   │
   ├─ Take batch of up to 1024 blocks
+  │    ├─ build `dirty_mem` and `ingress_live` snapshots for selected keys
+  │    └─ avoid per-key mutex contention while collecting batch payloads
   │
   ├─ Phase 1: pending manifest state update + L1 stage
   │    ├─ allocate object ids
@@ -130,6 +134,8 @@ dirty_mem + ingress_spill
   │    └─ cache.submit_upload(..., content_epoch) for each
   │
   ├─ Decrement dirty_bytes
+  ├─ Remove spill entries by `spill_seq` match against live index
+  │    (avoids re-reading full spill payloads from disk for byte-compare)
   ├─ Notify dirty_drained_notify (wake backpressured writers)
   │
   └─ If batch was full, loop immediately
