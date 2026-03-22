@@ -169,6 +169,14 @@ impl AimdController {
         }
     }
 
+    /// Return a future that resolves when AIMD concurrency state changes.
+    ///
+    /// Callers should register this before checking admission conditions to
+    /// avoid missed wakeups.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
     /// Record a successful completion and release one in-flight slot.
     fn on_success(&self) {
         self.successes.fetch_add(1, Ordering::Relaxed);

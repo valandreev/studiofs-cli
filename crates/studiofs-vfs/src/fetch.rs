@@ -426,13 +426,18 @@ impl FetchScheduler {
                 FetchClass::Prefetch => {
                     let deadline = Instant::now() + self.prefetch_acquire_wait;
                     loop {
+                        let notified = self.aimd.notified();
                         if let Some(permit) = self.try_acquire_prefetch_permit() {
                             break permit;
                         }
-                        if Instant::now() >= deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
                             return Err(FetchError::PrefetchSkipped);
                         }
-                        tokio::task::yield_now().await;
+                        let remaining = deadline.saturating_duration_since(now);
+                        if tokio::time::timeout(remaining, notified).await.is_err() {
+                            return Err(FetchError::PrefetchSkipped);
+                        }
                     }
                 }
             };
