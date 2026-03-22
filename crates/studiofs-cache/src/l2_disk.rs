@@ -40,6 +40,16 @@ use crate::platform_direct_io;
 /// Upper bound for active L2 blocking-I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 
+fn bytes_mut_uninit(len: usize) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(len);
+    // SAFETY: We only expose this buffer to I/O routines that immediately
+    // write initialized bytes into the slice before any read access.
+    unsafe {
+        buf.set_len(len);
+    }
+    buf
+}
+
 /// File-per-block disk cache on NVMe.
 pub struct L2DiskCache {
     /// Root cache directory (contains `blocks/` subdirectory).
@@ -209,19 +219,33 @@ impl L2DiskCache {
         path: PathBuf,
         expected_len_hint: Option<usize>,
     ) -> io::Result<Bytes> {
-        let expected_len = match expected_len_hint {
-            Some(len) => len,
-            None => tokio::fs::metadata(&path).await?.len() as usize,
-        };
-
-        let mut direct_buf = BytesMut::zeroed(expected_len);
         {
             let permit = self.acquire_io_permit().await?;
-            if let Some(read_len) =
-                platform_direct_io::read_block_direct(path.clone(), &mut direct_buf, permit).await?
-            {
-                direct_buf.truncate(read_len);
-                return Ok(direct_buf.freeze());
+            let path_for_direct = path.clone();
+            let direct = crate::runtime::spawn_blocking_profiled(
+                "l2_read_direct",
+                move || -> io::Result<Option<Bytes>> {
+                    let _permit = permit;
+                    let expected_len = match expected_len_hint {
+                        Some(len) => len,
+                        None => std::fs::metadata(&path_for_direct)?.len() as usize,
+                    };
+                    let mut direct_buf = bytes_mut_uninit(expected_len);
+                    if let Some(read_len) =
+                        platform_direct_io::read_block_direct(&path_for_direct, &mut direct_buf)?
+                    {
+                        direct_buf.truncate(read_len);
+                        Ok(Some(direct_buf.freeze()))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .await
+            .map_err(io::Error::other)??;
+
+            if let Some(bytes) = direct {
+                return Ok(bytes);
             }
         }
 
@@ -272,19 +296,33 @@ impl L2DiskCache {
             handles.push((
                 id,
                 tokio::spawn(async move {
-                    let expected_len = tokio::fs::metadata(&path).await?.len() as usize;
-                    let mut direct_buf = BytesMut::zeroed(expected_len);
                     let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
                     })?;
-                    if let Some(read_len) =
-                        platform_direct_io::read_block_direct(path.clone(), &mut direct_buf, permit)
-                            .await?
-                    {
-                        direct_buf.truncate(read_len);
-                        Ok(direct_buf.freeze())
-                    } else {
-                        Self::read_block_buffered(path, semaphore.clone()).await
+                    let path_for_direct = path.clone();
+                    let direct = crate::runtime::spawn_blocking_profiled(
+                        "l2_read_batch_direct",
+                        move || -> io::Result<Option<Bytes>> {
+                            let _permit = permit;
+                            let expected_len = std::fs::metadata(&path_for_direct)?.len() as usize;
+                            let mut direct_buf = bytes_mut_uninit(expected_len);
+                            if let Some(read_len) = platform_direct_io::read_block_direct(
+                                &path_for_direct,
+                                &mut direct_buf,
+                            )? {
+                                direct_buf.truncate(read_len);
+                                Ok(Some(direct_buf.freeze()))
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(io::Error::other)??;
+
+                    match direct {
+                        Some(bytes) => Ok(bytes),
+                        None => Self::read_block_buffered(path, semaphore.clone()).await,
                     }
                 }),
             ));

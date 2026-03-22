@@ -1,7 +1,6 @@
 use std::io;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use tokio::sync::OwnedSemaphorePermit;
+use std::path::Path;
 use tracing::debug;
 
 const DIRECT_IO_ALIGNMENT: usize = 4096;
@@ -119,29 +118,16 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) async fn read_block_direct(
-    path: PathBuf,
-    dst: &mut [u8],
-    permit: OwnedSemaphorePermit,
-) -> io::Result<Option<usize>> {
+pub(crate) fn read_block_direct(path: &Path, dst: &mut [u8]) -> io::Result<Option<usize>> {
     use std::os::unix::fs::OpenOptionsExt;
-    let dst_addr = dst.as_mut_ptr() as usize;
-    let dst_len = dst.len();
 
-    let outcome = tokio::task::spawn_blocking(move || -> io::Result<usize> {
-        let _permit = permit;
+    let outcome = (|| -> io::Result<usize> {
         let std_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
-            .open(&path)?;
-        // SAFETY: `dst_addr`/`dst_len` come from a live `&mut [u8]` in the
-        // async caller. We await this task before returning, so the buffer
-        // outlives the blocking read and is not aliased.
-        let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, dst_len) };
-        read_from_std_file_direct_into(std_file, dst_slice)
-    })
-    .await
-    .map_err(io::Error::other)?;
+            .open(path)?;
+        read_from_std_file_direct_into(std_file, dst)
+    })();
 
     match outcome {
         Ok(bytes) => Ok(Some(bytes)),
@@ -197,31 +183,18 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) async fn read_block_direct(
-    path: PathBuf,
-    dst: &mut [u8],
-    permit: OwnedSemaphorePermit,
-) -> io::Result<Option<usize>> {
+pub(crate) fn read_block_direct(path: &Path, dst: &mut [u8]) -> io::Result<Option<usize>> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-    let dst_addr = dst.as_mut_ptr() as usize;
-    let dst_len = dst.len();
 
-    let outcome = tokio::task::spawn_blocking(move || -> io::Result<usize> {
-        let _permit = permit;
+    let outcome = (|| -> io::Result<usize> {
         let std_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(&path)?;
-        // SAFETY: `dst_addr`/`dst_len` come from a live `&mut [u8]` in the
-        // async caller. We await this task before returning, so the buffer
-        // outlives the blocking read and is not aliased.
-        let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, dst_len) };
-        read_from_std_file_direct_into(std_file, dst_slice)
-    })
-    .await
-    .map_err(io::Error::other)?;
+            .open(path)?;
+        read_from_std_file_direct_into(std_file, dst)
+    })();
 
     match outcome {
         Ok(bytes) => Ok(Some(bytes)),
@@ -279,31 +252,18 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) async fn read_block_direct(
-    path: PathBuf,
-    dst: &mut [u8],
-    permit: OwnedSemaphorePermit,
-) -> io::Result<Option<usize>> {
+pub(crate) fn read_block_direct(path: &Path, dst: &mut [u8]) -> io::Result<Option<usize>> {
     use std::os::fd::AsRawFd;
-    let dst_addr = dst.as_mut_ptr() as usize;
-    let dst_len = dst.len();
 
-    let outcome = tokio::task::spawn_blocking(move || -> io::Result<usize> {
-        let _permit = permit;
-        let std_file = std::fs::OpenOptions::new().read(true).open(&path)?;
+    let outcome = (|| -> io::Result<usize> {
+        let std_file = std::fs::OpenOptions::new().read(true).open(path)?;
         let fd = std_file.as_raw_fd();
         let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
         if rc == -1 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `dst_addr`/`dst_len` come from a live `&mut [u8]` in the
-        // async caller. We await this task before returning, so the buffer
-        // outlives the blocking read and is not aliased.
-        let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, dst_len) };
-        read_from_std_file_direct_into(std_file, dst_slice)
-    })
-    .await
-    .map_err(io::Error::other)?;
+        read_from_std_file_direct_into(std_file, dst)
+    })();
 
     match outcome {
         Ok(bytes) => Ok(Some(bytes)),
@@ -344,11 +304,7 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-pub(crate) async fn read_block_direct(
-    _path: PathBuf,
-    _dst: &mut [u8],
-    _permit: OwnedSemaphorePermit,
-) -> io::Result<Option<usize>> {
+pub(crate) fn read_block_direct(_path: &Path, _dst: &mut [u8]) -> io::Result<Option<usize>> {
     Ok(None)
 }
 
