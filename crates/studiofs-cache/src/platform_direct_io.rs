@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use tracing::debug;
 
-const DIRECT_IO_ALIGNMENT: usize = 4096;
+pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 
 fn round_up_to_alignment(len: usize, alignment: usize) -> usize {
     if len == 0 {
@@ -118,25 +118,12 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn read_block_direct(path: &Path, dst: &mut [u8]) -> io::Result<Option<usize>> {
+fn open_read_file_direct(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-
-    let outcome = (|| -> io::Result<usize> {
-        let std_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
-            .open(path)?;
-        read_from_std_file_direct_into(std_file, dst)
-    })();
-
-    match outcome {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "O_DIRECT unavailable for block; falling back to buffered read");
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+        .open(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -183,30 +170,14 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn read_block_direct(path: &Path, dst: &mut [u8]) -> io::Result<Option<usize>> {
+fn open_read_file_direct(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-
-    let outcome = (|| -> io::Result<usize> {
-        let std_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(path)?;
-        read_from_std_file_direct_into(std_file, dst)
-    })();
-
-    match outcome {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(
-                error = %e,
-                "Windows direct I/O unavailable for block; falling back to buffered read"
-            );
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .open(path)
 }
 
 #[cfg(target_os = "windows")]
@@ -252,23 +223,45 @@ fn should_fallback_from_direct_io(e: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn read_block_direct(path: &Path, dst: &mut [u8]) -> io::Result<Option<usize>> {
+fn open_read_file_direct(path: &Path) -> io::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
 
-    let outcome = (|| -> io::Result<usize> {
-        let std_file = std::fs::OpenOptions::new().read(true).open(path)?;
-        let fd = std_file.as_raw_fd();
-        let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        read_from_std_file_direct_into(std_file, dst)
-    })();
+    let std_file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let fd = std_file.as_raw_fd();
+    let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std_file)
+}
 
-    match outcome {
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub(crate) fn open_block_direct_read(path: &Path) -> io::Result<Option<std::fs::File>> {
+    match open_read_file_direct(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if should_fallback_from_direct_io(&e) => {
+            debug!(
+                error = %e,
+                "direct I/O unavailable for block open; falling back to buffered read"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub(crate) fn read_block_direct_from_file(
+    std_file: std::fs::File,
+    dst: &mut [u8],
+) -> io::Result<Option<usize>> {
+    match read_from_std_file_direct_into(std_file, dst) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if should_fallback_from_direct_io(&e) => {
-            debug!(error = %e, "F_NOCACHE unavailable for block; falling back to buffered read");
+            debug!(
+                error = %e,
+                "direct I/O unavailable for block read; falling back to buffered read"
+            );
             Ok(None)
         }
         Err(e) => Err(e),
@@ -304,7 +297,15 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-pub(crate) fn read_block_direct(_path: &Path, _dst: &mut [u8]) -> io::Result<Option<usize>> {
+pub(crate) fn open_block_direct_read(_path: &Path) -> io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+pub(crate) fn read_block_direct_from_file(
+    _std_file: std::fs::File,
+    _dst: &mut [u8],
+) -> io::Result<Option<usize>> {
     Ok(None)
 }
 

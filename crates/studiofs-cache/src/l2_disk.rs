@@ -40,14 +40,35 @@ use crate::platform_direct_io;
 /// Upper bound for active L2 blocking-I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 
-fn bytes_mut_uninit(len: usize) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(len);
-    // SAFETY: We only expose this buffer to I/O routines that immediately
-    // write initialized bytes into the slice before any read access.
-    unsafe {
-        buf.set_len(len);
+fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
+    if len == 0 {
+        return Ok(BytesMut::new());
     }
-    buf
+
+    let total = len
+        .checked_add(alignment)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflow"))?;
+    let mut raw = BytesMut::with_capacity(total);
+    let base = raw.as_ptr() as usize;
+    let misalignment = base % alignment;
+    let prefix = if misalignment == 0 {
+        0
+    } else {
+        alignment - misalignment
+    };
+
+    // SAFETY: `raw` has capacity >= `prefix + len` by construction. This
+    // helper is only used for direct I/O read targets that are fully written
+    // by OS read calls before any initialized bytes are observed.
+    unsafe {
+        raw.set_len(prefix + len);
+    }
+    if prefix != 0 {
+        let _ = raw.split_to(prefix);
+    }
+    debug_assert_eq!(raw.len(), len);
+    debug_assert!((raw.as_ptr() as usize).is_multiple_of(alignment));
+    Ok(raw)
 }
 
 /// File-per-block disk cache on NVMe.
@@ -226,13 +247,21 @@ impl L2DiskCache {
                 "l2_read_direct",
                 move || -> io::Result<Option<Bytes>> {
                     let _permit = permit;
+                    let Some(std_file) =
+                        platform_direct_io::open_block_direct_read(&path_for_direct)?
+                    else {
+                        return Ok(None);
+                    };
                     let expected_len = match expected_len_hint {
                         Some(len) => len,
-                        None => std::fs::metadata(&path_for_direct)?.len() as usize,
+                        None => std_file.metadata()?.len() as usize,
                     };
-                    let mut direct_buf = bytes_mut_uninit(expected_len);
+                    let mut direct_buf = aligned_bytes_mut_uninit(
+                        expected_len,
+                        platform_direct_io::DIRECT_IO_ALIGNMENT,
+                    )?;
                     if let Some(read_len) =
-                        platform_direct_io::read_block_direct(&path_for_direct, &mut direct_buf)?
+                        platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf)?
                     {
                         direct_buf.truncate(read_len);
                         Ok(Some(direct_buf.freeze()))
@@ -304,10 +333,18 @@ impl L2DiskCache {
                         "l2_read_batch_direct",
                         move || -> io::Result<Option<Bytes>> {
                             let _permit = permit;
-                            let expected_len = std::fs::metadata(&path_for_direct)?.len() as usize;
-                            let mut direct_buf = bytes_mut_uninit(expected_len);
-                            if let Some(read_len) = platform_direct_io::read_block_direct(
-                                &path_for_direct,
+                            let Some(std_file) =
+                                platform_direct_io::open_block_direct_read(&path_for_direct)?
+                            else {
+                                return Ok(None);
+                            };
+                            let expected_len = std_file.metadata()?.len() as usize;
+                            let mut direct_buf = aligned_bytes_mut_uninit(
+                                expected_len,
+                                platform_direct_io::DIRECT_IO_ALIGNMENT,
+                            )?;
+                            if let Some(read_len) = platform_direct_io::read_block_direct_from_file(
+                                std_file,
                                 &mut direct_buf,
                             )? {
                                 direct_buf.truncate(read_len);
