@@ -598,13 +598,14 @@ impl BlockCache {
     ///
     /// Backpressure is applied when the queue is full and this call awaits
     /// worker progress.
-    pub async fn commit_l2_batch(&self, blocks: &[(ObjectId, Bytes)]) -> io::Result<()> {
+    pub async fn commit_l2_batch(&self, blocks: Vec<(ObjectId, Bytes)>) -> io::Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
 
         self.metrics.materialize_batches.enter_inflight();
         let batch_started = Instant::now();
+        let block_count = blocks.len();
         let total_bytes = blocks
             .iter()
             .map(|(_, data)| data.len() as u64)
@@ -612,14 +613,14 @@ impl BlockCache {
 
         let enqueue_result = async {
             for (object_id, data) in blocks {
-                self.enqueue_l2_commit(*object_id, data.clone()).await?;
+                self.enqueue_l2_commit(object_id, data).await?;
             }
             Ok::<(), io::Error>(())
         }
         .await;
 
         self.metrics.materialize_batches.record_batch(
-            blocks.len() as u64,
+            block_count as u64,
             total_bytes,
             batch_started.elapsed(),
         );
