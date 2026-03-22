@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
-use studiofs_data::object::{create_object, format_object_key, read_object};
+use studiofs_data::object::{create_object_buffer, format_object_key, read_object};
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
     BlockRef, MetaOpenOptions, ROOT_INO, ensure_studiofs_database, open_meta_engine,
@@ -180,11 +180,11 @@ fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
         attr.committed_size = payload.len() as u64;
         meta.set_attr(&attr).expect("set attr");
 
-        let object = create_object(payload).expect("encode object");
+        let object = create_object_buffer(Bytes::copy_from_slice(payload)).expect("encode object");
         let key = format_object_key(&format_info.data_prefix, object_id);
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(async { store.put_by_key(&key, Bytes::from(object)).await })
+        rt.block_on(async { store.put_by_key(&key, object).await })
             .expect("put object");
 
         meta.flush_metadata().expect("flush metadata");

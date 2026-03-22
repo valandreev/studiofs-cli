@@ -35,7 +35,7 @@ use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 use crate::runtime::{run_blocking, run_meta};
 use bytes::{Buf, Bytes, BytesMut};
 use opendal::options::WriteOptions;
-use opendal::{EntryMode, ErrorKind, Operator};
+use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -51,7 +51,7 @@ use studiofs_cache::block_cache::{
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
-    create_object, format_object_key, parse_object_id_from_key, read_object,
+    create_object_buffer, format_object_key, parse_object_id_from_key, read_object,
 };
 use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
@@ -8590,7 +8590,7 @@ impl StudioVfs {
             .await
             .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
         // Read raw block payload from cache only when we really need to upload.
-        let object_bytes = if remote_object_visible {
+        let object_bytes: Option<Buffer> = if remote_object_visible {
             None
         } else {
             let raw_payload = match self.block_cache.get(op.object_id).await {
@@ -8646,10 +8646,13 @@ impl StudioVfs {
                     }
                 }
             };
+            // Re-check visibility because the reconcile branch above may flip
+            // `remote_object_visible = true` when cache is missing but remote
+            // already has this object.
             if remote_object_visible {
                 None
             } else {
-                Some(Bytes::from(create_object(&raw_payload)?))
+                Some(create_object_buffer(raw_payload)?)
             }
         };
         drop(_upload_io_permit);
