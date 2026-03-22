@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_data::object::{create_object, format_object_key, read_object};
+use studiofs_data::object::{create_object_buffer, format_object_key, read_object};
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::engine::{PendingCreateRecord, UndoLogKind};
 use studiofs_meta::types::SetattrArgs;
@@ -972,7 +972,7 @@ async fn seed_committed_file(
     for (block_index, chunk) in payload.chunks(block_size).enumerate() {
         let object_id = object_ids[block_index];
         let key = format_object_key(&format_info.data_prefix, object_id);
-        let object_bytes = Bytes::from(create_object(chunk).unwrap());
+        let object_bytes = create_object_buffer(Bytes::copy_from_slice(chunk)).unwrap();
         store.put_by_key(&key, object_bytes).await.unwrap();
 
         let block_ref = if chunk.len() == block_size {
@@ -1508,7 +1508,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
         .expect("expected at least one block reference after flush");
     let object_id = blocks[0].1.object_id;
     let key = format_object_key(&info.data_prefix, object_id);
-    let object_bytes = Bytes::from(create_object(&payload).unwrap());
+    let object_bytes = create_object_buffer(Bytes::from(payload.clone())).unwrap();
     if let Err(err) = ds.operator().write(&key, object_bytes).await {
         if err.to_string().contains("NoSuchBucket") {
             eprintln!(
@@ -6292,10 +6292,10 @@ async fn test_object_format() {
     let original_data = b"Test data for object format";
 
     // Create object
-    let object = create_object(original_data).unwrap();
+    let object = create_object_buffer(Bytes::copy_from_slice(original_data)).unwrap();
 
     // Verify we can read it back
-    let decompressed = read_object(bytes::Bytes::from(object)).unwrap();
+    let decompressed = read_object(object).unwrap();
     assert_eq!(decompressed.as_ref(), original_data);
 }
 

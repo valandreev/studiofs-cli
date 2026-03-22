@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
-use opendal::{Operator, services::S3};
+use opendal::{Buffer, Operator, services::S3};
 use std::time::Duration;
 use studiofs_meta::FormatInfo;
 use thiserror::Error;
@@ -288,7 +288,8 @@ impl DataStore {
     }
 
     /// Upload a generic object to S3.
-    pub async fn put_object(&self, object_id: &str, data: Bytes) -> DataResult<()> {
+    pub async fn put_object(&self, object_id: &str, data: impl Into<Buffer>) -> DataResult<()> {
+        let data: Buffer = data.into();
         let key = self.object_key(object_id);
         debug!("uploading object: {key} ({} bytes)", data.len());
         self.op.write(&key, data).await?;
@@ -296,24 +297,29 @@ impl DataStore {
     }
 
     /// Upload bytes to an already-formatted storage key.
-    pub async fn put_by_key(&self, key: &str, data: Bytes) -> DataResult<()> {
+    ///
+    /// Accepts both contiguous (`Bytes`) and non-contiguous (`Buffer`) payloads.
+    /// Note: some service implementations may still materialize into contiguous
+    /// buffers internally if vectored writes are unsupported.
+    pub async fn put_by_key(&self, key: &str, data: impl Into<Buffer>) -> DataResult<()> {
+        let data: Buffer = data.into();
         debug!("uploading by key: {key} ({} bytes)", data.len());
         self.op.write(key, data).await?;
         Ok(())
     }
 
     /// Download a generic object from S3.
-    pub async fn get_object(&self, object_id: &str) -> DataResult<Bytes> {
+    pub async fn get_object(&self, object_id: &str) -> DataResult<Buffer> {
         let key = self.object_key(object_id);
         debug!("downloading object: {key}");
-        let data = self.op.read(&key).await?.to_bytes();
+        let data = self.op.read(&key).await?;
         Ok(data)
     }
 
     /// Download bytes from an already-formatted storage key.
-    pub async fn get_by_key(&self, key: &str) -> DataResult<Bytes> {
+    pub async fn get_by_key(&self, key: &str) -> DataResult<Buffer> {
         debug!("downloading by key: {key}");
-        let data = self.op.read(key).await?.to_bytes();
+        let data = self.op.read(key).await?;
         Ok(data)
     }
 

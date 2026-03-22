@@ -10,9 +10,10 @@
 //! - Objects are immutable and content-addressable by sequential ID
 
 use bytes::{Buf, BufMut, Bytes};
+use opendal::Buffer;
 use std::io::{self, Cursor};
 use thiserror::Error;
-use xxhash_rust::xxh64::xxh64;
+use xxhash_rust::xxh64::{Xxh64, xxh64};
 
 // =============================================================================
 // Constants
@@ -258,6 +259,10 @@ impl ObjectHeader {
 ///
 /// # Returns
 /// Complete object bytes (header + payload)
+#[deprecated(
+    since = "0.1.1",
+    note = "Use create_object_buffer to avoid full payload copying on hot paths"
+)]
 pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     create_object_with_flags(data, ObjectFlags::empty())
 }
@@ -265,6 +270,10 @@ pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
 /// Create an object with custom flags.
 ///
 /// Compression flags are not supported in this build.
+#[deprecated(
+    since = "0.1.1",
+    note = "Use create_object_buffer_with_flags to avoid full payload copying on hot paths"
+)]
 pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u8>, ObjectError> {
     if data.len() > MAX_OBJECT_SIZE as usize {
         return Err(ObjectError::ObjectTooLarge(data.len() as u64));
@@ -282,6 +291,35 @@ pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u
     Ok(object)
 }
 
+/// Create a full object buffer (Header + Payload) without copying payload bytes.
+///
+/// This is intended for upload paths where the payload is already owned as `Bytes`.
+/// The returned `Buffer` keeps header and payload as separate chunks.
+pub fn create_object_buffer(data: Bytes) -> Result<Buffer, ObjectError> {
+    create_object_buffer_with_flags(data, ObjectFlags::empty())
+}
+
+/// Create an object buffer with custom flags without copying payload bytes.
+///
+/// Compression flags are not supported in this build.
+pub fn create_object_buffer_with_flags(
+    data: Bytes,
+    flags: ObjectFlags,
+) -> Result<Buffer, ObjectError> {
+    if data.len() > MAX_OBJECT_SIZE as usize {
+        return Err(ObjectError::ObjectTooLarge(data.len() as u64));
+    }
+    if flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED) {
+        return Err(ObjectError::LegacyCompressionUnsupported);
+    }
+
+    let checksum = xxh64(data.as_ref(), 0);
+    let size = data.len() as u32;
+    let header = ObjectHeader::with_flags(size, size, checksum, flags).to_bytes();
+    let chunks = vec![Bytes::copy_from_slice(&header), data];
+    Ok(Buffer::from(chunks))
+}
+
 /// Read and validate an object.
 ///
 /// Validates header and checksum, then returns raw payload bytes.
@@ -291,7 +329,8 @@ pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u
 ///
 /// # Returns
 /// Original payload data
-pub fn read_object(data: Bytes) -> Result<Bytes, ObjectError> {
+pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
+    let data: Buffer = data.into();
     if data.len() < ObjectHeader::SIZE {
         return Err(
             io::Error::new(io::ErrorKind::UnexpectedEof, "file too short for header").into(),
@@ -299,7 +338,10 @@ pub fn read_object(data: Bytes) -> Result<Bytes, ObjectError> {
     }
 
     // Parse header
-    let header = ObjectHeader::from_bytes(&data[..ObjectHeader::SIZE])?;
+    let mut header_buf = data.slice(..ObjectHeader::SIZE);
+    let mut header_bytes = [0u8; ObjectHeader::SIZE];
+    header_buf.copy_to_slice(&mut header_bytes);
+    let header = ObjectHeader::from_bytes(&header_bytes)?;
     let payload = data.slice(ObjectHeader::SIZE..);
 
     // Validate payload size
@@ -316,7 +358,7 @@ pub fn read_object(data: Bytes) -> Result<Bytes, ObjectError> {
     }
 
     // Verify checksum
-    let computed_checksum = xxh64(payload.as_ref(), 0);
+    let computed_checksum = xxh64_buffer(&payload);
     if computed_checksum != header.checksum {
         return Err(ObjectError::ChecksumMismatch {
             expected: header.checksum,
@@ -324,7 +366,23 @@ pub fn read_object(data: Bytes) -> Result<Bytes, ObjectError> {
         });
     }
 
-    Ok(payload)
+    // Preserve zero-copy when payload is a single remaining chunk.
+    if Buffer::count(&payload) == 1 {
+        Ok(payload.current())
+    } else {
+        Ok(payload.to_bytes())
+    }
+}
+
+fn xxh64_buffer(data: &Buffer) -> u64 {
+    let mut hasher = Xxh64::new(0);
+    let mut remaining = data.clone();
+    while !remaining.is_empty() {
+        let chunk = remaining.current();
+        hasher.update(&chunk);
+        remaining.advance(chunk.len());
+    }
+    hasher.digest()
 }
 
 /// Read object header only (without loading payload bytes into a second buffer).
@@ -620,6 +678,41 @@ mod tests {
         let decoded = read_object(Bytes::from(object)).unwrap();
 
         assert_eq!(data.as_slice(), decoded.as_ref());
+    }
+
+    #[test]
+    fn test_object_buffer_roundtrip() {
+        let original_data = Bytes::from_static(b"buffer roundtrip payload");
+
+        let object = create_object_buffer(original_data.clone()).unwrap();
+        let decoded = read_object(object.to_bytes()).unwrap();
+
+        assert_eq!(original_data.as_ref(), decoded.as_ref());
+    }
+
+    #[test]
+    fn test_object_buffer_reuses_payload_bytes() {
+        let payload = Bytes::from(vec![0xAB; 4096]);
+        let payload_ptr = payload.as_ptr();
+
+        let mut object = create_object_buffer(payload.clone()).unwrap();
+        assert_eq!(
+            Buffer::count(&object),
+            2,
+            "expected header + payload chunks"
+        );
+
+        let header = object.current();
+        assert_eq!(header.len(), ObjectHeader::SIZE);
+
+        object.advance(ObjectHeader::SIZE);
+        let payload_chunk = object.current();
+        assert_eq!(payload_chunk.len(), payload.len());
+        assert_eq!(
+            payload_chunk.as_ptr(),
+            payload_ptr,
+            "payload chunk should reuse original Bytes allocation"
+        );
     }
 
     #[test]

@@ -150,7 +150,7 @@ PendingUpload received
   │
   ├─ Read block from cache (L1 or L2)
   ├─ Reject stale op if inode/incarnation no longer match
-  ├─ Build object (header + raw payload), compute xxh64 checksum
+  ├─ Build object `Buffer` (header + raw payload chunk), compute xxh64 checksum
   ├─ PUT to S3 via UploadScheduler (AIMD + retry/timeout policy)
   ├─ Mark extent record as uploaded only after upload success
   ├─ cache.complete_upload(pending) — unpin LRU entry
@@ -219,7 +219,8 @@ fetch_block(object_id)
   ├─ Acquire AIMD permit (may block if at capacity)
   │
   ├─ S3 GET with configurable timeout (default 45s)
-  ├─ Decode object + verify checksum (zero-copy `Bytes` slice payload)
+  ├─ Decode object from `opendal::Buffer` + verify checksum incrementally
+  ├─ Return zero-copy payload when a single payload chunk is available
   ├─ Populate L1 + L2 cache
   ├─ Resolve AIMD permit (success/failure)
   │

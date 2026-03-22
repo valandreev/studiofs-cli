@@ -4,8 +4,7 @@
 
 use crate::aimd::{AimdConfig, AimdController};
 use crate::vfs::VfsConfig;
-use bytes::Bytes;
-use opendal::ErrorKind;
+use opendal::{Buffer, ErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -108,7 +107,7 @@ impl UploadScheduler {
     }
 
     /// Upload object bytes to `key` with adaptive concurrency + retries.
-    pub async fn put(&self, key: &str, payload: Bytes) -> Result<(), UploadError> {
+    pub async fn put(&self, key: &str, payload: Buffer) -> Result<(), UploadError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
 
