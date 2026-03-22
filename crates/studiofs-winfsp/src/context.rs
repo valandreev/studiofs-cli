@@ -600,23 +600,25 @@ impl FileSystemContext for StudioFsContext {
         offset: u64,
     ) -> winfsp::Result<u32> {
         // Spawn the async read on a tokio worker thread so the WinFSP
-        // dispatch thread doesn't participate in IO polling.  We allocate
-        // an owned buffer, copy the result back.
+        // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
         let fh = context.fh;
         let buf_len = buffer.len();
+        let buffer_addr = buffer.as_mut_ptr() as usize;
         let vfs = self.vfs.clone();
 
-        let result: Result<(u32, Vec<u8>), _> = self.spawn_wait(async move {
-            let mut owned = vec![0u8; buf_len];
-            let n = vfs.read_into_fh(fh, ino, offset, &mut owned).await?;
-            owned.truncate(n as usize);
-            Ok((n, owned))
+        let result: Result<u32, _> = self.spawn_wait(async move {
+            // SAFETY:
+            // - `buffer_addr` originates from the WinFSP-provided `buffer` and remains
+            //   valid for the duration of this callback.
+            // - `spawn_wait` blocks until this task completes, so the caller cannot
+            //   observe or alias `buffer` concurrently while this mutable slice exists.
+            let out = unsafe { std::slice::from_raw_parts_mut(buffer_addr as *mut u8, buf_len) };
+            vfs.read_into_fh(fh, ino, offset, out).await
         });
 
         match result {
-            Ok((n, data)) => {
-                buffer[..n as usize].copy_from_slice(&data);
+            Ok(n) => {
                 trace!(
                     ino,
                     fh,
