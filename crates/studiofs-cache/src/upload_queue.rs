@@ -301,14 +301,13 @@ impl UploadQueue {
 
     fn remove_pending(&self, object_id: u64) {
         let mut state = self.pending_state.lock();
-        if let Some(removed) = state.by_object.remove(&object_id) {
-            if let std::collections::hash_map::Entry::Occupied(mut e) =
+        if let Some(removed) = state.by_object.remove(&object_id)
+            && let std::collections::hash_map::Entry::Occupied(mut e) =
                 state.ino_counts.entry(removed.ino)
-            {
-                *e.get_mut() -= 1;
-                if *e.get() == 0 {
-                    e.remove_entry();
-                }
+        {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove_entry();
             }
         }
     }
