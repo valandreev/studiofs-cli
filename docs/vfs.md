@@ -442,7 +442,7 @@ Namespace mutation updates are deterministic:
 - on create/mkdir/symlink/link: insert positive entry
 - on unlink/rmdir: insert negative entry
 - on rename: source entry becomes negative, destination becomes positive
-- deleted file blocks are removed from L1/L2 promptly; if a block is pinned by an in-flight upload, VFS defers the cache eviction until the upload completes
+- deleted file blocks are removed from L1/L2 promptly; if a block is pinned by an in-flight upload, VFS cancels that inode's in-flight upload and finalizes cleanup via pending-deletion journal + cache eviction path
 - parent directory generation is bumped only for affected parent directories
 - broad remote namespace apply events bump global namespace epoch
 

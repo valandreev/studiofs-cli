@@ -457,7 +457,7 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots |
 | `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Penalty multiplied by client wait penalty |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
-| `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Shutdown upload drain max wait |
+| `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Max graceful upload-drain wait before forced uploader cancellation |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
 Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:

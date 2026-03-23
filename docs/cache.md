@@ -175,14 +175,15 @@ Crash-safe writeback journal for blocks pending S3 upload.
 |----------|-------|
 | Journal dir | `{cache_dir}/upload/` |
 | File pattern | `{object_id:016x}.pending` |
-| Entry size | 42 bytes |
+| Entry size | 48 bytes (v2) |
 | Magic | `STFSUP` |
 | Recovery | Scans `.pending` files on startup |
 
 **Lifecycle:**
 1. `submit(ino, offset, object_id)` — creates journal file, sends to upload channel
-2. Upload worker receives from channel, performs S3 PUT
+2. Upload worker receives from channel, performs S3 PUT (cancellation-aware)
 3. `complete(pending)` — removes journal file, unpins block in LRU
+4. `cancel(pending)` — removes journal file and unpins block when upload is cancelled (for example, inode deleted)
 
 ### Block Cache (`block_cache.rs`)
 

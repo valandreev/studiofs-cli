@@ -120,7 +120,7 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground, read_only, direc
   └─ Shutdown:
        ├─ host.stop()
        ├─ host.unmount()
-       └─ vfs.shutdown() — drain uploads, persist checkpoint
+       └─ vfs.shutdown() — bounded upload drain, cancel in-flight uploader I/O, persist checkpoint
 ```
 
 Current signature includes additional policy controls:
@@ -272,7 +272,8 @@ mount_and_serve(vfs, rt, mount_point, foreground)
   ├─ `fuser::Session::new(...).run()` — blocks until unmount
   │
   └─ Shutdown:
-       ├─ Drain pending uploads
+       ├─ Attempt bounded drain of pending uploads (`STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS`)
+       ├─ Cancel in-flight uploader network I/O (CancellationToken)
        └─ Persist cache checkpoint
 ```
 
