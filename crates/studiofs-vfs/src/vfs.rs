@@ -602,7 +602,6 @@ const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS: u64 = 120;
 const DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS: u64 = 25;
-const DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS: u64 = 100;
 
 fn direct_io_sync_timeout() -> Duration {
     let secs = std::env::var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS")
@@ -6864,8 +6863,8 @@ impl StudioVfs {
     ///
     /// Called by FUSE `flush()`.  Flushes pending writes for the inode.
     /// For handles opened with `DIRECT_IO`/`WRITE_THROUGH`, this also
-    /// waits until all ingress and upload-queue entries for the inode
-    /// have drained to the backend (synchronous write-through guarantee).
+    /// waits until local ingress has drained for the inode so data is
+    /// durable in local cache/WAL before returning.
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
             let ino = open_file.ino;
@@ -6989,7 +6988,7 @@ impl StudioVfs {
     /// Writes are buffered identically to `write()`.  The synchronous
     /// backend drain for `DIRECT_IO`/`WRITE_THROUGH` handles is deferred
     /// to `flush_fh()` / `close()` so individual writes do not block on
-    /// S3 round-trips.
+    /// local ingress or S3 round-trips.
     pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let _ = fh; // reserved for future per-handle write policy
         self.write(ino, offset, data).await
@@ -7005,9 +7004,8 @@ impl StudioVfs {
             // "in the air" between pipeline stages.
             self.drain_dirty_mem().await;
             let has_pending_ingress = self.inode_has_pending_ingress(ino);
-            let has_pending_uploads = self.inode_has_pending_uploads(ino);
 
-            if !has_pending_ingress && !has_pending_uploads {
+            if !has_pending_ingress {
                 return Ok(());
             }
 
@@ -7019,11 +7017,7 @@ impl StudioVfs {
                 )));
             }
 
-            let max_sleep = if has_pending_ingress {
-                Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS)
-            } else {
-                Duration::from_millis(DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS)
-            };
+            let max_sleep = Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS);
             let sleep_for = std::cmp::min(deadline.saturating_duration_since(now), max_sleep);
             let progress = self.state.dirty_drained_notify.notified();
             tokio::select! {
