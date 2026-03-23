@@ -3881,6 +3881,25 @@ impl StudioVfs {
                 Duration::from_millis(config.metadata_invalidation_sync_interval_ms.max(1));
             let read_buffer_mb = config.read_buffer_mb.max(1);
             let block_size_nonzero = block_size.max(1) as u128;
+            // Block indices in the read path are u32; verify practical
+            // addressable range at mount-time to avoid silent undersizing when
+            // very small block sizes are configured.
+            const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
+            let max_addressable_bytes = (u32::MAX as u128).saturating_mul(block_size_nonzero);
+            debug_assert!(
+                max_addressable_bytes >= MIN_PRACTICAL_ADDRESSABLE_BYTES,
+                "configured block_size={} yields only {} addressable bytes with u32 block indices",
+                block_size_nonzero,
+                max_addressable_bytes
+            );
+            if max_addressable_bytes < MIN_PRACTICAL_ADDRESSABLE_BYTES {
+                warn!(
+                    block_size,
+                    max_addressable_bytes,
+                    min_recommended = MIN_PRACTICAL_ADDRESSABLE_BYTES,
+                    "small block_size reduces max file addressability with u32 block indices"
+                );
+            }
             let mb_to_blocks = |mb: u64| -> u32 {
                 let bytes = (mb as u128) * 1024 * 1024;
                 let blocks = (bytes / block_size_nonzero).max(1).min(u32::MAX as u128);

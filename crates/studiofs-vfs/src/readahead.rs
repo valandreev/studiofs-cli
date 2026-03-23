@@ -26,8 +26,8 @@
 //! concurrent calls to `record_read()` never schedule duplicate work.
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::types::Ino;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
@@ -69,6 +69,7 @@ pub struct ReadAheadTracker {
     /// Score penalty for random jumps.
     random_penalty: u8,
     /// Number of consecutive sequential blocks required for a ramp-up step.
+    /// Width doubling is conservative: at most one doubling per record_read call.
     sequential_ramp_trigger: u16,
 }
 
@@ -167,6 +168,8 @@ impl ReadAheadTracker {
                 .checked_div(self.sequential_ramp_trigger)
                 .unwrap_or(0);
             if next_bucket > prev_bucket {
+                // Conservative ramp-up: even if a read span crosses multiple
+                // thresholds, apply at most one doubling per call.
                 state.current_width = state
                     .current_width
                     .saturating_mul(2)
@@ -493,11 +496,6 @@ struct DirPrefetchState {
     last_touch: u64,
 }
 
-struct DirTrackerState {
-    dirs: HashMap<Ino, DirPrefetchState>,
-    access_tick: u64,
-}
-
 /// Tracks directory-level access patterns.
 ///
 /// When a user browses a directory (readdir) and then starts opening/reading
@@ -508,9 +506,11 @@ struct DirTrackerState {
 /// prefetch block 0 of the remaining siblings that haven't been accessed yet.
 pub struct DirAccessTracker {
     /// dir_ino → prefetch state
-    dirs: Mutex<DirTrackerState>,
+    dirs: DashMap<Ino, DirPrefetchState>,
     /// child_ino → parent_dir_ino (reverse lookup so on_read can find the dir)
     child_to_dir: DashMap<Ino, Ino>,
+    /// Monotonic stamp for per-directory LRU tracking.
+    access_tick: AtomicU64,
     /// Threshold: how many children must be read before prefetching triggers.
     threshold: usize,
     /// Hard cap for tracked directories to prevent unbounded growth.
@@ -529,31 +529,31 @@ impl DirAccessTracker {
     /// Create a new tracker with an explicit tracked-directory cap.
     pub fn new_with_capacity(threshold: usize, max_tracked_dirs: usize) -> Self {
         Self {
-            dirs: Mutex::new(DirTrackerState {
-                dirs: HashMap::new(),
-                access_tick: 0,
-            }),
+            dirs: DashMap::new(),
             child_to_dir: DashMap::new(),
+            access_tick: AtomicU64::new(0),
             threshold,
             max_tracked_dirs: max_tracked_dirs.max(1),
         }
     }
 
-    fn next_touch(state: &mut DirTrackerState) -> u64 {
-        state.access_tick = state.access_tick.saturating_add(1);
-        state.access_tick
+    fn next_touch(&self) -> u64 {
+        self.access_tick
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
     }
 
-    fn evict_lru_if_needed(&self, state: &mut DirTrackerState) {
-        while state.dirs.len() > self.max_tracked_dirs {
-            let Some((&victim_dir, _)) = state
+    fn evict_lru_if_needed(&self) {
+        while self.dirs.len() > self.max_tracked_dirs {
+            let Some(victim_dir) = self
                 .dirs
                 .iter()
-                .min_by_key(|(_, dir_state)| dir_state.last_touch)
+                .min_by_key(|entry| entry.last_touch)
+                .map(|entry| *entry.key())
             else {
                 break;
             };
-            if let Some(victim) = state.dirs.remove(&victim_dir) {
+            if let Some((_, victim)) = self.dirs.remove(&victim_dir) {
                 for child in &victim.children {
                     self.child_to_dir.remove(child);
                 }
@@ -566,23 +566,17 @@ impl DirAccessTracker {
     /// `children` should contain the inodes of regular-file children only
     /// (exclude directories and symlinks — those have no data blocks).
     pub fn on_readdir(&self, dir_ino: Ino, children: Vec<Ino>) {
-        // Register reverse mappings
-        for &child in &children {
-            self.child_to_dir.insert(child, dir_ino);
-        }
-
-        let mut dirs = self.dirs.lock();
-        if let Some(prev) = dirs.dirs.remove(&dir_ino) {
+        if let Some((_, prev)) = self.dirs.remove(&dir_ino) {
             for child in &prev.children {
                 self.child_to_dir.remove(child);
             }
-            // Re-register latest child set after pruning stale mappings.
-            for &child in &children {
-                self.child_to_dir.insert(child, dir_ino);
-            }
         }
-        let touch = Self::next_touch(&mut dirs);
-        dirs.dirs.insert(
+        // Register reverse mappings for the latest child set.
+        for &child in &children {
+            self.child_to_dir.insert(child, dir_ino);
+        }
+        let touch = self.next_touch();
+        self.dirs.insert(
             dir_ino,
             DirPrefetchState {
                 children,
@@ -591,7 +585,7 @@ impl DirAccessTracker {
                 last_touch: touch,
             },
         );
-        self.evict_lru_if_needed(&mut dirs);
+        self.evict_lru_if_needed();
     }
 
     /// Called when a child inode is read.
@@ -605,9 +599,8 @@ impl DirAccessTracker {
             None => return Vec::new(),
         };
 
-        let mut dirs = self.dirs.lock();
-        let touch = Self::next_touch(&mut dirs);
-        let state = match dirs.dirs.get_mut(&dir_ino) {
+        let touch = self.next_touch();
+        let mut state = match self.dirs.get_mut(&dir_ino) {
             Some(s) => s,
             None => {
                 // Reverse map can become stale after bounded eviction.
@@ -648,8 +641,7 @@ impl DirAccessTracker {
 
     /// Remove all state for a directory (e.g. when it is deleted).
     pub fn evict_dir(&self, dir_ino: Ino) {
-        let mut dirs = self.dirs.lock();
-        if let Some(state) = dirs.dirs.remove(&dir_ino) {
+        if let Some((_, state)) = self.dirs.remove(&dir_ino) {
             for child in &state.children {
                 self.child_to_dir.remove(child);
             }
