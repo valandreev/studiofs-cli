@@ -372,7 +372,7 @@ Size classes are configurable from the CLI:
 - `--medium-max <size>`: inclusive upper bound for the medium class
   (default `--block-size`)
 - `--sizes <spec>`: workload composition, either percentages
-  (`small=60,medium=30,large=10`) or explicit lists (`4KB,128KB,1MB,8MB`)
+  (`small=60,medium=30,large=10`) or explicit lists (`4KB,128KB,1MB,16MB`)
 
 Warm-cache measurement controls:
 

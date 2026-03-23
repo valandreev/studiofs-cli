@@ -112,10 +112,10 @@ Quick benchmark example:
 ```bash
 studiofs test-cache \
   /tmp/studiofs-cache-bench \
-  --block-size 8MB \
+  --block-size 16MB \
   --read-size 1MB \
   --small-max 10KB \
-  --medium-max 8MB \
+  --medium-max 16MB \
   --concurrency 16 \
   --io-depth 64 \
   --access-pattern mixed \

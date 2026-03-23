@@ -3,7 +3,7 @@
 //! Core types for the virtual filesystem metadata.
 //!
 //! Architecture Key Changes:
-//! - Files are split into fixed-size blocks (default 8MB)
+//! - Files are split into fixed-size blocks (default 16MB)
 //! - Each block has a sequential ID (not content hash)
 //! - Blocks are immutable - never modified, only created/deleted
 //! - No deduplication = no reference counting overhead
@@ -16,8 +16,8 @@ use std::time::SystemTime;
 // Constants
 // =============================================================================
 
-/// Default block size: 8 MiB (configurable at volume init).
-pub const DEFAULT_BLOCK_SIZE: u32 = 8 * 1024 * 1024;
+/// Default block size: 16 MiB (configurable at volume init).
+pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
 /// Current on-disk metadata format version.
 pub const CURRENT_FORMAT_VERSION: u16 = 1;
 
@@ -441,7 +441,7 @@ pub struct FormatInfo {
     /// Metadata backend configuration.
     #[serde(default)]
     pub metadata: MetadataConfig,
-    /// Block size in bytes (configurable at init, default 8MB).
+    /// Block size in bytes (configurable at init, default 16MB).
     pub block_size: u32,
 }
 
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(block_index_from_offset(1, block_size), 0);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024, block_size), 1);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024 + 1, block_size), 1);
-        assert_eq!(block_index_from_offset(8 * 1024 * 1024, block_size), 2);
+        assert_eq!(block_index_from_offset(16 * 1024 * 1024, block_size), 4);
     }
 
     #[test]
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(blocks_for_size(1, block_size), 1);
         assert_eq!(blocks_for_size(4 * 1024 * 1024, block_size), 1);
         assert_eq!(blocks_for_size(4 * 1024 * 1024 + 1, block_size), 2);
-        assert_eq!(blocks_for_size(8 * 1024 * 1024, block_size), 2);
+        assert_eq!(blocks_for_size(16 * 1024 * 1024, block_size), 4);
     }
 
     #[test]

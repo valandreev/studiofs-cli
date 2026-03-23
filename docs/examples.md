@@ -145,10 +145,10 @@ Direct L2 benchmark (bypass VFS/mount):
 ```bash
 studiofs test-cache \
   /tmp/studiofs-cache-bench \
-  --block-size 8MB \
+  --block-size 16MB \
   --read-size 1MB \
   --small-max 10KB \
-  --medium-max 8MB \
+  --medium-max 16MB \
   --sizes small=60,medium=30,large=10 \
   --concurrency 2 \
   --sequential-streams \
@@ -176,8 +176,7 @@ Notes:
 - Terminal output is a readable benchmark summary. The full structured JSON
   report is saved in the directory where `studiofs test-cache` was started,
   using an auto-generated file name unless `--json-output <path>` is provided.
-- `--sizes` accepts percentages (`small=60,medium=30,large=10`) or explicit
-  lists (`4KB,64KB,1MB,8MB`).
+- `--sizes` accepts percentages (`small=60,medium=30,large=10`) or explicit lists (`4KB,64KB,1MB,16MB`).
 - `--warmup-runs` runs prefill cycles that are not included in measured
   metrics.
 - Throughput in benchmark reports is phase-scoped: write-side metrics use

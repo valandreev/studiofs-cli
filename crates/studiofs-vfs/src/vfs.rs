@@ -1,7 +1,7 @@
 //! Core VFS implementation — Block-based architecture.
 //!
 //! Key design:
-//! - Files are split into fixed-size blocks (default 8MB)
+//! - Files are split into fixed-size blocks (default 16MB)
 //! - Each block has a sequential ID (not content hash)
 //! - Blocks are immutable - never modified, only created/deleted
 //! - No deduplication = no reference counting overhead

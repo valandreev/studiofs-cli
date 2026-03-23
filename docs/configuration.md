@@ -50,7 +50,7 @@ studiofs init <name> \
   --secret-key <s3-secret-key> \
   --meta <postgres-server-dsn> \
   [--region <region>] \
-  [--block-size <e.g. 8MB>]
+  [--block-size <e.g. 16MB>]
 ```
 
 Important:
@@ -225,10 +225,10 @@ Runs cache benchmarks without changing regular runtime configuration.
 ```bash
 studiofs test-cache \
   <path> \
-  [--block-size <e.g. 8MB>] \
+  [--block-size <e.g. 16MB>] \
   [--read-size <e.g. 1MB>] \
   [--small-max <e.g. 10KB>] \
-  [--medium-max <e.g. 8MB>] \
+  [--medium-max <e.g. 16MB>] \
   [--sizes <small=60,medium=30,large=10|4KB,128KB,1MB>] \
   [--concurrency <usize>] \
   [--sequential-streams] \
@@ -241,7 +241,7 @@ studiofs test-cache \
 ```
 
 Defaults:
-- `--block-size 8MB`
+- `--block-size 16MB`
 - `--read-size` defaults to `block-size`
 - `--small-max 10KB`
 - `--medium-max` defaults to `block-size`
@@ -278,7 +278,7 @@ Notes:
 - Throughput in benchmark reports is phase-scoped: write-side metrics are
   computed from write-phase wall time, and read-side metrics are computed from
   read-phase wall time instead of total benchmark runtime.
-- `--sizes` accepts either class percentages (`small=60,medium=30,large=10`) or an explicit list (`4KB,128KB,1MB,8MB`).
+- `--sizes` accepts either class percentages (`small=60,medium=30,large=10`) or an explicit list (`4KB,128KB,1MB,16MB`).
 - `--sequential-streams` runs each stream over its own segment in order and emits per-stream read/write metrics in JSON and terminal output.
 - In `--sequential-streams` mode, effective in-flight I/O is bounded by `min(--concurrency, --io-depth)` because each stream executes I/O serially.
 - Effective in-flight queue pressure is driven by `--io-depth`; worker count is raised to at least that value.
