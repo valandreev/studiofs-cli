@@ -6,16 +6,19 @@
 //! ## Algorithm
 //!
 //! Each inode gets a [`ReadState`] that keeps the last block index read and a
-//! *score* (0–[`MAX_SCORE`]).  On every recorded read:
+//! *score* (0–[`MAX_SCORE`]), plus a dynamic prefetch width.  On every recorded
+//! read:
 //!
 //! - If the new first block follows the previous last block consecutively
-//!   the score increments (up to MAX_SCORE).
+//!   the score increments (up to MAX_SCORE), and after a confirmed streak the
+//!   dynamic width ramps up (doubling each streak interval) up to a configured
+//!   cap.
 //! - If the reader is still inside the same block, the score is unchanged.
 //! - Any other jump decrements the score by 2.
 //!
 //! The number of blocks to prefetch equals the current score (capped at
-//! `width`).  So only truly sequential readers get aggressive prefetching while
-//! random readers are quickly quieted.
+//! dynamic width). So only truly sequential readers get aggressive prefetching
+//! while random readers are quickly quieted and reset toward baseline.
 //!
 //! ## In-flight deduplication
 //!
@@ -23,8 +26,8 @@
 //! concurrent calls to `record_read()` never schedule duplicate work.
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::types::Ino;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
@@ -39,6 +42,10 @@ struct ReadState {
     last_block: u32,
     /// Score representing how strongly sequential the access pattern is.
     score: u8,
+    /// Confirmed sequential read streak length.
+    sequential_streak: u16,
+    /// Dynamic width ramped up for sustained sequential readers.
+    current_width: u32,
 }
 
 // =============================================================================
@@ -51,14 +58,21 @@ pub struct ReadAheadTracker {
     states: DashMap<Ino, ReadState>,
     /// Blocks that are already being prefetched — avoids duplicate work.
     inflight: DashMap<(Ino, u32), ()>,
-    /// How many blocks ahead to fetch when fully ramped-up.
+    /// Maximum blocks ahead to fetch when fully ramped-up.
     pub width: u32,
+    /// Baseline prefetch width before ramp-up.
+    base_width: u32,
     /// Lower bound for prefetch depth once sequential access is detected.
     min_prefetch_on_seq: u32,
     /// Score increase per sequential span block.
     sequential_step: u8,
     /// Score penalty for random jumps.
     random_penalty: u8,
+    /// Number of consecutive sequential blocks required for a ramp-up step.
+    /// Width doubling is conservative: bounded doublings per record_read call.
+    sequential_ramp_trigger: u16,
+    /// Maximum ramp-up doublings allowed per single record_read call.
+    max_ramp_steps_per_call: u8,
 }
 
 impl ReadAheadTracker {
@@ -67,7 +81,7 @@ impl ReadAheadTracker {
     /// `width` — maximum number of blocks to prefetch ahead (e.g. 8 = 32 MB
     /// look-ahead with 4 MB blocks).
     pub fn new(width: u32) -> Self {
-        Self::new_with_tuning(width, 1, 1, 2)
+        Self::new_with_bounds(width, width, 1, 1, 2, 4)
     }
 
     /// Create a tracker with custom scoring and prefetch tuning.
@@ -77,17 +91,41 @@ impl ReadAheadTracker {
         sequential_step: u8,
         random_penalty: u8,
     ) -> Self {
-        let width = width.max(1);
-        let min_prefetch_on_seq = min_prefetch_on_seq.max(1).min(width);
-        let sequential_step = sequential_step.max(1);
-        let random_penalty = random_penalty.max(1);
-        Self {
-            states: DashMap::new(),
-            inflight: DashMap::new(),
+        Self::new_with_bounds(
+            width,
             width,
             min_prefetch_on_seq,
             sequential_step,
             random_penalty,
+            4,
+        )
+    }
+
+    /// Create a tracker with dynamic width bounds and custom tuning.
+    pub fn new_with_bounds(
+        base_width: u32,
+        max_width: u32,
+        min_prefetch_on_seq: u32,
+        sequential_step: u8,
+        random_penalty: u8,
+        sequential_ramp_trigger: u16,
+    ) -> Self {
+        let base_width = base_width.max(1);
+        let width = max_width.max(base_width);
+        let min_prefetch_on_seq = min_prefetch_on_seq.max(1).min(width);
+        let sequential_step = sequential_step.max(1);
+        let random_penalty = random_penalty.max(1);
+        let sequential_ramp_trigger = sequential_ramp_trigger.max(1);
+        Self {
+            states: DashMap::new(),
+            inflight: DashMap::new(),
+            width,
+            base_width,
+            min_prefetch_on_seq,
+            sequential_step,
+            random_penalty,
+            sequential_ramp_trigger,
+            max_ramp_steps_per_call: 2,
         }
     }
 
@@ -99,6 +137,8 @@ impl ReadAheadTracker {
         let mut state = self.states.entry(ino).or_insert(ReadState {
             last_block: u32::MAX,
             score: 0,
+            sequential_streak: 0,
+            current_width: self.base_width,
         });
 
         // Detect sequential continuation: the new read must start exactly at
@@ -118,14 +158,42 @@ impl ReadAheadTracker {
 
         if is_sequential {
             state.score = state.score.saturating_add(seq_gain);
+            let streak_add = span_blocks.min(u16::MAX as u32) as u16;
+            state.sequential_streak = state.sequential_streak.saturating_add(streak_add);
+
+            let prev_bucket = state
+                .sequential_streak
+                .saturating_sub(streak_add)
+                .checked_div(self.sequential_ramp_trigger)
+                .unwrap_or(0);
+            let next_bucket = state
+                .sequential_streak
+                .checked_div(self.sequential_ramp_trigger)
+                .unwrap_or(0);
+            if next_bucket > prev_bucket {
+                let ramp_steps = next_bucket
+                    .saturating_sub(prev_bucket)
+                    .min(self.max_ramp_steps_per_call as u16)
+                    as usize;
+                // Conservative ramp-up: even if a read span crosses multiple
+                // thresholds, apply only bounded doublings per call.
+                let mut next_width = state.current_width;
+                for _ in 0..ramp_steps {
+                    next_width = next_width.saturating_mul(2);
+                }
+                state.current_width = next_width.clamp(self.base_width, self.width);
+            }
         } else if is_same_block {
             // Keep score as-is.
         } else {
             state.score = state.score.saturating_sub(self.random_penalty);
+            state.sequential_streak = 0;
+            state.current_width = self.base_width;
         }
 
         state.last_block = last_block;
         let score = state.score;
+        let current_width = state.current_width.clamp(self.base_width, self.width);
         drop(state);
 
         if score == 0 {
@@ -133,11 +201,11 @@ impl ReadAheadTracker {
         }
 
         // Return up to `min(score, width)` blocks beyond last_block.
-        let mut prefetch_count = self.width.min(score as u32);
+        let mut prefetch_count = current_width.min(score as u32);
         if (is_sequential || is_same_block) && score > 0 {
             // For small sequential reads over high-latency links, keep a
             // minimum look-ahead window to avoid throughput oscillation.
-            prefetch_count = prefetch_count.max(self.min_prefetch_on_seq.min(self.width));
+            prefetch_count = prefetch_count.max(self.min_prefetch_on_seq.min(current_width));
         }
         (1..=prefetch_count)
             .filter_map(|i| {
@@ -186,6 +254,11 @@ impl ReadAheadTracker {
     pub fn evict(&self, ino: Ino) {
         self.states.remove(&ino);
     }
+
+    #[cfg(test)]
+    fn debug_width(&self, ino: Ino) -> Option<u32> {
+        self.states.get(&ino).map(|s| s.current_width)
+    }
 }
 
 // =============================================================================
@@ -214,29 +287,61 @@ mod tests {
 
     #[test]
     fn test_sequential_ramp_up() {
-        let tracker = ReadAheadTracker::new(8);
+        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1, 8, 2, 2);
 
         // First read: block 0 (score stays 0 — no prior history)
         let p = tracker.record_read(1, 0, 0);
         assert!(p.is_empty());
 
-        // Second read: block 1 (sequential after 0) → score becomes 1 → prefetch [2]
+        // Second read: block 1 (sequential after 0)
         let p = tracker.record_read(1, 1, 1);
-        assert_eq!(p, vec![2], "score=1 → 1 block ahead");
+        assert_eq!(p.len(), 8, "score=8, width=8 should prefetch 8 blocks");
+        assert_eq!(p[0], 2, "prefetch should start immediately after read head");
 
-        // Third read: block 2 → score=2 → prefetch [3, 4]
+        // Third read crosses ramp threshold (trigger=2) and doubles width.
         let p = tracker.record_read(1, 2, 2);
-        assert_eq!(p, vec![3, 4], "score=2 → 2 blocks ahead");
+        assert!(p.len() >= 8, "ramped width should allow deeper prefetch");
+        assert_eq!(tracker.debug_width(1), Some(16));
 
-        // Keep going until score is capped at MAX_SCORE.
+        // Keep going; width should continue to ramp but stay capped at max width.
         let mut last = 2u32;
-        for _ in 0..10 {
+        for _ in 0..20 {
             last += 1;
             let _ = tracker.record_read(1, last, last);
         }
+        assert_eq!(tracker.debug_width(1), Some(64));
         let blocks = tracker.record_read(1, last + 1, last + 1);
-        // Prefetch is still capped by width=8.
-        assert!(blocks.len() <= 8, "prefetch depth should not exceed width");
+        assert!(
+            blocks.len() <= 64,
+            "prefetch depth should not exceed max width"
+        );
+    }
+
+    #[test]
+    fn test_random_seek_scales_back_to_base_width() {
+        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1, 8, 2, 2);
+
+        tracker.record_read(1, 0, 0);
+        tracker.record_read(1, 1, 1);
+        tracker.record_read(1, 2, 2);
+        assert_eq!(tracker.debug_width(1), Some(16));
+
+        // Random jump resets width ramp.
+        let _ = tracker.record_read(1, 1000, 1000);
+        assert_eq!(tracker.debug_width(1), Some(8));
+    }
+
+    #[test]
+    fn test_large_span_ramps_up_by_two_steps_per_call() {
+        let tracker = ReadAheadTracker::new_with_bounds(8, 128, 1, 8, 2, 4);
+
+        // Establish baseline state.
+        let _ = tracker.record_read(1, 0, 0);
+        assert_eq!(tracker.debug_width(1), Some(8));
+
+        // span=8 crosses two ramp buckets (trigger=4). Width should 8 -> 32.
+        let _ = tracker.record_read(1, 1, 8);
+        assert_eq!(tracker.debug_width(1), Some(32));
     }
 
     #[test]
@@ -408,6 +513,10 @@ struct DirPrefetchState {
     seen: usize,
     /// Which children have already been scheduled for prefetch.
     prefetched: HashSet<Ino>,
+    /// Stable generation stamp for the current readdir child set.
+    readdir_touch: u64,
+    /// Monotonic access stamp used for bounded LRU-style eviction.
+    last_touch: u64,
 }
 
 /// Tracks directory-level access patterns.
@@ -420,11 +529,16 @@ struct DirPrefetchState {
 /// prefetch block 0 of the remaining siblings that haven't been accessed yet.
 pub struct DirAccessTracker {
     /// dir_ino → prefetch state
-    dirs: Mutex<std::collections::HashMap<Ino, DirPrefetchState>>,
-    /// child_ino → parent_dir_ino (reverse lookup so on_read can find the dir)
-    child_to_dir: DashMap<Ino, Ino>,
+    dirs: DashMap<Ino, DirPrefetchState>,
+    /// child_ino → (parent_dir_ino, generation touch stamp)
+    /// so stale reverse mappings can be pruned safely.
+    child_to_dir: DashMap<Ino, (Ino, u64)>,
+    /// Monotonic stamp for per-directory LRU tracking.
+    access_tick: AtomicU64,
     /// Threshold: how many children must be read before prefetching triggers.
     threshold: usize,
+    /// Hard cap for tracked directories to prevent unbounded growth.
+    max_tracked_dirs: usize,
 }
 
 impl DirAccessTracker {
@@ -433,10 +547,50 @@ impl DirAccessTracker {
     /// `threshold` — number of children that must be read before prefetching
     /// the rest of the directory (typically 2).
     pub fn new(threshold: usize) -> Self {
+        Self::new_with_capacity(threshold, 4096)
+    }
+
+    /// Create a new tracker with an explicit tracked-directory cap.
+    pub fn new_with_capacity(threshold: usize, max_tracked_dirs: usize) -> Self {
         Self {
-            dirs: Mutex::new(std::collections::HashMap::new()),
+            dirs: DashMap::new(),
             child_to_dir: DashMap::new(),
+            access_tick: AtomicU64::new(0),
             threshold,
+            max_tracked_dirs: max_tracked_dirs.max(1),
+        }
+    }
+
+    fn next_touch(&self) -> u64 {
+        self.access_tick
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn evict_lru_if_needed(&self) {
+        while self.dirs.len() > self.max_tracked_dirs {
+            let Some(victim_dir) = self
+                .dirs
+                .iter()
+                .min_by_key(|entry| entry.last_touch)
+                .map(|entry| *entry.key())
+            else {
+                break;
+            };
+            if let Some((_, victim)) = self.dirs.remove(&victim_dir) {
+                for child in &victim.children {
+                    self.child_to_dir.remove(child);
+                }
+            }
+        }
+    }
+
+    fn remove_child_mapping_if_unchanged(&self, child_ino: Ino, expected: (Ino, u64)) {
+        if let Some(current) = self.child_to_dir.get(&child_ino)
+            && *current.value() == expected
+        {
+            drop(current);
+            self.child_to_dir.remove(&child_ino);
         }
     }
 
@@ -445,20 +599,27 @@ impl DirAccessTracker {
     /// `children` should contain the inodes of regular-file children only
     /// (exclude directories and symlinks — those have no data blocks).
     pub fn on_readdir(&self, dir_ino: Ino, children: Vec<Ino>) {
-        // Register reverse mappings
-        for &child in &children {
-            self.child_to_dir.insert(child, dir_ino);
+        let touch = self.next_touch();
+        if let Some((_, prev)) = self.dirs.remove(&dir_ino) {
+            for child in &prev.children {
+                self.child_to_dir.remove(child);
+            }
         }
-
-        let mut dirs = self.dirs.lock();
-        dirs.insert(
+        self.dirs.insert(
             dir_ino,
             DirPrefetchState {
-                children,
+                children: children.clone(),
                 seen: 0,
                 prefetched: HashSet::new(),
+                readdir_touch: touch,
+                last_touch: touch,
             },
         );
+        // Register reverse mappings for the latest child set.
+        for &child in &children {
+            self.child_to_dir.insert(child, (dir_ino, touch));
+        }
+        self.evict_lru_if_needed();
     }
 
     /// Called when a child inode is read.
@@ -467,16 +628,27 @@ impl DirAccessTracker {
     /// Returns an empty vec if the threshold hasn't been met yet, or if the
     /// child's parent directory isn't tracked.
     pub fn on_child_read(&self, child_ino: Ino) -> Vec<Ino> {
-        let dir_ino = match self.child_to_dir.get(&child_ino) {
+        let (dir_ino, mapping_touch) = match self.child_to_dir.get(&child_ino) {
             Some(v) => *v,
             None => return Vec::new(),
         };
 
-        let mut dirs = self.dirs.lock();
-        let state = match dirs.get_mut(&dir_ino) {
+        let touch = self.next_touch();
+        let mut state = match self.dirs.get_mut(&dir_ino) {
             Some(s) => s,
-            None => return Vec::new(),
+            None => {
+                // Reverse map can become stale after bounded eviction.
+                // Remove only if no newer readdir mapping replaced it.
+                self.remove_child_mapping_if_unchanged(child_ino, (dir_ino, mapping_touch));
+                return Vec::new();
+            }
         };
+        if state.readdir_touch != mapping_touch {
+            // Stale mapping observed during concurrent readdir refresh.
+            self.remove_child_mapping_if_unchanged(child_ino, (dir_ino, mapping_touch));
+            return Vec::new();
+        }
+        state.last_touch = touch;
 
         // Already counted this child? Skip.
         if state.prefetched.contains(&child_ino) {
@@ -509,8 +681,7 @@ impl DirAccessTracker {
 
     /// Remove all state for a directory (e.g. when it is deleted).
     pub fn evict_dir(&self, dir_ino: Ino) {
-        let mut dirs = self.dirs.lock();
-        if let Some(state) = dirs.remove(&dir_ino) {
+        if let Some((_, state)) = self.dirs.remove(&dir_ino) {
             for child in &state.children {
                 self.child_to_dir.remove(child);
             }
@@ -577,5 +748,59 @@ mod dir_prefetch_tests {
         // After evict, children have no parent mapping
         let p = tracker.on_child_read(10);
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_bounded_dir_tracking_evicts_lru_mappings() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 2);
+        tracker.on_readdir(100, vec![10, 11]);
+        tracker.on_readdir(200, vec![20, 21]);
+        // Access dir 200 to make dir 100 the LRU victim.
+        let _ = tracker.on_child_read(20);
+        tracker.on_readdir(300, vec![30, 31]);
+
+        // Dir 100 should be evicted and its child mappings removed.
+        let p = tracker.on_child_read(10);
+        assert!(
+            p.is_empty(),
+            "evicted directory child mapping must be cleared"
+        );
+
+        // New directory remains active.
+        tracker.on_child_read(30);
+        let p_new = tracker.on_child_read(31);
+        assert!(p_new.is_empty());
+    }
+
+    #[test]
+    fn test_readdir_refresh_prunes_stale_child_mappings() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir(100, vec![10, 11, 12]);
+        tracker.on_readdir(100, vec![11, 13]);
+
+        // Child 10 no longer belongs to directory 100 and should be pruned.
+        let p_old = tracker.on_child_read(10);
+        assert!(p_old.is_empty());
+        let p_new = tracker.on_child_read(11);
+        assert!(p_new.is_empty());
+    }
+
+    #[test]
+    fn test_stale_child_mapping_does_not_remove_fresh_mapping() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir(100, vec![10]);
+        let stale = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+
+        // Refresh directory; child 10 is still present, but with a newer touch.
+        tracker.on_readdir(100, vec![10, 11]);
+        let fresh = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+        assert_ne!(stale.1, fresh.1, "touch stamp should advance on refresh");
+
+        // Simulate stale cleanup path: must not delete the fresh mapping.
+        tracker.remove_child_mapping_if_unchanged(10, stale);
+        assert!(
+            tracker.child_to_dir.get(&10).is_some(),
+            "fresh mapping must survive stale compare-and-remove"
+        );
     }
 }

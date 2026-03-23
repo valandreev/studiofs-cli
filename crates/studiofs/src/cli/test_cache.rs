@@ -3835,7 +3835,11 @@ mod tests {
         assert_eq!(plan.medium_files, 1);
         assert_eq!(plan.large_files, 1);
 
-        let default_plan = build_work_sizes(DEFAULT_BLOCK_SIZE as u64, &WorkloadSizeInput::Default, bounds);
+        let default_plan = build_work_sizes(
+            DEFAULT_BLOCK_SIZE as u64,
+            &WorkloadSizeInput::Default,
+            bounds,
+        );
         assert!(
             default_plan.sizes[..WORKLOAD_FILES_PER_TIER]
                 .iter()

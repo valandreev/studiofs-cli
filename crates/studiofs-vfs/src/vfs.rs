@@ -3881,6 +3881,25 @@ impl StudioVfs {
                 Duration::from_millis(config.metadata_invalidation_sync_interval_ms.max(1));
             let read_buffer_mb = config.read_buffer_mb.max(1);
             let block_size_nonzero = block_size.max(1) as u128;
+            // Block indices in the read path are u32; verify practical
+            // addressable range at mount-time to avoid silent undersizing when
+            // very small block sizes are configured.
+            const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
+            let max_addressable_bytes = (u32::MAX as u128).saturating_mul(block_size_nonzero);
+            debug_assert!(
+                max_addressable_bytes >= MIN_PRACTICAL_ADDRESSABLE_BYTES,
+                "configured block_size={} yields only {} addressable bytes with u32 block indices",
+                block_size_nonzero,
+                max_addressable_bytes
+            );
+            if max_addressable_bytes < MIN_PRACTICAL_ADDRESSABLE_BYTES {
+                warn!(
+                    block_size,
+                    max_addressable_bytes,
+                    min_recommended = MIN_PRACTICAL_ADDRESSABLE_BYTES,
+                    "small block_size reduces max file addressability with u32 block indices"
+                );
+            }
             let mb_to_blocks = |mb: u64| -> u32 {
                 let bytes = (mb as u128) * 1024 * 1024;
                 let blocks = (bytes / block_size_nonzero).max(1).min(u32::MAX as u128);
@@ -3888,7 +3907,8 @@ impl StudioVfs {
             };
             let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
             let prefetch_concurrency = config.prefetch_concurrency.max(1);
-            let readahead_width = config.readahead_width.max(1);
+            let readahead_base_width = config.readahead_width.max(1);
+            let readahead_max_width = buffer_blocks_default.max(readahead_base_width);
             let readahead_min_prefetch = config.readahead_min_prefetch.max(1);
             let readahead_seq_step = config.readahead_seq_step.max(1);
             let readahead_random_penalty = config.readahead_random_penalty.max(1);
@@ -3953,11 +3973,13 @@ impl StudioVfs {
             block_cache.spawn_background_tasks();
 
             // Init ReadAhead tracker + prefetch channel
-            let readahead = Arc::new(ReadAheadTracker::new_with_tuning(
-                readahead_width,
+            let readahead = Arc::new(ReadAheadTracker::new_with_bounds(
+                readahead_base_width,
+                readahead_max_width,
                 readahead_min_prefetch,
                 readahead_seq_step,
                 readahead_random_penalty,
+                4,
             ));
             let dir_prefetch = Arc::new(DirAccessTracker::new(2));
             let (prefetch_tx, mut prefetch_rx) =
@@ -5358,7 +5380,13 @@ impl StudioVfs {
                 .pending_incarnation
                 .as_ref()
                 .map(|pending| pending.content_epoch)
-                .unwrap_or(attr.content_epoch);
+                .unwrap_or_else(|| {
+                    let min_pending_epoch = committed
+                        .as_ref()
+                        .map(|base| base.content_epoch.saturating_add(1))
+                        .unwrap_or(0);
+                    attr.content_epoch.max(min_pending_epoch)
+                });
 
             InodeIncarnationState {
                 committed_incarnation: committed.clone(),
@@ -8265,15 +8293,20 @@ impl StudioVfs {
             return Vec::new();
         }
         // Ignore stale hints for inodes that no longer exist.
-        match self.meta.get_attr(ino) {
-            Ok(_) => {}
+        let attr = match self.meta.get_attr(ino) {
+            Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
                 self.readahead.evict(ino);
                 self.prefetch_last_hint.lock().remove(&ino);
                 return Vec::new();
             }
             Err(_) => return Vec::new(),
-        }
+        };
+        let eof_block = if attr.size == 0 {
+            None
+        } else {
+            Some(((attr.size.saturating_sub(1)) / self.block_size.max(1) as u64) as u32)
+        };
         // Keep ReadAhead state consistent even when prefetch budget is zero.
         let to_prefetch = self.readahead.record_read(ino, first_block, last_block);
         // Keep directory-level access state in sync regardless of budget.
@@ -8303,6 +8336,11 @@ impl StudioVfs {
         for block_idx in to_prefetch {
             if budget == 0 {
                 break;
+            }
+            if let Some(max_block) = eof_block
+                && block_idx > max_block
+            {
+                continue;
             }
             planned.push((ino, block_idx));
             budget = budget.saturating_sub(1);
