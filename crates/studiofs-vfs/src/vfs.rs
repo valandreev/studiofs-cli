@@ -5361,7 +5361,13 @@ impl StudioVfs {
                 .pending_incarnation
                 .as_ref()
                 .map(|pending| pending.content_epoch)
-                .unwrap_or(attr.content_epoch);
+                .unwrap_or_else(|| {
+                    let min_pending_epoch = committed
+                        .as_ref()
+                        .map(|base| base.content_epoch.saturating_add(1))
+                        .unwrap_or(0);
+                    attr.content_epoch.max(min_pending_epoch)
+                });
 
             InodeIncarnationState {
                 committed_incarnation: committed.clone(),
