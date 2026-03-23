@@ -408,6 +408,9 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
 | `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
 | `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` | `4096` | Capacity of L2 sync-read open-file descriptor LRU cache (set lower on hosts with strict FD limits) |
+| `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` (`u32::MAX` when `--direct-io`) | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
+| `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` | `1000` (`u32::MAX` when `--direct-io`) | WinFSP DirInfo metadata timeout; accepts milliseconds or `-1` / `max` |
+| `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` (`u32::MAX` when `--direct-io`) | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |

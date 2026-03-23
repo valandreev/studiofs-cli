@@ -27,6 +27,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use std::fs::File;
 use std::io;
+use std::io::Read as _;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,6 +55,7 @@ const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
+const DEFAULT_BUFFERED_READ_CAPACITY: usize = 8 * 1024 * 1024;
 const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
 const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT";
 #[cfg(windows)]
@@ -194,12 +196,60 @@ fn open_sync_read_file(path: &Path) -> io::Result<File> {
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).share_mode(WINDOWS_FILE_SHARE_ALL);
-        opts.open(path)
+        let file = opts.open(path)?;
+        apply_l2_read_open_hints(&file);
+        Ok(file)
     }
     #[cfg(not(windows))]
     {
-        File::open(path)
+        let file = File::open(path)?;
+        apply_l2_read_open_hints(&file);
+        Ok(file)
     }
+}
+
+fn apply_l2_read_open_hints(file: &File) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let fd = file.as_raw_fd();
+        let _ = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+    }
+}
+
+fn apply_l2_read_close_hints(file: &File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let fd = file.as_raw_fd();
+        let _ = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+    }
+}
+
+fn read_block_buffered(path: &Path, expected_len_hint: Option<usize>) -> io::Result<Bytes> {
+    let mut file = open_sync_read_file(path)?;
+
+    let capacity = match expected_len_hint {
+        Some(len) => len,
+        None => match usize::try_from(file.metadata()?.len()) {
+            Ok(len) => len,
+            Err(_) => DEFAULT_BUFFERED_READ_CAPACITY,
+        },
+    };
+    let mut out = Vec::with_capacity(capacity);
+    file.read_to_end(&mut out)?;
+    apply_l2_read_close_hints(&file);
+    Ok(Bytes::from(out))
 }
 
 /// File-per-block disk cache on NVMe.
@@ -357,7 +407,7 @@ impl L2DiskCache {
         if let Some(bytes) = try_read_direct_block(path, expected_len_hint)? {
             return Ok(bytes);
         }
-        std::fs::read(path).map(Bytes::from)
+        read_block_buffered(path, expected_len_hint)
     }
 
     async fn acquire_io_permit(&self) -> io::Result<OwnedSemaphorePermit> {
@@ -368,7 +418,10 @@ impl L2DiskCache {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))
     }
 
-    async fn read_block_bytes(path: PathBuf, expected_len_hint: Option<usize>) -> io::Result<Bytes> {
+    async fn read_block_bytes(
+        path: PathBuf,
+        expected_len_hint: Option<usize>,
+    ) -> io::Result<Bytes> {
         crate::runtime::spawn_blocking_profiled("l2_read", move || {
             Self::read_block_sync(&path, expected_len_hint)
         })
@@ -427,22 +480,23 @@ impl L2DiskCache {
         let mut join_set = tokio::task::JoinSet::new();
         let mut next_idx = 0usize;
 
-        let spawn_one = |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
-            let (id, size_hint) = ids[idx];
-            let path = self.block_path(id);
-            join_set.spawn(async move {
-                let read_result = match crate::runtime::spawn_blocking_profiled(
-                    "l2_read_batch",
-                    move || Self::read_block_sync(&path, size_hint.map(|len| len as usize)),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => Err(io::Error::other(e)),
-                };
-                (idx, read_result)
-            });
-        };
+        let spawn_one =
+            |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
+                let (id, size_hint) = ids[idx];
+                let path = self.block_path(id);
+                join_set.spawn(async move {
+                    let read_result =
+                        match crate::runtime::spawn_blocking_profiled("l2_read_batch", move || {
+                            Self::read_block_sync(&path, size_hint.map(|len| len as usize))
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => Err(io::Error::other(e)),
+                        };
+                    (idx, read_result)
+                });
+            };
 
         while next_idx < ids.len() && join_set.len() < max_in_flight {
             spawn_one(next_idx, &mut join_set);
@@ -478,8 +532,8 @@ impl L2DiskCache {
     /// Read a block synchronously (for non-async contexts like upload workers).
     pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match std::fs::read(&path) {
-            Ok(data) => Some(Bytes::from(data)),
+        match Self::read_block_sync(&path, None) {
+            Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
                 warn!(object_id, error = %e, "L2DiskCache sync read error");

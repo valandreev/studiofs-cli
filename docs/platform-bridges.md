@@ -42,9 +42,9 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | 512 bytes |
 | Allocation unit size | 16384 bytes |
 | Max component length | 255 |
-| File info timeout | 1000 ms |
-| Dir info timeout | 1000 ms |
-| Volume info timeout | 1000 ms |
+| File info timeout | `1000 ms` by default; `u32::MAX` in direct-io mode (NT Cache Manager delegation). Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Dir info timeout | `1000 ms` by default; `u32::MAX` in direct-io mode. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Volume info timeout | `1000 ms` by default; `u32::MAX` in direct-io mode. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
 | Persistent ACLs | Yes |
