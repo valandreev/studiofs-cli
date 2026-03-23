@@ -901,6 +901,7 @@ impl L2DiskCache {
         let spawn_one =
             |idx: usize, join_set: &mut tokio::task::JoinSet<RemoveBatchWorkerOutput>| {
                 let object_id = object_ids[idx];
+                self.fd_cache_invalidate(object_id);
                 let path = self.block_path(object_id);
                 let semaphore = Arc::clone(io_semaphore);
                 join_set.spawn(async move {
