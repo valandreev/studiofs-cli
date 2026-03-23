@@ -3149,6 +3149,7 @@ struct EffectiveAclCacheEntry {
     acl_namespace_epoch: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
 enum PrefetchWorkItem {
     ReadHint {
         ino: Ino,
@@ -7972,6 +7973,9 @@ impl StudioVfs {
         if self.shutdown_requested() || self.readahead.width == 0 {
             return Vec::new();
         }
+        // Keep ReadAhead state consistent even when prefetch budget is zero.
+        let to_prefetch = self.readahead.record_read(ino, first_block, last_block);
+
         // After transient transport failures, pause best-effort prefetch briefly
         // so foreground demand reads can recover the pipeline first.
         if self
@@ -7992,7 +7996,6 @@ impl StudioVfs {
             return Vec::new();
         }
 
-        let to_prefetch = self.readahead.record_read(ino, first_block, last_block);
         let mut planned: Vec<(Ino, u32)> = Vec::new();
         for block_idx in to_prefetch {
             if budget == 0 {
