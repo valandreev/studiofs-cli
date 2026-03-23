@@ -2730,9 +2730,12 @@ fn append_ingress_record(
     if !payload.is_empty() {
         file.write_all(payload)?;
     }
-    // Durable mode relies on ingress records surviving power loss once
-    // `flush_fh()` observes ingress drain completion.
-    file.sync_data()?;
+    // Durable mode relies on PUT records surviving power loss once
+    // `flush_fh()` observes ingress drain completion. Invalidate records are
+    // recovery optimizations and can be checkpointed asynchronously.
+    if kind == INGRESS_RECORD_PUT {
+        file.sync_data()?;
+    }
     Ok(start + INGRESS_RECORD_HEADER_LEN as u64)
 }
 
@@ -5343,8 +5346,8 @@ impl StudioVfs {
         }
     }
 
-    fn check_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
-        if let Some(message) = self.state.upload_sticky_errors.lock().get(&ino).cloned() {
+    fn consume_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
+        if let Some(message) = self.state.upload_sticky_errors.lock().remove(&ino) {
             return Err(VfsError::Other(format!(
                 "sticky upload error on inode {ino}: {message}"
             )));
@@ -6914,7 +6917,7 @@ impl StudioVfs {
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
             let ino = open_file.ino;
-            self.check_upload_sticky_error(ino)?;
+            self.consume_upload_sticky_error(ino)?;
             let unbuffered = open_file.flags.requests_unbuffered_io();
             self.flush(ino).await?;
             if unbuffered {
@@ -6936,7 +6939,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
-        self.check_upload_sticky_error(ino)?;
+        self.consume_upload_sticky_error(ino)?;
 
         // Flush pending write buffer
         self.flush(ino).await?;
@@ -8600,7 +8603,6 @@ impl StudioVfs {
             });
             return Ok(data.len() as u32);
         }
-        self.check_upload_sticky_error(ino)?;
 
         if data.is_empty() {
             return Ok(0);
@@ -8744,7 +8746,6 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
-        self.check_upload_sticky_error(ino)?;
 
         // Move all remaining dirty pending blocks into the dirty memory buffer.
         // The background slab flusher handles package + slab write + upload queue.
@@ -10350,7 +10351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sticky_upload_error_blocks_sync_points_until_cleared() {
+    fn test_sticky_upload_error_is_consumed_by_sync_points() {
         let tmp = tempfile::tempdir().unwrap();
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-upload-error");
         let _guard = rt.enter();
@@ -10360,27 +10361,23 @@ mod tests {
             let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
             vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
 
-            let write_err = vfs.write(ino, 0, b"payload").await.unwrap_err();
-            assert!(
-                write_err.to_string().contains("sticky upload error"),
-                "write should surface sticky upload errors"
-            );
-
             let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
             assert!(
                 fsync_err.to_string().contains("sticky upload error"),
                 "fsync should surface sticky upload errors"
             );
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.fsync(ino, false).await.unwrap();
 
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
             let flush_err = vfs.flush_fh(fh).await.unwrap_err();
             assert!(
                 flush_err.to_string().contains("sticky upload error"),
                 "flush_fh should surface sticky upload errors"
             );
-
-            vfs.clear_upload_sticky_error(ino);
             vfs.write(ino, 0, b"payload").await.unwrap();
             vfs.flush_fh(fh).await.unwrap();
+
             vfs.release_fh(fh).await.unwrap();
         });
     }

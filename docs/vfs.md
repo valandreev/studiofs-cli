@@ -98,7 +98,7 @@ Handle-aware write path:
   - `wait_for_ingress_drain(ino, timeout)` which waits only for local ingress to drain for that inode.
 - This provides synchronous local durability confirmation for unbuffered callers at natural sync boundaries; S3 upload remains asynchronous.
 - In `cache_safety_mode=durable`, ingress WAL appends are forced with local `sync_data()`, so this confirmation is resilient to process crash and OS-page-cache loss scenarios.
-- Asynchronous upload failures are tracked as sticky inode errors; subsequent `write`/`flush_fh`/`fsync` return `EIO` until a later successful upload clears the sticky state.
+- Asynchronous upload failures are tracked as sticky inode errors; the next `flush_fh`/`fsync` reports `EIO` and consumes that sticky error (new async failures can set it again).
 
 ### 2. `flush(ino)` / `close(ino)`
 
