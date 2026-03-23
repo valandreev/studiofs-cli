@@ -602,7 +602,6 @@ const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS: u64 = 120;
 const DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS: u64 = 25;
-const DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS: u64 = 100;
 
 fn direct_io_sync_timeout() -> Duration {
     let secs = std::env::var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS")
@@ -2731,6 +2730,12 @@ fn append_ingress_record(
     if !payload.is_empty() {
         file.write_all(payload)?;
     }
+    // Durable mode relies on PUT records surviving power loss once
+    // `flush_fh()` observes ingress drain completion. Invalidate records are
+    // recovery optimizations and can be checkpointed asynchronously.
+    if kind == INGRESS_RECORD_PUT {
+        file.sync_data()?;
+    }
     Ok(start + INGRESS_RECORD_HEADER_LEN as u64)
 }
 
@@ -3094,6 +3099,9 @@ struct VfsState {
     /// pending upload completes (or is cancelled).  Populated by
     /// `evict_inode_from_caches()` when it encounters a pinned block.
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    /// Sticky async upload failures keyed by inode. Once set, foreground sync
+    /// points surface EIO until a subsequent successful upload clears it.
+    upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
     /// Number of upload operations requeued after process failures.
     upload_requeues: AtomicU64,
     /// Upload operations canceled because inode was deleted/missing.
@@ -4186,6 +4194,7 @@ impl StudioVfs {
                     active_ingress_segment_id: AtomicU64::new(active_ingress_segment_id),
                     deleted_inodes: Mutex::new(std::collections::HashSet::new()),
                     pending_evictions: Mutex::new(std::collections::HashSet::new()),
+                    upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
                     upload_requeues: AtomicU64::new(0),
                     upload_canceled_deleted: AtomicU64::new(0),
                     upload_canceled_stale: AtomicU64::new(0),
@@ -5305,6 +5314,45 @@ impl StudioVfs {
     fn clear_inode_incarnation(&self, ino: Ino) {
         self.state.inode_incarnations.lock().remove(&ino);
         self.state.directory_generations.lock().remove(&ino);
+        self.state.upload_sticky_errors.lock().remove(&ino);
+    }
+
+    fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError) {
+        let message = error.to_string();
+        let mut sticky = self.state.upload_sticky_errors.lock();
+        let changed = sticky
+            .get(&ino)
+            .map(|existing| existing != &message)
+            .unwrap_or(true);
+        sticky.insert(ino, message.clone());
+        if changed {
+            warn!(
+                ino,
+                error = %message,
+                "recorded sticky async upload error for inode"
+            );
+        }
+    }
+
+    fn clear_upload_sticky_error(&self, ino: Ino) {
+        if self
+            .state
+            .upload_sticky_errors
+            .lock()
+            .remove(&ino)
+            .is_some()
+        {
+            info!(ino, "cleared sticky async upload error for inode");
+        }
+    }
+
+    fn consume_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
+        if let Some(message) = self.state.upload_sticky_errors.lock().remove(&ino) {
+            return Err(VfsError::Other(format!(
+                "sticky upload error on inode {ino}: {message}"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
@@ -6864,17 +6912,18 @@ impl StudioVfs {
     ///
     /// Called by FUSE `flush()`.  Flushes pending writes for the inode.
     /// For handles opened with `DIRECT_IO`/`WRITE_THROUGH`, this also
-    /// waits until all ingress and upload-queue entries for the inode
-    /// have drained to the backend (synchronous write-through guarantee).
+    /// waits until local ingress has drained for the inode so data is
+    /// durable in local cache/WAL before returning.
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
             let ino = open_file.ino;
             let unbuffered = open_file.flags.requests_unbuffered_io();
             self.flush(ino).await?;
             if unbuffered {
-                self.sync_inode_to_backend(ino, direct_io_sync_timeout())
+                self.wait_for_ingress_drain(ino, direct_io_sync_timeout())
                     .await?;
             }
+            self.consume_upload_sticky_error(ino)?;
         }
         Ok(())
     }
@@ -6908,6 +6957,7 @@ impl StudioVfs {
             .await?;
             self.state.attr_read_cache.lock().remove(ino);
         }
+        self.consume_upload_sticky_error(ino)?;
         Ok(())
     }
 
@@ -6989,13 +7039,13 @@ impl StudioVfs {
     /// Writes are buffered identically to `write()`.  The synchronous
     /// backend drain for `DIRECT_IO`/`WRITE_THROUGH` handles is deferred
     /// to `flush_fh()` / `close()` so individual writes do not block on
-    /// S3 round-trips.
+    /// local ingress or S3 round-trips.
     pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let _ = fh; // reserved for future per-handle write policy
         self.write(ino, offset, data).await
     }
 
-    async fn sync_inode_to_backend(&self, ino: Ino, timeout: Duration) -> VfsResult<()> {
+    async fn wait_for_ingress_drain(&self, ino: Ino, timeout: Duration) -> VfsResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
             // Always drain: a block may be in transit between dirty_mem and
@@ -7005,9 +7055,8 @@ impl StudioVfs {
             // "in the air" between pipeline stages.
             self.drain_dirty_mem().await;
             let has_pending_ingress = self.inode_has_pending_ingress(ino);
-            let has_pending_uploads = self.inode_has_pending_uploads(ino);
 
-            if !has_pending_ingress && !has_pending_uploads {
+            if !has_pending_ingress {
                 return Ok(());
             }
 
@@ -7019,11 +7068,7 @@ impl StudioVfs {
                 )));
             }
 
-            let max_sleep = if has_pending_ingress {
-                Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS)
-            } else {
-                Duration::from_millis(DIRECT_IO_SYNC_WAIT_UPLOAD_ONLY_MS)
-            };
+            let max_sleep = Duration::from_millis(DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS);
             let sleep_for = std::cmp::min(deadline.saturating_duration_since(now), max_sleep);
             let progress = self.state.dirty_drained_notify.notified();
             tokio::select! {
@@ -8826,6 +8871,7 @@ impl StudioVfs {
                             vfs.block_cache.cancel_upload(&op, true);
                             vfs.state.pending_evictions.lock().remove(&op.object_id);
                         } else {
+                            vfs.mark_upload_sticky_error(op.ino, &e);
                             let mut retry_op = op;
                             retry_op.retry_count = retry_op.retry_count.saturating_add(1);
                             let delay = vfs.upload_requeue_delay(&retry_op);
@@ -9253,6 +9299,7 @@ impl StudioVfs {
         } else {
             self.clear_inode_incarnation(op.ino);
         }
+        self.clear_upload_sticky_error(op.ino);
 
         // Post-upload cleanup: if the block was marked for deferred eviction
         // (inode was deleted while the upload was in flight), remove it now.
@@ -10301,6 +10348,70 @@ mod tests {
         assert_eq!(offset_within_block(100, block_size), 100);
         assert_eq!(offset_within_block(4 * 1024 * 1024, block_size), 0);
         assert_eq!(offset_within_block(4 * 1024 * 1024 + 100, block_size), 100);
+    }
+
+    #[test]
+    fn test_sticky_upload_error_is_consumed_by_sync_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-upload-error");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"sticky.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+
+            let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
+            assert!(
+                fsync_err.to_string().contains("sticky upload error"),
+                "fsync should surface sticky upload errors"
+            );
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.fsync(ino, false).await.unwrap();
+
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+            let flush_err = vfs.flush_fh(fh).await.unwrap_err();
+            assert!(
+                flush_err.to_string().contains("sticky upload error"),
+                "flush_fh should surface sticky upload errors"
+            );
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+
+            vfs.release_fh(fh).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_fsync_reports_sticky_error_after_persisting_current_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-fsync-order");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"sticky-fsync.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let payload = b"persist-before-sticky-report";
+
+            vfs.write(ino, 0, payload).await.unwrap();
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+
+            let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
+            assert!(
+                fsync_err.to_string().contains("sticky upload error"),
+                "fsync should still report sticky upload errors"
+            );
+
+            let after = vfs.getattr(ino).unwrap();
+            assert_eq!(
+                after.size,
+                payload.len() as u64,
+                "fsync must persist current dirty attrs before reporting sticky EIO"
+            );
+
+            // Error is consumable: the next fsync should proceed unless a new
+            // async upload failure occurs.
+            vfs.fsync(ino, false).await.unwrap();
+        });
     }
 
     // =========================================================================

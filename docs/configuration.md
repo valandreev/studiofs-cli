@@ -110,8 +110,9 @@ Notes:
 - `--direct-io` enables unbuffered I/O behavior for Windows WinFSP mounts:
   - handles opened with `FILE_NO_INTERMEDIATE_BUFFERING`/`FILE_WRITE_THROUGH` are treated as unbuffered in VFS.
   - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; fetched blocks are cached in L2 for potential re-reads.
-  - writes buffer data as normal; the synchronous drain to backend visibility is deferred to `flush()`/`close()` for the handle.
-  - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write backend wait timeout (default `120` seconds).
+  - writes buffer data as normal; synchronous confirmation at `flush()`/`close()` waits for local ingress durability (NVMe/WAL), not S3 upload completion.
+  - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write ingress-drain timeout (default `120` seconds).
+  - if asynchronous S3 upload fails, StudioFS records a sticky inode upload error; the next `flush`/`fsync` reports `EIO` and consumes that error.
   - this mode is intended for storage benchmarking and strict write-through workflows.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
