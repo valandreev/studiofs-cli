@@ -82,6 +82,15 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 - **Fewer stat syscalls on hot reads** — `BlockCache` now passes known block
   size from LRU/cache metadata into L2 direct-read path, avoiding per-read
   `metadata()` in the common case
+- **Sync caller-thread read path for cache hits** — hot path reads can serve L2
+  hits synchronously into caller-provided `&mut [u8]` buffers via
+  `read_into_sync()` / `get_sync_l2_into(...)`, bypassing async scheduler hops
+- **Open file descriptor reuse for sync reads** — `L2DiskCache` keeps a small
+  LRU of open block files for sync read hot paths to reduce repeated `open()`
+  syscall overhead on frequent cache hits
+- **Windows handle-share safety for rename/remove races** — sync-read cached
+  file handles are opened with read/write/delete sharing to coexist with
+  concurrent temp-rename based writes and removals
 - **Hinted-size validation** — if a hinted direct-read returns a different
   payload length than expected, the direct path is discarded and read retries
   via buffered fallback for correctness
@@ -90,6 +99,8 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   `std::fs::OpenOptions` + direct-open flags and async buffered fallback
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
+- **Tunable sync FD cache size** — `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY`
+  controls sync-read open-file LRU capacity (default `4096`)
 
 **Batch operations:**
 - `put_batch(blocks)` — parallel `spawn_blocking` per block
@@ -178,6 +189,7 @@ Unified API combining all components above.
 |--------|-------------|
 | `open(config)` | Initialize L1, L2, LRU, upload queue; scan L2 for recovery |
 | `get(id)` | L1 → L2 → miss (returns None) |
+| `get_sync_l2_into(id, off, out)` | Sync L2-only read directly into caller buffer (returns `None` on miss/bypass) |
 | `stage_l1(id, data)` | Insert into L1 + LRU as `MemoryOnly` |
 | `commit_l2(id, data)` | Enqueue one L2 commit into bounded scheduler |
 | `commit_l2_batch(blocks)` | Consume and enqueue `Vec<(ObjectId, Bytes)>` into bounded scheduler (applies backpressure on full queue) |
@@ -189,6 +201,7 @@ Unified API combining all components above.
 Timeout behavior:
 - L2 read timeout is treated as a cache miss (`get*` returns `None`) so callers can continue to remote/object-store fetch paths.
 - Repeated L2 read timeouts open a short-lived read circuit breaker (default: 3 consecutive timeouts, 5s cooldown), temporarily bypassing L2 reads to avoid piling additional blocking disk tasks during device stalls.
+- Sync L2 read-into path respects the same read circuit-breaker policy; when the breaker is open it reports miss/bypass so callers can fall back to async/remote fetch path.
 - L2 write timeout fails the direct write path and is retried by background commit workers up to the configured attempt cap before dropping the local commit job.
 - L2 blocking disk operations are bounded by an internal semaphore (default 128 in-flight tasks), preventing unbounded `spawn_blocking` growth when the local disk stalls.
 

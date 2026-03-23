@@ -23,5 +23,6 @@ pub use upload::UploadScheduler;
 pub use vfs::{
     CacheSafetyMode, KernelInvalidator, LockKind, NamespaceParent, NamespacePathStyle,
     NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsError, VfsIngressLane,
-    VfsIngressPressure, VfsIngressStats, VfsResult, VfsUploadStats, parse_size_bytes,
+    VfsIngressPressure, VfsIngressStats, VfsReadFastPathStats, VfsResult, VfsUploadStats,
+    parse_size_bytes,
 };

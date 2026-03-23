@@ -258,6 +258,12 @@ pub struct VfsUploadStats {
     pub canceled_stale: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct VfsReadFastPathStats {
+    pub sync_fast_path_hits: u64,
+    pub sync_fast_path_misses: u64,
+}
+
 pub type VfsResult<T> = Result<T, VfsError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3084,6 +3090,10 @@ struct VfsState {
     foreground_reads_inflight: AtomicUsize,
     /// Last time a foreground read was observed (unix millis).
     last_foreground_read_ms: AtomicU64,
+    /// Number of successful synchronous cache-only read fast-path operations.
+    sync_read_fast_path_hits: AtomicU64,
+    /// Number of synchronous cache-only fast-path misses/fallbacks.
+    sync_read_fast_path_misses: AtomicU64,
     /// Flag set at shutdown to stop the background slab flusher so it cannot
     /// race with the shutdown drain.
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
@@ -4140,6 +4150,8 @@ impl StudioVfs {
                     upload_canceled_stale: AtomicU64::new(0),
                     foreground_reads_inflight: AtomicUsize::new(0),
                     last_foreground_read_ms: AtomicU64::new(0),
+                    sync_read_fast_path_hits: AtomicU64::new(0),
+                    sync_read_fast_path_misses: AtomicU64::new(0),
                     slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
                     ingress_checkpoint_stopped: std::sync::atomic::AtomicBool::new(false),
                     ingress_checkpoint_persists: AtomicU64::new(0),
@@ -5250,6 +5262,16 @@ impl StudioVfs {
         }
     }
 
+    pub fn read_fast_path_stats(&self) -> VfsReadFastPathStats {
+        VfsReadFastPathStats {
+            sync_fast_path_hits: self.state.sync_read_fast_path_hits.load(Ordering::Relaxed),
+            sync_fast_path_misses: self
+                .state
+                .sync_read_fast_path_misses
+                .load(Ordering::Relaxed),
+        }
+    }
+
     fn logical_block_len(&self, file_size: u64, block_index: u32) -> usize {
         let block_start = block_index as u64 * self.block_size as u64;
         if block_start >= file_size {
@@ -5517,6 +5539,18 @@ impl StudioVfs {
         self.state
             .last_foreground_read_ms
             .store(Self::now_unix_millis(), Ordering::Relaxed);
+    }
+
+    fn record_sync_read_fast_path_hit(&self) {
+        self.state
+            .sync_read_fast_path_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_sync_read_fast_path_miss(&self) {
+        self.state
+            .sync_read_fast_path_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -6740,6 +6774,49 @@ impl StudioVfs {
             .await
     }
 
+    /// Try a synchronous L2-cache fast path directly into `buffer`.
+    ///
+    /// Returns `Ok(Some(n))` when fully served synchronously, or `Ok(None)` to
+    /// indicate caller should fall back to the async read path.
+    pub fn read_into_fh_sync_cached(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<Option<u32>> {
+        let unbuffered = self
+            .handle_table
+            .get(fh)
+            .map(|open| open.flags.requests_unbuffered_io())
+            .unwrap_or(false);
+        let result = self.read_into_sync_cached_with_mode(ino, offset, buffer, unbuffered)?;
+        if result.is_some() {
+            self.record_sync_read_fast_path_hit();
+        } else {
+            self.record_sync_read_fast_path_miss();
+        }
+        Ok(result)
+    }
+
+    /// Check whether a synchronous cache-only read can serve the full request.
+    ///
+    /// Returns `Ok(true)` only when every required committed block is currently
+    /// available in local cache (or represented by local overlay/hole data).
+    pub fn can_read_fh_sync_cached(
+        &self,
+        _fh: u64,
+        ino: Ino,
+        offset: u64,
+        size: u32,
+    ) -> VfsResult<bool> {
+        let can_read = self.can_read_sync_cached_with_mode(ino, offset, size as usize)?;
+        if !can_read {
+            self.record_sync_read_fast_path_miss();
+        }
+        Ok(can_read)
+    }
+
     /// Write file data using per-handle I/O flags.
     ///
     /// Writes are buffered identically to `write()`.  The synchronous
@@ -7659,6 +7736,29 @@ impl StudioVfs {
         self.read_into_with_mode(ino, offset, buffer, false).await
     }
 
+    fn calculate_blocks_needed(
+        &self,
+        offset: u64,
+        buffer_len: usize,
+        file_size: u64,
+    ) -> Vec<(u32, usize, usize)> {
+        let end = (offset + buffer_len as u64).min(file_size);
+        if offset >= end {
+            return Vec::new();
+        }
+        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new();
+        let mut cur = offset;
+        while cur < end {
+            let idx = block_index_from_offset(cur, self.block_size);
+            let off_in = offset_within_block(cur, self.block_size) as usize;
+            let space = self.block_size as usize - off_in;
+            let to_copy = (end - cur).min(space as u64) as usize;
+            blocks_needed.push((idx, off_in, to_copy));
+            cur += to_copy as u64;
+        }
+        blocks_needed
+    }
+
     async fn read_into_with_mode(
         &self,
         ino: Ino,
@@ -7694,22 +7794,9 @@ impl StudioVfs {
             .map(|pending| pending.content_epoch);
 
         // Clamp read to file size
-        let end = (offset + buffer.len() as u64).min(attr.size);
-        if offset >= end {
+        let blocks_needed = self.calculate_blocks_needed(offset, buffer.len(), attr.size);
+        if blocks_needed.is_empty() {
             return Ok(0);
-        }
-        let _effective_size = (end - offset) as usize;
-
-        // Pre-compute all blocks needed
-        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new(); // (block_index, offset_in_block, to_copy)
-        let mut cur = offset;
-        while cur < end {
-            let idx = block_index_from_offset(cur, self.block_size);
-            let off_in = offset_within_block(cur, self.block_size) as usize;
-            let space = self.block_size as usize - off_in;
-            let to_copy = (end - cur).min(space as u64) as usize;
-            blocks_needed.push((idx, off_in, to_copy));
-            cur += to_copy as u64;
         }
 
         // If only one block, read sequentially to avoid overhead
@@ -7887,6 +7974,162 @@ impl StudioVfs {
         self.read_block_direct(ino, block_index).await
     }
 
+    fn read_into_sync_cached_with_mode(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+        unbuffered: bool,
+    ) -> VfsResult<Option<u32>> {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
+            let end = (offset + buffer.len() as u64).min(attr.size);
+            let len = end.saturating_sub(offset) as usize;
+            if len > 0 {
+                buffer[..len].fill(0);
+            }
+            return Ok(Some(len as u32));
+        }
+
+        if buffer.is_empty() {
+            return Ok(Some(0));
+        }
+
+        self.mark_foreground_read();
+        struct ForegroundReadGuard<'a>(&'a StudioVfs);
+        impl Drop for ForegroundReadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unmark_foreground_read();
+            }
+        }
+        let _guard = ForegroundReadGuard(self);
+
+        let attr = self.getattr(ino)?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::RemoteContentPending);
+        }
+        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let pending_content_epoch = incarnation_state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch);
+
+        let blocks_needed = self.calculate_blocks_needed(offset, buffer.len(), attr.size);
+        if blocks_needed.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let Some(block_refs) =
+            self.probe_sync_cached_blocks(ino, pending_content_epoch, &blocks_needed)?
+        else {
+            return Ok(None);
+        };
+
+        let mut written = 0usize;
+        for (idx, (block_idx, off_in, to_copy)) in blocks_needed.iter().copied().enumerate() {
+            if let Some(overlay) =
+                self.read_pending_overlay_block_sync(ino, block_idx, pending_content_epoch)?
+            {
+                let copy_len = if to_copy == 0 || off_in >= overlay.len() {
+                    0
+                } else {
+                    to_copy.min(overlay.len() - off_in)
+                };
+                if copy_len > 0 {
+                    buffer[written..written + copy_len]
+                        .copy_from_slice(&overlay[off_in..off_in + copy_len]);
+                }
+                if copy_len < to_copy {
+                    buffer[written + copy_len..written + to_copy].fill(0);
+                }
+                written += to_copy;
+                continue;
+            }
+
+            let Some(block_ref) = block_refs[idx].as_ref() else {
+                buffer[written..written + to_copy].fill(0);
+                written += to_copy;
+                continue;
+            };
+
+            let dst = &mut buffer[written..written + to_copy];
+            let read =
+                match self
+                    .block_cache
+                    .get_sync_l2_into(block_ref.object_id, off_in as u64, dst)
+                {
+                    Some(read) => read.min(to_copy),
+                    None => return Ok(None),
+                };
+            if read < to_copy {
+                dst[read..].fill(0);
+            }
+            written += to_copy;
+        }
+
+        if !unbuffered {
+            self.maybe_prefetch(ino, &blocks_needed);
+        }
+
+        Ok(Some(written as u32))
+    }
+
+    fn can_read_sync_cached_with_mode(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer_len: usize,
+    ) -> VfsResult<bool> {
+        if self.ignored_entry_attr(ino).is_some() || buffer_len == 0 {
+            return Ok(true);
+        }
+        let attr = self.getattr(ino)?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::RemoteContentPending);
+        }
+        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let pending_content_epoch = incarnation_state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch);
+
+        let blocks_needed = self.calculate_blocks_needed(offset, buffer_len, attr.size);
+        if blocks_needed.is_empty() {
+            return Ok(true);
+        }
+
+        Ok(self
+            .probe_sync_cached_blocks(ino, pending_content_epoch, &blocks_needed)?
+            .is_some())
+    }
+
+    fn probe_sync_cached_blocks(
+        &self,
+        ino: Ino,
+        pending_content_epoch: Option<u64>,
+        blocks_needed: &[(u32, usize, usize)],
+    ) -> VfsResult<Option<Vec<Option<BlockRef>>>> {
+        let mut block_refs: Vec<Option<BlockRef>> = Vec::with_capacity(blocks_needed.len());
+        for (block_idx, _, _) in blocks_needed {
+            if self
+                .read_pending_overlay_block_sync(ino, *block_idx, pending_content_epoch)?
+                .is_some()
+            {
+                block_refs.push(None);
+                continue;
+            }
+            let block_ref = self.get_file_block_sync(ino, *block_idx)?;
+            let Some(block_ref) = block_ref else {
+                block_refs.push(None);
+                continue;
+            };
+            if !self.block_cache.contains(block_ref.object_id) {
+                return Ok(None);
+            }
+            block_refs.push(Some(block_ref));
+        }
+        Ok(Some(block_refs))
+    }
+
     async fn get_file_block_async(
         &self,
         ino: Ino,
@@ -7897,6 +8140,12 @@ impl StudioVfs {
             engine.get_file_block(ino, block_index)
         })
         .await
+    }
+
+    fn get_file_block_sync(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>> {
+        self.meta
+            .get_file_block(ino, block_index)
+            .map_err(VfsError::Meta)
     }
 
     async fn load_spill_block_async(&self, key: (Ino, u32)) -> VfsResult<Option<Bytes>> {
@@ -8809,6 +9058,10 @@ impl StudioVfs {
                     canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
                     foreground_reads_inflight =
                         self.state.foreground_reads_inflight.load(Ordering::Relaxed),
+                    vfs_read_sync_fast_path_hits =
+                        self.state.sync_read_fast_path_hits.load(Ordering::Relaxed),
+                    vfs_read_sync_fast_path_misses =
+                        self.state.sync_read_fast_path_misses.load(Ordering::Relaxed),
                     dirty_mem_blocks = ingress.dirty_mem_blocks,
                     dirty_mem_bytes = ingress.dirty_mem_bytes,
                     spill_records = ingress.spill_records,

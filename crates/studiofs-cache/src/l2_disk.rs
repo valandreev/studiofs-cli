@@ -23,7 +23,11 @@
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
 use bytes::{Bytes, BytesMut};
+use lru::LruCache;
+use parking_lot::Mutex;
+use std::fs::File;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,12 +37,24 @@ use tracing::{debug, warn};
 
 use crate::platform_direct_io;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 // =============================================================================
 // L2DiskCache
 // =============================================================================
 
 /// Upper bound for active L2 blocking-I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
+/// Number of hot block files to keep as open descriptors for sync read fast-path.
+const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
+const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
     if alignment == 0 {
@@ -122,6 +138,52 @@ fn try_read_direct_block(
     }
 }
 
+fn read_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(windows)]
+    {
+        return file.seek_read(buf, offset);
+    }
+    #[cfg(unix)]
+    {
+        return file.read_at(buf, offset);
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pread-style reads are unsupported on this platform",
+    ))
+}
+
+fn read_into_slice_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    // One positional read attempt is enough for the sync cache-hit path.
+    // Short reads are propagated to caller and treated as tail zero-fill there.
+    read_file_at(file, buf, offset)
+}
+
+fn sync_fd_cache_capacity() -> usize {
+    std::env::var(L2_SYNC_FD_CACHE_CAPACITY_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_L2_SYNC_FD_CACHE_CAPACITY)
+}
+
+fn open_sync_read_file(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).share_mode(WINDOWS_FILE_SHARE_ALL);
+        opts.open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 /// File-per-block disk cache on NVMe.
 pub struct L2DiskCache {
     /// Root cache directory (contains `blocks/` subdirectory).
@@ -135,6 +197,8 @@ pub struct L2DiskCache {
     max_bytes: AtomicU64,
     /// Limits active blocking L2 I/O to avoid exhausting Tokio's blocking pool.
     io_semaphore: Arc<Semaphore>,
+    /// Small LRU of open file descriptors used by synchronous read fast-path.
+    sync_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
 }
 
 impl L2DiskCache {
@@ -201,6 +265,10 @@ impl L2DiskCache {
             total_bytes: AtomicU64::new(0),
             max_bytes: AtomicU64::new(max_bytes),
             io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
+            sync_read_fd_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(sync_fd_cache_capacity())
+                    .expect("sync fd cache capacity must be non-zero"),
+            )),
         };
 
         Ok(this)
@@ -424,6 +492,32 @@ impl L2DiskCache {
         }
     }
 
+    /// Read a block synchronously into a provided output slice at an offset.
+    ///
+    /// Returns `Ok(None)` when the block file is not present.
+    pub fn read_into_sync(
+        &self,
+        object_id: u64,
+        offset: u64,
+        out: &mut [u8],
+    ) -> io::Result<Option<usize>> {
+        let file = match self.fd_cache_get(object_id) {
+            Some(file) => file,
+            None => {
+                let path = self.block_path(object_id);
+                let opened = match open_sync_read_file(&path) {
+                    Ok(file) => Arc::new(file),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                self.fd_cache_insert(object_id, Arc::clone(&opened));
+                opened
+            }
+        };
+        let read = read_into_slice_at(file.as_ref(), offset, out)?;
+        Ok(Some(read))
+    }
+
     /// Write a block to disk (decompressed data) from an owned `Bytes` buffer.
     ///
     /// Atomic: writes to a `.tmp` file then renames — combined in a single
@@ -444,6 +538,9 @@ impl L2DiskCache {
         .await
         .map_err(io::Error::other)??;
 
+        // Invalidate after successful write+rename so future sync reads reopen
+        // the new inode instead of a cached old descriptor.
+        self.fd_cache_invalidate(object_id);
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
         Ok(())
     }
@@ -499,6 +596,7 @@ impl L2DiskCache {
         for (id, len, handle) in handles {
             let (res, elapsed_ns) = match handle.await {
                 Ok(Ok((Ok(()), elapsed_ns))) => {
+                    self.fd_cache_invalidate(id);
                     self.total_bytes.fetch_add(len, Ordering::Relaxed);
                     (Ok(()), elapsed_ns)
                 }
@@ -520,6 +618,9 @@ impl L2DiskCache {
 
         Self::write_block_file(&path, &tmp_path, data)?;
 
+        // Invalidate after successful write+rename so future sync reads reopen
+        // the new inode instead of a cached old descriptor.
+        self.fd_cache_invalidate(object_id);
         self.total_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -527,6 +628,7 @@ impl L2DiskCache {
 
     /// Remove a block from disk.
     pub async fn remove(&self, object_id: u64) {
+        self.fd_cache_invalidate(object_id);
         let path = self.block_path(object_id);
         let permit = match self.acquire_io_permit().await {
             Ok(permit) => permit,
@@ -566,6 +668,7 @@ impl L2DiskCache {
 
     /// Remove a block synchronously.
     pub fn remove_sync(&self, object_id: u64) {
+        self.fd_cache_invalidate(object_id);
         let path = self.block_path(object_id);
         match std::fs::metadata(&path) {
             Ok(meta) => {
@@ -620,6 +723,18 @@ impl L2DiskCache {
     /// Root cache directory.
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    fn fd_cache_get(&self, object_id: u64) -> Option<Arc<File>> {
+        self.sync_read_fd_cache.lock().get(&object_id).cloned()
+    }
+
+    fn fd_cache_insert(&self, object_id: u64, file: Arc<File>) {
+        self.sync_read_fd_cache.lock().put(object_id, file);
+    }
+
+    fn fd_cache_invalidate(&self, object_id: u64) {
+        let _ = self.sync_read_fd_cache.lock().pop(&object_id);
     }
 }
 

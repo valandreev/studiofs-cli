@@ -672,13 +672,44 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let can_sync = match self
+            .vfs
+            .can_read_fh_sync_cached(fh, ino, offset as u64, size)
+        {
+            Ok(can_sync) => can_sync,
+            Err(e) => {
+                error!("can_read_sync_cached({ino}, off={offset}, sz={size}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+                return;
+            }
+        };
+
+        if can_sync {
+            let mut out = vec![0u8; size as usize];
+            match self
+                .vfs
+                .read_into_fh_sync_cached(fh, ino, offset as u64, &mut out)
+            {
+                Ok(Some(n)) => {
+                    reply.data(&out[..n as usize]);
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!("read_sync_cached({ino}, off={offset}, sz={size}) -> {e}");
+                    reply.error(vfs_err_to_errno(&e));
+                    return;
+                }
+            }
+        }
+
         match self.rt.block_on(self.vfs.read(ino, offset as u64, size)) {
             Ok(data) => reply.data(&data),
             Err(e) => {
