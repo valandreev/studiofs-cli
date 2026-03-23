@@ -48,19 +48,29 @@ use std::os::windows::fs::OpenOptionsExt as _;
 // L2DiskCache
 // =============================================================================
 
-/// Upper bound for active L2 blocking-I/O tasks.
+/// Upper bound for active L2 blocking write/remove I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
+/// Max number of blocking L2 read tasks scheduled concurrently by one batch read call.
+const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
 const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
+const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT";
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+type PutBatchWorkerOutput = (usize, u64, u64, io::Result<(io::Result<()>, u64)>);
 
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
     if alignment == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "alignment must be non-zero",
+        ));
+    }
+    if !alignment.is_power_of_two() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alignment must be a power of two",
         ));
     }
     if len == 0 {
@@ -171,6 +181,14 @@ fn sync_fd_cache_capacity() -> usize {
         .unwrap_or(DEFAULT_L2_SYNC_FD_CACHE_CAPACITY)
 }
 
+fn read_batch_max_in_flight() -> usize {
+    std::env::var(L2_READ_BATCH_MAX_IN_FLIGHT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT)
+}
+
 fn open_sync_read_file(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
@@ -195,8 +213,10 @@ pub struct L2DiskCache {
     total_bytes: AtomicU64,
     /// Maximum allowed bytes.
     max_bytes: AtomicU64,
-    /// Limits active blocking L2 I/O to avoid exhausting Tokio's blocking pool.
-    io_semaphore: Arc<Semaphore>,
+    /// Limits active blocking L2 write/remove I/O to avoid exhausting Tokio's blocking pool.
+    write_io_semaphore: Arc<Semaphore>,
+    /// Max number of blocking L2 reads spawned concurrently by one batch call.
+    read_batch_max_in_flight: usize,
     /// Small LRU of open file descriptors used by synchronous read fast-path.
     sync_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
 }
@@ -264,7 +284,8 @@ impl L2DiskCache {
             shard_dirs: Arc::new(shard_dirs),
             total_bytes: AtomicU64::new(0),
             max_bytes: AtomicU64::new(max_bytes),
-            io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
+            write_io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
+            read_batch_max_in_flight: read_batch_max_in_flight().max(1),
             sync_read_fd_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(sync_fd_cache_capacity())
                     .expect("sync fd cache capacity must be non-zero"),
@@ -332,52 +353,27 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    async fn read_block_buffered(path: PathBuf, semaphore: Arc<Semaphore>) -> io::Result<Bytes> {
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))?;
-
-        crate::runtime::spawn_blocking_profiled("l2_read_buffered", move || -> io::Result<Bytes> {
-            let _permit = permit;
-            std::fs::read(path).map(Bytes::from)
-        })
-        .await
-        .map_err(io::Error::other)?
+    fn read_block_sync(path: &Path, expected_len_hint: Option<usize>) -> io::Result<Bytes> {
+        if let Some(bytes) = try_read_direct_block(path, expected_len_hint)? {
+            return Ok(bytes);
+        }
+        std::fs::read(path).map(Bytes::from)
     }
 
     async fn acquire_io_permit(&self) -> io::Result<OwnedSemaphorePermit> {
-        self.io_semaphore
+        self.write_io_semaphore
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))
     }
 
-    async fn read_block_bytes(
-        &self,
-        path: PathBuf,
-        expected_len_hint: Option<usize>,
-    ) -> io::Result<Bytes> {
-        {
-            let permit = self.acquire_io_permit().await?;
-            let path_for_direct = path.clone();
-            let direct = crate::runtime::spawn_blocking_profiled(
-                "l2_read_direct",
-                move || -> io::Result<Option<Bytes>> {
-                    let _permit = permit;
-                    try_read_direct_block(&path_for_direct, expected_len_hint)
-                },
-            )
-            .await
-            .map_err(io::Error::other)??;
-
-            if let Some(bytes) = direct {
-                return Ok(bytes);
-            }
-        }
-
-        Self::read_block_buffered(path, self.io_semaphore.clone()).await
+    async fn read_block_bytes(path: PathBuf, expected_len_hint: Option<usize>) -> io::Result<Bytes> {
+        crate::runtime::spawn_blocking_profiled("l2_read", move || {
+            Self::read_block_sync(&path, expected_len_hint)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     /// Read a block from disk. Returns `None` if not cached.
@@ -399,10 +395,7 @@ impl L2DiskCache {
         size_hint: Option<u32>,
     ) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match self
-            .read_block_bytes(path, size_hint.map(|v| v as usize))
-            .await
-        {
+        match Self::read_block_bytes(path, size_hint.map(|v| v as usize)).await {
             Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -428,54 +421,57 @@ impl L2DiskCache {
         &self,
         ids: &[(u64, Option<u32>)],
     ) -> Vec<(u64, Option<Bytes>)> {
-        let mut handles = Vec::with_capacity(ids.len());
-        for &(id, size_hint) in ids {
-            let path = self.block_path(id);
-            let semaphore = self.io_semaphore.clone();
-            handles.push((
-                id,
-                tokio::spawn(async move {
-                    let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
-                    })?;
-                    let path_for_direct = path.clone();
-                    let direct = crate::runtime::spawn_blocking_profiled(
-                        "l2_read_batch_direct",
-                        move || -> io::Result<Option<Bytes>> {
-                            let _permit = permit;
-                            try_read_direct_block(
-                                &path_for_direct,
-                                size_hint.map(|len| len as usize),
-                            )
-                        },
-                    )
-                    .await
-                    .map_err(io::Error::other)??;
+        let mut results: Vec<(u64, Option<Bytes>)> =
+            ids.iter().map(|(id, _)| (*id, None)).collect();
+        let max_in_flight = self.read_batch_max_in_flight.max(1);
+        let mut join_set = tokio::task::JoinSet::new();
+        let mut next_idx = 0usize;
 
-                    match direct {
-                        Some(bytes) => Ok(bytes),
-                        None => Self::read_block_buffered(path, semaphore.clone()).await,
-                    }
-                }),
-            ));
+        let spawn_one = |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
+            let (id, size_hint) = ids[idx];
+            let path = self.block_path(id);
+            join_set.spawn(async move {
+                let read_result = match crate::runtime::spawn_blocking_profiled(
+                    "l2_read_batch",
+                    move || Self::read_block_sync(&path, size_hint.map(|len| len as usize)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => Err(io::Error::other(e)),
+                };
+                (idx, read_result)
+            });
+        };
+
+        while next_idx < ids.len() && join_set.len() < max_in_flight {
+            spawn_one(next_idx, &mut join_set);
+            next_idx += 1;
         }
 
-        let mut results = Vec::with_capacity(handles.len());
-        for (id, handle) in handles {
-            let data = match handle.await {
-                Ok(Ok(data)) => Some(data),
-                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
-                Ok(Err(e)) => {
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, Ok(data))) => {
+                    results[idx].1 = Some(data);
+                }
+                Ok((idx, Err(e))) if e.kind() == io::ErrorKind::NotFound => {
+                    results[idx].1 = None;
+                }
+                Ok((idx, Err(e))) => {
+                    let id = results[idx].0;
                     warn!(id, error = %e, "L2DiskCache batch read error");
-                    None
                 }
                 Err(e) => {
-                    warn!(id, error = %e, "L2DiskCache batch join error");
-                    None
+                    warn!(error = %e, "L2DiskCache batch join error");
                 }
-            };
-            results.push((id, data));
+            }
+
+            if next_idx < ids.len() {
+                spawn_one(next_idx, &mut join_set);
+                next_idx += 1;
+            }
         }
+
         results
     }
 
@@ -560,52 +556,92 @@ impl L2DiskCache {
     /// service them concurrently through multiple queues.  Returns errors
     /// for individual blocks as `(object_id, Error)`.
     pub async fn put_batch(&self, blocks: &[(u64, Bytes)]) -> Vec<(u64, io::Result<()>, u64)> {
-        let mut handles = Vec::with_capacity(blocks.len());
-        for (id, data) in blocks {
+        let max_in_flight = DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT.max(1);
+        let mut join_set = tokio::task::JoinSet::new();
+        let mut next_idx = 0usize;
+        let mut results: Vec<(u64, io::Result<()>, u64)> = blocks
+            .iter()
+            .map(|(id, _)| {
+                (
+                    *id,
+                    Err(io::Error::other("L2 put batch task did not complete")),
+                    0,
+                )
+            })
+            .collect();
+
+        let spawn_one = |idx: usize, join_set: &mut tokio::task::JoinSet<PutBatchWorkerOutput>| {
+            let (id, data) = &blocks[idx];
             let path = self.block_path(*id);
             let tmp_path = Self::unique_tmp_path(&path);
             let owned = data.clone();
             let object_id = *id;
-            let semaphore = self.io_semaphore.clone();
-            handles.push((
-                object_id,
-                data.len() as u64,
-                tokio::spawn(async move {
-                    let permit = semaphore.acquire_owned().await.map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
-                    })?;
-                    crate::runtime::spawn_blocking_profiled(
-                        "l2_put_batch",
-                        move || -> (io::Result<()>, u64) {
-                            // Intentionally measure on-worker disk write latency only.
-                            // Queueing delay before worker pickup is excluded.
-                            let _permit = permit;
-                            let started = std::time::Instant::now();
-                            let result = Self::write_block_file(&path, &tmp_path, &owned);
-                            let elapsed_ns =
-                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                            (result, elapsed_ns)
-                        },
-                    )
-                    .await
-                    .map_err(io::Error::other)
-                }),
-            ));
+            let len = data.len() as u64;
+            let semaphore = self.write_io_semaphore.clone();
+            join_set.spawn(async move {
+                let permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return (
+                            idx,
+                            object_id,
+                            len,
+                            Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "L2 I/O semaphore closed",
+                            )),
+                        );
+                    }
+                };
+
+                let job = crate::runtime::spawn_blocking_profiled(
+                    "l2_put_batch",
+                    move || -> (io::Result<()>, u64) {
+                        // Intentionally measure on-worker disk write latency only.
+                        // Queueing delay before worker pickup is excluded.
+                        let _permit = permit;
+                        let started = std::time::Instant::now();
+                        let result = Self::write_block_file(&path, &tmp_path, &owned);
+                        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        (result, elapsed_ns)
+                    },
+                )
+                .await
+                .map_err(io::Error::other);
+
+                (idx, object_id, len, job)
+            });
+        };
+
+        while next_idx < blocks.len() && join_set.len() < max_in_flight {
+            spawn_one(next_idx, &mut join_set);
+            next_idx += 1;
         }
-        let mut results = Vec::with_capacity(handles.len());
-        for (id, len, handle) in handles {
-            let (res, elapsed_ns) = match handle.await {
-                Ok(Ok((Ok(()), elapsed_ns))) => {
+
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, id, len, Ok((Ok(()), elapsed_ns)))) => {
                     self.fd_cache_invalidate(id);
                     self.total_bytes.fetch_add(len, Ordering::Relaxed);
-                    (Ok(()), elapsed_ns)
+                    results[idx] = (id, Ok(()), elapsed_ns);
                 }
-                Ok(Ok((Err(e), elapsed_ns))) => (Err(e), elapsed_ns),
-                Ok(Err(e)) => (Err(e), 0),
-                Err(e) => (Err(io::Error::other(e)), 0),
-            };
-            results.push((id, res, elapsed_ns));
+                Ok((idx, id, _len, Ok((Err(e), elapsed_ns)))) => {
+                    results[idx] = (id, Err(e), elapsed_ns);
+                }
+                Ok((idx, id, _len, Err(e))) => {
+                    results[idx] = (id, Err(e), 0);
+                }
+                Err(e) => {
+                    warn!(error = %e, "L2DiskCache put_batch join error");
+                }
+            }
+
+            if next_idx < blocks.len() {
+                spawn_one(next_idx, &mut join_set);
+                next_idx += 1;
+            }
         }
+
         results
     }
 
