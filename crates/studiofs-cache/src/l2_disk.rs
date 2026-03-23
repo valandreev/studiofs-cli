@@ -185,7 +185,7 @@ fn open_sync_read_file(path: &Path) -> io::Result<File> {
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).share_mode(WINDOWS_FILE_SHARE_ALL);
-        return opts.open(path);
+        opts.open(path)
     }
     #[cfg(not(windows))]
     {
