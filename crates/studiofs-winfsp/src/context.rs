@@ -683,6 +683,23 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        if let Some(n) = self
+            .vfs
+            .read_into_fh_sync_cached(context.fh, context.ino, offset, buffer)
+            .map_err(vfs_to_winfsp_err)?
+        {
+            trace!(
+                ino = context.ino,
+                fh = context.fh,
+                offset,
+                n,
+                open_flags = context.open_flags.bits(),
+                unbuffered = context.open_flags.requests_unbuffered_io(),
+                "read (sync cache fast-path)"
+            );
+            return Ok(n);
+        }
+
         // Spawn the async read on a tokio worker thread so the WinFSP
         // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;

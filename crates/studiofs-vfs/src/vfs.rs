@@ -6740,6 +6740,25 @@ impl StudioVfs {
             .await
     }
 
+    /// Try a synchronous L2-cache fast path directly into `buffer`.
+    ///
+    /// Returns `Ok(Some(n))` when fully served synchronously, or `Ok(None)` to
+    /// indicate caller should fall back to the async read path.
+    pub fn read_into_fh_sync_cached(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<Option<u32>> {
+        let unbuffered = self
+            .handle_table
+            .get(fh)
+            .map(|open| open.flags.requests_unbuffered_io())
+            .unwrap_or(false);
+        self.read_into_sync_cached_with_mode(ino, offset, buffer, unbuffered)
+    }
+
     /// Write file data using per-handle I/O flags.
     ///
     /// Writes are buffered identically to `write()`.  The synchronous
@@ -7887,6 +7906,134 @@ impl StudioVfs {
         self.read_block_direct(ino, block_index).await
     }
 
+    fn read_into_sync_cached_with_mode(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+        unbuffered: bool,
+    ) -> VfsResult<Option<u32>> {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
+            let end = (offset + buffer.len() as u64).min(attr.size);
+            let len = end.saturating_sub(offset) as usize;
+            if len > 0 {
+                buffer[..len].fill(0);
+            }
+            return Ok(Some(len as u32));
+        }
+
+        if buffer.is_empty() {
+            return Ok(Some(0));
+        }
+
+        self.mark_foreground_read();
+        struct ForegroundReadGuard<'a>(&'a StudioVfs);
+        impl Drop for ForegroundReadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unmark_foreground_read();
+            }
+        }
+        let _guard = ForegroundReadGuard(self);
+
+        let attr = self.getattr(ino)?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::RemoteContentPending);
+        }
+        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let pending_content_epoch = incarnation_state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch);
+
+        let end = (offset + buffer.len() as u64).min(attr.size);
+        if offset >= end {
+            return Ok(Some(0));
+        }
+
+        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new();
+        let mut cur = offset;
+        while cur < end {
+            let idx = block_index_from_offset(cur, self.block_size);
+            let off_in = offset_within_block(cur, self.block_size) as usize;
+            let space = self.block_size as usize - off_in;
+            let to_copy = (end - cur).min(space as u64) as usize;
+            blocks_needed.push((idx, off_in, to_copy));
+            cur += to_copy as u64;
+        }
+
+        // Probe first so we only commit to the sync path when every requested
+        // committed block is currently available in cache.
+        let mut block_refs: Vec<Option<BlockRef>> = Vec::with_capacity(blocks_needed.len());
+        for (block_idx, _, _) in &blocks_needed {
+            if self
+                .read_pending_overlay_block_sync(ino, *block_idx, pending_content_epoch)?
+                .is_some()
+            {
+                block_refs.push(None);
+                continue;
+            }
+            let block_ref = self.get_file_block_sync(ino, *block_idx)?;
+            let Some(block_ref) = block_ref else {
+                block_refs.push(None);
+                continue;
+            };
+            if !self.block_cache.contains(block_ref.object_id) {
+                return Ok(None);
+            }
+            block_refs.push(Some(block_ref));
+        }
+
+        let mut written = 0usize;
+        for (idx, (block_idx, off_in, to_copy)) in blocks_needed.iter().copied().enumerate() {
+            if let Some(overlay) =
+                self.read_pending_overlay_block_sync(ino, block_idx, pending_content_epoch)?
+            {
+                let copy_len = if to_copy == 0 || off_in >= overlay.len() {
+                    0
+                } else {
+                    to_copy.min(overlay.len() - off_in)
+                };
+                if copy_len > 0 {
+                    buffer[written..written + copy_len]
+                        .copy_from_slice(&overlay[off_in..off_in + copy_len]);
+                } else {
+                    buffer[written..written + to_copy].fill(0);
+                }
+                if copy_len < to_copy {
+                    buffer[written + copy_len..written + to_copy].fill(0);
+                }
+                written += to_copy;
+                continue;
+            }
+
+            let Some(block_ref) = block_refs[idx].as_ref() else {
+                buffer[written..written + to_copy].fill(0);
+                written += to_copy;
+                continue;
+            };
+
+            let dst = &mut buffer[written..written + to_copy];
+            let read =
+                match self
+                    .block_cache
+                    .get_sync_l2_into(block_ref.object_id, off_in as u64, dst)
+                {
+                    Some(read) => read.min(to_copy),
+                    None => return Ok(None),
+                };
+            if read < to_copy {
+                dst[read..].fill(0);
+            }
+            written += to_copy;
+        }
+
+        if !unbuffered {
+            self.maybe_prefetch(ino, &blocks_needed);
+        }
+
+        Ok(Some(written as u32))
+    }
+
     async fn get_file_block_async(
         &self,
         ino: Ino,
@@ -7897,6 +8044,12 @@ impl StudioVfs {
             engine.get_file_block(ino, block_index)
         })
         .await
+    }
+
+    fn get_file_block_sync(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>> {
+        self.meta
+            .get_file_block(ino, block_index)
+            .map_err(VfsError::Meta)
     }
 
     async fn load_spill_block_async(&self, key: (Ino, u32)) -> VfsResult<Option<Bytes>> {

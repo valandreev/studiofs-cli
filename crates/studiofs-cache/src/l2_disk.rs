@@ -23,6 +23,7 @@
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
 
 use bytes::{Bytes, BytesMut};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +33,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::platform_direct_io;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
 
 // =============================================================================
 // L2DiskCache
@@ -120,6 +126,40 @@ fn try_read_direct_block(
     } else {
         Ok(None)
     }
+}
+
+fn read_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(windows)]
+    {
+        return file.seek_read(buf, offset);
+    }
+    #[cfg(unix)]
+    {
+        return file.read_at(buf, offset);
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pread-style reads are unsupported on this platform",
+    ))
+}
+
+fn read_into_slice_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let mut total = 0usize;
+    while total < buf.len() {
+        let off = offset
+            .checked_add(total as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        let n = read_file_at(file, &mut buf[total..], off)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n);
+    }
+    Ok(total)
 }
 
 /// File-per-block disk cache on NVMe.
@@ -422,6 +462,25 @@ impl L2DiskCache {
                 None
             }
         }
+    }
+
+    /// Read a block synchronously into a provided output slice at an offset.
+    ///
+    /// Returns `Ok(None)` when the block file is not present.
+    pub fn read_into_sync(
+        &self,
+        object_id: u64,
+        offset: u64,
+        out: &mut [u8],
+    ) -> io::Result<Option<usize>> {
+        let path = self.block_path(object_id);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let read = read_into_slice_at(&file, offset, out)?;
+        Ok(Some(read))
     }
 
     /// Write a block to disk (decompressed data) from an owned `Bytes` buffer.

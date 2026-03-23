@@ -487,6 +487,34 @@ impl BlockCache {
         self.l2.get_sync(object_id)
     }
 
+    /// Read from an L2 block synchronously into a provided output slice.
+    ///
+    /// Returns `None` when the block is not available on L2.
+    pub fn get_sync_l2_into(
+        &self,
+        object_id: ObjectId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        if self.is_l2_read_breaker_open() {
+            return None;
+        }
+        let started = Instant::now();
+        match self.l2.read_into_sync(object_id, offset, out) {
+            Ok(Some(read)) => {
+                self.record_l2_read_completion();
+                self.metrics.l2_read.record(read as u64, started.elapsed());
+                self.lru.touch(object_id);
+                Some(read)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(object_id, error = %e, "L2 sync read_into error");
+                None
+            }
+        }
+    }
+
     /// Write a block to cache (L1 + L2).
     ///
     /// The block is written to the NVMe file and kept in RAM.

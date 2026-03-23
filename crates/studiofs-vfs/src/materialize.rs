@@ -225,21 +225,23 @@ impl Materializer {
         let entries: Vec<BatchFlushEntry> = work
             .iter()
             .zip(ids.iter())
-            .map(|((ino, block_index, data, _from_spill, _spill_seq), &object_id)| {
-                let length = data.len() as u32;
-                let flags = if length < vfs.block_size {
-                    BlockFlags::PARTIAL_BLOCK
-                } else {
-                    BlockFlags::empty()
-                };
-                BatchFlushEntry {
-                    ino: *ino,
-                    block_index: *block_index,
-                    object_id,
-                    length,
-                    flags,
-                }
-            })
+            .map(
+                |((ino, block_index, data, _from_spill, _spill_seq), &object_id)| {
+                    let length = data.len() as u32;
+                    let flags = if length < vfs.block_size {
+                        BlockFlags::PARTIAL_BLOCK
+                    } else {
+                        BlockFlags::empty()
+                    };
+                    BatchFlushEntry {
+                        ino: *ino,
+                        block_index: *block_index,
+                        object_id,
+                        length,
+                        flags,
+                    }
+                },
+            )
             .collect();
 
         let results = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
@@ -256,8 +258,7 @@ impl Materializer {
 
         let mut epoch_cache = HashMap::<Ino, u64>::new();
         let mut extents = Vec::with_capacity(work.len());
-        for (idx, (ino, block_index, data, from_spill, spill_seq)) in work.into_iter().enumerate()
-        {
+        for (idx, (ino, block_index, data, from_spill, spill_seq)) in work.into_iter().enumerate() {
             let content_epoch = if let Some(epoch) = epoch_cache.get(&ino) {
                 *epoch
             } else {
