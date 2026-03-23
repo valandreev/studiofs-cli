@@ -69,8 +69,10 @@ pub struct ReadAheadTracker {
     /// Score penalty for random jumps.
     random_penalty: u8,
     /// Number of consecutive sequential blocks required for a ramp-up step.
-    /// Width doubling is conservative: at most one doubling per record_read call.
+    /// Width doubling is conservative: bounded doublings per record_read call.
     sequential_ramp_trigger: u16,
+    /// Maximum ramp-up doublings allowed per single record_read call.
+    max_ramp_steps_per_call: u8,
 }
 
 impl ReadAheadTracker {
@@ -123,6 +125,7 @@ impl ReadAheadTracker {
             sequential_step,
             random_penalty,
             sequential_ramp_trigger,
+            max_ramp_steps_per_call: 2,
         }
     }
 
@@ -168,12 +171,17 @@ impl ReadAheadTracker {
                 .checked_div(self.sequential_ramp_trigger)
                 .unwrap_or(0);
             if next_bucket > prev_bucket {
+                let ramp_steps = next_bucket
+                    .saturating_sub(prev_bucket)
+                    .min(self.max_ramp_steps_per_call as u16)
+                    as usize;
                 // Conservative ramp-up: even if a read span crosses multiple
-                // thresholds, apply at most one doubling per call.
-                state.current_width = state
-                    .current_width
-                    .saturating_mul(2)
-                    .clamp(self.base_width, self.width);
+                // thresholds, apply only bounded doublings per call.
+                let mut next_width = state.current_width;
+                for _ in 0..ramp_steps {
+                    next_width = next_width.saturating_mul(2);
+                }
+                state.current_width = next_width.clamp(self.base_width, self.width);
             }
         } else if is_same_block {
             // Keep score as-is.
@@ -321,6 +329,19 @@ mod tests {
         // Random jump resets width ramp.
         let _ = tracker.record_read(1, 1000, 1000);
         assert_eq!(tracker.debug_width(1), Some(8));
+    }
+
+    #[test]
+    fn test_large_span_ramps_up_by_two_steps_per_call() {
+        let tracker = ReadAheadTracker::new_with_bounds(8, 128, 1, 8, 2, 4);
+
+        // Establish baseline state.
+        let _ = tracker.record_read(1, 0, 0);
+        assert_eq!(tracker.debug_width(1), Some(8));
+
+        // span=8 crosses two ramp buckets (trigger=4). Width should 8 -> 32.
+        let _ = tracker.record_read(1, 1, 8);
+        assert_eq!(tracker.debug_width(1), Some(32));
     }
 
     #[test]
