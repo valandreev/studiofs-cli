@@ -102,6 +102,10 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   runs direct reads/writes via `spawn_blocking` with `std::fs::OpenOptions` +
   direct-open flags and async buffered fallback. Write/remove operations are
   semaphore-bounded, while read fan-out is controlled per call path
+- **QoS-aware local I/O** — L2 cache operations now accept a foreground vs
+  background priority token. Foreground user reads/writes keep the hot path on
+  the foreground semaphore, while upload cleanup and cache eviction use the
+  background semaphore to avoid starving interactive I/O
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
 - **Tunable sync FD cache size** — `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY`
@@ -119,6 +123,8 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   order and direct-I/O-first read policy
 - `get_batch_with_size_hints([(id, Option<size>)])` — same as `get_batch`, but
   can skip per-item `metadata()` when caller already knows block lengths
+- `remove_batch_with_priority(ids, priority)` — remove many blocks in parallel
+  with foreground/background QoS routing
 
 ### L2 Commit Scheduler (`block_cache.rs`)
 
@@ -216,6 +222,7 @@ Timeout behavior:
 - Sync L2 read-into path respects the same read circuit-breaker policy; when the breaker is open it reports miss/bypass so callers can fall back to async/remote fetch path.
 - L2 write timeout fails the direct write path and is retried by background commit workers up to the configured attempt cap before dropping the local commit job.
 - L2 write/remove operations are bounded by an internal semaphore (default 128 in-flight tasks), preventing unbounded mutation-side `spawn_blocking` growth when local disk stalls.
+- Background eviction and post-upload cleanup use the background priority pool so large delete bursts do not compete with foreground reads on the same local disk budget.
 - L2 batch reads use a sliding-window fan-out budget (`STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT`, default 256) to avoid lock-step chunk stalls and keep read queue depth stable.
 
 **Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.

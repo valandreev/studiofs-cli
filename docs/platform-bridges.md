@@ -162,8 +162,8 @@ Trash semantics, so deletes go through ordinary rename/restore flow instead of
 `unlink` fallback:
 - the file remains available in Trash
 - inode metadata is preserved
-- local L1/L2 cache blocks for the file are evicted promptly to release disk
-  space
+- local L1/L2 cache blocks for the file are evicted promptly via the background
+  cache priority path so delete bursts do not contend with foreground reads
 
 This keeps Trash recovery semantics intact while preventing local cache growth
 from Finder-driven deletes.
@@ -247,6 +247,10 @@ Implements `fuser::Filesystem` trait.
 | `symlink` | `symlink()` |
 | `readlink` | `readlink()` |
 | `statfs` | `statfs()` |
+
+`unlink()` and cache-only rename cleanup still present a synchronous bridge API,
+but the internal block eviction work is batched and routed through the
+background local-I/O pool.
 
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.
 

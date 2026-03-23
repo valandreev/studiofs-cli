@@ -60,6 +60,11 @@ the capacity limit is reached.
 Mount profile note:
 - `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
 
+Local cache QoS:
+- foreground user reads/writes use the foreground L2 semaphore
+- upload worker reads and cache eviction use the background L2 semaphore
+- cache-only delete/rename cleanup keeps the public VFS API synchronous, but the internal block eviction path is batched and routed through the background priority pool
+
 Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on
   the mounted client.
@@ -422,6 +427,7 @@ Namespace mutation updates are deterministic:
 - on create/mkdir/symlink/link: insert positive entry
 - on unlink/rmdir: insert negative entry
 - on rename: source entry becomes negative, destination becomes positive
+- deleted file blocks are removed from L1/L2 promptly; if a block is pinned by an in-flight upload, VFS defers the cache eviction until the upload completes
 - parent directory generation is bumped only for affected parent directories
 - broad remote namespace apply events bump global namespace epoch
 
