@@ -14,8 +14,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataBackend, MetadataConfig,
-    PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend,
+    MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
 };
 use uuid::Uuid;
 
@@ -177,7 +177,7 @@ fn insert_pg_volume(dsn: &str, name: &str) -> i64 {
         let row = client
             .query_one(
                 "INSERT INTO volumes (name, uuid, block_size) VALUES ($1, $2, $3) RETURNING vol",
-                &[&name, &uuid, &(8 * 1024 * 1024)],
+                &[&name, &uuid, &(DEFAULT_BLOCK_SIZE as i32)],
             )
             .await
             .expect("insert volume");
@@ -253,7 +253,7 @@ fn create_local_metadata(
                 volume_id: pg_volume_id,
             }),
         },
-        block_size: 8 * 1024 * 1024,
+        block_size: DEFAULT_BLOCK_SIZE,
     };
     meta.set_format_info(&format_info).expect("set format info");
 }
@@ -288,7 +288,7 @@ fn create_local_metadata_with_bad_s3_secret(
                 volume_id: pg_volume_id,
             }),
         },
-        block_size: 8 * 1024 * 1024,
+        block_size: DEFAULT_BLOCK_SIZE,
     };
     meta.set_format_info(&format_info).expect("set format info");
 }

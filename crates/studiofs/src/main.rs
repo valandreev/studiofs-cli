@@ -339,7 +339,7 @@ RUNTIME POLICY:
         #[arg(long, hide = true)]
         metadata_region: Option<String>,
 
-        /// Block size in bytes (e.g. 4MB, 8MB, 16MB). Defaults to 8MB if not specified.
+        /// Block size in bytes (e.g. 4MB, 16MB, 32MB). Defaults to 16MB if not specified.
         /// Larger blocks reduce metadata overhead but increase memory usage per operation.
         #[arg(long)]
         block_size: Option<String>,
@@ -601,7 +601,7 @@ WARNING: This action is irreversible.")]
         /// and treats this path as cache directory.
         path: PathBuf,
 
-        /// Block payload size (e.g. 1MB, 4MB, 8MB). Defaults to 8MB.
+        /// Block payload size (e.g. 1MB, 4MB, 16MB, 32MB). Defaults to 16MB.
         #[arg(long)]
         block_size: Option<String>,
 
@@ -613,7 +613,7 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         small_max: Option<String>,
 
-        /// Upper bound for the `medium` size class (inclusive), e.g. 8MB.
+        /// Upper bound for the `medium` size class (inclusive), e.g. 16MB.
         #[arg(long)]
         medium_max: Option<String>,
 
@@ -635,7 +635,7 @@ WARNING: This action is irreversible.")]
 
         /// Workload size profile:
         /// - percentages: `small=60,medium=30,large=10`
-        /// - explicit sizes: `4KB,128KB,1MB,8MB`
+        /// - explicit sizes: `4KB,128KB,1MB,16MB`
         #[arg(long)]
         sizes: Option<String>,
 

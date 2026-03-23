@@ -57,7 +57,7 @@ const DEFAULT_L2_BACKGROUND_BLOCKING_IO_MAX_IN_FLIGHT: usize = 32;
 const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
-const DEFAULT_BUFFERED_READ_CAPACITY: usize = 8 * 1024 * 1024;
+const DEFAULT_BUFFERED_READ_CAPACITY: usize = 16 * 1024 * 1024;
 const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
 const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT";
 #[cfg(windows)]

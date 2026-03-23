@@ -35,6 +35,7 @@ const SMALL_FILE_MIN_BYTES: u64 = 1024;
 const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
 const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
+const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -3295,7 +3296,12 @@ pub fn run(
     if concurrency == 0 {
         return Err(anyhow!("--concurrency must be >= 1"));
     }
-    let block_size = parse_size_arg("block-size", block_size.as_deref().unwrap_or("8MB"))?;
+    let block_size = parse_size_arg(
+        "block-size",
+        block_size
+            .as_deref()
+            .unwrap_or(DEFAULT_TEST_CACHE_BLOCK_SIZE_STR),
+    )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_L1_SIZE.to_string();
     let l2_limit_default = DEFAULT_L2_SIZE.to_string();
@@ -3432,6 +3438,7 @@ pub fn run(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use studiofs_meta::DEFAULT_BLOCK_SIZE;
     use tempfile::tempdir;
 
     fn sample_report() -> BenchmarkReport {
@@ -3442,8 +3449,8 @@ mod tests {
             started_at: "2026-03-18T15:12:55Z".to_string(),
             completed_at: "2026-03-18T15:12:55Z".to_string(),
             total_elapsed_ms: 93.05,
-            block_size: 8 * 1024 * 1024,
-            read_size: 8 * 1024 * 1024,
+            block_size: DEFAULT_BLOCK_SIZE as u64,
+            read_size: DEFAULT_BLOCK_SIZE as u64,
             concurrency: 1,
             sequential_streams: false,
             io_depth: 32,
@@ -3589,7 +3596,7 @@ mod tests {
             advanced_metrics: Some(AdvancedMetricsReport {
                 size_class_boundaries: SizeClassBoundaryReport {
                     small_max_bytes: 10 * 1024,
-                    medium_max_bytes: 8 * 1024 * 1024,
+                    medium_max_bytes: DEFAULT_BLOCK_SIZE as u64,
                 },
                 size_class_stats: SizeClassStatsReport {
                     writes: vec![
@@ -3745,7 +3752,7 @@ mod tests {
 
     #[test]
     fn workload_profile_has_expected_tiers() {
-        let block_size = 8 * 1024 * 1024;
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
         let bounds = SizeClassBounds {
             small_max: SMALL_FILE_MAX_BYTES,
             medium_max: block_size,
@@ -3801,13 +3808,13 @@ mod tests {
 
     #[test]
     fn sizes_explicit_list_parses() {
-        let parsed = parse_sizes_arg(Some("4KB,1MB,8MB")).unwrap();
+        let parsed = parse_sizes_arg(Some("4KB,1MB,16MB")).unwrap();
         match parsed {
             WorkloadSizeInput::ExplicitList(values) => {
                 assert_eq!(values.len(), 3);
                 assert_eq!(values[0], 4 * 1024);
                 assert_eq!(values[1], 1024 * 1024);
-                assert_eq!(values[2], 8 * 1024 * 1024);
+                assert_eq!(values[2], 16 * 1024 * 1024);
             }
             other => panic!("expected explicit list, got {other:?}"),
         }
@@ -3820,7 +3827,7 @@ mod tests {
             medium_max: 6 * 1024,
         };
         let plan = build_work_sizes(
-            8 * 1024 * 1024,
+            DEFAULT_BLOCK_SIZE as u64,
             &WorkloadSizeInput::ExplicitList(vec![1024, 4 * 1024, 8 * 1024]),
             bounds,
         );
@@ -3828,7 +3835,7 @@ mod tests {
         assert_eq!(plan.medium_files, 1);
         assert_eq!(plan.large_files, 1);
 
-        let default_plan = build_work_sizes(8 * 1024 * 1024, &WorkloadSizeInput::Default, bounds);
+        let default_plan = build_work_sizes(DEFAULT_BLOCK_SIZE as u64, &WorkloadSizeInput::Default, bounds);
         assert!(
             default_plan.sizes[..WORKLOAD_FILES_PER_TIER]
                 .iter()
