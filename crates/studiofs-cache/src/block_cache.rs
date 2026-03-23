@@ -25,7 +25,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::l1_mem::L1MemCache;
-use crate::l2_disk::{self, L2DiskCache};
+use crate::l2_disk::{self, L2DiskCache, L2IoPriority};
 use crate::lru_tracker::{BlockLocation, CheckpointEntry, LruStats, LruTracker, ObjectId};
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::upload_queue::{PendingUpload, UploadQueue};
@@ -350,7 +350,9 @@ impl BlockCache {
     ///
     /// Lookup: L1 (RAM) → L2 (NVMe file) → None.
     pub async fn get(&self, object_id: ObjectId) -> Option<Bytes> {
-        self.get_with_trace(object_id).await.0
+        self.get_with_qos(object_id, L2IoPriority::Foreground)
+            .await
+            .0
     }
 
     /// Read a block and return per-level lookup trace for observability.
@@ -358,6 +360,14 @@ impl BlockCache {
     /// This does not change cache behavior; it only exposes lookup timing and
     /// the level that served the payload.
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
+        self.get_with_qos(object_id, L2IoPriority::Foreground).await
+    }
+
+    async fn get_with_qos(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> (Option<Bytes>, CacheReadTrace) {
         let l1_started = Instant::now();
         if let Some(data) = self.l1.get(object_id) {
             let trace = CacheReadTrace {
@@ -385,7 +395,8 @@ impl BlockCache {
         let expected_size = self.lru.size(object_id);
         let l2_result = tokio::time::timeout(
             self.config.l2_read_timeout,
-            self.l2.get_with_size_hint(object_id, expected_size),
+            self.l2
+                .get_with_size_hint(object_id, expected_size, priority),
         )
         .await;
         let data_opt = match l2_result {
@@ -487,6 +498,15 @@ impl BlockCache {
         self.l2.get_sync(object_id)
     }
 
+    /// Read a block with an explicit L2 QoS priority.
+    pub async fn get_with_priority(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> Option<Bytes> {
+        self.get_with_qos(object_id, priority).await.0
+    }
+
     /// Read from an L2 block synchronously into a provided output slice.
     ///
     /// Returns `None` when the block is not available on L2.
@@ -525,7 +545,8 @@ impl BlockCache {
         let started = Instant::now();
         match tokio::time::timeout(
             self.config.l2_write_timeout,
-            self.l2.put_bytes(object_id, data.clone()),
+            self.l2
+                .put_bytes_with_priority(object_id, data.clone(), L2IoPriority::Foreground),
         )
         .await
         {
@@ -561,9 +582,34 @@ impl BlockCache {
 
     /// Remove a block from all cache levels.
     pub async fn remove(&self, object_id: ObjectId) {
+        self.remove_with_priority(object_id, L2IoPriority::Foreground)
+            .await;
+    }
+
+    /// Remove a block from all cache levels with an explicit L2 QoS priority.
+    pub async fn remove_with_priority(&self, object_id: ObjectId, priority: L2IoPriority) {
         self.l1.remove(object_id);
-        self.l2.remove(object_id).await;
+        self.l2.remove_with_priority(object_id, priority).await;
         self.lru.remove(object_id);
+    }
+
+    /// Remove multiple blocks from all cache levels with an explicit L2 QoS priority.
+    pub async fn remove_batch_with_priority(
+        &self,
+        object_ids: &[ObjectId],
+        priority: L2IoPriority,
+    ) {
+        if object_ids.is_empty() {
+            return;
+        }
+
+        for &object_id in object_ids {
+            self.l1.remove(object_id);
+            self.lru.remove(object_id);
+        }
+
+        let ids: Vec<u64> = object_ids.to_vec();
+        let _ = self.l2.remove_batch_with_priority(&ids, priority).await;
     }
 
     /// Remove a block synchronously (for use in sync eviction paths).
@@ -885,21 +931,40 @@ impl BlockCache {
         }
     }
 
-    /// Run L2 eviction: fully remove oldest disk-only entries.
-    fn evict_l2_bytes(&self, mut to_free: u64) {
+    /// Collect L2 eviction candidates and synchronously update the LRU.
+    fn collect_l2_evictions(&self, mut to_free: u64) -> Vec<(u64, u64)> {
+        let mut evictions = Vec::new();
         while to_free > 0 {
             let Some((id, size)) = self.lru.evict_l2() else {
                 break;
             };
             // Also remove from L1 just in case.
             self.l1.remove(id);
-            // Remove file from disk (sync — we're in a background task).
-            self.l2.remove_sync(id);
+            evictions.push((id, size as u64));
             if size as u64 >= to_free {
                 break;
             }
             to_free -= size as u64;
         }
+        evictions
+    }
+
+    /// Run L2 eviction: fully remove oldest disk-only entries.
+    async fn evict_l2_bytes(&self, to_free: u64) {
+        let evictions = self.collect_l2_evictions(to_free);
+        if evictions.is_empty() {
+            return;
+        }
+
+        let ids: Vec<u64> = evictions.iter().map(|(id, _)| *id).collect();
+        let freed = evictions
+            .iter()
+            .fold(0u64, |acc, (_, size)| acc.saturating_add(*size));
+        let _ = self
+            .l2
+            .remove_batch_with_priority(&ids, L2IoPriority::Background)
+            .await;
+        debug!(freed_mb = freed / (1024 * 1024), "L2 eviction complete");
     }
 
     // =========================================================================
@@ -931,7 +996,11 @@ impl BlockCache {
                 attempts += 1;
                 let write_result: io::Result<()> = match tokio::time::timeout(
                     self.config.l2_write_timeout,
-                    self.l2.put_bytes(job.object_id, job.data.clone()),
+                    self.l2.put_bytes_with_priority(
+                        job.object_id,
+                        job.data.clone(),
+                        L2IoPriority::Background,
+                    ),
                 )
                 .await
                 {
@@ -1033,8 +1102,7 @@ impl BlockCache {
             let l2_max = self.l2.max_bytes();
             if l2_used > l2_max {
                 let excess = l2_used - l2_max;
-                self.evict_l2_bytes(excess);
-                debug!(freed_mb = excess / (1024 * 1024), "L2 eviction complete");
+                self.evict_l2_bytes(excess).await;
             }
 
             // Phase 3: Disk space guard.
@@ -1051,7 +1119,7 @@ impl BlockCache {
                         );
                         // First demote L1 entries, then evict L2.
                         self.evict_l1_bytes(need);
-                        self.evict_l2_bytes(need);
+                        self.evict_l2_bytes(need).await;
                     }
                 }
             }
