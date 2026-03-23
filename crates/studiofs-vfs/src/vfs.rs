@@ -4631,10 +4631,11 @@ impl StudioVfs {
     }
 
     fn maybe_release_upload_cancel_token(&self, ino: Ino) {
+        let mut tokens = self.state.upload_cancel_tokens.lock();
         if self.block_cache.has_pending_uploads_for_ino(ino) {
             return;
         }
-        self.state.upload_cancel_tokens.lock().remove(&ino);
+        tokens.remove(&ino);
     }
 
     pub fn is_shutting_down(&self) -> bool {
