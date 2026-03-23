@@ -7667,7 +7667,6 @@ impl StudioVfs {
         self.meta.rmdir(parent, name)?;
         self.bump_namespace_for_parents([parent]);
         if let Some(removed_ino) = removed {
-            self.mark_inode_deleted_for_uploads(removed_ino);
             self.bump_directory_generation(removed_ino);
         }
         self.dentry_cache_insert_negative(parent, name);
