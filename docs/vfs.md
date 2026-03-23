@@ -180,8 +180,15 @@ local metadata view ──┬─ pending incarnation extents
                          └─ FetchScheduler → S3
          │
          ▼
-  ReadAheadTracker ────── detect sequential access
-         │                prefetch next N blocks
+  enqueue prefetch hint ── lightweight `(ino, first..last)` send
+         │
+         ▼
+  background prefetch worker
+         │
+         ├─ `record_read()` + `DirAccessTracker::on_child_read()`
+         ├─ budget + fetch headroom checks
+         ├─ dedupe/merge pending work
+         └─ spawn `read_block_for_prefetch()` tasks
          ▼
   assemble response bytes
 ```
@@ -287,10 +294,16 @@ Runtime tuning knobs:
 - `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
 - `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
-On each `read()`:
-1. `record_read(ino, first_block, last_block)` returns blocks to prefetch
-2. Background tasks call `fetch_block()` for each prefetch block
-3. `start_prefetch` / `finish_prefetch` track in-flight dedup
+On each buffered `read()`:
+1. Hot path enqueues a compact prefetch hint (`ino`, `first_block`, `last_block`) and returns to user work.
+2. Background worker updates read-ahead state (`record_read`) and directory access state (`on_child_read`) regardless of transient prefetch budget limits.
+3. Worker applies prefetch budget/headroom limits, deduplicates pending/in-flight blocks, and runs `read_block_for_prefetch()` tasks.
+4. `start_prefetch` / `finish_prefetch` continue to guard in-flight deduplication.
+
+Worker robustness details:
+- stale hints for deleted inodes are dropped before scheduling;
+- hint ranges are merged/suppressed to reduce channel churn on fragmented client read patterns;
+- worker loop is panic-guarded and logs failures instead of silently disappearing.
 
 ### DirAccessTracker
 
