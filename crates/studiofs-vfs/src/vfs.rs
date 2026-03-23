@@ -3096,6 +3096,10 @@ struct VfsState {
     /// set before calling `flush_block()` to avoid re-inserting evicted blocks
     /// into the cache (TOCTOU race between `drain_dirty_mem` and `unlink`).
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
+    /// Per-inode cancellation tokens for in-flight uploads. Tokens are
+    /// children of `uploader_shutdown_token` so global shutdown still cancels
+    /// all active uploads.
+    upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     /// Object IDs that should be removed from the block cache after their
     /// pending upload completes (or is cancelled).  Populated by
     /// `evict_inode_from_caches()` when it encounters a pinned block.
@@ -4194,6 +4198,7 @@ impl StudioVfs {
                     next_ignored_ino: AtomicU64::new(1u64 << 63),
                     active_ingress_segment_id: AtomicU64::new(active_ingress_segment_id),
                     deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+                    upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
                     pending_evictions: Mutex::new(std::collections::HashSet::new()),
                     upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
                     upload_requeues: AtomicU64::new(0),
@@ -4590,6 +4595,46 @@ impl StudioVfs {
         self.state
             .uploader_shutdown_requested
             .load(Ordering::Acquire)
+    }
+
+    fn uploader_cancel_token_for_inode(&self, ino: Ino) -> CancellationToken {
+        if self.state.deleted_inodes.lock().contains(&ino) {
+            let token = CancellationToken::new();
+            token.cancel();
+            return token;
+        }
+
+        let mut tokens = self.state.upload_cancel_tokens.lock();
+        tokens
+            .entry(ino)
+            .or_insert_with(|| self.state.uploader_shutdown_token.child_token())
+            .clone()
+    }
+
+    fn mark_inode_deleted_for_uploads(&self, ino: Ino) {
+        self.state.deleted_inodes.lock().insert(ino);
+        if let Some(token) = self.state.upload_cancel_tokens.lock().get(&ino).cloned() {
+            token.cancel();
+        }
+    }
+
+    fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> bool {
+        if !self.state.deleted_inodes.lock().contains(&op.ino) {
+            return false;
+        }
+        self.state
+            .upload_canceled_deleted
+            .fetch_add(1, Ordering::Relaxed);
+        self.block_cache.cancel_upload(op, true);
+        self.state.pending_evictions.lock().remove(&op.object_id);
+        true
+    }
+
+    fn maybe_release_upload_cancel_token(&self, ino: Ino) {
+        if self.block_cache.has_pending_uploads_for_ino(ino) {
+            return;
+        }
+        self.state.upload_cancel_tokens.lock().remove(&ino);
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -6851,7 +6896,7 @@ impl StudioVfs {
             // Last handle closed on an unlinked file — final cleanup
             debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
-            self.state.deleted_inodes.lock().insert(ino);
+            self.mark_inode_deleted_for_uploads(ino);
 
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -7512,7 +7557,7 @@ impl StudioVfs {
 
                 // Mark this inode as deleted FIRST — the background slab flusher checks
                 // this set to avoid re-inserting evicted blocks (race condition fix).
-                self.state.deleted_inodes.lock().insert(attr.ino);
+                self.mark_inode_deleted_for_uploads(attr.ino);
 
                 // Remove all blocks and mark for GC
                 let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
@@ -7689,7 +7734,7 @@ impl StudioVfs {
 
         // If an existing entry was overwritten, schedule GC + evict caches
         if let Some(ino) = rename_result.displaced_ino {
-            self.state.deleted_inodes.lock().insert(ino);
+            self.mark_inode_deleted_for_uploads(ino);
 
             // Compute total bytes for USED_SPACE before removing blocks
             let blocks = self.meta.get_file_blocks(ino)?;
@@ -8983,7 +9028,22 @@ impl StudioVfs {
     /// If the owning inode has been deleted, the upload is cancelled immediately
     /// (no S3 write) and the block is evicted from cache.
     async fn process_upload(&self, op: PendingUpload) -> VfsResult<()> {
+        struct UploadTokenCleanup<'a> {
+            vfs: &'a StudioVfs,
+            ino: Ino,
+        }
+        impl Drop for UploadTokenCleanup<'_> {
+            fn drop(&mut self) {
+                self.vfs.maybe_release_upload_cancel_token(self.ino);
+            }
+        }
+
+        let _token_cleanup = UploadTokenCleanup {
+            vfs: self,
+            ino: op.ino,
+        };
         let block_index = block_index_from_offset(op.offset, self.block_size);
+        let upload_cancel_token = self.uploader_cancel_token_for_inode(op.ino);
         debug!(
             ino = op.ino,
             object_id = op.object_id,
@@ -9000,7 +9060,12 @@ impl StudioVfs {
             let delay_ms = self.upload_delay.as_millis() as u64;
             if age_ms < delay_ms {
                 tokio::select! {
-                    _ = self.state.uploader_shutdown_token.cancelled() => return Ok(()),
+                    _ = upload_cancel_token.cancelled() => {
+                        if self.cancel_upload_if_inode_deleted(&op) {
+                            debug!(ino = op.ino, object_id = op.object_id, "process_upload cancelled during upload delay");
+                        }
+                        return Ok(());
+                    }
                     _ = tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)) => {}
                 }
             }
@@ -9101,7 +9166,7 @@ impl StudioVfs {
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
             match run_with_timeout_or_cancel(
-                &self.state.uploader_shutdown_token,
+                &upload_cancel_token,
                 Duration::from_secs(5),
                 self.fetch_scheduler.data_store().exists(&key),
             )
@@ -9135,7 +9200,10 @@ impl StudioVfs {
                 }
                 // Shutdown cancellation: keep op pending in journal by exiting
                 // before any completion path.
-                TimeoutOrCancel::Cancelled => return Ok(()),
+                TimeoutOrCancel::Cancelled => {
+                    self.cancel_upload_if_inode_deleted(&op);
+                    return Ok(());
+                }
             }
         }
 
@@ -9175,7 +9243,7 @@ impl StudioVfs {
                     // this object, we can still continue with commit reconcile.
                     if op.retry_count > 0 {
                         match run_with_timeout_or_cancel(
-                            &self.state.uploader_shutdown_token,
+                            &upload_cancel_token,
                             Duration::from_secs(5),
                             self.fetch_scheduler.data_store().exists(&key),
                         )
@@ -9210,7 +9278,10 @@ impl StudioVfs {
                             }
                             // Shutdown cancellation: exit quietly so worker loop
                             // does not requeue/log as transient failure.
-                            TimeoutOrCancel::Cancelled => return Ok(()),
+                            TimeoutOrCancel::Cancelled => {
+                                self.cancel_upload_if_inode_deleted(&op);
+                                return Ok(());
+                            }
                         }
                     } else {
                         // First attempt without cache data is unexpected; retry
@@ -9241,7 +9312,7 @@ impl StudioVfs {
         if let Some(object_bytes) = object_bytes {
             match self
                 .upload_scheduler
-                .put(&key, object_bytes, &self.state.uploader_shutdown_token)
+                .put(&key, object_bytes, &upload_cancel_token)
                 .await
             {
                 Ok(()) => {}
@@ -9249,7 +9320,10 @@ impl StudioVfs {
                 // do not mark sticky errors and do not trigger in-memory requeue.
                 // Because `complete_upload` is not called, the pending op remains
                 // in the persistent journal for safe resume on next mount.
-                Err(crate::upload::UploadError::Cancelled) => return Ok(()),
+                Err(crate::upload::UploadError::Cancelled) => {
+                    self.cancel_upload_if_inode_deleted(&op);
+                    return Ok(());
+                }
                 Err(e) => return Err(VfsError::Other(e.to_string())),
             }
             debug!(
