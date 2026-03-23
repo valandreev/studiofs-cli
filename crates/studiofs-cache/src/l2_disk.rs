@@ -51,7 +51,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 /// Upper bound for active L2 blocking write/remove I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 /// Max number of blocking L2 read tasks scheduled concurrently by one batch read call.
-const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 512;
+const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
 const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
@@ -64,6 +64,12 @@ fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "alignment must be non-zero",
+        ));
+    }
+    if !alignment.is_power_of_two() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alignment must be a power of two",
         ));
     }
     if len == 0 {
@@ -208,6 +214,8 @@ pub struct L2DiskCache {
     max_bytes: AtomicU64,
     /// Limits active blocking L2 write/remove I/O to avoid exhausting Tokio's blocking pool.
     write_io_semaphore: Arc<Semaphore>,
+    /// Max number of blocking L2 reads spawned concurrently by one batch call.
+    read_batch_max_in_flight: usize,
     /// Small LRU of open file descriptors used by synchronous read fast-path.
     sync_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
 }
@@ -276,6 +284,7 @@ impl L2DiskCache {
             total_bytes: AtomicU64::new(0),
             max_bytes: AtomicU64::new(max_bytes),
             write_io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
+            read_batch_max_in_flight: read_batch_max_in_flight().max(1),
             sync_read_fd_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(sync_fd_cache_capacity())
                     .expect("sync fd cache capacity must be non-zero"),
@@ -411,41 +420,57 @@ impl L2DiskCache {
         &self,
         ids: &[(u64, Option<u32>)],
     ) -> Vec<(u64, Option<Bytes>)> {
-        let mut results = Vec::with_capacity(ids.len());
-        let max_in_flight = read_batch_max_in_flight().max(1);
-        let mut idx = 0;
+        let mut results: Vec<(u64, Option<Bytes>)> =
+            ids.iter().map(|(id, _)| (*id, None)).collect();
+        let max_in_flight = self.read_batch_max_in_flight.max(1);
+        let mut join_set = tokio::task::JoinSet::new();
+        let mut next_idx = 0usize;
 
-        while idx < ids.len() {
-            let end = (idx + max_in_flight).min(ids.len());
-            let chunk = &ids[idx..end];
-            let mut handles = Vec::with_capacity(chunk.len());
-
-            for &(id, size_hint) in chunk {
-                let path = self.block_path(id);
-                let handle = crate::runtime::spawn_blocking_profiled("l2_read_batch", move || {
-                    Self::read_block_sync(&path, size_hint.map(|len| len as usize))
-                });
-                handles.push((id, handle));
-            }
-
-            for (id, handle) in handles {
-                let data = match handle.await {
-                    Ok(Ok(data)) => Some(data),
-                    Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
-                    Ok(Err(e)) => {
-                        warn!(id, error = %e, "L2DiskCache batch read error");
-                        None
-                    }
-                    Err(e) => {
-                        warn!(id, error = %e, "L2DiskCache batch join error");
-                        None
-                    }
+        let spawn_one = |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
+            let (id, size_hint) = ids[idx];
+            let path = self.block_path(id);
+            join_set.spawn(async move {
+                let read_result = match crate::runtime::spawn_blocking_profiled(
+                    "l2_read_batch",
+                    move || Self::read_block_sync(&path, size_hint.map(|len| len as usize)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => Err(io::Error::other(e)),
                 };
-                results.push((id, data));
+                (idx, read_result)
+            });
+        };
+
+        while next_idx < ids.len() && join_set.len() < max_in_flight {
+            spawn_one(next_idx, &mut join_set);
+            next_idx += 1;
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, Ok(data))) => {
+                    results[idx].1 = Some(data);
+                }
+                Ok((idx, Err(e))) if e.kind() == io::ErrorKind::NotFound => {
+                    results[idx].1 = None;
+                }
+                Ok((idx, Err(e))) => {
+                    let id = results[idx].0;
+                    warn!(id, error = %e, "L2DiskCache batch read error");
+                }
+                Err(e) => {
+                    warn!(error = %e, "L2DiskCache batch join error");
+                }
             }
 
-            idx = end;
+            if next_idx < ids.len() {
+                spawn_one(next_idx, &mut join_set);
+                next_idx += 1;
+            }
         }
+
         results
     }
 
