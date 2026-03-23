@@ -6805,16 +6805,11 @@ impl StudioVfs {
     /// available in local cache (or represented by local overlay/hole data).
     pub fn can_read_fh_sync_cached(
         &self,
-        fh: u64,
+        _fh: u64,
         ino: Ino,
         offset: u64,
         size: u32,
     ) -> VfsResult<bool> {
-        let _unbuffered = self
-            .handle_table
-            .get(fh)
-            .map(|open| open.flags.requests_unbuffered_io())
-            .unwrap_or(false);
         let can_read = self.can_read_sync_cached_with_mode(ino, offset, size as usize)?;
         if !can_read {
             self.record_sync_read_fast_path_miss();
@@ -7741,6 +7736,29 @@ impl StudioVfs {
         self.read_into_with_mode(ino, offset, buffer, false).await
     }
 
+    fn calculate_blocks_needed(
+        &self,
+        offset: u64,
+        buffer_len: usize,
+        file_size: u64,
+    ) -> Vec<(u32, usize, usize)> {
+        let end = (offset + buffer_len as u64).min(file_size);
+        if offset >= end {
+            return Vec::new();
+        }
+        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new();
+        let mut cur = offset;
+        while cur < end {
+            let idx = block_index_from_offset(cur, self.block_size);
+            let off_in = offset_within_block(cur, self.block_size) as usize;
+            let space = self.block_size as usize - off_in;
+            let to_copy = (end - cur).min(space as u64) as usize;
+            blocks_needed.push((idx, off_in, to_copy));
+            cur += to_copy as u64;
+        }
+        blocks_needed
+    }
+
     async fn read_into_with_mode(
         &self,
         ino: Ino,
@@ -7776,22 +7794,9 @@ impl StudioVfs {
             .map(|pending| pending.content_epoch);
 
         // Clamp read to file size
-        let end = (offset + buffer.len() as u64).min(attr.size);
-        if offset >= end {
+        let blocks_needed = self.calculate_blocks_needed(offset, buffer.len(), attr.size);
+        if blocks_needed.is_empty() {
             return Ok(0);
-        }
-        let _effective_size = (end - offset) as usize;
-
-        // Pre-compute all blocks needed
-        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new(); // (block_index, offset_in_block, to_copy)
-        let mut cur = offset;
-        while cur < end {
-            let idx = block_index_from_offset(cur, self.block_size);
-            let off_in = offset_within_block(cur, self.block_size) as usize;
-            let space = self.block_size as usize - off_in;
-            let to_copy = (end - cur).min(space as u64) as usize;
-            blocks_needed.push((idx, off_in, to_copy));
-            cur += to_copy as u64;
         }
 
         // If only one block, read sequentially to avoid overhead
@@ -8008,20 +8013,9 @@ impl StudioVfs {
             .as_ref()
             .map(|pending| pending.content_epoch);
 
-        let end = (offset + buffer.len() as u64).min(attr.size);
-        if offset >= end {
+        let blocks_needed = self.calculate_blocks_needed(offset, buffer.len(), attr.size);
+        if blocks_needed.is_empty() {
             return Ok(Some(0));
-        }
-
-        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new();
-        let mut cur = offset;
-        while cur < end {
-            let idx = block_index_from_offset(cur, self.block_size);
-            let off_in = offset_within_block(cur, self.block_size) as usize;
-            let space = self.block_size as usize - off_in;
-            let to_copy = (end - cur).min(space as u64) as usize;
-            blocks_needed.push((idx, off_in, to_copy));
-            cur += to_copy as u64;
         }
 
         let Some(block_refs) =
@@ -8098,20 +8092,9 @@ impl StudioVfs {
             .as_ref()
             .map(|pending| pending.content_epoch);
 
-        let end = (offset + buffer_len as u64).min(attr.size);
-        if offset >= end {
+        let blocks_needed = self.calculate_blocks_needed(offset, buffer_len, attr.size);
+        if blocks_needed.is_empty() {
             return Ok(true);
-        }
-
-        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new();
-        let mut cur = offset;
-        while cur < end {
-            let idx = block_index_from_offset(cur, self.block_size);
-            let off_in = offset_within_block(cur, self.block_size) as usize;
-            let space = self.block_size as usize - off_in;
-            let to_copy = (end - cur).min(space as u64) as usize;
-            blocks_needed.push((idx, off_in, to_copy));
-            cur += to_copy as u64;
         }
 
         Ok(self

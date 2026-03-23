@@ -41,6 +41,8 @@ use crate::platform_direct_io;
 use std::os::unix::fs::FileExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 
 // =============================================================================
 // L2DiskCache
@@ -50,6 +52,9 @@ use std::os::windows::fs::FileExt as _;
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
+const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
     if alignment == 0 {
@@ -167,6 +172,27 @@ fn read_into_slice_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<us
     Ok(total)
 }
 
+fn sync_fd_cache_capacity() -> usize {
+    std::env::var(L2_SYNC_FD_CACHE_CAPACITY_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_L2_SYNC_FD_CACHE_CAPACITY)
+}
+
+fn open_sync_read_file(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).share_mode(WINDOWS_FILE_SHARE_ALL);
+        return opts.open(path);
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 /// File-per-block disk cache on NVMe.
 pub struct L2DiskCache {
     /// Root cache directory (contains `blocks/` subdirectory).
@@ -249,7 +275,7 @@ impl L2DiskCache {
             max_bytes: AtomicU64::new(max_bytes),
             io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
             sync_read_fd_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_L2_SYNC_FD_CACHE_CAPACITY)
+                NonZeroUsize::new(sync_fd_cache_capacity())
                     .expect("sync fd cache capacity must be non-zero"),
             )),
         };
@@ -488,7 +514,7 @@ impl L2DiskCache {
             Some(file) => file,
             None => {
                 let path = self.block_path(object_id);
-                let opened = match File::open(&path) {
+                let opened = match open_sync_read_file(&path) {
                     Ok(file) => Arc::new(file),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(e),
