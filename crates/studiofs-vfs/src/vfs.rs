@@ -32,7 +32,7 @@ use crate::incarnation::{
 use crate::qos::{FairInodeScheduler, QosController};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
-use crate::runtime::{run_blocking, run_meta};
+use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
 use opendal::options::WriteOptions;
@@ -63,6 +63,7 @@ use studiofs_meta::*;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Parse a human-readable size string into bytes.
@@ -3149,8 +3150,8 @@ struct VfsState {
     shutdown_completed: std::sync::atomic::AtomicBool,
     /// Wake non-uploader background loops so shutdown does not wait for long sleeps.
     shutdown_notify: tokio::sync::Notify,
-    /// Wake uploader dispatch/worker loops so shutdown can stop queue consumption.
-    uploader_shutdown_notify: tokio::sync::Notify,
+    /// Cancels in-flight uploader operations and wakes uploader loops on shutdown.
+    uploader_shutdown_token: CancellationToken,
     /// Join handles for top-level non-uploader background tasks.
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Top-level uploader task; it owns and joins its worker pool internally.
@@ -4230,7 +4231,7 @@ impl StudioVfs {
                     uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
                     shutdown_completed: std::sync::atomic::AtomicBool::new(false),
                     shutdown_notify: tokio::sync::Notify::new(),
-                    uploader_shutdown_notify: tokio::sync::Notify::new(),
+                    uploader_shutdown_token: CancellationToken::new(),
                     background_tasks: Mutex::new(Vec::new()),
                     uploader_task: Mutex::new(None),
                 }),
@@ -4603,7 +4604,7 @@ impl StudioVfs {
             .uploader_shutdown_requested
             .swap(true, Ordering::AcqRel)
         {
-            self.state.uploader_shutdown_notify.notify_waiters();
+            self.state.uploader_shutdown_token.cancel();
         }
     }
 
@@ -8843,7 +8844,7 @@ impl StudioVfs {
                 let mut ops_since_yield = 0u32;
                 loop {
                     let op = tokio::select! {
-                        _ = vfs.state.uploader_shutdown_notify.notified() => None,
+                        _ = vfs.state.uploader_shutdown_token.cancelled() => None,
                         op = async {
                             let mut rx = rx.lock().await;
                             rx.recv().await
@@ -8885,7 +8886,7 @@ impl StudioVfs {
                                 e
                             );
                             let should_requeue = tokio::select! {
-                                _ = vfs.state.uploader_shutdown_notify.notified() => false,
+                                _ = vfs.state.uploader_shutdown_token.cancelled() => false,
                                 _ = tokio::time::sleep(delay) => !vfs.uploader_shutdown_requested(),
                             };
                             if should_requeue && !vfs.block_cache.requeue_upload(retry_op) {
@@ -8912,7 +8913,7 @@ impl StudioVfs {
 
             tokio::select! {
                 biased;
-                _ = self.state.uploader_shutdown_notify.notified() => break,
+                _ = self.state.uploader_shutdown_token.cancelled() => break,
                 permit = worker_tx.reserve(), if !fair.is_empty() => {
                     match permit {
                         Ok(permit) => {
@@ -8999,7 +9000,7 @@ impl StudioVfs {
             let delay_ms = self.upload_delay.as_millis() as u64;
             if age_ms < delay_ms {
                 tokio::select! {
-                    _ = self.state.uploader_shutdown_notify.notified() => return Ok(()),
+                    _ = self.state.uploader_shutdown_token.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)) => {}
                 }
             }
@@ -9099,13 +9100,14 @@ impl StudioVfs {
         let key = format_object_key(&self.data_prefix, op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
-            match tokio::time::timeout(
+            match run_with_timeout_or_cancel(
+                &self.state.uploader_shutdown_token,
                 Duration::from_secs(5),
                 self.fetch_scheduler.data_store().exists(&key),
             )
             .await
             {
-                Ok(Ok(true)) => {
+                TimeoutOrCancel::Completed(Ok(true)) => {
                     remote_object_visible = true;
                     debug!(
                         object_id = op.object_id,
@@ -9115,8 +9117,8 @@ impl StudioVfs {
                         "upload reconcile: remote object already visible, skipping re-upload"
                     );
                 }
-                Ok(Ok(false)) => {}
-                Ok(Err(err)) => {
+                TimeoutOrCancel::Completed(Ok(false)) => {}
+                TimeoutOrCancel::Completed(Err(err)) => {
                     debug!(
                         object_id = op.object_id,
                         error = %err,
@@ -9124,13 +9126,14 @@ impl StudioVfs {
                         "upload reconcile: remote exists() check failed, falling back to upload"
                     );
                 }
-                Err(_) => {
+                TimeoutOrCancel::TimedOut => {
                     debug!(
                         object_id = op.object_id,
                         retry_count = op.retry_count,
                         "upload reconcile: remote exists() check timed out, falling back to upload"
                     );
                 }
+                TimeoutOrCancel::Cancelled => return Ok(()),
             }
         }
 
@@ -9169,13 +9172,14 @@ impl StudioVfs {
                     // Block data is missing from cache. If remote already has
                     // this object, we can still continue with commit reconcile.
                     if op.retry_count > 0 {
-                        match tokio::time::timeout(
+                        match run_with_timeout_or_cancel(
+                            &self.state.uploader_shutdown_token,
                             Duration::from_secs(5),
                             self.fetch_scheduler.data_store().exists(&key),
                         )
                         .await
                         {
-                            Ok(Ok(true)) => {
+                            TimeoutOrCancel::Completed(Ok(true)) => {
                                 debug!(
                                     object_id = op.object_id,
                                     ino = op.ino,
@@ -9186,7 +9190,9 @@ impl StudioVfs {
                                 remote_object_visible = true;
                                 Bytes::new()
                             }
-                            _ => {
+                            TimeoutOrCancel::Completed(Ok(false))
+                            | TimeoutOrCancel::Completed(Err(_))
+                            | TimeoutOrCancel::TimedOut => {
                                 // If the inode was deleted between our checks
                                 // (race), cancel cleanly. Otherwise this remains a
                                 // genuine error and will be retried.
@@ -9200,6 +9206,7 @@ impl StudioVfs {
                                     op.object_id
                                 )));
                             }
+                            TimeoutOrCancel::Cancelled => return Ok(()),
                         }
                     } else {
                         // First attempt without cache data is unexpected; retry
@@ -9228,10 +9235,15 @@ impl StudioVfs {
         drop(_upload_io_permit);
 
         if let Some(object_bytes) = object_bytes {
-            self.upload_scheduler
-                .put(&key, object_bytes)
+            match self
+                .upload_scheduler
+                .put(&key, object_bytes, &self.state.uploader_shutdown_token)
                 .await
-                .map_err(|e| VfsError::Other(e.to_string()))?;
+            {
+                Ok(()) => {}
+                Err(crate::upload::UploadError::Cancelled) => return Ok(()),
+                Err(e) => return Err(VfsError::Other(e.to_string())),
+            }
             debug!(
                 ino = op.ino,
                 object_id = op.object_id,
@@ -9997,64 +10009,8 @@ impl StudioVfs {
         }
     }
 
-    async fn reconcile_remote_completed_pending(&self) -> usize {
-        let pending_ops = self.block_cache.snapshot_pending_uploads();
-        if pending_ops.is_empty() {
-            return 0;
-        }
-
-        let mut reconciled = 0usize;
-        for op in &pending_ops {
-            let key = format_object_key(&self.data_prefix, op.object_id);
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.fetch_scheduler.data_store().exists(&key),
-            )
-            .await
-            {
-                Ok(Ok(true)) => {
-                    let block_index = block_index_from_offset(op.offset, self.block_size);
-                    if let Err(e) =
-                        commit::CommitCoordinator::finish_extent_upload(self, op, block_index).await
-                    {
-                        debug!(
-                            object_id = op.object_id,
-                            ino = op.ino,
-                            error = %e,
-                            "VFS shutdown: publish reconcile after remote exists() failed"
-                        );
-                    } else {
-                        self.block_cache.complete_upload(op);
-                    }
-                    reconciled += 1;
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
-                    debug!(
-                        object_id = op.object_id,
-                        error = %e,
-                        "VFS shutdown: remote reconcile exists() failed"
-                    );
-                }
-                Err(_) => {
-                    debug!(
-                        object_id = op.object_id,
-                        "VFS shutdown: remote reconcile exists() timed out, skipping"
-                    );
-                }
-            }
-        }
-        if reconciled > 0 {
-            info!(
-                reconciled,
-                "VFS shutdown: reconciled pending uploads already present on remote"
-            );
-        }
-        reconciled
-    }
-
-    /// Best-effort graceful shutdown: drain dirty buffers, wait for pending
-    /// uploads to complete, then persist cache checkpoint.
+    /// Best-effort graceful shutdown: drain dirty buffers, persist final
+    /// checkpoint state, cancel uploader tasks, then persist cache checkpoint.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         if self.state.shutdown_completed.load(Ordering::Acquire) {
             return;
@@ -10137,48 +10093,22 @@ impl StudioVfs {
             );
         }
 
-        // Phase 3: wait for uploads to drain, reconcile already-uploaded blocks.
+        // Phase 3: cancel uploader work immediately after final ingress
+        // checkpoint persistence and stop uploader tasks.
+        self.request_uploader_shutdown();
         let pending = self.block_cache.pending_upload_count();
         if pending > 0 {
-            if upload_drain_timeout.is_zero() {
-                info!(
-                    pending,
-                    "VFS shutdown: skipping upload drain (resume from journal on next start)"
-                );
-            } else {
-                info!(pending, "VFS shutdown: waiting for uploads to drain");
-                let mut drained = self
-                    .block_cache
-                    .wait_for_uploads_idle(upload_drain_timeout)
-                    .await;
-                if !drained {
-                    let reconciled = self.reconcile_remote_completed_pending().await;
-                    if reconciled > 0 {
-                        info!(
-                            reconciled,
-                            "VFS shutdown: reconciled already-uploaded blocks"
-                        );
-                        drained = self
-                            .block_cache
-                            .wait_for_uploads_idle(Duration::from_millis(500))
-                            .await;
-                    }
-                }
-                if !drained {
-                    let pending_ops = self.block_cache.snapshot_pending_uploads();
-                    let sample_object_ids: Vec<u64> =
-                        pending_ops.iter().take(8).map(|op| op.object_id).collect();
-                    warn!(
-                        pending = self.block_cache.pending_upload_count(),
-                        pending_journal_files = pending_ops.len(),
-                        pending_object_ids_sample = ?sample_object_ids,
-                        timeout_ms = upload_drain_timeout.as_millis() as u64,
-                        "VFS shutdown: upload queue did not fully drain before timeout"
-                    );
-                }
-            }
+            let pending_ops = self.block_cache.snapshot_pending_uploads();
+            let sample_object_ids: Vec<u64> =
+                pending_ops.iter().take(8).map(|op| op.object_id).collect();
+            info!(
+                pending,
+                pending_journal_files = pending_ops.len(),
+                pending_object_ids_sample = ?sample_object_ids,
+                requested_drain_timeout_ms = upload_drain_timeout.as_millis() as u64,
+                "VFS shutdown: uploader cancelled after checkpoint; pending uploads will resume from journal"
+            );
         }
-        self.request_uploader_shutdown();
         self.join_uploader_task(background_join_timeout).await;
 
         // Phase 4: persist metadata + cache checkpoint.

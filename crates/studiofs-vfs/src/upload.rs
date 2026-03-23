@@ -3,12 +3,14 @@
 //! This mirrors the fetch-side adaptive control, but for PUT requests.
 
 use crate::aimd::{AimdConfig, AimdController};
+use crate::runtime::{TimeoutOrCancel, run_with_timeout_or_cancel, sleep_or_cancel};
 use crate::vfs::VfsConfig;
 use opendal::{Buffer, ErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use studiofs_data::store::{DataError, DataStore};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 /// Lock-free counters for upload observability.
@@ -65,6 +67,8 @@ impl std::fmt::Display for UploadMetrics {
 pub enum UploadError {
     #[error("upload failed after {attempts} attempts: {source}")]
     Exhausted { attempts: u32, source: DataError },
+    #[error("upload cancelled")]
+    Cancelled,
 }
 
 /// Adaptive uploader with AIMD concurrency and per-request retry.
@@ -119,21 +123,32 @@ impl UploadScheduler {
     }
 
     /// Upload object bytes to `key` with adaptive concurrency + retries.
-    pub async fn put(&self, key: &str, payload: Buffer) -> Result<(), UploadError> {
+    pub async fn put(
+        &self,
+        key: &str,
+        payload: Buffer,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), UploadError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
 
         for attempt in 0..self.max_attempts {
+            if cancel_token.is_cancelled() {
+                return Err(UploadError::Cancelled);
+            }
             if attempt == 0 {
                 let penalty_ms = self.adaptive_penalty_ms.load(Ordering::Relaxed);
                 if penalty_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(penalty_ms)).await;
+                    if !sleep_or_cancel(cancel_token, Duration::from_millis(penalty_ms)).await {
+                        return Err(UploadError::Cancelled);
+                    }
                 }
             }
             self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
             let permit = self.aimd.acquire().await;
             let req_start = Instant::now();
-            let put_result = tokio::time::timeout(
+            let put_result = run_with_timeout_or_cancel(
+                cancel_token,
                 self.request_timeout,
                 self.data_store.put_by_key(key, payload.clone()),
             )
@@ -141,7 +156,7 @@ impl UploadScheduler {
             let req_ms = req_start.elapsed().as_millis();
 
             match put_result {
-                Ok(Ok(())) => {
+                TimeoutOrCancel::Completed(Ok(())) => {
                     permit.success();
                     self.metrics.uploads_ok.fetch_add(1, Ordering::Relaxed);
                     self.metrics
@@ -157,7 +172,7 @@ impl UploadScheduler {
                     );
                     return Ok(());
                 }
-                Ok(Err(e)) => {
+                TimeoutOrCancel::Completed(Err(e)) => {
                     self.metrics.uploads_err.fetch_add(1, Ordering::Relaxed);
                     classify_data_error(&self.metrics, &e);
                     let retryable = is_retryable(&e);
@@ -183,7 +198,9 @@ impl UploadScheduler {
                             error = %e,
                             "upload failed, retrying"
                         );
-                        tokio::time::sleep(delay).await;
+                        if !sleep_or_cancel(cancel_token, delay).await {
+                            return Err(UploadError::Cancelled);
+                        }
                     } else if retryable {
                         error!(
                             attempts = self.max_attempts,
@@ -208,7 +225,7 @@ impl UploadScheduler {
                         break;
                     }
                 }
-                Err(_) => {
+                TimeoutOrCancel::TimedOut => {
                     permit.failure();
                     self.metrics.uploads_err.fetch_add(1, Ordering::Relaxed);
                     self.metrics.timeout_err.fetch_add(1, Ordering::Relaxed);
@@ -232,7 +249,9 @@ impl UploadScheduler {
                             delay_ms = delay.as_millis() as u64,
                             "upload timed out, retrying"
                         );
-                        tokio::time::sleep(delay).await;
+                        if !sleep_or_cancel(cancel_token, delay).await {
+                            return Err(UploadError::Cancelled);
+                        }
                     } else {
                         error!(
                             attempts = self.max_attempts,
@@ -243,6 +262,9 @@ impl UploadScheduler {
                     }
 
                     last_err = Some(timeout_err);
+                }
+                TimeoutOrCancel::Cancelled => {
+                    return Err(UploadError::Cancelled);
                 }
             }
         }

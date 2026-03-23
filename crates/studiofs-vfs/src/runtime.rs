@@ -1,8 +1,16 @@
 use std::sync::Arc;
+use std::time::Duration;
 use studiofs_meta::{MetaEngine, MetaResult};
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 use super::{VfsError, VfsResult};
+
+pub enum TimeoutOrCancel<T> {
+    Completed(T),
+    TimedOut,
+    Cancelled,
+}
 
 /// Run a potentially blocking closure on Tokio's dedicated blocking pool and
 /// propagate `JoinError` as `VfsError::Join`.
@@ -22,4 +30,29 @@ pub async fn run_meta<T: Send + 'static>(
     task::spawn_blocking(move || operation(engine).map_err(VfsError::Meta))
         .await
         .map_err(VfsError::Join)?
+}
+
+/// Race an async operation against timeout and cancellation.
+pub async fn run_with_timeout_or_cancel<T>(
+    cancel_token: &CancellationToken,
+    timeout: Duration,
+    operation: impl std::future::Future<Output = T>,
+) -> TimeoutOrCancel<T> {
+    tokio::select! {
+        _ = cancel_token.cancelled() => TimeoutOrCancel::Cancelled,
+        result = tokio::time::timeout(timeout, operation) => {
+            match result {
+                Ok(value) => TimeoutOrCancel::Completed(value),
+                Err(_) => TimeoutOrCancel::TimedOut,
+            }
+        }
+    }
+}
+
+/// Sleep unless cancellation is requested first.
+pub async fn sleep_or_cancel(cancel_token: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = cancel_token.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }

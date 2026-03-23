@@ -19,6 +19,7 @@ repository = "https://github.com/valandreev/studiofs-cli"
 [workspace.dependencies]
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 async-trait = "0.1"
 futures = "0.3"
 tokio-postgres = "0.7"
