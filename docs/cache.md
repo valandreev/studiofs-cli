@@ -95,16 +95,21 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   payload length than expected, the direct path is discarded and read retries
   via buffered fallback for correctness
 - **Current Linux runtime note** — this path does not use `io_uring` yet; it
-  runs direct reads/writes in bounded `spawn_blocking` workers with
-  `std::fs::OpenOptions` + direct-open flags and async buffered fallback
+  runs direct reads/writes via `spawn_blocking` with `std::fs::OpenOptions` +
+  direct-open flags and async buffered fallback. Write/remove operations are
+  semaphore-bounded, while read fan-out is controlled per call path
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
 - **Tunable sync FD cache size** — `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY`
   controls sync-read open-file LRU capacity (default `4096`)
+- **Tunable batch-read fan-out** — `STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT`
+  controls max in-flight reads per `get_batch*` call (default `256`)
 
 **Batch operations:**
-- `put_batch(blocks)` — parallel `spawn_blocking` per block
-- `get_batch(ids)` — parallel async fan-out with preserved input order
+- `put_batch(blocks)` — sliding-window `JoinSet` scheduling with preserved
+  input order and semaphore-bounded write workers
+- `get_batch(ids)` — sliding-window `JoinSet` fan-out with preserved input
+  order and direct-I/O-first read policy
 - `get_batch_with_size_hints([(id, Option<size>)])` — same as `get_batch`, but
   can skip per-item `metadata()` when caller already knows block lengths
 
@@ -203,7 +208,8 @@ Timeout behavior:
 - Repeated L2 read timeouts open a short-lived read circuit breaker (default: 3 consecutive timeouts, 5s cooldown), temporarily bypassing L2 reads to avoid piling additional blocking disk tasks during device stalls.
 - Sync L2 read-into path respects the same read circuit-breaker policy; when the breaker is open it reports miss/bypass so callers can fall back to async/remote fetch path.
 - L2 write timeout fails the direct write path and is retried by background commit workers up to the configured attempt cap before dropping the local commit job.
-- L2 blocking disk operations are bounded by an internal semaphore (default 128 in-flight tasks), preventing unbounded `spawn_blocking` growth when the local disk stalls.
+- L2 write/remove operations are bounded by an internal semaphore (default 128 in-flight tasks), preventing unbounded mutation-side `spawn_blocking` growth when local disk stalls.
+- L2 batch reads use a sliding-window fan-out budget (`STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT`, default 256) to avoid lock-step chunk stalls and keep read queue depth stable.
 
 **Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.
 If the serialized checkpoint payload is unchanged (same entry count + CRC), the
