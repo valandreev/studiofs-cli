@@ -407,6 +407,7 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `4096` | L2 commit queue capacity before enqueue backpressure |
 | `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
 | `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
+| `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` | `4096` | Capacity of L2 sync-read open-file descriptor LRU cache (set lower on hosts with strict FD limits) |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |
@@ -462,6 +463,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - materialize batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache L2 read/write throughput and latency histograms
 - L2 commit scheduler counters (`cache_l2_commit_queue_depth`, `cache_l2_commit_queue_depth_peak`, `cache_l2_commit_workers_active`, `cache_l2_commit_workers_active_peak`, `cache_l2_commit_backpressure_events`)
+- VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
 

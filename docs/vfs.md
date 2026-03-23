@@ -192,7 +192,14 @@ Handle-aware read path:
   - disables best-effort prefetch for that read,
   - resolves committed blocks through an L2-only direct path (no L1 lookup/promotion),
   - blocks fetched from S3 are cached in L2 (disk cache) to avoid repeat remote fetches.
+- VFS also provides a synchronous cache-only fast path (`read_into_fh_sync_cached`):
+  - probes all requested blocks first,
+  - serves synchronously only when the full request can be satisfied locally,
+  - reads L2 hits directly into caller-provided output slices,
+  - returns fallback (`None`) on miss so S3/object-store fetch remains async.
 - WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
+- FUSE bridge uses `can_read_fh_sync_cached(...)` as a cheap probe to avoid
+  output-buffer allocation on sync-cache misses.
 
 ## FetchScheduler (`fetch.rs`)
 
@@ -246,6 +253,10 @@ Prefetch reads use `fetch_block_prefetch()`:
 | `singleflight_joins` | Deduplicated requests |
 | `retries` | Retried fetches |
 | `bytes_downloaded` | Total bytes from S3 |
+
+Additional sync-fast-path counters are emitted in `upload pipeline counters`:
+- `vfs_read_sync_fast_path_hits`
+- `vfs_read_sync_fast_path_misses`
 
 ### Connection Warmup
 
