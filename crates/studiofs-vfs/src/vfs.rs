@@ -258,6 +258,12 @@ pub struct VfsUploadStats {
     pub canceled_stale: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct VfsReadFastPathStats {
+    pub sync_fast_path_hits: u64,
+    pub sync_fast_path_misses: u64,
+}
+
 pub type VfsResult<T> = Result<T, VfsError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3084,6 +3090,10 @@ struct VfsState {
     foreground_reads_inflight: AtomicUsize,
     /// Last time a foreground read was observed (unix millis).
     last_foreground_read_ms: AtomicU64,
+    /// Number of successful synchronous cache-only read fast-path operations.
+    sync_read_fast_path_hits: AtomicU64,
+    /// Number of synchronous cache-only fast-path misses/fallbacks.
+    sync_read_fast_path_misses: AtomicU64,
     /// Flag set at shutdown to stop the background slab flusher so it cannot
     /// race with the shutdown drain.
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
@@ -4140,6 +4150,8 @@ impl StudioVfs {
                     upload_canceled_stale: AtomicU64::new(0),
                     foreground_reads_inflight: AtomicUsize::new(0),
                     last_foreground_read_ms: AtomicU64::new(0),
+                    sync_read_fast_path_hits: AtomicU64::new(0),
+                    sync_read_fast_path_misses: AtomicU64::new(0),
                     slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
                     ingress_checkpoint_stopped: std::sync::atomic::AtomicBool::new(false),
                     ingress_checkpoint_persists: AtomicU64::new(0),
@@ -5250,6 +5262,16 @@ impl StudioVfs {
         }
     }
 
+    pub fn read_fast_path_stats(&self) -> VfsReadFastPathStats {
+        VfsReadFastPathStats {
+            sync_fast_path_hits: self.state.sync_read_fast_path_hits.load(Ordering::Relaxed),
+            sync_fast_path_misses: self
+                .state
+                .sync_read_fast_path_misses
+                .load(Ordering::Relaxed),
+        }
+    }
+
     fn logical_block_len(&self, file_size: u64, block_index: u32) -> usize {
         let block_start = block_index as u64 * self.block_size as u64;
         if block_start >= file_size {
@@ -5517,6 +5539,18 @@ impl StudioVfs {
         self.state
             .last_foreground_read_ms
             .store(Self::now_unix_millis(), Ordering::Relaxed);
+    }
+
+    fn record_sync_read_fast_path_hit(&self) {
+        self.state
+            .sync_read_fast_path_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_sync_read_fast_path_miss(&self) {
+        self.state
+            .sync_read_fast_path_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -6756,7 +6790,13 @@ impl StudioVfs {
             .get(fh)
             .map(|open| open.flags.requests_unbuffered_io())
             .unwrap_or(false);
-        self.read_into_sync_cached_with_mode(ino, offset, buffer, unbuffered)
+        let result = self.read_into_sync_cached_with_mode(ino, offset, buffer, unbuffered)?;
+        if result.is_some() {
+            self.record_sync_read_fast_path_hit();
+        } else {
+            self.record_sync_read_fast_path_miss();
+        }
+        Ok(result)
     }
 
     /// Check whether a synchronous cache-only read can serve the full request.
@@ -6775,7 +6815,11 @@ impl StudioVfs {
             .get(fh)
             .map(|open| open.flags.requests_unbuffered_io())
             .unwrap_or(false);
-        self.can_read_sync_cached_with_mode(ino, offset, size as usize)
+        let can_read = self.can_read_sync_cached_with_mode(ino, offset, size as usize)?;
+        if !can_read {
+            self.record_sync_read_fast_path_miss();
+        }
+        Ok(can_read)
     }
 
     /// Write file data using per-handle I/O flags.
@@ -9031,6 +9075,10 @@ impl StudioVfs {
                     canceled_stale = self.state.upload_canceled_stale.load(Ordering::Relaxed),
                     foreground_reads_inflight =
                         self.state.foreground_reads_inflight.load(Ordering::Relaxed),
+                    vfs_read_sync_fast_path_hits =
+                        self.state.sync_read_fast_path_hits.load(Ordering::Relaxed),
+                    vfs_read_sync_fast_path_misses =
+                        self.state.sync_read_fast_path_misses.load(Ordering::Relaxed),
                     dirty_mem_blocks = ingress.dirty_mem_blocks,
                     dirty_mem_bytes = ingress.dirty_mem_bytes,
                     spill_records = ingress.spill_records,
