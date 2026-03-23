@@ -76,7 +76,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `get_security_by_name` | `NamespaceResolver::resolve_path()` |
 | `open` | `NamespaceResolver::resolve_path()` + `open()` (records `DIRECT_IO` / `WRITE_THROUGH` intent) |
 | `close` | `release()` |
-| `read` | `read_into_fh()` (per-handle unbuffered path when requested) |
+| `read` | `read_into_fh_sync_cached()` fast path, then `read_into_fh()` fallback |
 | `write` | `write_fh()` (unbuffered backend drain deferred to flush/close) |
 | `cleanup` | `flush()` |
 | `flush` | `flush()` |
@@ -90,7 +90,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `cleanup` + delete flag | `unlink()` / `rmdir()` |
 
 I/O buffer behavior on Windows callbacks:
-- `read`: WinFSP-provided output buffer is filled directly by `read_into_fh()` (no intermediate `Vec<u8>` and no extra memcpy in `StudioFsContext`).
+- `read`: WinFSP first tries VFS synchronous cache-only fast path into caller buffer (`read_into_fh_sync_cached()`), then falls back to async `read_into_fh()` on miss; both paths avoid bridge-layer intermediate buffers/copies.
 - `write`: WinFSP-provided input buffer is forwarded directly to `write_fh()` (no intermediate `to_vec()` copy in `StudioFsContext`).
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 

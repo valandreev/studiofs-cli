@@ -34,6 +34,7 @@ use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{run_blocking, run_meta};
 use bytes::{Buf, Bytes, BytesMut};
+use futures::FutureExt;
 use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
@@ -3149,6 +3150,19 @@ struct EffectiveAclCacheEntry {
     acl_namespace_epoch: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PrefetchWorkItem {
+    ReadHint {
+        ino: Ino,
+        first_block: u32,
+        last_block: u32,
+    },
+    Block {
+        ino: Ino,
+        block_idx: u32,
+    },
+}
+
 // =============================================================================
 // StudioVfs Implementation
 // =============================================================================
@@ -3202,9 +3216,11 @@ pub struct StudioVfs {
     readahead: Arc<ReadAheadTracker>,
     /// Directory-level prefetch tracker.
     dir_prefetch: Arc<DirAccessTracker>,
-    /// Channel sender for scheduling background prefetch tasks.
+    /// Channel sender for background prefetch planning and execution.
     /// The receiver lives in a spawned task that has an Arc<Self>.
-    prefetch_tx: tokio::sync::mpsc::UnboundedSender<(Ino, u32)>,
+    prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
+    /// Last queued block range per inode to suppress duplicate read hints.
+    prefetch_last_hint: Mutex<HashMap<Ino, (u32, u32)>>,
     /// Signal sender to wake the background flusher when new dirty blocks
     /// are buffered.
     dirty_flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -3912,7 +3928,7 @@ impl StudioVfs {
             ));
             let dir_prefetch = Arc::new(DirAccessTracker::new(2));
             let (prefetch_tx, mut prefetch_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(Ino, u32)>();
+                tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
 
             // Dirty-write memory buffer + background flusher channel.
             let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -4206,6 +4222,7 @@ impl StudioVfs {
                 readahead: readahead.clone(),
                 dir_prefetch,
                 prefetch_tx,
+                prefetch_last_hint: Mutex::new(HashMap::new()),
                 dirty_flush_tx,
                 max_dirty_bytes,
                 max_xattr_bytes,
@@ -4238,35 +4255,81 @@ impl StudioVfs {
             let vfs_for_prefetch = vfs.clone();
             let prefetch_limit = vfs.prefetch_concurrency.max(1);
             vfs.track_background_task(tokio::spawn(async move {
-                let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
-                let mut inflight = JoinSet::new();
-                loop {
-                    tokio::select! {
-                        _ = vfs_for_prefetch.state.shutdown_notify.notified() => {
-                            inflight.abort_all();
-                            while inflight.join_next().await.is_some() {}
-                            break;
-                        }
-                        Some((ino, block_idx)) = prefetch_rx.recv() => {
+                let worker = async {
+                    let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
+                    let mut pending_queue: VecDeque<(Ino, u32)> = VecDeque::new();
+                    let mut pending_set: HashSet<(Ino, u32)> = HashSet::new();
+                    let mut inflight = JoinSet::new();
+                    loop {
+                        // Launch as many queued prefetches as permits allow without
+                        // blocking the worker event loop.
+                        while let Some((ino, block_idx)) = pending_queue.front().copied() {
                             if vfs_for_prefetch.shutdown_requested() {
-                                continue;
+                                pending_queue.clear();
+                                pending_set.clear();
+                                break;
                             }
-                            let permit = match prefetch_sem.clone().acquire_owned().await {
+                            let permit = match prefetch_sem.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => break,
                             };
+                            let _ = pending_queue.pop_front();
+                            pending_set.remove(&(ino, block_idx));
+                            if !vfs_for_prefetch.readahead.start_prefetch(ino, block_idx) {
+                                continue;
+                            }
                             let v = vfs_for_prefetch.clone();
                             inflight.spawn(async move {
                                 let _permit = permit;
                                 let _ = v.read_block_for_prefetch(ino, block_idx).await;
                             });
                         }
-                        joined = inflight.join_next(), if !inflight.is_empty() => {
-                            if joined.is_none() {
+
+                        tokio::select! {
+                            _ = vfs_for_prefetch.state.shutdown_notify.notified() => {
+                                inflight.abort_all();
+                                while inflight.join_next().await.is_some() {}
                                 break;
+                            }
+                            Some(work_item) = prefetch_rx.recv() => {
+                                if vfs_for_prefetch.shutdown_requested() {
+                                    continue;
+                                }
+                                let planned: Vec<(Ino, u32)> = match work_item {
+                                    PrefetchWorkItem::ReadHint {
+                                        ino,
+                                        first_block,
+                                        last_block,
+                                    } => vfs_for_prefetch
+                                        .plan_prefetch_blocks_from_hint(ino, first_block, last_block),
+                                    PrefetchWorkItem::Block { ino, block_idx } => {
+                                        vec![(ino, block_idx)]
+                                    }
+                                };
+                                for (ino, block_idx) in planned {
+                                    if pending_set.insert((ino, block_idx)) {
+                                        pending_queue.push_back((ino, block_idx));
+                                    }
+                                }
+                            }
+                            joined = inflight.join_next(), if !inflight.is_empty() => {
+                                if joined.is_none() {
+                                    break;
+                                }
                             }
                         }
                     }
+                };
+                if let Err(panic_payload) = std::panic::AssertUnwindSafe(worker).catch_unwind().await
+                {
+                    let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+                        *msg
+                    } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
+                        msg.as_str()
+                    } else {
+                        "unknown panic payload"
+                    };
+                    error!("prefetch worker panicked: {}", panic_msg);
                 }
             }));
 
@@ -6604,9 +6667,10 @@ impl StudioVfs {
         if attr.kind == studiofs_meta::types::FileType::RegularFile
             && attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
-            && self.readahead.start_prefetch(ino, 0)
         {
-            let _ = self.prefetch_tx.send((ino, 0));
+            let _ = self
+                .prefetch_tx
+                .send(PrefetchWorkItem::Block { ino, block_idx: 0 });
         }
 
         Ok(fh)
@@ -7578,6 +7642,7 @@ impl StudioVfs {
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
+        self.prefetch_last_hint.lock().remove(&ino);
     }
 
     fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
@@ -7605,6 +7670,7 @@ impl StudioVfs {
             );
         }
         self.readahead.evict(ino);
+        self.prefetch_last_hint.lock().remove(&ino);
         Ok(())
     }
 
@@ -7819,14 +7885,14 @@ impl StudioVfs {
                         buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
                     }
                     if !unbuffered {
-                        self.maybe_prefetch(ino, &blocks_needed);
+                        self.enqueue_prefetch_hint(ino, &blocks_needed);
                     }
                     Ok(copy_len as u32)
                 }
                 Err(VfsError::BlockNotFound(_, _)) => {
                     buffer[..to_copy].fill(0u8);
                     if !unbuffered {
-                        self.maybe_prefetch(ino, &blocks_needed);
+                        self.enqueue_prefetch_hint(ino, &blocks_needed);
                     }
                     Ok(to_copy as u32)
                 }
@@ -7882,25 +7948,82 @@ impl StudioVfs {
         }
 
         if !unbuffered {
-            self.maybe_prefetch(ino, &blocks_needed);
+            self.enqueue_prefetch_hint(ino, &blocks_needed);
         }
         Ok(written as u32)
     }
 
-    /// Trigger read-ahead prefetches if a sequential access pattern is detected.
-    /// Called after every successful `read_into()` to amortise scheduling overhead.
+    /// Enqueue a read hint for background prefetch planning and execution.
+    /// Called after successful buffered reads with minimal work on the read path.
     #[inline]
-    fn maybe_prefetch(&self, ino: Ino, blocks_needed: &[(u32, usize, usize)]) {
-        if self.shutdown_requested() || blocks_needed.is_empty() || self.readahead.width == 0 {
+    fn enqueue_prefetch_hint(&self, ino: Ino, blocks_needed: &[(u32, usize, usize)]) {
+        if self.shutdown_requested() || blocks_needed.is_empty() {
             return;
         }
+        let first_block = blocks_needed[0].0;
+        let last_block = blocks_needed.last().unwrap().0;
+        {
+            let mut last_hints = self.prefetch_last_hint.lock();
+            if let Some((prev_first, prev_last)) = last_hints.get(&ino).copied() {
+                // Suppress redundant hints fully covered by the previous range.
+                if first_block >= prev_first && last_block <= prev_last {
+                    return;
+                }
+                // Merge overlapping/adjacent ranges to reduce hint churn.
+                if first_block <= prev_last.saturating_add(1)
+                    && prev_first <= last_block.saturating_add(1)
+                {
+                    last_hints.insert(
+                        ino,
+                        (prev_first.min(first_block), prev_last.max(last_block)),
+                    );
+                } else {
+                    last_hints.insert(ino, (first_block, last_block));
+                }
+            } else {
+                last_hints.insert(ino, (first_block, last_block));
+            }
+        }
+        let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
+            ino,
+            first_block,
+            last_block,
+        });
+    }
+
+    /// Compute prefetch blocks from a read hint.
+    /// Runs on the background prefetch worker to keep the hot path lean.
+    fn plan_prefetch_blocks_from_hint(
+        &self,
+        ino: Ino,
+        first_block: u32,
+        last_block: u32,
+    ) -> Vec<(Ino, u32)> {
+        if self.shutdown_requested() || self.readahead.width == 0 {
+            return Vec::new();
+        }
+        // Ignore stale hints for inodes that no longer exist.
+        match self.meta.get_attr(ino) {
+            Ok(_) => {}
+            Err(MetaError::InodeNotFound(_)) => {
+                self.readahead.evict(ino);
+                self.prefetch_last_hint.lock().remove(&ino);
+                return Vec::new();
+            }
+            Err(_) => return Vec::new(),
+        }
+        // Keep ReadAhead state consistent even when prefetch budget is zero.
+        let to_prefetch = self.readahead.record_read(ino, first_block, last_block);
+        // Keep directory-level access state in sync regardless of budget.
+        let siblings = self.dir_prefetch.on_child_read(ino);
+
         // After transient transport failures, pause best-effort prefetch briefly
         // so foreground demand reads can recover the pipeline first.
         if self
             .fetch_scheduler
             .recent_send_error(self.prefetch_pause_on_neterr)
         {
-            return;
+            return Vec::new();
         }
         // Keep headroom for foreground reads: cap best-effort prefetch by
         // current fetch window and in-flight load.
@@ -7911,33 +8034,28 @@ impl StudioVfs {
             .saturating_sub(self.prefetch_foreground_reserve)
             .min(self.prefetch_max_per_cycle);
         if budget == 0 {
-            return;
+            return Vec::new();
         }
 
-        let first_block = blocks_needed[0].0;
-        let last_block = blocks_needed.last().unwrap().0;
-        let to_prefetch = self.readahead.record_read(ino, first_block, last_block);
+        let mut planned: Vec<(Ino, u32)> = Vec::new();
         for block_idx in to_prefetch {
             if budget == 0 {
                 break;
             }
-            if self.readahead.start_prefetch(ino, block_idx) {
-                // Best-effort; ignore send errors (worker may have exited).
-                let _ = self.prefetch_tx.send((ino, block_idx));
-                budget = budget.saturating_sub(1);
-            }
+            planned.push((ino, block_idx));
+            budget = budget.saturating_sub(1);
         }
 
         // Directory-level prefetch: if this child is in a tracked directory
         // and the threshold is met, prefetch block 0 of sibling files.
-        let siblings = self.dir_prefetch.on_child_read(ino);
         for sibling_ino in siblings.into_iter().take(self.dir_prefetch_max_batch) {
             if budget == 0 {
                 break;
             }
-            let _ = self.prefetch_tx.send((sibling_ino, 0));
+            planned.push((sibling_ino, 0));
             budget = budget.saturating_sub(1);
         }
+        planned
     }
 
     /// Read a block from the local pending incarnation overlay first, then
@@ -8067,7 +8185,7 @@ impl StudioVfs {
         }
 
         if !unbuffered {
-            self.maybe_prefetch(ino, &blocks_needed);
+            self.enqueue_prefetch_hint(ino, &blocks_needed);
         }
 
         Ok(Some(written as u32))
