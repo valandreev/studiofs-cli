@@ -158,18 +158,9 @@ fn read_into_slice_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<us
     if buf.is_empty() {
         return Ok(0);
     }
-    let mut total = 0usize;
-    while total < buf.len() {
-        let off = offset
-            .checked_add(total as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
-        let n = read_file_at(file, &mut buf[total..], off)?;
-        if n == 0 {
-            break;
-        }
-        total = total.saturating_add(n);
-    }
-    Ok(total)
+    // One positional read attempt is enough for the sync cache-hit path.
+    // Short reads are propagated to caller and treated as tail zero-fill there.
+    read_file_at(file, buf, offset)
 }
 
 fn sync_fd_cache_capacity() -> usize {
@@ -535,7 +526,6 @@ impl L2DiskCache {
     /// Shard directories are pre-created by `open()`, so no `create_dir_all`
     /// call on the hot path.
     pub async fn put_bytes(&self, object_id: u64, data: Bytes) -> io::Result<()> {
-        self.fd_cache_invalidate(object_id);
         let path = self.block_path(object_id);
         let tmp_path = Self::unique_tmp_path(&path);
         let len = data.len() as u64;
@@ -548,6 +538,9 @@ impl L2DiskCache {
         .await
         .map_err(io::Error::other)??;
 
+        // Invalidate after successful write+rename so future sync reads reopen
+        // the new inode instead of a cached old descriptor.
+        self.fd_cache_invalidate(object_id);
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
         Ok(())
     }
@@ -603,6 +596,7 @@ impl L2DiskCache {
         for (id, len, handle) in handles {
             let (res, elapsed_ns) = match handle.await {
                 Ok(Ok((Ok(()), elapsed_ns))) => {
+                    self.fd_cache_invalidate(id);
                     self.total_bytes.fetch_add(len, Ordering::Relaxed);
                     (Ok(()), elapsed_ns)
                 }
@@ -619,12 +613,14 @@ impl L2DiskCache {
     ///
     /// Shard directories are pre-created by `open()`.
     pub fn put_sync(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
-        self.fd_cache_invalidate(object_id);
         let path = self.block_path(object_id);
         let tmp_path = Self::unique_tmp_path(&path);
 
         Self::write_block_file(&path, &tmp_path, data)?;
 
+        // Invalidate after successful write+rename so future sync reads reopen
+        // the new inode instead of a cached old descriptor.
+        self.fd_cache_invalidate(object_id);
         self.total_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
