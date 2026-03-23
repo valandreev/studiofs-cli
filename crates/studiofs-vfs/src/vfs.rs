@@ -49,6 +49,7 @@ use studiofs_cache::block_cache::{
     BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
     DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
+use studiofs_cache::l2_disk::L2IoPriority;
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
@@ -8960,7 +8961,11 @@ impl StudioVfs {
         let object_bytes: Option<Buffer> = if remote_object_visible {
             None
         } else {
-            let raw_payload = match self.block_cache.get(op.object_id).await {
+            let raw_payload = match self
+                .block_cache
+                .get_with_priority(op.object_id, L2IoPriority::Background)
+                .await
+            {
                 Some(data) => data,
                 None => {
                     // Block data is missing from cache. If remote already has

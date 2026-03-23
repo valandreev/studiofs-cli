@@ -50,7 +50,9 @@ use std::os::windows::fs::OpenOptionsExt as _;
 // =============================================================================
 
 /// Upper bound for active L2 blocking write/remove I/O tasks.
-const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
+const DEFAULT_L2_FOREGROUND_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
+/// Upper bound for background upload I/O tasks.
+const DEFAULT_L2_BACKGROUND_BLOCKING_IO_MAX_IN_FLIGHT: usize = 32;
 /// Max number of blocking L2 read tasks scheduled concurrently by one batch read call.
 const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
@@ -61,6 +63,13 @@ const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLI
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 type PutBatchWorkerOutput = (usize, u64, u64, io::Result<(io::Result<()>, u64)>);
+
+/// Priority class for L2 I/O permits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L2IoPriority {
+    Foreground,
+    Background,
+}
 
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
     if alignment == 0 {
@@ -263,8 +272,10 @@ pub struct L2DiskCache {
     total_bytes: AtomicU64,
     /// Maximum allowed bytes.
     max_bytes: AtomicU64,
-    /// Limits active blocking L2 write/remove I/O to avoid exhausting Tokio's blocking pool.
-    write_io_semaphore: Arc<Semaphore>,
+    /// Limits active foreground L2 I/O to avoid exhausting Tokio's blocking pool.
+    foreground_io_semaphore: Arc<Semaphore>,
+    /// Limits active background L2 I/O for upload/flush work.
+    background_io_semaphore: Arc<Semaphore>,
     /// Max number of blocking L2 reads spawned concurrently by one batch call.
     read_batch_max_in_flight: usize,
     /// Small LRU of open file descriptors used by synchronous read fast-path.
@@ -334,7 +345,12 @@ impl L2DiskCache {
             shard_dirs: Arc::new(shard_dirs),
             total_bytes: AtomicU64::new(0),
             max_bytes: AtomicU64::new(max_bytes),
-            write_io_semaphore: Arc::new(Semaphore::new(DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT)),
+            foreground_io_semaphore: Arc::new(Semaphore::new(
+                DEFAULT_L2_FOREGROUND_BLOCKING_IO_MAX_IN_FLIGHT,
+            )),
+            background_io_semaphore: Arc::new(Semaphore::new(
+                DEFAULT_L2_BACKGROUND_BLOCKING_IO_MAX_IN_FLIGHT,
+            )),
             read_batch_max_in_flight: read_batch_max_in_flight().max(1),
             sync_read_fd_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(sync_fd_cache_capacity())
@@ -410,8 +426,12 @@ impl L2DiskCache {
         read_block_buffered(path, expected_len_hint)
     }
 
-    async fn acquire_io_permit(&self) -> io::Result<OwnedSemaphorePermit> {
-        self.write_io_semaphore
+    async fn acquire_io_permit(&self, priority: L2IoPriority) -> io::Result<OwnedSemaphorePermit> {
+        let semaphore = match priority {
+            L2IoPriority::Foreground => &self.foreground_io_semaphore,
+            L2IoPriority::Background => &self.background_io_semaphore,
+        };
+        semaphore
             .clone()
             .acquire_owned()
             .await
@@ -419,10 +439,14 @@ impl L2DiskCache {
     }
 
     async fn read_block_bytes(
+        &self,
         path: PathBuf,
         expected_len_hint: Option<usize>,
+        priority: L2IoPriority,
     ) -> io::Result<Bytes> {
+        let permit = self.acquire_io_permit(priority).await?;
         crate::runtime::spawn_blocking_profiled("l2_read", move || {
+            let _permit = permit;
             Self::read_block_sync(&path, expected_len_hint)
         })
         .await
@@ -435,7 +459,13 @@ impl L2DiskCache {
     /// If a platform/filesystem rejects direct mode for this block, read falls
     /// back to async buffered I/O.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
-        self.get_with_size_hint(object_id, None).await
+        self.get_with_priority(object_id, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Read a block from disk with an explicit QoS priority.
+    pub async fn get_with_priority(&self, object_id: u64, priority: L2IoPriority) -> Option<Bytes> {
+        self.get_with_size_hint(object_id, None, priority).await
     }
 
     /// Read a block using a known payload size hint from cache metadata.
@@ -446,9 +476,13 @@ impl L2DiskCache {
         &self,
         object_id: u64,
         size_hint: Option<u32>,
+        priority: L2IoPriority,
     ) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match Self::read_block_bytes(path, size_hint.map(|v| v as usize)).await {
+        match self
+            .read_block_bytes(path, size_hint.map(|v| v as usize), priority)
+            .await
+        {
             Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -463,8 +497,18 @@ impl L2DiskCache {
     /// Returns a `Vec` of `(object_id, Option<Bytes>)` in the same order as
     /// the input.
     pub async fn get_batch(&self, ids: &[u64]) -> Vec<(u64, Option<Bytes>)> {
+        self.get_batch_with_priority(ids, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Read multiple blocks from disk in parallel with a QoS priority.
+    pub async fn get_batch_with_priority(
+        &self,
+        ids: &[u64],
+        priority: L2IoPriority,
+    ) -> Vec<(u64, Option<Bytes>)> {
         let sized_ids: Vec<(u64, Option<u32>)> = ids.iter().copied().map(|id| (id, None)).collect();
-        self.get_batch_with_size_hints(&sized_ids).await
+        self.get_batch_with_size_hints(&sized_ids, priority).await
     }
 
     /// Read multiple blocks from disk in parallel with optional size hints.
@@ -473,6 +517,7 @@ impl L2DiskCache {
     pub async fn get_batch_with_size_hints(
         &self,
         ids: &[(u64, Option<u32>)],
+        priority: L2IoPriority,
     ) -> Vec<(u64, Option<Bytes>)> {
         let mut results: Vec<(u64, Option<Bytes>)> =
             ids.iter().map(|(id, _)| (*id, None)).collect();
@@ -484,9 +529,26 @@ impl L2DiskCache {
             |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
                 let (id, size_hint) = ids[idx];
                 let path = self.block_path(id);
+                let semaphore = match priority {
+                    L2IoPriority::Foreground => self.foreground_io_semaphore.clone(),
+                    L2IoPriority::Background => self.background_io_semaphore.clone(),
+                };
                 join_set.spawn(async move {
+                    let permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return (
+                                idx,
+                                Err(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "L2 I/O semaphore closed",
+                                )),
+                            );
+                        }
+                    };
                     let read_result =
                         match crate::runtime::spawn_blocking_profiled("l2_read_batch", move || {
+                            let _permit = permit;
                             Self::read_block_sync(&path, size_hint.map(|len| len as usize))
                         })
                         .await
@@ -576,10 +638,21 @@ impl L2DiskCache {
     /// Shard directories are pre-created by `open()`, so no `create_dir_all`
     /// call on the hot path.
     pub async fn put_bytes(&self, object_id: u64, data: Bytes) -> io::Result<()> {
+        self.put_bytes_with_priority(object_id, data, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Write a block to disk with an explicit QoS priority.
+    pub async fn put_bytes_with_priority(
+        &self,
+        object_id: u64,
+        data: Bytes,
+        priority: L2IoPriority,
+    ) -> io::Result<()> {
         let path = self.block_path(object_id);
         let tmp_path = Self::unique_tmp_path(&path);
         let len = data.len() as u64;
-        let permit = self.acquire_io_permit().await?;
+        let permit = self.acquire_io_permit(priority).await?;
 
         crate::runtime::spawn_blocking_profiled("l2_put", move || -> io::Result<()> {
             let _permit = permit;
@@ -600,7 +673,22 @@ impl L2DiskCache {
     /// This compatibility helper copies into an owned `Bytes` payload; prefer
     /// [`put_bytes`] on hot paths that already own a `Bytes` buffer.
     pub async fn put(&self, object_id: u64, data: &[u8]) -> io::Result<()> {
-        self.put_bytes(object_id, Bytes::copy_from_slice(data))
+        self.put_bytes_with_priority(
+            object_id,
+            Bytes::copy_from_slice(data),
+            L2IoPriority::Foreground,
+        )
+        .await
+    }
+
+    /// Write a block to disk from a byte slice with explicit QoS priority.
+    pub async fn put_with_priority(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        priority: L2IoPriority,
+    ) -> io::Result<()> {
+        self.put_bytes_with_priority(object_id, Bytes::copy_from_slice(data), priority)
             .await
     }
 
@@ -610,7 +698,21 @@ impl L2DiskCache {
     /// service them concurrently through multiple queues.  Returns errors
     /// for individual blocks as `(object_id, Error)`.
     pub async fn put_batch(&self, blocks: &[(u64, Bytes)]) -> Vec<(u64, io::Result<()>, u64)> {
-        let max_in_flight = DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT.max(1);
+        self.put_batch_with_priority(blocks, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Write multiple blocks to disk in parallel with a QoS priority.
+    pub async fn put_batch_with_priority(
+        &self,
+        blocks: &[(u64, Bytes)],
+        priority: L2IoPriority,
+    ) -> Vec<(u64, io::Result<()>, u64)> {
+        let max_in_flight = match priority {
+            L2IoPriority::Foreground => DEFAULT_L2_FOREGROUND_BLOCKING_IO_MAX_IN_FLIGHT,
+            L2IoPriority::Background => DEFAULT_L2_BACKGROUND_BLOCKING_IO_MAX_IN_FLIGHT,
+        }
+        .max(1);
         let mut join_set = tokio::task::JoinSet::new();
         let mut next_idx = 0usize;
         let mut results: Vec<(u64, io::Result<()>, u64)> = blocks
@@ -631,7 +733,10 @@ impl L2DiskCache {
             let owned = data.clone();
             let object_id = *id;
             let len = data.len() as u64;
-            let semaphore = self.write_io_semaphore.clone();
+            let semaphore = match priority {
+                L2IoPriority::Foreground => self.foreground_io_semaphore.clone(),
+                L2IoPriority::Background => self.background_io_semaphore.clone(),
+            };
             join_set.spawn(async move {
                 let permit = match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
@@ -720,7 +825,7 @@ impl L2DiskCache {
     pub async fn remove(&self, object_id: u64) {
         self.fd_cache_invalidate(object_id);
         let path = self.block_path(object_id);
-        let permit = match self.acquire_io_permit().await {
+        let permit = match self.acquire_io_permit(L2IoPriority::Foreground).await {
             Ok(permit) => permit,
             Err(e) => {
                 warn!(object_id, error = %e, "L2DiskCache remove permit error");
@@ -887,6 +992,28 @@ pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreground_and_background_permits_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+        cache.foreground_io_semaphore = Arc::new(Semaphore::new(1));
+        cache.background_io_semaphore = Arc::new(Semaphore::new(1));
+
+        let _foreground = cache
+            .acquire_io_permit(L2IoPriority::Foreground)
+            .await
+            .unwrap();
+        let background = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            cache.acquire_io_permit(L2IoPriority::Background),
+        )
+        .await;
+        assert!(
+            background.is_ok(),
+            "background permit should not wait on foreground"
+        );
+    }
 
     #[tokio::test]
     async fn put_get_remove() {

@@ -25,7 +25,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::l1_mem::L1MemCache;
-use crate::l2_disk::{self, L2DiskCache};
+use crate::l2_disk::{self, L2DiskCache, L2IoPriority};
 use crate::lru_tracker::{BlockLocation, CheckpointEntry, LruStats, LruTracker, ObjectId};
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::upload_queue::{PendingUpload, UploadQueue};
@@ -350,7 +350,9 @@ impl BlockCache {
     ///
     /// Lookup: L1 (RAM) → L2 (NVMe file) → None.
     pub async fn get(&self, object_id: ObjectId) -> Option<Bytes> {
-        self.get_with_trace(object_id).await.0
+        self.get_with_trace_priority(object_id, L2IoPriority::Foreground)
+            .await
+            .0
     }
 
     /// Read a block and return per-level lookup trace for observability.
@@ -358,6 +360,15 @@ impl BlockCache {
     /// This does not change cache behavior; it only exposes lookup timing and
     /// the level that served the payload.
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
+        self.get_with_trace_priority(object_id, L2IoPriority::Foreground)
+            .await
+    }
+
+    async fn get_with_trace_priority(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> (Option<Bytes>, CacheReadTrace) {
         let l1_started = Instant::now();
         if let Some(data) = self.l1.get(object_id) {
             let trace = CacheReadTrace {
@@ -385,7 +396,8 @@ impl BlockCache {
         let expected_size = self.lru.size(object_id);
         let l2_result = tokio::time::timeout(
             self.config.l2_read_timeout,
-            self.l2.get_with_size_hint(object_id, expected_size),
+            self.l2
+                .get_with_size_hint(object_id, expected_size, priority),
         )
         .await;
         let data_opt = match l2_result {
@@ -487,6 +499,15 @@ impl BlockCache {
         self.l2.get_sync(object_id)
     }
 
+    /// Read a block with an explicit L2 QoS priority.
+    pub async fn get_with_priority(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> Option<Bytes> {
+        self.get_with_trace_priority(object_id, priority).await.0
+    }
+
     /// Read from an L2 block synchronously into a provided output slice.
     ///
     /// Returns `None` when the block is not available on L2.
@@ -525,7 +546,8 @@ impl BlockCache {
         let started = Instant::now();
         match tokio::time::timeout(
             self.config.l2_write_timeout,
-            self.l2.put_bytes(object_id, data.clone()),
+            self.l2
+                .put_bytes_with_priority(object_id, data.clone(), L2IoPriority::Foreground),
         )
         .await
         {
@@ -931,7 +953,11 @@ impl BlockCache {
                 attempts += 1;
                 let write_result: io::Result<()> = match tokio::time::timeout(
                     self.config.l2_write_timeout,
-                    self.l2.put_bytes(job.object_id, job.data.clone()),
+                    self.l2.put_bytes_with_priority(
+                        job.object_id,
+                        job.data.clone(),
+                        L2IoPriority::Background,
+                    ),
                 )
                 .await
                 {
