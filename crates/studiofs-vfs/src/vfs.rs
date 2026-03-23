@@ -4612,10 +4612,19 @@ impl StudioVfs {
     }
 
     fn mark_inode_deleted_for_uploads(&self, ino: Ino) {
+        // Soft upload cancellation marker: stops background uploads for this inode.
+        // Data for still-open unlinked files must remain locally readable until
+        // the last handle is released (POSIX open-unlink semantics).
         self.state.deleted_inodes.lock().insert(ino);
         if let Some(token) = self.state.upload_cancel_tokens.lock().get(&ino).cloned() {
             token.cancel();
         }
+    }
+
+    fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) {
+        let has_open_handles = self.handle_table.open_count(op.ino) > 0;
+        self.block_cache.cancel_upload(op, !has_open_handles);
+        self.state.pending_evictions.lock().remove(&op.object_id);
     }
 
     fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> bool {
@@ -4625,9 +4634,27 @@ impl StudioVfs {
         self.state
             .upload_canceled_deleted
             .fetch_add(1, Ordering::Relaxed);
-        self.block_cache.cancel_upload(op, true);
-        self.state.pending_evictions.lock().remove(&op.object_id);
+        self.cancel_upload_for_deleted_inode(op);
+        self.maybe_clear_deleted_inode_marker(op.ino);
         true
+    }
+
+    fn maybe_clear_deleted_inode_marker(&self, ino: Ino) {
+        if !self.state.deleted_inodes.lock().contains(&ino) {
+            return;
+        }
+        if self.handle_table.open_count(ino) > 0 {
+            return;
+        }
+        if self.block_cache.has_pending_uploads_for_ino(ino) {
+            return;
+        }
+        // Only clear after inode metadata is actually gone. This keeps the
+        // marker stable for open-unlink inodes until final orphan cleanup.
+        if self.meta.get_attr(ino).is_ok() {
+            return;
+        }
+        self.state.deleted_inodes.lock().remove(&ino);
     }
 
     fn maybe_release_upload_cancel_token(&self, ino: Ino) {
@@ -6941,7 +6968,6 @@ impl StudioVfs {
                     .retain(|(i, _), _| *i != ino);
                 self.evict_inode_from_caches(ino, &removed_ids).await;
             }
-
             debug!(
                 "orphan cleanup complete: ino={} removed_blocks={} freed_bytes={}",
                 ino,
@@ -6951,6 +6977,7 @@ impl StudioVfs {
             self.clear_inode_incarnation(ino);
             self.state.dirty_attrs.lock().remove(&ino);
             self.state.attr_read_cache.lock().remove(ino);
+            self.maybe_clear_deleted_inode_marker(ino);
         }
         Ok(())
     }
@@ -7521,7 +7548,7 @@ impl StudioVfs {
 
         if open_handles > 0 {
             // Open-unlink: atomically remove dentry + decrement nlink, keep inode alive.
-            let _attr = match self.meta.unlink_open_handle(parent, name) {
+            let attr = match self.meta.unlink_open_handle(parent, name) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => {
                     self.heal_orphaned_dentry(parent, name, Some(ino));
@@ -7532,6 +7559,12 @@ impl StudioVfs {
                 }
                 Err(err) => return Err(VfsError::Meta(err)),
             };
+            if attr.nlink == 0 {
+                // Open-unlink still removes the final namespace reference right away.
+                // Cancel pending uploads immediately while deferred inode cleanup waits
+                // for the last open handle to close.
+                self.mark_inode_deleted_for_uploads(attr.ino);
+            }
 
             // Mark as orphan — release_fh will do the real cleanup
             self.handle_table.mark_orphan(ino);
@@ -7555,9 +7588,7 @@ impl StudioVfs {
 
             if attr.nlink == 0 {
                 // Inode fully removed — clean up blocks, caches, pending writes.
-
-                // Mark this inode as deleted FIRST — the background slab flusher checks
-                // this set to avoid re-inserting evicted blocks (race condition fix).
+                // Keep this call for idempotency (open-unlink path may have already marked).
                 self.mark_inode_deleted_for_uploads(attr.ino);
 
                 // Remove all blocks and mark for GC
@@ -8915,8 +8946,11 @@ impl StudioVfs {
                                 "upload failed for deleted inode, cancelling: {}",
                                 e
                             );
-                            vfs.block_cache.cancel_upload(&op, true);
-                            vfs.state.pending_evictions.lock().remove(&op.object_id);
+                            vfs.cancel_upload_for_deleted_inode(&op);
+                            vfs.state
+                                .upload_canceled_deleted
+                                .fetch_add(1, Ordering::Relaxed);
+                            vfs.maybe_clear_deleted_inode_marker(op.ino);
                         } else {
                             vfs.mark_upload_sticky_error(op.ino, &e);
                             let mut retry_op = op;
@@ -9075,8 +9109,15 @@ impl StudioVfs {
             return Ok(());
         }
 
-        // ── Fast-path: inode deleted → cancel upload, skip S3 write ──────
-        let inode_deleted = self.state.deleted_inodes.lock().contains(&op.ino);
+        // ── Fast-path: inode deleted → cancel upload, skip metadata and S3 work ──
+        if self.cancel_upload_if_inode_deleted(&op) {
+            debug!(
+                object_id = op.object_id,
+                ino = op.ino,
+                "process_upload canceled: inode deleted (short-circuit)"
+            );
+            return Ok(());
+        }
         // Also check metadata: after a remount, `deleted_inodes` is empty but
         // the inode may have been deleted in a prior session.  If the inode no
         // longer exists in the metadata store, the upload is stale.
@@ -9086,8 +9127,7 @@ impl StudioVfs {
         })
         .await
         .ok();
-        let inode_gone = inode_deleted || attr.is_none();
-        if inode_gone {
+        if attr.is_none() {
             self.state
                 .upload_canceled_deleted
                 .fetch_add(1, Ordering::Relaxed);
@@ -9096,8 +9136,8 @@ impl StudioVfs {
                 ino = op.ino,
                 "upload cancelled: inode deleted or missing"
             );
-            self.block_cache.cancel_upload(&op, true);
-            self.state.pending_evictions.lock().remove(&op.object_id);
+            self.cancel_upload_for_deleted_inode(&op);
+            self.maybe_clear_deleted_inode_marker(op.ino);
             debug!(
                 ino = op.ino,
                 object_id = op.object_id,
