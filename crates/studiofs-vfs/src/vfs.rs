@@ -6917,13 +6917,13 @@ impl StudioVfs {
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
             let ino = open_file.ino;
-            self.consume_upload_sticky_error(ino)?;
             let unbuffered = open_file.flags.requests_unbuffered_io();
             self.flush(ino).await?;
             if unbuffered {
                 self.wait_for_ingress_drain(ino, direct_io_sync_timeout())
                     .await?;
             }
+            self.consume_upload_sticky_error(ino)?;
         }
         Ok(())
     }
@@ -6939,7 +6939,6 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
-        self.consume_upload_sticky_error(ino)?;
 
         // Flush pending write buffer
         self.flush(ino).await?;
@@ -6958,6 +6957,7 @@ impl StudioVfs {
             .await?;
             self.state.attr_read_cache.lock().remove(ino);
         }
+        self.consume_upload_sticky_error(ino)?;
         Ok(())
     }
 
