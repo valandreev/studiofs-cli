@@ -427,15 +427,18 @@ impl L2DiskCache {
     }
 
     async fn acquire_io_permit(&self, priority: L2IoPriority) -> io::Result<OwnedSemaphorePermit> {
-        let semaphore = match priority {
-            L2IoPriority::Foreground => &self.foreground_io_semaphore,
-            L2IoPriority::Background => &self.background_io_semaphore,
-        };
-        semaphore
-            .clone()
+        self.io_semaphore(priority)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))
+    }
+
+    #[inline]
+    fn io_semaphore(&self, priority: L2IoPriority) -> Arc<Semaphore> {
+        match priority {
+            L2IoPriority::Foreground => Arc::clone(&self.foreground_io_semaphore),
+            L2IoPriority::Background => Arc::clone(&self.background_io_semaphore),
+        }
     }
 
     async fn read_block_bytes(
@@ -524,15 +527,13 @@ impl L2DiskCache {
         let max_in_flight = self.read_batch_max_in_flight.max(1);
         let mut join_set = tokio::task::JoinSet::new();
         let mut next_idx = 0usize;
+        let io_semaphore = self.io_semaphore(priority);
 
         let spawn_one =
             |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
                 let (id, size_hint) = ids[idx];
                 let path = self.block_path(id);
-                let semaphore = match priority {
-                    L2IoPriority::Foreground => self.foreground_io_semaphore.clone(),
-                    L2IoPriority::Background => self.background_io_semaphore.clone(),
-                };
+                let semaphore = io_semaphore.clone();
                 join_set.spawn(async move {
                     let permit = match semaphore.acquire_owned().await {
                         Ok(permit) => permit,
@@ -725,6 +726,7 @@ impl L2DiskCache {
                 )
             })
             .collect();
+        let io_semaphore = self.io_semaphore(priority);
 
         let spawn_one = |idx: usize, join_set: &mut tokio::task::JoinSet<PutBatchWorkerOutput>| {
             let (id, data) = &blocks[idx];
@@ -733,10 +735,7 @@ impl L2DiskCache {
             let owned = data.clone();
             let object_id = *id;
             let len = data.len() as u64;
-            let semaphore = match priority {
-                L2IoPriority::Foreground => self.foreground_io_semaphore.clone(),
-                L2IoPriority::Background => self.background_io_semaphore.clone(),
-            };
+            let semaphore = io_semaphore.clone();
             join_set.spawn(async move {
                 let permit = match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
@@ -823,9 +822,15 @@ impl L2DiskCache {
 
     /// Remove a block from disk.
     pub async fn remove(&self, object_id: u64) {
+        self.remove_with_priority(object_id, L2IoPriority::Foreground)
+            .await;
+    }
+
+    /// Remove a block from disk with an explicit QoS priority.
+    pub async fn remove_with_priority(&self, object_id: u64, priority: L2IoPriority) {
         self.fd_cache_invalidate(object_id);
         let path = self.block_path(object_id);
-        let permit = match self.acquire_io_permit(L2IoPriority::Foreground).await {
+        let permit = match self.acquire_io_permit(priority).await {
             Ok(permit) => permit,
             Err(e) => {
                 warn!(object_id, error = %e, "L2DiskCache remove permit error");

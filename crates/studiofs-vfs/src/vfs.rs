@@ -9105,7 +9105,9 @@ impl StudioVfs {
         // Post-upload cleanup: if the block was marked for deferred eviction
         // (inode was deleted while the upload was in flight), remove it now.
         if self.state.pending_evictions.lock().remove(&op.object_id) {
-            self.block_cache.remove_sync(op.object_id);
+            self.block_cache
+                .remove_with_priority(op.object_id, L2IoPriority::Background)
+                .await;
             debug!(
                 object_id = op.object_id,
                 "post-upload eviction: block removed (inode deleted)"
@@ -9117,7 +9119,9 @@ impl StudioVfs {
             .await
             && current.object_id != op.object_id
         {
-            self.block_cache.remove_sync(op.object_id);
+            self.block_cache
+                .remove_with_priority(op.object_id, L2IoPriority::Background)
+                .await;
         }
 
         debug!(

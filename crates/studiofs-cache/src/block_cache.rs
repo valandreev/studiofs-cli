@@ -583,8 +583,14 @@ impl BlockCache {
 
     /// Remove a block from all cache levels.
     pub async fn remove(&self, object_id: ObjectId) {
+        self.remove_with_priority(object_id, L2IoPriority::Foreground)
+            .await;
+    }
+
+    /// Remove a block from all cache levels with an explicit L2 QoS priority.
+    pub async fn remove_with_priority(&self, object_id: ObjectId, priority: L2IoPriority) {
         self.l1.remove(object_id);
-        self.l2.remove(object_id).await;
+        self.l2.remove_with_priority(object_id, priority).await;
         self.lru.remove(object_id);
     }
 
@@ -908,15 +914,17 @@ impl BlockCache {
     }
 
     /// Run L2 eviction: fully remove oldest disk-only entries.
-    fn evict_l2_bytes(&self, mut to_free: u64) {
+    async fn evict_l2_bytes(&self, mut to_free: u64) {
         while to_free > 0 {
             let Some((id, size)) = self.lru.evict_l2() else {
                 break;
             };
             // Also remove from L1 just in case.
             self.l1.remove(id);
-            // Remove file from disk (sync — we're in a background task).
-            self.l2.remove_sync(id);
+            // Remove file from disk using the background L2 pool.
+            self.l2
+                .remove_with_priority(id, L2IoPriority::Background)
+                .await;
             if size as u64 >= to_free {
                 break;
             }
@@ -1059,7 +1067,7 @@ impl BlockCache {
             let l2_max = self.l2.max_bytes();
             if l2_used > l2_max {
                 let excess = l2_used - l2_max;
-                self.evict_l2_bytes(excess);
+                self.evict_l2_bytes(excess).await;
                 debug!(freed_mb = excess / (1024 * 1024), "L2 eviction complete");
             }
 
@@ -1077,7 +1085,7 @@ impl BlockCache {
                         );
                         // First demote L1 entries, then evict L2.
                         self.evict_l1_bytes(need);
-                        self.evict_l2_bytes(need);
+                        self.evict_l2_bytes(need).await;
                     }
                 }
             }
