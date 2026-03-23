@@ -63,6 +63,8 @@ const L2_SYNC_DIRECT_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_DIRECT_FD_C
 const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT";
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+#[cfg(windows)]
+const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
 type PutBatchWorkerOutput = (usize, u64, u64, io::Result<(io::Result<()>, u64)>);
 type RemoveBatchWorkerOutput = (usize, u64, io::Result<u64>);
 
@@ -685,7 +687,7 @@ impl L2DiskCache {
             Ok(read) => Ok(Some(read)),
             Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(None),
             #[cfg(windows)]
-            Err(e) if matches!(e.raw_os_error(), Some(87)) => Ok(None),
+            Err(e) if matches!(e.raw_os_error(), Some(WINDOWS_ERROR_INVALID_PARAMETER)) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1273,5 +1275,53 @@ mod tests {
         cache.put_sync(99, b"sync data").unwrap();
         let got = cache.get_sync(99).unwrap();
         assert_eq!(&got[..], b"sync data");
+    }
+
+    #[test]
+    fn sync_fd_budget_is_split_across_buffered_and_direct_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+
+        let buffered = cache.sync_read_fd_cache.lock().cap().get();
+        let direct = cache.sync_direct_read_fd_cache.lock().cap().get();
+        let total = sync_fd_cache_capacity().max(2);
+
+        assert_eq!(buffered + direct, total);
+        assert!(buffered > 0);
+        assert!(direct > 0);
+    }
+
+    #[test]
+    fn fd_cache_invalidate_clears_both_buffered_and_direct_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+        let object_id = 0x1200_0000_0000_0001;
+        let path = cache.block_path(object_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, b"fd-cache-test").unwrap();
+
+        let file = Arc::new(File::open(&path).unwrap());
+        cache.fd_cache_insert(object_id, Arc::clone(&file));
+        cache.direct_fd_cache_insert(object_id, file);
+
+        assert!(cache.fd_cache_get(object_id).is_some());
+        assert!(cache.direct_fd_cache_get(object_id).is_some());
+
+        cache.fd_cache_invalidate(object_id);
+
+        assert!(cache.fd_cache_get(object_id).is_none());
+        assert!(cache.direct_fd_cache_get(object_id).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_into_sync_direct_rejects_unaligned_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
+        let mut out = [0u8; 4096];
+        let result = cache.read_into_sync_direct(1, 1, &mut out).unwrap();
+        assert!(result.is_none());
     }
 }

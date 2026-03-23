@@ -1509,4 +1509,12 @@ mod tests {
         assert!(cache.get(1).await.is_some());
         assert!(cache.get(2).await.is_some());
     }
+
+    #[tokio::test]
+    async fn get_sync_l2_into_direct_returns_none_for_missing_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _rx) = BlockCache::open(test_config(dir.path())).unwrap();
+        let mut out = [0u8; 4096];
+        assert!(cache.get_sync_l2_into_direct(9999, 0, &mut out).is_none());
+    }
 }
