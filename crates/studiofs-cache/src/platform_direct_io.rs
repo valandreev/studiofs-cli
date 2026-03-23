@@ -5,25 +5,8 @@ use tracing::debug;
 
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 
-fn round_up_to_alignment(len: usize, alignment: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    len.div_ceil(alignment) * alignment
-}
-
 fn is_aligned(ptr: *const (), alignment: usize) -> bool {
     (ptr as usize).is_multiple_of(alignment)
-}
-
-fn make_aligned_buffer(len: usize, alignment: usize) -> (Vec<u8>, usize) {
-    if len == 0 {
-        return (Vec::new(), 0);
-    }
-    let raw = vec![0u8; len + alignment - 1];
-    let base = raw.as_ptr() as usize;
-    let offset = (alignment - (base % alignment)) % alignment;
-    (raw, offset)
 }
 
 fn read_all(mut std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
@@ -57,24 +40,10 @@ fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io
         return Ok(filled);
     }
 
-    // O_DIRECT requires aligned user pointers and aligned transfer lengths.
-    // When the caller buffer is not suitable, read into a temporary aligned
-    // bounce buffer and copy only the requested payload back to `dst`.
-    let io_len = round_up_to_alignment(dst.len(), DIRECT_IO_ALIGNMENT);
-    let (mut raw, offset) = make_aligned_buffer(io_len, DIRECT_IO_ALIGNMENT);
-    let bounce = &mut raw[offset..offset + io_len];
-    let filled = read_all(std_file, bounce)?;
-
-    if filled == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "direct read returned EOF before data",
-        ));
-    }
-
-    let copy_len = dst.len().min(filled);
-    dst[..copy_len].copy_from_slice(&bounce[..copy_len]);
-    Ok(copy_len)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "direct read requires aligned buffer and length",
+    ))
 }
 
 fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Result<()> {
@@ -90,18 +59,10 @@ fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Res
         return Ok(());
     }
 
-    let io_len = round_up_to_alignment(data.len(), DIRECT_IO_ALIGNMENT);
-    let (mut raw, offset) = make_aligned_buffer(io_len, DIRECT_IO_ALIGNMENT);
-    let bounce = &mut raw[offset..offset + io_len];
-    bounce[..data.len()].copy_from_slice(data);
-    std_file.write_all(bounce)?;
-
-    // Keep observable file size equal to payload length for unaligned tails.
-    if io_len != data.len() {
-        std_file.set_len(data.len() as u64)?;
-    }
-
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "direct write requires aligned buffer and length",
+    ))
 }
 
 #[cfg(target_os = "linux")]

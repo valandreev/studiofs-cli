@@ -8470,14 +8470,26 @@ impl StudioVfs {
             };
 
             let dst = &mut buffer[written..written + to_copy];
-            let read =
-                match self
-                    .block_cache
+            #[cfg(windows)]
+            let maybe_read = if unbuffered {
+                self.block_cache
+                    .get_sync_l2_into_direct(block_ref.object_id, off_in as u64, dst)
+                    .or_else(|| {
+                        self.block_cache
+                            .get_sync_l2_into(block_ref.object_id, off_in as u64, dst)
+                    })
+            } else {
+                self.block_cache
                     .get_sync_l2_into(block_ref.object_id, off_in as u64, dst)
-                {
-                    Some(read) => read.min(to_copy),
-                    None => return Ok(None),
-                };
+            };
+            #[cfg(not(windows))]
+            let maybe_read =
+                self.block_cache
+                    .get_sync_l2_into(block_ref.object_id, off_in as u64, dst);
+            let read = match maybe_read {
+                Some(read) => read.min(to_copy),
+                None => return Ok(None),
+            };
             if read < to_copy {
                 dst[read..].fill(0);
             }

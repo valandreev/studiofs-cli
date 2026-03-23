@@ -234,10 +234,20 @@ Handle-aware read path:
   - probes all requested blocks first,
   - serves synchronously only when the full request can be satisfied locally,
   - reads L2 hits directly into caller-provided output slices,
+  - on Windows with unbuffered handles, it first attempts direct L2 reads through
+    `FILE_FLAG_NO_BUFFERING` descriptors and falls back to buffered L2 reads when
+    direct constraints are not met (for example unaligned offset/length/buffer),
   - returns fallback (`None`) on miss so S3/object-store fetch remains async.
 - WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
 - FUSE bridge uses `can_read_fh_sync_cached(...)` as a cheap probe to avoid
   output-buffer allocation on sync-cache misses.
+
+L2 sync descriptor cache budget:
+- `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` is treated as the total sync read FD budget.
+- Budget is split across buffered and direct sync FD caches to avoid doubling open
+  descriptor pressure.
+- `STUDIOFS_L2_SYNC_DIRECT_FD_CACHE_CAPACITY` optionally overrides the direct cache
+  share (still clamped within the total budget).
 
 ## FetchScheduler (`fetch.rs`)
 
