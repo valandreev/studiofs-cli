@@ -63,6 +63,7 @@ const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLI
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 type PutBatchWorkerOutput = (usize, u64, u64, io::Result<(io::Result<()>, u64)>);
+type RemoveBatchWorkerOutput = (usize, u64, io::Result<u64>);
 
 /// Priority class for L2 I/O permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,17 +428,17 @@ impl L2DiskCache {
     }
 
     async fn acquire_io_permit(&self, priority: L2IoPriority) -> io::Result<OwnedSemaphorePermit> {
-        self.io_semaphore(priority)
+        Arc::clone(self.io_semaphore(priority))
             .acquire_owned()
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))
     }
 
     #[inline]
-    fn io_semaphore(&self, priority: L2IoPriority) -> Arc<Semaphore> {
+    fn io_semaphore(&self, priority: L2IoPriority) -> &Arc<Semaphore> {
         match priority {
-            L2IoPriority::Foreground => Arc::clone(&self.foreground_io_semaphore),
-            L2IoPriority::Background => Arc::clone(&self.background_io_semaphore),
+            L2IoPriority::Foreground => &self.foreground_io_semaphore,
+            L2IoPriority::Background => &self.background_io_semaphore,
         }
     }
 
@@ -533,7 +534,7 @@ impl L2DiskCache {
             |idx: usize, join_set: &mut tokio::task::JoinSet<(usize, io::Result<Bytes>)>| {
                 let (id, size_hint) = ids[idx];
                 let path = self.block_path(id);
-                let semaphore = io_semaphore.clone();
+                let semaphore = Arc::clone(io_semaphore);
                 join_set.spawn(async move {
                     let permit = match semaphore.acquire_owned().await {
                         Ok(permit) => permit,
@@ -735,7 +736,7 @@ impl L2DiskCache {
             let owned = data.clone();
             let object_id = *id;
             let len = data.len() as u64;
-            let semaphore = io_semaphore.clone();
+            let semaphore = Arc::clone(io_semaphore);
             join_set.spawn(async move {
                 let permit = match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
@@ -864,6 +865,114 @@ impl L2DiskCache {
         if removed_size > 0 {
             self.total_bytes.fetch_sub(removed_size, Ordering::Relaxed);
         }
+    }
+
+    /// Remove multiple blocks from disk in parallel.
+    pub async fn remove_batch(&self, object_ids: &[u64]) -> Vec<(u64, io::Result<()>)> {
+        self.remove_batch_with_priority(object_ids, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Remove multiple blocks from disk in parallel with a QoS priority.
+    pub async fn remove_batch_with_priority(
+        &self,
+        object_ids: &[u64],
+        priority: L2IoPriority,
+    ) -> Vec<(u64, io::Result<()>)> {
+        let max_in_flight = match priority {
+            L2IoPriority::Foreground => DEFAULT_L2_FOREGROUND_BLOCKING_IO_MAX_IN_FLIGHT,
+            L2IoPriority::Background => DEFAULT_L2_BACKGROUND_BLOCKING_IO_MAX_IN_FLIGHT,
+        }
+        .max(1);
+        let mut join_set = tokio::task::JoinSet::new();
+        let mut next_idx = 0usize;
+        let mut results: Vec<(u64, io::Result<()>)> = object_ids
+            .iter()
+            .copied()
+            .map(|id| {
+                (
+                    id,
+                    Err(io::Error::other("L2 remove batch task did not complete")),
+                )
+            })
+            .collect();
+        let io_semaphore = self.io_semaphore(priority);
+
+        let spawn_one =
+            |idx: usize, join_set: &mut tokio::task::JoinSet<RemoveBatchWorkerOutput>| {
+                let object_id = object_ids[idx];
+                let path = self.block_path(object_id);
+                let semaphore = Arc::clone(io_semaphore);
+                join_set.spawn(async move {
+                    let permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return (
+                                idx,
+                                object_id,
+                                Err(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "L2 I/O semaphore closed",
+                                )),
+                            );
+                        }
+                    };
+
+                    let job =
+                        crate::runtime::spawn_blocking_profiled("l2_remove_batch", move || {
+                            let _permit = permit;
+                            match std::fs::metadata(&path) {
+                                Ok(meta) => {
+                                    let size = meta.len();
+                                    match std::fs::remove_file(&path) {
+                                        Ok(()) => Ok(size),
+                                        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+                                Err(e) => Err(e),
+                            }
+                        })
+                        .await
+                        .map_err(io::Error::other)
+                        .and_then(|result| result);
+
+                    (idx, object_id, job)
+                });
+            };
+
+        while next_idx < object_ids.len() && join_set.len() < max_in_flight {
+            spawn_one(next_idx, &mut join_set);
+            next_idx += 1;
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, id, Ok(removed_size))) => {
+                    if removed_size > 0 {
+                        self.total_bytes.fetch_sub(removed_size, Ordering::Relaxed);
+                    }
+                    results[idx] = (id, Ok(()));
+                }
+                Ok((idx, id, Err(e))) if e.kind() == io::ErrorKind::NotFound => {
+                    results[idx] = (id, Ok(()));
+                }
+                Ok((idx, id, Err(e))) => {
+                    results[idx] = (id, Err(e));
+                }
+                Err(e) => {
+                    warn!(error = %e, "L2DiskCache remove_batch join error");
+                }
+            }
+
+            if next_idx < object_ids.len() {
+                spawn_one(next_idx, &mut join_set);
+                next_idx += 1;
+            }
+        }
+
+        results
     }
 
     /// Remove a block synchronously.

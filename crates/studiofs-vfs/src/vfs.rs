@@ -6742,7 +6742,7 @@ impl StudioVfs {
                     .pending_blocks
                     .lock()
                     .retain(|(i, _), _| *i != ino);
-                self.evict_inode_from_caches(ino, &removed_ids);
+                self.evict_inode_from_caches(ino, &removed_ids).await;
             }
 
             debug!(
@@ -7397,7 +7397,7 @@ impl StudioVfs {
                     .retain(|(ino, _), _| *ino != attr.ino);
 
                 // Immediately evict all cached blocks for this inode — no need to wait for GC.
-                self.evict_inode_from_caches(attr.ino, &removed_ids);
+                self.evict_inode_from_caches(attr.ino, &removed_ids).await;
 
                 let l2_after = self.block_cache.l2_bytes();
                 info!(
@@ -7508,7 +7508,7 @@ impl StudioVfs {
                     attr.crtime = source_attr.crtime;
                 });
                 if source_attr.kind == FileType::RegularFile {
-                    self.evict_file_cache_only(source_attr.ino)?;
+                    self.evict_file_cache_only(source_attr.ino).await?;
                 }
             }
             self.bump_namespace_for_parents([new_parent]);
@@ -7546,7 +7546,7 @@ impl StudioVfs {
                     .pending_blocks
                     .lock()
                     .retain(|(i, _), _| *i != ino);
-                self.evict_inode_from_caches(ino, &removed_ids);
+                self.evict_inode_from_caches(ino, &removed_ids).await;
             }
 
             // Decrement USED_SPACE for removed blocks
@@ -7563,7 +7563,7 @@ impl StudioVfs {
         }
 
         if moved_into_trash {
-            self.evict_file_cache_only(rename_result.moved_ino)?;
+            self.evict_file_cache_only(rename_result.moved_ino).await?;
         }
 
         // Invalidate source and dest parent directory caches
@@ -7583,7 +7583,7 @@ impl StudioVfs {
     ///
     /// Called by `unlink()` so that deleted file data is no longer occupying
     /// disk / RAM space without waiting for the next background GC run.
-    fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
+    async fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
         self.remove_live_extents_for_inode(ino);
 
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
@@ -7622,7 +7622,7 @@ impl StudioVfs {
         // Blocks with a pending upload are pinned — schedule deferred eviction
         // so they are cleaned up once the upload completes (or is cancelled by
         // the uploader when it detects the inode is deleted).
-        let mut evicted = 0;
+        let mut evicted = Vec::new();
         let mut deferred_pinned = 0;
         for &object_id in object_ids {
             if self.block_cache.is_pinned(object_id) {
@@ -7631,13 +7631,19 @@ impl StudioVfs {
                 deferred_pinned += 1;
                 continue;
             }
-            self.block_cache.remove_sync(object_id);
-            evicted += 1;
+            evicted.push(object_id);
         }
-        if evicted > 0 || deferred_pinned > 0 {
+        if !evicted.is_empty() {
+            self.block_cache
+                .remove_batch_with_priority(&evicted, L2IoPriority::Background)
+                .await;
+        }
+        if !evicted.is_empty() || deferred_pinned > 0 {
             debug!(
                 "evict_inode: ino={} evicted {} blocks, deferred pinned={}",
-                ino, evicted, deferred_pinned
+                ino,
+                evicted.len(),
+                deferred_pinned
             );
         }
 
@@ -7646,14 +7652,14 @@ impl StudioVfs {
         self.prefetch_last_hint.lock().remove(&ino);
     }
 
-    fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
+    async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
         let object_ids: Vec<u64> = self
             .meta
             .get_file_blocks(ino)?
             .into_iter()
             .map(|(_, block_ref)| block_ref.object_id)
             .collect();
-        let mut evicted = 0;
+        let mut evicted = Vec::new();
         let mut deferred_pinned = 0;
         for object_id in object_ids {
             if self.block_cache.is_pinned(object_id) {
@@ -7661,13 +7667,19 @@ impl StudioVfs {
                 deferred_pinned += 1;
                 continue;
             }
-            self.block_cache.remove_sync(object_id);
-            evicted += 1;
+            evicted.push(object_id);
         }
-        if evicted > 0 || deferred_pinned > 0 {
+        if !evicted.is_empty() {
+            self.block_cache
+                .remove_batch_with_priority(&evicted, L2IoPriority::Background)
+                .await;
+        }
+        if !evicted.is_empty() || deferred_pinned > 0 {
             info!(
                 "trash-move cache eviction: ino={} evicted {} blocks, deferred pinned={}",
-                ino, evicted, deferred_pinned
+                ino,
+                evicted.len(),
+                deferred_pinned
             );
         }
         self.readahead.evict(ino);
