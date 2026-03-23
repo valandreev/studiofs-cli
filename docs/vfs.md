@@ -56,6 +56,8 @@ the capacity limit is reached.
 | `l2_commit_queue_capacity` | 4096 | Bounded L2 commit queue capacity |
 | `l2_read_timeout_ms` | 5000 | Max wait for local L2 read before cache-miss fallback |
 | `l2_write_timeout_ms` | 5000 | Max wait for local L2 write attempt |
+| `upload_stats_interval_secs` | 1 | Upload pipeline/adaptive-control tick interval |
+| `upload_l2_lookup_spike_threshold_ms` | 10 | L2 lookup latency threshold that enables adaptive upload throttling |
 
 Mount profile note:
 - `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
@@ -69,6 +71,10 @@ Runtime principal selection:
 - `STUDIOFS_PRINCIPAL` (default `*`) sets the principal used for ACL checks on
   the mounted client.
 - `studiofs mount --principal <name>` overrides `STUDIOFS_PRINCIPAL` for that mount.
+
+Adaptive upload throttling overrides:
+- `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` controls control-loop tick cadence.
+- `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` tunes the L2 latency spike threshold.
 
 ## Write Path
 
@@ -162,6 +168,12 @@ PendingUpload received
   │
   └─ On failure: requeue with backoff
 ```
+
+Adaptive upload control:
+- workers use cooperative scheduler yielding (`tokio::task::yield_now()`) periodically to avoid starving foreground tasks.
+- upload backpressure samples cache pipeline metrics on each control tick.
+- L2 latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
+- first upload attempt applies adaptive penalty; retries keep retry/backoff behavior unchanged.
 
 Remote-visible regular-file size advances only when a full incarnation is committed
 through `committed_size`, not through the local foreground `size`.

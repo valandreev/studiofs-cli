@@ -43,14 +43,16 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{
     BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
     DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
 use studiofs_cache::l2_disk::L2IoPriority;
-use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
+use studiofs_cache::metrics::{
+    CachePipelineMetricsSnapshot, IoStats, IoStatsSnapshot, MaterializeBatchStats,
+};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     create_object_buffer, format_object_key, parse_object_id_from_key, read_object,
@@ -559,10 +561,17 @@ const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
 const DEFAULT_UPLOAD_DELAY_MS: u64 = 2000;
 const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 5000;
 const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
-const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 10;
+const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 1;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
+const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
+const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 2;
+const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 250;
+const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 4;
+const UPLOAD_SCHEDULER_PENALTY_DECAY_NUM: u64 = 3;
+const UPLOAD_SCHEDULER_PENALTY_DECAY_DEN: u64 = 4;
+const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = 8;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
 const DEFAULT_DENTRY_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY: usize = 16_384;
@@ -738,6 +747,8 @@ pub struct VfsConfig {
     pub upload_requeue_max_ms: u64,
     /// Upload metrics log interval.
     pub upload_stats_interval_secs: u64,
+    /// L2 lookup latency threshold that triggers upload throttling.
+    pub upload_l2_lookup_spike_threshold_ms: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
     /// Whether background slab flushing is enabled.
@@ -862,6 +873,7 @@ impl Default for VfsConfig {
             upload_requeue_base_ms: DEFAULT_UPLOAD_REQUEUE_BASE_MS,
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
+            upload_l2_lookup_spike_threshold_ms: DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS,
             slab_flush_interval_ms: 10,
             background_slab_flush_enabled: true,
             ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
@@ -3204,9 +3216,16 @@ pub struct StudioVfs {
     ingress_checkpoint_max_live_segments: u64,
     /// Shared local-I/O budget for upload path reads from cache.
     upload_cache_io_slots: Arc<Semaphore>,
+    upload_cache_io_slots_max: u32,
     qos: Arc<QosController>,
-    /// Extra cost per upload op when foreground reads are active.
-    upload_cache_io_user_penalty: u32,
+    /// Configured baseline slot cost per upload op when foreground reads are active.
+    upload_cache_io_user_penalty_base: u32,
+    /// Dynamic slot cost adjusted from cache-latency feedback.
+    upload_cache_io_user_penalty: AtomicU32,
+    /// L2 lookup latency threshold above which upload throttling engages.
+    upload_l2_lookup_spike_threshold_ns: u64,
+    /// Previous L2 read snapshot for interval-based latency deltas.
+    upload_l2_read_prev: Mutex<Option<IoStatsSnapshot>>,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
@@ -4052,6 +4071,10 @@ impl StudioVfs {
             );
             let upload_stats_interval =
                 Duration::from_secs(config.upload_stats_interval_secs.max(1));
+            let upload_l2_lookup_spike_threshold_ns =
+                Duration::from_millis(config.upload_l2_lookup_spike_threshold_ms.max(1))
+                    .as_nanos()
+                    .clamp(1, u64::MAX as u128) as u64;
             let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms.max(1));
             let shutdown_metadata_flush_timeout =
                 Duration::from_secs(config.shutdown_metadata_flush_timeout_secs.max(1));
@@ -4082,6 +4105,7 @@ impl StudioVfs {
                 requeue_base_ms = upload_requeue_base.as_millis() as u64,
                 requeue_max_ms = upload_requeue_max.as_millis() as u64,
                 upload_stats_interval_secs = upload_stats_interval.as_secs(),
+                upload_l2_lookup_spike_threshold_ns,
                 slab_flush_interval_ms = slab_flush_interval.as_millis() as u64,
                 ingress_checkpoint_interval_secs = ingress_checkpoint_interval.as_secs(),
                 ingress_checkpoint_min_append_bytes,
@@ -4214,8 +4238,12 @@ impl StudioVfs {
                 ingress_checkpoint_max_segment_lag,
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
+                upload_cache_io_slots_max: upload_cache_io_slots as u32,
                 qos,
-                upload_cache_io_user_penalty,
+                upload_cache_io_user_penalty_base: upload_cache_io_user_penalty,
+                upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
+                upload_l2_lookup_spike_threshold_ns,
+                upload_l2_read_prev: Mutex::new(None),
                 upload_user_idle_grace,
                 upload_worker_count,
                 max_drain_batch,
@@ -4848,6 +4876,80 @@ impl StudioVfs {
         let jitter_seed = op.object_id ^ Self::now_unix_millis();
         let jitter_ms = jitter_seed % jitter_max;
         capped.saturating_add(Duration::from_millis(jitter_ms))
+    }
+
+    fn delta_average_latency_ns(
+        previous: &IoStatsSnapshot,
+        current: &IoStatsSnapshot,
+    ) -> Option<u64> {
+        let delta_ops = current.ops.saturating_sub(previous.ops);
+        if delta_ops == 0 {
+            return None;
+        }
+        let delta_total_ns = current
+            .total_latency_ns
+            .saturating_sub(previous.total_latency_ns);
+        Some(delta_total_ns / delta_ops)
+    }
+
+    fn average_latency_ns(stats: &IoStatsSnapshot) -> Option<u64> {
+        if stats.ops == 0 {
+            None
+        } else {
+            Some(stats.total_latency_ns / stats.ops)
+        }
+    }
+
+    fn update_upload_io_penalty(&self, congested: bool) -> u32 {
+        let base_penalty = self.upload_cache_io_user_penalty_base.max(1);
+        let max_penalty = self.upload_cache_io_slots_max.max(base_penalty);
+        let current = self.upload_cache_io_user_penalty.load(Ordering::Relaxed);
+        let next = if congested {
+            current.saturating_add(1).min(max_penalty)
+        } else if current > base_penalty {
+            (current / 2).max(base_penalty)
+        } else {
+            base_penalty
+        };
+        self.upload_cache_io_user_penalty
+            .store(next, Ordering::Relaxed);
+        next
+    }
+
+    fn adjust_upload_backpressure_from_metrics(
+        &self,
+        cache_pipeline: &CachePipelineMetricsSnapshot,
+    ) {
+        let current_l2 = &cache_pipeline.l2_read;
+        let previous_l2 = self.upload_l2_read_prev.lock().clone();
+        let l2_lookup_avg_ns = previous_l2
+            .as_ref()
+            .and_then(|prev| Self::delta_average_latency_ns(prev, current_l2))
+            .or_else(|| Self::average_latency_ns(current_l2))
+            .unwrap_or(0);
+        *self.upload_l2_read_prev.lock() = Some(current_l2.clone());
+
+        let threshold_ns = self.upload_l2_lookup_spike_threshold_ns.max(1);
+        let congested = l2_lookup_avg_ns > threshold_ns;
+        let io_penalty = self.update_upload_io_penalty(congested);
+
+        let current_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
+        let next_penalty_ms = if congested {
+            let overshoot =
+                (l2_lookup_avg_ns / threshold_ns).clamp(1, UPLOAD_SCHEDULER_OVERSHOOT_MAX);
+            let step = overshoot
+                .saturating_mul(io_penalty as u64)
+                .saturating_mul(UPLOAD_SCHEDULER_PENALTY_STEP_MS);
+            current_penalty_ms
+                .saturating_add(step)
+                .min(UPLOAD_SCHEDULER_PENALTY_MAX_MS)
+        } else {
+            let decayed = current_penalty_ms.saturating_mul(UPLOAD_SCHEDULER_PENALTY_DECAY_NUM)
+                / UPLOAD_SCHEDULER_PENALTY_DECAY_DEN;
+            if decayed <= 1 { 0 } else { decayed }
+        };
+        self.upload_scheduler
+            .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
     }
 
     fn remove_spill_entry(&self, key: (Ino, u32)) -> Option<SpillEntry> {
@@ -8693,6 +8795,7 @@ impl StudioVfs {
             let rx = worker_rx.clone();
             let vfs = self.clone();
             workers.spawn(async move {
+                let mut ops_since_yield = 0u32;
                 loop {
                     let op = tokio::select! {
                         _ = vfs.state.uploader_shutdown_notify.notified() => None,
@@ -8744,11 +8847,17 @@ impl StudioVfs {
                             }
                         }
                     }
+                    ops_since_yield = ops_since_yield.saturating_add(1);
+                    if ops_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
+                        ops_since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             });
         }
 
         let mut fair: FairInodeScheduler<PendingUpload> = FairInodeScheduler::default();
+        let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
         loop {
             if self.uploader_shutdown_requested() || (inbound_closed && fair.is_empty()) {
@@ -8771,6 +8880,11 @@ impl StudioVfs {
                                     "uploader dispatch op"
                                 );
                                 permit.send(op);
+                                dispatched_since_yield = dispatched_since_yield.saturating_add(1);
+                                if dispatched_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
+                                    dispatched_since_yield = 0;
+                                    tokio::task::yield_now().await;
+                                }
                             }
                         }
                         Err(_) => break,
@@ -8983,7 +9097,9 @@ impl StudioVfs {
         // local I/O slots, effectively shrinking upload pressure and preserving
         // read latency/throughput for foreground operations.
         let upload_io_cost = if self.foreground_read_active() {
-            self.upload_cache_io_user_penalty.max(1)
+            self.upload_cache_io_user_penalty
+                .load(Ordering::Relaxed)
+                .max(1)
         } else {
             1
         };
@@ -9187,6 +9303,7 @@ impl StudioVfs {
             let ingress_append = self.state.ingress_append_stats.snapshot();
             let materialize_batches = self.state.materialize_batch_stats.snapshot();
             let cache_pipeline = self.block_cache.cache_pipeline_metrics();
+            self.adjust_upload_backpressure_from_metrics(&cache_pipeline);
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
@@ -9339,6 +9456,13 @@ impl StudioVfs {
                     attr_read_cache_entry_budget = attr_read_cache.entry_budget,
                     attr_read_cache_byte_budget = attr_read_cache.byte_budget,
                     "upload pipeline counters"
+                );
+                debug!(
+                    upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
+                    upload_io_penalty_dynamic =
+                        self.upload_cache_io_user_penalty.load(Ordering::Relaxed),
+                    upload_scheduler_penalty_ms = self.upload_scheduler.adaptive_penalty_ms(),
+                    "upload pipeline adaptive throttle"
                 );
             }
             self.upload_scheduler.log_stats(pending, p95_ms, max_ms);

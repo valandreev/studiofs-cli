@@ -285,6 +285,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         "STUDIOFS_UPLOAD_STATS_INTERVAL_SECS",
         upload_stats_interval_secs
     );
+    set_u64!(
+        "STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS",
+        upload_l2_lookup_spike_threshold_ms
+    );
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
         config.upload_max_attempts = value as u32;
     }

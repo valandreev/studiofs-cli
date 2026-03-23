@@ -75,6 +75,7 @@ pub struct UploadScheduler {
     request_timeout: Duration,
     retry_base_delay: Duration,
     retry_max_delay: Duration,
+    adaptive_penalty_ms: AtomicU64,
     pub metrics: UploadMetrics,
 }
 
@@ -102,8 +103,19 @@ impl UploadScheduler {
             request_timeout: Duration::from_secs(request_timeout_s),
             retry_base_delay: Duration::from_millis(retry_base_ms),
             retry_max_delay: Duration::from_millis(retry_max_ms),
+            adaptive_penalty_ms: AtomicU64::new(0),
             metrics: UploadMetrics::new(),
         }
+    }
+
+    pub fn set_adaptive_penalty(&self, delay: Duration) {
+        let penalty_ms = delay.as_millis().clamp(0, u64::MAX as u128) as u64;
+        self.adaptive_penalty_ms
+            .store(penalty_ms, Ordering::Relaxed);
+    }
+
+    pub fn adaptive_penalty_ms(&self) -> u64 {
+        self.adaptive_penalty_ms.load(Ordering::Relaxed)
     }
 
     /// Upload object bytes to `key` with adaptive concurrency + retries.
@@ -112,6 +124,12 @@ impl UploadScheduler {
         let overall_start = Instant::now();
 
         for attempt in 0..self.max_attempts {
+            if attempt == 0 {
+                let penalty_ms = self.adaptive_penalty_ms.load(Ordering::Relaxed);
+                if penalty_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(penalty_ms)).await;
+                }
+            }
             self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
             let permit = self.aimd.acquire().await;
             let req_start = Instant::now();
