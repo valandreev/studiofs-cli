@@ -27,7 +27,7 @@
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use studiofs_meta::types::Ino;
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
@@ -489,6 +489,13 @@ struct DirPrefetchState {
     seen: usize,
     /// Which children have already been scheduled for prefetch.
     prefetched: HashSet<Ino>,
+    /// Monotonic access stamp used for bounded LRU-style eviction.
+    last_touch: u64,
+}
+
+struct DirTrackerState {
+    dirs: HashMap<Ino, DirPrefetchState>,
+    access_tick: u64,
 }
 
 /// Tracks directory-level access patterns.
@@ -501,11 +508,13 @@ struct DirPrefetchState {
 /// prefetch block 0 of the remaining siblings that haven't been accessed yet.
 pub struct DirAccessTracker {
     /// dir_ino → prefetch state
-    dirs: Mutex<std::collections::HashMap<Ino, DirPrefetchState>>,
+    dirs: Mutex<DirTrackerState>,
     /// child_ino → parent_dir_ino (reverse lookup so on_read can find the dir)
     child_to_dir: DashMap<Ino, Ino>,
     /// Threshold: how many children must be read before prefetching triggers.
     threshold: usize,
+    /// Hard cap for tracked directories to prevent unbounded growth.
+    max_tracked_dirs: usize,
 }
 
 impl DirAccessTracker {
@@ -514,10 +523,41 @@ impl DirAccessTracker {
     /// `threshold` — number of children that must be read before prefetching
     /// the rest of the directory (typically 2).
     pub fn new(threshold: usize) -> Self {
+        Self::new_with_capacity(threshold, 4096)
+    }
+
+    /// Create a new tracker with an explicit tracked-directory cap.
+    pub fn new_with_capacity(threshold: usize, max_tracked_dirs: usize) -> Self {
         Self {
-            dirs: Mutex::new(std::collections::HashMap::new()),
+            dirs: Mutex::new(DirTrackerState {
+                dirs: HashMap::new(),
+                access_tick: 0,
+            }),
             child_to_dir: DashMap::new(),
             threshold,
+            max_tracked_dirs: max_tracked_dirs.max(1),
+        }
+    }
+
+    fn next_touch(state: &mut DirTrackerState) -> u64 {
+        state.access_tick = state.access_tick.saturating_add(1);
+        state.access_tick
+    }
+
+    fn evict_lru_if_needed(&self, state: &mut DirTrackerState) {
+        while state.dirs.len() > self.max_tracked_dirs {
+            let Some((&victim_dir, _)) = state
+                .dirs
+                .iter()
+                .min_by_key(|(_, dir_state)| dir_state.last_touch)
+            else {
+                break;
+            };
+            if let Some(victim) = state.dirs.remove(&victim_dir) {
+                for child in &victim.children {
+                    self.child_to_dir.remove(child);
+                }
+            }
         }
     }
 
@@ -532,14 +572,26 @@ impl DirAccessTracker {
         }
 
         let mut dirs = self.dirs.lock();
-        dirs.insert(
+        if let Some(prev) = dirs.dirs.remove(&dir_ino) {
+            for child in &prev.children {
+                self.child_to_dir.remove(child);
+            }
+            // Re-register latest child set after pruning stale mappings.
+            for &child in &children {
+                self.child_to_dir.insert(child, dir_ino);
+            }
+        }
+        let touch = Self::next_touch(&mut dirs);
+        dirs.dirs.insert(
             dir_ino,
             DirPrefetchState {
                 children,
                 seen: 0,
                 prefetched: HashSet::new(),
+                last_touch: touch,
             },
         );
+        self.evict_lru_if_needed(&mut dirs);
     }
 
     /// Called when a child inode is read.
@@ -554,10 +606,16 @@ impl DirAccessTracker {
         };
 
         let mut dirs = self.dirs.lock();
-        let state = match dirs.get_mut(&dir_ino) {
+        let touch = Self::next_touch(&mut dirs);
+        let state = match dirs.dirs.get_mut(&dir_ino) {
             Some(s) => s,
-            None => return Vec::new(),
+            None => {
+                // Reverse map can become stale after bounded eviction.
+                self.child_to_dir.remove(&child_ino);
+                return Vec::new();
+            }
         };
+        state.last_touch = touch;
 
         // Already counted this child? Skip.
         if state.prefetched.contains(&child_ino) {
@@ -591,7 +649,7 @@ impl DirAccessTracker {
     /// Remove all state for a directory (e.g. when it is deleted).
     pub fn evict_dir(&self, dir_ino: Ino) {
         let mut dirs = self.dirs.lock();
-        if let Some(state) = dirs.remove(&dir_ino) {
+        if let Some(state) = dirs.dirs.remove(&dir_ino) {
             for child in &state.children {
                 self.child_to_dir.remove(child);
             }
@@ -658,5 +716,40 @@ mod dir_prefetch_tests {
         // After evict, children have no parent mapping
         let p = tracker.on_child_read(10);
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_bounded_dir_tracking_evicts_lru_mappings() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 2);
+        tracker.on_readdir(100, vec![10, 11]);
+        tracker.on_readdir(200, vec![20, 21]);
+        // Access dir 200 to make dir 100 the LRU victim.
+        let _ = tracker.on_child_read(20);
+        tracker.on_readdir(300, vec![30, 31]);
+
+        // Dir 100 should be evicted and its child mappings removed.
+        let p = tracker.on_child_read(10);
+        assert!(
+            p.is_empty(),
+            "evicted directory child mapping must be cleared"
+        );
+
+        // New directory remains active.
+        tracker.on_child_read(30);
+        let p_new = tracker.on_child_read(31);
+        assert!(p_new.is_empty());
+    }
+
+    #[test]
+    fn test_readdir_refresh_prunes_stale_child_mappings() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir(100, vec![10, 11, 12]);
+        tracker.on_readdir(100, vec![11, 13]);
+
+        // Child 10 no longer belongs to directory 100 and should be pruned.
+        let p_old = tracker.on_child_read(10);
+        assert!(p_old.is_empty());
+        let p_new = tracker.on_child_read(11);
+        assert!(p_new.is_empty());
     }
 }
