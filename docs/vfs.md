@@ -95,8 +95,8 @@ Handle-aware write path:
   deferred to `flush_fh()` / `close()`, so individual writes do not block on S3 round-trips.
 - At flush/close time, `flush_fh()` calls:
   - `flush(ino)` to stage accepted data,
-  - `sync_inode_to_backend(ino, timeout)` which waits until both ingress and upload queues are clear for that inode.
-- This provides a synchronous write-through confirmation path for unbuffered callers at natural sync boundaries.
+  - `wait_for_ingress_drain(ino, timeout)` which waits only for local ingress to drain for that inode.
+- This provides synchronous local durability confirmation for unbuffered callers at natural sync boundaries; S3 upload remains asynchronous.
 
 ### 2. `flush(ino)` / `close(ino)`
 

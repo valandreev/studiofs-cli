@@ -6871,7 +6871,7 @@ impl StudioVfs {
             let unbuffered = open_file.flags.requests_unbuffered_io();
             self.flush(ino).await?;
             if unbuffered {
-                self.sync_inode_to_backend(ino, direct_io_sync_timeout())
+                self.wait_for_ingress_drain(ino, direct_io_sync_timeout())
                     .await?;
             }
         }
@@ -6994,7 +6994,7 @@ impl StudioVfs {
         self.write(ino, offset, data).await
     }
 
-    async fn sync_inode_to_backend(&self, ino: Ino, timeout: Duration) -> VfsResult<()> {
+    async fn wait_for_ingress_drain(&self, ino: Ino, timeout: Duration) -> VfsResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
             // Always drain: a block may be in transit between dirty_mem and
