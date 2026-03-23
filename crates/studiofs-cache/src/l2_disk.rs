@@ -48,7 +48,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 // L2DiskCache
 // =============================================================================
 
-/// Upper bound for active L2 blocking-I/O tasks.
+/// Upper bound for active L2 blocking write/remove I/O tasks.
 const DEFAULT_L2_BLOCKING_IO_MAX_IN_FLIGHT: usize = 128;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
@@ -195,7 +195,7 @@ pub struct L2DiskCache {
     total_bytes: AtomicU64,
     /// Maximum allowed bytes.
     max_bytes: AtomicU64,
-    /// Limits active blocking L2 I/O to avoid exhausting Tokio's blocking pool.
+    /// Limits active blocking L2 write/remove I/O to avoid exhausting Tokio's blocking pool.
     io_semaphore: Arc<Semaphore>,
     /// Small LRU of open file descriptors used by synchronous read fast-path.
     sync_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
@@ -332,14 +332,8 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    async fn read_block_buffered(path: PathBuf, semaphore: Arc<Semaphore>) -> io::Result<Bytes> {
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed"))?;
-
+    async fn read_block_buffered(path: PathBuf) -> io::Result<Bytes> {
         crate::runtime::spawn_blocking_profiled("l2_read_buffered", move || -> io::Result<Bytes> {
-            let _permit = permit;
             std::fs::read(path).map(Bytes::from)
         })
         .await
@@ -359,25 +353,21 @@ impl L2DiskCache {
         path: PathBuf,
         expected_len_hint: Option<usize>,
     ) -> io::Result<Bytes> {
-        {
-            let permit = self.acquire_io_permit().await?;
-            let path_for_direct = path.clone();
-            let direct = crate::runtime::spawn_blocking_profiled(
-                "l2_read_direct",
-                move || -> io::Result<Option<Bytes>> {
-                    let _permit = permit;
-                    try_read_direct_block(&path_for_direct, expected_len_hint)
-                },
-            )
-            .await
-            .map_err(io::Error::other)??;
+        let path_for_direct = path.clone();
+        let direct = crate::runtime::spawn_blocking_profiled(
+            "l2_read_direct",
+            move || -> io::Result<Option<Bytes>> {
+                try_read_direct_block(&path_for_direct, expected_len_hint)
+            },
+        )
+        .await
+        .map_err(io::Error::other)??;
 
-            if let Some(bytes) = direct {
-                return Ok(bytes);
-            }
+        if let Some(bytes) = direct {
+            return Ok(bytes);
         }
 
-        Self::read_block_buffered(path, self.io_semaphore.clone()).await
+        Self::read_block_buffered(path).await
     }
 
     /// Read a block from disk. Returns `None` if not cached.
@@ -431,18 +421,13 @@ impl L2DiskCache {
         let mut handles = Vec::with_capacity(ids.len());
         for &(id, size_hint) in ids {
             let path = self.block_path(id);
-            let semaphore = self.io_semaphore.clone();
             handles.push((
                 id,
                 tokio::spawn(async move {
-                    let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "L2 I/O semaphore closed")
-                    })?;
                     let path_for_direct = path.clone();
                     let direct = crate::runtime::spawn_blocking_profiled(
                         "l2_read_batch_direct",
                         move || -> io::Result<Option<Bytes>> {
-                            let _permit = permit;
                             try_read_direct_block(
                                 &path_for_direct,
                                 size_hint.map(|len| len as usize),
@@ -454,7 +439,7 @@ impl L2DiskCache {
 
                     match direct {
                         Some(bytes) => Ok(bytes),
-                        None => Self::read_block_buffered(path, semaphore.clone()).await,
+                        None => Self::read_block_buffered(path).await,
                     }
                 }),
             ));
