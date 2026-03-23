@@ -9133,6 +9133,8 @@ impl StudioVfs {
                         "upload reconcile: remote exists() check timed out, falling back to upload"
                     );
                 }
+                // Shutdown cancellation: keep op pending in journal by exiting
+                // before any completion path.
                 TimeoutOrCancel::Cancelled => return Ok(()),
             }
         }
@@ -9206,6 +9208,8 @@ impl StudioVfs {
                                     op.object_id
                                 )));
                             }
+                            // Shutdown cancellation: exit quietly so worker loop
+                            // does not requeue/log as transient failure.
                             TimeoutOrCancel::Cancelled => return Ok(()),
                         }
                     } else {
@@ -9241,6 +9245,10 @@ impl StudioVfs {
                 .await
             {
                 Ok(()) => {}
+                // Treat cancellation as an intentional shutdown path:
+                // do not mark sticky errors and do not trigger in-memory requeue.
+                // Because `complete_upload` is not called, the pending op remains
+                // in the persistent journal for safe resume on next mount.
                 Err(crate::upload::UploadError::Cancelled) => return Ok(()),
                 Err(e) => return Err(VfsError::Other(e.to_string())),
             }
@@ -10093,20 +10101,40 @@ impl StudioVfs {
             );
         }
 
-        // Phase 3: cancel uploader work immediately after final ingress
-        // checkpoint persistence and stop uploader tasks.
-        self.request_uploader_shutdown();
+        // Phase 3: attempt graceful upload drain (bounded by user timeout),
+        // then cancel uploader work so network-blocked requests are aborted.
         let pending = self.block_cache.pending_upload_count();
+        let mut drained = pending == 0;
         if pending > 0 {
+            if upload_drain_timeout.is_zero() {
+                info!(
+                    pending,
+                    "VFS shutdown: skipping upload drain and cancelling uploader immediately"
+                );
+            } else {
+                info!(
+                    pending,
+                    timeout_ms = upload_drain_timeout.as_millis() as u64,
+                    "VFS shutdown: waiting for uploads to drain before forced cancellation"
+                );
+                drained = self
+                    .block_cache
+                    .wait_for_uploads_idle(upload_drain_timeout)
+                    .await;
+            }
+        }
+
+        self.request_uploader_shutdown();
+
+        if !drained {
             let pending_ops = self.block_cache.snapshot_pending_uploads();
             let sample_object_ids: Vec<u64> =
                 pending_ops.iter().take(8).map(|op| op.object_id).collect();
             info!(
-                pending,
+                pending = self.block_cache.pending_upload_count(),
                 pending_journal_files = pending_ops.len(),
                 pending_object_ids_sample = ?sample_object_ids,
-                requested_drain_timeout_ms = upload_drain_timeout.as_millis() as u64,
-                "VFS shutdown: uploader cancelled after checkpoint; pending uploads will resume from journal"
+                "VFS shutdown: uploader cancelled; remaining pending uploads will resume from journal"
             );
         }
         self.join_uploader_task(background_join_timeout).await;
