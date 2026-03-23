@@ -7308,6 +7308,10 @@ impl StudioVfs {
     /// decremented, but the inode and blocks are kept alive (orphan).
     /// Actual cleanup happens in `release_fh()` when the last handle closes.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        Self::run_sync_future(self.unlink_inner(parent, name))
+    }
+
+    async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
             self.bump_namespace_for_parents([parent]);
@@ -7459,6 +7463,16 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
+        Self::run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
+    }
+
+    async fn rename_inner(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> VfsResult<()> {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         if parent == new_parent && name == new_name {
@@ -7512,7 +7526,7 @@ impl StudioVfs {
                 }
             }
             self.bump_namespace_for_parents([new_parent]);
-            return self.unlink(parent, name);
+            return self.unlink_inner(parent, name).await;
         }
         let rename_result = self
             .meta
@@ -7573,6 +7587,16 @@ impl StudioVfs {
         }
         self.meta.request_eager_flush();
         Ok(())
+    }
+
+    fn run_sync_future<T>(future: impl std::future::Future<Output = T>) -> T {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        } else {
+            tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime for synchronous VFS operation")
+                .block_on(future)
+        }
     }
 
     // =========================================================================

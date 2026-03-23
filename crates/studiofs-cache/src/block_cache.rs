@@ -608,7 +608,7 @@ impl BlockCache {
             self.lru.remove(object_id);
         }
 
-        let ids: Vec<u64> = object_ids.iter().copied().collect();
+        let ids: Vec<u64> = object_ids.to_vec();
         let _ = self.l2.remove_batch_with_priority(&ids, priority).await;
     }
 
