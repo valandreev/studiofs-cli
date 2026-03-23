@@ -172,6 +172,17 @@ PendingUpload received
   └─ On failure: requeue with backoff
 ```
 
+Deleted-inode cancellation behavior:
+- VFS tracks unlinked inodes in an in-memory `deleted_inodes` set and cancels
+  queued/in-flight uploads via `CancellationToken`.
+- `process_upload` short-circuits on `deleted_inodes` before metadata lookups to
+  avoid metadata-backlog spikes on mass delete.
+- For `open-unlink` (inode removed from namespace but still opened by a process),
+  upload cancel is soft: pending upload journal entries are canceled, but block
+  data is kept locally readable until the last handle closes.
+- Marker cleanup is conservative: a deleted inode marker is cleared only after
+  no open handles, no pending uploads, and inode metadata is gone.
+
 Adaptive upload control:
 - workers use cooperative scheduler yielding (`tokio::task::yield_now()`) periodically to avoid starving foreground tasks.
 - upload backpressure samples cache pipeline metrics on each control tick.

@@ -58,6 +58,8 @@ The current architecture relies on these focused regressions:
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
   - `test_truncate_to_zero_then_rewrite`
   - `test_write_at_exact_block_boundary_transition`
+  - `open_unlink_keeps_data_readable_while_canceling_pending_uploads`
+  - `large_file_unlink_cancels_pending_uploads`
   - `test_crash_recovery_replays_ingress_spill_before_metadata_flush`
   - `test_ingress_prefers_spill_before_backpressure`
   - `test_ingress_pressure_reports_backpressure_when_spill_is_full`
