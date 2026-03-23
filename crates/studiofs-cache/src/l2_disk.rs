@@ -58,6 +58,7 @@ const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY"
 const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT";
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+type PutBatchWorkerOutput = (usize, u64, u64, io::Result<(io::Result<()>, u64)>);
 
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
     if alignment == 0 {
@@ -569,13 +570,7 @@ impl L2DiskCache {
             })
             .collect();
 
-        let spawn_one = |idx: usize,
-                         join_set: &mut tokio::task::JoinSet<(
-            usize,
-            u64,
-            u64,
-            io::Result<(io::Result<()>, u64)>,
-        )>| {
+        let spawn_one = |idx: usize, join_set: &mut tokio::task::JoinSet<PutBatchWorkerOutput>| {
             let (id, data) = &blocks[idx];
             let path = self.block_path(*id);
             let tmp_path = Self::unique_tmp_path(&path);
