@@ -6759,6 +6759,25 @@ impl StudioVfs {
         self.read_into_sync_cached_with_mode(ino, offset, buffer, unbuffered)
     }
 
+    /// Check whether a synchronous cache-only read can serve the full request.
+    ///
+    /// Returns `Ok(true)` only when every required committed block is currently
+    /// available in local cache (or represented by local overlay/hole data).
+    pub fn can_read_fh_sync_cached(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        size: u32,
+    ) -> VfsResult<bool> {
+        let _unbuffered = self
+            .handle_table
+            .get(fh)
+            .map(|open| open.flags.requests_unbuffered_io())
+            .unwrap_or(false);
+        self.can_read_sync_cached_with_mode(ino, offset, size as usize)
+    }
+
     /// Write file data using per-handle I/O flags.
     ///
     /// Writes are buffered identically to `write()`.  The synchronous
@@ -7961,27 +7980,11 @@ impl StudioVfs {
             cur += to_copy as u64;
         }
 
-        // Probe first so we only commit to the sync path when every requested
-        // committed block is currently available in cache.
-        let mut block_refs: Vec<Option<BlockRef>> = Vec::with_capacity(blocks_needed.len());
-        for (block_idx, _, _) in &blocks_needed {
-            if self
-                .read_pending_overlay_block_sync(ino, *block_idx, pending_content_epoch)?
-                .is_some()
-            {
-                block_refs.push(None);
-                continue;
-            }
-            let block_ref = self.get_file_block_sync(ino, *block_idx)?;
-            let Some(block_ref) = block_ref else {
-                block_refs.push(None);
-                continue;
-            };
-            if !self.block_cache.contains(block_ref.object_id) {
-                return Ok(None);
-            }
-            block_refs.push(Some(block_ref));
-        }
+        let Some(block_refs) =
+            self.probe_sync_cached_blocks(ino, pending_content_epoch, &blocks_needed)?
+        else {
+            return Ok(None);
+        };
 
         let mut written = 0usize;
         for (idx, (block_idx, off_in, to_copy)) in blocks_needed.iter().copied().enumerate() {
@@ -7996,8 +7999,6 @@ impl StudioVfs {
                 if copy_len > 0 {
                     buffer[written..written + copy_len]
                         .copy_from_slice(&overlay[off_in..off_in + copy_len]);
-                } else {
-                    buffer[written..written + to_copy].fill(0);
                 }
                 if copy_len < to_copy {
                     buffer[written + copy_len..written + to_copy].fill(0);
@@ -8032,6 +8033,74 @@ impl StudioVfs {
         }
 
         Ok(Some(written as u32))
+    }
+
+    fn can_read_sync_cached_with_mode(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer_len: usize,
+    ) -> VfsResult<bool> {
+        if self.ignored_entry_attr(ino).is_some() || buffer_len == 0 {
+            return Ok(true);
+        }
+        let attr = self.getattr(ino)?;
+        if self.remote_upload_placeholder_visible(ino, &attr) {
+            return Err(VfsError::RemoteContentPending);
+        }
+        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let pending_content_epoch = incarnation_state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch);
+
+        let end = (offset + buffer_len as u64).min(attr.size);
+        if offset >= end {
+            return Ok(true);
+        }
+
+        let mut blocks_needed: Vec<(u32, usize, usize)> = Vec::new();
+        let mut cur = offset;
+        while cur < end {
+            let idx = block_index_from_offset(cur, self.block_size);
+            let off_in = offset_within_block(cur, self.block_size) as usize;
+            let space = self.block_size as usize - off_in;
+            let to_copy = (end - cur).min(space as u64) as usize;
+            blocks_needed.push((idx, off_in, to_copy));
+            cur += to_copy as u64;
+        }
+
+        Ok(self
+            .probe_sync_cached_blocks(ino, pending_content_epoch, &blocks_needed)?
+            .is_some())
+    }
+
+    fn probe_sync_cached_blocks(
+        &self,
+        ino: Ino,
+        pending_content_epoch: Option<u64>,
+        blocks_needed: &[(u32, usize, usize)],
+    ) -> VfsResult<Option<Vec<Option<BlockRef>>>> {
+        let mut block_refs: Vec<Option<BlockRef>> = Vec::with_capacity(blocks_needed.len());
+        for (block_idx, _, _) in blocks_needed {
+            if self
+                .read_pending_overlay_block_sync(ino, *block_idx, pending_content_epoch)?
+                .is_some()
+            {
+                block_refs.push(None);
+                continue;
+            }
+            let block_ref = self.get_file_block_sync(ino, *block_idx)?;
+            let Some(block_ref) = block_ref else {
+                block_refs.push(None);
+                continue;
+            };
+            if !self.block_cache.contains(block_ref.object_id) {
+                return Ok(None);
+            }
+            block_refs.push(Some(block_ref));
+        }
+        Ok(Some(block_refs))
     }
 
     async fn get_file_block_async(
