@@ -492,6 +492,8 @@ struct DirPrefetchState {
     seen: usize,
     /// Which children have already been scheduled for prefetch.
     prefetched: HashSet<Ino>,
+    /// Stable generation stamp for the current readdir child set.
+    readdir_touch: u64,
     /// Monotonic access stamp used for bounded LRU-style eviction.
     last_touch: u64,
 }
@@ -507,8 +509,9 @@ struct DirPrefetchState {
 pub struct DirAccessTracker {
     /// dir_ino → prefetch state
     dirs: DashMap<Ino, DirPrefetchState>,
-    /// child_ino → parent_dir_ino (reverse lookup so on_read can find the dir)
-    child_to_dir: DashMap<Ino, Ino>,
+    /// child_ino → (parent_dir_ino, generation touch stamp)
+    /// so stale reverse mappings can be pruned safely.
+    child_to_dir: DashMap<Ino, (Ino, u64)>,
     /// Monotonic stamp for per-directory LRU tracking.
     access_tick: AtomicU64,
     /// Threshold: how many children must be read before prefetching triggers.
@@ -561,30 +564,40 @@ impl DirAccessTracker {
         }
     }
 
+    fn remove_child_mapping_if_unchanged(&self, child_ino: Ino, expected: (Ino, u64)) {
+        if let Some(current) = self.child_to_dir.get(&child_ino)
+            && *current.value() == expected
+        {
+            drop(current);
+            self.child_to_dir.remove(&child_ino);
+        }
+    }
+
     /// Called after `readdir(dir_ino)` completes.
     ///
     /// `children` should contain the inodes of regular-file children only
     /// (exclude directories and symlinks — those have no data blocks).
     pub fn on_readdir(&self, dir_ino: Ino, children: Vec<Ino>) {
+        let touch = self.next_touch();
         if let Some((_, prev)) = self.dirs.remove(&dir_ino) {
             for child in &prev.children {
                 self.child_to_dir.remove(child);
             }
         }
-        // Register reverse mappings for the latest child set.
-        for &child in &children {
-            self.child_to_dir.insert(child, dir_ino);
-        }
-        let touch = self.next_touch();
         self.dirs.insert(
             dir_ino,
             DirPrefetchState {
-                children,
+                children: children.clone(),
                 seen: 0,
                 prefetched: HashSet::new(),
+                readdir_touch: touch,
                 last_touch: touch,
             },
         );
+        // Register reverse mappings for the latest child set.
+        for &child in &children {
+            self.child_to_dir.insert(child, (dir_ino, touch));
+        }
         self.evict_lru_if_needed();
     }
 
@@ -594,7 +607,7 @@ impl DirAccessTracker {
     /// Returns an empty vec if the threshold hasn't been met yet, or if the
     /// child's parent directory isn't tracked.
     pub fn on_child_read(&self, child_ino: Ino) -> Vec<Ino> {
-        let dir_ino = match self.child_to_dir.get(&child_ino) {
+        let (dir_ino, mapping_touch) = match self.child_to_dir.get(&child_ino) {
             Some(v) => *v,
             None => return Vec::new(),
         };
@@ -604,10 +617,16 @@ impl DirAccessTracker {
             Some(s) => s,
             None => {
                 // Reverse map can become stale after bounded eviction.
-                self.child_to_dir.remove(&child_ino);
+                // Remove only if no newer readdir mapping replaced it.
+                self.remove_child_mapping_if_unchanged(child_ino, (dir_ino, mapping_touch));
                 return Vec::new();
             }
         };
+        if state.readdir_touch != mapping_touch {
+            // Stale mapping observed during concurrent readdir refresh.
+            self.remove_child_mapping_if_unchanged(child_ino, (dir_ino, mapping_touch));
+            return Vec::new();
+        }
         state.last_touch = touch;
 
         // Already counted this child? Skip.
@@ -743,5 +762,24 @@ mod dir_prefetch_tests {
         assert!(p_old.is_empty());
         let p_new = tracker.on_child_read(11);
         assert!(p_new.is_empty());
+    }
+
+    #[test]
+    fn test_stale_child_mapping_does_not_remove_fresh_mapping() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir(100, vec![10]);
+        let stale = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+
+        // Refresh directory; child 10 is still present, but with a newer touch.
+        tracker.on_readdir(100, vec![10, 11]);
+        let fresh = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+        assert_ne!(stale.1, fresh.1, "touch stamp should advance on refresh");
+
+        // Simulate stale cleanup path: must not delete the fresh mapping.
+        tracker.remove_child_mapping_if_unchanged(10, stale);
+        assert!(
+            tracker.child_to_dir.get(&10).is_some(),
+            "fresh mapping must survive stale compare-and-remove"
+        );
     }
 }
