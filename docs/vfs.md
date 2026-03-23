@@ -99,6 +99,7 @@ Handle-aware write path:
 - This provides synchronous local durability confirmation for unbuffered callers at natural sync boundaries; S3 upload remains asynchronous.
 - In `cache_safety_mode=durable`, ingress WAL appends are forced with local `sync_data()`, so this confirmation is resilient to process crash and OS-page-cache loss scenarios.
 - Asynchronous upload failures are tracked as sticky inode errors; the next `flush_fh`/`fsync` reports `EIO` and consumes that sticky error (new async failures can set it again).
+- `flush_fh`/`fsync` report sticky upload errors only after finishing the current local sync step, so newly written data is still persisted locally before `EIO` is returned.
 
 ### 2. `flush(ino)` / `close(ino)`
 

@@ -10382,6 +10382,38 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_fsync_reports_sticky_error_after_persisting_current_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-fsync-order");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"sticky-fsync.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let payload = b"persist-before-sticky-report";
+
+            vfs.write(ino, 0, payload).await.unwrap();
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+
+            let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
+            assert!(
+                fsync_err.to_string().contains("sticky upload error"),
+                "fsync should still report sticky upload errors"
+            );
+
+            let after = vfs.getattr(ino).unwrap();
+            assert_eq!(
+                after.size,
+                payload.len() as u64,
+                "fsync must persist current dirty attrs before reporting sticky EIO"
+            );
+
+            // Error is consumable: the next fsync should proceed unless a new
+            // async upload failure occurs.
+            vfs.fsync(ino, false).await.unwrap();
+        });
+    }
+
     // =========================================================================
     // HandleTable Unit Tests
     // =========================================================================
