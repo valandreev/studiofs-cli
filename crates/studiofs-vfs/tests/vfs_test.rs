@@ -3973,6 +3973,93 @@ fn large_file_unlink_cancels_pending_uploads() {
 }
 
 #[test]
+fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr05-open-unlink-cancel-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let payload = vec![0x5Au8; block_size * 2];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+
+        let attr = vfs
+            .create(1, b"open-unlink-cancel.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open handle before unlink");
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+            })
+            .await,
+            "two full-block uploads should be pending before open-unlink"
+        );
+
+        vfs.unlink(1, b"open-unlink-cancel.bin").unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    && vfs.upload_stats().canceled_deleted >= 2
+            })
+            .await,
+            "open-unlink must cancel pending uploads without waiting for close"
+        );
+
+        let data = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            data.as_ref(),
+            payload.as_slice(),
+            "open-unlink file must remain readable from local cache until last handle closes"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn large_file_partial_overwrite_reuploads_only_touched_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
