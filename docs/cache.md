@@ -66,7 +66,11 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   either size hint or opened-file metadata (`std_file.metadata()`), avoiding
   extra path-based `stat` races.
 - **Robust fallback** — when a platform/filesystem rejects direct I/O for a
-  file, read path transparently falls back to async buffered file reads
+  file, read path transparently falls back to async buffered file reads.
+  Linux buffered fallback emits `posix_fadvise(..., POSIX_FADV_DONTNEED)` after
+  read completion to reduce double-caching pressure in page cache.
+  macOS buffered/direct path relies on `F_NOCACHE` descriptor state and uses
+  regular read/write calls (no `O_DIRECT`-style alignment requirements).
 - **Alignment strategy** — L2 direct-read targets use a 4 KiB-aligned
   `BytesMut` allocation helper; if caller buffer/length is still unsuitable
   for direct mode, platform layer uses a temporary aligned bounce buffer
@@ -104,6 +108,9 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   controls sync-read open-file LRU capacity (default `4096`)
 - **Tunable batch-read fan-out** — `STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT`
   controls max in-flight reads per `get_batch*` call (default `256`)
+- **Buffered-read preallocation guard** — when size hint is absent,
+  buffered L2 reads preallocate using file metadata length; if conversion to
+  platform `usize` fails, fallback preallocation uses `8 MiB`.
 
 **Batch operations:**
 - `put_batch(blocks)` — sliding-window `JoinSet` scheduling with preserved

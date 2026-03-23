@@ -250,7 +250,7 @@ pub(crate) fn open_block_direct_read(path: &Path) -> io::Result<Option<std::fs::
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn read_block_direct_from_file(
     std_file: std::fs::File,
     dst: &mut [u8],
@@ -269,11 +269,36 @@ pub(crate) fn read_block_direct_from_file(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn read_block_direct_from_file(
+    std_file: std::fs::File,
+    dst: &mut [u8],
+) -> io::Result<Option<usize>> {
+    if dst.is_empty() {
+        return Ok(Some(0));
+    }
+    match read_all(std_file, dst) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "direct read returned EOF before data",
+        )),
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if should_fallback_from_direct_io(&e) => {
+            debug!(
+                error = %e,
+                "direct I/O unavailable for block read; falling back to buffered read"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let direct = (|| -> io::Result<()> {
-        let std_file = std::fs::OpenOptions::new()
+        let mut std_file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -283,7 +308,7 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
         if rc == -1 {
             return Err(io::Error::last_os_error());
         }
-        write_to_std_file_direct(std_file, data)
+        std_file.write_all(data)
     })();
 
     match direct {
