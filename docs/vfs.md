@@ -310,11 +310,17 @@ Per-inode sequential read detection with adaptive prefetch depth.
 - **Score** per inode: 0–255, starts at 0
 - Sequential read: score increases (default `+4` per sequential block span)
 - Random read: score -2
-- Prefetch depth = `min(score, configured_width)`, with a minimum floor on sequential streams (default 16 blocks)
+- Dynamic width:
+  - baseline width = `STUDIOFS_READAHEAD_WIDTH` (default `128`)
+  - max width is derived from read buffer budget (`STUDIOFS_READ_BUFFER_MB`) and block size
+  - sustained sequential reads ramp width up by doubling; random seeks reset width to baseline
+- Ramp-up is bounded per call (currently up to 2 doublings per `record_read`), so one large read span can advance faster than 1-block reads without runaway over-prefetch.
+- Prefetch depth = `min(score, current_dynamic_width)`, with a minimum floor on sequential streams (default 16 blocks)
+- Planned prefetch blocks are clamped to file EOF to avoid over-prefetch on small files.
 
 Runtime tuning knobs:
 - `STUDIOFS_READ_BUFFER_MB` (default `2048`) - high-level read buffer budget; drives fetch AIMD max window
-- `STUDIOFS_READAHEAD_WIDTH` (default `128` blocks)
+- `STUDIOFS_READAHEAD_WIDTH` (default `128` blocks; baseline dynamic width)
 - `STUDIOFS_READAHEAD_MIN_PREFETCH` (default `16` blocks)
 - `STUDIOFS_READAHEAD_SEQ_STEP` (default `4`)
 - `STUDIOFS_READAHEAD_RANDOM_PENALTY` (default `2`)
@@ -339,6 +345,11 @@ Worker robustness details:
 ### DirAccessTracker
 
 Similar to ReadAheadTracker but for directory listing — detects sequential `readdir` access patterns.
+
+Implementation details:
+- Uses `DashMap` for per-directory state to reduce global lock contention under concurrent scans.
+- Uses bounded tracking (LRU-style eviction) to prevent unbounded growth of directory/child reverse mappings.
+- Reverse child→dir mappings are generation-stamped to avoid stale cleanup races when `on_readdir` refreshes a directory while `on_child_read` is running.
 
 ## AIMD Controller (`aimd.rs`)
 
