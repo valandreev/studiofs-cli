@@ -3217,6 +3217,8 @@ pub struct StudioVfs {
     /// Channel sender for background prefetch planning and execution.
     /// The receiver lives in a spawned task that has an Arc<Self>.
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
+    /// Last queued block range per inode to suppress duplicate read hints.
+    prefetch_last_hint: Mutex<HashMap<Ino, (u32, u32)>>,
     /// Signal sender to wake the background flusher when new dirty blocks
     /// are buffered.
     dirty_flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -4218,6 +4220,7 @@ impl StudioVfs {
                 readahead: readahead.clone(),
                 dir_prefetch,
                 prefetch_tx,
+                prefetch_last_hint: Mutex::new(HashMap::new()),
                 dirty_flush_tx,
                 max_dirty_bytes,
                 max_xattr_bytes,
@@ -4251,8 +4254,34 @@ impl StudioVfs {
             let prefetch_limit = vfs.prefetch_concurrency.max(1);
             vfs.track_background_task(tokio::spawn(async move {
                 let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
+                let mut pending_queue: VecDeque<(Ino, u32)> = VecDeque::new();
+                let mut pending_set: HashSet<(Ino, u32)> = HashSet::new();
                 let mut inflight = JoinSet::new();
                 loop {
+                    // Launch as many queued prefetches as permits allow without
+                    // blocking the worker event loop.
+                    while let Some((ino, block_idx)) = pending_queue.front().copied() {
+                        if vfs_for_prefetch.shutdown_requested() {
+                            pending_queue.clear();
+                            pending_set.clear();
+                            break;
+                        }
+                        let permit = match prefetch_sem.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        };
+                        let _ = pending_queue.pop_front();
+                        pending_set.remove(&(ino, block_idx));
+                        if !vfs_for_prefetch.readahead.start_prefetch(ino, block_idx) {
+                            continue;
+                        }
+                        let v = vfs_for_prefetch.clone();
+                        inflight.spawn(async move {
+                            let _permit = permit;
+                            let _ = v.read_block_for_prefetch(ino, block_idx).await;
+                        });
+                    }
+
                     tokio::select! {
                         _ = vfs_for_prefetch.state.shutdown_notify.notified() => {
                             inflight.abort_all();
@@ -4275,18 +4304,9 @@ impl StudioVfs {
                                 }
                             };
                             for (ino, block_idx) in planned {
-                                if vfs_for_prefetch.shutdown_requested() {
-                                    break;
+                                if pending_set.insert((ino, block_idx)) {
+                                    pending_queue.push_back((ino, block_idx));
                                 }
-                                let permit = match prefetch_sem.clone().acquire_owned().await {
-                                    Ok(permit) => permit,
-                                    Err(_) => break,
-                                };
-                                let v = vfs_for_prefetch.clone();
-                                inflight.spawn(async move {
-                                    let _permit = permit;
-                                    let _ = v.read_block_for_prefetch(ino, block_idx).await;
-                                });
                             }
                         }
                         joined = inflight.join_next(), if !inflight.is_empty() => {
@@ -6632,7 +6652,6 @@ impl StudioVfs {
         if attr.kind == studiofs_meta::types::FileType::RegularFile
             && attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
-            && self.readahead.start_prefetch(ino, 0)
         {
             let _ = self
                 .prefetch_tx
@@ -7608,6 +7627,7 @@ impl StudioVfs {
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
+        self.prefetch_last_hint.lock().remove(&ino);
     }
 
     fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
@@ -7635,6 +7655,7 @@ impl StudioVfs {
             );
         }
         self.readahead.evict(ino);
+        self.prefetch_last_hint.lock().remove(&ino);
         Ok(())
     }
 
@@ -7926,6 +7947,13 @@ impl StudioVfs {
         }
         let first_block = blocks_needed[0].0;
         let last_block = blocks_needed.last().unwrap().0;
+        {
+            let mut last_hints = self.prefetch_last_hint.lock();
+            if last_hints.get(&ino).copied() == Some((first_block, last_block)) {
+                return;
+            }
+            last_hints.insert(ino, (first_block, last_block));
+        }
         let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
             ino,
             first_block,
@@ -7970,10 +7998,8 @@ impl StudioVfs {
             if budget == 0 {
                 break;
             }
-            if self.readahead.start_prefetch(ino, block_idx) {
-                planned.push((ino, block_idx));
-                budget = budget.saturating_sub(1);
-            }
+            planned.push((ino, block_idx));
+            budget = budget.saturating_sub(1);
         }
 
         // Directory-level prefetch: if this child is in a tracked directory
