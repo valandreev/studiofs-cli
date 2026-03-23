@@ -138,10 +138,10 @@ impl UploadScheduler {
             }
             if attempt == 0 {
                 let penalty_ms = self.adaptive_penalty_ms.load(Ordering::Relaxed);
-                if penalty_ms > 0 {
-                    if !sleep_or_cancel(cancel_token, Duration::from_millis(penalty_ms)).await {
-                        return Err(UploadError::Cancelled);
-                    }
+                if penalty_ms > 0
+                    && !sleep_or_cancel(cancel_token, Duration::from_millis(penalty_ms)).await
+                {
+                    return Err(UploadError::Cancelled);
                 }
             }
             self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
