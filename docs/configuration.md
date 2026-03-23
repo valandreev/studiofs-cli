@@ -112,6 +112,7 @@ Notes:
   - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; fetched blocks are cached in L2 for potential re-reads.
   - writes buffer data as normal; synchronous confirmation at `flush()`/`close()` waits for local ingress durability (NVMe/WAL), not S3 upload completion.
   - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write ingress-drain timeout (default `120` seconds).
+  - if asynchronous S3 upload fails, StudioFS records a sticky inode upload error and later `write`/`flush`/`fsync` return `EIO` until upload succeeds.
   - this mode is intended for storage benchmarking and strict write-through workflows.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.

@@ -2730,6 +2730,9 @@ fn append_ingress_record(
     if !payload.is_empty() {
         file.write_all(payload)?;
     }
+    // Durable mode relies on ingress records surviving power loss once
+    // `flush_fh()` observes ingress drain completion.
+    file.sync_data()?;
     Ok(start + INGRESS_RECORD_HEADER_LEN as u64)
 }
 
@@ -3093,6 +3096,9 @@ struct VfsState {
     /// pending upload completes (or is cancelled).  Populated by
     /// `evict_inode_from_caches()` when it encounters a pinned block.
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    /// Sticky async upload failures keyed by inode. Once set, foreground sync
+    /// points surface EIO until a subsequent successful upload clears it.
+    upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
     /// Number of upload operations requeued after process failures.
     upload_requeues: AtomicU64,
     /// Upload operations canceled because inode was deleted/missing.
@@ -4185,6 +4191,7 @@ impl StudioVfs {
                     active_ingress_segment_id: AtomicU64::new(active_ingress_segment_id),
                     deleted_inodes: Mutex::new(std::collections::HashSet::new()),
                     pending_evictions: Mutex::new(std::collections::HashSet::new()),
+                    upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
                     upload_requeues: AtomicU64::new(0),
                     upload_canceled_deleted: AtomicU64::new(0),
                     upload_canceled_stale: AtomicU64::new(0),
@@ -5304,6 +5311,45 @@ impl StudioVfs {
     fn clear_inode_incarnation(&self, ino: Ino) {
         self.state.inode_incarnations.lock().remove(&ino);
         self.state.directory_generations.lock().remove(&ino);
+        self.state.upload_sticky_errors.lock().remove(&ino);
+    }
+
+    fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError) {
+        let message = error.to_string();
+        let mut sticky = self.state.upload_sticky_errors.lock();
+        let changed = sticky
+            .get(&ino)
+            .map(|existing| existing != &message)
+            .unwrap_or(true);
+        sticky.insert(ino, message.clone());
+        if changed {
+            warn!(
+                ino,
+                error = %message,
+                "recorded sticky async upload error for inode"
+            );
+        }
+    }
+
+    fn clear_upload_sticky_error(&self, ino: Ino) {
+        if self
+            .state
+            .upload_sticky_errors
+            .lock()
+            .remove(&ino)
+            .is_some()
+        {
+            info!(ino, "cleared sticky async upload error for inode");
+        }
+    }
+
+    fn check_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
+        if let Some(message) = self.state.upload_sticky_errors.lock().get(&ino).cloned() {
+            return Err(VfsError::Other(format!(
+                "sticky upload error on inode {ino}: {message}"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
@@ -6868,6 +6914,7 @@ impl StudioVfs {
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
             let ino = open_file.ino;
+            self.check_upload_sticky_error(ino)?;
             let unbuffered = open_file.flags.requests_unbuffered_io();
             self.flush(ino).await?;
             if unbuffered {
@@ -6889,6 +6936,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
+        self.check_upload_sticky_error(ino)?;
 
         // Flush pending write buffer
         self.flush(ino).await?;
@@ -8552,6 +8600,7 @@ impl StudioVfs {
             });
             return Ok(data.len() as u32);
         }
+        self.check_upload_sticky_error(ino)?;
 
         if data.is_empty() {
             return Ok(0);
@@ -8695,6 +8744,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
+        self.check_upload_sticky_error(ino)?;
 
         // Move all remaining dirty pending blocks into the dirty memory buffer.
         // The background slab flusher handles package + slab write + upload queue.
@@ -8820,6 +8870,7 @@ impl StudioVfs {
                             vfs.block_cache.cancel_upload(&op, true);
                             vfs.state.pending_evictions.lock().remove(&op.object_id);
                         } else {
+                            vfs.mark_upload_sticky_error(op.ino, &e);
                             let mut retry_op = op;
                             retry_op.retry_count = retry_op.retry_count.saturating_add(1);
                             let delay = vfs.upload_requeue_delay(&retry_op);
@@ -9247,6 +9298,7 @@ impl StudioVfs {
         } else {
             self.clear_inode_incarnation(op.ino);
         }
+        self.clear_upload_sticky_error(op.ino);
 
         // Post-upload cleanup: if the block was marked for deferred eviction
         // (inode was deleted while the upload was in flight), remove it now.
@@ -10295,6 +10347,42 @@ mod tests {
         assert_eq!(offset_within_block(100, block_size), 100);
         assert_eq!(offset_within_block(4 * 1024 * 1024, block_size), 0);
         assert_eq!(offset_within_block(4 * 1024 * 1024 + 100, block_size), 100);
+    }
+
+    #[test]
+    fn test_sticky_upload_error_blocks_sync_points_until_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-upload-error");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"sticky.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+
+            let write_err = vfs.write(ino, 0, b"payload").await.unwrap_err();
+            assert!(
+                write_err.to_string().contains("sticky upload error"),
+                "write should surface sticky upload errors"
+            );
+
+            let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
+            assert!(
+                fsync_err.to_string().contains("sticky upload error"),
+                "fsync should surface sticky upload errors"
+            );
+
+            let flush_err = vfs.flush_fh(fh).await.unwrap_err();
+            assert!(
+                flush_err.to_string().contains("sticky upload error"),
+                "flush_fh should surface sticky upload errors"
+            );
+
+            vfs.clear_upload_sticky_error(ino);
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+        });
     }
 
     // =========================================================================
