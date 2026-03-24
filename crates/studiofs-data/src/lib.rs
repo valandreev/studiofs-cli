@@ -1,7 +1,7 @@
 //! StudioFS Data Layer
 //!
 //! Handles reading/writing data blocks to S3-compatible storage via OpenDAL.
-//! Blocks are 4MiB units that correspond to slices within chunks.
+//! Logical blocks are 16MiB; cloud objects are stored as four 4MiB fragments.
 
 pub mod block;
 pub mod object;

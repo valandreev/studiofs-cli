@@ -8,25 +8,33 @@
 - Object key generation and sharding based on block IDs.
 - Object payload validation (xxh64 checksums).
 - Read/write connection profile separation (`IoProfile`).
+- Hybrid cloud layout for logical blocks: one 16 MiB logical block is stored as four 4 MiB fragment objects.
 
 ## S3 Key Layout
 
-Files in StudioFS are split into fixed-size blocks (default 8 MiB). Each block is assigned a globally unique, sequential 64-bit ID upon creation. 
+Files in StudioFS are split into fixed-size logical blocks (default 16 MiB). Each logical block is assigned a globally unique, sequential 64-bit object ID.
 
-Objects are routed to S3 using the following paths:
+Remote storage uses a 4x4 hybrid scheme:
 
-### Block Data Objects
-```
-<volume>/data/chunks/<hash>/<slice_id>_<block_index>_<block_size>
-```
-- `<hash>`: First layers of distribution derived from slice ID.
-- `<slice_id>`: The sequential block ID.
-
-### Generic Objects
+### Logical Object Base Key
 ```
 <volume>/objects/<ab>/<cd>/<object_id>
 ```
-- `<ab>/<cd>`: The first 4 hex characters of the object ID for S3 partition distribution.
+- `<ab>/<cd>`: First 4 hex characters of object ID for S3 partition distribution.
+
+### Cloud Fragment Keys (4 fragments per logical object)
+```
+<volume>/objects/<ab>/<cd>/<object_id>/<fragment_index>
+```
+- `fragment_index`: `0..3`
+- Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
+- Fragment writes/retries are independent, so network failures only retry the affected piece.
+
+Legacy `DataStore::put_block/get_block/...` APIs still use the historical:
+```
+<volume>/data/chunks/<hash>/<slice_id>_<block_index>_<block_size>
+```
+These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<fragment_index>`.
 
 ## Object Format (Version 2)
 
@@ -56,7 +64,7 @@ Little-endian encoding is used for all multi-byte fields.
 +------------------+
 ```
 
-On write, object upload paths use `opendal::Buffer` (`header` + payload chunks) to avoid copying full 8 MiB payload buffers when prepending the fixed header.
+On write, object upload paths use `opendal::Buffer` (`header` + payload chunks) to avoid copying full fragment payload buffers when prepending the fixed header.
 
 On read, object decode accepts `opendal::Buffer` directly, parses the fixed header from a small stack buffer, and validates checksum incrementally across buffer chunks. Payload is returned as zero-copy `Bytes` when the payload is a single contiguous chunk, with contiguous materialization only as a fallback for fragmented payloads.
 

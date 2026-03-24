@@ -48,7 +48,7 @@ the capacity limit is reached.
 | `cache_dir` | — | Root for block cache + journals |
 | `cache_size` | 100 GiB | L2 disk cache budget |
 | `memory_limit` | 25% of total RAM | L1 memory cache budget when `--memory-limit` is omitted |
-| `block_size` | 8 MiB | Block size (from format info) |
+| `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Max prefetch depth |
 | `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
@@ -164,8 +164,9 @@ PendingUpload received
   │
   ├─ Read block from cache (L1 or L2)
   ├─ Reject stale op if inode/incarnation no longer match
-  ├─ Build object `Buffer` (header + raw payload chunk), compute xxh64 checksum
-  ├─ PUT to S3 via UploadScheduler (AIMD + retry/timeout policy)
+  ├─ Split logical block into 4 cloud fragments (up to 4 MiB each)
+  ├─ Build fragment `Buffer`s (header + raw payload chunk), compute xxh64 checksums
+  ├─ PUT fragment objects to S3 in parallel via UploadScheduler (AIMD + retry/timeout policy)
   ├─ Mark extent record as uploaded only after upload success
   ├─ cache.complete_upload(pending) — unpin LRU entry
   │
@@ -208,7 +209,7 @@ local metadata view ──┬─ pending incarnation extents
                          ├─ ingress_spill
                          ├─ L1 memory cache
                          ├─ L2 disk cache
-                         └─ FetchScheduler → S3
+                         └─ FetchScheduler → S3 fragment fetch (parallel, per-fragment retry)
          │
          ▼
   enqueue prefetch hint ── lightweight `(ino, first..last)` send
@@ -369,9 +370,9 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 | Field | Fetch Default | Upload Default |
 |-------|--------------|----------------|
-| `initial_window` | derived from read buffer (`~32` for 2048 MiB / 8 MiB blocks) | 16 |
+| `initial_window` | derived from read buffer (`~16` for 2048 MiB / 16 MiB blocks) | 16 |
 | `min_window` | 1 | 1 |
-| `max_window` | derived from read buffer (`256` for 2048 MiB / 8 MiB blocks) | 512 |
+| `max_window` | derived from read buffer (`128` for 2048 MiB / 16 MiB blocks) | 512 |
 | `increase_step` | derived (`4.0` when max window >= 1024) | 2.0 |
 | `decrease_factor` | 0.85 | 0.85 |
 | `decrease_cooldown` | 3s | 3s |

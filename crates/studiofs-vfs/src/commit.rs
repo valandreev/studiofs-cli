@@ -94,22 +94,34 @@ impl CommitCoordinator {
         loop {
             let mut all_visible = true;
             for (_, extent) in live_extents {
-                let key = format_object_key(&vfs.data_prefix, extent.object_id);
-                match vfs.fetch_scheduler.data_store().exists(&key).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        all_visible = false;
-                        break;
+                let checks = format_object_fragment_keys(&vfs.data_prefix, extent.object_id)
+                    .into_iter()
+                    .map(|key| async {
+                        let result = vfs.fetch_scheduler.data_store().exists(&key).await;
+                        (key, result)
+                    });
+                let results = futures::future::join_all(checks).await;
+                for (key, result) in results {
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            all_visible = false;
+                            break;
+                        }
+                        Err(err) => {
+                            all_visible = false;
+                            tracing::debug!(
+                                object_id = extent.object_id,
+                                key,
+                                error = %err,
+                                "publish visibility check failed, will retry"
+                            );
+                            break;
+                        }
                     }
-                    Err(err) => {
-                        all_visible = false;
-                        tracing::debug!(
-                            object_id = extent.object_id,
-                            error = %err,
-                            "publish visibility check failed, will retry"
-                        );
-                        break;
-                    }
+                }
+                if !all_visible {
+                    break;
                 }
             }
 
@@ -146,18 +158,19 @@ async fn requeue_missing_manifest_uploads(
             continue;
         }
 
-        let key = format_object_key(&vfs.data_prefix, block_ref.object_id);
-        let visible = match tokio::time::timeout(
-            Duration::from_secs(3),
-            vfs.fetch_scheduler.data_store().exists(&key),
-        )
-        .await
-        {
-            Ok(Ok(true)) => true,
-            Ok(Ok(false)) => false,
-            Ok(Err(_)) => false,
-            Err(_) => false,
-        };
+        let checks = format_object_fragment_keys(&vfs.data_prefix, block_ref.object_id)
+            .into_iter()
+            .map(|key| async move {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    vfs.fetch_scheduler.data_store().exists(&key),
+                )
+                .await
+            });
+        let visible = futures::future::join_all(checks)
+            .await
+            .into_iter()
+            .all(|result| matches!(result, Ok(Ok(true))));
         if visible {
             continue;
         }

@@ -8,7 +8,7 @@ local-first metadata path and eventual multi-client convergence.
 Core principles:
 - Foreground filesystem operations read and write local `redb` only.
 - PostgreSQL is the shared replication bus and checkpoint store, not the hot read path.
-- File payloads live in immutable S3 objects.
+- File payloads live in immutable S3 objects; each 16 MiB logical block is stored as four 4 MiB cloud fragments.
 - Runtime file visibility is split into local accepted state and remote-visible
   committed state.
 - RAM + NVMe cache tiers hide most object-store latency.
@@ -58,7 +58,7 @@ Core invariants:
 4. `flush(ino)`/`close(ino)` applies the configured cache safety policy:
    - `durable`: appends accepted records to ingress (durable local accept path),
    - `fast`: skips ingress payload persistence and relies on best-effort self-heal on restart.
-5. Background workers materialize and upload accepted records.
+5. Background workers materialize accepted records and upload each logical block as four independent cloud fragments.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
 8. Other clients pull only newer foreign batches and apply remote-visible namespace/attrs/symlinks/xattrs to local `base_*`.

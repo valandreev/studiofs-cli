@@ -30,6 +30,12 @@ pub const MAX_OBJECT_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Default block size: 16 MiB.
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
+/// Cloud fragment size per logical block: 4 MiB.
+pub const CLOUD_FRAGMENT_SIZE: usize = 4 * 1024 * 1024;
+/// Number of cloud fragments per logical block.
+pub const CLOUD_FRAGMENT_COUNT: usize = 4;
+/// Compile-time invariant: one logical block must map exactly to fixed cloud fragments.
+const _: [(); DEFAULT_BLOCK_SIZE as usize] = [(); CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT];
 
 // =============================================================================
 // Error Types
@@ -51,6 +57,8 @@ pub enum ObjectError {
     ObjectTooLarge(u64),
     #[error("invalid object ID: {0}")]
     InvalidObjectId(String),
+    #[error("invalid cloud fragment layout: {0}")]
+    InvalidFragmentLayout(String),
 }
 
 // =============================================================================
@@ -316,24 +324,24 @@ pub fn create_object_buffer_with_flags(
     let checksum = xxh64(data.as_ref(), 0);
     let size = data.len() as u32;
     let header = ObjectHeader::with_flags(size, size, checksum, flags).to_bytes();
-    
+
     // Chunk the data into 1MB pieces for better network transmission behavior.
     // When sending 16MB contiguous buffers over a local network -> router -> external IP
     // loopback, hyper/reqwest tries to push large chunks into the socket. This can
     // cause micro-bursts that exceed router queue depths (bufferbloat) and drop packets,
-    // severely limiting upload throughput. By slicing the `Bytes` (zero-copy), we force 
+    // severely limiting upload throughput. By slicing the `Bytes` (zero-copy), we force
     // hyper to write to the socket in smaller 1MB chunks.
     let chunk_size = 1024 * 1024;
     let num_data_chunks = data.len().div_ceil(chunk_size);
     let mut chunks = Vec::with_capacity(1 + num_data_chunks);
     chunks.push(Bytes::copy_from_slice(&header));
-    
+
     for i in 0..num_data_chunks {
         let start = i * chunk_size;
         let end = (start + chunk_size).min(data.len());
         chunks.push(data.slice(start..end));
     }
-    
+
     Ok(Buffer::from(chunks))
 }
 
@@ -418,7 +426,7 @@ pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
 // Object ID Utilities
 // =============================================================================
 
-/// Format object ID as S3 key path.
+/// Format object ID as S3 key base path.
 ///
 /// Key format: `{data_prefix}{prefix}/{object_id}`
 ///
@@ -444,6 +452,70 @@ pub fn format_object_key(data_prefix: &str, object_id: u64) -> String {
     format!("{}{}/{}", normalized_prefix, prefix, hex_id)
 }
 
+/// Format one cloud fragment key for an object.
+///
+/// Key format: `{data_prefix}{prefix}/{object_id}/{fragment_index}`
+pub fn format_object_fragment_key(data_prefix: &str, object_id: u64, fragment_index: u8) -> String {
+    assert!(
+        (fragment_index as usize) < CLOUD_FRAGMENT_COUNT,
+        "fragment index out of range"
+    );
+    format!(
+        "{}/{}",
+        format_object_key(data_prefix, object_id),
+        fragment_index
+    )
+}
+
+/// Format all cloud fragment keys for an object in stable order [0..4).
+pub fn format_object_fragment_keys(
+    data_prefix: &str,
+    object_id: u64,
+) -> [String; CLOUD_FRAGMENT_COUNT] {
+    std::array::from_fn(|idx| format_object_fragment_key(data_prefix, object_id, idx as u8))
+}
+
+/// Validate cloud fragment shape and return reconstructed logical payload size.
+///
+/// Rules:
+/// - exactly `CLOUD_FRAGMENT_COUNT` fragments are expected;
+/// - no fragment may exceed `CLOUD_FRAGMENT_SIZE`;
+/// - after the first short fragment (`len < CLOUD_FRAGMENT_SIZE`), all following
+///   fragments must be empty.
+pub fn validate_cloud_fragment_layout(lengths: &[usize]) -> Result<usize, ObjectError> {
+    if lengths.len() != CLOUD_FRAGMENT_COUNT {
+        return Err(ObjectError::InvalidFragmentLayout(format!(
+            "expected {} fragments, got {}",
+            CLOUD_FRAGMENT_COUNT,
+            lengths.len()
+        )));
+    }
+
+    let mut seen_short_fragment = false;
+    let mut total_len = 0usize;
+
+    for (idx, &len) in lengths.iter().enumerate() {
+        if len > CLOUD_FRAGMENT_SIZE {
+            return Err(ObjectError::InvalidFragmentLayout(format!(
+                "fragment {idx} length {len} exceeds max {CLOUD_FRAGMENT_SIZE}"
+            )));
+        }
+        if seen_short_fragment && len != 0 {
+            return Err(ObjectError::InvalidFragmentLayout(format!(
+                "fragment {idx} has len {len} after prior short fragment"
+            )));
+        }
+        if len < CLOUD_FRAGMENT_SIZE {
+            seen_short_fragment = true;
+        }
+        total_len = total_len
+            .checked_add(len)
+            .ok_or_else(|| ObjectError::InvalidFragmentLayout("fragment length overflow".into()))?;
+    }
+
+    Ok(total_len)
+}
+
 /// Parse object ID from S3 key.
 ///
 /// # Arguments
@@ -454,16 +526,31 @@ pub fn format_object_key(data_prefix: &str, object_id: u64) -> String {
 pub fn parse_object_id_from_key(key: &str) -> Result<u64, ObjectError> {
     let parts: Vec<&str> = key.split('/').collect();
 
-    // Expected format: {data_prefix}/{prefix}/{object_id}
+    // Legacy format: {data_prefix}/{prefix}/{object_id}
+    // Fragmented format: {data_prefix}/{prefix}/{object_id}/{fragment_index}
     if parts.len() < 2 {
         return Err(ObjectError::InvalidObjectId(key.to_string()));
     }
 
-    let hex_id = parts
+    let tail = parts
         .last()
         .ok_or_else(|| ObjectError::InvalidObjectId(key.to_string()))?;
 
-    u64::from_str_radix(hex_id, 16).map_err(|_| ObjectError::InvalidObjectId(key.to_string()))
+    // Try fragmented key first: .../{object_id}/{fragment_index}
+    if let Ok(fragment_index) = tail.parse::<usize>()
+        && fragment_index < CLOUD_FRAGMENT_COUNT
+    {
+        let hex_id = parts
+            .get(parts.len().saturating_sub(2))
+            .ok_or_else(|| ObjectError::InvalidObjectId(key.to_string()))?;
+        if hex_id.len() == 16 && hex_id.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return u64::from_str_radix(hex_id, 16)
+                .map_err(|_| ObjectError::InvalidObjectId(key.to_string()));
+        }
+    }
+
+    // Legacy key: .../{object_id}
+    u64::from_str_radix(tail, 16).map_err(|_| ObjectError::InvalidObjectId(key.to_string()))
 }
 
 // =============================================================================
@@ -675,6 +762,43 @@ mod tests {
         let object_id = parse_object_id_from_key(key).unwrap();
 
         assert_eq!(object_id, 0x1234);
+    }
+
+    #[test]
+    fn test_fragment_key_formatting() {
+        let data_prefix = "disk-a/objects/";
+        let object_id: u64 = 0x1234;
+
+        let key = format_object_fragment_key(data_prefix, object_id, 2);
+        assert_eq!(key, "disk-a/objects/0000/0000000000001234/2");
+    }
+
+    #[test]
+    fn test_fragment_key_parsing() {
+        let key = "disk-a/objects/0000/0000000000001234/3";
+        let object_id = parse_object_id_from_key(key).unwrap();
+
+        assert_eq!(object_id, 0x1234);
+    }
+
+    #[test]
+    fn test_validate_cloud_fragment_layout_ok() {
+        let full = CLOUD_FRAGMENT_SIZE;
+        let total = validate_cloud_fragment_layout(&[full, full, 123, 0]).unwrap();
+        assert_eq!(total, full * 2 + 123);
+    }
+
+    #[test]
+    fn test_validate_cloud_fragment_layout_rejects_non_empty_after_short() {
+        let full = CLOUD_FRAGMENT_SIZE;
+        let err = validate_cloud_fragment_layout(&[full, 7, 1, 0]).unwrap_err();
+        assert!(matches!(err, ObjectError::InvalidFragmentLayout(_)));
+    }
+
+    #[test]
+    fn test_validate_cloud_fragment_layout_rejects_wrong_count() {
+        let err = validate_cloud_fragment_layout(&[CLOUD_FRAGMENT_SIZE]).unwrap_err();
+        assert!(matches!(err, ObjectError::InvalidFragmentLayout(_)));
     }
 
     #[test]

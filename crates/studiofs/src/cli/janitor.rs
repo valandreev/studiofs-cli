@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opendal::services::S3;
-use opendal::{EntryMode, Operator};
-use studiofs_data::object::parse_object_id_from_key;
+use opendal::{EntryMode, ErrorKind, Operator};
+use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 use studiofs_meta::open_meta_engine;
 
 #[derive(Debug, Default)]
@@ -47,6 +47,7 @@ fn normalize_prefix(format_info: &studiofs_meta::FormatInfo) -> String {
 
 async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorStats> {
     let mut stats = JanitorStats::default();
+    let mut seen_objects = HashSet::new();
     let now = SystemTime::now();
     let now_unix = now
         .duration_since(UNIX_EPOCH)
@@ -66,6 +67,9 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
             Ok(id) => id,
             Err(_) => continue,
         };
+        if !seen_objects.insert(object_id) {
+            continue;
+        }
 
         if ctx.referenced.contains(&object_id) {
             stats.referenced_files = stats.referenced_files.saturating_add(1);
@@ -116,14 +120,24 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
             continue;
         }
 
-        match ctx.op.delete(&path).await {
-            Ok(_) => {
-                stats.deleted = stats.deleted.saturating_add(1);
-            }
-            Err(_) => {
-                stats.delete_errors = stats.delete_errors.saturating_add(1);
+        let mut delete_failed = false;
+        for key in format_object_fragment_keys(ctx.prefix, object_id) {
+            if let Err(err) = ctx.op.delete(&key).await {
+                if err.kind() == ErrorKind::NotFound {
+                    continue;
+                }
+                delete_failed = true;
+                eprintln!(
+                    "janitor: failed to delete fragment key={} object_id={}: {}",
+                    key, object_id, err
+                );
             }
         }
+        if delete_failed {
+            stats.delete_errors = stats.delete_errors.saturating_add(1);
+            continue;
+        }
+        stats.deleted = stats.deleted.saturating_add(1);
     }
 
     Ok(stats)

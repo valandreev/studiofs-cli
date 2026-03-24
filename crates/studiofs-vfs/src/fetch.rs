@@ -14,12 +14,13 @@ use crate::qos::QosController;
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::{StreamExt, stream::FuturesUnordered};
 use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::BlockCache;
-use studiofs_data::object::read_object;
+use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -52,6 +53,9 @@ pub enum FetchError {
 
     #[error("prefetch skipped: no foreground headroom")]
     PrefetchSkipped,
+
+    #[error("corrupt fragment layout for object {object_id}: {reason}")]
+    CorruptFragment { object_id: u64, reason: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,8 +208,8 @@ impl FetchScheduler {
     /// 3. AIMD-governed concurrency for the actual HTTP request.
     /// 4. Retry with exponential backoff on transient errors.
     /// 5. Cache population on success.
-    pub async fn fetch_block(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
-        self.fetch_block_with_class(object_id, key, FetchClass::Foreground)
+    pub async fn fetch_block(&self, object_id: u64, keys: &[String]) -> Result<Bytes, FetchError> {
+        self.fetch_block_with_class(object_id, keys, FetchClass::Foreground)
             .await
     }
 
@@ -216,16 +220,16 @@ impl FetchScheduler {
     pub async fn fetch_block_prefetch(
         &self,
         object_id: u64,
-        key: &str,
+        keys: &[String],
     ) -> Result<Bytes, FetchError> {
-        self.fetch_block_with_class(object_id, key, FetchClass::Prefetch)
+        self.fetch_block_with_class(object_id, keys, FetchClass::Prefetch)
             .await
     }
 
     async fn fetch_block_with_class(
         &self,
         object_id: u64,
-        key: &str,
+        keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
@@ -305,7 +309,7 @@ impl FetchScheduler {
             active: std::cell::Cell::new(true),
         };
 
-        let result = self.do_fetch_with_retry(object_id, key, class).await;
+        let result = self.do_fetch_with_retry(object_id, keys, class).await;
 
         // Notify waiters before cleanup removes the entry.
         let success = result.is_ok();
@@ -403,10 +407,64 @@ impl FetchScheduler {
 
     // ── Internal ────────────────────────────────────────────────────
 
-    /// Perform the actual S3 GET with retries, AIMD permit, decode, cache.
+    /// Fetch all remote fragments, decode them, reassemble, and populate cache.
     async fn do_fetch_with_retry(
         &self,
         object_id: u64,
+        keys: &[String],
+        class: FetchClass,
+    ) -> Result<Bytes, FetchError> {
+        // Fetch fragments concurrently and copy each part into its final offset
+        // as soon as it completes to avoid keeping both full `Vec<Bytes>` and
+        // final payload in memory at once.
+        let mut in_flight = FuturesUnordered::new();
+        for (fragment_index, key) in keys.iter().enumerate() {
+            let key = key.clone();
+            in_flight.push(async move {
+                self.fetch_fragment_with_retry(object_id, fragment_index, &key, class)
+                    .await
+                    .map(|part| (fragment_index, part))
+            });
+        }
+
+        let mut assembled = vec![0u8; keys.len().saturating_mul(CLOUD_FRAGMENT_SIZE)];
+        let mut lengths = vec![0usize; keys.len()];
+        while let Some(next) = in_flight.next().await {
+            let (fragment_index, part) = next?;
+            let start = fragment_index.saturating_mul(CLOUD_FRAGMENT_SIZE);
+            let end = start.saturating_add(part.len());
+            if end > assembled.len() {
+                return Err(FetchError::CacheWrite(std::io::Error::other(
+                    "fragment bounds exceed assembled payload buffer",
+                )));
+            }
+            assembled[start..end].copy_from_slice(&part);
+            lengths[fragment_index] = part.len();
+        }
+
+        let total_len = validate_cloud_fragment_layout(&lengths).map_err(|e| {
+            FetchError::CorruptFragment {
+                object_id,
+                reason: e.to_string(),
+            }
+        })?;
+        assembled.truncate(total_len);
+        let payload = Bytes::from(assembled);
+
+        // Populate cache (L1 + L2) with the reconstructed logical block.
+        self.cache
+            .put(object_id, payload.clone())
+            .await
+            .map_err(FetchError::CacheWrite)?;
+
+        Ok(payload)
+    }
+
+    /// Perform S3 GET for one fragment with retries + AIMD.
+    async fn fetch_fragment_with_retry(
+        &self,
+        object_id: u64,
+        fragment_index: usize,
         key: &str,
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
@@ -473,6 +531,7 @@ impl FetchScheduler {
 
                     debug!(
                         object_id,
+                        fragment_index,
                         key,
                         bytes = compressed.len(),
                         req_ms,
@@ -483,13 +542,6 @@ impl FetchScheduler {
 
                     // Decode STFS object payload.
                     let payload = read_object(compressed)?;
-
-                    // Populate cache (L1 + L2).
-                    self.cache
-                        .put(object_id, payload.clone())
-                        .await
-                        .map_err(FetchError::CacheWrite)?;
-
                     return Ok(payload);
                 }
                 Ok(Err(e)) => {
@@ -548,6 +600,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 delay_ms = delay.as_millis() as u64,
                                 is_server_overload,
@@ -560,6 +613,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 delay_ms = delay.as_millis() as u64,
                                 is_server_overload,
@@ -574,6 +628,7 @@ impl FetchScheduler {
                             debug!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 error = %e,
@@ -583,6 +638,7 @@ impl FetchScheduler {
                             error!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 error = %e,
@@ -616,6 +672,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 timeout_s = self.request_timeout.as_secs(),
                                 delay_ms = delay.as_millis() as u64,
                                 "prefetch timed out, retrying"
@@ -625,6 +682,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 timeout_s = self.request_timeout.as_secs(),
                                 delay_ms = delay.as_millis() as u64,
                                 "fetch timed out, retrying (AIMD window unchanged)"
@@ -636,6 +694,7 @@ impl FetchScheduler {
                             debug!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 "prefetch timed out, retries exhausted"
                             );
@@ -643,6 +702,7 @@ impl FetchScheduler {
                             error!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 "fetch timed out, all retries exhausted"
                             );

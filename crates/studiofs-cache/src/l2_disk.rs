@@ -269,7 +269,7 @@ fn read_block_buffered(path: &Path, expected_len_hint: Option<usize>) -> io::Res
         },
     };
     let mut out = Vec::with_capacity(capacity);
-    
+
     // Read in 1MB chunks to avoid saturating the disk queue with a single massive
     // I/O request. This allows the OS to interleave smaller foreground client
     // reads, preventing up to 10x latency spikes during background S3 uploads.
@@ -280,7 +280,7 @@ fn read_block_buffered(path: &Path, expected_len_hint: Option<usize>) -> io::Res
             break;
         }
     }
-    
+
     apply_l2_read_close_hints(&file);
     Ok(Bytes::from(out))
 }
