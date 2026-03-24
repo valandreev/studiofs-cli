@@ -2,12 +2,14 @@
 //!
 //! Requires RustFS/S3 + PostgreSQL test env (ignored by default).
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
-use studiofs_data::object::{create_object_buffer, format_object_key, read_object};
+use studiofs_data::object::{
+    CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys, read_object,
+};
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
     BlockRef, MetaOpenOptions, ROOT_INO, ensure_studiofs_database, open_meta_engine,
@@ -106,6 +108,49 @@ fn default_meta_dir(home: &Path, name: &str) -> PathBuf {
     home.join(".studiofs").join("meta").join(name)
 }
 
+async fn put_fragmented_object(
+    store: &DataStore,
+    data_prefix: &str,
+    object_id: u64,
+    payload: Bytes,
+) -> Result<(), String> {
+    let keys = format_object_fragment_keys(data_prefix, object_id);
+    for (fragment_index, key) in keys.iter().enumerate() {
+        let start = fragment_index * CLOUD_FRAGMENT_SIZE;
+        let end = (start + CLOUD_FRAGMENT_SIZE).min(payload.len());
+        let fragment_payload = if start < payload.len() {
+            payload.slice(start..end)
+        } else {
+            Bytes::new()
+        };
+        let object = create_object_buffer(fragment_payload)
+            .map_err(|e| format!("encode object fragment: {e}"))?;
+        store
+            .put_by_key(key, object)
+            .await
+            .map_err(|e| format!("write object fragment: {e}"))?;
+    }
+    Ok(())
+}
+
+async fn get_fragmented_object(
+    store: &DataStore,
+    data_prefix: &str,
+    object_id: u64,
+) -> Result<Bytes, String> {
+    let keys = format_object_fragment_keys(data_prefix, object_id);
+    let mut payload = BytesMut::new();
+    for key in &keys {
+        let raw = store
+            .get_by_key(key)
+            .await
+            .map_err(|e| format!("read object fragment: {e}"))?;
+        let fragment = read_object(raw).map_err(|e| format!("decode object fragment: {e}"))?;
+        payload.extend_from_slice(&fragment);
+    }
+    Ok(payload.freeze())
+}
+
 fn resolved_pg_dsn(raw: &str) -> String {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async { ensure_studiofs_database(raw).await })
@@ -180,12 +225,18 @@ fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
         attr.committed_size = payload.len() as u64;
         meta.set_attr(&attr).expect("set attr");
 
-        let object = create_object_buffer(Bytes::copy_from_slice(payload)).expect("encode object");
-        let key = format_object_key(&format_info.data_prefix, object_id);
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(async { store.put_by_key(&key, object).await })
-            .expect("put object");
+        rt.block_on(async {
+            put_fragmented_object(
+                &store,
+                &format_info.data_prefix,
+                object_id,
+                Bytes::copy_from_slice(payload),
+            )
+            .await
+        })
+        .expect("put object");
 
         meta.flush_metadata().expect("flush metadata");
         // The next step shells out to `studiofs dump`, which re-opens this same
@@ -215,13 +266,13 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
             .get_file_block(entry.ino, 0)
             .expect("get file block")
             .expect("block 0 exists");
-        let key = format_object_key(&format_info.data_prefix, block.object_id);
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let raw = rt
-            .block_on(async { store.get_by_key(&key).await })
+        let decoded = rt
+            .block_on(async {
+                get_fragmented_object(&store, &format_info.data_prefix, block.object_id).await
+            })
             .expect("get object");
-        let decoded = read_object(raw).expect("decode object");
         assert_eq!(decoded, expected);
         drop(meta);
     }

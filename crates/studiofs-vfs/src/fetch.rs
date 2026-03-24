@@ -204,8 +204,8 @@ impl FetchScheduler {
     /// 3. AIMD-governed concurrency for the actual HTTP request.
     /// 4. Retry with exponential backoff on transient errors.
     /// 5. Cache population on success.
-    pub async fn fetch_block(&self, object_id: u64, key: &str) -> Result<Bytes, FetchError> {
-        self.fetch_block_with_class(object_id, key, FetchClass::Foreground)
+    pub async fn fetch_block(&self, object_id: u64, keys: &[String]) -> Result<Bytes, FetchError> {
+        self.fetch_block_with_class(object_id, keys, FetchClass::Foreground)
             .await
     }
 
@@ -216,16 +216,16 @@ impl FetchScheduler {
     pub async fn fetch_block_prefetch(
         &self,
         object_id: u64,
-        key: &str,
+        keys: &[String],
     ) -> Result<Bytes, FetchError> {
-        self.fetch_block_with_class(object_id, key, FetchClass::Prefetch)
+        self.fetch_block_with_class(object_id, keys, FetchClass::Prefetch)
             .await
     }
 
     async fn fetch_block_with_class(
         &self,
         object_id: u64,
-        key: &str,
+        keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
@@ -305,7 +305,7 @@ impl FetchScheduler {
             active: std::cell::Cell::new(true),
         };
 
-        let result = self.do_fetch_with_retry(object_id, key, class).await;
+        let result = self.do_fetch_with_retry(object_id, keys, class).await;
 
         // Notify waiters before cleanup removes the entry.
         let success = result.is_ok();
@@ -403,10 +403,36 @@ impl FetchScheduler {
 
     // ── Internal ────────────────────────────────────────────────────
 
-    /// Perform the actual S3 GET with retries, AIMD permit, decode, cache.
+    /// Fetch all remote fragments, decode them, reassemble, and populate cache.
     async fn do_fetch_with_retry(
         &self,
         object_id: u64,
+        keys: &[String],
+        class: FetchClass,
+    ) -> Result<Bytes, FetchError> {
+        let mut payload = bytes::BytesMut::new();
+        for (fragment_index, key) in keys.iter().enumerate() {
+            let part = self
+                .fetch_fragment_with_retry(object_id, fragment_index, key, class)
+                .await?;
+            payload.extend_from_slice(&part);
+        }
+        let payload = payload.freeze();
+
+        // Populate cache (L1 + L2) with the reconstructed logical block.
+        self.cache
+            .put(object_id, payload.clone())
+            .await
+            .map_err(FetchError::CacheWrite)?;
+
+        Ok(payload)
+    }
+
+    /// Perform S3 GET for one fragment with retries + AIMD.
+    async fn fetch_fragment_with_retry(
+        &self,
+        object_id: u64,
+        fragment_index: usize,
         key: &str,
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
@@ -473,6 +499,7 @@ impl FetchScheduler {
 
                     debug!(
                         object_id,
+                        fragment_index,
                         key,
                         bytes = compressed.len(),
                         req_ms,
@@ -483,13 +510,6 @@ impl FetchScheduler {
 
                     // Decode STFS object payload.
                     let payload = read_object(compressed)?;
-
-                    // Populate cache (L1 + L2).
-                    self.cache
-                        .put(object_id, payload.clone())
-                        .await
-                        .map_err(FetchError::CacheWrite)?;
-
                     return Ok(payload);
                 }
                 Ok(Err(e)) => {
@@ -548,6 +568,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 delay_ms = delay.as_millis() as u64,
                                 is_server_overload,
@@ -560,6 +581,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 delay_ms = delay.as_millis() as u64,
                                 is_server_overload,
@@ -574,6 +596,7 @@ impl FetchScheduler {
                             debug!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 error = %e,
@@ -583,6 +606,7 @@ impl FetchScheduler {
                             error!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 req_ms,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 error = %e,
@@ -616,6 +640,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 timeout_s = self.request_timeout.as_secs(),
                                 delay_ms = delay.as_millis() as u64,
                                 "prefetch timed out, retrying"
@@ -625,6 +650,7 @@ impl FetchScheduler {
                                 attempt = attempt + 1,
                                 max = max_attempts,
                                 key,
+                                fragment_index,
                                 timeout_s = self.request_timeout.as_secs(),
                                 delay_ms = delay.as_millis() as u64,
                                 "fetch timed out, retrying (AIMD window unchanged)"
@@ -636,6 +662,7 @@ impl FetchScheduler {
                             debug!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 "prefetch timed out, retries exhausted"
                             );
@@ -643,6 +670,7 @@ impl FetchScheduler {
                             error!(
                                 attempts = max_attempts,
                                 key,
+                                fragment_index,
                                 total_ms = overall_start.elapsed().as_millis() as u64,
                                 "fetch timed out, all retries exhausted"
                             );

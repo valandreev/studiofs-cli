@@ -20,7 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_data::object::{create_object_buffer, format_object_key, read_object};
+use studiofs_data::object::{
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
+    format_object_fragment_keys, format_object_key, read_object,
+};
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::engine::{PendingCreateRecord, UndoLogKind};
 use studiofs_meta::types::SetattrArgs;
@@ -907,6 +910,88 @@ async fn wait_until_absent(ds: &DataStore, path: &str, timeout: Duration) -> boo
     }
 }
 
+async fn wait_until_object_exists(
+    ds: &DataStore,
+    data_prefix: &str,
+    object_id: u64,
+    timeout: Duration,
+) -> bool {
+    let keys = format_object_fragment_keys(data_prefix, object_id);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all_visible = true;
+        for key in &keys {
+            match ds.exists(key).await {
+                Ok(true) => {}
+                _ => {
+                    all_visible = false;
+                    break;
+                }
+            }
+        }
+        if all_visible {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_until_object_absent(
+    ds: &DataStore,
+    data_prefix: &str,
+    object_id: u64,
+    timeout: Duration,
+) -> bool {
+    let keys = format_object_fragment_keys(data_prefix, object_id);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all_absent = true;
+        for key in &keys {
+            match ds.exists(key).await {
+                Ok(false) | Err(_) => {}
+                Ok(true) => {
+                    all_absent = false;
+                    break;
+                }
+            }
+        }
+        if all_absent {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn put_fragmented_object(
+    ds: &DataStore,
+    data_prefix: &str,
+    object_id: u64,
+    payload: Bytes,
+) -> Result<(), String> {
+    let keys = format_object_fragment_keys(data_prefix, object_id);
+    for (fragment_index, key) in keys.iter().enumerate() {
+        let start = fragment_index * CLOUD_FRAGMENT_SIZE;
+        let end = (start + CLOUD_FRAGMENT_SIZE).min(payload.len());
+        let fragment_payload = if start < payload.len() {
+            payload.slice(start..end)
+        } else {
+            Bytes::new()
+        };
+        let object_bytes =
+            create_object_buffer(fragment_payload).map_err(|e| format!("encode fragment: {e}"))?;
+        ds.put_by_key(key, object_bytes)
+            .await
+            .map_err(|e| format!("write fragment: {e}"))?;
+    }
+    Ok(())
+}
+
 async fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
 where
     F: FnMut() -> bool,
@@ -971,9 +1056,14 @@ async fn seed_committed_file(
 
     for (block_index, chunk) in payload.chunks(block_size).enumerate() {
         let object_id = object_ids[block_index];
-        let key = format_object_key(&format_info.data_prefix, object_id);
-        let object_bytes = create_object_buffer(Bytes::copy_from_slice(chunk)).unwrap();
-        store.put_by_key(&key, object_bytes).await.unwrap();
+        put_fragmented_object(
+            &store,
+            &format_info.data_prefix,
+            object_id,
+            Bytes::copy_from_slice(chunk),
+        )
+        .await
+        .unwrap();
 
         let block_ref = if chunk.len() == block_size {
             BlockRef::new_full(object_id, chunk.len() as u32)
@@ -1367,12 +1457,17 @@ async fn test_pending_deletions_gc() {
         .expect("Should have 1 block after initial write");
     assert_eq!(blocks_before.len(), 1);
     let old_block_id = blocks_before[0].1.object_id;
-    let old_key = format_object_key(&info.data_prefix, old_block_id);
 
     // Under the committed/overlay model, the old block becomes GC-eligible
     // only after it has actually been uploaded.
     assert!(
-        wait_until_exists(&ds, &old_key, Duration::from_secs(20)).await,
+        wait_until_object_exists(
+            &ds,
+            &info.data_prefix,
+            old_block_id,
+            Duration::from_secs(20)
+        )
+        .await,
         "initial object should be uploaded before overwrite GC check"
     );
     assert!(
@@ -1447,28 +1542,30 @@ async fn test_background_janitor_removes_orphan_object() {
 
     // Upload an orphan object directly to data storage (metadata doesn't reference it).
     let orphan_id = 0xdead_beef_u64;
-    let orphan_key = format_object_key(&info.data_prefix, orphan_id);
-    if let Err(err) = ds
-        .operator()
-        .write(&orphan_key, Bytes::from_static(b"orphan-object"))
-        .await
-    {
-        if err.to_string().contains("NoSuchBucket") {
-            eprintln!(
-                "skip test_background_janitor_removes_orphan_object: {}",
-                err
-            );
-            return;
+    for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
+        let key = format_object_fragment_key(&info.data_prefix, orphan_id, fragment_index as u8);
+        if let Err(err) = ds
+            .operator()
+            .write(&key, Bytes::from_static(b"orphan-object"))
+            .await
+        {
+            if err.to_string().contains("NoSuchBucket") {
+                eprintln!(
+                    "skip test_background_janitor_removes_orphan_object: {}",
+                    err
+                );
+                return;
+            }
+            panic!("failed to write orphan object: {}", err);
         }
-        panic!("failed to write orphan object: {}", err);
     }
     assert!(
-        wait_until_exists(&ds, &orphan_key, Duration::from_secs(5)).await,
+        wait_until_object_exists(&ds, &info.data_prefix, orphan_id, Duration::from_secs(5)).await,
         "orphan object must exist before janitor cycle"
     );
 
     assert!(
-        wait_until_absent(&ds, &orphan_key, Duration::from_secs(20)).await,
+        wait_until_object_absent(&ds, &info.data_prefix, orphan_id, Duration::from_secs(20)).await,
         "background janitor should delete orphan object"
     );
 }
@@ -1507,9 +1604,14 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
         .expect("expected at least one block reference after flush");
     let object_id = blocks[0].1.object_id;
-    let key = format_object_key(&info.data_prefix, object_id);
-    let object_bytes = create_object_buffer(Bytes::from(payload.clone())).unwrap();
-    if let Err(err) = ds.operator().write(&key, object_bytes).await {
+    if let Err(err) = put_fragmented_object(
+        &ds,
+        &info.data_prefix,
+        object_id,
+        Bytes::from(payload.clone()),
+    )
+    .await
+    {
         if err.to_string().contains("NoSuchBucket") {
             eprintln!(
                 "skip test_background_janitor_cleans_simulated_crash_orphan: {}",
@@ -1520,7 +1622,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
         panic!("failed to write simulated crash object: {}", err);
     }
     assert!(
-        wait_until_exists(&ds, &key, Duration::from_secs(5)).await,
+        wait_until_object_exists(&ds, &info.data_prefix, object_id, Duration::from_secs(5)).await,
         "uploaded data object should exist before simulated crash"
     );
 
@@ -1533,7 +1635,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 
     // 3) Janitor should eventually detect object as orphan and delete it.
     assert!(
-        wait_until_absent(&ds, &key, Duration::from_secs(25)).await,
+        wait_until_object_absent(&ds, &info.data_prefix, object_id, Duration::from_secs(25)).await,
         "background janitor should clean orphan object from simulated crash"
     );
 }
@@ -1909,11 +2011,16 @@ fn test_crash_recovery_replays_pending_journal() {
         let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
         assert!(!blocks.is_empty(), "file blocks must exist in metadata");
         let object_id = blocks[0].1.object_id;
-        let key = format_object_key(&online_info.data_prefix, object_id);
         let check_store = DataStore::new(&DataStoreConfig::from(&online_info)).unwrap();
 
         assert!(
-            wait_until_exists(&check_store, &key, Duration::from_secs(15)).await,
+            wait_until_object_exists(
+                &check_store,
+                &online_info.data_prefix,
+                object_id,
+                Duration::from_secs(15),
+            )
+            .await,
             "recovered uploader should eventually upload object {object_id}"
         );
     });
@@ -2004,9 +2111,14 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             baseline_object_id = blocks[0].1.object_id;
 
             let ds = DataStore::new(&data_config).unwrap();
-            let key = format_object_key(&format_info.data_prefix, baseline_object_id);
             assert!(
-                wait_until_exists(&ds, &key, Duration::from_secs(60)).await,
+                wait_until_object_exists(
+                    &ds,
+                    &format_info.data_prefix,
+                    baseline_object_id,
+                    Duration::from_secs(60),
+                )
+                .await,
                 "baseline object should be uploaded before overwrite crash test"
             );
 
@@ -3136,9 +3248,14 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 .expect("expected committed baseline block refs");
             baseline_object_id = baseline[0].1.object_id;
             let ds = DataStore::new(&data_config_online).unwrap();
-            let key = format_object_key(&format_info.data_prefix, baseline_object_id);
             assert!(
-                wait_until_exists(&ds, &key, Duration::from_secs(15)).await,
+                wait_until_object_exists(
+                    &ds,
+                    &format_info.data_prefix,
+                    baseline_object_id,
+                    Duration::from_secs(15),
+                )
+                .await,
                 "baseline object should exist before replacement spill replay test"
             );
             vfs.shutdown(Duration::from_secs(15)).await;
@@ -5908,10 +6025,15 @@ fn test_write_fast_mode_no_spill_artifacts() {
         }
         let object_id =
             object_id.expect("expected pending/committed object id for fast-mode write");
-        let key = format_object_key(&format_info.data_prefix, object_id);
         let ds = DataStore::new(&data_config).unwrap();
         assert!(
-            wait_until_exists(&ds, &key, Duration::from_secs(60)).await,
+            wait_until_object_exists(
+                &ds,
+                &format_info.data_prefix,
+                object_id,
+                Duration::from_secs(60)
+            )
+            .await,
             "fast-mode flush should still publish object to remote store"
         );
 

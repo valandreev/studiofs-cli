@@ -55,7 +55,8 @@ use studiofs_cache::metrics::{
 };
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
-    create_object_buffer, format_object_key, parse_object_id_from_key, read_object,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
+    parse_object_id_from_key, read_object,
 };
 use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
@@ -8615,10 +8616,10 @@ impl StudioVfs {
         }
 
         // Best-effort prefetch: keep reserved AIMD headroom for foreground reads.
-        let key = format_object_key(&self.data_prefix, block_ref.object_id);
+        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
         let _ = self
             .fetch_scheduler
-            .fetch_block_prefetch(block_ref.object_id, &key)
+            .fetch_block_prefetch(block_ref.object_id, &keys)
             .await;
         self.readahead.finish_prefetch(ino, block_index);
     }
@@ -8638,9 +8639,9 @@ impl StudioVfs {
             .await?
             .ok_or(VfsError::BlockNotFound(ino, block_index))?;
 
-        let key = format_object_key(&self.data_prefix, block_ref.object_id);
+        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
         self.fetch_scheduler
-            .fetch_block(block_ref.object_id, &key)
+            .fetch_block(block_ref.object_id, &keys)
             .await
             .map_err(|e| match e {
                 crate::fetch::FetchError::NotFound { .. } => {
@@ -8664,21 +8665,26 @@ impl StudioVfs {
             return Ok(cached);
         }
 
-        let key = format_object_key(&self.data_prefix, block_ref.object_id);
-        let compressed = self
-            .fetch_scheduler
-            .data_store()
-            .get_by_key(&key)
-            .await
-            .map_err(|e| match e {
-                studiofs_data::store::DataError::OpenDal(oe)
-                    if oe.kind() == ErrorKind::NotFound =>
-                {
-                    VfsError::BlockNotFound(ino, block_index)
-                }
-                other => VfsError::Other(other.to_string()),
-            })?;
-        let data = read_object(compressed).map_err(|e| VfsError::Other(e.to_string()))?;
+        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
+        let mut data = BytesMut::new();
+        for key in &keys {
+            let compressed = self
+                .fetch_scheduler
+                .data_store()
+                .get_by_key(key)
+                .await
+                .map_err(|e| match e {
+                    studiofs_data::store::DataError::OpenDal(oe)
+                        if oe.kind() == ErrorKind::NotFound =>
+                    {
+                        VfsError::BlockNotFound(ino, block_index)
+                    }
+                    other => VfsError::Other(other.to_string()),
+                })?;
+            let fragment = read_object(compressed).map_err(|e| VfsError::Other(e.to_string()))?;
+            data.extend_from_slice(&fragment);
+        }
+        let data = data.freeze();
 
         // Warm L2 (disk cache) so subsequent reads of the same block avoid
         // another S3 round-trip.  L1 (RAM) promotion is intentionally skipped
@@ -8846,10 +8852,10 @@ impl StudioVfs {
         }
 
         // Fetch from S3 via FetchScheduler (handles retry, AIMD, singleflight)
-        let key = format_object_key(&self.data_prefix, block_ref.object_id);
+        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
         let data = self
             .fetch_scheduler
-            .fetch_block(block_ref.object_id, &key)
+            .fetch_block(block_ref.object_id, &keys)
             .await
             .map_err(|e| VfsError::Other(e.to_string()))?;
 
@@ -9245,48 +9251,61 @@ impl StudioVfs {
         }
 
         let t0 = Instant::now();
-        let key = format_object_key(&self.data_prefix, op.object_id);
+        let fragment_keys = format_object_fragment_keys(&self.data_prefix, op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
-            match run_with_timeout_or_cancel(
-                &upload_cancel_token,
-                Duration::from_secs(5),
-                self.fetch_scheduler.data_store().exists(&key),
-            )
-            .await
-            {
-                TimeoutOrCancel::Completed(Ok(true)) => {
-                    remote_object_visible = true;
-                    debug!(
-                        object_id = op.object_id,
-                        ino = op.ino,
-                        block_index,
-                        retry_count = op.retry_count,
-                        "upload reconcile: remote object already visible, skipping re-upload"
-                    );
+            let mut all_visible = true;
+            for key in &fragment_keys {
+                match run_with_timeout_or_cancel(
+                    &upload_cancel_token,
+                    Duration::from_secs(5),
+                    self.fetch_scheduler.data_store().exists(key),
+                )
+                .await
+                {
+                    TimeoutOrCancel::Completed(Ok(true)) => {}
+                    TimeoutOrCancel::Completed(Ok(false)) => {
+                        all_visible = false;
+                        break;
+                    }
+                    TimeoutOrCancel::Completed(Err(err)) => {
+                        all_visible = false;
+                        debug!(
+                            object_id = op.object_id,
+                            key,
+                            error = %err,
+                            retry_count = op.retry_count,
+                            "upload reconcile: remote exists() check failed, falling back to upload"
+                        );
+                        break;
+                    }
+                    TimeoutOrCancel::TimedOut => {
+                        all_visible = false;
+                        debug!(
+                            object_id = op.object_id,
+                            key,
+                            retry_count = op.retry_count,
+                            "upload reconcile: remote exists() check timed out, falling back to upload"
+                        );
+                        break;
+                    }
+                    // Shutdown cancellation: keep op pending in journal by exiting
+                    // before any completion path.
+                    TimeoutOrCancel::Cancelled => {
+                        self.cancel_upload_if_inode_deleted(&op);
+                        return Ok(());
+                    }
                 }
-                TimeoutOrCancel::Completed(Ok(false)) => {}
-                TimeoutOrCancel::Completed(Err(err)) => {
-                    debug!(
-                        object_id = op.object_id,
-                        error = %err,
-                        retry_count = op.retry_count,
-                        "upload reconcile: remote exists() check failed, falling back to upload"
-                    );
-                }
-                TimeoutOrCancel::TimedOut => {
-                    debug!(
-                        object_id = op.object_id,
-                        retry_count = op.retry_count,
-                        "upload reconcile: remote exists() check timed out, falling back to upload"
-                    );
-                }
-                // Shutdown cancellation: keep op pending in journal by exiting
-                // before any completion path.
-                TimeoutOrCancel::Cancelled => {
-                    self.cancel_upload_if_inode_deleted(&op);
-                    return Ok(());
-                }
+            }
+            if all_visible {
+                remote_object_visible = true;
+                debug!(
+                    object_id = op.object_id,
+                    ino = op.ino,
+                    block_index,
+                    retry_count = op.retry_count,
+                    "upload reconcile: remote object already visible, skipping re-upload"
+                );
             }
         }
 
@@ -9312,7 +9331,7 @@ impl StudioVfs {
             .await
             .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
         // Read raw block payload from cache only when we really need to upload.
-        let object_bytes: Option<Buffer> = if remote_object_visible {
+        let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
             None
         } else {
             let raw_payload = match self
@@ -9325,46 +9344,53 @@ impl StudioVfs {
                     // Block data is missing from cache. If remote already has
                     // this object, we can still continue with commit reconcile.
                     if op.retry_count > 0 {
-                        match run_with_timeout_or_cancel(
-                            &upload_cancel_token,
-                            Duration::from_secs(5),
-                            self.fetch_scheduler.data_store().exists(&key),
-                        )
-                        .await
-                        {
-                            TimeoutOrCancel::Completed(Ok(true)) => {
-                                debug!(
-                                    object_id = op.object_id,
-                                    ino = op.ino,
-                                    block_index,
-                                    retry_count = op.retry_count,
-                                    "upload reconcile: cache entry missing but remote object exists"
-                                );
-                                remote_object_visible = true;
-                                Bytes::new()
-                            }
-                            TimeoutOrCancel::Completed(Ok(false))
-                            | TimeoutOrCancel::Completed(Err(_))
-                            | TimeoutOrCancel::TimedOut => {
-                                // If the inode was deleted between our checks
-                                // (race), cancel cleanly. Otherwise this remains a
-                                // genuine error and will be retried.
-                                if self.state.deleted_inodes.lock().contains(&op.ino) {
-                                    self.block_cache.cancel_upload(&op, false);
-                                    self.state.pending_evictions.lock().remove(&op.object_id);
+                        let mut all_visible = true;
+                        for key in &fragment_keys {
+                            match run_with_timeout_or_cancel(
+                                &upload_cancel_token,
+                                Duration::from_secs(5),
+                                self.fetch_scheduler.data_store().exists(key),
+                            )
+                            .await
+                            {
+                                TimeoutOrCancel::Completed(Ok(true)) => {}
+                                TimeoutOrCancel::Completed(Ok(false))
+                                | TimeoutOrCancel::Completed(Err(_))
+                                | TimeoutOrCancel::TimedOut => {
+                                    all_visible = false;
+                                    break;
+                                }
+                                // Shutdown cancellation: exit quietly so worker
+                                // loop does not requeue/log as transient failure.
+                                TimeoutOrCancel::Cancelled => {
+                                    self.cancel_upload_if_inode_deleted(&op);
                                     return Ok(());
                                 }
-                                return Err(VfsError::Other(format!(
-                                    "object {} missing from cache",
-                                    op.object_id
-                                )));
                             }
-                            // Shutdown cancellation: exit quietly so worker loop
-                            // does not requeue/log as transient failure.
-                            TimeoutOrCancel::Cancelled => {
-                                self.cancel_upload_if_inode_deleted(&op);
+                        }
+                        if all_visible {
+                            debug!(
+                                object_id = op.object_id,
+                                ino = op.ino,
+                                block_index,
+                                retry_count = op.retry_count,
+                                "upload reconcile: cache entry missing but remote object exists"
+                            );
+                            remote_object_visible = true;
+                            Bytes::new()
+                        } else {
+                            // If the inode was deleted between our checks
+                            // (race), cancel cleanly. Otherwise this remains a
+                            // genuine error and will be retried.
+                            if self.state.deleted_inodes.lock().contains(&op.ino) {
+                                self.block_cache.cancel_upload(&op, false);
+                                self.state.pending_evictions.lock().remove(&op.object_id);
                                 return Ok(());
                             }
+                            return Err(VfsError::Other(format!(
+                                "object {} missing from cache",
+                                op.object_id
+                            )));
                         }
                     } else {
                         // First attempt without cache data is unexpected; retry
@@ -9387,32 +9413,57 @@ impl StudioVfs {
             if remote_object_visible {
                 None
             } else {
-                Some(create_object_buffer(raw_payload)?)
+                let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
+                for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
+                    let start = fragment_index * CLOUD_FRAGMENT_SIZE;
+                    let end = (start + CLOUD_FRAGMENT_SIZE).min(raw_payload.len());
+                    let fragment_payload = if start < raw_payload.len() {
+                        raw_payload.slice(start..end)
+                    } else {
+                        Bytes::new()
+                    };
+                    fragments.push(create_object_buffer(fragment_payload)?);
+                }
+                Some(fragments)
             }
         };
         drop(_upload_io_permit);
 
         if let Some(object_bytes) = object_bytes {
-            match self
-                .upload_scheduler
-                .put(&key, object_bytes, &upload_cancel_token)
-                .await
+            for (fragment_index, (key, payload)) in fragment_keys
+                .iter()
+                .zip(object_bytes.into_iter())
+                .enumerate()
             {
-                Ok(()) => {}
-                // Treat cancellation as an intentional shutdown path:
-                // do not mark sticky errors and do not trigger in-memory requeue.
-                // Because `complete_upload` is not called, the pending op remains
-                // in the persistent journal for safe resume on next mount.
-                Err(crate::upload::UploadError::Cancelled) => {
-                    self.cancel_upload_if_inode_deleted(&op);
-                    return Ok(());
+                match self
+                    .upload_scheduler
+                    .put(key, payload, &upload_cancel_token)
+                    .await
+                {
+                    Ok(()) => {}
+                    // Treat cancellation as an intentional shutdown path:
+                    // do not mark sticky errors and do not trigger in-memory requeue.
+                    // Because `complete_upload` is not called, the pending op remains
+                    // in the persistent journal for safe resume on next mount.
+                    Err(crate::upload::UploadError::Cancelled) => {
+                        self.cancel_upload_if_inode_deleted(&op);
+                        return Ok(());
+                    }
+                    Err(e) => return Err(VfsError::Other(e.to_string())),
                 }
-                Err(e) => return Err(VfsError::Other(e.to_string())),
+                debug!(
+                    ino = op.ino,
+                    object_id = op.object_id,
+                    block_index,
+                    fragment_index,
+                    "process_upload fragment put completed"
+                );
             }
             debug!(
                 ino = op.ino,
                 object_id = op.object_id,
                 block_index,
+                fragments = CLOUD_FRAGMENT_COUNT,
                 "process_upload put completed"
             );
         }
@@ -9523,10 +9574,10 @@ impl StudioVfs {
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
             let metadata_backlog = self.meta.replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
-            
+
             let is_active = Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
             let activity_started = is_active && !upload_pipeline_summary_was_active;
-            
+
             let should_log = if activity_started {
                 ticks_since_last_log = 0;
                 true
@@ -9557,7 +9608,7 @@ impl StudioVfs {
                     "upload pipeline"
                 );
             }
-            
+
             upload_pipeline_summary_was_active = is_active;
             debug!(
                 dentry_cache_entries = dentry_cache.occupancy_entries,
@@ -9829,30 +9880,32 @@ impl StudioVfs {
                             continue;
                         }
 
-                        // Delete from S3
-                        let key = format_object_key(&self.data_prefix, object_id);
-                        match self.data_write.delete_by_key(&key).await {
-                            Ok(_) => {
-                                // Remove from pending deletions
-                                let meta = self.meta.clone();
-                                if let Err(e) =
-                                    run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                                        engine.remove_pending_deletion(object_id)?;
-                                        Ok(())
-                                    })
-                                    .await
-                                {
-                                    warn!(
-                                        "failed to remove pending deletion for {}: {}",
-                                        object_id, e
-                                    );
-                                }
-                                deleted_count += 1;
-                                debug!("GC deleted object {}", object_id);
+                        // Delete all cloud fragments for the logical object.
+                        let mut delete_failed = false;
+                        for key in format_object_fragment_keys(&self.data_prefix, object_id) {
+                            if let Err(e) = self.data_write.delete_by_key(&key).await {
+                                delete_failed = true;
+                                warn!(
+                                    object_id,
+                                    key,
+                                    error = %e,
+                                    "failed to delete object fragment from S3"
+                                );
                             }
-                            Err(e) => {
-                                warn!("failed to delete object {} from S3: {}", object_id, e);
+                        }
+                        if !delete_failed {
+                            // Remove from pending deletions
+                            let meta = self.meta.clone();
+                            if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                                engine.remove_pending_deletion(object_id)?;
+                                Ok(())
+                            })
+                            .await
+                            {
+                                warn!("failed to remove pending deletion for {}: {}", object_id, e);
                             }
+                            deleted_count += 1;
+                            debug!("GC deleted object {}", object_id);
                         }
                     }
                     if deleted_count > 0 {
@@ -10067,6 +10120,7 @@ impl StudioVfs {
             let mut skipped_cap: u64 = 0;
             let mut skipped_non_object_key: u64 = 0;
             let mut delete_errors: u64 = 0;
+            let mut seen_objects: HashSet<u64> = HashSet::new();
 
             for entry in entries {
                 if entry.metadata().mode() != EntryMode::FILE {
@@ -10081,6 +10135,9 @@ impl StudioVfs {
                         continue;
                     }
                 };
+                if !seen_objects.insert(object_id) {
+                    continue;
+                }
                 if referenced.contains(&object_id) {
                     continue;
                 }
@@ -10116,9 +10173,15 @@ impl StudioVfs {
                     continue;
                 }
 
-                if let Err(e) = self.data_write.operator().delete(path).await {
+                let mut delete_failed = false;
+                for key in format_object_fragment_keys(&self.data_prefix, object_id) {
+                    if let Err(e) = self.data_write.operator().delete(&key).await {
+                        delete_failed = true;
+                        warn!(cycle, key, error = %e, "janitor: fragment delete failed");
+                    }
+                }
+                if delete_failed {
                     delete_errors = delete_errors.saturating_add(1);
-                    warn!(cycle, path, error = %e, "janitor: delete failed");
                     continue;
                 }
                 deleted = deleted.saturating_add(1);

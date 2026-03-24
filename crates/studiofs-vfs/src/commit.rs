@@ -94,22 +94,27 @@ impl CommitCoordinator {
         loop {
             let mut all_visible = true;
             for (_, extent) in live_extents {
-                let key = format_object_key(&vfs.data_prefix, extent.object_id);
-                match vfs.fetch_scheduler.data_store().exists(&key).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        all_visible = false;
-                        break;
+                for key in format_object_fragment_keys(&vfs.data_prefix, extent.object_id) {
+                    match vfs.fetch_scheduler.data_store().exists(&key).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            all_visible = false;
+                            break;
+                        }
+                        Err(err) => {
+                            all_visible = false;
+                            tracing::debug!(
+                                object_id = extent.object_id,
+                                key,
+                                error = %err,
+                                "publish visibility check failed, will retry"
+                            );
+                            break;
+                        }
                     }
-                    Err(err) => {
-                        all_visible = false;
-                        tracing::debug!(
-                            object_id = extent.object_id,
-                            error = %err,
-                            "publish visibility check failed, will retry"
-                        );
-                        break;
-                    }
+                }
+                if !all_visible {
+                    break;
                 }
             }
 
@@ -146,18 +151,23 @@ async fn requeue_missing_manifest_uploads(
             continue;
         }
 
-        let key = format_object_key(&vfs.data_prefix, block_ref.object_id);
-        let visible = match tokio::time::timeout(
-            Duration::from_secs(3),
-            vfs.fetch_scheduler.data_store().exists(&key),
-        )
-        .await
-        {
-            Ok(Ok(true)) => true,
-            Ok(Ok(false)) => false,
-            Ok(Err(_)) => false,
-            Err(_) => false,
-        };
+        let mut visible = true;
+        for key in format_object_fragment_keys(&vfs.data_prefix, block_ref.object_id) {
+            visible = match tokio::time::timeout(
+                Duration::from_secs(3),
+                vfs.fetch_scheduler.data_store().exists(&key),
+            )
+            .await
+            {
+                Ok(Ok(true)) => true,
+                Ok(Ok(false)) => false,
+                Ok(Err(_)) => false,
+                Err(_) => false,
+            };
+            if !visible {
+                break;
+            }
+        }
         if visible {
             continue;
         }
