@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::BlockCache;
-use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object};
+use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -442,31 +442,12 @@ impl FetchScheduler {
             lengths[fragment_index] = part.len();
         }
 
-        // Validate fragment shape to avoid silent data corruption:
-        // after the first short fragment, all remaining fragments must be empty.
-        let mut seen_short_fragment = false;
-        for (idx, &len) in lengths.iter().enumerate() {
-            if len > CLOUD_FRAGMENT_SIZE {
-                return Err(FetchError::CorruptFragment {
-                    object_id,
-                    reason: format!(
-                        "fragment {idx} length {len} exceeds max {}",
-                        CLOUD_FRAGMENT_SIZE
-                    ),
-                });
+        let total_len = validate_cloud_fragment_layout(&lengths).map_err(|e| {
+            FetchError::CorruptFragment {
+                object_id,
+                reason: e.to_string(),
             }
-            if seen_short_fragment && len != 0 {
-                return Err(FetchError::CorruptFragment {
-                    object_id,
-                    reason: format!("fragment {idx} has len {len} after prior short fragment"),
-                });
-            }
-            if len < CLOUD_FRAGMENT_SIZE {
-                seen_short_fragment = true;
-            }
-        }
-
-        let total_len: usize = lengths.iter().sum();
+        })?;
         assembled.truncate(total_len);
         let payload = Bytes::from(assembled);
 

@@ -34,6 +34,8 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
 pub const CLOUD_FRAGMENT_SIZE: usize = 4 * 1024 * 1024;
 /// Number of cloud fragments per logical block.
 pub const CLOUD_FRAGMENT_COUNT: usize = 4;
+/// Compile-time invariant: one logical block must map exactly to fixed cloud fragments.
+const _: [(); DEFAULT_BLOCK_SIZE as usize] = [(); CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT];
 
 // =============================================================================
 // Error Types
@@ -55,6 +57,8 @@ pub enum ObjectError {
     ObjectTooLarge(u64),
     #[error("invalid object ID: {0}")]
     InvalidObjectId(String),
+    #[error("invalid cloud fragment layout: {0}")]
+    InvalidFragmentLayout(String),
 }
 
 // =============================================================================
@@ -471,6 +475,47 @@ pub fn format_object_fragment_keys(
     std::array::from_fn(|idx| format_object_fragment_key(data_prefix, object_id, idx as u8))
 }
 
+/// Validate cloud fragment shape and return reconstructed logical payload size.
+///
+/// Rules:
+/// - exactly `CLOUD_FRAGMENT_COUNT` fragments are expected;
+/// - no fragment may exceed `CLOUD_FRAGMENT_SIZE`;
+/// - after the first short fragment (`len < CLOUD_FRAGMENT_SIZE`), all following
+///   fragments must be empty.
+pub fn validate_cloud_fragment_layout(lengths: &[usize]) -> Result<usize, ObjectError> {
+    if lengths.len() != CLOUD_FRAGMENT_COUNT {
+        return Err(ObjectError::InvalidFragmentLayout(format!(
+            "expected {} fragments, got {}",
+            CLOUD_FRAGMENT_COUNT,
+            lengths.len()
+        )));
+    }
+
+    let mut seen_short_fragment = false;
+    let mut total_len = 0usize;
+
+    for (idx, &len) in lengths.iter().enumerate() {
+        if len > CLOUD_FRAGMENT_SIZE {
+            return Err(ObjectError::InvalidFragmentLayout(format!(
+                "fragment {idx} length {len} exceeds max {CLOUD_FRAGMENT_SIZE}"
+            )));
+        }
+        if seen_short_fragment && len != 0 {
+            return Err(ObjectError::InvalidFragmentLayout(format!(
+                "fragment {idx} has len {len} after prior short fragment"
+            )));
+        }
+        if len < CLOUD_FRAGMENT_SIZE {
+            seen_short_fragment = true;
+        }
+        total_len = total_len
+            .checked_add(len)
+            .ok_or_else(|| ObjectError::InvalidFragmentLayout("fragment length overflow".into()))?;
+    }
+
+    Ok(total_len)
+}
+
 /// Parse object ID from S3 key.
 ///
 /// # Arguments
@@ -734,6 +779,26 @@ mod tests {
         let object_id = parse_object_id_from_key(key).unwrap();
 
         assert_eq!(object_id, 0x1234);
+    }
+
+    #[test]
+    fn test_validate_cloud_fragment_layout_ok() {
+        let full = CLOUD_FRAGMENT_SIZE;
+        let total = validate_cloud_fragment_layout(&[full, full, 123, 0]).unwrap();
+        assert_eq!(total, full * 2 + 123);
+    }
+
+    #[test]
+    fn test_validate_cloud_fragment_layout_rejects_non_empty_after_short() {
+        let full = CLOUD_FRAGMENT_SIZE;
+        let err = validate_cloud_fragment_layout(&[full, 7, 1, 0]).unwrap_err();
+        assert!(matches!(err, ObjectError::InvalidFragmentLayout(_)));
+    }
+
+    #[test]
+    fn test_validate_cloud_fragment_layout_rejects_wrong_count() {
+        let err = validate_cloud_fragment_layout(&[CLOUD_FRAGMENT_SIZE]).unwrap_err();
+        assert!(matches!(err, ObjectError::InvalidFragmentLayout(_)));
     }
 
     #[test]

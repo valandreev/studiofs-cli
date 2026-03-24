@@ -56,7 +56,7 @@ use studiofs_cache::metrics::{
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
-    parse_object_id_from_key, read_object,
+    parse_object_id_from_key, read_object, validate_cloud_fragment_layout,
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
@@ -3874,6 +3874,16 @@ impl StudioVfs {
                 format!("{}/", format_info.data_prefix)
             };
             let block_size = format_info.block_size;
+            let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
+            if (block_size as usize) > cloud_logical_block_capacity {
+                return Err(VfsError::Other(format!(
+                    "volume block_size {} exceeds 4x4 cloud fragment capacity {} ({} fragments x {} bytes)",
+                    block_size,
+                    cloud_logical_block_capacity,
+                    CLOUD_FRAGMENT_COUNT,
+                    CLOUD_FRAGMENT_SIZE
+                )));
+            }
             let janitor_interval = Duration::from_secs(config.janitor_interval_secs.max(1));
             let janitor_skip_newer_than = Duration::from_secs(config.janitor_skip_newer_secs);
             let janitor_max_deletes_per_run = config.janitor_max_deletes.max(1);
@@ -8691,25 +8701,9 @@ impl StudioVfs {
             }
         }
 
-        let mut seen_short_fragment = false;
-        for (idx, fragment) in decoded_parts.iter().enumerate() {
-            let len = fragment.len();
-            if len > CLOUD_FRAGMENT_SIZE {
-                return Err(VfsError::Other(format!(
-                    "corrupt fragment {idx}: len {len} exceeds max {CLOUD_FRAGMENT_SIZE}"
-                )));
-            }
-            if seen_short_fragment && len != 0 {
-                return Err(VfsError::Other(format!(
-                    "corrupt fragment {idx}: non-empty fragment after prior short fragment"
-                )));
-            }
-            if len < CLOUD_FRAGMENT_SIZE {
-                seen_short_fragment = true;
-            }
-        }
-
-        let total_len: usize = decoded_parts.iter().map(|b| b.len()).sum();
+        let fragment_lengths: Vec<usize> = decoded_parts.iter().map(|b| b.len()).collect();
+        let total_len = validate_cloud_fragment_layout(&fragment_lengths)
+            .map_err(|e| VfsError::Other(format!("corrupt fragment layout: {e}")))?;
         let mut data = BytesMut::with_capacity(total_len);
         for fragment in decoded_parts {
             data.extend_from_slice(&fragment);
