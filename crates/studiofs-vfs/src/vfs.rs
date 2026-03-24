@@ -34,7 +34,7 @@ use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
 use bytes::{Buf, Bytes, BytesMut};
-use futures::FutureExt;
+use futures::{FutureExt, future::try_join_all};
 use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
@@ -9254,15 +9254,22 @@ impl StudioVfs {
         let fragment_keys = format_object_fragment_keys(&self.data_prefix, op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
+            let checks = fragment_keys.iter().map(|key| {
+                let cancel_token = upload_cancel_token.clone();
+                async move {
+                    let result = run_with_timeout_or_cancel(
+                        &cancel_token,
+                        Duration::from_secs(5),
+                        self.fetch_scheduler.data_store().exists(key),
+                    )
+                    .await;
+                    (key, result)
+                }
+            });
+            let results = futures::future::join_all(checks).await;
             let mut all_visible = true;
-            for key in &fragment_keys {
-                match run_with_timeout_or_cancel(
-                    &upload_cancel_token,
-                    Duration::from_secs(5),
-                    self.fetch_scheduler.data_store().exists(key),
-                )
-                .await
-                {
+            for (key, result) in results {
+                match result {
                     TimeoutOrCancel::Completed(Ok(true)) => {}
                     TimeoutOrCancel::Completed(Ok(false)) => {
                         all_visible = false;
@@ -9344,15 +9351,22 @@ impl StudioVfs {
                     // Block data is missing from cache. If remote already has
                     // this object, we can still continue with commit reconcile.
                     if op.retry_count > 0 {
+                        let checks = fragment_keys.iter().map(|key| {
+                            let cancel_token = upload_cancel_token.clone();
+                            async move {
+                                let result = run_with_timeout_or_cancel(
+                                    &cancel_token,
+                                    Duration::from_secs(5),
+                                    self.fetch_scheduler.data_store().exists(key),
+                                )
+                                .await;
+                                (key, result)
+                            }
+                        });
+                        let results = futures::future::join_all(checks).await;
                         let mut all_visible = true;
-                        for key in &fragment_keys {
-                            match run_with_timeout_or_cancel(
-                                &upload_cancel_token,
-                                Duration::from_secs(5),
-                                self.fetch_scheduler.data_store().exists(key),
-                            )
-                            .await
-                            {
+                        for (_key, result) in results {
+                            match result {
                                 TimeoutOrCancel::Completed(Ok(true)) => {}
                                 TimeoutOrCancel::Completed(Ok(false))
                                 | TimeoutOrCancel::Completed(Err(_))
@@ -9430,34 +9444,46 @@ impl StudioVfs {
         drop(_upload_io_permit);
 
         if let Some(object_bytes) = object_bytes {
-            for (fragment_index, (key, payload)) in fragment_keys
+            let uploads = fragment_keys
                 .iter()
                 .zip(object_bytes.into_iter())
                 .enumerate()
-            {
-                match self
-                    .upload_scheduler
-                    .put(key, payload, &upload_cancel_token)
-                    .await
-                {
-                    Ok(()) => {}
-                    // Treat cancellation as an intentional shutdown path:
-                    // do not mark sticky errors and do not trigger in-memory requeue.
-                    // Because `complete_upload` is not called, the pending op remains
-                    // in the persistent journal for safe resume on next mount.
-                    Err(crate::upload::UploadError::Cancelled) => {
-                        self.cancel_upload_if_inode_deleted(&op);
-                        return Ok(());
+                .map(|(fragment_index, (key, payload))| {
+                    let cancel_token = upload_cancel_token.clone();
+                    async move {
+                        self.upload_scheduler
+                            .put(key, payload, &cancel_token)
+                            .await
+                            .map(|_| (fragment_index, key.clone()))
+                            .map_err(|e| (fragment_index, key.clone(), e))
                     }
-                    Err(e) => return Err(VfsError::Other(e.to_string())),
+                });
+            match try_join_all(uploads).await {
+                Ok(done) => {
+                    for (fragment_index, key) in done {
+                        debug!(
+                            ino = op.ino,
+                            object_id = op.object_id,
+                            block_index,
+                            fragment_index,
+                            key,
+                            "process_upload fragment put completed"
+                        );
+                    }
                 }
-                debug!(
-                    ino = op.ino,
-                    object_id = op.object_id,
-                    block_index,
-                    fragment_index,
-                    "process_upload fragment put completed"
-                );
+                // Treat cancellation as an intentional shutdown path:
+                // do not mark sticky errors and do not trigger in-memory requeue.
+                // Because `complete_upload` is not called, the pending op remains
+                // in the persistent journal for safe resume on next mount.
+                Err((_fragment_index, _key, crate::upload::UploadError::Cancelled)) => {
+                    self.cancel_upload_if_inode_deleted(&op);
+                    return Ok(());
+                }
+                Err((fragment_index, key, e)) => {
+                    return Err(VfsError::Other(format!(
+                        "fragment upload failed (idx={fragment_index}, key={key}): {e}"
+                    )));
+                }
             }
             debug!(
                 ino = op.ino,

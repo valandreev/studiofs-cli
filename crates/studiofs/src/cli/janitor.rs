@@ -122,8 +122,12 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
 
         let mut delete_failed = false;
         for key in format_object_fragment_keys(ctx.prefix, object_id) {
-            if ctx.op.delete(&key).await.is_err() {
+            if let Err(err) = ctx.op.delete(&key).await {
                 delete_failed = true;
+                eprintln!(
+                    "janitor: failed to delete fragment key={} object_id={}: {}",
+                    key, object_id, err
+                );
             }
         }
         if delete_failed {

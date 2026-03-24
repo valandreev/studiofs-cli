@@ -14,6 +14,7 @@ use crate::qos::QosController;
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::future::try_join_all;
 use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -410,11 +411,16 @@ impl FetchScheduler {
         keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
-        let mut payload = bytes::BytesMut::new();
-        for (fragment_index, key) in keys.iter().enumerate() {
-            let part = self
-                .fetch_fragment_with_retry(object_id, fragment_index, key, class)
-                .await?;
+        // Fetch all fragments concurrently. Each fragment keeps its own retry
+        // loop, so transient failures only retry the affected 4MiB piece.
+        let parts = try_join_all(keys.iter().enumerate().map(|(fragment_index, key)| {
+            self.fetch_fragment_with_retry(object_id, fragment_index, key, class)
+        }))
+        .await?;
+
+        let total_len = parts.iter().map(Bytes::len).sum();
+        let mut payload = bytes::BytesMut::with_capacity(total_len);
+        for part in parts {
             payload.extend_from_slice(&part);
         }
         let payload = payload.freeze();

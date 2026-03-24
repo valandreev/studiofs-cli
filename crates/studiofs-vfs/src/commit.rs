@@ -94,8 +94,15 @@ impl CommitCoordinator {
         loop {
             let mut all_visible = true;
             for (_, extent) in live_extents {
-                for key in format_object_fragment_keys(&vfs.data_prefix, extent.object_id) {
-                    match vfs.fetch_scheduler.data_store().exists(&key).await {
+                let checks = format_object_fragment_keys(&vfs.data_prefix, extent.object_id)
+                    .into_iter()
+                    .map(|key| async {
+                        let result = vfs.fetch_scheduler.data_store().exists(&key).await;
+                        (key, result)
+                    });
+                let results = futures::future::join_all(checks).await;
+                for (key, result) in results {
+                    match result {
                         Ok(true) => {}
                         Ok(false) => {
                             all_visible = false;
@@ -151,23 +158,19 @@ async fn requeue_missing_manifest_uploads(
             continue;
         }
 
-        let mut visible = true;
-        for key in format_object_fragment_keys(&vfs.data_prefix, block_ref.object_id) {
-            visible = match tokio::time::timeout(
-                Duration::from_secs(3),
-                vfs.fetch_scheduler.data_store().exists(&key),
-            )
+        let checks = format_object_fragment_keys(&vfs.data_prefix, block_ref.object_id)
+            .into_iter()
+            .map(|key| async move {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    vfs.fetch_scheduler.data_store().exists(&key),
+                )
+                .await
+            });
+        let visible = futures::future::join_all(checks)
             .await
-            {
-                Ok(Ok(true)) => true,
-                Ok(Ok(false)) => false,
-                Ok(Err(_)) => false,
-                Err(_) => false,
-            };
-            if !visible {
-                break;
-            }
-        }
+            .into_iter()
+            .all(|result| matches!(result, Ok(Ok(true))));
         if visible {
             continue;
         }
