@@ -14,13 +14,13 @@ use crate::qos::QosController;
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::future::try_join_all;
+use futures::{StreamExt, stream::FuturesUnordered};
 use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::BlockCache;
-use studiofs_data::object::read_object;
+use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -411,19 +411,36 @@ impl FetchScheduler {
         keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
-        // Fetch all fragments concurrently. Each fragment keeps its own retry
-        // loop, so transient failures only retry the affected 4MiB piece.
-        let parts = try_join_all(keys.iter().enumerate().map(|(fragment_index, key)| {
-            self.fetch_fragment_with_retry(object_id, fragment_index, key, class)
-        }))
-        .await?;
-
-        let total_len = parts.iter().map(Bytes::len).sum();
-        let mut payload = bytes::BytesMut::with_capacity(total_len);
-        for part in parts {
-            payload.extend_from_slice(&part);
+        // Fetch fragments concurrently and copy each part into its final offset
+        // as soon as it completes to avoid keeping both full `Vec<Bytes>` and
+        // final payload in memory at once.
+        let mut in_flight = FuturesUnordered::new();
+        for (fragment_index, key) in keys.iter().enumerate() {
+            let key = key.clone();
+            in_flight.push(async move {
+                self.fetch_fragment_with_retry(object_id, fragment_index, &key, class)
+                    .await
+                    .map(|part| (fragment_index, part))
+            });
         }
-        let payload = payload.freeze();
+
+        let mut assembled = vec![0u8; keys.len().saturating_mul(CLOUD_FRAGMENT_SIZE)];
+        let mut lengths = vec![0usize; keys.len()];
+        while let Some(next) = in_flight.next().await {
+            let (fragment_index, part) = next?;
+            let start = fragment_index.saturating_mul(CLOUD_FRAGMENT_SIZE);
+            let end = start.saturating_add(part.len());
+            if end > assembled.len() {
+                return Err(FetchError::CacheWrite(std::io::Error::other(
+                    "fragment bounds exceed assembled payload buffer",
+                )));
+            }
+            assembled[start..end].copy_from_slice(&part);
+            lengths[fragment_index] = part.len();
+        }
+        let total_len: usize = lengths.iter().sum();
+        assembled.truncate(total_len);
+        let payload = Bytes::from(assembled);
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
         self.cache

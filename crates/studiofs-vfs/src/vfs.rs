@@ -34,7 +34,7 @@ use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
 use bytes::{Buf, Bytes, BytesMut};
-use futures::{FutureExt, future::try_join_all};
+use futures::{FutureExt, future::join_all};
 use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
@@ -58,7 +58,7 @@ use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key, read_object,
 };
-use studiofs_data::store::{DataStore, DataStoreConfig, IoProfile};
+use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
 use studiofs_meta::*;
 use thiserror::Error;
@@ -8666,8 +8666,7 @@ impl StudioVfs {
         }
 
         let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
-        let mut data = BytesMut::new();
-        for key in &keys {
+        let parts = join_all(keys.iter().map(|key| async {
             let compressed = self
                 .fetch_scheduler
                 .data_store()
@@ -8681,8 +8680,15 @@ impl StudioVfs {
                     }
                     other => VfsError::Other(other.to_string()),
                 })?;
-            let fragment = read_object(compressed).map_err(|e| VfsError::Other(e.to_string()))?;
-            data.extend_from_slice(&fragment);
+            read_object(compressed).map_err(|e| VfsError::Other(e.to_string()))
+        }))
+        .await;
+        let mut data = BytesMut::new();
+        for part in parts {
+            match part {
+                Ok(fragment) => data.extend_from_slice(&fragment),
+                Err(other) => return Err(other),
+            }
         }
         let data = data.freeze();
 
@@ -9458,9 +9464,12 @@ impl StudioVfs {
                             .map_err(|e| (fragment_index, key.clone(), e))
                     }
                 });
-            match try_join_all(uploads).await {
-                Ok(done) => {
-                    for (fragment_index, key) in done {
+            let done = join_all(uploads).await;
+            let mut first_error: Option<(usize, String, crate::upload::UploadError)> = None;
+            let mut saw_cancel = false;
+            for result in done {
+                match result {
+                    Ok((fragment_index, key)) => {
                         debug!(
                             ino = op.ino,
                             object_id = op.object_id,
@@ -9470,20 +9479,28 @@ impl StudioVfs {
                             "process_upload fragment put completed"
                         );
                     }
+                    Err((_, _, crate::upload::UploadError::Cancelled)) => {
+                        saw_cancel = true;
+                    }
+                    Err((fragment_index, key, e)) => {
+                        if first_error.is_none() {
+                            first_error = Some((fragment_index, key, e));
+                        }
+                    }
                 }
-                // Treat cancellation as an intentional shutdown path:
-                // do not mark sticky errors and do not trigger in-memory requeue.
-                // Because `complete_upload` is not called, the pending op remains
-                // in the persistent journal for safe resume on next mount.
-                Err((_fragment_index, _key, crate::upload::UploadError::Cancelled)) => {
-                    self.cancel_upload_if_inode_deleted(&op);
-                    return Ok(());
-                }
-                Err((fragment_index, key, e)) => {
-                    return Err(VfsError::Other(format!(
-                        "fragment upload failed (idx={fragment_index}, key={key}): {e}"
-                    )));
-                }
+            }
+            // Treat cancellation as an intentional shutdown path:
+            // do not mark sticky errors and do not trigger in-memory requeue.
+            // Because `complete_upload` is not called, the pending op remains
+            // in the persistent journal for safe resume on next mount.
+            if saw_cancel {
+                self.cancel_upload_if_inode_deleted(&op);
+                return Ok(());
+            }
+            if let Some((fragment_index, key, e)) = first_error {
+                return Err(VfsError::Other(format!(
+                    "fragment upload failed (idx={fragment_index}, key={key}): {e}"
+                )));
             }
             debug!(
                 ino = op.ino,
@@ -9910,6 +9927,10 @@ impl StudioVfs {
                         let mut delete_failed = false;
                         for key in format_object_fragment_keys(&self.data_prefix, object_id) {
                             if let Err(e) = self.data_write.delete_by_key(&key).await {
+                                if matches!(&e, DataError::OpenDal(oe) if oe.kind() == ErrorKind::NotFound)
+                                {
+                                    continue;
+                                }
                                 delete_failed = true;
                                 warn!(
                                     object_id,
@@ -10202,6 +10223,9 @@ impl StudioVfs {
                 let mut delete_failed = false;
                 for key in format_object_fragment_keys(&self.data_prefix, object_id) {
                     if let Err(e) = self.data_write.operator().delete(&key).await {
+                        if e.kind() == ErrorKind::NotFound {
+                            continue;
+                        }
                         delete_failed = true;
                         warn!(cycle, key, error = %e, "janitor: fragment delete failed");
                     }

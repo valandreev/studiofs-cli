@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opendal::services::S3;
-use opendal::{EntryMode, Operator};
+use opendal::{EntryMode, ErrorKind, Operator};
 use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 use studiofs_meta::open_meta_engine;
 
@@ -123,6 +123,9 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
         let mut delete_failed = false;
         for key in format_object_fragment_keys(ctx.prefix, object_id) {
             if let Err(err) = ctx.op.delete(&key).await {
+                if err.kind() == ErrorKind::NotFound {
+                    continue;
+                }
                 delete_failed = true;
                 eprintln!(
                     "janitor: failed to delete fragment key={} object_id={}: {}",
