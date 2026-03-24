@@ -9345,31 +9345,38 @@ impl StudioVfs {
             .acquire_upload()
             .await
             .map_err(|e| VfsError::Other(format!("upload qos permit failed: {e}")))?;
-        // Upload QoS: when user reads are active, each upload consumes multiple
-        // local I/O slots, effectively shrinking upload pressure and preserving
-        // read latency/throughput for foreground operations.
-        let upload_io_cost = if self.foreground_read_active() {
-            self.upload_cache_io_user_penalty
-                .load(Ordering::Relaxed)
-                .max(1)
-        } else {
-            1
-        };
-        let _upload_io_permit = self
-            .upload_cache_io_slots
-            .clone()
-            .acquire_many_owned(upload_io_cost)
-            .await
-            .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
         // Read raw block payload from cache only when we really need to upload.
         let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
             None
         } else {
-            let raw_payload = match self
-                .block_cache
-                .get_with_priority(op.object_id, L2IoPriority::Background)
-                .await
-            {
+            // Hold local upload I/O slots strictly around the L2 read phase.
+            // Never keep them during network visibility checks or S3 uploads.
+            let raw_payload = {
+                // Upload QoS: when user reads are active, each upload consumes
+                // multiple local I/O slots, effectively shrinking upload pressure
+                // and preserving read latency/throughput for foreground ops.
+                let upload_io_cost = if self.foreground_read_active() {
+                    self.upload_cache_io_user_penalty
+                        .load(Ordering::Relaxed)
+                        .max(1)
+                } else {
+                    1
+                };
+                let upload_io_permit = self
+                    .upload_cache_io_slots
+                    .clone()
+                    .acquire_many_owned(upload_io_cost)
+                    .await
+                    .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
+                let read_result = self
+                    .block_cache
+                    .get_with_priority(op.object_id, L2IoPriority::Background)
+                    .await;
+                drop(upload_io_permit);
+                read_result
+            };
+
+            let raw_payload = match raw_payload {
                 Some(data) => data,
                 None => {
                     // Block data is missing from cache. If remote already has
@@ -9465,7 +9472,6 @@ impl StudioVfs {
                 Some(fragments)
             }
         };
-        drop(_upload_io_permit);
 
         if let Some(object_bytes) = object_bytes {
             let uploads = fragment_keys
