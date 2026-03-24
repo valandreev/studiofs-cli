@@ -156,9 +156,10 @@ pub enum VfsError {
     #[error("invalid filename: {0}")]
     InvalidName(String),
 
-    #[error("qos permit failure at {stage}: {message}")]
+    #[error("qos permit failure at {stage} for object {object_id}: {message}")]
     QosFailure {
         stage: &'static str,
+        object_id: u64,
         message: String,
     },
 
@@ -9023,6 +9024,16 @@ impl StudioVfs {
                         if vfs.uploader_shutdown_requested() {
                             break;
                         }
+                        if matches!(e, VfsError::QosFailure { .. })
+                            && vfs.state.uploader_shutdown_token.is_cancelled()
+                        {
+                            debug!(
+                                object_id = op.object_id,
+                                ino = op.ino,
+                                "upload qos failure during shutdown; suppressing retry/log spam"
+                            );
+                            break;
+                        }
                         // If the inode was deleted, don't retry — cancel the upload.
                         if vfs.state.deleted_inodes.lock().contains(&op.ino) {
                             info!(
@@ -9359,6 +9370,7 @@ impl StudioVfs {
             .await
             .map_err(|e| VfsError::QosFailure {
                 stage: "upload_qos",
+                object_id: op.object_id,
                 message: e.to_string(),
             })?;
         // Read raw block payload from cache only when we really need to upload.
@@ -9385,6 +9397,7 @@ impl StudioVfs {
                     .await
                     .map_err(|e| VfsError::QosFailure {
                         stage: "upload_cache_io_slots",
+                        object_id: op.object_id,
                         message: e.to_string(),
                     })?;
                 let read_result = self
