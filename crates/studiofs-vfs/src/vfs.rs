@@ -156,6 +156,12 @@ pub enum VfsError {
     #[error("invalid filename: {0}")]
     InvalidName(String),
 
+    #[error("qos permit failure at {stage}: {message}")]
+    QosFailure {
+        stage: &'static str,
+        message: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -4132,10 +4138,17 @@ impl StudioVfs {
             let ingress_checkpoint_max_segment_lag = config.ingress_checkpoint_max_segment_lag;
             let ingress_checkpoint_max_live_segments = config.ingress_checkpoint_max_live_segments;
             let upload_cache_io_slots = config.upload_cache_io_slots.max(1);
-            let upload_cache_io_user_penalty = config
-                .upload_cache_io_user_penalty
-                .max(1)
-                .min(upload_cache_io_slots as u32);
+            let requested_upload_cache_io_user_penalty = config.upload_cache_io_user_penalty.max(1);
+            let upload_cache_io_user_penalty =
+                requested_upload_cache_io_user_penalty.min(upload_cache_io_slots as u32);
+            if requested_upload_cache_io_user_penalty > upload_cache_io_slots as u32 {
+                warn!(
+                    requested_upload_cache_io_user_penalty,
+                    upload_cache_io_slots,
+                    clamped_upload_cache_io_user_penalty = upload_cache_io_user_penalty,
+                    "upload_cache_io_user_penalty exceeds upload_cache_io_slots; clamping"
+                );
+            }
             let upload_user_idle_grace = Duration::from_millis(config.upload_user_idle_grace_ms);
             let upload_worker_count = if config.upload_worker_count > 0 {
                 config.upload_worker_count
@@ -9344,7 +9357,10 @@ impl StudioVfs {
             .qos
             .acquire_upload()
             .await
-            .map_err(|e| VfsError::Other(format!("upload qos permit failed: {e}")))?;
+            .map_err(|e| VfsError::QosFailure {
+                stage: "upload_qos",
+                message: e.to_string(),
+            })?;
         // Read raw block payload from cache only when we really need to upload.
         let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
             None
@@ -9367,7 +9383,10 @@ impl StudioVfs {
                     .clone()
                     .acquire_many_owned(upload_io_cost)
                     .await
-                    .map_err(|e| VfsError::Other(format!("upload io qos permit failed: {e}")))?;
+                    .map_err(|e| VfsError::QosFailure {
+                        stage: "upload_cache_io_slots",
+                        message: e.to_string(),
+                    })?;
                 let read_result = self
                     .block_cache
                     .get_with_priority(op.object_id, L2IoPriority::Background)
