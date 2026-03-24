@@ -316,7 +316,24 @@ pub fn create_object_buffer_with_flags(
     let checksum = xxh64(data.as_ref(), 0);
     let size = data.len() as u32;
     let header = ObjectHeader::with_flags(size, size, checksum, flags).to_bytes();
-    let chunks = vec![Bytes::copy_from_slice(&header), data];
+    
+    // Chunk the data into 1MB pieces for better network transmission behavior.
+    // When sending 16MB contiguous buffers over a local network -> router -> external IP
+    // loopback, hyper/reqwest tries to push large chunks into the socket. This can
+    // cause micro-bursts that exceed router queue depths (bufferbloat) and drop packets,
+    // severely limiting upload throughput. By slicing the `Bytes` (zero-copy), we force 
+    // hyper to write to the socket in smaller 1MB chunks.
+    let chunk_size = 1024 * 1024;
+    let num_data_chunks = data.len().div_ceil(chunk_size);
+    let mut chunks = Vec::with_capacity(1 + num_data_chunks);
+    chunks.push(Bytes::copy_from_slice(&header));
+    
+    for i in 0..num_data_chunks {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(data.len());
+        chunks.push(data.slice(start..end));
+    }
+    
     Ok(Buffer::from(chunks))
 }
 
