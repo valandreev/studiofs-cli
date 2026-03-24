@@ -39,6 +39,7 @@ use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -156,9 +157,9 @@ pub enum VfsError {
     #[error("invalid filename: {0}")]
     InvalidName(String),
 
-    #[error("qos permit failure at {stage} for object {object_id}: {message}")]
+    #[error("qos permit failure at {stage} for object {object_id} (0x{object_id:016x}): {message}")]
     QosFailure {
-        stage: &'static str,
+        stage: Cow<'static, str>,
         object_id: u64,
         message: String,
     },
@@ -9020,53 +9021,56 @@ impl StudioVfs {
                         break;
                     }
 
-                    if let Err(e) = vfs.process_upload(op.clone()).await {
-                        if vfs.uploader_shutdown_requested() {
-                            break;
-                        }
-                        if matches!(e, VfsError::QosFailure { .. })
-                            && vfs.state.uploader_shutdown_token.is_cancelled()
+                    match vfs.process_upload(op.clone()).await {
+                        Ok(()) => {}
+                        Err(VfsError::QosFailure { object_id, .. })
+                            if vfs.state.uploader_shutdown_token.is_cancelled() =>
                         {
                             debug!(
-                                object_id = op.object_id,
+                                object_id,
                                 ino = op.ino,
-                                "upload qos failure during shutdown; suppressing retry/log spam"
+                                "upload worker qos cancelled during shutdown"
                             );
                             break;
                         }
-                        // If the inode was deleted, don't retry — cancel the upload.
-                        if vfs.state.deleted_inodes.lock().contains(&op.ino) {
-                            info!(
-                                object_id = op.object_id,
-                                ino = op.ino,
-                                "upload failed for deleted inode, cancelling: {}",
-                                e
-                            );
-                            vfs.cancel_upload_for_deleted_inode(&op);
-                            vfs.state
-                                .upload_canceled_deleted
-                                .fetch_add(1, Ordering::Relaxed);
-                            vfs.maybe_clear_deleted_inode_marker(op.ino);
-                        } else {
-                            vfs.mark_upload_sticky_error(op.ino, &e);
-                            let mut retry_op = op;
-                            retry_op.retry_count = retry_op.retry_count.saturating_add(1);
-                            let delay = vfs.upload_requeue_delay(&retry_op);
-                            vfs.state.upload_requeues.fetch_add(1, Ordering::Relaxed);
-                            warn!(
-                                object_id = retry_op.object_id,
-                                ino = retry_op.ino,
-                                retry_count = retry_op.retry_count,
-                                delay_ms = delay.as_millis() as u64,
-                                "upload processing error, will requeue: {}",
-                                e
-                            );
-                            let should_requeue = tokio::select! {
-                                _ = vfs.state.uploader_shutdown_token.cancelled() => false,
-                                _ = tokio::time::sleep(delay) => !vfs.uploader_shutdown_requested(),
-                            };
-                            if should_requeue && !vfs.block_cache.requeue_upload(retry_op) {
-                                error!("failed to requeue upload op after error");
+                        Err(e) => {
+                            if vfs.uploader_shutdown_requested() {
+                                break;
+                            }
+                            // If the inode was deleted, don't retry — cancel the upload.
+                            if vfs.state.deleted_inodes.lock().contains(&op.ino) {
+                                info!(
+                                    object_id = op.object_id,
+                                    ino = op.ino,
+                                    "upload failed for deleted inode, cancelling: {}",
+                                    e
+                                );
+                                vfs.cancel_upload_for_deleted_inode(&op);
+                                vfs.state
+                                    .upload_canceled_deleted
+                                    .fetch_add(1, Ordering::Relaxed);
+                                vfs.maybe_clear_deleted_inode_marker(op.ino);
+                            } else {
+                                vfs.mark_upload_sticky_error(op.ino, &e);
+                                let mut retry_op = op;
+                                retry_op.retry_count = retry_op.retry_count.saturating_add(1);
+                                let delay = vfs.upload_requeue_delay(&retry_op);
+                                vfs.state.upload_requeues.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    object_id = retry_op.object_id,
+                                    ino = retry_op.ino,
+                                    retry_count = retry_op.retry_count,
+                                    delay_ms = delay.as_millis() as u64,
+                                    "upload processing error, will requeue: {}",
+                                    e
+                                );
+                                let should_requeue = tokio::select! {
+                                    _ = vfs.state.uploader_shutdown_token.cancelled() => false,
+                                    _ = tokio::time::sleep(delay) => !vfs.uploader_shutdown_requested(),
+                                };
+                                if should_requeue && !vfs.block_cache.requeue_upload(retry_op) {
+                                    error!("failed to requeue upload op after error");
+                                }
                             }
                         }
                     }
@@ -9369,7 +9373,7 @@ impl StudioVfs {
             .acquire_upload()
             .await
             .map_err(|e| VfsError::QosFailure {
-                stage: "upload_qos",
+                stage: Cow::Borrowed("upload_qos"),
                 object_id: op.object_id,
                 message: e.to_string(),
             })?;
@@ -9396,7 +9400,7 @@ impl StudioVfs {
                     .acquire_many_owned(upload_io_cost)
                     .await
                     .map_err(|e| VfsError::QosFailure {
-                        stage: "upload_cache_io_slots",
+                        stage: Cow::Borrowed("upload_cache_io_slots"),
                         object_id: op.object_id,
                         message: e.to_string(),
                     })?;
