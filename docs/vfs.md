@@ -162,9 +162,10 @@ Consumes from upload queue channel:
 ```
 PendingUpload received
   │
-  ├─ Read block from cache (L1 or L2)
+  ├─ Local I/O phase: acquire upload local-cache I/O slots, read block from cache (L1 or L2), release slots immediately
   ├─ Reject stale op if inode/incarnation no longer match
   ├─ Split logical block into 4 cloud fragments (up to 4 MiB each)
+  ├─ Network phase: upload fragments to S3 (no local-cache I/O slot held)
   ├─ Build fragment `Buffer`s (header + raw payload chunk), compute xxh64 checksums
   ├─ PUT fragment objects to S3 in parallel via UploadScheduler (AIMD + retry/timeout policy)
   ├─ Mark extent record as uploaded only after upload success
@@ -189,6 +190,9 @@ Adaptive upload control:
 - upload backpressure samples cache pipeline metrics on each control tick.
 - L2 latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
 - first upload attempt applies adaptive penalty; retries keep retry/backoff behavior unchanged.
+- local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
+- QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.
+- shutdown path suppresses noisy requeue/warn loops for QoS failures triggered by uploader cancellation.
 
 Remote-visible regular-file size advances only when a full incarnation is committed
 through `committed_size`, not through the local foreground `size`.

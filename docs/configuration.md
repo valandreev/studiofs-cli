@@ -454,8 +454,8 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `10` | Upload metrics log interval |
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
 | `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
-| `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots |
-| `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Penalty multiplied by client wait penalty |
+| `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
+| `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Per-upload slot cost when foreground reads are active; clamped to `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Max graceful upload-drain wait before forced uploader cancellation |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
@@ -472,6 +472,10 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
+
+Upload local-I/O tuning notes:
+- upload workers use phase separation: local-cache I/O slots are released immediately after the cache read and are not held during S3 upload waits.
+- when `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` is configured above `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`, StudioFS clamps it and emits a startup warning.
 
 ### Testing
 

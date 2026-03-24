@@ -442,12 +442,11 @@ impl FetchScheduler {
             lengths[fragment_index] = part.len();
         }
 
-        let total_len = validate_cloud_fragment_layout(&lengths).map_err(|e| {
-            FetchError::CorruptFragment {
+        let total_len =
+            validate_cloud_fragment_layout(&lengths).map_err(|e| FetchError::CorruptFragment {
                 object_id,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
         assembled.truncate(total_len);
         let payload = Bytes::from(assembled);
 
