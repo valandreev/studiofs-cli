@@ -4,6 +4,7 @@ use std::path::Path;
 use tracing::debug;
 
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
+pub(crate) const IO_CHUNK_SIZE: usize = 1024 * 1024;
 
 fn is_aligned(ptr: *const (), alignment: usize) -> bool {
     (ptr as usize).is_multiple_of(alignment)
@@ -11,10 +12,15 @@ fn is_aligned(ptr: *const (), alignment: usize) -> bool {
 
 fn read_all(mut std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0usize;
+    // Break into chunks to yield the device queue to other threads/requests.
+    // This allows the OS disk scheduler to interleave smaller foreground client
+    // reads, preventing massive latency spikes during background S3 uploads.
     while filled < dst.len() {
-        match std_file.read(&mut dst[filled..]) {
+        let end = (filled + IO_CHUNK_SIZE).min(dst.len());
+        match std_file.read(&mut dst[filled..end]) {
             Ok(0) => break,
             Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }

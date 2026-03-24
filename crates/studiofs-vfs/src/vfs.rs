@@ -4806,19 +4806,11 @@ impl StudioVfs {
             && ingress.checkpoint_pending_mutations == 0
     }
 
-    fn should_log_upload_pipeline_summary(
-        pending_uploads: usize,
-        pending_metadata_ops: u32,
-        was_active: bool,
-    ) -> bool {
-        Self::upload_pipeline_summary_is_active(pending_uploads, pending_metadata_ops) || was_active
-    }
-
     fn upload_pipeline_summary_is_active(
         pending_uploads: usize,
         pending_metadata_ops: u32,
     ) -> bool {
-        pending_uploads != 0 || pending_metadata_ops != 0
+        pending_uploads != 0 || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
     }
 
     fn format_upload_pipeline_pending_uploads(pending_upload_bytes: u64) -> String {
@@ -9518,6 +9510,7 @@ impl StudioVfs {
 
     async fn background_upload_stats(self: Arc<Self>) {
         let mut upload_pipeline_summary_was_active = false;
+        let mut ticks_since_last_log = 0u64;
         loop {
             tokio::select! {
                 _ = self.state.shutdown_notify.notified() => break,
@@ -9530,6 +9523,20 @@ impl StudioVfs {
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
             let metadata_backlog = self.meta.replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
+            
+            let is_active = Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
+            let activity_started = is_active && !upload_pipeline_summary_was_active;
+            
+            let should_log = if activity_started {
+                ticks_since_last_log = 0;
+                true
+            } else if is_active || upload_pipeline_summary_was_active {
+                ticks_since_last_log += 1;
+                ticks_since_last_log >= 15
+            } else {
+                false
+            };
+
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
             let ingress_append = self.state.ingress_append_stats.snapshot();
@@ -9539,11 +9546,9 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
-            if Self::should_log_upload_pipeline_summary(
-                pending,
-                pending_metadata_ops,
-                upload_pipeline_summary_was_active,
-            ) {
+
+            if should_log {
+                ticks_since_last_log = 0;
                 let pending_uploads =
                     Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
                 info!(
@@ -9552,8 +9557,8 @@ impl StudioVfs {
                     "upload pipeline"
                 );
             }
-            upload_pipeline_summary_was_active =
-                Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
+            
+            upload_pipeline_summary_was_active = is_active;
             debug!(
                 dentry_cache_entries = dentry_cache.occupancy_entries,
                 dentry_cache_bytes = dentry_cache.occupancy_bytes,
@@ -10409,16 +10414,17 @@ mod tests {
 
     #[test]
     fn upload_pipeline_summary_logs_only_when_pending_work_exists() {
-        assert!(!StudioVfs::should_log_upload_pipeline_summary(0, 0, false));
-        assert!(StudioVfs::should_log_upload_pipeline_summary(1, 0, false));
-        assert!(StudioVfs::should_log_upload_pipeline_summary(0, 1, false));
+        assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0));
+        assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0));
+        assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 1)); // < 10 threshold
+        assert!(StudioVfs::upload_pipeline_summary_is_active(0, 10));
     }
 
     #[test]
-    fn upload_pipeline_summary_logs_one_final_idle_line_after_activity() {
-        assert!(StudioVfs::should_log_upload_pipeline_summary(256, 0, false));
-        assert!(StudioVfs::should_log_upload_pipeline_summary(0, 0, true));
-        assert!(!StudioVfs::should_log_upload_pipeline_summary(0, 0, false));
+    fn upload_pipeline_summary_is_active_checks() {
+        assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0));
+        assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 9));
+        assert!(StudioVfs::upload_pipeline_summary_is_active(0, 11));
     }
 
     #[test]
