@@ -8683,12 +8683,36 @@ impl StudioVfs {
             read_object(compressed).map_err(|e| VfsError::Other(e.to_string()))
         }))
         .await;
-        let mut data = BytesMut::new();
+        let mut decoded_parts = Vec::with_capacity(parts.len());
         for part in parts {
             match part {
-                Ok(fragment) => data.extend_from_slice(&fragment),
+                Ok(fragment) => decoded_parts.push(fragment),
                 Err(other) => return Err(other),
             }
+        }
+
+        let mut seen_short_fragment = false;
+        for (idx, fragment) in decoded_parts.iter().enumerate() {
+            let len = fragment.len();
+            if len > CLOUD_FRAGMENT_SIZE {
+                return Err(VfsError::Other(format!(
+                    "corrupt fragment {idx}: len {len} exceeds max {CLOUD_FRAGMENT_SIZE}"
+                )));
+            }
+            if seen_short_fragment && len != 0 {
+                return Err(VfsError::Other(format!(
+                    "corrupt fragment {idx}: non-empty fragment after prior short fragment"
+                )));
+            }
+            if len < CLOUD_FRAGMENT_SIZE {
+                seen_short_fragment = true;
+            }
+        }
+
+        let total_len: usize = decoded_parts.iter().map(|b| b.len()).sum();
+        let mut data = BytesMut::with_capacity(total_len);
+        for fragment in decoded_parts {
+            data.extend_from_slice(&fragment);
         }
         let data = data.freeze();
 

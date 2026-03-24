@@ -53,6 +53,9 @@ pub enum FetchError {
 
     #[error("prefetch skipped: no foreground headroom")]
     PrefetchSkipped,
+
+    #[error("corrupt fragment layout for object {object_id}: {reason}")]
+    CorruptFragment { object_id: u64, reason: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -438,6 +441,31 @@ impl FetchScheduler {
             assembled[start..end].copy_from_slice(&part);
             lengths[fragment_index] = part.len();
         }
+
+        // Validate fragment shape to avoid silent data corruption:
+        // after the first short fragment, all remaining fragments must be empty.
+        let mut seen_short_fragment = false;
+        for (idx, &len) in lengths.iter().enumerate() {
+            if len > CLOUD_FRAGMENT_SIZE {
+                return Err(FetchError::CorruptFragment {
+                    object_id,
+                    reason: format!(
+                        "fragment {idx} length {len} exceeds max {}",
+                        CLOUD_FRAGMENT_SIZE
+                    ),
+                });
+            }
+            if seen_short_fragment && len != 0 {
+                return Err(FetchError::CorruptFragment {
+                    object_id,
+                    reason: format!("fragment {idx} has len {len} after prior short fragment"),
+                });
+            }
+            if len < CLOUD_FRAGMENT_SIZE {
+                seen_short_fragment = true;
+            }
+        }
+
         let total_len: usize = lengths.iter().sum();
         assembled.truncate(total_len);
         let payload = Bytes::from(assembled);
