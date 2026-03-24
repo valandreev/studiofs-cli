@@ -880,36 +880,6 @@ async fn ensure_bucket() {
     let _ = ensure_bucket_ready().await;
 }
 
-async fn wait_until_exists(ds: &DataStore, path: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match ds.exists(path).await {
-            Ok(true) => return true,
-            Ok(false) => {}
-            Err(_) => {}
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn wait_until_absent(ds: &DataStore, path: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match ds.exists(path).await {
-            Ok(false) => return true,
-            Ok(true) => {}
-            Err(_) => return true,
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 async fn wait_until_object_exists(
     ds: &DataStore,
     data_prefix: &str,
