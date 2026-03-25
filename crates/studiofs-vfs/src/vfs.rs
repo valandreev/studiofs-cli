@@ -5111,7 +5111,7 @@ impl StudioVfs {
 
     fn foreground_speedometer_snapshot(&self) -> (Option<u64>, usize) {
         let now_ms = Self::now_unix_millis();
-        let mut samples_all = Vec::new();
+        let mut samples_all = Vec::with_capacity(FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES);
         let mut total_samples = 0usize;
         for shard in &self.state.foreground_read_latency_shards {
             let mut samples = shard.lock();
