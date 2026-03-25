@@ -417,6 +417,7 @@ pub fn run(
     direct_io: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
+    endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mount_point, resolved_cache_dir, memory_limit, cache_size) =
         super::settings::resolve_studiofs_config_for_mount(
@@ -439,6 +440,27 @@ pub fn run(
         "configured L2 cache profile"
     );
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
+
+    // Validate endpoint override before any mount operations (SFS-95)
+    if let Some(ep) = endpoint {
+        // Try parsing as-is, then with http:// prefix
+        let parsed = url::Url::parse(ep)
+            .ok()
+            .or_else(|| url::Url::parse(&format!("http://{ep}")).ok());
+
+        let valid = parsed.map(|url| {
+            let scheme = url.scheme();
+            let has_host = url.host().is_some();
+            matches!(scheme, "http" | "https") && has_host
+        }).unwrap_or(false);
+
+        if !valid {
+            anyhow::bail!(
+                "invalid S3 endpoint '{}': must be an HTTP(S) URL with a host (e.g., http://192.168.1.50:9000)",
+                ep
+            );
+        }
+    }
 
     #[cfg(windows)]
     let mount_point = {
@@ -611,6 +633,16 @@ pub fn run(
     } else {
         (live_meta, false)
     };
+
+    // Apply runtime S3 endpoint override if provided (SFS-95)
+    if let Some(endpoint) = endpoint {
+        info!(
+            original_endpoint = %format_info.endpoint,
+            override_endpoint = %endpoint,
+            "overriding S3 endpoint for this mount session"
+        );
+        format_info.endpoint = endpoint.to_string();
+    }
 
     info!(
         "mounting volume '{}' (storage: endpoint={}, bucket={})",

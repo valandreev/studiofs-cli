@@ -67,6 +67,22 @@ pub struct DataStore {
     profile: IoProfile,
 }
 
+fn is_ip_endpoint(endpoint: &str) -> bool {
+    fn check_host(url: &url::Url) -> bool {
+        url.host()
+            .map(|h| matches!(h, url::Host::Ipv4(_) | url::Host::Ipv6(_)))
+            .unwrap_or(false)
+    }
+
+    if let Ok(url) = url::Url::parse(endpoint) && check_host(&url) {
+        return true;
+    }
+    if let Ok(url) = url::Url::parse(&format!("http://{endpoint}")) && check_host(&url) {
+        return true;
+    }
+    false
+}
+
 impl DataStore {
     /// Create a new DataStore with the default I/O profile.
     pub fn new(config: &DataStoreConfig) -> DataResult<Self> {
@@ -82,6 +98,12 @@ impl DataStore {
             .secret_access_key(&config.secret_key)
             .disable_config_load()
             .disable_ec2_metadata();
+
+        // For IP-based endpoints, ensure we use path-style (default in OpenDAL).
+        // Virtual-host style (bucket.host) doesn't work with IP addresses.
+        if is_ip_endpoint(&config.endpoint) {
+            info!("using path-style addressing for IP-based S3 endpoint");
+        }
 
         if !config.region.is_empty() {
             builder = builder.region(&config.region);
@@ -389,5 +411,30 @@ impl DataStore {
     /// Get the underlying operator (for advanced use).
     pub fn operator(&self) -> &Operator {
         &self.op
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_ip_endpoint_ipv4() {
+        assert!(is_ip_endpoint("http://192.168.1.50:9000"));
+        assert!(is_ip_endpoint("https://10.0.0.1:9000"));
+        assert!(is_ip_endpoint("192.168.1.50:9000"));
+    }
+
+    #[test]
+    fn test_is_ip_endpoint_ipv6() {
+        assert!(is_ip_endpoint("http://[::1]:9000"));
+        assert!(is_ip_endpoint("https://[::1]"));
+    }
+
+    #[test]
+    fn test_is_ip_endpoint_hostname() {
+        assert!(!is_ip_endpoint("http://minio.local:9000"));
+        assert!(!is_ip_endpoint("https://s3.amazonaws.com"));
+        assert!(!is_ip_endpoint("minio.local:9000"));
     }
 }

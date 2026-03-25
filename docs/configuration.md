@@ -125,6 +125,10 @@ Notes:
 - Default mount tags include platform, volume name, mount mode, cache mode, bridge, and `runtime=mount`.
 - When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
+- `--endpoint <URL>` overrides the S3 endpoint URL for the current mount session.
+  - Useful for mounting via a local IP address (e.g. `http://192.168.1.50:9000`) instead of the public endpoint configured during `studiofs init`.
+  - This override only applies to the current process and is NOT saved to the configuration file.
+  - When the endpoint is an IP address, StudioFS automatically uses path-style addressing (required for IP-based S3-compatible services like MinIO).
 
 Windows one-time registry setup (manual alternative):
 
