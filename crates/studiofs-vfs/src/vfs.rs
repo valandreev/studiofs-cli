@@ -575,6 +575,7 @@ const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
+const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
 const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 2;
 const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 250;
@@ -785,6 +786,8 @@ pub struct VfsConfig {
     pub upload_fg_read_latency_target_ms: u64,
     /// Sliding window used by the foreground-read speedometer.
     pub upload_fg_read_latency_window_ms: u64,
+    /// Number of speedometer windows to retain last P90 when no fresh samples arrive.
+    pub upload_fg_read_latency_sticky_windows: u64,
     /// Upload worker pool size.
     pub upload_worker_count: usize,
     /// Upload max attempts.
@@ -902,6 +905,7 @@ impl Default for VfsConfig {
             upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
             upload_fg_read_latency_target_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
             upload_fg_read_latency_window_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS,
+            upload_fg_read_latency_sticky_windows: DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS,
             upload_worker_count: 0,
             upload_max_attempts: 10,
             upload_request_timeout_secs: 120,
@@ -3262,6 +3266,8 @@ pub struct StudioVfs {
     upload_fg_read_latency_target_ns: u64,
     /// Sliding window for foreground speedometer samples.
     upload_fg_read_latency_window: Duration,
+    /// Sticky horizon for using last known foreground P90 in the throttle loop.
+    upload_fg_read_latency_sticky_window: Duration,
     /// Last observed foreground P90 (ns), used as sticky fallback.
     upload_fg_read_last_p90_ns: AtomicU64,
     /// Timestamp of the last observed foreground P90.
@@ -4196,6 +4202,10 @@ impl StudioVfs {
                 .upload_fg_read_latency_target_ms
                 .max(config.upload_l2_lookup_spike_threshold_ms.max(1));
             let upload_fg_read_latency_window_ms = config.upload_fg_read_latency_window_ms.max(100);
+            let upload_fg_read_latency_sticky_windows =
+                config.upload_fg_read_latency_sticky_windows.max(1);
+            let upload_fg_read_latency_sticky_window_ms = upload_fg_read_latency_window_ms
+                .saturating_mul(upload_fg_read_latency_sticky_windows);
             let upload_worker_count = if config.upload_worker_count > 0 {
                 config.upload_worker_count
             } else {
@@ -4221,6 +4231,7 @@ impl StudioVfs {
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 upload_fg_read_latency_target_ms,
                 upload_fg_read_latency_window_ms,
+                upload_fg_read_latency_sticky_windows,
                 max_dirty_bytes,
                 max_xattr_bytes,
                 max_spill_bytes,
@@ -4362,6 +4373,9 @@ impl StudioVfs {
                     as u64,
                 upload_fg_read_latency_window: Duration::from_millis(
                     upload_fg_read_latency_window_ms,
+                ),
+                upload_fg_read_latency_sticky_window: Duration::from_millis(
+                    upload_fg_read_latency_sticky_window_ms,
                 ),
                 upload_fg_read_last_p90_ns: AtomicU64::new(0),
                 upload_fg_read_last_p90_at_ms: AtomicU64::new(0),
@@ -5140,9 +5154,8 @@ impl StudioVfs {
             return None;
         }
         let sticky_window_ms = self
-            .upload_fg_read_latency_window
+            .upload_fg_read_latency_sticky_window
             .as_millis()
-            .saturating_mul(2)
             .clamp(1, u64::MAX as u128) as u64;
         if now_ms.saturating_sub(last_at) > sticky_window_ms {
             return None;
@@ -9959,8 +9972,10 @@ impl StudioVfs {
                     upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
                     upload_io_penalty_dynamic =
                         self.upload_cache_io_user_penalty.load(Ordering::Relaxed),
-                    foreground_read_p90_ms =
-                        foreground_read_p90_ns.map(|ns| ns.saturating_div(1_000_000)),
+                    foreground_read_p90_present = foreground_read_p90_ns.is_some(),
+                    foreground_read_p90_ms = foreground_read_p90_ns
+                        .map(|ns| ns.saturating_div(1_000_000))
+                        .unwrap_or(0),
                     foreground_read_speedometer_samples,
                     foreground_read_target_ms = self
                         .upload_fg_read_latency_target_ns

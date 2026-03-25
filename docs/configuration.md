@@ -451,12 +451,16 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_UPLOAD_DELAY_MS` | `2000` | Delay uploads for overwrite/delete coalescing |
 | `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
-| `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `10` | Upload metrics log interval |
+| `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
 | `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
 | `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Per-upload slot cost when foreground reads are active; clamped to `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
+| `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `50` | Foreground-read P90 latency target for upload throttling |
+| `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `3000` | Foreground-read speedometer window |
+| `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` | `2` | Keep last P90 for this many windows when samples pause |
+| `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` | `10` | Legacy compatibility floor for `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` |
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Max graceful upload-drain wait before forced uploader cancellation |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
@@ -476,6 +480,7 @@ Dentry/path shortcut logs also include negative-hit ratio. The summary `upload p
 Upload local-I/O tuning notes:
 - upload workers use phase separation: local-cache I/O slots are released immediately after the cache read and are not held during S3 upload waits.
 - when `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` is configured above `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`, StudioFS clamps it and emits a startup warning.
+- speedometer logs include `foreground_read_p90_present` and `foreground_read_p90_ms` for stable parsing even when no fresh samples exist.
 
 ### Testing
 
