@@ -8472,9 +8472,10 @@ impl StudioVfs {
         let window = self.fetch_scheduler.window().floor().max(1.0) as usize;
         let in_flight = self.fetch_scheduler.in_flight();
         let available = window.saturating_sub(in_flight);
+        let cycle_cap = self.prefetch_max_per_cycle.max(window / 2).max(1);
         let mut budget = available
             .saturating_sub(self.prefetch_foreground_reserve)
-            .min(self.prefetch_max_per_cycle);
+            .min(cycle_cap);
         if budget == 0 {
             return Vec::new();
         }
