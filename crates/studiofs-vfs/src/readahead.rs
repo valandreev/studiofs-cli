@@ -38,6 +38,7 @@ const VELOCITY_SAMPLE_ALPHA: f64 = 0.25;
 const VELOCITY_SAMPLE_MIN_AGE_US: u64 = 1_000;
 const VELOCITY_SAMPLE_MAX_AGE_US: u64 = 2_000_000;
 const LARGE_SEEK_RESET_BLOCK_DELTA: u32 = 256;
+const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
 // =============================================================================
 // Internal state
@@ -56,6 +57,10 @@ struct ReadState {
     last_read_at_micros: u64,
     /// EWMA estimate of read velocity in blocks/sec.
     velocity_blocks_per_sec_ema: f64,
+    /// Start timestamp for the current velocity sampling window.
+    velocity_sample_anchor_micros: u64,
+    /// Accumulated blocks inside the current velocity sampling window.
+    velocity_sample_blocks: u32,
 }
 
 // =============================================================================
@@ -132,7 +137,21 @@ impl ReadAheadTracker {
             current_width: self.base_width,
             last_read_at_micros: 0,
             velocity_blocks_per_sec_ema: 0.0,
+            velocity_sample_anchor_micros: 0,
+            velocity_sample_blocks: 0,
         });
+
+        if state.last_read_at_micros > 0
+            && now_micros.saturating_sub(state.last_read_at_micros) > VELOCITY_SAMPLE_MAX_AGE_US
+        {
+            // Previous throughput signal is stale after long idle periods.
+            state.score = 0;
+            state.sequential_streak = 0;
+            state.current_width = self.base_width;
+            state.velocity_blocks_per_sec_ema = 0.0;
+            state.velocity_sample_anchor_micros = 0;
+            state.velocity_sample_blocks = 0;
+        }
 
         // Detect sequential continuation: the new read must start exactly at
         // the block immediately after where we left off.
@@ -177,10 +196,16 @@ impl ReadAheadTracker {
                 state.current_width = next_width.clamp(self.base_width, self.width);
             }
             if state.last_read_at_micros > 0 {
-                let delta_micros = now_micros.saturating_sub(state.last_read_at_micros);
-                if (VELOCITY_SAMPLE_MIN_AGE_US..=VELOCITY_SAMPLE_MAX_AGE_US).contains(&delta_micros)
+                if state.velocity_sample_anchor_micros == 0 {
+                    state.velocity_sample_anchor_micros = state.last_read_at_micros.max(1);
+                }
+                state.velocity_sample_blocks =
+                    state.velocity_sample_blocks.saturating_add(span_blocks);
+                let sample_delta = now_micros.saturating_sub(state.velocity_sample_anchor_micros);
+                if (VELOCITY_SAMPLE_MIN_AGE_US..=VELOCITY_SAMPLE_MAX_AGE_US).contains(&sample_delta)
                 {
-                    let inst_bps = (span_blocks as f64 * 1_000_000.0) / delta_micros as f64;
+                    let sampled_blocks = state.velocity_sample_blocks.max(1);
+                    let inst_bps = (sampled_blocks as f64 * 1_000_000.0) / sample_delta as f64;
                     if inst_bps.is_finite() && inst_bps > 0.0 {
                         state.velocity_blocks_per_sec_ema =
                             if state.velocity_blocks_per_sec_ema > 0.0 {
@@ -189,6 +214,8 @@ impl ReadAheadTracker {
                             } else {
                                 inst_bps
                             };
+                        state.velocity_sample_anchor_micros = now_micros;
+                        state.velocity_sample_blocks = 0;
                         let velocity_width =
                             self.velocity_width_target(state.velocity_blocks_per_sec_ema);
                         state.current_width = state
@@ -212,6 +239,8 @@ impl ReadAheadTracker {
             }
             state.sequential_streak = 0;
             state.current_width = self.base_width;
+            state.velocity_sample_anchor_micros = 0;
+            state.velocity_sample_blocks = 0;
         }
 
         state.last_block = last_block;
@@ -284,8 +313,8 @@ impl ReadAheadTracker {
         let random_penalty = random_penalty.max(1);
         let sequential_ramp_trigger = sequential_ramp_trigger.max(1);
         Self {
-            states: DashMap::new(),
-            inflight: DashMap::new(),
+            states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
+            inflight: DashMap::with_capacity_and_shard_amount(16_384, READAHEAD_DASHMAP_SHARDS),
             width,
             base_width,
             min_prefetch_on_seq,
@@ -400,7 +429,10 @@ mod tests {
         t = t.saturating_add(500);
         let p = tracker.record_read_at_micros(1, 2, 2, t);
         assert!(p.len() >= 8, "ramped width should allow deeper prefetch");
-        assert_eq!(tracker.debug_width(1), Some(16));
+        assert!(
+            tracker.debug_width(1).unwrap_or(8) >= 16,
+            "sequential ramp should raise width above base"
+        );
 
         // Keep going; width should continue to ramp but stay capped at max width.
         let mut last = 2u32;
@@ -428,7 +460,10 @@ mod tests {
         let _ = tracker.record_read_at_micros(1, 1, 1, t);
         t = t.saturating_add(500);
         let _ = tracker.record_read_at_micros(1, 2, 2, t);
-        assert_eq!(tracker.debug_width(1), Some(16));
+        assert!(
+            tracker.debug_width(1).unwrap_or(8) >= 16,
+            "sequential stream should widen before random reset"
+        );
 
         // Random jump resets width ramp.
         t = t.saturating_add(500);
@@ -676,6 +711,23 @@ mod tests {
             "large seek should reset score and suppress immediate prefetch"
         );
         assert_eq!(tracker.debug_width(1), Some(16));
+    }
+
+    #[test]
+    fn test_sub_ms_samples_accumulate_and_update_velocity() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let mut t = 1_000_000u64;
+        let _ = tracker.record_read_at_micros(1, 0, 0, t);
+
+        for block in 1..=32u32 {
+            t = t.saturating_add(500); // below per-call min age
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+        }
+
+        assert!(
+            tracker.debug_width(1).unwrap_or(16) > 16,
+            "sub-ms bursts should still contribute to velocity via accumulation"
+        );
     }
 }
 
