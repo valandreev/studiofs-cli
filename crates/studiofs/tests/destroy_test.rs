@@ -34,6 +34,7 @@ struct InfraFixture {
     marker_key: String,
     pg_dsn: String,
     pg_volume_id: i64,
+    pg_uuid: String,
     env: TestEnv,
 }
 
@@ -164,7 +165,7 @@ fn ensure_pg_schema(dsn: &str) {
     });
 }
 
-fn insert_pg_volume(dsn: &str, name: &str) -> i64 {
+fn insert_pg_volume(dsn: &str, name: &str) -> (i64, String) {
     let uuid = Uuid::new_v4().to_string();
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     rt.block_on(async {
@@ -182,7 +183,8 @@ fn insert_pg_volume(dsn: &str, name: &str) -> i64 {
             .await
             .expect("insert volume");
         conn_task.abort();
-        row.get(0)
+        let vol: i64 = row.get(0);
+        (vol, uuid)
     })
 }
 
@@ -225,6 +227,7 @@ fn create_local_metadata(
     pg_dsn: &str,
     pg_volume_id: i64,
     env: &TestEnv,
+    uuid: &str,
 ) {
     std::fs::create_dir_all(meta_dir).expect("create metadata dir");
     std::fs::create_dir_all(meta_dir.join("cache")).expect("create cache dir");
@@ -238,7 +241,7 @@ fn create_local_metadata(
     let format_info = FormatInfo {
         format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
-        uuid: Uuid::new_v4().to_string(),
+        uuid: uuid.to_string(),
         endpoint: env.s3_endpoint.clone(),
         bucket: env.s3_bucket.clone(),
         access_key: env.s3_access_key.clone(),
@@ -309,7 +312,7 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
     let home_dir = tempfile::tempdir().expect("create temp home");
     let meta_dir = home_meta_dir(home_dir.path(), &name);
 
-    let pg_volume_id = insert_pg_volume(&studio_dsn, &name);
+    let (pg_volume_id, pg_uuid) = insert_pg_volume(&studio_dsn, &name);
 
     let store = make_datastore(env, &name);
     let marker_key = format!("{name}/objects/destroy-marker.txt");
@@ -327,6 +330,7 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
         marker_key,
         pg_dsn: studio_dsn,
         pg_volume_id,
+        pg_uuid,
         env: TestEnv {
             s3_endpoint: env.s3_endpoint.clone(),
             s3_bucket: env.s3_bucket.clone(),
@@ -372,13 +376,14 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
     assert!(db_path.exists(), "local DB should exist before destroy");
 
     let output = run_destroy_cmd(fixture.home_dir.path(), &fixture.name, false, &fixture.name);
+    let text = output_text(&output);
     assert!(
-        !output.status.success(),
-        "destroy should fail when S3 credentials are invalid"
+        output.status.success(),
+        "destroy should exit cleanly (not fail) when S3 credentials are invalid, got: {text}"
     );
     assert!(
         db_path.exists(),
-        "local DB should remain after a failed destroy"
+        "local DB should remain after destroy exits early due to consistency check failure"
     );
 
     let store = make_datastore(&fixture.env, &fixture.name);
@@ -410,6 +415,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
         &fixture.pg_dsn,
         fixture.pg_volume_id,
         &fixture.env,
+        &fixture.pg_uuid,
     );
     assert!(
         fixture.meta_dir.exists(),
@@ -456,6 +462,7 @@ fn destroy_full_removes_local_s3_and_postgres_state() {
         &fixture.pg_dsn,
         fixture.pg_volume_id,
         &fixture.env,
+        &fixture.pg_uuid,
     );
 
     let output = run_destroy_cmd(fixture.home_dir.path(), &fixture.name, false, &fixture.name);
