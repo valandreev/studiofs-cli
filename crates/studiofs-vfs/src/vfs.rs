@@ -9788,6 +9788,9 @@ impl StudioVfs {
     async fn background_upload_stats(self: Arc<Self>) {
         let mut upload_pipeline_summary_was_active = false;
         let mut ticks_since_last_log = 0u64;
+        let mut zero_log_counter = 0u8;
+        const ZERO_LOG_TARGET: u8 = 3;
+
         loop {
             tokio::select! {
                 _ = self.state.shutdown_notify.notified() => break,
@@ -9806,10 +9809,25 @@ impl StudioVfs {
 
             let should_log = if activity_started {
                 ticks_since_last_log = 0;
+                zero_log_counter = 0;
                 true
-            } else if is_active || upload_pipeline_summary_was_active {
+            } else if is_active {
                 ticks_since_last_log += 1;
-                ticks_since_last_log >= 15
+                ticks_since_last_log >= 10
+            } else if upload_pipeline_summary_was_active {
+                // Just transitioned from active to inactive
+                ticks_since_last_log = 0;
+                zero_log_counter = 1;
+                true
+            } else if zero_log_counter > 0 && zero_log_counter < ZERO_LOG_TARGET {
+                // Inactive, but still need to log a few more zero messages
+                ticks_since_last_log += 1;
+                if ticks_since_last_log >= 10 {
+                    zero_log_counter += 1;
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             };
