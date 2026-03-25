@@ -335,6 +335,9 @@ Per-inode sequential read detection with adaptive prefetch depth.
   - baseline width = `STUDIOFS_READAHEAD_WIDTH` (default `128`)
   - max width is derived from read buffer budget (`STUDIOFS_READ_BUFFER_MB`) and block size
   - sustained sequential reads ramp width up by doubling; random seeks reset width to baseline
+- Sequential velocity is tracked via EWMA (blocks/sec) over microsecond sampling windows:
+  - sub-millisecond reads are accumulated into a sample window (anti-dither),
+  - stale velocity state is reset after long idle gaps.
 - Ramp-up is bounded per call (currently up to 2 doublings per `record_read`), so one large read span can advance faster than 1-block reads without runaway over-prefetch.
 - Prefetch depth = `min(score, current_dynamic_width)`, with a minimum floor on sequential streams (default 16 blocks)
 - Planned prefetch blocks are clamped to file EOF to avoid over-prefetch on small files.
@@ -347,7 +350,7 @@ Runtime tuning knobs:
 - `STUDIOFS_READAHEAD_RANDOM_PENALTY` (default `2`)
 - `STUDIOFS_PREFETCH_CONCURRENCY` (default `128`)
 - `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `max(32, prefetch_concurrency / 2)`, keeps fetch headroom for direct reads)
-- `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `96`)
+- `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `256`, effective cap also scales with AIMD window)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `250`, temporarily pauses prefetch after transport send errors)
 - `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
 - `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
@@ -382,7 +385,7 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 |-------|--------------|----------------|
 | `initial_window` | derived from read buffer (`~16` for 2048 MiB / 16 MiB blocks) | 16 |
 | `min_window` | 1 | 1 |
-| `max_window` | derived from read buffer (`128` for 2048 MiB / 16 MiB blocks) | 512 |
+| `max_window` | derived from expanded readahead cap (`1024` for 2048 MiB / 16 MiB blocks) | 512 |
 | `increase_step` | derived (`4.0` when max window >= 1024) | 2.0 |
 | `decrease_factor` | 0.85 | 0.85 |
 | `decrease_cooldown` | 3s | 3s |

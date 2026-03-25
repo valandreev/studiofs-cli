@@ -13,6 +13,8 @@
 //!   the score increments (up to MAX_SCORE), and after a confirmed streak the
 //!   dynamic width ramps up (doubling each streak interval) up to a configured
 //!   cap.
+//! - Sequential velocity is tracked with an EWMA over microsecond sample
+//!   windows; very short reads are accumulated until a minimum sample age.
 //! - If the reader is still inside the same block, the score is unchanged.
 //! - Any other jump decrements the score by 2.
 //!
@@ -212,7 +214,9 @@ impl ReadAheadTracker {
                                 state.velocity_blocks_per_sec_ema * (1.0 - VELOCITY_SAMPLE_ALPHA)
                                     + inst_bps * VELOCITY_SAMPLE_ALPHA
                             } else {
-                                inst_bps
+                                // Soft-start EMA to avoid immediate aggressive
+                                // widening from a single fast first sample.
+                                inst_bps * VELOCITY_SAMPLE_ALPHA
                             };
                         state.velocity_sample_anchor_micros = now_micros;
                         state.velocity_sample_blocks = 0;
