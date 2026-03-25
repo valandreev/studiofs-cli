@@ -151,7 +151,9 @@ impl ReadAheadTracker {
             state.sequential_streak = 0;
             state.current_width = self.base_width;
             state.velocity_blocks_per_sec_ema = 0.0;
-            state.velocity_sample_anchor_micros = 0;
+            // Re-seed anchor with "now" so resumed sequential reads can build
+            // fresh velocity samples immediately after idle reset.
+            state.velocity_sample_anchor_micros = now_micros;
             state.velocity_sample_blocks = 0;
         }
 
@@ -731,6 +733,32 @@ mod tests {
         assert!(
             tracker.debug_width(1).unwrap_or(16) > 16,
             "sub-ms bursts should still contribute to velocity via accumulation"
+        );
+    }
+
+    #[test]
+    fn test_velocity_recovers_after_idle_reset() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let mut t = 1_000_000u64;
+        let _ = tracker.record_read_at_micros(1, 0, 0, t);
+        for block in 1..=16u32 {
+            t = t.saturating_add(1_000);
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+        }
+        assert!(tracker.debug_width(1).unwrap_or(16) > 16);
+
+        // Long idle period triggers stale-reset path.
+        t = t.saturating_add(VELOCITY_SAMPLE_MAX_AGE_US + 10);
+        let _ = tracker.record_read_at_micros(1, 17, 17, t);
+
+        // Continued sequential reads should re-enable velocity widening.
+        for block in 18..=64u32 {
+            t = t.saturating_add(1_000);
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+        }
+        assert!(
+            tracker.debug_width(1).unwrap_or(16) > 16,
+            "velocity-based widening should recover after pause/resume"
         );
     }
 }
