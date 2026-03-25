@@ -50,7 +50,7 @@ the capacity limit is reached.
 | `memory_limit` | 25% of total RAM | L1 memory cache budget when `--memory-limit` is omitted |
 | `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
-| `readahead_width` | 128 | Max prefetch depth |
+| `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |
 | `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
 | `l2_commit_workers` | 32 | Bounded L2 commit scheduler workers |
 | `l2_commit_queue_capacity` | 4096 | Bounded L2 commit queue capacity |

@@ -561,7 +561,7 @@ const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
 const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 32;
-const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 96;
+const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 256;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
@@ -3977,7 +3977,11 @@ impl StudioVfs {
             let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
             let prefetch_concurrency = config.prefetch_concurrency.max(1);
             let readahead_base_width = config.readahead_width.max(1);
-            let readahead_max_width = buffer_blocks_default.max(readahead_base_width);
+            // Keep base conservative while allowing velocity-based expansion
+            // for sustained sequential readers.
+            let readahead_max_width = buffer_blocks_default
+                .max(readahead_base_width.saturating_mul(8))
+                .max(256);
             let readahead_min_prefetch = config.readahead_min_prefetch.max(1);
             let readahead_seq_step = config.readahead_seq_step.max(1);
             let readahead_random_penalty = config.readahead_random_penalty.max(1);
@@ -4074,7 +4078,7 @@ impl StudioVfs {
 
             // Build AIMD config for the fetch scheduler from config.
             let fetch_aimd_config = {
-                let fetch_max_window_default = (buffer_blocks_default as f64).clamp(64.0, 4096.0);
+                let fetch_max_window_default = (readahead_max_width as f64).clamp(128.0, 4096.0);
                 let fetch_initial_window_default =
                     (fetch_max_window_default / 8.0).clamp(16.0, 256.0);
                 let fetch_increase_default = if fetch_max_window_default >= 1024.0 {
