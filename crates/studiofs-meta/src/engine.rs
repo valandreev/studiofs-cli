@@ -68,9 +68,10 @@ pub enum MetaError {
     #[error("xattr value too large: actual={actual} bytes, limit={limit} bytes")]
     XattrValueTooLarge { actual: usize, limit: usize },
 
-    #[error(
-        "access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}"
-    )]
+    #[error("disk UUID mismatch: local={local}, remote={remote}")]
+    UuidMismatch { local: String, remote: String },
+
+    #[error("access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}")]
     AccessDenied {
         ino: Ino,
         principal: String,
@@ -146,6 +147,13 @@ impl MetadataReplicationBacklog {
 /// All operations are synchronous (redb is sync). The VFS layer wraps them
 /// in `spawn_blocking` for async compatibility.
 pub trait MetaEngine: Send + Sync {
+    /// Verify that the local metadata matches the remote state (e.g. UUID check).
+    ///
+    /// Engines that support remote verification should override this.
+    fn check_consistency(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     /// Flush pending metadata mutations to remote store (if any).
     ///
     /// Local-only engines can keep the default no-op implementation.

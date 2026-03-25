@@ -615,8 +615,39 @@ impl PgMetaEngine {
         &self.postgres_url
     }
 
-    pub fn volume_id(&self) -> i64 {
+    #[allow(dead_code)]
+    fn volume_id(&self) -> i64 {
         self.volume_id
+    }
+
+    fn fetch_remote_uuid(&self, volume_id: i64) -> MetaResult<String> {
+        let postgres_url = self.postgres_url.clone();
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "fetch volume uuid",
+                move |client| async move {
+                    let row = client
+                        .query_opt("SELECT uuid FROM volumes WHERE vol = $1", &[&volume_id])
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres volume uuid query failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    let row = row.ok_or_else(|| {
+                        MetaError::Storage(format!("volume id {} not found in postgres", volume_id))
+                    })?;
+                    Ok(row.get::<_, String>(0))
+                },
+            )
+            .await
+        })
     }
 
     fn now_millis() -> i64 {
@@ -1805,6 +1836,18 @@ impl MetaEngine for PgMetaEngine {
         }
     }
 
+    fn check_consistency(&self) -> MetaResult<()> {
+        let local_info = self.local.get_format_info()?;
+        let remote_uuid = self.fetch_remote_uuid(self.volume_id)?;
+        if local_info.uuid != remote_uuid {
+            return Err(MetaError::UuidMismatch {
+                local: local_info.uuid,
+                remote: remote_uuid,
+            });
+        }
+        Ok(())
+    }
+
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
         self.local.set_format_info(info)
     }
@@ -2214,6 +2257,26 @@ mod tests {
 
         fn format_info(&self) -> FormatInfo {
             format_info(&self.name, &self.uuid, &self.dsn, self.volume_id)
+        }
+
+        fn update_uuid(&self, new_uuid: &str) {
+            let _ = run_async(async {
+                let (client, connection) = tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
+                    .await
+                    .expect("connect");
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+                    .execute(
+                        "UPDATE volumes SET uuid = $1 WHERE vol = $2",
+                        &[&new_uuid, &self.volume_id],
+                    )
+                    .await
+                    .expect("update uuid");
+                conn_task.abort();
+                Ok::<(), MetaError>(())
+            });
         }
     }
 
@@ -5551,5 +5614,40 @@ mod tests {
             pins.contains(&55_001),
             "janitor must see cross-client snapshot pins from postgres"
         );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_uuid_mismatch_blocks_consistency_check() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("meta.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-uuid-mismatch");
+        let info = volume.format_info();
+        seed_local(&db_path, &info);
+
+        let engine = PgMetaEngine::open(&db_path).expect("open engine");
+
+        // Initial check should pass
+        engine
+            .check_consistency()
+            .expect("initial UUID check must pass");
+
+        // Simulate disk recreation: change UUID in PG for this volume_id
+        volume.update_uuid("recreated-uuid-12345");
+
+        // Next check should fail
+        let result = engine.check_consistency();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MetaError::UuidMismatch { local, remote } => {
+                assert_eq!(local, info.uuid);
+                assert_eq!(remote, "recreated-uuid-12345");
+            }
+            e => panic!("expected UuidMismatch, got {:?}", e),
+        }
     }
 }

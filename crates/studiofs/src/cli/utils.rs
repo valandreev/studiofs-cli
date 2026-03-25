@@ -198,6 +198,18 @@ pub fn remove_pid_file_in(dir: &std::path::Path, mount_point: &str) -> Result<()
     Ok(())
 }
 
+/// Format a suggested cleanup command for the user based on the current OS.
+pub fn format_cleanup_command(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("studiofs.exe destroy {name} --local")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("studiofs destroy {name} --local")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

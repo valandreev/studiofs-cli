@@ -3,7 +3,6 @@
 use std::io::Write;
 use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
-use studiofs_meta::{MetaEngine, RedbMetaEngine};
 use tracing::warn;
 
 pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> {
@@ -19,11 +18,32 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
 
     // 2. Open metadata to get S3 credentials
     // We only need read access to format info
-    let meta = RedbMetaEngine::open(&db_path)?;
-    let format_info = meta.get_format_info()?;
+    let live_meta = studiofs_meta::open_meta_engine(&db_path)?;
+    let format_info = live_meta.get_format_info()?;
+
+    // 2.1 Validate UUID against remote store if applicable (SFS-95)
+    if !local_only && let Err(e) = live_meta.check_consistency() {
+        let cleanup = super::utils::format_cleanup_command(name);
+        match e {
+            studiofs_meta::engine::MetaError::UuidMismatch { local, remote } => {
+                println!("Warning: Local disk UUID does not match the remote database. You might be trying to destroy a recreated disk that you haven't discovered yet.");
+                println!("Remote UUID: {remote}");
+                println!("Local UUID:  {local}");
+                println!("\nDo you want to only remove the local stale configuration?");
+                println!("Suggested command: {cleanup}");
+                return Ok(());
+            }
+            _ => {
+                println!("Warning: Could not verify disk identity (remote database is unreachable).");
+                println!("If you want to remove the local configuration and metadata only, use the --local flag.");
+                println!("Suggested command: {cleanup}");
+                return Ok(());
+            }
+        }
+    }
 
     // Close DB so we can delete it later
-    drop(meta);
+    drop(live_meta);
 
     // 3. Confirm with user
     println!("WARNING: You are about to DESTROY volume '{}'.", name);

@@ -568,6 +568,19 @@ pub fn run(
     let db_path = meta_dir.join(format!("{name}.db"));
     debug!("opening volume {name:?} from {db_path:?}");
     let live_meta = open_meta_engine(&db_path)?;
+
+    // Validate UUID against remote store if applicable (SFS-95)
+    if let Err(e) = live_meta.check_consistency() {
+        if let studiofs_meta::engine::MetaError::UuidMismatch { local, remote } = &e {
+            let cleanup = super::utils::format_cleanup_command(name);
+            anyhow::bail!(
+                "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
+                name, local, remote, cleanup
+            );
+        }
+        return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));
+    }
+
     let mut format_info = live_meta.get_format_info()?;
     let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
         let snapshot = live_meta

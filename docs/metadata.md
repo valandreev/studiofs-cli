@@ -26,6 +26,35 @@ Current behavior:
 - local serving view is `overlay over base`
 - `metadata_state` is used as a bootstrap/checkpoint store, not the primary runtime sync channel
 
+## Volume Identity and UUID Verification
+
+Each StudioFS volume is assigned a unique `disk_uuid` during initialization (`studiofs init`). This UUID is stored in both the remote metadata store (PostgreSQL) and the local metadata file (`.db` via `redb`).
+
+### UUID Mismatch Protection
+
+To prevent accidental data corruption or inconsistent states when a volume is deleted and recreated with the same name, StudioFS performs a mandatory UUID verification during `mount` and `destroy` operations:
+
+- **Mount**: Before starting the filesystem, the client connects to the remote PostgreSQL database and compares the local UUID with the remote one. If they do not match, the mount is blocked.
+- **Destroy**: Before performing a remote destruction of S3 data and PostgreSQL tables, the UUID is verified. If a mismatch is detected, the command will fail and suggest using `--local` to only clean up the stale local metadata.
+
+### Offline Behavior
+
+If the remote PostgreSQL database is unreachable during a `mount` or `destroy` command:
+- **Mount**: The operation is blocked because the identity of the disk cannot be verified.
+- **Destroy**: The command will warn that the identity could not be verified and will only allow a local cleanup via the `--local` flag.
+
+### Troubleshooting
+
+If you see a "Disk recreated" error, it means your local metadata belongs to a previous instance of a disk with the same name. To resolve this, you must remove your local state:
+```bash
+# Windows
+studiofs.exe destroy <name> --local
+
+# Linux/macOS
+studiofs destroy <name> --local
+```
+After cleaning up locally, you can use `studiofs discover` to connect to the new instance of the disk.
+
 ## Sync Model
 
 ### Local vs Remote-Visible State
