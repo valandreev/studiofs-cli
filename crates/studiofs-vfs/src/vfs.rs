@@ -51,7 +51,7 @@ use studiofs_cache::block_cache::{
     DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
 use studiofs_cache::l2_disk::L2IoPriority;
-use studiofs_cache::metrics::{CachePipelineMetricsSnapshot, IoStats, MaterializeBatchStats};
+use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -3259,6 +3259,10 @@ pub struct StudioVfs {
     upload_fg_read_latency_target_ns: u64,
     /// Sliding window for foreground speedometer samples.
     upload_fg_read_latency_window: Duration,
+    /// Last observed foreground P90 (ns), used as sticky fallback.
+    upload_fg_read_last_p90_ns: AtomicU64,
+    /// Timestamp of the last observed foreground P90.
+    upload_fg_read_last_p90_at_ms: AtomicU64,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
@@ -4350,6 +4354,8 @@ impl StudioVfs {
                 upload_fg_read_latency_window: Duration::from_millis(
                     upload_fg_read_latency_window_ms,
                 ),
+                upload_fg_read_last_p90_ns: AtomicU64::new(0),
+                upload_fg_read_last_p90_at_ms: AtomicU64::new(0),
                 upload_user_idle_grace,
                 upload_worker_count,
                 max_drain_batch,
@@ -5083,7 +5089,7 @@ impl StudioVfs {
         samples.push_back((now_ms, elapsed_ns));
     }
 
-    fn foreground_read_p90_latency_ns(&self) -> Option<u64> {
+    fn foreground_speedometer_snapshot(&self) -> (Option<u64>, usize) {
         let now_ms = Self::now_unix_millis();
         let mut samples = self.state.foreground_read_latency_samples.lock();
         Self::trim_foreground_latency_samples(
@@ -5091,23 +5097,32 @@ impl StudioVfs {
             now_ms,
             self.upload_fg_read_latency_window,
         );
-        Self::p90_ns(samples.iter().map(|(_, latency_ns)| *latency_ns).collect())
+        let p90_ns = Self::p90_ns(samples.iter().map(|(_, latency_ns)| *latency_ns).collect());
+        if let Some(p90) = p90_ns {
+            self.upload_fg_read_last_p90_ns
+                .store(p90, Ordering::Relaxed);
+            self.upload_fg_read_last_p90_at_ms
+                .store(now_ms, Ordering::Relaxed);
+        }
+        (p90_ns, samples.len())
     }
 
-    fn foreground_read_p90_latency_ms(&self) -> Option<u64> {
-        self.foreground_read_p90_latency_ns()
-            .map(|ns| ns.saturating_div(1_000_000))
-    }
-
-    fn foreground_read_speedometer_samples(&self) -> usize {
+    fn foreground_sticky_p90_latency_ns(&self) -> Option<u64> {
         let now_ms = Self::now_unix_millis();
-        let mut samples = self.state.foreground_read_latency_samples.lock();
-        Self::trim_foreground_latency_samples(
-            &mut samples,
-            now_ms,
-            self.upload_fg_read_latency_window,
-        );
-        samples.len()
+        let last_at = self.upload_fg_read_last_p90_at_ms.load(Ordering::Relaxed);
+        if last_at == 0 {
+            return None;
+        }
+        let sticky_window_ms = self
+            .upload_fg_read_latency_window
+            .as_millis()
+            .saturating_mul(2)
+            .clamp(1, u64::MAX as u128) as u64;
+        if now_ms.saturating_sub(last_at) > sticky_window_ms {
+            return None;
+        }
+        let p90 = self.upload_fg_read_last_p90_ns.load(Ordering::Relaxed);
+        if p90 == 0 { None } else { Some(p90) }
     }
 
     fn update_upload_io_penalty(&self, congested: bool) -> u32 {
@@ -5126,11 +5141,8 @@ impl StudioVfs {
         next
     }
 
-    fn adjust_upload_backpressure_from_metrics(
-        &self,
-        _cache_pipeline: &CachePipelineMetricsSnapshot,
-    ) {
-        let p90_latency_ns = self.foreground_read_p90_latency_ns();
+    fn adjust_upload_backpressure_from_metrics(&self, p90_latency_ns: Option<u64>) {
+        let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_penalty = self.update_upload_io_penalty(congested);
@@ -9763,7 +9775,9 @@ impl StudioVfs {
             let ingress_append = self.state.ingress_append_stats.snapshot();
             let materialize_batches = self.state.materialize_batch_stats.snapshot();
             let cache_pipeline = self.block_cache.cache_pipeline_metrics();
-            self.adjust_upload_backpressure_from_metrics(&cache_pipeline);
+            let (foreground_read_p90_ns, foreground_read_speedometer_samples) =
+                self.foreground_speedometer_snapshot();
+            self.adjust_upload_backpressure_from_metrics(foreground_read_p90_ns);
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
@@ -9919,9 +9933,9 @@ impl StudioVfs {
                     upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
                     upload_io_penalty_dynamic =
                         self.upload_cache_io_user_penalty.load(Ordering::Relaxed),
-                    foreground_read_p90_ms = self.foreground_read_p90_latency_ms(),
-                    foreground_read_speedometer_samples =
-                        self.foreground_read_speedometer_samples(),
+                    foreground_read_p90_ms =
+                        foreground_read_p90_ns.map(|ns| ns.saturating_div(1_000_000)),
+                    foreground_read_speedometer_samples,
                     foreground_read_target_ms = self
                         .upload_fg_read_latency_target_ns
                         .saturating_div(1_000_000),
@@ -10699,6 +10713,15 @@ mod tests {
     #[test]
     fn foreground_speedometer_p90_handles_empty_input() {
         assert_eq!(StudioVfs::p90_ns(vec![]), None);
+    }
+
+    #[test]
+    fn foreground_speedometer_trim_drops_expired_samples() {
+        let mut samples =
+            std::collections::VecDeque::from([(100, 10_u64), (200, 20_u64), (350, 30_u64)]);
+        StudioVfs::trim_foreground_latency_samples(&mut samples, 400, Duration::from_millis(150));
+        let kept: Vec<(u64, u64)> = samples.into_iter().collect();
+        assert_eq!(kept, vec![(350, 30)]);
     }
 
     #[test]
