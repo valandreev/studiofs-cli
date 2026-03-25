@@ -56,7 +56,7 @@ const DEFAULT_L2_BACKGROUND_BLOCKING_IO_MAX_IN_FLIGHT: usize = 32;
 /// Max number of blocking L2 read tasks scheduled concurrently by one batch read call.
 const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 /// Number of hot block files to keep as open descriptors for sync read fast-path.
-const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 4096;
+const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 16_384;
 const DEFAULT_BUFFERED_READ_CAPACITY: usize = 16 * 1024 * 1024;
 const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
 const L2_SYNC_DIRECT_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_DIRECT_FD_CACHE_CAPACITY";
@@ -211,6 +211,24 @@ fn read_batch_max_in_flight() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT)
+}
+
+#[cfg(unix)]
+fn current_nofile_soft_limit() -> Option<u64> {
+    // SAFETY: `getrlimit` initializes the provided struct on success.
+    let mut lim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, lim.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `rc == 0` means `lim` was initialized by `getrlimit`.
+    let lim = unsafe { lim.assume_init() };
+    Some(lim.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+fn current_nofile_soft_limit() -> Option<u64> {
+    None
 }
 
 fn open_sync_read_file(path: &Path) -> io::Result<File> {
@@ -369,6 +387,16 @@ impl L2DiskCache {
         // Keep total open-FD budget bounded even with separate buffered/direct
         // sync caches by splitting one configured capacity across both.
         let total_fd_cache_capacity = sync_fd_cache_capacity().max(2);
+        if let Some(nofile_soft_limit) = current_nofile_soft_limit()
+            && total_fd_cache_capacity as u64 >= nofile_soft_limit
+        {
+            warn!(
+                fd_cache_capacity = total_fd_cache_capacity,
+                nofile_soft_limit,
+                env = L2_SYNC_FD_CACHE_CAPACITY_ENV,
+                "L2 sync FD cache capacity is near/above process nofile soft limit; consider lowering cache capacity or increasing ulimit -n"
+            );
+        }
         let direct_fd_cache_capacity = direct_sync_fd_cache_capacity(total_fd_cache_capacity);
         let buffered_fd_cache_capacity =
             total_fd_cache_capacity.saturating_sub(direct_fd_cache_capacity);
