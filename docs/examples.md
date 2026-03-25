@@ -54,6 +54,12 @@ Mount using the conservative USB L2 cache profile (for external USB SSDs):
 studiofs mount myvolume Z: --l2-profile usb
 ```
 
+Mount with a local S3 endpoint (for low-latency access in hybrid networks):
+
+```bash
+studiofs mount myvolume Z: --endpoint http://192.168.1.50:9000
+```
+
 To unmount a volume running in the background:
 
 ```bash

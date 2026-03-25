@@ -417,6 +417,7 @@ pub fn run(
     direct_io: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
+    endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mount_point, resolved_cache_dir, memory_limit, cache_size) =
         super::settings::resolve_studiofs_config_for_mount(
@@ -611,6 +612,25 @@ pub fn run(
     } else {
         (live_meta, false)
     };
+
+    // Apply runtime S3 endpoint override if provided (SFS-95)
+    if let Some(endpoint) = endpoint {
+        // Validate URL before applying override
+        if url::Url::parse(endpoint).is_err()
+            && url::Url::parse(&format!("http://{endpoint}")).is_err()
+        {
+            anyhow::bail!(
+                "invalid S3 endpoint '{}': must be a valid URL (e.g., http://192.168.1.50:9000)",
+                endpoint
+            );
+        }
+        info!(
+            original_endpoint = %format_info.endpoint,
+            override_endpoint = %endpoint,
+            "overriding S3 endpoint for this mount session"
+        );
+        format_info.endpoint = endpoint.to_string();
+    }
 
     info!(
         "mounting volume '{}' (storage: endpoint={}, bucket={})",

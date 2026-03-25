@@ -474,6 +474,14 @@ ACL PRINCIPAL:
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
         snapshot_id: Option<String>,
+
+        /// Override the S3 endpoint URL for this mount session.
+        ///
+        /// Useful for mounting via a local IP address (e.g. http://192.168.1.50:9000)
+        /// instead of the public endpoint configured during `studiofs init`.
+        /// This override only applies to the current process and is NOT saved.
+        #[arg(long)]
+        endpoint: Option<String>,
     },
 
     /// Unmount a previously mounted filesystem volume
@@ -758,6 +766,7 @@ fn main() -> anyhow::Result<()> {
             direct_io,
             profile,
             snapshot_id,
+            endpoint,
         } => {
             #[cfg(windows)]
             cli::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
@@ -777,6 +786,7 @@ fn main() -> anyhow::Result<()> {
                 direct_io,
                 profile,
                 snapshot_id.as_deref(),
+                endpoint.as_deref(),
             )?;
         }
         Commands::Settings { settings } => {
@@ -1088,6 +1098,40 @@ mod tests {
         match cli.command {
             Commands::Mount { principal, .. } => {
                 assert_eq!(principal.as_deref(), Some("alice"));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_endpoint_override_parses() {
+        let cli = parse(&[
+            "mount",
+            "vol",
+            "Z:",
+            "--endpoint",
+            "http://192.168.1.50:9000",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Mount {
+                endpoint, ..
+            } => {
+                assert_eq!(
+                    endpoint.as_deref(),
+                    Some("http://192.168.1.50:9000")
+                );
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_endpoint_default_is_none() {
+        let cli = parse(&["mount", "vol", "Z:"]).unwrap();
+        match cli.command {
+            Commands::Mount { endpoint, .. } => {
+                assert_eq!(endpoint, None);
             }
             other => panic!("expected Mount, got {other:?}"),
         }
