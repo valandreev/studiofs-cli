@@ -37,6 +37,7 @@ const MAX_SCORE: u8 = 255;
 const VELOCITY_SAMPLE_ALPHA: f64 = 0.25;
 const VELOCITY_SAMPLE_MIN_AGE_US: u64 = 1_000;
 const VELOCITY_SAMPLE_MAX_AGE_US: u64 = 2_000_000;
+const LARGE_SEEK_RESET_BLOCK_DELTA: u32 = 256;
 
 // =============================================================================
 // Internal state
@@ -200,10 +201,17 @@ impl ReadAheadTracker {
         } else if is_same_block {
             // Keep score as-is.
         } else {
-            state.score = state.score.saturating_sub(self.random_penalty);
+            let large_seek_jump = state.last_block != u32::MAX
+                && first_block.abs_diff(state.last_block) >= LARGE_SEEK_RESET_BLOCK_DELTA;
+            if large_seek_jump {
+                state.score = 0;
+                state.velocity_blocks_per_sec_ema = 0.0;
+            } else {
+                state.score = state.score.saturating_sub(self.random_penalty);
+                state.velocity_blocks_per_sec_ema *= 0.5;
+            }
             state.sequential_streak = 0;
             state.current_width = self.base_width;
-            state.velocity_blocks_per_sec_ema *= 0.5;
         }
 
         state.last_block = last_block;
@@ -627,6 +635,46 @@ mod tests {
             let _ = tracker.record_read_at_micros(1, block, block, t);
         }
 
+        assert_eq!(tracker.debug_width(1), Some(16));
+    }
+
+    #[test]
+    fn test_stale_velocity_sample_does_not_expand_window() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let mut t = 1_000_000u64;
+        let _ = tracker.record_read_at_micros(1, 0, 0, t);
+
+        // Gap exceeds VELOCITY_SAMPLE_MAX_AGE_US, so velocity sample is ignored.
+        t = t.saturating_add(VELOCITY_SAMPLE_MAX_AGE_US + 1);
+        let _ = tracker.record_read_at_micros(1, 1, 1, t);
+
+        assert_eq!(tracker.debug_width(1), Some(16));
+    }
+
+    #[test]
+    fn test_large_seek_hard_resets_velocity_and_score() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let mut t = 1_000_000u64;
+        let _ = tracker.record_read_at_micros(1, 0, 0, t);
+
+        for block in 1..=32u32 {
+            t = t.saturating_add(1_000);
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+        }
+        assert!(tracker.debug_width(1).unwrap_or(16) > 16);
+
+        // Jump far enough to trigger hard reset path.
+        t = t.saturating_add(1_000);
+        let prefetch = tracker.record_read_at_micros(
+            1,
+            32 + LARGE_SEEK_RESET_BLOCK_DELTA + 32,
+            32 + LARGE_SEEK_RESET_BLOCK_DELTA + 32,
+            t,
+        );
+        assert!(
+            prefetch.is_empty(),
+            "large seek should reset score and suppress immediate prefetch"
+        );
         assert_eq!(tracker.debug_width(1), Some(16));
     }
 }
