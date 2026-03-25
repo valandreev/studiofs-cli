@@ -1848,6 +1848,45 @@ impl MetaEngine for PgMetaEngine {
         Ok(())
     }
 
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let size = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "fetch remote metadata size",
+                move |client| async move {
+                    let row = client
+                        .query_one(
+                            r#"
+                            SELECT 
+                                (SELECT COALESCE(SUM(pg_column_size(snapshot)), 0) FROM metadata_state WHERE vol = $1) +
+                                (SELECT COALESCE(SUM(pg_column_size(event_payload)), 0) FROM event_log WHERE vol = $1) +
+                                (SELECT COALESCE(SUM(pg_column_size(snapshot_payload)), 0) FROM snapshots WHERE vol = $1)
+                            "#,
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres metadata size query failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    let bytes: i64 = row.get(0);
+                    // COALESCE ensures non-negative; saturating conversion handles edge cases
+                    Ok(bytes.max(0) as u64)
+                },
+            )
+            .await
+        })?;
+        Ok(Some(size))
+    }
+
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
         self.local.set_format_info(info)
     }
@@ -2261,9 +2300,10 @@ mod tests {
 
         fn update_uuid(&self, new_uuid: &str) {
             let _ = run_async(async {
-                let (client, connection) = tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
-                    .await
-                    .expect("connect");
+                let (client, connection) =
+                    tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
+                        .await
+                        .expect("connect");
                 let conn_task = tokio::spawn(async move {
                     let _ = connection.await;
                 });

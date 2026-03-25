@@ -6,6 +6,7 @@
 
 use crate::cli::test_cache_profile::TestCacheProfileSession;
 use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
+use crate::cli::utils::{format_bytes, format_throughput};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -28,7 +29,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
 const MAX_LATENCY_SAMPLES: usize = 200_000;
-const BINARY_UNIT_DIVISOR: f64 = 1024.0;
 const WORKLOAD_FILES_PER_TIER: usize = 100;
 const DEFAULT_WORKLOAD_FILES: usize = WORKLOAD_FILES_PER_TIER * 3;
 const SMALL_FILE_MIN_BYTES: u64 = 1024;
@@ -2525,37 +2525,6 @@ async fn run_mounted_end_to_end(
     match benchmark_result {
         Ok(report) => Ok(report),
         Err(err) => Err(err),
-    }
-}
-
-fn format_binary_value(mut value: f64) -> (f64, &'static str) {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut unit = units[0];
-    for next_unit in units.iter().skip(1) {
-        if value < BINARY_UNIT_DIVISOR {
-            break;
-        }
-        value /= BINARY_UNIT_DIVISOR;
-        unit = next_unit;
-    }
-    (value, unit)
-}
-
-fn format_bytes(bytes: u64) -> String {
-    let (value, unit) = format_binary_value(bytes as f64);
-    if unit == "B" {
-        format!("{value:.0} {unit}")
-    } else {
-        format!("{value:.2} {unit}")
-    }
-}
-
-fn format_throughput(bytes_per_sec: f64) -> String {
-    let (value, unit) = format_binary_value(bytes_per_sec.max(0.0));
-    if unit == "B" {
-        format!("{value:.0} {unit}/s")
-    } else {
-        format!("{value:.2} {unit}/s")
     }
 }
 

@@ -210,6 +210,46 @@ pub fn format_cleanup_command(name: &str) -> String {
     }
 }
 
+// ─── Byte formatting utilities ───────────────────────────────────────────────
+
+const BINARY_UNIT_DIVISOR: f64 = 1024.0;
+
+/// Format a binary value (bytes) with appropriate unit (B, KiB, MiB, GiB, etc.)
+fn format_binary_value(mut value: f64) -> (f64, &'static str) {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut unit = units[0];
+    for next_unit in units.iter().skip(1) {
+        if value < BINARY_UNIT_DIVISOR {
+            break;
+        }
+        value /= BINARY_UNIT_DIVISOR;
+        unit = next_unit;
+    }
+    (value, unit)
+}
+
+/// Format bytes as a human-readable string without space between number and unit.
+/// Examples: "512B", "1.5KiB", "2.0MiB", "1.0GiB"
+pub fn format_bytes(bytes: u64) -> String {
+    let (value, unit) = format_binary_value(bytes as f64);
+    if unit == "B" {
+        format!("{value:.0}{unit}")
+    } else {
+        format!("{value:.1}{unit}")
+    }
+}
+
+/// Format throughput (bytes per second) as a human-readable string.
+/// Examples: "512B/s", "1.5KiB/s", "2.0MiB/s"
+pub fn format_throughput(bytes_per_sec: f64) -> String {
+    let (value, unit) = format_binary_value(bytes_per_sec.max(0.0));
+    if unit == "B" {
+        format!("{value:.0}{unit}/s")
+    } else {
+        format!("{value:.2}{unit}/s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

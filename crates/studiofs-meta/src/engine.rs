@@ -466,6 +466,11 @@ pub trait MetaEngine: Send + Sync {
         Ok(pins)
     }
 
+    /// Return the estimated size of remote metadata in bytes, if applicable.
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        Ok(None)
+    }
+
     // ─── High-Level Operations ───────────────────────────────────────────
 
     /// Create a new file: allocate inode, set attrs, add dentry.

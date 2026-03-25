@@ -1,11 +1,13 @@
 //! `studiofs status` — show filesystem status.
 
+use crate::cli::utils::format_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-use studiofs_meta::{MetaEngine, RedbMetaEngine, counters};
+use studiofs_meta::counters;
 
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
+
 const INGRESS_RECORD_PUT: u8 = 1;
 const INGRESS_RECORD_INVALIDATE: u8 = 2;
 const INGRESS_RECORD_HEADER_LEN: usize = 37;
@@ -32,22 +34,6 @@ fn local_cache_path(meta_dir: &Path, cache_dir: Option<&Path>, volume_uuid: &str
         .map(Path::to_path_buf)
         .unwrap_or_else(|| meta_dir.join("cache"));
     base.join(volume_uuid)
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.1} GiB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MiB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KiB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
@@ -187,7 +173,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         return Ok(());
     }
 
-    let engine = RedbMetaEngine::open(&db_path)?;
+    let engine = studiofs_meta::open_meta_engine(&db_path)?;
     let format_info = engine.get_format_info()?;
 
     let total_inodes = engine.get_counter(counters::TOTAL_INODES)?;
@@ -198,6 +184,9 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(&cache_path.join("upload"))?;
+
+    let remote_size = engine.remote_metadata_size()?.unwrap_or(0);
+    let local_db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     println!("StudioFS Volume Status");
     println!("──────────────────────");
@@ -210,25 +199,26 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         "  Block size: {} MiB",
         format_info.block_size / (1024 * 1024)
     );
-    println!("  Meta backend: {:?}", format_info.metadata.backend);
-    if let Some(remote) = &format_info.metadata.remote {
-        println!("  Meta endpoint: {}", remote.endpoint);
-        println!("  Meta bucket:   {}", remote.bucket);
-        println!("  Meta prefix:   {}", remote.prefix);
-    }
+
     if let Some(pg) = &format_info.metadata.postgres {
+        println!("\n  Meta backend: Postgres");
         println!("  Postgres URL:  {}", pg.url);
         println!("  Postgres vol:  {}", pg.volume_id);
+        println!("  Postgres size: {}", format_bytes(remote_size));
+    } else {
+        println!("\n  Meta backend: {:?}", format_info.metadata.backend);
     }
-    println!();
-    println!("  Inodes:     {}", total_inodes);
-    println!("  Used space: {} bytes", used_space);
+
+    println!("\n  Inodes:     {}", total_inodes);
     println!("  Next inode: {}", next_inode);
     println!("  Next block: {}", next_block);
-    println!("  Metadata:   {:?}", db_path);
-    println!("  Cache:      {:?}", cache_path);
-    println!();
-    println!("Local Ingress");
+
+    println!("\n  Used space: {}", format_bytes(used_space));
+
+    println!("\n  Metadata:   {:?}", db_path);
+    println!("  Meta size:   {}", format_bytes(local_db_size));
+
+    println!("\nLocal Ingress");
     println!("─────────────");
     println!("  Spill records:      {}", spill_stats.records);
     println!("  Spill bytes:        {}", format_bytes(spill_stats.bytes));
