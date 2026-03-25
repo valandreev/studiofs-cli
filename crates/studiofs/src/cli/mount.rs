@@ -686,6 +686,7 @@ pub fn run(
     );
     println!("  Memory limit: {}", memory_limit_display);
     println!("  Cache size:   {}", cache_size);
+    println!("  Cache path:   {}", cache_path_str);
     println!(
         "  Storage:      {} / {}",
         format_info.endpoint, format_info.bucket
