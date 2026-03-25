@@ -57,7 +57,10 @@ the capacity limit is reached.
 | `l2_read_timeout_ms` | 5000 | Max wait for local L2 read before cache-miss fallback |
 | `l2_write_timeout_ms` | 5000 | Max wait for local L2 write attempt |
 | `upload_stats_interval_secs` | 1 | Upload pipeline/adaptive-control tick interval |
-| `upload_l2_lookup_spike_threshold_ms` | 10 | L2 lookup latency threshold that enables adaptive upload throttling |
+| `upload_fg_read_latency_target_ms` | 50 | Foreground-read P90 latency target for upload throttling |
+| `upload_fg_read_latency_window_ms` | 3000 | Foreground-read speedometer sliding window |
+| `upload_fg_read_latency_sticky_windows` | 2 | Keep last observed P90 for this many windows when samples pause |
+| `upload_l2_lookup_spike_threshold_ms` | 10 | Legacy compatibility floor for `upload_fg_read_latency_target_ms` |
 
 Mount profile note:
 - `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
@@ -74,7 +77,10 @@ Runtime principal selection:
 
 Adaptive upload throttling overrides:
 - `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` controls control-loop tick cadence.
-- `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` tunes the L2 latency spike threshold.
+- `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` sets the foreground P90 target.
+- `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` sets the speedometer sampling window.
+- `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` controls how long last P90 is retained.
+- `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` is kept for compatibility and acts as a floor for the new target.
 
 ## Write Path
 
@@ -187,8 +193,8 @@ Deleted-inode cancellation behavior:
 
 Adaptive upload control:
 - workers use cooperative scheduler yielding (`tokio::task::yield_now()`) periodically to avoid starving foreground tasks.
-- upload backpressure samples cache pipeline metrics on each control tick.
-- L2 latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
+- upload backpressure uses a foreground-read P90 speedometer on each control tick.
+- foreground-read latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
 - first upload attempt applies adaptive penalty; retries keep retry/backoff behavior unchanged.
 - local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
 - QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.
