@@ -581,6 +581,7 @@ const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 250;
 const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 4;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_NUM: u64 = 3;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_DEN: u64 = 4;
+const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
 const FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES: usize = 4_096;
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = 8;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
@@ -3134,9 +3135,11 @@ struct VfsState {
     foreground_reads_inflight: AtomicUsize,
     /// Last time a foreground read was observed (unix millis).
     last_foreground_read_ms: AtomicU64,
-    /// Sliding samples for the foreground read speedometer:
-    /// `(timestamp_ms, latency_ns)`.
-    foreground_read_latency_samples: Mutex<VecDeque<(u64, u64)>>,
+    /// Sliding samples for the foreground read speedometer (sharded):
+    /// each entry is `(timestamp_ms, latency_ns)`.
+    foreground_read_latency_shards: Vec<Mutex<VecDeque<(u64, u64)>>>,
+    /// Round-robin shard selector for foreground read latency writes.
+    foreground_read_shard_cursor: AtomicU64,
     /// Number of successful synchronous cache-only read fast-path operations.
     sync_read_fast_path_hits: AtomicU64,
     /// Number of synchronous cache-only fast-path misses/fallbacks.
@@ -3322,14 +3325,17 @@ pub struct StudioVfs {
 struct ForegroundReadScope<'a> {
     vfs: &'a StudioVfs,
     started: Instant,
+    shard_idx: usize,
 }
 
 impl<'a> ForegroundReadScope<'a> {
     fn new(vfs: &'a StudioVfs) -> Self {
         vfs.mark_foreground_read();
+        let shard_idx = vfs.select_foreground_latency_shard();
         Self {
             vfs,
             started: Instant::now(),
+            shard_idx,
         }
     }
 }
@@ -3337,7 +3343,7 @@ impl<'a> ForegroundReadScope<'a> {
 impl Drop for ForegroundReadScope<'_> {
     fn drop(&mut self) {
         self.vfs
-            .record_foreground_read_latency(self.started.elapsed());
+            .record_foreground_read_latency(self.shard_idx, self.started.elapsed());
         self.vfs.unmark_foreground_read();
     }
 }
@@ -4293,7 +4299,10 @@ impl StudioVfs {
                     upload_canceled_stale: AtomicU64::new(0),
                     foreground_reads_inflight: AtomicUsize::new(0),
                     last_foreground_read_ms: AtomicU64::new(0),
-                    foreground_read_latency_samples: Mutex::new(VecDeque::new()),
+                    foreground_read_latency_shards: (0..FOREGROUND_READ_SPEEDOMETER_SHARDS)
+                        .map(|_| Mutex::new(VecDeque::new()))
+                        .collect(),
+                    foreground_read_shard_cursor: AtomicU64::new(0),
                     sync_read_fast_path_hits: AtomicU64::new(0),
                     sync_read_fast_path_misses: AtomicU64::new(0),
                     slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
@@ -5077,10 +5086,21 @@ impl StudioVfs {
         }
     }
 
-    fn record_foreground_read_latency(&self, elapsed: Duration) {
+    fn select_foreground_latency_shard(&self) -> usize {
+        let shard_count = self.state.foreground_read_latency_shards.len().max(1);
+        (self
+            .state
+            .foreground_read_shard_cursor
+            .fetch_add(1, Ordering::Relaxed) as usize)
+            % shard_count
+    }
+
+    fn record_foreground_read_latency(&self, shard_idx: usize, elapsed: Duration) {
         let now_ms = Self::now_unix_millis();
         let elapsed_ns = elapsed.as_nanos().clamp(1, u64::MAX as u128) as u64;
-        let mut samples = self.state.foreground_read_latency_samples.lock();
+        let shard_count = self.state.foreground_read_latency_shards.len().max(1);
+        let idx = shard_idx % shard_count;
+        let mut samples = self.state.foreground_read_latency_shards[idx].lock();
         Self::trim_foreground_latency_samples(
             &mut samples,
             now_ms,
@@ -5091,20 +5111,26 @@ impl StudioVfs {
 
     fn foreground_speedometer_snapshot(&self) -> (Option<u64>, usize) {
         let now_ms = Self::now_unix_millis();
-        let mut samples = self.state.foreground_read_latency_samples.lock();
-        Self::trim_foreground_latency_samples(
-            &mut samples,
-            now_ms,
-            self.upload_fg_read_latency_window,
-        );
-        let p90_ns = Self::p90_ns(samples.iter().map(|(_, latency_ns)| *latency_ns).collect());
+        let mut samples_all = Vec::new();
+        let mut total_samples = 0usize;
+        for shard in &self.state.foreground_read_latency_shards {
+            let mut samples = shard.lock();
+            Self::trim_foreground_latency_samples(
+                &mut samples,
+                now_ms,
+                self.upload_fg_read_latency_window,
+            );
+            total_samples = total_samples.saturating_add(samples.len());
+            samples_all.extend(samples.iter().map(|(_, latency_ns)| *latency_ns));
+        }
+        let p90_ns = Self::p90_ns(samples_all);
         if let Some(p90) = p90_ns {
             self.upload_fg_read_last_p90_ns
                 .store(p90, Ordering::Relaxed);
             self.upload_fg_read_last_p90_at_ms
                 .store(now_ms, Ordering::Relaxed);
         }
-        (p90_ns, samples.len())
+        (p90_ns, total_samples)
     }
 
     fn foreground_sticky_p90_latency_ns(&self) -> Option<u64> {
