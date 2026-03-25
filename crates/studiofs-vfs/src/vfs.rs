@@ -51,9 +51,7 @@ use studiofs_cache::block_cache::{
     DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
 use studiofs_cache::l2_disk::L2IoPriority;
-use studiofs_cache::metrics::{
-    CachePipelineMetricsSnapshot, IoStats, IoStatsSnapshot, MaterializeBatchStats,
-};
+use studiofs_cache::metrics::{CachePipelineMetricsSnapshot, IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -575,12 +573,15 @@ const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 1;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
+const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
+const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
 const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
 const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 2;
 const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 250;
 const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 4;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_NUM: u64 = 3;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_DEN: u64 = 4;
+const FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES: usize = 4_096;
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = 8;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
 const DEFAULT_DENTRY_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -756,7 +757,8 @@ pub struct VfsConfig {
     pub upload_requeue_max_ms: u64,
     /// Upload metrics log interval.
     pub upload_stats_interval_secs: u64,
-    /// L2 lookup latency threshold that triggers upload throttling.
+    /// Legacy throttle threshold knob kept for backward compatibility.
+    /// The speedometer now uses foreground-read P90 latency.
     pub upload_l2_lookup_spike_threshold_ms: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
@@ -778,6 +780,10 @@ pub struct VfsConfig {
     pub upload_cache_io_user_penalty: u32,
     /// User idle grace after the last foreground read.
     pub upload_user_idle_grace_ms: u64,
+    /// Foreground-read P90 latency target that triggers upload throttling.
+    pub upload_fg_read_latency_target_ms: u64,
+    /// Sliding window used by the foreground-read speedometer.
+    pub upload_fg_read_latency_window_ms: u64,
     /// Upload worker pool size.
     pub upload_worker_count: usize,
     /// Upload max attempts.
@@ -893,6 +899,8 @@ impl Default for VfsConfig {
             upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
             upload_cache_io_user_penalty: DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY,
             upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
+            upload_fg_read_latency_target_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
+            upload_fg_read_latency_window_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS,
             upload_worker_count: 0,
             upload_max_attempts: 10,
             upload_request_timeout_secs: 120,
@@ -3126,6 +3134,9 @@ struct VfsState {
     foreground_reads_inflight: AtomicUsize,
     /// Last time a foreground read was observed (unix millis).
     last_foreground_read_ms: AtomicU64,
+    /// Sliding samples for the foreground read speedometer:
+    /// `(timestamp_ms, latency_ns)`.
+    foreground_read_latency_samples: Mutex<VecDeque<(u64, u64)>>,
     /// Number of successful synchronous cache-only read fast-path operations.
     sync_read_fast_path_hits: AtomicU64,
     /// Number of synchronous cache-only fast-path misses/fallbacks.
@@ -3244,10 +3255,10 @@ pub struct StudioVfs {
     upload_cache_io_user_penalty_base: u32,
     /// Dynamic slot cost adjusted from cache-latency feedback.
     upload_cache_io_user_penalty: AtomicU32,
-    /// L2 lookup latency threshold above which upload throttling engages.
-    upload_l2_lookup_spike_threshold_ns: u64,
-    /// Previous L2 read snapshot for interval-based latency deltas.
-    upload_l2_read_prev: Mutex<Option<IoStatsSnapshot>>,
+    /// Foreground read latency target (P90) used by the upload throttle loop.
+    upload_fg_read_latency_target_ns: u64,
+    /// Sliding window for foreground speedometer samples.
+    upload_fg_read_latency_window: Duration,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
@@ -3302,6 +3313,29 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: std::sync::RwLock<Option<Arc<dyn KernelInvalidator>>>,
+}
+
+struct ForegroundReadScope<'a> {
+    vfs: &'a StudioVfs,
+    started: Instant,
+}
+
+impl<'a> ForegroundReadScope<'a> {
+    fn new(vfs: &'a StudioVfs) -> Self {
+        vfs.mark_foreground_read();
+        Self {
+            vfs,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ForegroundReadScope<'_> {
+    fn drop(&mut self) {
+        self.vfs
+            .record_foreground_read_latency(self.started.elapsed());
+        self.vfs.unmark_foreground_read();
+    }
 }
 
 impl StudioVfs {
@@ -4125,10 +4159,6 @@ impl StudioVfs {
             );
             let upload_stats_interval =
                 Duration::from_secs(config.upload_stats_interval_secs.max(1));
-            let upload_l2_lookup_spike_threshold_ns =
-                Duration::from_millis(config.upload_l2_lookup_spike_threshold_ms.max(1))
-                    .as_nanos()
-                    .clamp(1, u64::MAX as u128) as u64;
             let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms.max(1));
             let shutdown_metadata_flush_timeout =
                 Duration::from_secs(config.shutdown_metadata_flush_timeout_secs.max(1));
@@ -4152,6 +4182,10 @@ impl StudioVfs {
                 );
             }
             let upload_user_idle_grace = Duration::from_millis(config.upload_user_idle_grace_ms);
+            let upload_fg_read_latency_target_ms = config
+                .upload_fg_read_latency_target_ms
+                .max(config.upload_l2_lookup_spike_threshold_ms.max(1));
+            let upload_fg_read_latency_window_ms = config.upload_fg_read_latency_window_ms.max(100);
             let upload_worker_count = if config.upload_worker_count > 0 {
                 config.upload_worker_count
             } else {
@@ -4166,7 +4200,6 @@ impl StudioVfs {
                 requeue_base_ms = upload_requeue_base.as_millis() as u64,
                 requeue_max_ms = upload_requeue_max.as_millis() as u64,
                 upload_stats_interval_secs = upload_stats_interval.as_secs(),
-                upload_l2_lookup_spike_threshold_ns,
                 slab_flush_interval_ms = slab_flush_interval.as_millis() as u64,
                 ingress_checkpoint_interval_secs = ingress_checkpoint_interval.as_secs(),
                 ingress_checkpoint_min_append_bytes,
@@ -4176,6 +4209,8 @@ impl StudioVfs {
                 upload_cache_io_slots,
                 upload_cache_io_user_penalty,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
+                upload_fg_read_latency_target_ms,
+                upload_fg_read_latency_window_ms,
                 max_dirty_bytes,
                 max_xattr_bytes,
                 max_spill_bytes,
@@ -4254,6 +4289,7 @@ impl StudioVfs {
                     upload_canceled_stale: AtomicU64::new(0),
                     foreground_reads_inflight: AtomicUsize::new(0),
                     last_foreground_read_ms: AtomicU64::new(0),
+                    foreground_read_latency_samples: Mutex::new(VecDeque::new()),
                     sync_read_fast_path_hits: AtomicU64::new(0),
                     sync_read_fast_path_misses: AtomicU64::new(0),
                     slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
@@ -4305,8 +4341,15 @@ impl StudioVfs {
                 qos,
                 upload_cache_io_user_penalty_base: upload_cache_io_user_penalty,
                 upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
-                upload_l2_lookup_spike_threshold_ns,
-                upload_l2_read_prev: Mutex::new(None),
+                upload_fg_read_latency_target_ns: Duration::from_millis(
+                    upload_fg_read_latency_target_ms,
+                )
+                .as_nanos()
+                .clamp(1, u64::MAX as u128)
+                    as u64,
+                upload_fg_read_latency_window: Duration::from_millis(
+                    upload_fg_read_latency_window_ms,
+                ),
                 upload_user_idle_grace,
                 upload_worker_count,
                 max_drain_batch,
@@ -5001,26 +5044,70 @@ impl StudioVfs {
         capped.saturating_add(Duration::from_millis(jitter_ms))
     }
 
-    fn delta_average_latency_ns(
-        previous: &IoStatsSnapshot,
-        current: &IoStatsSnapshot,
-    ) -> Option<u64> {
-        let delta_ops = current.ops.saturating_sub(previous.ops);
-        if delta_ops == 0 {
+    fn p90_ns(mut values: Vec<u64>) -> Option<u64> {
+        if values.is_empty() {
             return None;
         }
-        let delta_total_ns = current
-            .total_latency_ns
-            .saturating_sub(previous.total_latency_ns);
-        Some(delta_total_ns / delta_ops)
+        values.sort_unstable();
+        let idx = ((values.len() - 1) * 90) / 100;
+        values.get(idx).copied()
     }
 
-    fn average_latency_ns(stats: &IoStatsSnapshot) -> Option<u64> {
-        if stats.ops == 0 {
-            None
-        } else {
-            Some(stats.total_latency_ns / stats.ops)
+    fn trim_foreground_latency_samples(
+        samples: &mut VecDeque<(u64, u64)>,
+        now_ms: u64,
+        window: Duration,
+    ) {
+        let window_ms = window.as_millis().clamp(1, u64::MAX as u128) as u64;
+        let cutoff = now_ms.saturating_sub(window_ms);
+        while samples
+            .front()
+            .is_some_and(|(timestamp_ms, _)| *timestamp_ms < cutoff)
+        {
+            samples.pop_front();
         }
+        while samples.len() > FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    fn record_foreground_read_latency(&self, elapsed: Duration) {
+        let now_ms = Self::now_unix_millis();
+        let elapsed_ns = elapsed.as_nanos().clamp(1, u64::MAX as u128) as u64;
+        let mut samples = self.state.foreground_read_latency_samples.lock();
+        Self::trim_foreground_latency_samples(
+            &mut samples,
+            now_ms,
+            self.upload_fg_read_latency_window,
+        );
+        samples.push_back((now_ms, elapsed_ns));
+    }
+
+    fn foreground_read_p90_latency_ns(&self) -> Option<u64> {
+        let now_ms = Self::now_unix_millis();
+        let mut samples = self.state.foreground_read_latency_samples.lock();
+        Self::trim_foreground_latency_samples(
+            &mut samples,
+            now_ms,
+            self.upload_fg_read_latency_window,
+        );
+        Self::p90_ns(samples.iter().map(|(_, latency_ns)| *latency_ns).collect())
+    }
+
+    fn foreground_read_p90_latency_ms(&self) -> Option<u64> {
+        self.foreground_read_p90_latency_ns()
+            .map(|ns| ns.saturating_div(1_000_000))
+    }
+
+    fn foreground_read_speedometer_samples(&self) -> usize {
+        let now_ms = Self::now_unix_millis();
+        let mut samples = self.state.foreground_read_latency_samples.lock();
+        Self::trim_foreground_latency_samples(
+            &mut samples,
+            now_ms,
+            self.upload_fg_read_latency_window,
+        );
+        samples.len()
     }
 
     fn update_upload_io_penalty(&self, congested: bool) -> u32 {
@@ -5041,25 +5128,19 @@ impl StudioVfs {
 
     fn adjust_upload_backpressure_from_metrics(
         &self,
-        cache_pipeline: &CachePipelineMetricsSnapshot,
+        _cache_pipeline: &CachePipelineMetricsSnapshot,
     ) {
-        let current_l2 = &cache_pipeline.l2_read;
-        let previous_l2 = self.upload_l2_read_prev.lock().clone();
-        let l2_lookup_avg_ns = previous_l2
-            .as_ref()
-            .and_then(|prev| Self::delta_average_latency_ns(prev, current_l2))
-            .or_else(|| Self::average_latency_ns(current_l2))
-            .unwrap_or(0);
-        *self.upload_l2_read_prev.lock() = Some(current_l2.clone());
-
-        let threshold_ns = self.upload_l2_lookup_spike_threshold_ns.max(1);
-        let congested = l2_lookup_avg_ns > threshold_ns;
+        let p90_latency_ns = self.foreground_read_p90_latency_ns();
+        let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
+        let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_penalty = self.update_upload_io_penalty(congested);
 
         let current_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
         let next_penalty_ms = if congested {
-            let overshoot =
-                (l2_lookup_avg_ns / threshold_ns).clamp(1, UPLOAD_SCHEDULER_OVERSHOOT_MAX);
+            let overshoot = p90_latency_ns
+                .unwrap_or(threshold_ns)
+                .saturating_div(threshold_ns)
+                .clamp(1, UPLOAD_SCHEDULER_OVERSHOOT_MAX);
             let step = overshoot
                 .saturating_mul(io_penalty as u64)
                 .saturating_mul(UPLOAD_SCHEDULER_PENALTY_STEP_MS);
@@ -8149,14 +8230,7 @@ impl StudioVfs {
             return Ok(len as u32);
         }
 
-        self.mark_foreground_read();
-        struct ForegroundReadGuard<'a>(&'a StudioVfs);
-        impl Drop for ForegroundReadGuard<'_> {
-            fn drop(&mut self) {
-                self.0.unmark_foreground_read();
-            }
-        }
-        let _guard = ForegroundReadGuard(self);
+        let _guard = ForegroundReadScope::new(self);
         let attr = self.getattr_async(ino).await?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
             return Err(VfsError::RemoteContentPending);
@@ -8430,14 +8504,7 @@ impl StudioVfs {
             return Ok(Some(0));
         }
 
-        self.mark_foreground_read();
-        struct ForegroundReadGuard<'a>(&'a StudioVfs);
-        impl Drop for ForegroundReadGuard<'_> {
-            fn drop(&mut self) {
-                self.0.unmark_foreground_read();
-            }
-        }
-        let _guard = ForegroundReadGuard(self);
+        let _guard = ForegroundReadScope::new(self);
 
         let attr = self.getattr(ino)?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
@@ -9852,6 +9919,12 @@ impl StudioVfs {
                     upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
                     upload_io_penalty_dynamic =
                         self.upload_cache_io_user_penalty.load(Ordering::Relaxed),
+                    foreground_read_p90_ms = self.foreground_read_p90_latency_ms(),
+                    foreground_read_speedometer_samples =
+                        self.foreground_read_speedometer_samples(),
+                    foreground_read_target_ms = self
+                        .upload_fg_read_latency_target_ns
+                        .saturating_div(1_000_000),
                     upload_scheduler_penalty_ms = self.upload_scheduler.adaptive_penalty_ms(),
                     "upload pipeline adaptive throttle"
                 );
@@ -10615,6 +10688,17 @@ mod tests {
             StudioVfs::format_upload_pipeline_pending_uploads(1904 * 1024 * 1024),
             "1.9GB"
         );
+    }
+
+    #[test]
+    fn foreground_speedometer_p90_uses_recent_tail() {
+        let p90 = StudioVfs::p90_ns(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(p90, Some(9));
+    }
+
+    #[test]
+    fn foreground_speedometer_p90_handles_empty_input() {
+        assert_eq!(StudioVfs::p90_ns(vec![]), None);
     }
 
     #[test]
