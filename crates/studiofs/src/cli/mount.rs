@@ -441,6 +441,27 @@ pub fn run(
     );
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
 
+    // Validate endpoint override before any mount operations (SFS-95)
+    if let Some(ep) = endpoint {
+        // Try parsing as-is, then with http:// prefix
+        let parsed = url::Url::parse(ep)
+            .ok()
+            .or_else(|| url::Url::parse(&format!("http://{ep}")).ok());
+
+        let valid = parsed.map(|url| {
+            let scheme = url.scheme();
+            let has_host = url.host().is_some();
+            matches!(scheme, "http" | "https") && has_host
+        }).unwrap_or(false);
+
+        if !valid {
+            anyhow::bail!(
+                "invalid S3 endpoint '{}': must be an HTTP(S) URL with a host (e.g., http://192.168.1.50:9000)",
+                ep
+            );
+        }
+    }
+
     #[cfg(windows)]
     let mount_point = {
         if let Ok(from_env) = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL") {
@@ -615,15 +636,6 @@ pub fn run(
 
     // Apply runtime S3 endpoint override if provided (SFS-95)
     if let Some(endpoint) = endpoint {
-        // Validate URL before applying override
-        if url::Url::parse(endpoint).is_err()
-            && url::Url::parse(&format!("http://{endpoint}")).is_err()
-        {
-            anyhow::bail!(
-                "invalid S3 endpoint '{}': must be a valid URL (e.g., http://192.168.1.50:9000)",
-                endpoint
-            );
-        }
         info!(
             original_endpoint = %format_info.endpoint,
             override_endpoint = %endpoint,
