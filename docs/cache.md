@@ -292,6 +292,7 @@ benchmarks:
   - backpressure (`backpressure_events`, backpressure wait totals/max/histogram)
 - queue depth metrics for upload queue (`pending_depth`, `pending_depth_peak`)
 - backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
+- transit-memory budget snapshot (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, foreground/background waiter counts)
 - blocking-task pressure metrics for cache hot paths:
   - active blocking tasks (`active`, `active_peak`)
   - lifecycle counters (`submitted`, `started`, `completed`)
