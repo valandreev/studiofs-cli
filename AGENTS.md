@@ -79,7 +79,7 @@ cargo clippy -p studiofs
 
 - **Use `thiserror` for domain errors** (not `anyhow` for library code)
 - **Prefer `Result<T, E>` over panics** for recoverable errors
-- **Use `Arc<T>` for shared state** (e.g., `Arc<dyn MetaEngine>`)
+- **Use `Arc<T>` for shared state** (e.g., `Arc<dyn AsyncMetaEngine>` at async boundaries, `Arc<dyn MetaEngine>` for sync metadata internals)
 - **Use ` parking_lot` for synchronization primitives** (faster than std)
 - **Follow Rust edition 2024** conventions
 

@@ -14,12 +14,16 @@ Holds all runtime state:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `meta` | `Arc<dyn MetaEngine>` | Metadata operations |
+| `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_cache` | `Arc<BlockCache>` | L1 + L2 block cache |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Open files, dirty buffers, backpressure |
+
+Notes:
+- Sync metadata access still exists via `sync_meta()` for explicitly blocking-safe contexts.
+- Async call paths should use `run_meta(self.meta_async.clone(), ...)` so blocking work stays behind one boundary.
 
 ### ACL Enforcement
 
