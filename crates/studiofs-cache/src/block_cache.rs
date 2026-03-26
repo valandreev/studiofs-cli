@@ -931,7 +931,7 @@ impl BlockCache {
     // Internal: promotion
     // =========================================================================
 
-    fn promote_to_l1(&self, object_id: ObjectId, data: Bytes) {
+    pub fn promote_to_l1(&self, object_id: ObjectId, data: Bytes) {
         self.l1.insert(object_id, data);
         self.lru
             .set_location(object_id, BlockLocation::MemoryAndDisk);

@@ -8651,6 +8651,13 @@ impl StudioVfs {
                 dst[read..].fill(0);
             }
             written += to_copy;
+
+
+            // Promote to L1 if budget allows (consistent with async path).
+            // We only promote if the read was full and valid.
+            if read == to_copy {
+                self.block_cache.promote_to_l1(block_ref.object_id, Bytes::copy_from_slice(&dst[..read]));
+            }
         }
 
         if !unbuffered {

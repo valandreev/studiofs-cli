@@ -251,10 +251,7 @@ fn open_sync_read_file(path: &Path) -> io::Result<File> {
 fn apply_l2_read_open_hints(file: &File) {
     #[cfg(target_os = "macos")]
     {
-        use std::os::fd::AsRawFd;
-
-        let fd = file.as_raw_fd();
-        let _ = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+        let _ = file;
     }
     #[cfg(not(target_os = "macos"))]
     {
