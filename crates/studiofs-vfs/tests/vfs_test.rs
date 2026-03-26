@@ -178,12 +178,14 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
     {
         config.max_dirty_bytes = bytes;
     }
     if let Ok(v) = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
     {
         config.max_spill_bytes = bytes;
     }
@@ -191,7 +193,7 @@ fn test_vfs_config_from_env() -> VfsConfig {
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
     {
-        config.max_ingress_segment_bytes = bytes as u64;
+        config.max_ingress_segment_bytes = bytes;
     }
     if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
         config.background_slab_flush_enabled = !disable;
@@ -274,6 +276,7 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Ok(v) = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
     {
         config.max_xattr_bytes = bytes;
     }
@@ -283,6 +286,7 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Ok(v) = std::env::var("STUDIOFS_DENTRY_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
     {
         config.dentry_cache_bytes = bytes;
     }
@@ -292,6 +296,7 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Ok(v) = std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
     {
         config.path_shortcut_cache_bytes = bytes;
     }
@@ -301,6 +306,7 @@ fn test_vfs_config_from_env() -> VfsConfig {
     if let Ok(v) = std::env::var("STUDIOFS_ATTR_READ_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
     {
         config.attr_read_cache_bytes = bytes;
     }

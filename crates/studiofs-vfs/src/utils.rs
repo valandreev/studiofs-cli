@@ -5,7 +5,7 @@
 /// Supports plain bytes and `KB`, `MB`, `GB`, and `TB` suffixes.
 /// Suffixes use binary multipliers (powers of 1024).
 /// Fractional values are truncated toward zero after conversion to bytes.
-pub fn parse_size_bytes(raw: &str) -> Option<usize> {
+pub fn parse_size_bytes(raw: &str) -> Option<u64> {
     let s = raw.trim().to_ascii_uppercase();
     if s.is_empty() {
         return None;
@@ -47,7 +47,7 @@ pub fn parse_size_bytes(raw: &str) -> Option<usize> {
             return None;
         }
         let frac_value = frac_part.parse::<u128>().ok()?;
-        let scale = 10u128.pow(frac_part.len() as u32);
+        let scale = 10u128.checked_pow(frac_part.len() as u32)?;
         let scaled_int = int_part.checked_mul(scale)?;
         let scaled_num = scaled_int.checked_add(frac_value)?;
         (scaled_num, scale)
@@ -55,7 +55,7 @@ pub fn parse_size_bytes(raw: &str) -> Option<usize> {
 
     let scaled_bytes = scaled_num.checked_mul(multiplier)?;
     let bytes = scaled_bytes / scale;
-    usize::try_from(bytes).ok()
+    u64::try_from(bytes).ok()
 }
 
 #[cfg(test)]
@@ -93,7 +93,13 @@ mod tests {
 
     #[test]
     fn parse_size_bytes_rejects_overflow() {
-        let too_big = (usize::MAX as u128) + 1;
+        let too_big = (u64::MAX as u128) + 1;
         assert_eq!(parse_size_bytes(&too_big.to_string()), None);
+    }
+
+    #[test]
+    fn parse_size_bytes_rejects_fraction_scale_overflow() {
+        let input = format!("1.{}KB", "0".repeat(50));
+        assert_eq!(parse_size_bytes(&input), None);
     }
 }

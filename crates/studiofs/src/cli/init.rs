@@ -23,7 +23,7 @@ use uuid::Uuid;
 fn parse_size(size_str: &str) -> anyhow::Result<u32> {
     let bytes = parse_size_bytes(size_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid size: {}", size_str))?;
-    if bytes > u32::MAX as usize {
+    if bytes > u32::MAX as u64 {
         return Err(anyhow::anyhow!(
             "Block size too large: {} (max 4GB)",
             size_str
