@@ -3324,248 +3324,6 @@ impl MetaEngineCore for RedbMetaEngine {
         Ok(pins)
     }
 
-    // ─── Counters ────────────────────────────────────────────────────────
-
-    fn get_counter(&self, name: &str) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(COUNTERS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(name)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(v) => Ok(v.value()),
-            None => Ok(0),
-        }
-    }
-
-    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let new_val;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current = match table
-                .get(name)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            new_val = current + delta;
-            table
-                .insert(name, new_val)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(new_val)
-    }
-
-    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let new_val;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current = match table
-                .get(name)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            new_val = current.saturating_sub(delta);
-            table
-                .insert(name, new_val)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(new_val)
-    }
-
-    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(name, value)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    // ─── Inodes ──────────────────────────────────────────────────────────
-
-    fn next_inode(&self) -> MetaResult<Ino> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let ino;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            ino = match table
-                .get(counters::NEXT_INODE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => ROOT_INO + 1,
-            };
-            table
-                .insert(counters::NEXT_INODE, ino + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(ino)
-    }
-
-    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
-    }
-
-    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
-        if inos.is_empty() {
-            return Ok(Vec::new());
-        }
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        let mut attrs = Vec::with_capacity(inos.len());
-        for &ino in inos {
-            match Self::resolve_attr_in_read_snapshot(
-                &txn,
-                ino,
-                &overlay_block_inodes,
-                &overlay_attr_inodes,
-            ) {
-                Ok(attr) => attrs.push(attr),
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(attrs)
-    }
-
-    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-
-        let mut inos = std::collections::BTreeSet::new();
-        for table_def in [BASE_INODES_TABLE, INODES_TABLE] {
-            let table = txn
-                .open_table(table_def)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for row in table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                inos.insert(ino.value());
-            }
-        }
-
-        let mut attrs = Vec::with_capacity(inos.len());
-        for ino in inos {
-            match Self::resolve_attr_in_read_snapshot(
-                &txn,
-                ino,
-                &overlay_block_inodes,
-                &overlay_attr_inodes,
-            ) {
-                Ok(attr) => attrs.push(attr),
-                Err(MetaError::InodeNotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(attrs)
-    }
-
-    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut normalized = attr.clone();
-            if normalized.kind == FileType::RegularFile {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
-                Self::transition_upload_state_for_local_mutation(
-                    &mut normalized,
-                    has_committed_manifest,
-                );
-            }
-            Self::set_inode_overlay_in_txn(&txn, &normalized)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr {
-                    attr: normalized.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_inode_overlay_in_txn(&txn, ino)?;
-
-            Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
-
-            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
     // ─── Directory Entries ───────────────────────────────────────────────
 
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
@@ -6156,7 +5914,245 @@ impl MetaFormat for RedbMetaEngine {
         Ok(info)
     }
 }
-impl MetaInodes for RedbMetaEngine {}
+impl MetaInodes for RedbMetaEngine {
+    fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match table
+            .get(name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => Ok(v.value()),
+            None => Ok(0),
+        }
+    }
+
+    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let new_val;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current = match table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            new_val = current + delta;
+            table
+                .insert(name, new_val)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let new_val;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current = match table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            new_val = current.saturating_sub(delta);
+            table
+                .insert(name, new_val)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(name, value)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn next_inode(&self) -> MetaResult<Ino> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let ino;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            ino = match table
+                .get(counters::NEXT_INODE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => ROOT_INO + 1,
+            };
+            table
+                .insert(counters::NEXT_INODE, ino + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(ino)
+    }
+
+    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
+    }
+
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        if inos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        let mut attrs = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            match Self::resolve_attr_in_read_snapshot(
+                &txn,
+                ino,
+                &overlay_block_inodes,
+                &overlay_attr_inodes,
+            ) {
+                Ok(attr) => attrs.push(attr),
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(attrs)
+    }
+
+    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut normalized = attr.clone();
+            if normalized.kind == FileType::RegularFile {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let has_committed_manifest =
+                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                Self::transition_upload_state_for_local_mutation(
+                    &mut normalized,
+                    has_committed_manifest,
+                );
+            }
+            Self::set_inode_overlay_in_txn(&txn, &normalized)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr {
+                    attr: normalized.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_inode_overlay_in_txn(&txn, ino)?;
+
+            Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
+
+            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+
+        let mut inos = std::collections::BTreeSet::new();
+        for table_def in [BASE_INODES_TABLE, INODES_TABLE] {
+            let table = txn
+                .open_table(table_def)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                inos.insert(ino.value());
+            }
+        }
+
+        let mut attrs = Vec::with_capacity(inos.len());
+        for ino in inos {
+            match Self::resolve_attr_in_read_snapshot(
+                &txn,
+                ino,
+                &overlay_block_inodes,
+                &overlay_attr_inodes,
+            ) {
+                Ok(attr) => attrs.push(attr),
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(attrs)
+    }
+}
 impl MetaNamespace for RedbMetaEngine {}
 impl MetaBlocks for RedbMetaEngine {}
 impl MetaGc for RedbMetaEngine {}

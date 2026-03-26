@@ -152,64 +152,7 @@ impl MetadataReplicationBacklog {
 /// All operations are synchronous (redb is sync). Async callers should use
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
-pub trait MetaEngineCore: Send + Sync {
-    // ─── Counters ────────────────────────────────────────────────────────
-
-    /// Get a counter value, returns 0 if not set.
-    fn get_counter(&self, name: &str) -> MetaResult<u64>;
-
-    /// Increment a counter atomically, returns the new value.
-    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>;
-
-    /// Decrement a counter atomically (saturating at 0), returns the new value.
-    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>;
-
-    /// Set a counter to a specific value.
-    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>;
-
-    // ─── Inodes ──────────────────────────────────────────────────────────
-
-    /// Allocate a new inode number.
-    fn next_inode(&self) -> MetaResult<Ino>;
-
-    /// Get inode attributes.
-    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>;
-
-    /// Batch-fetch inode attributes.
-    ///
-    /// Default implementation calls [`MetaEngine::get_attr`] for each inode in
-    /// order and returns results in the same order as `inos`.
-    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
-        let mut attrs = Vec::with_capacity(inos.len());
-        for &ino in inos {
-            attrs.push(self.get_attr(ino)?);
-        }
-        Ok(attrs)
-    }
-
-    /// Set (create or update) inode attributes.
-    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>;
-
-    /// Remove an inode's attributes.
-    fn remove_attr(&self, ino: Ino) -> MetaResult<()>;
-
-    /// Enumerate existing inode attributes.
-    ///
-    /// Default implementation scans inode ids in `[ROOT_INO, NEXT_INODE)`.
-    /// Backends can override with a direct table scan for better performance.
-    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
-        let next = self.get_counter(counters::NEXT_INODE)?;
-        let mut out = Vec::new();
-        for ino in ROOT_INO..next {
-            match self.get_attr(ino) {
-                Ok(attr) => out.push(attr),
-                Err(MetaError::InodeNotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(out)
-    }
-
+pub trait MetaEngineCore: Send + Sync + MetaInodes {
     // ─── Directory Entries ───────────────────────────────────────────────
 
     /// Look up a child entry by name in a parent directory.
@@ -514,7 +457,54 @@ pub trait MetaFormat: Send + Sync {
     fn get_format_info(&self) -> MetaResult<FormatInfo>;
 }
 
-pub trait MetaInodes: MetaEngineCore {}
+pub trait MetaInodes: Send + Sync {
+    /// Get a counter value, returns 0 if not set.
+    fn get_counter(&self, name: &str) -> MetaResult<u64>;
+
+    /// Increment a counter atomically, returns the new value.
+    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>;
+
+    /// Decrement a counter atomically (saturating at 0), returns the new value.
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>;
+
+    /// Set a counter to a specific value.
+    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>;
+
+    /// Allocate a new inode number.
+    fn next_inode(&self) -> MetaResult<Ino>;
+
+    /// Get inode attributes.
+    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>;
+
+    /// Batch-fetch inode attributes.
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        let mut attrs = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            attrs.push(self.get_attr(ino)?);
+        }
+        Ok(attrs)
+    }
+
+    /// Set (create or update) inode attributes.
+    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>;
+
+    /// Remove an inode's attributes.
+    fn remove_attr(&self, ino: Ino) -> MetaResult<()>;
+
+    /// Enumerate existing inode attributes.
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        let next = self.get_counter(counters::NEXT_INODE)?;
+        let mut out = Vec::new();
+        for ino in ROOT_INO..next {
+            match self.get_attr(ino) {
+                Ok(attr) => out.push(attr),
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(out)
+    }
+}
 
 pub trait MetaNamespace: MetaEngineCore {}
 

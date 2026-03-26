@@ -1785,46 +1785,6 @@ impl PgMetaEngine {
 }
 
 impl MetaEngineCore for PgMetaEngine {
-    fn get_counter(&self, name: &str) -> MetaResult<u64> {
-        self.local.get_counter(name)
-    }
-
-    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        self.mutate(|local| local.incr_counter(name, delta))
-    }
-
-    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        self.mutate(|local| local.decr_counter(name, delta))
-    }
-
-    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
-        self.mutate(|local| local.set_counter(name, value))
-    }
-
-    fn next_inode(&self) -> MetaResult<Ino> {
-        self.mutate(|local| local.next_inode())
-    }
-
-    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
-        self.local.get_attr(ino)
-    }
-
-    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
-        self.local.get_attrs_batch(inos)
-    }
-
-    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
-        self.local.list_inode_attrs()
-    }
-
-    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
-        self.mutate(|local| local.set_attr(attr))
-    }
-
-    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_attr(ino))
-    }
-
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
         self.local.lookup(parent, name)
     }
@@ -2100,7 +2060,47 @@ impl MetaFormat for PgMetaEngine {
         self.local.get_format_info()
     }
 }
-impl MetaInodes for PgMetaEngine {}
+impl MetaInodes for PgMetaEngine {
+    fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        self.local.get_counter(name)
+    }
+
+    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        self.mutate(|local| local.incr_counter(name, delta))
+    }
+
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        self.mutate(|local| local.decr_counter(name, delta))
+    }
+
+    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
+        self.mutate(|local| local.set_counter(name, value))
+    }
+
+    fn next_inode(&self) -> MetaResult<Ino> {
+        self.mutate(|local| local.next_inode())
+    }
+
+    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        self.local.get_attr(ino)
+    }
+
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        self.local.get_attrs_batch(inos)
+    }
+
+    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+        self.mutate(|local| local.set_attr(attr))
+    }
+
+    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_attr(ino))
+    }
+
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        self.local.list_inode_attrs()
+    }
+}
 impl MetaNamespace for PgMetaEngine {}
 impl MetaBlocks for PgMetaEngine {}
 impl MetaGc for PgMetaEngine {}
