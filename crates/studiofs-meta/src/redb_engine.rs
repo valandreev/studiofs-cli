@@ -3324,161 +3324,6 @@ impl MetaEngineCore for RedbMetaEngine {
         Ok(pins)
     }
 
-    // ─── Directory Entries ───────────────────────────────────────────────
-
-    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = self.local_overlay_dentries()?;
-        let key = encode_dentry_key(parent, name);
-        if Self::has_slice_marker(&txn, DENTRY_TOMBSTONES_TABLE, key.as_slice())? {
-            return Err(MetaError::EntryNotFound {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        if overlay_dentries.contains(&key) {
-            return Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(
-                MetaError::EntryNotFound {
-                    parent,
-                    name: String::from_utf8_lossy(name).to_string(),
-                },
-            );
-        }
-
-        if let Some(entry) = Self::lookup_in_table(&txn, BASE_DENTRIES_TABLE, parent, name)? {
-            return Ok(entry);
-        }
-
-        Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(MetaError::EntryNotFound {
-            parent,
-            name: String::from_utf8_lossy(name).to_string(),
-        })
-    }
-
-    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = self.local_overlay_dentries()?;
-        let tombstones = txn
-            .open_table(DENTRY_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut merged = std::collections::BTreeMap::<Vec<u8>, DirEntry>::new();
-        for entry in Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)? {
-            merged.insert(entry.name.clone(), entry);
-        }
-
-        let prefix = dentry_prefix(parent);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-        for row in tombstones
-            .range(prefix.as_slice()..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (decoded_parent, name) = decode_dentry_key(key.value());
-            if decoded_parent != parent {
-                break;
-            }
-            merged.remove(name);
-        }
-
-        for entry in Self::readdir_from_table(&txn, DENTRIES_TABLE, parent)? {
-            let key = encode_dentry_key(parent, &entry.name);
-            if overlay_dentries.contains(&key) {
-                merged.insert(entry.name.clone(), entry);
-            }
-        }
-
-        let base_names: std::collections::HashSet<Vec<u8>> =
-            Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)?
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect();
-        for key in overlay_dentries {
-            let (overlay_parent, overlay_name) = decode_dentry_key(&key);
-            if overlay_parent != parent {
-                continue;
-            }
-            if !base_names.contains(overlay_name)
-                && let Some(entry) =
-                    Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?
-            {
-                merged.insert(
-                    overlay_name.to_vec(),
-                    DirEntry {
-                        name: overlay_name.to_vec(),
-                        ino: entry.ino,
-                        kind: entry.kind,
-                    },
-                );
-            }
-            if base_names.contains(overlay_name)
-                && Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?.is_none()
-            {
-                merged.remove(overlay_name);
-            }
-        }
-
-        Ok(merged.into_values().collect())
-    }
-
-    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name: name.to_vec(),
-                    entry: entry.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        let entry_val = self.lookup(parent, name)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemoveEntry {
-                    parent,
-                    name: name.to_vec(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(entry_val)
-    }
     // --- File Blocks -----------------------------------------------------
 
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
@@ -6153,7 +5998,161 @@ impl MetaInodes for RedbMetaEngine {
         Ok(attrs)
     }
 }
-impl MetaNamespace for RedbMetaEngine {}
+impl MetaNamespace for RedbMetaEngine {
+    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = self.local_overlay_dentries()?;
+        let key = encode_dentry_key(parent, name);
+        if Self::has_slice_marker(&txn, DENTRY_TOMBSTONES_TABLE, key.as_slice())? {
+            return Err(MetaError::EntryNotFound {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            });
+        }
+
+        if overlay_dentries.contains(&key) {
+            return Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(
+                MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                },
+            );
+        }
+
+        if let Some(entry) = Self::lookup_in_table(&txn, BASE_DENTRIES_TABLE, parent, name)? {
+            return Ok(entry);
+        }
+
+        Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(MetaError::EntryNotFound {
+            parent,
+            name: String::from_utf8_lossy(name).to_string(),
+        })
+    }
+
+    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = self.local_overlay_dentries()?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut merged = std::collections::BTreeMap::<Vec<u8>, DirEntry>::new();
+        for entry in Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)? {
+            merged.insert(entry.name.clone(), entry);
+        }
+
+        let prefix = dentry_prefix(parent);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        for row in tombstones
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_parent, name) = decode_dentry_key(key.value());
+            if decoded_parent != parent {
+                break;
+            }
+            merged.remove(name);
+        }
+
+        for entry in Self::readdir_from_table(&txn, DENTRIES_TABLE, parent)? {
+            let key = encode_dentry_key(parent, &entry.name);
+            if overlay_dentries.contains(&key) {
+                merged.insert(entry.name.clone(), entry);
+            }
+        }
+
+        let base_names: std::collections::HashSet<Vec<u8>> =
+            Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        for key in overlay_dentries {
+            let (overlay_parent, overlay_name) = decode_dentry_key(&key);
+            if overlay_parent != parent {
+                continue;
+            }
+            if !base_names.contains(overlay_name)
+                && let Some(entry) =
+                    Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?
+            {
+                merged.insert(
+                    overlay_name.to_vec(),
+                    DirEntry {
+                        name: overlay_name.to_vec(),
+                        ino: entry.ino,
+                        kind: entry.kind,
+                    },
+                );
+            }
+            if base_names.contains(overlay_name)
+                && Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?.is_none()
+            {
+                merged.remove(overlay_name);
+            }
+        }
+
+        Ok(merged.into_values().collect())
+    }
+
+    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
+        if self.lookup(parent, name).is_ok() {
+            return Err(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            });
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: entry.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        let entry_val = self.lookup(parent, name)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveEntry {
+                    parent,
+                    name: name.to_vec(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(entry_val)
+    }
+}
 impl MetaBlocks for RedbMetaEngine {}
 impl MetaGc for RedbMetaEngine {}
 impl MetaRecovery for RedbMetaEngine {}

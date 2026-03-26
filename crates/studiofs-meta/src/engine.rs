@@ -153,20 +153,6 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
-    // ─── Directory Entries ───────────────────────────────────────────────
-
-    /// Look up a child entry by name in a parent directory.
-    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
-
-    /// List all entries in a directory.
-    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>>;
-
-    /// Add a directory entry. Returns error if it already exists.
-    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()>;
-
-    /// Remove a directory entry by name. Returns the removed entry.
-    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
-
     // ─── File Blocks (New Architecture) ──────────────────────────────────
 
     /// Get a specific block reference for a file.
@@ -506,7 +492,19 @@ pub trait MetaInodes: Send + Sync {
     }
 }
 
-pub trait MetaNamespace: MetaEngineCore {}
+pub trait MetaNamespace: Send + Sync {
+    /// Look up a child entry by name in a parent directory.
+    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
+
+    /// List all entries in a directory.
+    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>>;
+
+    /// Add a directory entry. Returns error if it already exists.
+    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()>;
+
+    /// Remove a directory entry by name. Returns the removed entry.
+    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
+}
 
 pub trait MetaBlocks: MetaEngineCore {}
 

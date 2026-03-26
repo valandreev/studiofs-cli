@@ -1785,22 +1785,6 @@ impl PgMetaEngine {
 }
 
 impl MetaEngineCore for PgMetaEngine {
-    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        self.local.lookup(parent, name)
-    }
-
-    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
-        self.local.readdir(parent)
-    }
-
-    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        self.mutate(|local| local.add_entry(parent, name, entry))
-    }
-
-    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        self.mutate(|local| local.remove_entry(parent, name))
-    }
-
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         self.local.get_file_block(ino, block_index)
     }
@@ -2101,7 +2085,23 @@ impl MetaInodes for PgMetaEngine {
         self.local.list_inode_attrs()
     }
 }
-impl MetaNamespace for PgMetaEngine {}
+impl MetaNamespace for PgMetaEngine {
+    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        self.local.lookup(parent, name)
+    }
+
+    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
+        self.local.readdir(parent)
+    }
+
+    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
+        self.mutate(|local| local.add_entry(parent, name, entry))
+    }
+
+    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        self.mutate(|local| local.remove_entry(parent, name))
+    }
+}
 impl MetaBlocks for PgMetaEngine {}
 impl MetaGc for PgMetaEngine {}
 impl MetaRecovery for PgMetaEngine {}
