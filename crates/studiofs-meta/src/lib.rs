@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
-    BatchFlushEntry, BatchFlushResult, MetaBlocks, MetaEngine, MetaError, MetaGc, MetaNamespace,
-    MetaReplication, MetaResult,
+    BatchFlushEntry, BatchFlushResult, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaError,
+    MetaFormat, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult,
+    MetaSnapshots, MetaSymlink, MetaXattr,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{

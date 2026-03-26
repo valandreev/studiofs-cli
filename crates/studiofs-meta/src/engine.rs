@@ -144,20 +144,15 @@ impl MetadataReplicationBacklog {
     }
 }
 
-/// Abstract metadata engine interface.
+/// Strict backend contract.
+///
+/// This trait is intentionally comprehensive: storage backends implement it once,
+/// while user-facing capability traits below expose focused method groups.
 ///
 /// All operations are synchronous (redb is sync). Async callers should use
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
-pub trait MetaNamespace: Send + Sync {}
-
-pub trait MetaBlocks: Send + Sync {}
-
-pub trait MetaGc: Send + Sync {}
-
-pub trait MetaReplication: Send + Sync {}
-
-pub trait MetaEngine: Send + Sync + MetaNamespace + MetaBlocks + MetaGc + MetaReplication {
+pub trait MetaEngineCore: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
     ///
     /// Engines that support remote verification should override this.
@@ -200,7 +195,9 @@ pub trait MetaEngine: Send + Sync + MetaNamespace + MetaBlocks + MetaGc + MetaRe
     /// This token should advance only for namespace mutations (add/remove/rename
     /// directory entries). By default it falls back to `metadata_version_token()`
     /// for engines that don't expose finer-grained signals yet.
-    fn namespace_version_token(&self) -> Option<String>;
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
 
     /// Best-effort count of local metadata mutations not yet durably pushed to
     /// the shared remote metadata source.
@@ -568,4 +565,70 @@ pub trait MetaEngine: Send + Sync + MetaNamespace + MetaBlocks + MetaGc + MetaRe
 
     /// Look up snapshot by id.
     fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
+}
+
+pub trait MetaFormat: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaFormat for T {}
+
+pub trait MetaInodes: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaInodes for T {}
+
+pub trait MetaNamespace: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaNamespace for T {}
+
+pub trait MetaBlocks: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaBlocks for T {}
+
+pub trait MetaGc: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaGc for T {}
+
+pub trait MetaRecovery: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaRecovery for T {}
+
+pub trait MetaSymlink: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaSymlink for T {}
+
+pub trait MetaXattr: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaXattr for T {}
+
+pub trait MetaAcl: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaAcl for T {}
+
+pub trait MetaSnapshots: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaSnapshots for T {}
+
+pub trait MetaReplication: MetaEngineCore {}
+impl<T: MetaEngineCore + ?Sized> MetaReplication for T {}
+
+/// Public aggregate contract for consumers.
+pub trait MetaEngine:
+    MetaEngineCore
+    + MetaFormat
+    + MetaInodes
+    + MetaNamespace
+    + MetaBlocks
+    + MetaGc
+    + MetaRecovery
+    + MetaSymlink
+    + MetaXattr
+    + MetaAcl
+    + MetaSnapshots
+    + MetaReplication
+{
+}
+
+impl<T> MetaEngine for T where
+    T: MetaEngineCore
+        + MetaFormat
+        + MetaInodes
+        + MetaNamespace
+        + MetaBlocks
+        + MetaGc
+        + MetaRecovery
+        + MetaSymlink
+        + MetaXattr
+        + MetaAcl
+        + MetaSnapshots
+        + MetaReplication
+{
 }

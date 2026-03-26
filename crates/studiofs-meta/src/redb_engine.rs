@@ -3307,15 +3307,7 @@ impl RedbMetaEngine {
     }
 }
 
-impl MetaNamespace for RedbMetaEngine {}
-
-impl MetaBlocks for RedbMetaEngine {}
-
-impl MetaGc for RedbMetaEngine {}
-
-impl MetaReplication for RedbMetaEngine {}
-
-impl MetaEngine for RedbMetaEngine {
+impl MetaEngineCore for RedbMetaEngine {
     fn check_consistency(&self) -> MetaResult<()> {
         Ok(())
     }

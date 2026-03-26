@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
-use studiofs_meta::{MetaEngine, MetadataBackend, RedbMetaEngine, open_meta_engine};
+use studiofs_meta::{
+    MetaEngine, MetaEngineCore, MetadataBackend, RedbMetaEngine, open_meta_engine,
+};
 use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfig, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
@@ -625,7 +627,7 @@ pub fn run(
         snapshot_engine.import_snapshot(&snapshot_state)?;
 
         (
-            Arc::new(snapshot_engine) as Arc<dyn studiofs_meta::MetaEngine>,
+            Arc::new(snapshot_engine) as Arc<dyn MetaEngine>,
             true,
         )
     } else {

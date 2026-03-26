@@ -6,15 +6,23 @@
 - `SyncMetaEngineAdapter` (bridges sync engines via blocking execution)
 - `run_meta(...)` in VFS (maps runtime `JoinError` separately from metadata-domain errors)
 
-`MetaEngine` now requires explicit backend capability opt-in via focused marker
-traits:
+`MetaEngine` now acts as an aggregate capability contract built from focused
+sub-traits:
+- `MetaFormat`
+- `MetaInodes`
 - `MetaNamespace`
 - `MetaBlocks`
 - `MetaGc`
+- `MetaRecovery`
+- `MetaSymlink`
+- `MetaXattr`
+- `MetaAcl`
+- `MetaSnapshots`
 - `MetaReplication`
 
-Default silent no-op fallbacks were removed for capability-sensitive operations
-so backend gaps fail at compile time instead of surfacing as runtime drift.
+Backends implement strict `MetaEngineCore` (no silent default no-op fallbacks
+for capability-sensitive operations), while consumers can depend on narrower
+capability traits instead of a single god-object surface.
 
 ## Engines
 
