@@ -577,9 +577,9 @@ const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
-const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 2;
-const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 250;
-const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 4;
+const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 8;
+const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 400;
+const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_NUM: u64 = 3;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_DEN: u64 = 4;
 const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
@@ -9332,7 +9332,8 @@ impl StudioVfs {
             return Ok(());
         }
 
-        // ── Fast-path: inode deleted → cancel upload, skip metadata and S3 work ──
+        // Fast-path first: if inode is already deleted, avoid any penalty
+        // computation/sleep and cancel upload immediately.
         if self.cancel_upload_if_inode_deleted(&op) {
             debug!(
                 object_id = op.object_id,
@@ -9341,6 +9342,42 @@ impl StudioVfs {
             );
             return Ok(());
         }
+
+        // Apply adaptive cool-down before the worker enters the local L2 read
+        // phase so background uploads create real quiet windows for foreground
+        // reads instead of a back-to-back disk conveyor.
+        let adaptive_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
+        if adaptive_penalty_ms > 0 {
+            tokio::select! {
+                _ = self.state.uploader_shutdown_token.cancelled() => return Ok(()),
+                _ = upload_cancel_token.cancelled() => {
+                    // Per-inode upload token is a child of the uploader shutdown
+                    // token, so cancellation can mean either inode deletion or
+                    // global uploader shutdown. Distinguish the two for clearer
+                    // metrics/log semantics.
+                    if self.state.deleted_inodes.lock().contains(&op.ino)
+                        && self.cancel_upload_if_inode_deleted(&op)
+                    {
+                        debug!(
+                            ino = op.ino,
+                            object_id = op.object_id,
+                            penalty_ms = adaptive_penalty_ms,
+                            "process_upload cancelled during adaptive pre-read cooldown"
+                        );
+                    } else {
+                        debug!(
+                            ino = op.ino,
+                            object_id = op.object_id,
+                            penalty_ms = adaptive_penalty_ms,
+                            "process_upload cancelled during adaptive pre-read cooldown (shutdown/token cancel)"
+                        );
+                    }
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(adaptive_penalty_ms)) => {}
+            }
+        }
+
         // Also check metadata: after a remount, `deleted_inodes` is empty but
         // the inode may have been deleted in a prior session.  If the inode no
         // longer exists in the metadata store, the upload is stale.
