@@ -435,7 +435,7 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base delay |
 | `STUDIOFS_FETCH_RETRY_MAX_MS` | `2000` | Fetch retry max delay |
 | `STUDIOFS_FETCH_PREFETCH_RESERVE` | `0` | Reserved fetch slots kept free for foreground reads; `0` uses the runtime default |
-| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `150` | Max time a prefetch waits for a fetch slot before skipping |
+| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `75` | Max time a prefetch waits for a fetch slot before skipping |
 | `STUDIOFS_QOS_ACCEPT_SLOTS` | `64` | QoS semaphore slots for accept operations |
 | `STUDIOFS_QOS_MATERIALIZE_SLOTS` | `2` | QoS semaphore slots for materialization |
 | `STUDIOFS_QOS_UPLOAD_SLOTS` | `4` | QoS semaphore slots for uploads |
@@ -447,7 +447,7 @@ Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.
 | `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base backoff |
 | `STUDIOFS_FETCH_RETRY_MAX_MS` | `2000` | Fetch retry max backoff |
 | `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` | `4` | Prefetch fetch retry attempts |
-| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `150` | Max wait for prefetch AIMD permit before skipping |
+| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `75` | Max wait for prefetch AIMD permit before skipping |
 | `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Upload retry attempts |
 | `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-attempt upload timeout |
 | `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base backoff |

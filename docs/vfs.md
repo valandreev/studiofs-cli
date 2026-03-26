@@ -357,7 +357,7 @@ Runtime tuning knobs:
 - `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `256`, effective cap also scales with AIMD window)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `250`, temporarily pauses prefetch after transport send errors)
 - `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
-- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `150`)
+- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
 On each buffered `read()`:
 1. Hot path enqueues a compact prefetch hint (`ino`, `first_block`, `last_block`) and returns to user work.
