@@ -18,6 +18,13 @@ use uuid::Uuid;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn parse_block_size(size_str: &str) -> anyhow::Result<u32> {
+    let bytes = parse_size_bytes(size_str)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", size_str))?;
+    u32::try_from(bytes).map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))
+}
+
 #[cfg(unix)]
 fn get_current_ids() -> (u32, u32) {
     unsafe { (libc::getuid(), libc::getgid()) }
@@ -401,11 +408,7 @@ pub fn run(
 
     // Parse block size if provided, otherwise use default
     let actual_block_size = if let Some(size_str) = block_size {
-        let bytes = parse_size_bytes(size_str)
-            .filter(|&bytes| bytes > 0)
-            .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", size_str))?;
-        u32::try_from(bytes)
-            .map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))?
+        parse_block_size(size_str)?
     } else {
         DEFAULT_BLOCK_SIZE
     };
@@ -472,14 +475,6 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse_block_size(size_str: &str) -> anyhow::Result<u32> {
-        let bytes = parse_size_bytes(size_str)
-            .filter(|&bytes| bytes > 0)
-            .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", size_str))?;
-        u32::try_from(bytes)
-            .map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))
-    }
 
     #[test]
     fn test_parse_size_bytes() {

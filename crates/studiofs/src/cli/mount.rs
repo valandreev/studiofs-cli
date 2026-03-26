@@ -170,8 +170,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     macro_rules! set_size {
         ($key:literal, $field:ident) => {
             if let Ok(v) = std::env::var($key)
-                && let Some(bytes) = parse_size_bytes(&v)
-                && bytes > 0
+                && let Ok(bytes) = parse_positive_size_arg(&v)
                 && let Ok(bytes) = usize::try_from(bytes)
             {
                 config.$field = bytes;
@@ -182,8 +181,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
     set_size!("STUDIOFS_MAX_SPILL_BYTES", max_spill_bytes);
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
-        && let Some(bytes) = parse_size_bytes(&v)
-        && bytes > 0
+        && let Ok(bytes) = parse_positive_size_arg(&v)
     {
         config.max_ingress_segment_bytes = bytes;
     }
@@ -654,10 +652,8 @@ pub fn run(
 
     // Set up caches
     let (mem_limit, memory_limit_display) = if let Some(memory_limit) = memory_limit.as_deref() {
-        (
-            parse_positive_size_arg(memory_limit)?,
-            memory_limit.to_string(),
-        )
+        let parsed = parse_positive_size_arg(memory_limit)?;
+        (parsed, format_binary_size(parsed))
     } else {
         let dynamic_limit = detect_dynamic_l1_limit()?;
         (
