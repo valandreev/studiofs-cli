@@ -29,8 +29,9 @@ use studiofs_meta::engine::{PendingCreateRecord, UndoLogKind};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetaError, MetadataBackend, MetadataConfig,
-    PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetaEngineCore, MetaError, MetadataBackend,
+    MetadataConfig, PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine,
+    ensure_studiofs_database,
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{

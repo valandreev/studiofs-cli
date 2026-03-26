@@ -626,10 +626,7 @@ pub fn run(
         snapshot_engine.set_format_info(&format_info)?;
         snapshot_engine.import_snapshot(&snapshot_state)?;
 
-        (
-            Arc::new(snapshot_engine) as Arc<dyn MetaEngine>,
-            true,
-        )
+        (Arc::new(snapshot_engine) as Arc<dyn MetaEngine>, true)
     } else {
         (live_meta, false)
     };
