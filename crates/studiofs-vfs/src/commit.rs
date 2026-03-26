@@ -29,9 +29,10 @@ impl CommitCoordinator {
         }
 
         let ino = op.ino;
-        let required_blocks = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-            engine.get_file_blocks(ino)
-        })
+        let required_blocks = run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
+        )
         .await?;
         if required_blocks.is_empty() {
             return Ok(());
@@ -54,27 +55,30 @@ impl CommitCoordinator {
             return Err(err);
         }
 
-        let attr = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-            engine.get_attr(ino)
-        })
+        let attr = run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
+        )
         .await?;
         if attr.content_epoch != op.content_epoch {
             return Ok(());
         }
 
         let content_epoch = op.content_epoch;
-        let published = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-            engine.publish_file_manifest(ino, content_epoch)
-        })
+        let published = run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.publish_file_manifest(ino, content_epoch),
+        )
         .await?;
         if !published {
             return Ok(());
         }
 
         vfs.remove_live_extents_for_inode_epoch(op.ino, op.content_epoch);
-        if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-            engine.get_attr(ino)
-        })
+        if let Ok(attr) = run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
+        )
         .await
         {
             vfs.refresh_inode_incarnation_state_from_attr(ino, &attr);

@@ -146,8 +146,9 @@ impl MetadataReplicationBacklog {
 
 /// Abstract metadata engine interface.
 ///
-/// All operations are synchronous (redb is sync). The VFS layer wraps them
-/// in `spawn_blocking` for async compatibility.
+/// All operations are synchronous (redb is sync). Async callers should use
+/// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
+/// explicit async boundary.
 pub trait MetaEngine: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
     ///

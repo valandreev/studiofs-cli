@@ -210,9 +210,10 @@ impl Materializer {
         }
 
         let keys_len = work.len();
-        let ids = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-            engine.next_block_ids(keys_len as u32)
-        })
+        let ids = match run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.next_block_ids(keys_len as u32),
+        )
         .await
         {
             Ok(ids) => ids,
@@ -244,9 +245,10 @@ impl Materializer {
             )
             .collect();
 
-        let results = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-            engine.flush_blocks_batch(&entries)
-        })
+        let results = match run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.flush_blocks_batch(&entries),
+        )
         .await
         {
             Ok(results) => results,
@@ -301,9 +303,10 @@ impl Materializer {
 
         let mut manifests = Vec::with_capacity(touched_by_inode.len());
         for (ino, (content_epoch, touched)) in touched_by_inode {
-            let visible_blocks = run_meta(vfs.meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-                engine.get_file_blocks(ino)
-            })
+            let visible_blocks = run_meta(
+                vfs.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
+            )
             .await?;
             let reused_visible_block_count = visible_blocks
                 .iter()

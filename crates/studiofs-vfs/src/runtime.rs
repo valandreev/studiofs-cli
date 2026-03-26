@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use studiofs_meta::{MetaEngine, MetaResult};
+use studiofs_meta::{AsyncMetaEngine, MetaEngine, MetaResult, execute_sync_meta};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
@@ -24,12 +24,12 @@ pub async fn run_blocking<T: Send + 'static>(
 
 /// Run a metadata-engine closure on the blocking pool.
 pub async fn run_meta<T: Send + 'static>(
-    engine: Arc<dyn MetaEngine>,
+    engine: Arc<dyn AsyncMetaEngine>,
     operation: impl FnOnce(Arc<dyn MetaEngine>) -> MetaResult<T> + Send + 'static,
 ) -> VfsResult<T> {
-    task::spawn_blocking(move || operation(engine).map_err(VfsError::Meta))
+    execute_sync_meta(engine, operation)
         .await
-        .map_err(VfsError::Join)?
+        .map_err(VfsError::Meta)
 }
 
 /// Race an async operation against timeout and cancellation.

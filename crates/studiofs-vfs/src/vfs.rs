@@ -3182,6 +3182,8 @@ enum PrefetchWorkItem {
 pub struct StudioVfs {
     /// Metadata engine.
     meta: Arc<dyn MetaEngine>,
+    /// Async boundary for metadata operations.
+    meta_async: Arc<dyn AsyncMetaEngine>,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
     /// Unified two-level block cache (L1 RAM + L2 NVMe) with upload queue.
@@ -3683,7 +3685,7 @@ impl StudioVfs {
             }));
         }
 
-        let meta = self.meta.clone();
+        let meta = self.meta_async.clone();
         let principal = self.acl_principal.clone();
         let actual = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
             Self::effective_access_level_meta(engine.as_ref(), &principal, ino)
@@ -3882,6 +3884,8 @@ impl StudioVfs {
         config: VfsConfig,
     ) -> VfsResult<Arc<Self>> {
         {
+            let meta_async: Arc<dyn AsyncMetaEngine> =
+                Arc::new(SyncMetaEngineAdapter::new(meta.clone()));
             // Get volume info
             let format_info = meta.get_format_info()?;
             let data_prefix = if format_info.data_prefix.trim().is_empty() {
@@ -4225,6 +4229,7 @@ impl StudioVfs {
 
             let vfs = Arc::new(Self {
                 meta,
+                meta_async,
                 data_write,
                 block_cache,
                 block_size,
@@ -4606,7 +4611,7 @@ impl StudioVfs {
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
 
         if last_namespace_token.is_some() || last_metadata_token.is_some() {
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 Self::collect_metadata_inodes(engine.as_ref())
             })
@@ -4628,7 +4633,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let sync = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
                 let before_namespace = engine.namespace_version_token();
                 let before_metadata = engine.metadata_version_token();
@@ -4662,7 +4667,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let Ok(current_snapshot) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 Self::collect_metadata_inodes(engine.as_ref())
             })
@@ -5254,7 +5259,7 @@ impl StudioVfs {
         if let Some(attr) = self.state.dirty_attrs.lock().get(&ino) {
             return Ok(attr.content_epoch);
         }
-        let meta = self.meta.clone();
+        let meta = self.meta_async.clone();
         run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
             Ok(engine.get_attr(ino)?.content_epoch)
         })
@@ -6571,7 +6576,7 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let meta = self.meta.clone();
+        let meta = self.meta_async.clone();
         let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
             engine.get_attr(ino)
         })
@@ -7086,7 +7091,7 @@ impl StudioVfs {
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let (removed_ids, total_bytes) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 let blocks = match engine.get_file_blocks(ino) {
                     Ok(blocks) => blocks,
@@ -7180,7 +7185,7 @@ impl StudioVfs {
             self.state.dirty_attrs.lock().remove(&ino)
         };
         if let Some(attr) = dirty_attr {
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.set_attr(&attr)
             })
@@ -7356,7 +7361,7 @@ impl StudioVfs {
                         // Bimodal strong mode guarantee:
                         // flush local data + metadata before releasing distributed lock.
                         self.flush(ino).await?;
-                        let meta = self.meta.clone();
+                        let meta = self.meta_async.clone();
                         run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                             engine.flush_metadata()?;
                             Ok(())
@@ -7407,7 +7412,7 @@ impl StudioVfs {
                 }
                 // Bimodal strong mode guarantee:
                 // refresh local metadata view before lock is considered granted.
-                let meta = self.meta.clone();
+                let meta = self.meta_async.clone();
                 run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                     engine.sync_metadata()?;
                     Ok(())
@@ -8680,7 +8685,7 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
     ) -> VfsResult<Option<BlockRef>> {
-        let meta = self.meta.clone();
+        let meta = self.meta_async.clone();
         run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
             engine.get_file_block(ino, block_index)
         })
@@ -9039,7 +9044,7 @@ impl StudioVfs {
         let dirty_attr = { self.state.dirty_attrs.lock().get(&ino).cloned() };
         if let Some(attr) = dirty_attr {
             let attr_for_meta = attr.clone();
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.set_attr(&attr_for_meta)
             })
@@ -9357,7 +9362,7 @@ impl StudioVfs {
         // Also check metadata: after a remount, `deleted_inodes` is empty but
         // the inode may have been deleted in a prior session.  If the inode no
         // longer exists in the metadata store, the upload is stale.
-        let meta = self.meta.clone();
+        let meta = self.meta_async.clone();
         let attr = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
             engine.get_attr(op.ino)
         })
@@ -10107,7 +10112,7 @@ impl StudioVfs {
                 break;
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.try_acquire_global_janitor_lock()
             })
@@ -10124,7 +10129,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.get_global_snapshot_pins()
             })
@@ -10132,7 +10137,7 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    let meta = self.meta.clone();
+                    let meta = self.meta_async.clone();
                     let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                         engine.release_global_janitor_lock()
                     })
@@ -10149,7 +10154,7 @@ impl StudioVfs {
                 .unwrap_or(0);
 
             // Get pending deletions
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.get_pending_deletions()
             })
@@ -10188,7 +10193,7 @@ impl StudioVfs {
                         }
                         if !delete_failed {
                             // Remove from pending deletions
-                            let meta = self.meta.clone();
+                            let meta = self.meta_async.clone();
                             if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                                 engine.remove_pending_deletion(object_id)?;
                                 Ok(())
@@ -10206,7 +10211,7 @@ impl StudioVfs {
                     }
                 }
                 Err(e) => {
-                    let meta = self.meta.clone();
+                    let meta = self.meta_async.clone();
                     let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                         engine.release_global_janitor_lock()
                     })
@@ -10215,7 +10220,7 @@ impl StudioVfs {
                 }
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.release_global_janitor_lock()
             })
@@ -10260,7 +10265,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.try_acquire_global_janitor_lock()
             })
@@ -10277,7 +10282,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.get_global_snapshot_pins()
             })
@@ -10285,7 +10290,7 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    let meta = self.meta.clone();
+                    let meta = self.meta_async.clone();
                     let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                         engine.release_global_janitor_lock()
                     })
@@ -10295,7 +10300,7 @@ impl StudioVfs {
                 }
             };
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let referenced = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.get_referenced_object_ids()
             })
@@ -10303,7 +10308,7 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    let meta = self.meta.clone();
+                    let meta = self.meta_async.clone();
                     let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                         engine.release_global_janitor_lock()
                     })
@@ -10312,7 +10317,7 @@ impl StudioVfs {
                     continue;
                 }
             };
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let pending_map: HashMap<u64, i64> =
                 match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                     engine.get_pending_deletions()
@@ -10326,7 +10331,7 @@ impl StudioVfs {
                     }
                 };
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let recovered_undo_parents = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.recover_pending_creates()
             })
@@ -10344,7 +10349,7 @@ impl StudioVfs {
                 }
                 self.bump_namespace_for_parents(recovered_undo_parents.iter().copied());
             }
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             let (undo_total, undo_started, undo_replaying, undo_completed) =
                 match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                     engine.list_undo_logs()
@@ -10385,7 +10390,7 @@ impl StudioVfs {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    let meta = self.meta.clone();
+                    let meta = self.meta_async.clone();
                     let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                         engine.release_global_janitor_lock()
                     })
@@ -10503,7 +10508,7 @@ impl StudioVfs {
                 "janitor cycle complete"
             );
 
-            let meta = self.meta.clone();
+            let meta = self.meta_async.clone();
             if let Err(e) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.release_global_janitor_lock()
             })
