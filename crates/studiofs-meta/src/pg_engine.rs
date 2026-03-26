@@ -1853,30 +1853,6 @@ impl MetaEngineCore for PgMetaEngine {
         self.mutate(|local| local.link(ino, new_parent, new_name))
     }
 
-    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.set_symlink_target(ino, target))
-    }
-
-    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
-        self.local.get_symlink_target(ino)
-    }
-
-    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
-        self.local.get_xattr(ino, name)
-    }
-
-    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
-        self.mutate(|local| local.set_xattr(ino, name, value, flags))
-    }
-
-    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.remove_xattr(ino, name))
-    }
-
-    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
-        self.local.list_xattrs(ino)
-    }
-
     fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
         self.mutate(|local| local.set_acl_rule(ino, principal, access_level))
     }
@@ -2105,8 +2081,32 @@ impl MetaRecovery for PgMetaEngine {
         self.local.list_undo_logs()
     }
 }
-impl MetaSymlink for PgMetaEngine {}
-impl MetaXattr for PgMetaEngine {}
+impl MetaSymlink for PgMetaEngine {
+    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.set_symlink_target(ino, target))
+    }
+
+    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        self.local.get_symlink_target(ino)
+    }
+}
+impl MetaXattr for PgMetaEngine {
+    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        self.local.get_xattr(ino, name)
+    }
+
+    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
+        self.mutate(|local| local.set_xattr(ino, name, value, flags))
+    }
+
+    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.remove_xattr(ino, name))
+    }
+
+    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        self.local.list_xattrs(ino)
+    }
+}
 impl MetaAcl for PgMetaEngine {}
 impl MetaSnapshots for PgMetaEngine {}
 impl MetaReplication for PgMetaEngine {

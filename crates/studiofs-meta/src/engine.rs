@@ -236,31 +236,6 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         self.link_atomic(ino, new_parent, new_name)
     }
 
-    // ─── Symlinks ────────────────────────────────────────────────────────
-
-    /// Store a symlink target for the given inode.
-    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()>;
-
-    /// Get the symlink target for the given inode.
-    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>;
-
-    // ─── Extended Attributes (xattr) ─────────────────────────────────────
-
-    /// Get an extended attribute value.
-    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
-
-    /// Set an extended attribute.
-    /// Flags:
-    /// - `XATTR_CREATE_FLAG`: fail if key exists
-    /// - `XATTR_REPLACE_FLAG`: fail if key is missing
-    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>;
-
-    /// Remove an extended attribute.
-    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()>;
-
-    /// List all extended attribute names for an inode.
-    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
-
     // ─── Access Control (ACL) ────────────────────────────────────────────
 
     /// Set (create/update) explicit ACL rule for `(ino, principal)`.
@@ -506,9 +481,30 @@ pub trait MetaRecovery: Send + Sync {
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
 }
 
-pub trait MetaSymlink: MetaEngineCore {}
+pub trait MetaSymlink: Send + Sync {
+    /// Store a symlink target for the given inode.
+    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()>;
 
-pub trait MetaXattr: MetaEngineCore {}
+    /// Get the symlink target for the given inode.
+    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>;
+}
+
+pub trait MetaXattr: Send + Sync {
+    /// Get an extended attribute value.
+    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
+
+    /// Set an extended attribute.
+    /// Flags:
+    /// - `XATTR_CREATE_FLAG`: fail if key exists
+    /// - `XATTR_REPLACE_FLAG`: fail if key is missing
+    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>;
+
+    /// Remove an extended attribute.
+    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()>;
+
+    /// List all extended attribute names for an inode.
+    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
+}
 
 pub trait MetaAcl: MetaEngineCore {}
 
