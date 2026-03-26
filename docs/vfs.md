@@ -81,7 +81,7 @@ Adaptive upload throttling overrides:
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` sets the speedometer sampling window.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` controls how long last P90 is retained.
 - `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` is kept for compatibility and acts as a floor for the new target.
-- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers (default `1024MB`).
+- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers (default `2048MB`).
 
 ## Write Path
 
