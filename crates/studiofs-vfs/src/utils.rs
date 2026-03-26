@@ -2,7 +2,7 @@
 
 /// Parse a human-readable size string into bytes.
 ///
-/// Supports plain bytes and `KB`, `MB`, `GB`, and `TB` suffixes.
+/// Supports plain bytes and `KB`, `MB`, `GB`, `TB`, `PB`, and `EB` suffixes.
 /// Suffixes use binary multipliers (powers of 1024).
 /// Fractional values are truncated toward zero after conversion to bytes.
 pub fn parse_size_bytes(raw: &str) -> Option<u64> {
@@ -10,7 +10,11 @@ pub fn parse_size_bytes(raw: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
+    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("EB") {
+        (v, 1024u128 * 1024 * 1024 * 1024 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("PB") {
+        (v, 1024u128 * 1024 * 1024 * 1024 * 1024)
+    } else if let Some(v) = s.strip_suffix("TB") {
         (v, 1024u128 * 1024 * 1024 * 1024)
     } else if let Some(v) = s.strip_suffix("GB") {
         (v, 1024u128 * 1024 * 1024)
@@ -67,6 +71,15 @@ mod tests {
         assert_eq!(parse_size_bytes("1.5MB"), Some(1_572_864));
         assert_eq!(parse_size_bytes("2.25GB"), Some(2_415_919_104));
         assert_eq!(parse_size_bytes("0.5KB"), Some(512));
+    }
+
+    #[test]
+    fn parse_size_bytes_accepts_pb_eb_suffixes() {
+        assert_eq!(parse_size_bytes("1PB"), Some(1_125_899_906_842_624));
+        assert_eq!(
+            parse_size_bytes("1EB"),
+            Some(1_152_921_504_606_846_976)
+        );
     }
 
     #[test]

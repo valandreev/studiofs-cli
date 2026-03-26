@@ -649,26 +649,33 @@ pub struct VfsConfig {
     /// Lock retry max backoff.
     pub lock_retry_max_ms: u64,
     /// Maximum total bytes allowed in the dirty-write memory buffer.
+    /// Parsed from env via `parse_size_bytes` (for example `1.5GB`).
     pub max_dirty_bytes: usize,
     /// Maximum bytes allowed for a single xattr value.
+    /// Parsed from env via `parse_size_bytes` (for example `64KB`).
     pub max_xattr_bytes: usize,
     /// Dentry cache entry budget.
     pub dentry_cache_capacity: usize,
     /// Dentry cache byte budget.
+    /// Parsed from env via `parse_size_bytes` (for example `512MB`).
     pub dentry_cache_bytes: usize,
     /// Path shortcut cache entry budget.
     pub path_shortcut_cache_capacity: usize,
     /// Path shortcut cache byte budget.
+    /// Parsed from env via `parse_size_bytes` (for example `256MB`).
     pub path_shortcut_cache_bytes: usize,
     /// Attr read cache entry budget.
     pub attr_read_cache_capacity: usize,
     /// Attr read cache byte budget.
+    /// Parsed from env via `parse_size_bytes` (for example `128MB`).
     pub attr_read_cache_bytes: usize,
     /// Effective ACL cache entry budget.
     pub effective_acl_cache_capacity: usize,
     /// Maximum bytes allowed in local NVMe spill.
+    /// Parsed from env via `parse_size_bytes` (for example `64GB`).
     pub max_spill_bytes: usize,
     /// Maximum active ingress segment size.
+    /// Parsed from env via `parse_size_bytes` (for example `1GB`).
     pub max_ingress_segment_bytes: u64,
     /// Local cache durability/safety policy.
     pub cache_safety_mode: CacheSafetyMode,
@@ -728,6 +735,7 @@ pub struct VfsConfig {
     /// Upload slot cost when foreground reads are active.
     pub upload_cache_io_user_penalty: u32,
     /// Max active transit-memory bytes used by in-flight read/upload buffers.
+    /// Parsed from env via `parse_size_bytes` (for example `2GB`).
     pub transit_memory_budget_bytes: usize,
     /// User idle grace after the last foreground read.
     pub upload_user_idle_grace_ms: u64,
