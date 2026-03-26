@@ -3,6 +3,8 @@
 /// Parse a human-readable size string into bytes.
 ///
 /// Supports plain bytes and `KB`, `MB`, `GB`, and `TB` suffixes.
+/// Suffixes use binary multipliers (powers of 1024).
+/// Fractional values are truncated toward zero after conversion to bytes.
 pub fn parse_size_bytes(raw: &str) -> Option<usize> {
     let s = raw.trim().to_ascii_uppercase();
     if s.is_empty() {
@@ -65,5 +67,33 @@ mod tests {
         assert_eq!(parse_size_bytes("1.5MB"), Some(1_572_864));
         assert_eq!(parse_size_bytes("2.25GB"), Some(2_415_919_104));
         assert_eq!(parse_size_bytes("0.5KB"), Some(512));
+    }
+
+    #[test]
+    fn parse_size_bytes_accepts_whitespace_and_case_insensitive_suffixes() {
+        assert_eq!(parse_size_bytes(" 1 kb "), Some(1024));
+        assert_eq!(parse_size_bytes(" .5 MB "), Some(524_288));
+    }
+
+    #[test]
+    fn parse_size_bytes_truncates_fractional_bytes() {
+        assert_eq!(parse_size_bytes("1.999B"), Some(1));
+        assert_eq!(parse_size_bytes("0.5B"), Some(0));
+    }
+
+    #[test]
+    fn parse_size_bytes_rejects_malformed_values() {
+        assert_eq!(parse_size_bytes(""), None);
+        assert_eq!(parse_size_bytes("   "), None);
+        assert_eq!(parse_size_bytes("1.2.3MB"), None);
+        assert_eq!(parse_size_bytes("1..5MB"), None);
+        assert_eq!(parse_size_bytes("1,5MB"), None);
+        assert_eq!(parse_size_bytes("abc"), None);
+    }
+
+    #[test]
+    fn parse_size_bytes_rejects_overflow() {
+        let too_big = (usize::MAX as u128) + 1;
+        assert_eq!(parse_size_bytes(&too_big.to_string()), None);
     }
 }
