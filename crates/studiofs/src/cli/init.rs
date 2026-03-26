@@ -18,19 +18,11 @@ use uuid::Uuid;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Parse a size string like "4MB", "1GB" into bytes.
-/// Supports KB, MB, GB, TB suffixes. Defaults to bytes if no suffix.
-fn parse_size(size_str: &str) -> anyhow::Result<u32> {
+fn parse_block_size(size_str: &str) -> anyhow::Result<u32> {
     let bytes = parse_size_bytes(size_str)
-        .ok_or_else(|| anyhow::anyhow!("Invalid size: {}", size_str))?;
-    if bytes > u32::MAX as u64 {
-        return Err(anyhow::anyhow!(
-            "Block size too large: {} (max 4GB)",
-            size_str
-        ));
-    }
-
-    Ok(bytes as u32)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", size_str))?;
+    u32::try_from(bytes).map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))
 }
 
 #[cfg(unix)]
@@ -416,7 +408,7 @@ pub fn run(
 
     // Parse block size if provided, otherwise use default
     let actual_block_size = if let Some(size_str) = block_size {
-        parse_size(size_str)?
+        parse_block_size(size_str)?
     } else {
         DEFAULT_BLOCK_SIZE
     };
@@ -486,49 +478,54 @@ mod tests {
 
     #[test]
     fn test_parse_size_bytes() {
-        assert_eq!(parse_size("100").unwrap(), 100);
-        assert_eq!(parse_size("100B").unwrap(), 100);
+        assert_eq!(parse_block_size("100").unwrap(), 100);
+        assert_eq!(parse_block_size("100B").unwrap(), 100);
     }
 
     #[test]
     fn test_parse_size_kb() {
-        assert_eq!(parse_size("1KB").unwrap(), 1024);
-        assert_eq!(parse_size("512KB").unwrap(), 512 * 1024);
+        assert_eq!(parse_block_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_block_size("512KB").unwrap(), 512 * 1024);
     }
 
     #[test]
     fn test_parse_size_mb() {
-        assert_eq!(parse_size("1MB").unwrap(), 1024 * 1024);
-        assert_eq!(parse_size("4MB").unwrap(), 4 * 1024 * 1024);
-        assert_eq!(parse_size("8MB").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(parse_block_size("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_block_size("4MB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_block_size("8MB").unwrap(), 8 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_size_gb() {
-        assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_block_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_block_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_size_case_insensitive() {
-        assert_eq!(parse_size("1mb").unwrap(), 1024 * 1024);
-        assert_eq!(parse_size("4MB").unwrap(), 4 * 1024 * 1024);
-        assert_eq!(parse_size("8mB").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(parse_block_size("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_block_size("4MB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_block_size("8mB").unwrap(), 8 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_size_whitespace() {
-        assert_eq!(parse_size("  4MB  ").unwrap(), 4 * 1024 * 1024);
-        assert_eq!(parse_size("4 MB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_block_size("  4MB  ").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_block_size("4 MB").unwrap(), 4 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_size_invalid_suffix() {
-        assert!(parse_size("4XB").is_err());
+        assert!(parse_block_size("4XB").is_err());
     }
 
     #[test]
     fn test_parse_size_invalid_number() {
-        assert!(parse_size("abcMB").is_err());
+        assert!(parse_block_size("abcMB").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_zero_rejected() {
+        assert!(parse_block_size("0").is_err());
     }
 }

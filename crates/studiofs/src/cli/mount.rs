@@ -23,11 +23,10 @@ pub enum L2Profile {
     Usb,
 }
 
-/// Parse a human-readable size string like "100GB", "512MB", "1TB".
-fn parse_size(s: &str) -> anyhow::Result<u64> {
-    let bytes = parse_size_bytes(s)
-        .ok_or_else(|| anyhow::anyhow!("invalid size '{}'", s))?;
-    Ok(bytes)
+fn parse_positive_size_arg(raw: &str) -> anyhow::Result<u64> {
+    parse_size_bytes(raw)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", raw))
 }
 
 fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {
@@ -171,8 +170,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     macro_rules! set_size {
         ($key:literal, $field:ident) => {
             if let Ok(v) = std::env::var($key)
-                && let Some(bytes) = parse_size_bytes(&v)
-                && bytes > 0
+                && let Ok(bytes) = parse_positive_size_arg(&v)
                 && let Ok(bytes) = usize::try_from(bytes)
             {
                 config.$field = bytes;
@@ -183,8 +181,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
     set_size!("STUDIOFS_MAX_SPILL_BYTES", max_spill_bytes);
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
-        && let Some(bytes) = parse_size_bytes(&v)
-        && bytes > 0
+        && let Ok(bytes) = parse_positive_size_arg(&v)
     {
         config.max_ingress_segment_bytes = bytes;
     }
@@ -655,7 +652,8 @@ pub fn run(
 
     // Set up caches
     let (mem_limit, memory_limit_display) = if let Some(memory_limit) = memory_limit.as_deref() {
-        (parse_size(memory_limit)?, memory_limit.to_string())
+        let parsed = parse_positive_size_arg(memory_limit)?;
+        (parsed, format_binary_size(parsed))
     } else {
         let dynamic_limit = detect_dynamic_l1_limit()?;
         (
@@ -666,7 +664,7 @@ pub fn run(
             ),
         )
     };
-    let cache_size_bytes = parse_size(&cache_size)?;
+    let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
 
@@ -881,11 +879,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_size() {
-        assert_eq!(parse_size("100GB").unwrap(), 100 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("512MB").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_size("1TB").unwrap(), 1024 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("1024").unwrap(), 1024);
+    fn test_parse_positive_size_arg() {
+        assert_eq!(
+            parse_positive_size_arg("100GB").unwrap(),
+            100 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_positive_size_arg("1.5GB").unwrap(), 1_610_612_736);
+        assert!(parse_positive_size_arg("0").is_err());
     }
 
     #[test]
