@@ -257,6 +257,10 @@ impl Drop for TransitWaiter<'_> {
         }
         let mut state = self.budget.state.lock();
         self.disarm(&mut state);
+        drop(state);
+        // Wake background waiters that may have been blocked only by
+        // `waiting_foreground > 0` before this cancellation/drop.
+        self.budget.notify.notify_waiters();
     }
 }
 
@@ -373,5 +377,42 @@ mod tests {
             .await
             .expect("background waiter should complete after foreground releases")
             .expect("background waiter join should succeed");
+    }
+
+    #[tokio::test]
+    async fn transit_waiter_drop_notifies_background_waiters() {
+        let budget = TransitMemoryBudget::new(2);
+        let _holder = budget.acquire_background(1).await;
+        let fg_budget = budget.clone();
+        let fg_waiter = tokio::spawn(async move {
+            let _guard = fg_budget.acquire_foreground(2).await;
+        });
+
+        let register_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            let snap = budget.snapshot();
+            if snap.waiting_foreground > 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= register_deadline {
+                panic!("foreground waiter did not register in time");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let bg_budget = budget.clone();
+        let (bg_tx, bg_rx) = oneshot::channel::<()>();
+        let bg_waiter = tokio::spawn(async move {
+            let _guard = bg_budget.acquire_background(1).await;
+            let _ = bg_tx.send(());
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(timeout(Duration::from_millis(40), bg_rx).await.is_err());
+
+        fg_waiter.abort();
+        timeout(Duration::from_millis(250), bg_waiter)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
