@@ -1,8 +1,8 @@
 use crate::engine::{
     BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore,
-    MetaError, MetaFormat, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication,
-    MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord, UndoLogKind,
-    UndoLogRecord,
+    MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -1796,73 +1796,6 @@ impl MetaEngineCore for PgMetaEngine {
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
         self.load_pg_global_snapshot_pins()
     }
-
-    fn create_file(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_file(parent, name, uid, gid, mode))
-    }
-
-    fn create_dir(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_dir(parent, name, uid, gid, mode))
-    }
-
-    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.unlink(parent, name))
-    }
-
-    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.unlink_open_handle(parent, name))
-    }
-
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.rmdir(parent, name))
-    }
-
-    fn rename_atomic(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> MetaResult<RenameAtomicResult> {
-        self.mutate(|local| local.rename_atomic(parent, name, new_parent, new_name))
-    }
-
-    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.rename(parent, name, new_parent, new_name))
-    }
-
-    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.link_atomic(ino, new_parent, new_name))
-    }
-
-    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.link(ino, new_parent, new_name))
-    }
-
-    fn create_symlink(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        target: &[u8],
-        uid: u32,
-        gid: u32,
-    ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_symlink(parent, name, target, uid, gid))
-    }
 }
 
 impl MetaFormat for PgMetaEngine {
@@ -1930,6 +1863,74 @@ impl MetaNamespace for PgMetaEngine {
 
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
         self.mutate(|local| local.remove_entry(parent, name))
+    }
+}
+impl MetaFsOps for PgMetaEngine {
+    fn create_file(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_file(parent, name, uid, gid, mode))
+    }
+
+    fn create_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_dir(parent, name, uid, gid, mode))
+    }
+
+    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.unlink(parent, name))
+    }
+
+    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.unlink_open_handle(parent, name))
+    }
+
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.rmdir(parent, name))
+    }
+
+    fn rename_atomic(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> MetaResult<RenameAtomicResult> {
+        self.mutate(|local| local.rename_atomic(parent, name, new_parent, new_name))
+    }
+
+    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.rename(parent, name, new_parent, new_name))
+    }
+
+    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.link_atomic(ino, new_parent, new_name))
+    }
+
+    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.link(ino, new_parent, new_name))
+    }
+
+    fn create_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_symlink(parent, name, target, uid, gid))
     }
 }
 impl MetaBlocks for PgMetaEngine {

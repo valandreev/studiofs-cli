@@ -549,7 +549,8 @@ pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_meta::{MetaEngineCore, MetaNamespace, RedbMetaEngine};
+    use studiofs_meta::engine::MetaFsOps;
+    use studiofs_meta::{MetaNamespace, RedbMetaEngine};
 
     fn temp_engine() -> RedbMetaEngine {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -10749,6 +10749,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use studiofs_meta::engine::MetaFsOps;
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 

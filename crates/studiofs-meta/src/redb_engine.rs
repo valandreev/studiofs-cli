@@ -3307,23 +3307,7 @@ impl RedbMetaEngine {
     }
 }
 
-impl MetaEngineCore for RedbMetaEngine {
-    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
-        Ok(true)
-    }
-
-    fn release_global_janitor_lock(&self) -> MetaResult<()> {
-        Ok(())
-    }
-
-    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
-        let mut pins = HashSet::new();
-        for snapshot in self.list_snapshots()? {
-            pins.extend(snapshot.pinned_object_ids);
-        }
-        Ok(pins)
-    }
-
+impl MetaFsOps for RedbMetaEngine {
     // --- Atomic Rename ---------------------------------------------------
 
     fn rename_atomic(
@@ -4421,6 +4405,24 @@ impl RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
+    }
+}
+
+impl MetaEngineCore for RedbMetaEngine {
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        Ok(true)
+    }
+
+    fn release_global_janitor_lock(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        let mut pins = HashSet::new();
+        for snapshot in self.list_snapshots()? {
+            pins.extend(snapshot.pinned_object_ids);
+        }
+        Ok(pins)
     }
 }
 

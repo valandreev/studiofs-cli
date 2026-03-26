@@ -164,87 +164,6 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
 
     /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
-
-    // ─── High-Level Operations ───────────────────────────────────────────
-
-    /// Create a new file: allocate inode, set attrs, add dentry.
-    fn create_file(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr>;
-
-    /// Create a new directory: allocate inode, set attrs, add dentry, update parent nlink.
-    fn create_dir(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr>;
-
-    /// Unlink a file: remove dentry, decrement nlink, clean up if nlink=0.
-    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
-
-    /// Open-unlink transaction: remove dentry and decrement nlink, but keep inode alive.
-    ///
-    /// This is used by VFS when the file still has open handles and final inode/block
-    /// cleanup is deferred until the last handle is released.
-    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
-
-    /// Remove an empty directory.
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
-
-    /// Atomic rename: move a directory entry in a single transaction.
-    ///
-    /// Returns `Some(displaced_ino)` if the target entry was overwritten
-    /// (the displaced inode's nlink was decremented and — if zero — its
-    /// attr was removed).  The caller (VFS) is responsible for scheduling
-    /// block GC for the displaced inode.
-    fn rename_atomic(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> MetaResult<RenameAtomicResult>;
-
-    /// Rename a file or directory (delegates to `rename_atomic`).
-    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.rename_atomic(parent, name, new_parent, new_name)?;
-        Ok(())
-    }
-
-    // ─── Hardlinks ───────────────────────────────────────────────────────
-
-    /// Create a hard link in a single atomic transaction.
-    ///
-    /// Increments the inode's nlink and adds a new directory entry pointing
-    /// to the existing inode.  Directories cannot be hardlinked.
-    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr>;
-
-    /// Create a hard link (validates and delegates to `link_atomic`).
-    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        let attr = self.get_attr(ino)?;
-        if attr.kind == FileType::Directory {
-            return Err(MetaError::IsADirectory(ino));
-        }
-        self.link_atomic(ino, new_parent, new_name)
-    }
-
-    /// Create a symlink: allocate inode, store target, add dentry.
-    fn create_symlink(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        target: &[u8],
-        uid: u32,
-        gid: u32,
-    ) -> MetaResult<InodeAttr>;
 }
 
 pub trait MetaFormat: Send + Sync {
@@ -316,6 +235,74 @@ pub trait MetaNamespace: Send + Sync {
 
     /// Remove a directory entry by name. Returns the removed entry.
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
+}
+
+pub trait MetaFsOps: Send + Sync + MetaInodes {
+    /// Create a new file: allocate inode, set attrs, add dentry.
+    fn create_file(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr>;
+
+    /// Create a new directory: allocate inode, set attrs, add dentry, update parent nlink.
+    fn create_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr>;
+
+    /// Unlink a file: remove dentry, decrement nlink, clean up if nlink=0.
+    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Open-unlink transaction: remove dentry and decrement nlink, but keep inode alive.
+    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Remove an empty directory.
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
+
+    /// Atomic rename: move a directory entry in a single transaction.
+    fn rename_atomic(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> MetaResult<RenameAtomicResult>;
+
+    /// Rename a file or directory (delegates to `rename_atomic`).
+    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
+        self.rename_atomic(parent, name, new_parent, new_name)?;
+        Ok(())
+    }
+
+    /// Create a hard link in a single atomic transaction.
+    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Create a hard link (validates and delegates to `link_atomic`).
+    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        let attr = self.get_attr(ino)?;
+        if attr.kind == FileType::Directory {
+            return Err(MetaError::IsADirectory(ino));
+        }
+        self.link_atomic(ino, new_parent, new_name)
+    }
+
+    /// Create a symlink: allocate inode, store target, add dentry.
+    fn create_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr>;
 }
 
 pub trait MetaBlocks: Send + Sync + MetaInodes {
@@ -543,6 +530,7 @@ pub trait MetaEngine:
     + MetaFormat
     + MetaInodes
     + MetaNamespace
+    + MetaFsOps
     + MetaBlocks
     + MetaGc
     + MetaRecovery
