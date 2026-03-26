@@ -6191,6 +6191,18 @@ impl RedbMetaEngine {
     }
 }
 
+impl MetaFormat for RedbMetaEngine {}
+impl MetaInodes for RedbMetaEngine {}
+impl MetaNamespace for RedbMetaEngine {}
+impl MetaBlocks for RedbMetaEngine {}
+impl MetaGc for RedbMetaEngine {}
+impl MetaRecovery for RedbMetaEngine {}
+impl MetaSymlink for RedbMetaEngine {}
+impl MetaXattr for RedbMetaEngine {}
+impl MetaAcl for RedbMetaEngine {}
+impl MetaSnapshots for RedbMetaEngine {}
+impl MetaReplication for RedbMetaEngine {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

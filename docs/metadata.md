@@ -22,7 +22,9 @@ sub-traits:
 
 Backends implement strict `MetaEngineCore` (no silent default no-op fallbacks
 for capability-sensitive operations), while consumers can depend on narrower
-capability traits instead of a single god-object surface.
+capability traits instead of a single god-object surface. Capability traits are
+opt-in per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
+contracts fail at compile time.
 
 ## Engines
 

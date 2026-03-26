@@ -568,37 +568,26 @@ pub trait MetaEngineCore: Send + Sync {
 }
 
 pub trait MetaFormat: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaFormat for T {}
 
 pub trait MetaInodes: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaInodes for T {}
 
 pub trait MetaNamespace: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaNamespace for T {}
 
 pub trait MetaBlocks: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaBlocks for T {}
 
 pub trait MetaGc: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaGc for T {}
 
 pub trait MetaRecovery: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaRecovery for T {}
 
 pub trait MetaSymlink: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaSymlink for T {}
 
 pub trait MetaXattr: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaXattr for T {}
 
 pub trait MetaAcl: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaAcl for T {}
 
 pub trait MetaSnapshots: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaSnapshots for T {}
 
 pub trait MetaReplication: MetaEngineCore {}
-impl<T: MetaEngineCore + ?Sized> MetaReplication for T {}
 
 /// Public aggregate contract for consumers.
 pub trait MetaEngine:

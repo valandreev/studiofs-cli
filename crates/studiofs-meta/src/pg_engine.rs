@@ -1,6 +1,8 @@
 use crate::engine::{
-    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaEngineCore, MetaError, MetaResult,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore,
+    MetaError, MetaFormat, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication,
+    MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord, UndoLogKind,
+    UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -2200,6 +2202,18 @@ impl MetaEngineCore for PgMetaEngine {
         self.mutate(|local| local.create_symlink(parent, name, target, uid, gid))
     }
 }
+
+impl MetaFormat for PgMetaEngine {}
+impl MetaInodes for PgMetaEngine {}
+impl MetaNamespace for PgMetaEngine {}
+impl MetaBlocks for PgMetaEngine {}
+impl MetaGc for PgMetaEngine {}
+impl MetaRecovery for PgMetaEngine {}
+impl MetaSymlink for PgMetaEngine {}
+impl MetaXattr for PgMetaEngine {}
+impl MetaAcl for PgMetaEngine {}
+impl MetaSnapshots for PgMetaEngine {}
+impl MetaReplication for PgMetaEngine {}
 
 #[cfg(test)]
 mod tests {
