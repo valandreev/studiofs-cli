@@ -71,7 +71,9 @@ pub enum MetaError {
     #[error("disk UUID mismatch: local={local}, remote={remote}")]
     UuidMismatch { local: String, remote: String },
 
-    #[error("access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}")]
+    #[error(
+        "access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}"
+    )]
     AccessDenied {
         ino: Ino,
         principal: String,

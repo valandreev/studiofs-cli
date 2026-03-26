@@ -448,11 +448,13 @@ pub fn run(
             .ok()
             .or_else(|| url::Url::parse(&format!("http://{ep}")).ok());
 
-        let valid = parsed.map(|url| {
-            let scheme = url.scheme();
-            let has_host = url.host().is_some();
-            matches!(scheme, "http" | "https") && has_host
-        }).unwrap_or(false);
+        let valid = parsed
+            .map(|url| {
+                let scheme = url.scheme();
+                let has_host = url.host().is_some();
+                matches!(scheme, "http" | "https") && has_host
+            })
+            .unwrap_or(false);
 
         if !valid {
             anyhow::bail!(
@@ -597,7 +599,10 @@ pub fn run(
             let cleanup = super::utils::format_cleanup_command(name);
             anyhow::bail!(
                 "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
-                name, local, remote, cleanup
+                name,
+                local,
+                remote,
+                cleanup
             );
         }
         return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));

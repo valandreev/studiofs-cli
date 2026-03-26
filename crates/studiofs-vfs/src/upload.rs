@@ -123,6 +123,10 @@ impl UploadScheduler {
     }
 
     /// Upload object bytes to `key` with adaptive concurrency + retries.
+    ///
+    /// Note: foreground-aware adaptive cool-down is intentionally applied at
+    /// the VFS worker level before local L2 disk reads. Keep this method
+    /// focused on network/S3 request scheduling and retry behavior.
     pub async fn put(
         &self,
         key: &str,
@@ -135,14 +139,6 @@ impl UploadScheduler {
         for attempt in 0..self.max_attempts {
             if cancel_token.is_cancelled() {
                 return Err(UploadError::Cancelled);
-            }
-            if attempt == 0 {
-                let penalty_ms = self.adaptive_penalty_ms.load(Ordering::Relaxed);
-                if penalty_ms > 0
-                    && !sleep_or_cancel(cancel_token, Duration::from_millis(penalty_ms)).await
-                {
-                    return Err(UploadError::Cancelled);
-                }
             }
             self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
             let permit = self.aimd.acquire().await;

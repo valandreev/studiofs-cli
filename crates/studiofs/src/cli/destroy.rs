@@ -26,7 +26,9 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
         let cleanup = super::utils::format_cleanup_command(name);
         match e {
             studiofs_meta::engine::MetaError::UuidMismatch { local, remote } => {
-                println!("Warning: Local disk UUID does not match the remote database. You might be trying to destroy a recreated disk that you haven't discovered yet.");
+                println!(
+                    "Warning: Local disk UUID does not match the remote database. You might be trying to destroy a recreated disk that you haven't discovered yet."
+                );
                 println!("Remote UUID: {remote}");
                 println!("Local UUID:  {local}");
                 println!("\nDo you want to only remove the local stale configuration?");
@@ -34,8 +36,12 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
                 return Ok(());
             }
             _ => {
-                println!("Warning: Could not verify disk identity (remote database is unreachable).");
-                println!("If you want to remove the local configuration and metadata only, use the --local flag.");
+                println!(
+                    "Warning: Could not verify disk identity (remote database is unreachable)."
+                );
+                println!(
+                    "If you want to remove the local configuration and metadata only, use the --local flag."
+                );
                 println!("Suggested command: {cleanup}");
                 return Ok(());
             }

@@ -74,10 +74,14 @@ fn is_ip_endpoint(endpoint: &str) -> bool {
             .unwrap_or(false)
     }
 
-    if let Ok(url) = url::Url::parse(endpoint) && check_host(&url) {
+    if let Ok(url) = url::Url::parse(endpoint)
+        && check_host(&url)
+    {
         return true;
     }
-    if let Ok(url) = url::Url::parse(&format!("http://{endpoint}")) && check_host(&url) {
+    if let Ok(url) = url::Url::parse(&format!("http://{endpoint}"))
+        && check_host(&url)
+    {
         return true;
     }
     false

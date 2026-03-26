@@ -577,9 +577,9 @@ const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
-const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 2;
-const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 250;
-const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 4;
+const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 8;
+const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 400;
+const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_NUM: u64 = 3;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_DEN: u64 = 4;
 const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
@@ -9313,10 +9313,12 @@ impl StudioVfs {
         if self.uploader_shutdown_requested() {
             return Ok(());
         }
+        let mut waited_upload_delay_ms = 0u64;
         if self.upload_delay > Duration::from_millis(0) {
             let age_ms = Self::now_unix_millis().saturating_sub(op.created_unix_ms);
             let delay_ms = self.upload_delay.as_millis() as u64;
             if age_ms < delay_ms {
+                waited_upload_delay_ms = delay_ms - age_ms;
                 tokio::select! {
                     _ = upload_cancel_token.cancelled() => {
                         if self.cancel_upload_if_inode_deleted(&op) {
@@ -9324,7 +9326,7 @@ impl StudioVfs {
                         }
                         return Ok(());
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(waited_upload_delay_ms)) => {}
                 }
             }
         }
@@ -9332,7 +9334,8 @@ impl StudioVfs {
             return Ok(());
         }
 
-        // ── Fast-path: inode deleted → cancel upload, skip metadata and S3 work ──
+        // Fast-path first: if inode is already deleted, avoid any penalty
+        // computation/sleep and cancel upload immediately.
         if self.cancel_upload_if_inode_deleted(&op) {
             debug!(
                 object_id = op.object_id,
@@ -9341,6 +9344,42 @@ impl StudioVfs {
             );
             return Ok(());
         }
+
+        // Apply adaptive cool-down before the worker enters the local L2 read
+        // phase so background uploads create real quiet windows for foreground
+        // reads instead of a back-to-back disk conveyor.
+        let adaptive_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
+        let effective_adaptive_penalty_ms =
+            adaptive_penalty_ms.saturating_sub(waited_upload_delay_ms);
+        if effective_adaptive_penalty_ms > 0 {
+            tokio::select! {
+                _ = self.state.uploader_shutdown_token.cancelled() => return Ok(()),
+                _ = upload_cancel_token.cancelled() => {
+                    if self.cancel_upload_if_inode_deleted(&op) {
+                        debug!(
+                            ino = op.ino,
+                            object_id = op.object_id,
+                            penalty_ms = effective_adaptive_penalty_ms,
+                            raw_penalty_ms = adaptive_penalty_ms,
+                            upload_delay_waited_ms = waited_upload_delay_ms,
+                            "process_upload cancelled during adaptive pre-read cooldown"
+                        );
+                    } else {
+                        debug!(
+                            ino = op.ino,
+                            object_id = op.object_id,
+                            penalty_ms = effective_adaptive_penalty_ms,
+                            raw_penalty_ms = adaptive_penalty_ms,
+                            upload_delay_waited_ms = waited_upload_delay_ms,
+                            "process_upload cancelled during adaptive pre-read cooldown (shutdown/token cancel)"
+                        );
+                    }
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(effective_adaptive_penalty_ms)) => {}
+            }
+        }
+
         // Also check metadata: after a remount, `deleted_inodes` is empty but
         // the inode may have been deleted in a prior session.  If the inode no
         // longer exists in the metadata store, the upload is stale.

@@ -1114,13 +1114,8 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Mount {
-                endpoint, ..
-            } => {
-                assert_eq!(
-                    endpoint.as_deref(),
-                    Some("http://192.168.1.50:9000")
-                );
+            Commands::Mount { endpoint, .. } => {
+                assert_eq!(endpoint.as_deref(), Some("http://192.168.1.50:9000"));
             }
             other => panic!("expected Mount, got {other:?}"),
         }
