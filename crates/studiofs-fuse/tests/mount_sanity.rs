@@ -5,7 +5,7 @@ use std::sync::Arc;
 use studiofs_data::store::DataStoreConfig;
 use studiofs_fuse::StudioFuseFs;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetadataConfig, RedbMetaEngine,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
 use studiofs_vfs::{StudioVfs, VfsConfig};
 

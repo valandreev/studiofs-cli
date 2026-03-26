@@ -223,7 +223,7 @@ fn current_nofile_soft_limit() -> Option<u64> {
     }
     // SAFETY: `rc == 0` means `lim` was initialized by `getrlimit`.
     let lim = unsafe { lim.assume_init() };
-    Some(lim.rlim_cur as u64)
+    Some(lim.rlim_cur)
 }
 
 #[cfg(not(unix))]

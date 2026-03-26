@@ -6,6 +6,7 @@ use tracing::debug;
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
 pub(crate) const IO_CHUNK_SIZE: usize = 1024 * 1024;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn is_aligned(ptr: *const (), alignment: usize) -> bool {
     (ptr as usize).is_multiple_of(alignment)
 }
@@ -27,6 +28,7 @@ fn read_all(mut std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
     if dst.is_empty() {
         return Ok(0);
@@ -52,6 +54,7 @@ fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io
     ))
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn write_to_std_file_direct(mut std_file: std::fs::File, data: &[u8]) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
