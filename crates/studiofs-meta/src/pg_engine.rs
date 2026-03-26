@@ -1785,66 +1785,6 @@ impl PgMetaEngine {
 }
 
 impl MetaEngineCore for PgMetaEngine {
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        self.local.get_file_block(ino, block_index)
-    }
-
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>> {
-        self.mutate(|local| local.set_file_block(ino, block_index, block))
-    }
-
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        self.local.get_file_blocks(ino)
-    }
-
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.remove_file_blocks(ino))
-    }
-
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
-        self.mutate(|local| local.remove_file_block(ino, block_index))
-    }
-
-    fn next_block_id(&self) -> MetaResult<u64> {
-        self.mutate(|local| local.next_block_id())
-    }
-
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.next_block_ids(count))
-    }
-
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        self.mutate(|local| local.flush_blocks_batch(entries))
-    }
-
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let result = self
-            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
     }
@@ -2102,7 +2042,67 @@ impl MetaNamespace for PgMetaEngine {
         self.mutate(|local| local.remove_entry(parent, name))
     }
 }
-impl MetaBlocks for PgMetaEngine {}
+impl MetaBlocks for PgMetaEngine {
+    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
+        self.local.get_file_block(ino, block_index)
+    }
+
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>> {
+        self.mutate(|local| local.set_file_block(ino, block_index, block))
+    }
+
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+        self.local.get_file_blocks(ino)
+    }
+
+    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.mutate(|local| local.remove_file_blocks(ino))
+    }
+
+    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
+        self.mutate(|local| local.remove_file_block(ino, block_index))
+    }
+
+    fn next_block_id(&self) -> MetaResult<u64> {
+        self.mutate(|local| local.next_block_id())
+    }
+
+    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        self.mutate(|local| local.next_block_ids(count))
+    }
+
+    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
+        self.mutate(|local| local.flush_blocks_batch(entries))
+    }
+
+    fn commit_uploaded_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool> {
+        let result = self
+            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+        let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+}
 impl MetaGc for PgMetaEngine {}
 impl MetaRecovery for PgMetaEngine {}
 impl MetaSymlink for PgMetaEngine {}

@@ -153,95 +153,6 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
-    // ─── File Blocks (New Architecture) ──────────────────────────────────
-
-    /// Get a specific block reference for a file.
-    /// Key: (inode, block_index)
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
-
-    /// Set a block reference for a file.
-    /// Returns the old block reference if it existed (for GC marking).
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>>;
-
-    /// Get all block references for a file.
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
-
-    /// Remove all blocks for a file (used when deleting).
-    /// Returns the list of removed block IDs for GC.
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>;
-
-    /// Remove a single block for a file (used in truncate).
-    /// Returns the removed block ID if it existed.
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>>;
-
-    /// Allocate a new sequential block ID.
-    fn next_block_id(&self) -> MetaResult<u64>;
-
-    /// Allocate `count` consecutive block IDs in a single transaction.
-    ///
-    /// Returns `count` IDs starting from the current counter value.
-    /// Default implementation calls `next_block_id()` repeatedly.
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        let mut ids = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            ids.push(self.next_block_id()?);
-        }
-        Ok(ids)
-    }
-
-    /// Flush a batch of block writes in a single transaction.
-    ///
-    /// For each entry:
-    /// - Sets the new `BlockRef` in `FILE_BLOCKS`
-    /// - If an old block existed at `(ino, block_index)`, returns it to the
-    ///   caller so remote-visible replacement/GC can be decided later
-    /// - Increments `USED_SPACE` by the new block's length
-    ///
-    /// Returns one [`BatchFlushResult`] per entry (same order).
-    ///
-    /// Default implementation calls individual methods sequentially.
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        let mut results = Vec::with_capacity(entries.len());
-        for e in entries {
-            let block_ref = BlockRef {
-                object_id: e.object_id,
-                offset: 0,
-                length: e.length,
-                flags: e.flags,
-            };
-            let old = self.set_file_block(e.ino, e.block_index, &block_ref)?;
-            if let Some(ref old_block) = old {
-                self.decr_counter(counters::USED_SPACE, old_block.length as u64)?;
-            }
-            self.incr_counter(counters::USED_SPACE, e.length as u64)?;
-            results.push(BatchFlushResult { old_block: old });
-        }
-        Ok(results)
-    }
-
-    /// Mark a block as remote-visible after its object upload has completed.
-    ///
-    /// Remote-backed engines can use this to publish block visibility and
-    /// advance remote-visible file size independently from the local write view.
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool>;
-
-    /// Atomically publish the current file manifest as the new committed head.
-    ///
-    /// This switches the committed manifest at file granularity and updates the
-    /// inode's coarse remote upload state to `ready` when successful.
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
-
     // ─── Pending Deletions (GC) ───────────────────────
 
     /// Add a block to pending deletions (mark for GC).
@@ -506,7 +417,94 @@ pub trait MetaNamespace: Send + Sync {
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
 }
 
-pub trait MetaBlocks: MetaEngineCore {}
+pub trait MetaBlocks: Send + Sync + MetaInodes {
+    /// Get a specific block reference for a file.
+    /// Key: (inode, block_index)
+    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
+
+    /// Set a block reference for a file.
+    /// Returns the old block reference if it existed (for GC marking).
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>>;
+
+    /// Get all block references for a file.
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
+
+    /// Remove all blocks for a file (used when deleting).
+    /// Returns the list of removed block IDs for GC.
+    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>;
+
+    /// Remove a single block for a file (used in truncate).
+    /// Returns the removed block ID if it existed.
+    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>>;
+
+    /// Allocate a new sequential block ID.
+    fn next_block_id(&self) -> MetaResult<u64>;
+
+    /// Allocate `count` consecutive block IDs in a single transaction.
+    ///
+    /// Returns `count` IDs starting from the current counter value.
+    /// Default implementation calls `next_block_id()` repeatedly.
+    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        let mut ids = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            ids.push(self.next_block_id()?);
+        }
+        Ok(ids)
+    }
+
+    /// Flush a batch of block writes in a single transaction.
+    ///
+    /// For each entry:
+    /// - Sets the new `BlockRef` in `FILE_BLOCKS`
+    /// - If an old block existed at `(ino, block_index)`, returns it to the
+    ///   caller so remote-visible replacement/GC can be decided later
+    /// - Increments `USED_SPACE` by the new block's length
+    ///
+    /// Returns one [`BatchFlushResult`] per entry (same order).
+    ///
+    /// Default implementation calls individual methods sequentially.
+    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
+        let mut results = Vec::with_capacity(entries.len());
+        for e in entries {
+            let block_ref = BlockRef {
+                object_id: e.object_id,
+                offset: 0,
+                length: e.length,
+                flags: e.flags,
+            };
+            let old = self.set_file_block(e.ino, e.block_index, &block_ref)?;
+            if let Some(ref old_block) = old {
+                self.decr_counter(counters::USED_SPACE, old_block.length as u64)?;
+            }
+            self.incr_counter(counters::USED_SPACE, e.length as u64)?;
+            results.push(BatchFlushResult { old_block: old });
+        }
+        Ok(results)
+    }
+
+    /// Mark a block as remote-visible after its object upload has completed.
+    ///
+    /// Remote-backed engines can use this to publish block visibility and
+    /// advance remote-visible file size independently from the local write view.
+    fn commit_uploaded_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool>;
+
+    /// Atomically publish the current file manifest as the new committed head.
+    ///
+    /// This switches the committed manifest at file granularity and updates the
+    /// inode's coarse remote upload state to `ready` when successful.
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
+}
 
 pub trait MetaGc: MetaEngineCore {}
 
