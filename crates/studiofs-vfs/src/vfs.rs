@@ -560,7 +560,7 @@ const DEFAULT_READAHEAD_WIDTH: u32 = 128;
 const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
-const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 32;
+const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 16;
 const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 256;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
@@ -572,7 +572,9 @@ const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
 const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 1;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
-const DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES: usize = 0;
+const DEFAULT_TRANSIT_MEMORY_BUDGET_RATIO_PERCENT: u64 = 80;
+const DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS: u64 = 150;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
@@ -921,7 +923,7 @@ impl Default for VfsConfig {
             fetch_retry_base_ms: 50,
             fetch_retry_max_ms: 2_000,
             fetch_prefetch_reserve: 0,
-            fetch_prefetch_acquire_wait_ms: 75,
+            fetch_prefetch_acquire_wait_ms: DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
             max_drain_batch: 1024,
             l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
@@ -4125,8 +4127,17 @@ impl StudioVfs {
             };
 
             let qos = Arc::new(QosController::from_config(&config));
-            let transit_memory_budget =
-                TransitMemoryBudget::new(config.transit_memory_budget_bytes);
+            let transit_memory_budget_bytes = if config.transit_memory_budget_bytes > 0 {
+                config.transit_memory_budget_bytes
+            } else {
+                let derived = ((memory_limit as u128)
+                    .saturating_mul(DEFAULT_TRANSIT_MEMORY_BUDGET_RATIO_PERCENT as u128)
+                    / 100)
+                    .max(1)
+                    .min(usize::MAX as u128) as usize;
+                derived.max(block_size as usize)
+            };
+            let transit_memory_budget = TransitMemoryBudget::new(transit_memory_budget_bytes);
             let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
                 data_read,
                 block_cache.clone(),
@@ -4241,7 +4252,7 @@ impl StudioVfs {
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots,
                 upload_cache_io_user_penalty,
-                transit_memory_budget_bytes = config.transit_memory_budget_bytes,
+                transit_memory_budget_bytes,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 upload_fg_read_latency_target_ms,
                 upload_fg_read_latency_window_ms,

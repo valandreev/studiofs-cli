@@ -81,7 +81,7 @@ Adaptive upload throttling overrides:
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` sets the speedometer sampling window.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` controls how long last P90 is retained.
 - `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` is kept for compatibility and acts as a floor for the new target.
-- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers (default `2048MB`).
+- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers (default `80%` of memory limit).
 
 ## Write Path
 
@@ -353,11 +353,11 @@ Runtime tuning knobs:
 - `STUDIOFS_READAHEAD_SEQ_STEP` (default `4`)
 - `STUDIOFS_READAHEAD_RANDOM_PENALTY` (default `2`)
 - `STUDIOFS_PREFETCH_CONCURRENCY` (default `128`)
-- `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `max(32, prefetch_concurrency / 2)`, keeps fetch headroom for direct reads)
+- `STUDIOFS_PREFETCH_FOREGROUND_RESERVE` (default `16`, keeps fetch headroom for direct reads)
 - `STUDIOFS_PREFETCH_MAX_PER_CYCLE` (default `256`, effective cap also scales with AIMD window)
 - `STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS` (default `250`, temporarily pauses prefetch after transport send errors)
 - `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` (default `4`, prefetch retries are best-effort and shorter than foreground)
-- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
+- `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `150`)
 
 On each buffered `read()`:
 1. Hot path enqueues a compact prefetch hint (`ino`, `first_block`, `last_block`) and returns to user work.
