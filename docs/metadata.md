@@ -11,6 +11,7 @@ sub-traits:
 - `MetaFormat`
 - `MetaInodes`
 - `MetaNamespace`
+- `MetaFsOps`
 - `MetaBlocks`
 - `MetaGc`
 - `MetaRecovery`
@@ -20,10 +21,11 @@ sub-traits:
 - `MetaSnapshots`
 - `MetaReplication`
 
-Backends implement strict `MetaEngineCore` (no silent default no-op fallbacks
-for capability-sensitive operations), while consumers can depend on narrower
-capability traits instead of a single god-object surface. Capability traits are
-opt-in per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
+`MetaEngineCore` now contains only cross-cutting engine responsibilities
+(global janitor lease + global snapshot pins), while filesystem and metadata
+operations are split across capability traits. Consumers can depend on narrower
+contracts instead of a single god-object surface. Capability traits are opt-in
+per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
 contracts fail at compile time.
 
 ## Engines
@@ -606,7 +608,7 @@ use a unified undo-recovery path with explicit intent records.
 
 ### Undo-intent records
 
-`MetaEngine` exposes:
+`MetaRecovery` exposes:
 
 - `pending_creates` (create intent journal)
 - `deferred_deletes` (open-unlink orphan journal)
