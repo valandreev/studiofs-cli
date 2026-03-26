@@ -27,6 +27,8 @@ pub async fn run_meta<T: Send + 'static>(
     engine: Arc<dyn AsyncMetaEngine>,
     operation: impl FnOnce(Arc<dyn MetaEngine>) -> MetaResult<T> + Send + 'static,
 ) -> VfsResult<T> {
+    // Keep runtime/task failures distinct from metadata-engine domain failures.
+    // A JoinError generally indicates panic/cancellation at the execution layer.
     execute_sync_meta(engine, operation)
         .await
         .map_err(VfsError::Join)?

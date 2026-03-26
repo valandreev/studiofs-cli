@@ -3543,11 +3543,12 @@ impl StudioVfs {
     }
 
     fn acl_rule_for_inode(&self, ino: Ino) -> VfsResult<Option<AccessLevel>> {
-        if let Some(level) = self.sync_meta().get_acl_rule(ino, &self.acl_principal)? {
+        let meta = self.sync_meta();
+        if let Some(level) = meta.get_acl_rule(ino, &self.acl_principal)? {
             return Ok(Some(level));
         }
         if self.acl_principal != "*" {
-            return Ok(self.sync_meta().get_acl_rule(ino, "*")?);
+            return Ok(meta.get_acl_rule(ino, "*")?);
         }
         Ok(None)
     }
@@ -3710,17 +3711,18 @@ impl StudioVfs {
         principal: &str,
         access_level: AccessLevel,
     ) -> VfsResult<()> {
-        self.sync_meta()
-            .set_acl_rule(ino, principal, access_level)?;
+        let meta = self.sync_meta();
+        meta.set_acl_rule(ino, principal, access_level)?;
         self.bump_acl_epoch();
-        self.sync_meta().request_eager_flush();
+        meta.request_eager_flush();
         Ok(())
     }
 
     pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
-        self.sync_meta().remove_acl_rule(ino, principal)?;
+        let meta = self.sync_meta();
+        meta.remove_acl_rule(ino, principal)?;
         self.bump_acl_epoch();
-        self.sync_meta().request_eager_flush();
+        meta.request_eager_flush();
         Ok(())
     }
 
@@ -4604,8 +4606,9 @@ impl StudioVfs {
     }
 
     async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
-        let mut last_namespace_token = self.sync_meta().namespace_version_token();
-        let mut last_metadata_token = self.sync_meta().metadata_version_token();
+        let meta = self.sync_meta();
+        let mut last_namespace_token = meta.namespace_version_token();
+        let mut last_metadata_token = meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
 
         if last_namespace_token.is_some() || last_metadata_token.is_some() {
@@ -6347,6 +6350,13 @@ impl StudioVfs {
         *self.kernel_invalidator.write().unwrap() = None;
     }
 
+    /// Obtain the synchronous metadata engine handle backing this VFS.
+    ///
+    /// Prefer caching this once per function (`let meta = self.sync_meta();`) if
+    /// multiple synchronous metadata calls are needed.
+    ///
+    /// In async paths, prefer `run_meta(...)` with `self.meta_async.clone()` so
+    /// blocking work stays behind the explicit async boundary.
     fn sync_meta(&self) -> Arc<dyn MetaEngine> {
         self.meta_async.sync_engine()
     }
@@ -6358,12 +6368,14 @@ impl StudioVfs {
 
     /// Get volume name.
     pub fn volume_name(&self) -> VfsResult<String> {
-        Ok(self.sync_meta().get_format_info()?.name)
+        let meta = self.sync_meta();
+        Ok(meta.get_format_info()?.name)
     }
 
     /// Get volume UUID.
     pub fn uuid(&self) -> VfsResult<String> {
-        Ok(self.sync_meta().get_format_info()?.uuid)
+        let meta = self.sync_meta();
+        Ok(meta.get_format_info()?.uuid)
     }
 
     /// Get block size.
