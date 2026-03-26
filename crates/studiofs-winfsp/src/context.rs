@@ -341,6 +341,14 @@ fn create_default_security_descriptor() -> Vec<u8> {
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     match &e {
+        studiofs_vfs::VfsError::Join(join_err) => {
+            error!(
+                error = %join_err,
+                "critical runtime failure (JoinError), requesting emergency unmount"
+            );
+            crate::request_shutdown();
+            winfsp::FspError::from(STATUS_UNSUCCESSFUL)
+        }
         studiofs_vfs::VfsError::Meta(me) => match me {
             studiofs_meta::MetaError::InodeNotFound(_) => {
                 winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND)

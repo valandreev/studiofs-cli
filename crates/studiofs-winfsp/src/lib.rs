@@ -334,6 +334,14 @@ this usually means Administrator privileges are required, or WinFSP must be conf
 static SHUTDOWN_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
     std::sync::Mutex::new(None);
 
+pub(crate) fn request_shutdown() {
+    if let Ok(guard) = SHUTDOWN_TX.lock()
+        && let Some(tx) = guard.as_ref()
+    {
+        let _ = tx.send(());
+    }
+}
+
 unsafe extern "system" {
     fn SetConsoleCtrlHandler(
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
@@ -342,11 +350,7 @@ unsafe extern "system" {
 }
 
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
-    if let Ok(guard) = SHUTDOWN_TX.lock()
-        && let Some(tx) = guard.as_ref()
-    {
-        let _ = tx.send(());
-    }
+    request_shutdown();
     1 // TRUE — handled
 }
 

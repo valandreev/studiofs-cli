@@ -76,10 +76,7 @@ mod tests {
     #[test]
     fn parse_size_bytes_accepts_pb_eb_suffixes() {
         assert_eq!(parse_size_bytes("1PB"), Some(1_125_899_906_842_624));
-        assert_eq!(
-            parse_size_bytes("1EB"),
-            Some(1_152_921_504_606_846_976)
-        );
+        assert_eq!(parse_size_bytes("1EB"), Some(1_152_921_504_606_846_976));
     }
 
     #[test]

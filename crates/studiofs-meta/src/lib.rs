@@ -3,6 +3,7 @@
 //! Provides metadata storage for the virtual filesystem using redb as the embedded KV store.
 //! All filesystem structure (inodes, directory entries, chunk/slice mappings) is managed here.
 
+pub mod async_engine;
 pub mod engine;
 pub mod events;
 pub mod pg_dsn;
@@ -14,6 +15,7 @@ pub mod types;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{BatchFlushEntry, BatchFlushResult, MetaEngine, MetaError, MetaResult};
 pub use events::MetaEvent;
 pub use pg_dsn::{

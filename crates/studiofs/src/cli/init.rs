@@ -22,7 +22,8 @@ fn parse_block_size(size_str: &str) -> anyhow::Result<u32> {
     let bytes = parse_size_bytes(size_str)
         .filter(|&bytes| bytes > 0)
         .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", size_str))?;
-    u32::try_from(bytes).map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))
+    u32::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))
 }
 
 #[cfg(unix)]

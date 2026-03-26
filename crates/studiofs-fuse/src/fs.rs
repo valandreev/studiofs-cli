@@ -55,6 +55,16 @@ fn missing_xattr_errno() -> i32 {
     }
 }
 
+fn note_critical_vfs_error(e: &VfsError) {
+    if let VfsError::Join(join_err) = e {
+        error!(
+            error = %join_err,
+            "critical runtime failure (JoinError), requesting emergency unmount"
+        );
+        super::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> Vec<u8> {
     let offset = position as usize;
@@ -177,6 +187,7 @@ fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
 /// Map VfsError to the correct libc errno for FUSE replies.
 fn vfs_err_to_errno(e: &VfsError) -> i32 {
     use studiofs_meta::MetaError;
+    note_critical_vfs_error(e);
     match e {
         VfsError::Meta(me) => match me {
             MetaError::InodeNotFound(_) => libc::ENOENT,
@@ -190,6 +201,7 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
             _ => libc::EIO,
         },
         VfsError::BlockNotFound(_, _) => libc::EIO,
+        VfsError::Join(_) => libc::EIO,
         VfsError::WouldBlock | VfsError::RemoteContentPending => libc::EAGAIN,
         VfsError::InvalidName(_) => libc::EINVAL,
         VfsError::Io(ioe) => match ioe.kind() {

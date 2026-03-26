@@ -1,6 +1,10 @@
 # Metadata Engine
 
 `studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
+`studiofs-vfs` consumes metadata through an explicit async boundary:
+- `AsyncMetaEngine` (object-safe runtime boundary)
+- `SyncMetaEngineAdapter` (bridges sync engines via blocking execution)
+- `run_meta(...)` in VFS (maps runtime `JoinError` separately from metadata-domain errors)
 
 ## Engines
 
