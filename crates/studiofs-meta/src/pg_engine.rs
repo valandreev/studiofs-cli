@@ -1785,50 +1785,6 @@ impl PgMetaEngine {
 }
 
 impl MetaEngineCore for PgMetaEngine {
-    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
-        self.mutate(|local| local.add_deferred_delete(record))
-    }
-
-    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_deferred_delete(ino))
-    }
-
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        self.local.list_deferred_deletes()
-    }
-
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
-        self.mutate(|local| local.recover_pending_creates())
-    }
-
-    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
-        self.mutate(|local| local.add_pending_create(record))
-    }
-
-    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_pending_create(ino))
-    }
-
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        self.local.list_pending_creates()
-    }
-
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        self.mutate(|local| local.recover_undo_logs())
-    }
-
-    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
-        self.mutate(|local| local.append_undo_log(record))
-    }
-
-    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_undo_logs_for(kind, ino))
-    }
-
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        self.local.list_undo_logs()
-    }
-
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
         self.try_acquire_pg_janitor_lock()
     }
@@ -2104,7 +2060,51 @@ impl MetaGc for PgMetaEngine {
         self.local.get_referenced_object_ids()
     }
 }
-impl MetaRecovery for PgMetaEngine {}
+impl MetaRecovery for PgMetaEngine {
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
+        self.mutate(|local| local.add_deferred_delete(record))
+    }
+
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_deferred_delete(ino))
+    }
+
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
+        self.local.list_deferred_deletes()
+    }
+
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
+        self.mutate(|local| local.recover_pending_creates())
+    }
+
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
+        self.mutate(|local| local.add_pending_create(record))
+    }
+
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_pending_create(ino))
+    }
+
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        self.local.list_pending_creates()
+    }
+
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
+        self.mutate(|local| local.recover_undo_logs())
+    }
+
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
+        self.mutate(|local| local.append_undo_log(record))
+    }
+
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_undo_logs_for(kind, ino))
+    }
+
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
+        self.local.list_undo_logs()
+    }
+}
 impl MetaSymlink for PgMetaEngine {}
 impl MetaXattr for PgMetaEngine {}
 impl MetaAcl for PgMetaEngine {}

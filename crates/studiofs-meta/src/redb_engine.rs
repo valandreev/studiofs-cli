@@ -3324,64 +3324,6 @@ impl MetaEngineCore for RedbMetaEngine {
         Ok(pins)
     }
 
-    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DEFERRED_DELETES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let encoded = encode(record)?;
-            table
-                .insert(record.ino, encoded.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DEFERRED_DELETES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = table
-                .remove(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::DeferredDelete, ino)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        self.cleanup_stale_undo_logs()?;
-        Ok(())
-    }
-
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(DEFERRED_DELETES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            out.push(decode(value.value())?);
-        }
-        Ok(out)
-    }
-
     // --- Atomic Rename ---------------------------------------------------
 
     fn rename_atomic(
@@ -3581,132 +3523,6 @@ impl MetaEngineCore for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(result)
-    }
-
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
-        self.recover_pending_create_intents()
-    }
-
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        let mut touched_parents: HashSet<Ino> =
-            self.recover_pending_create_intents()?.into_iter().collect();
-
-        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
-            .list_deferred_deletes()?
-            .into_iter()
-            .map(|record| (record.ino, record))
-            .collect();
-        let undo_logs = self.list_undo_logs()?;
-        if !undo_logs.is_empty() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            for record in undo_logs {
-                if record.kind != UndoLogKind::DeferredDelete {
-                    continue;
-                }
-                if record.phase == UndoLogPhase::Completed {
-                    continue;
-                }
-                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
-                    continue;
-                };
-                self.set_undo_log_phase_for(
-                    record.kind.clone(),
-                    record.ino,
-                    UndoLogPhase::Replaying,
-                )?;
-
-                let blocks = match self.get_file_blocks(record.ino) {
-                    Ok(blocks) => blocks,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-                let removed_ids = match self.remove_file_blocks(record.ino) {
-                    Ok(ids) => ids,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                for object_id in removed_ids {
-                    self.add_pending_deletion(object_id, timestamp)?;
-                }
-                if total_bytes > 0 {
-                    let _ = self.decr_counter(counters::USED_SPACE, total_bytes)?;
-                }
-                match self.remove_attr(record.ino) {
-                    Ok(()) => {}
-                    Err(MetaError::InodeNotFound(_)) => {}
-                    Err(err) => return Err(err),
-                }
-                self.remove_deferred_delete(record.ino)?;
-                touched_parents.insert(deferred.parent);
-            }
-        }
-
-        self.cleanup_stale_undo_logs()?;
-        Ok(touched_parents.into_iter().collect())
-    }
-
-    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
-        self.add_pending_create_intent(record)
-    }
-
-    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
-        self.remove_pending_create_intent(ino)?;
-        self.cleanup_stale_undo_logs()?;
-        Ok(())
-    }
-
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        self.list_pending_create_intents()
-    }
-
-    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::append_undo_log_in_txn(&txn, record)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_undo_logs_for_in_txn(&txn, kind, ino)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(UNDO_LOG_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            out.push(decode(v.value())?);
-        }
-        Ok(out)
     }
 
     // --- Symlinks --------------------------------------------------------
@@ -6146,7 +5962,191 @@ impl MetaGc for RedbMetaEngine {
         Ok(refs)
     }
 }
-impl MetaRecovery for RedbMetaEngine {}
+impl MetaRecovery for RedbMetaEngine {
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let encoded = encode(record)?;
+            table
+                .insert(record.ino, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = table
+                .remove(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::DeferredDelete, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(DEFERRED_DELETES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
+        self.recover_pending_create_intents()
+    }
+
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
+        let mut touched_parents: HashSet<Ino> =
+            self.recover_pending_create_intents()?.into_iter().collect();
+
+        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
+            .list_deferred_deletes()?
+            .into_iter()
+            .map(|record| (record.ino, record))
+            .collect();
+        let undo_logs = self.list_undo_logs()?;
+        if !undo_logs.is_empty() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for record in undo_logs {
+                if record.kind != UndoLogKind::DeferredDelete {
+                    continue;
+                }
+                if record.phase == UndoLogPhase::Completed {
+                    continue;
+                }
+                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
+                    continue;
+                };
+                self.set_undo_log_phase_for(
+                    record.kind.clone(),
+                    record.ino,
+                    UndoLogPhase::Replaying,
+                )?;
+
+                let blocks = match self.get_file_blocks(record.ino) {
+                    Ok(blocks) => blocks,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+                let removed_ids = match self.remove_file_blocks(record.ino) {
+                    Ok(ids) => ids,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                for object_id in removed_ids {
+                    self.add_pending_deletion(object_id, timestamp)?;
+                }
+                if total_bytes > 0 {
+                    let _ = self.decr_counter(counters::USED_SPACE, total_bytes)?;
+                }
+                match self.remove_attr(record.ino) {
+                    Ok(()) => {}
+                    Err(MetaError::InodeNotFound(_)) => {}
+                    Err(err) => return Err(err),
+                }
+                self.remove_deferred_delete(record.ino)?;
+                touched_parents.insert(deferred.parent);
+            }
+        }
+
+        self.cleanup_stale_undo_logs()?;
+        Ok(touched_parents.into_iter().collect())
+    }
+
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
+        self.add_pending_create_intent(record)
+    }
+
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
+        self.remove_pending_create_intent(ino)?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        self.list_pending_create_intents()
+    }
+
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::append_undo_log_in_txn(&txn, record)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_undo_logs_for_in_txn(&txn, kind, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(v.value())?);
+        }
+        Ok(out)
+    }
+}
 impl MetaSymlink for RedbMetaEngine {}
 impl MetaXattr for RedbMetaEngine {}
 impl MetaAcl for RedbMetaEngine {}

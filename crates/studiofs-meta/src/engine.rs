@@ -153,34 +153,6 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
-    /// Replay pending create intents and heal dangling namespace entries.
-    ///
-    /// Returns parent inode ids whose directory namespace was mutated during replay.
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>>;
-
-    /// Record a pending create intent for crash recovery.
-    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()>;
-
-    /// Remove a pending create intent.
-    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()>;
-
-    /// List pending create intents.
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>>;
-
-    /// Append an operation into the generic undo log.
-    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()>;
-
-    /// Remove all undo-log records for the `(kind, ino)` tuple.
-    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()>;
-
-    /// List undo-log records.
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>>;
-
-    /// Replay generic undo-log records and heal dangling namespace state.
-    ///
-    /// Returns parent inode ids whose directory namespace was mutated during replay.
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>>;
-
     /// Try to acquire the global janitor lease before contacting remote object storage.
     ///
     /// Local-only engines may allow the janitor to proceed immediately. Distributed
@@ -223,15 +195,6 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// This is used by VFS when the file still has open handles and final inode/block
     /// cleanup is deferred until the last handle is released.
     fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
-
-    /// Record a deferred delete (open-unlink orphan) for crash-safe cleanup.
-    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()>;
-
-    /// Remove a deferred delete record after final cleanup.
-    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()>;
-
-    /// List deferred delete records pending replay/recovery.
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
 
     /// Remove an empty directory.
     fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
@@ -506,7 +469,42 @@ pub trait MetaGc: Send + Sync {
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
 }
 
-pub trait MetaRecovery: MetaEngineCore {}
+pub trait MetaRecovery: Send + Sync {
+    /// Replay pending create intents and heal dangling namespace entries.
+    /// Returns parent inode ids whose directory namespace was mutated during replay.
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>>;
+
+    /// Record a pending create intent for crash recovery.
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()>;
+
+    /// Remove a pending create intent.
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()>;
+
+    /// List pending create intents.
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>>;
+
+    /// Append an operation into the generic undo log.
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()>;
+
+    /// Remove all undo-log records for the `(kind, ino)` tuple.
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()>;
+
+    /// List undo-log records.
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>>;
+
+    /// Replay generic undo-log records and heal dangling namespace state.
+    /// Returns parent inode ids whose directory namespace was mutated during replay.
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>>;
+
+    /// Record a deferred delete (open-unlink orphan) for crash-safe cleanup.
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()>;
+
+    /// Remove a deferred delete record after final cleanup.
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()>;
+
+    /// List deferred delete records pending replay/recovery.
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
+}
 
 pub trait MetaSymlink: MetaEngineCore {}
 
