@@ -23,6 +23,12 @@ pub enum L2Profile {
     Usb,
 }
 
+fn parse_positive_size_arg(raw: &str) -> anyhow::Result<u64> {
+    parse_size_bytes(raw)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", raw))
+}
+
 fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {
     anyhow::ensure!(
         total_memory_bytes > 0,
@@ -649,8 +655,7 @@ pub fn run(
     // Set up caches
     let (mem_limit, memory_limit_display) = if let Some(memory_limit) = memory_limit.as_deref() {
         (
-            parse_size_bytes(memory_limit)
-                .ok_or_else(|| anyhow::anyhow!("invalid size '{}'", memory_limit))?,
+            parse_positive_size_arg(memory_limit)?,
             memory_limit.to_string(),
         )
     } else {
@@ -663,8 +668,7 @@ pub fn run(
             ),
         )
     };
-    let cache_size_bytes = parse_size_bytes(&cache_size)
-        .ok_or_else(|| anyhow::anyhow!("invalid size '{}'", cache_size))?;
+    let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
 
@@ -879,12 +883,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mount_size_inputs_parse_with_shared_parser() {
-        assert_eq!(parse_size_bytes("100GB").unwrap(), 100 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size_bytes("512MB").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_size_bytes("1TB").unwrap(), 1024 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size_bytes("1024").unwrap(), 1024);
-        assert_eq!(parse_size_bytes("1.5GB").unwrap(), 1_610_612_736);
+    fn test_parse_positive_size_arg() {
+        assert_eq!(
+            parse_positive_size_arg("100GB").unwrap(),
+            100 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_positive_size_arg("1.5GB").unwrap(), 1_610_612_736);
+        assert!(parse_positive_size_arg("0").is_err());
     }
 
     #[test]
