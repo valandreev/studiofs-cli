@@ -149,36 +149,36 @@ impl MetadataReplicationBacklog {
 /// All operations are synchronous (redb is sync). Async callers should use
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
-pub trait MetaEngine: Send + Sync {
+pub trait MetaNamespace: Send + Sync {}
+
+pub trait MetaBlocks: Send + Sync {}
+
+pub trait MetaGc: Send + Sync {}
+
+pub trait MetaReplication: Send + Sync {}
+
+pub trait MetaEngine: Send + Sync + MetaNamespace + MetaBlocks + MetaGc + MetaReplication {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
     ///
     /// Engines that support remote verification should override this.
-    fn check_consistency(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    fn check_consistency(&self) -> MetaResult<()>;
 
     /// Flush pending metadata mutations to remote store (if any).
     ///
     /// Local-only engines can keep the default no-op implementation.
-    fn flush_metadata(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    fn flush_metadata(&self) -> MetaResult<()>;
 
     /// Force metadata synchronization from remote source (if applicable).
     ///
     /// Used by strong-consistency paths (e.g. distributed file locks) to
     /// guarantee refresh-before-lock-grant semantics.
-    fn sync_metadata(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    fn sync_metadata(&self) -> MetaResult<()>;
 
     /// Stable identifier used for invalidation self-echo suppression.
     ///
     /// Engines that publish invalidation events should override this and return
     /// the same identifier they include in event payloads.
-    fn invalidation_sender_id(&self) -> Option<String> {
-        None
-    }
+    fn invalidation_sender_id(&self) -> Option<String>;
 
     /// Request a near-immediate flush of pending metadata mutations.
     ///
@@ -186,31 +186,25 @@ pub trait MetaEngine: Send + Sync {
     /// unlink, rmdir, rename, …) so that changes reach remote metadata within
     /// a short batching window (~250 ms) instead of waiting for the full
     /// `flush_interval` (default 60 s).  The default is a no-op.
-    fn request_eager_flush(&self) {}
+    fn request_eager_flush(&self);
 
     /// Best-effort metadata version token for change detection.
     ///
     /// Remote-backed engines can expose a monotonic-ish token (for example,
     /// an object ETag) so invalidation listeners can tell whether a sync
     /// actually observed a newer remote snapshot.
-    fn metadata_version_token(&self) -> Option<String> {
-        None
-    }
+    fn metadata_version_token(&self) -> Option<String>;
 
     /// Best-effort namespace-only version token for dentry/path invalidation.
     ///
     /// This token should advance only for namespace mutations (add/remove/rename
     /// directory entries). By default it falls back to `metadata_version_token()`
     /// for engines that don't expose finer-grained signals yet.
-    fn namespace_version_token(&self) -> Option<String> {
-        self.metadata_version_token()
-    }
+    fn namespace_version_token(&self) -> Option<String>;
 
     /// Best-effort count of local metadata mutations not yet durably pushed to
     /// the shared remote metadata source.
-    fn replication_backlog(&self) -> MetadataReplicationBacklog {
-        MetadataReplicationBacklog::default()
-    }
+    fn replication_backlog(&self) -> MetadataReplicationBacklog;
 
     // ─── Format / Settings ───────────────────────────────────────────────
 
@@ -368,21 +362,17 @@ pub trait MetaEngine: Send + Sync {
     /// advance remote-visible file size independently from the local write view.
     fn commit_uploaded_block(
         &self,
-        _ino: Ino,
-        _block_index: u32,
-        _expected_epoch: u64,
-        _block: &BlockRef,
-    ) -> MetaResult<bool> {
-        Ok(true)
-    }
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool>;
 
     /// Atomically publish the current file manifest as the new committed head.
     ///
     /// This switches the committed manifest at file granularity and updates the
     /// inode's coarse remote upload state to `ready` when successful.
-    fn publish_file_manifest(&self, _ino: Ino, _expected_epoch: u64) -> MetaResult<bool> {
-        Ok(false)
-    }
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
 
     // ─── Pending Deletions (GC) ───────────────────────
 
@@ -397,82 +387,50 @@ pub trait MetaEngine: Send + Sync {
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
 
     /// Get currently referenced object IDs from FILE_BLOCKS metadata.
-    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        Err(MetaError::Storage(
-            "get_referenced_object_ids not implemented".to_string(),
-        ))
-    }
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
 
     /// Replay pending create intents and heal dangling namespace entries.
     ///
     /// Returns parent inode ids whose directory namespace was mutated during replay.
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
-        Ok(Vec::new())
-    }
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>>;
 
     /// Record a pending create intent for crash recovery.
-    fn add_pending_create(&self, _record: &PendingCreateRecord) -> MetaResult<()> {
-        Ok(())
-    }
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()>;
 
     /// Remove a pending create intent.
-    fn remove_pending_create(&self, _ino: Ino) -> MetaResult<()> {
-        Ok(())
-    }
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()>;
 
     /// List pending create intents.
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        Ok(Vec::new())
-    }
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>>;
 
     /// Append an operation into the generic undo log.
-    fn append_undo_log(&self, _record: &UndoLogRecord) -> MetaResult<()> {
-        Ok(())
-    }
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()>;
 
     /// Remove all undo-log records for the `(kind, ino)` tuple.
-    fn remove_undo_logs_for(&self, _kind: UndoLogKind, _ino: Ino) -> MetaResult<()> {
-        Ok(())
-    }
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()>;
 
     /// List undo-log records.
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        Ok(Vec::new())
-    }
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>>;
 
     /// Replay generic undo-log records and heal dangling namespace state.
     ///
     /// Returns parent inode ids whose directory namespace was mutated during replay.
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        self.recover_pending_creates()
-    }
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>>;
 
     /// Try to acquire the global janitor lease before contacting remote object storage.
     ///
     /// Local-only engines may allow the janitor to proceed immediately. Distributed
     /// engines should return `Ok(false)` when another client already holds the lease.
-    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
-        Ok(true)
-    }
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>;
 
     /// Release the global janitor lease, if one was acquired.
-    fn release_global_janitor_lock(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    fn release_global_janitor_lock(&self) -> MetaResult<()>;
 
     /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
-    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
-        let mut pins = HashSet::new();
-        for snapshot in self.list_snapshots()? {
-            pins.extend(snapshot.pinned_object_ids);
-        }
-        Ok(pins)
-    }
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
 
     /// Return the estimated size of remote metadata in bytes, if applicable.
-    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
-        Ok(None)
-    }
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
 
     // ─── High-Level Operations ───────────────────────────────────────────
 
@@ -506,19 +464,13 @@ pub trait MetaEngine: Send + Sync {
     fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
 
     /// Record a deferred delete (open-unlink orphan) for crash-safe cleanup.
-    fn add_deferred_delete(&self, _record: &DeferredDeleteRecord) -> MetaResult<()> {
-        Ok(())
-    }
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()>;
 
     /// Remove a deferred delete record after final cleanup.
-    fn remove_deferred_delete(&self, _ino: Ino) -> MetaResult<()> {
-        Ok(())
-    }
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()>;
 
     /// List deferred delete records pending replay/recovery.
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        Ok(Vec::new())
-    }
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
 
     /// Remove an empty directory.
     fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
@@ -609,19 +561,11 @@ pub trait MetaEngine: Send + Sync {
     // ─── Snapshots ────────────────────────────────────────────────────────
 
     /// Create an immutable snapshot rooted at `root_ino`.
-    fn create_snapshot(&self, _root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        Err(MetaError::Storage(
-            "create_snapshot not implemented".to_string(),
-        ))
-    }
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot>;
 
     /// List known snapshots.
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        Ok(Vec::new())
-    }
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>>;
 
     /// Look up snapshot by id.
-    fn get_snapshot(&self, _snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        Ok(None)
-    }
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
 }

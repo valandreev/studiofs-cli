@@ -16,7 +16,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
-pub use engine::{BatchFlushEntry, BatchFlushResult, MetaEngine, MetaError, MetaResult};
+pub use engine::{
+    BatchFlushEntry, BatchFlushResult, MetaBlocks, MetaEngine, MetaError, MetaGc, MetaNamespace,
+    MetaReplication, MetaResult,
+};
 pub use events::MetaEvent;
 pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,

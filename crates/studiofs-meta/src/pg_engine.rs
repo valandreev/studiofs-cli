@@ -1,6 +1,7 @@
 use crate::engine::{
-    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaEngine, MetaError, MetaResult,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaBlocks, MetaEngine, MetaError,
+    MetaGc, MetaNamespace, MetaReplication, MetaResult, PendingCreateRecord, UndoLogKind,
+    UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -1781,6 +1782,14 @@ impl PgMetaEngine {
         Ok(result)
     }
 }
+
+impl MetaNamespace for PgMetaEngine {}
+
+impl MetaBlocks for PgMetaEngine {}
+
+impl MetaGc for PgMetaEngine {}
+
+impl MetaReplication for PgMetaEngine {}
 
 impl MetaEngine for PgMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {

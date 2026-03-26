@@ -3307,7 +3307,65 @@ impl RedbMetaEngine {
     }
 }
 
+impl MetaNamespace for RedbMetaEngine {}
+
+impl MetaBlocks for RedbMetaEngine {}
+
+impl MetaGc for RedbMetaEngine {}
+
+impl MetaReplication for RedbMetaEngine {}
+
 impl MetaEngine for RedbMetaEngine {
+    fn check_consistency(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn flush_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn sync_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn invalidation_sender_id(&self) -> Option<String> {
+        None
+    }
+
+    fn request_eager_flush(&self) {}
+
+    fn metadata_version_token(&self) -> Option<String> {
+        None
+    }
+
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
+
+    fn replication_backlog(&self) -> MetadataReplicationBacklog {
+        MetadataReplicationBacklog::default()
+    }
+
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        Ok(true)
+    }
+
+    fn release_global_janitor_lock(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        let mut pins = HashSet::new();
+        for snapshot in self.list_snapshots()? {
+            pins.extend(snapshot.pinned_object_ids);
+        }
+        Ok(pins)
+    }
+
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        Ok(None)
+    }
+
     // ─── Format / Settings ───────────────────────────────────────────────
 
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
