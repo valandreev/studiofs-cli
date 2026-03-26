@@ -3307,1264 +3307,7 @@ impl RedbMetaEngine {
     }
 }
 
-impl MetaEngine for RedbMetaEngine {
-    // ─── Format / Settings ───────────────────────────────────────────────
-
-    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
-        let json = serde_json::to_vec(info).map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(SETTINGS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert("format", json.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_format_info(&self) -> MetaResult<FormatInfo> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SETTINGS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let entry = table
-            .get("format")
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .ok_or(MetaError::NotFormatted)?;
-        let info: FormatInfo = serde_json::from_slice(entry.value())
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        Ok(info)
-    }
-
-    // ─── Counters ────────────────────────────────────────────────────────
-
-    fn get_counter(&self, name: &str) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(COUNTERS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(name)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(v) => Ok(v.value()),
-            None => Ok(0),
-        }
-    }
-
-    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let new_val;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current = match table
-                .get(name)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            new_val = current + delta;
-            table
-                .insert(name, new_val)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(new_val)
-    }
-
-    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let new_val;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current = match table
-                .get(name)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            new_val = current.saturating_sub(delta);
-            table
-                .insert(name, new_val)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(new_val)
-    }
-
-    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(name, value)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    // ─── Inodes ──────────────────────────────────────────────────────────
-
-    fn next_inode(&self) -> MetaResult<Ino> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let ino;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            ino = match table
-                .get(counters::NEXT_INODE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => ROOT_INO + 1,
-            };
-            table
-                .insert(counters::NEXT_INODE, ino + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(ino)
-    }
-
-    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
-    }
-
-    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
-        if inos.is_empty() {
-            return Ok(Vec::new());
-        }
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        let mut attrs = Vec::with_capacity(inos.len());
-        for &ino in inos {
-            match Self::resolve_attr_in_read_snapshot(
-                &txn,
-                ino,
-                &overlay_block_inodes,
-                &overlay_attr_inodes,
-            ) {
-                Ok(attr) => attrs.push(attr),
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(attrs)
-    }
-
-    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-
-        let mut inos = std::collections::BTreeSet::new();
-        for table_def in [BASE_INODES_TABLE, INODES_TABLE] {
-            let table = txn
-                .open_table(table_def)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for row in table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                inos.insert(ino.value());
-            }
-        }
-
-        let mut attrs = Vec::with_capacity(inos.len());
-        for ino in inos {
-            match Self::resolve_attr_in_read_snapshot(
-                &txn,
-                ino,
-                &overlay_block_inodes,
-                &overlay_attr_inodes,
-            ) {
-                Ok(attr) => attrs.push(attr),
-                Err(MetaError::InodeNotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(attrs)
-    }
-
-    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut normalized = attr.clone();
-            if normalized.kind == FileType::RegularFile {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
-                Self::transition_upload_state_for_local_mutation(
-                    &mut normalized,
-                    has_committed_manifest,
-                );
-            }
-            Self::set_inode_overlay_in_txn(&txn, &normalized)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr {
-                    attr: normalized.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_inode_overlay_in_txn(&txn, ino)?;
-
-            Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
-
-            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    // ─── Directory Entries ───────────────────────────────────────────────
-
-    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = self.local_overlay_dentries()?;
-        let key = encode_dentry_key(parent, name);
-        if Self::has_slice_marker(&txn, DENTRY_TOMBSTONES_TABLE, key.as_slice())? {
-            return Err(MetaError::EntryNotFound {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        if overlay_dentries.contains(&key) {
-            return Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(
-                MetaError::EntryNotFound {
-                    parent,
-                    name: String::from_utf8_lossy(name).to_string(),
-                },
-            );
-        }
-
-        if let Some(entry) = Self::lookup_in_table(&txn, BASE_DENTRIES_TABLE, parent, name)? {
-            return Ok(entry);
-        }
-
-        Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(MetaError::EntryNotFound {
-            parent,
-            name: String::from_utf8_lossy(name).to_string(),
-        })
-    }
-
-    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = self.local_overlay_dentries()?;
-        let tombstones = txn
-            .open_table(DENTRY_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut merged = std::collections::BTreeMap::<Vec<u8>, DirEntry>::new();
-        for entry in Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)? {
-            merged.insert(entry.name.clone(), entry);
-        }
-
-        let prefix = dentry_prefix(parent);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-        for row in tombstones
-            .range(prefix.as_slice()..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (decoded_parent, name) = decode_dentry_key(key.value());
-            if decoded_parent != parent {
-                break;
-            }
-            merged.remove(name);
-        }
-
-        for entry in Self::readdir_from_table(&txn, DENTRIES_TABLE, parent)? {
-            let key = encode_dentry_key(parent, &entry.name);
-            if overlay_dentries.contains(&key) {
-                merged.insert(entry.name.clone(), entry);
-            }
-        }
-
-        let base_names: std::collections::HashSet<Vec<u8>> =
-            Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)?
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect();
-        for key in overlay_dentries {
-            let (overlay_parent, overlay_name) = decode_dentry_key(&key);
-            if overlay_parent != parent {
-                continue;
-            }
-            if !base_names.contains(overlay_name)
-                && let Some(entry) =
-                    Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?
-            {
-                merged.insert(
-                    overlay_name.to_vec(),
-                    DirEntry {
-                        name: overlay_name.to_vec(),
-                        ino: entry.ino,
-                        kind: entry.kind,
-                    },
-                );
-            }
-            if base_names.contains(overlay_name)
-                && Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?.is_none()
-            {
-                merged.remove(overlay_name);
-            }
-        }
-
-        Ok(merged.into_values().collect())
-    }
-
-    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        if self.lookup(parent, name).is_ok() {
-            return Err(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name: name.to_vec(),
-                    entry: entry.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        let entry_val = self.lookup(parent, name)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemoveEntry {
-                    parent,
-                    name: name.to_vec(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(entry_val)
-    }
-    // --- File Blocks -----------------------------------------------------
-
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        let key = encode_file_block_key(ino, block_index);
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(entry) => {
-                let block: BlockRef = decode(entry.value())?;
-                Ok(Some(block))
-            }
-            None => {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                match committed
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                {
-                    Some(entry) => {
-                        let block: BlockRef = decode(entry.value())?;
-                        Ok(Some(block))
-                    }
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>> {
-        let key = encode_file_block_key(ino, block_index);
-        let data = encode(block)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let old_block;
-        {
-            let mut table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            // Get old block if exists (for GC)
-            old_block = if let Some(entry) = table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let old: BlockRef = decode(entry.value())?;
-                Some(old)
-            } else {
-                None
-            };
-
-            table
-                .insert(key.as_slice(), data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let attr_bytes = inodes
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|g| g.value().to_vec());
-            if let Some(attr_bytes) = attr_bytes {
-                let mut attr: InodeAttr = decode(&attr_bytes)?;
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
-                Self::transition_upload_state_for_local_mutation(&mut attr, has_committed_manifest);
-                let encoded = encode(&attr)?;
-                inodes
-                    .insert(ino, encoded.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-            }
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetFileBlock {
-                    ino,
-                    block_index,
-                    block: block.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(old_block)
-    }
-
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        let prefix = file_block_prefix(ino);
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut blocks = std::collections::BTreeMap::new();
-
-        // Scan all keys starting with the inode prefix
-        let mut range_end = prefix.to_vec();
-        // Increment last byte to get exclusive upper bound
-        *range_end.last_mut().unwrap() += 1;
-
-        let iter = table
-            .range(prefix.as_slice()..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        for result in iter {
-            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let key_bytes = key.value();
-            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
-            if decoded_ino != ino {
-                break;
-            }
-            let block: BlockRef = decode(value.value())?;
-            blocks.insert(block_index, block);
-        }
-
-        let iter = committed
-            .range(prefix.as_slice()..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        for result in iter {
-            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let key_bytes = key.value();
-            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
-            if decoded_ino != ino {
-                break;
-            }
-            blocks.entry(block_index).or_insert(decode(value.value())?);
-        }
-
-        Ok(blocks.into_iter().collect())
-    }
-
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        let prefix = file_block_prefix(ino);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let removed_ids;
-        {
-            let mut table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            // Collect keys to remove
-            let mut range_end = prefix.to_vec();
-            *range_end.last_mut().unwrap() += 1;
-
-            // First pass: collect all block IDs
-            let blocks_to_remove: Vec<(Vec<u8>, u64)> = {
-                let iter = table
-                    .range(prefix.as_slice()..range_end.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                iter.filter_map(|r| r.ok())
-                    .filter_map(|(k, v)| {
-                        let block: BlockRef = decode(v.value()).ok()?;
-                        Some((k.value().to_vec(), block.object_id))
-                    })
-                    .collect()
-            };
-
-            // Extract just the IDs for return
-            removed_ids = blocks_to_remove.iter().map(|(_, id)| *id).collect();
-
-            // Remove all entries
-            for (key, _) in &blocks_to_remove {
-                table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let _ = committed.remove(key.as_slice());
-            }
-
-            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveFileBlocks { ino })?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(removed_ids)
-    }
-
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
-        let key = encode_file_block_key(ino, block_index);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let removed_id;
-        let mut updated_attr: Option<InodeAttr> = None;
-        {
-            let mut table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            if let Some(entry) = table
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let block: BlockRef = decode(entry.value())?;
-                removed_id = Some(block.object_id);
-                let _ = committed.remove(key.as_slice());
-
-                let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
-                drop(committed);
-                let mut inodes = txn
-                    .open_table(INODES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let attr_bytes = inodes
-                    .get(ino)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                    .map(|g| g.value().to_vec());
-                if let Some(attr_bytes) = attr_bytes {
-                    let mut attr: InodeAttr = decode(&attr_bytes)?;
-                    attr.committed_size = new_committed_size;
-                    let has_committed_manifest = new_committed_size > 0;
-                    Self::transition_upload_state_for_local_mutation(
-                        &mut attr,
-                        has_committed_manifest,
-                    );
-                    let data = encode(&attr)?;
-                    inodes
-                        .insert(ino, data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    updated_attr = Some(attr);
-                }
-
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::RemoveFileBlock { ino, block_index },
-                )?;
-                if let Some(attr) = &updated_attr {
-                    Self::append_event_in_txn(
-                        &txn,
-                        &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-                    )?;
-                }
-            } else {
-                removed_id = None;
-            }
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(removed_id)
-    }
-
-    fn next_block_id(&self) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let id;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            id = match table
-                .get(counters::NEXT_BLOCK_ID)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 1, // Start from 1
-            };
-            table
-                .insert(counters::NEXT_BLOCK_ID, id + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(id)
-    }
-
-    /// Allocate `count` consecutive block IDs in a single redb transaction.
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let first_id;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            first_id = match table
-                .get(counters::NEXT_BLOCK_ID)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 1,
-            };
-            table
-                .insert(counters::NEXT_BLOCK_ID, first_id + count as u64)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok((first_id..first_id + count as u64).collect())
-    }
-
-    /// Flush a batch of block writes in a **single** redb transaction.
-    ///
-    /// This replaces N individual transactions (each with its own fsync) with
-    /// one transaction — reducing commit overhead by ~100-300×.
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        if entries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut results = Vec::with_capacity(entries.len());
-        let mut used_space_delta: i64 = 0;
-
-        {
-            let mut blocks_table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut counters_table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut touched_inodes = std::collections::BTreeSet::new();
-
-            for e in entries {
-                let key = encode_file_block_key(e.ino, e.block_index);
-                let block_ref = BlockRef {
-                    object_id: e.object_id,
-                    offset: 0,
-                    length: e.length,
-                    flags: e.flags,
-                };
-                let data = encode(&block_ref)?;
-
-                // Read old block ref (for GC).
-                let old_block = if let Some(entry) = blocks_table
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                {
-                    let old: BlockRef = decode(entry.value())?;
-                    Some(old)
-                } else {
-                    None
-                };
-
-                // Write new block ref.
-                blocks_table
-                    .insert(key.as_slice(), data.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-                // Handle old block: add to pending deletions, adjust delta.
-                if let Some(ref old) = old_block {
-                    used_space_delta -= old.length as i64;
-                }
-
-                used_space_delta += e.length as i64;
-                results.push(BatchFlushResult { old_block });
-                touched_inodes.insert(e.ino);
-            }
-
-            if !touched_inodes.is_empty() {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let mut inodes = txn
-                    .open_table(INODES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                for ino in touched_inodes {
-                    let attr_bytes = inodes
-                        .get(ino)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                        .map(|g| g.value().to_vec());
-                    if let Some(attr_bytes) = attr_bytes {
-                        let mut attr: InodeAttr = decode(&attr_bytes)?;
-                        let has_committed_manifest =
-                            !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
-                        Self::transition_upload_state_for_local_mutation(
-                            &mut attr,
-                            has_committed_manifest,
-                        );
-                        let encoded = encode(&attr)?;
-                        inodes
-                            .insert(ino, encoded.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                }
-            }
-
-            // Apply net USED_SPACE delta in one counter update.
-            let current_used = match counters_table
-                .get(counters::USED_SPACE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            let new_used = if used_space_delta >= 0 {
-                current_used.saturating_add(used_space_delta as u64)
-            } else {
-                current_used.saturating_sub((-used_space_delta) as u64)
-            };
-            counters_table
-                .insert(counters::USED_SPACE, new_used)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            // Inline event-log append: we already hold COUNTERS_TABLE, so we
-            // cannot call append_event_in_txn (which would try to open it again).
-            let seq_id = match counters_table
-                .get("nextEventSeq")
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 1,
-            };
-            counters_table
-                .insert("nextEventSeq", seq_id + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let batch_blocks: Vec<(Ino, u32, BlockRef)> = entries
-                .iter()
-                .map(|e| {
-                    (
-                        e.ino,
-                        e.block_index,
-                        BlockRef {
-                            object_id: e.object_id,
-                            offset: 0,
-                            length: e.length,
-                            flags: e.flags,
-                        },
-                    )
-                })
-                .collect();
-            let event = crate::events::MetaEvent::SetFileBlocksBatch {
-                blocks: batch_blocks,
-            };
-            let event_data = encode(&event)?;
-            let mut events = txn
-                .open_table(EVENT_LOG_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            events
-                .insert(seq_id, event_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(results)
-    }
-
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let key = encode_file_block_key(ino, block_index);
-        let data = encode(block)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        {
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let attr_bytes = match inodes
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(g) => g.value().to_vec(),
-                None => return Ok(false),
-            };
-            let mut attr: InodeAttr = decode(&attr_bytes)?;
-            if attr.content_epoch != expected_epoch {
-                return Ok(false);
-            }
-
-            let blocks = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current = blocks
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|g| decode::<BlockRef>(g.value()))
-                .transpose()?;
-            drop(blocks);
-            let Some(current) = current else {
-                return Ok(false);
-            };
-            if current != *block {
-                return Ok(false);
-            }
-
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let old_committed = committed
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|g| decode::<BlockRef>(g.value()))
-                .transpose()?;
-
-            committed
-                .insert(key.as_slice(), data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
-            drop(committed);
-
-            let previous_committed_size = attr.committed_size;
-            let previous_committed_epoch = attr.committed_content_epoch;
-            let previous_upload_state = attr.upload_state;
-            let manifest_matches_committed = Self::manifest_matches_committed_in_txn(&txn, ino)?;
-            attr.committed_size = new_committed_size;
-            if manifest_matches_committed {
-                attr.committed_content_epoch = attr.content_epoch;
-                attr.upload_state = UploadState::Ready;
-            } else {
-                Self::transition_upload_state_for_local_mutation(&mut attr, new_committed_size > 0);
-            }
-            let committed_changed = previous_committed_size != attr.committed_size
-                || previous_committed_epoch != attr.committed_content_epoch
-                || previous_upload_state != attr.upload_state;
-            let attr_data = encode(&attr)?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::CommitFileBlock {
-                    ino,
-                    block_index,
-                    block: block.clone(),
-                },
-            )?;
-            if committed_changed {
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-                )?;
-            }
-
-            if let Some(old) = old_committed
-                && old.object_id != block.object_id
-            {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let mut pending_del_table = txn
-                    .open_table(PENDING_DELETIONS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                pending_del_table
-                    .insert(old.object_id, timestamp)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                drop(pending_del_table);
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::AddPendingDeletion {
-                        object_id: old.object_id,
-                        timestamp,
-                    },
-                )?;
-            }
-        }
-
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(true)
-    }
-
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let published_blocks;
-        {
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let attr_bytes = match inodes
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(g) => g.value().to_vec(),
-                None => return Ok(false),
-            };
-            let mut attr: InodeAttr = decode(&attr_bytes)?;
-            if attr.content_epoch != expected_epoch {
-                return Ok(false);
-            }
-
-            published_blocks = Self::current_manifest_in_txn(&txn, ino)?;
-
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let old_committed = Self::remove_all_committed_blocks_in_txn(&mut committed, ino)?;
-            let mut surviving = std::collections::HashSet::new();
-            for (block_index, block) in &published_blocks {
-                let key = encode_file_block_key(ino, *block_index);
-                let data = encode(block)?;
-                committed
-                    .insert(key.as_slice(), data.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                surviving.insert(block.object_id);
-            }
-            drop(committed);
-
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            for object_id in old_committed {
-                if surviving.contains(&object_id) {
-                    continue;
-                }
-                let mut pending_del_table = txn
-                    .open_table(PENDING_DELETIONS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                pending_del_table
-                    .insert(object_id, timestamp)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                drop(pending_del_table);
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::AddPendingDeletion {
-                        object_id,
-                        timestamp,
-                    },
-                )?;
-            }
-
-            attr.committed_size = attr.size;
-            attr.committed_content_epoch = attr.content_epoch;
-            attr.upload_state = UploadState::Ready;
-            let attr_data = encode(&attr)?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::PublishFileManifest {
-                    ino,
-                    blocks: published_blocks.clone(),
-                },
-            )?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
-            )?;
-        }
-
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(true)
-    }
-
-    // --- Pending Deletions (GC) -----------------------------------------
-
-    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(PENDING_DELETIONS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(object_id, timestamp)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddPendingDeletion {
-                    object_id,
-                    timestamp,
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(PENDING_DELETIONS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .remove(object_id)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemovePendingDeletion { object_id },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(PENDING_DELETIONS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        // Iterate all entries
-        let deletions: Vec<(u64, i64)> = table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.value(), v.value()))
-            .collect();
-
-        Ok(deletions)
-    }
-
-    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DEFERRED_DELETES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let encoded = encode(record)?;
-            table
-                .insert(record.ino, encoded.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(DEFERRED_DELETES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = table
-                .remove(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::DeferredDelete, ino)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        self.cleanup_stale_undo_logs()?;
-        Ok(())
-    }
-
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(DEFERRED_DELETES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            out.push(decode(value.value())?);
-        }
-        Ok(out)
-    }
-
+impl MetaFsOps for RedbMetaEngine {
     // --- Atomic Rename ---------------------------------------------------
 
     fn rename_atomic(
@@ -4764,395 +3507,6 @@ impl MetaEngine for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(result)
-    }
-
-    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let snapshots = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut refs = HashSet::new();
-        for item in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let block: BlockRef = decode(v.value())?;
-            refs.insert(block.object_id);
-        }
-        for item in committed
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let block: BlockRef = decode(v.value())?;
-            refs.insert(block.object_id);
-        }
-        for item in snapshots
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let snapshot: MetadataSnapshot = decode(v.value())?;
-            refs.extend(snapshot.pinned_object_ids);
-        }
-        Ok(refs)
-    }
-
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
-        self.recover_pending_create_intents()
-    }
-
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        let mut touched_parents: HashSet<Ino> =
-            self.recover_pending_create_intents()?.into_iter().collect();
-
-        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
-            .list_deferred_deletes()?
-            .into_iter()
-            .map(|record| (record.ino, record))
-            .collect();
-        let undo_logs = self.list_undo_logs()?;
-        if !undo_logs.is_empty() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            for record in undo_logs {
-                if record.kind != UndoLogKind::DeferredDelete {
-                    continue;
-                }
-                if record.phase == UndoLogPhase::Completed {
-                    continue;
-                }
-                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
-                    continue;
-                };
-                self.set_undo_log_phase_for(
-                    record.kind.clone(),
-                    record.ino,
-                    UndoLogPhase::Replaying,
-                )?;
-
-                let blocks = match self.get_file_blocks(record.ino) {
-                    Ok(blocks) => blocks,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-                let removed_ids = match self.remove_file_blocks(record.ino) {
-                    Ok(ids) => ids,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                for object_id in removed_ids {
-                    self.add_pending_deletion(object_id, timestamp)?;
-                }
-                if total_bytes > 0 {
-                    let _ = self.decr_counter(counters::USED_SPACE, total_bytes)?;
-                }
-                match self.remove_attr(record.ino) {
-                    Ok(()) => {}
-                    Err(MetaError::InodeNotFound(_)) => {}
-                    Err(err) => return Err(err),
-                }
-                self.remove_deferred_delete(record.ino)?;
-                touched_parents.insert(deferred.parent);
-            }
-        }
-
-        self.cleanup_stale_undo_logs()?;
-        Ok(touched_parents.into_iter().collect())
-    }
-
-    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
-        self.add_pending_create_intent(record)
-    }
-
-    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
-        self.remove_pending_create_intent(ino)?;
-        self.cleanup_stale_undo_logs()?;
-        Ok(())
-    }
-
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        self.list_pending_create_intents()
-    }
-
-    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::append_undo_log_in_txn(&txn, record)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_undo_logs_for_in_txn(&txn, kind, ino)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(UNDO_LOG_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            out.push(decode(v.value())?);
-        }
-        Ok(out)
-    }
-
-    // --- Symlinks --------------------------------------------------------
-
-    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::set_symlink_overlay_in_txn(&txn, ino, target)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetSymlinkTarget {
-                    ino,
-                    target: target.to_vec(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        self.merged_symlink_target(&txn, ino)?
-            .ok_or(MetaError::InodeNotFound(ino))
-    }
-
-    // --- Extended Attributes (xattr) --------------------------------------
-
-    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        self.merged_xattr_value(&txn, ino, name)
-    }
-
-    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
-        let current = self.get_xattr(ino, name)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            if flags & XATTR_CREATE_FLAG != 0 && current.is_some() {
-                return Err(MetaError::EntryExists {
-                    parent: ino,
-                    name: String::from_utf8_lossy(name).to_string(),
-                });
-            }
-            if flags & XATTR_REPLACE_FLAG != 0 && current.is_none() {
-                return Err(MetaError::EntryNotFound {
-                    parent: ino,
-                    name: String::from_utf8_lossy(name).to_string(),
-                });
-            }
-
-            Self::set_xattr_overlay_in_txn(&txn, ino, name, value)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetXattr {
-                    ino,
-                    name: name.to_vec(),
-                    value: value.to_vec(),
-                    flags,
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
-        if self.get_xattr(ino, name)?.is_none() {
-            return Err(MetaError::EntryNotFound {
-                parent: ino,
-                name: String::from_utf8_lossy(name).to_string(),
-            });
-        }
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            Self::remove_xattr_overlay_in_txn(&txn, ino, name)?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemoveXattr {
-                    ino,
-                    name: name.to_vec(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut names = std::collections::BTreeSet::<Vec<u8>>::new();
-
-        for key in Self::keys_for_inode_in_table(&txn, BASE_XATTRS_TABLE, ino)? {
-            if !Self::has_slice_marker(&txn, XATTR_TOMBSTONES_TABLE, key.as_slice())? {
-                names.insert(xattr_name_from_key(&key).to_vec());
-            }
-        }
-        for key in Self::keys_for_inode_in_table(&txn, XATTRS_TABLE, ino)? {
-            names.insert(xattr_name_from_key(&key).to_vec());
-        }
-
-        Ok(names.into_iter().collect())
-    }
-
-    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
-        let _ = self.get_attr(ino)?;
-        let key = encode_acl_rule_key(ino, principal);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut rules = txn
-                .open_table(ACL_RULES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            rules
-                .insert(key.as_slice(), access_level as u8)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut tombstones = txn
-                .open_table(ACL_RULE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = tombstones.remove(key.as_slice());
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAclRule {
-                    ino,
-                    principal: principal.to_string(),
-                    access_level,
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
-        let key = encode_acl_rule_key(ino, principal);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut rules = txn
-                .open_table(ACL_RULES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = rules.remove(key.as_slice());
-            let mut tombstones = txn
-                .open_table(ACL_RULE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            tombstones
-                .insert(key.as_slice(), 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemoveAclRule {
-                    ino,
-                    principal: principal.to_string(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
-        let key = encode_acl_rule_key(ino, principal);
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if Self::has_slice_marker(&txn, ACL_RULE_TOMBSTONES_TABLE, key.as_slice())? {
-            return Ok(None);
-        }
-        let rules = txn
-            .open_table(ACL_RULES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if let Some(value) = rules
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            return AccessLevel::from_u8(value.value())
-                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
-                .map(Some);
-        }
-        let base = txn
-            .open_table(BASE_ACL_RULES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match base
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(value) => AccessLevel::from_u8(value.value())
-                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
-                .map(Some),
-            None => Ok(None),
-        }
     }
 
     // --- High-Level Operations (ACID Atomicity) --------------------------
@@ -5775,93 +4129,6 @@ impl MetaEngine for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
-
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        let root_attr = self.get_attr(root_ino)?;
-        if root_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(root_ino));
-        }
-
-        let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
-        let snapshot_payload = serde_json::to_vec(&self.export_snapshot()?)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-
-        let snapshot = MetadataSnapshot {
-            id: uuid::Uuid::new_v4().to_string(),
-            root_ino,
-            created_at: InodeAttr::now_nanos(),
-            state: SnapshotState::Pending,
-            pinned_object_ids,
-            snapshot_payload,
-        };
-
-        let bytes = encode(&snapshot)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(SNAPSHOTS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(snapshot.id.as_str(), bytes.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::CreateSnapshot {
-                    snapshot: snapshot.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(snapshot)
-    }
-
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut snapshots = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_id, raw) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let snapshot: MetadataSnapshot = decode(raw.value())?;
-            snapshots.push(snapshot);
-        }
-        snapshots.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(snapshots)
-    }
-
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let Some(raw) = table
-            .get(snapshot_id)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        let snapshot: MetadataSnapshot = decode(raw.value())?;
-        Ok(Some(snapshot))
-    }
 }
 
 impl RedbMetaEngine {
@@ -6140,6 +4407,1784 @@ impl RedbMetaEngine {
         Ok(())
     }
 }
+
+impl MetaEngineCore for RedbMetaEngine {
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        Ok(true)
+    }
+
+    fn release_global_janitor_lock(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        let mut pins = HashSet::new();
+        for snapshot in self.list_snapshots()? {
+            pins.extend(snapshot.pinned_object_ids);
+        }
+        Ok(pins)
+    }
+}
+
+impl MetaFormat for RedbMetaEngine {
+    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
+        let json = serde_json::to_vec(info).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert("format", json.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_format_info(&self) -> MetaResult<FormatInfo> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let entry = table
+            .get("format")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .ok_or(MetaError::NotFormatted)?;
+        let info: FormatInfo = serde_json::from_slice(entry.value())
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        Ok(info)
+    }
+}
+impl MetaInodes for RedbMetaEngine {
+    fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match table
+            .get(name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => Ok(v.value()),
+            None => Ok(0),
+        }
+    }
+
+    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let new_val;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current = match table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            new_val = current + delta;
+            table
+                .insert(name, new_val)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let new_val;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current = match table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            new_val = current.saturating_sub(delta);
+            table
+                .insert(name, new_val)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(name, value)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn next_inode(&self) -> MetaResult<Ino> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let ino;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            ino = match table
+                .get(counters::NEXT_INODE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => ROOT_INO + 1,
+            };
+            table
+                .insert(counters::NEXT_INODE, ino + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(ino)
+    }
+
+    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
+    }
+
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        if inos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        let mut attrs = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            match Self::resolve_attr_in_read_snapshot(
+                &txn,
+                ino,
+                &overlay_block_inodes,
+                &overlay_attr_inodes,
+            ) {
+                Ok(attr) => attrs.push(attr),
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(attrs)
+    }
+
+    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut normalized = attr.clone();
+            if normalized.kind == FileType::RegularFile {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let has_committed_manifest =
+                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                Self::transition_upload_state_for_local_mutation(
+                    &mut normalized,
+                    has_committed_manifest,
+                );
+            }
+            Self::set_inode_overlay_in_txn(&txn, &normalized)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr {
+                    attr: normalized.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_inode_overlay_in_txn(&txn, ino)?;
+
+            Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
+
+            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+
+        let mut inos = std::collections::BTreeSet::new();
+        for table_def in [BASE_INODES_TABLE, INODES_TABLE] {
+            let table = txn
+                .open_table(table_def)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                inos.insert(ino.value());
+            }
+        }
+
+        let mut attrs = Vec::with_capacity(inos.len());
+        for ino in inos {
+            match Self::resolve_attr_in_read_snapshot(
+                &txn,
+                ino,
+                &overlay_block_inodes,
+                &overlay_attr_inodes,
+            ) {
+                Ok(attr) => attrs.push(attr),
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(attrs)
+    }
+}
+impl MetaNamespace for RedbMetaEngine {
+    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = self.local_overlay_dentries()?;
+        let key = encode_dentry_key(parent, name);
+        if Self::has_slice_marker(&txn, DENTRY_TOMBSTONES_TABLE, key.as_slice())? {
+            return Err(MetaError::EntryNotFound {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            });
+        }
+
+        if overlay_dentries.contains(&key) {
+            return Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(
+                MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                },
+            );
+        }
+
+        if let Some(entry) = Self::lookup_in_table(&txn, BASE_DENTRIES_TABLE, parent, name)? {
+            return Ok(entry);
+        }
+
+        Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, name)?.ok_or(MetaError::EntryNotFound {
+            parent,
+            name: String::from_utf8_lossy(name).to_string(),
+        })
+    }
+
+    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = self.local_overlay_dentries()?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut merged = std::collections::BTreeMap::<Vec<u8>, DirEntry>::new();
+        for entry in Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)? {
+            merged.insert(entry.name.clone(), entry);
+        }
+
+        let prefix = dentry_prefix(parent);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        for row in tombstones
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_parent, name) = decode_dentry_key(key.value());
+            if decoded_parent != parent {
+                break;
+            }
+            merged.remove(name);
+        }
+
+        for entry in Self::readdir_from_table(&txn, DENTRIES_TABLE, parent)? {
+            let key = encode_dentry_key(parent, &entry.name);
+            if overlay_dentries.contains(&key) {
+                merged.insert(entry.name.clone(), entry);
+            }
+        }
+
+        let base_names: std::collections::HashSet<Vec<u8>> =
+            Self::readdir_from_table(&txn, BASE_DENTRIES_TABLE, parent)?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        for key in overlay_dentries {
+            let (overlay_parent, overlay_name) = decode_dentry_key(&key);
+            if overlay_parent != parent {
+                continue;
+            }
+            if !base_names.contains(overlay_name)
+                && let Some(entry) =
+                    Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?
+            {
+                merged.insert(
+                    overlay_name.to_vec(),
+                    DirEntry {
+                        name: overlay_name.to_vec(),
+                        ino: entry.ino,
+                        kind: entry.kind,
+                    },
+                );
+            }
+            if base_names.contains(overlay_name)
+                && Self::lookup_in_table(&txn, DENTRIES_TABLE, parent, overlay_name)?.is_none()
+            {
+                merged.remove(overlay_name);
+            }
+        }
+
+        Ok(merged.into_values().collect())
+    }
+
+    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
+        if self.lookup(parent, name).is_ok() {
+            return Err(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            });
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: entry.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        let entry_val = self.lookup(parent, name)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveEntry {
+                    parent,
+                    name: name.to_vec(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(entry_val)
+    }
+}
+impl MetaBlocks for RedbMetaEngine {
+    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
+        let key = encode_file_block_key(ino, block_index);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(entry) => {
+                let block: BlockRef = decode(entry.value())?;
+                Ok(Some(block))
+            }
+            None => {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                match committed
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    Some(entry) => {
+                        let block: BlockRef = decode(entry.value())?;
+                        Ok(Some(block))
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>> {
+        let key = encode_file_block_key(ino, block_index);
+        let data = encode(block)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let old_block;
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // Get old block if exists (for GC)
+            old_block = if let Some(entry) = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let old: BlockRef = decode(entry.value())?;
+                Some(old)
+            } else {
+                None
+            };
+
+            table
+                .insert(key.as_slice(), data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(attr_bytes) = attr_bytes {
+                let mut attr: InodeAttr = decode(&attr_bytes)?;
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let has_committed_manifest =
+                    !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                Self::transition_upload_state_for_local_mutation(&mut attr, has_committed_manifest);
+                let encoded = encode(&attr)?;
+                inodes
+                    .insert(ino, encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetFileBlock {
+                    ino,
+                    block_index,
+                    block: block.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(old_block)
+    }
+
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let prefix = file_block_prefix(ino);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let committed = txn
+            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut blocks = std::collections::BTreeMap::new();
+
+        // Scan all keys starting with the inode prefix
+        let mut range_end = prefix.to_vec();
+        // Increment last byte to get exclusive upper bound
+        *range_end.last_mut().unwrap() += 1;
+
+        let iter = table
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for result in iter {
+            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value();
+            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
+            if decoded_ino != ino {
+                break;
+            }
+            let block: BlockRef = decode(value.value())?;
+            blocks.insert(block_index, block);
+        }
+
+        let iter = committed
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for result in iter {
+            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value();
+            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
+            if decoded_ino != ino {
+                break;
+            }
+            blocks.entry(block_index).or_insert(decode(value.value())?);
+        }
+
+        Ok(blocks.into_iter().collect())
+    }
+
+    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let removed_ids;
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut committed = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            // Collect keys to remove
+            let mut range_end = prefix.to_vec();
+            *range_end.last_mut().unwrap() += 1;
+
+            // First pass: collect all block IDs
+            let blocks_to_remove: Vec<(Vec<u8>, u64)> = {
+                let iter = table
+                    .range(prefix.as_slice()..range_end.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                iter.filter_map(|r| r.ok())
+                    .filter_map(|(k, v)| {
+                        let block: BlockRef = decode(v.value()).ok()?;
+                        Some((k.value().to_vec(), block.object_id))
+                    })
+                    .collect()
+            };
+
+            // Extract just the IDs for return
+            removed_ids = blocks_to_remove.iter().map(|(_, id)| *id).collect();
+
+            // Remove all entries
+            for (key, _) in &blocks_to_remove {
+                table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let _ = committed.remove(key.as_slice());
+            }
+
+            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveFileBlocks { ino })?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(removed_ids)
+    }
+
+    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
+        let key = encode_file_block_key(ino, block_index);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let removed_id;
+        let mut updated_attr: Option<InodeAttr> = None;
+        {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut committed = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            if let Some(entry) = table
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let block: BlockRef = decode(entry.value())?;
+                removed_id = Some(block.object_id);
+                let _ = committed.remove(key.as_slice());
+
+                let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
+                drop(committed);
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let attr_bytes = inodes
+                    .get(ino)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|g| g.value().to_vec());
+                if let Some(attr_bytes) = attr_bytes {
+                    let mut attr: InodeAttr = decode(&attr_bytes)?;
+                    attr.committed_size = new_committed_size;
+                    let has_committed_manifest = new_committed_size > 0;
+                    Self::transition_upload_state_for_local_mutation(
+                        &mut attr,
+                        has_committed_manifest,
+                    );
+                    let data = encode(&attr)?;
+                    inodes
+                        .insert(ino, data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    updated_attr = Some(attr);
+                }
+
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::RemoveFileBlock { ino, block_index },
+                )?;
+                if let Some(attr) = &updated_attr {
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                    )?;
+                }
+            } else {
+                removed_id = None;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(removed_id)
+    }
+
+    fn next_block_id(&self) -> MetaResult<u64> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let id;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            id = match table
+                .get(counters::NEXT_BLOCK_ID)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 1, // Start from 1
+            };
+            table
+                .insert(counters::NEXT_BLOCK_ID, id + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// Allocate `count` consecutive block IDs in a single redb transaction.
+    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let first_id;
+        {
+            let mut table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            first_id = match table
+                .get(counters::NEXT_BLOCK_ID)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 1,
+            };
+            table
+                .insert(counters::NEXT_BLOCK_ID, first_id + count as u64)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok((first_id..first_id + count as u64).collect())
+    }
+
+    /// Flush a batch of block writes in a **single** redb transaction.
+    ///
+    /// This replaces N individual transactions (each with its own fsync) with
+    /// one transaction - reducing commit overhead by ~100-300x.
+    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(entries.len());
+        let mut used_space_delta: i64 = 0;
+
+        {
+            let mut blocks_table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut counters_table = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut touched_inodes = std::collections::BTreeSet::new();
+
+            for e in entries {
+                let key = encode_file_block_key(e.ino, e.block_index);
+                let block_ref = BlockRef {
+                    object_id: e.object_id,
+                    offset: 0,
+                    length: e.length,
+                    flags: e.flags,
+                };
+                let data = encode(&block_ref)?;
+
+                // Read old block ref (for GC).
+                let old_block = if let Some(entry) = blocks_table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    let old: BlockRef = decode(entry.value())?;
+                    Some(old)
+                } else {
+                    None
+                };
+
+                // Write new block ref.
+                blocks_table
+                    .insert(key.as_slice(), data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                if let Some(ref old) = old_block {
+                    used_space_delta -= old.length as i64;
+                }
+
+                used_space_delta += e.length as i64;
+                results.push(BatchFlushResult { old_block });
+                touched_inodes.insert(e.ino);
+            }
+
+            if !touched_inodes.is_empty() {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for ino in touched_inodes {
+                    let attr_bytes = inodes
+                        .get(ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|g| g.value().to_vec());
+                    if let Some(attr_bytes) = attr_bytes {
+                        let mut attr: InodeAttr = decode(&attr_bytes)?;
+                        let has_committed_manifest =
+                            !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                        Self::transition_upload_state_for_local_mutation(
+                            &mut attr,
+                            has_committed_manifest,
+                        );
+                        let encoded = encode(&attr)?;
+                        inodes
+                            .insert(ino, encoded.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+            }
+
+            let current_used = match counters_table
+                .get(counters::USED_SPACE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            let new_used = if used_space_delta >= 0 {
+                current_used.saturating_add(used_space_delta as u64)
+            } else {
+                current_used.saturating_sub((-used_space_delta) as u64)
+            };
+            counters_table
+                .insert(counters::USED_SPACE, new_used)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let seq_id = match counters_table
+                .get("nextEventSeq")
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(v) => v.value(),
+                None => 1,
+            };
+            counters_table
+                .insert("nextEventSeq", seq_id + 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let batch_blocks: Vec<(Ino, u32, BlockRef)> = entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.ino,
+                        e.block_index,
+                        BlockRef {
+                            object_id: e.object_id,
+                            offset: 0,
+                            length: e.length,
+                            flags: e.flags,
+                        },
+                    )
+                })
+                .collect();
+            let event = crate::events::MetaEvent::SetFileBlocksBatch {
+                blocks: batch_blocks,
+            };
+            let event_data = encode(&event)?;
+            let mut events = txn
+                .open_table(EVENT_LOG_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            events
+                .insert(seq_id, event_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(results)
+    }
+
+    fn commit_uploaded_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool> {
+        let key = encode_file_block_key(ino, block_index);
+        let data = encode(block)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        {
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = match inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(false),
+            };
+            let mut attr: InodeAttr = decode(&attr_bytes)?;
+            if attr.content_epoch != expected_epoch {
+                return Ok(false);
+            }
+
+            let blocks = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current = blocks
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| decode::<BlockRef>(g.value()))
+                .transpose()?;
+            drop(blocks);
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            if current != *block {
+                return Ok(false);
+            }
+
+            let mut committed = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let old_committed = committed
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|g| decode::<BlockRef>(g.value()))
+                .transpose()?;
+
+            committed
+                .insert(key.as_slice(), data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
+            drop(committed);
+
+            let previous_committed_size = attr.committed_size;
+            let previous_committed_epoch = attr.committed_content_epoch;
+            let previous_upload_state = attr.upload_state;
+            let manifest_matches_committed = Self::manifest_matches_committed_in_txn(&txn, ino)?;
+            attr.committed_size = new_committed_size;
+            if manifest_matches_committed {
+                attr.committed_content_epoch = attr.content_epoch;
+                attr.upload_state = UploadState::Ready;
+            } else {
+                Self::transition_upload_state_for_local_mutation(&mut attr, new_committed_size > 0);
+            }
+            let committed_changed = previous_committed_size != attr.committed_size
+                || previous_committed_epoch != attr.committed_content_epoch
+                || previous_upload_state != attr.upload_state;
+            let attr_data = encode(&attr)?;
+            inodes
+                .insert(ino, attr_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::CommitFileBlock {
+                    ino,
+                    block_index,
+                    block: block.clone(),
+                },
+            )?;
+            if committed_changed {
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                )?;
+            }
+
+            if let Some(old) = old_committed
+                && old.object_id != block.object_id
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let mut pending_del_table = txn
+                    .open_table(PENDING_DELETIONS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                pending_del_table
+                    .insert(old.object_id, timestamp)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(pending_del_table);
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddPendingDeletion {
+                        object_id: old.object_id,
+                        timestamp,
+                    },
+                )?;
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let published_blocks;
+        {
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = match inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(false),
+            };
+            let mut attr: InodeAttr = decode(&attr_bytes)?;
+            if attr.content_epoch != expected_epoch {
+                return Ok(false);
+            }
+
+            published_blocks = Self::current_manifest_in_txn(&txn, ino)?;
+
+            let mut committed = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let old_committed = Self::remove_all_committed_blocks_in_txn(&mut committed, ino)?;
+            let mut surviving = std::collections::HashSet::new();
+            for (block_index, block) in &published_blocks {
+                let key = encode_file_block_key(ino, *block_index);
+                let data = encode(block)?;
+                committed
+                    .insert(key.as_slice(), data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                surviving.insert(block.object_id);
+            }
+            drop(committed);
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for object_id in old_committed {
+                if surviving.contains(&object_id) {
+                    continue;
+                }
+                let mut pending_del_table = txn
+                    .open_table(PENDING_DELETIONS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                pending_del_table
+                    .insert(object_id, timestamp)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(pending_del_table);
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddPendingDeletion {
+                        object_id,
+                        timestamp,
+                    },
+                )?;
+            }
+
+            attr.committed_size = attr.size;
+            attr.committed_content_epoch = attr.content_epoch;
+            attr.upload_state = UploadState::Ready;
+            let attr_data = encode(&attr)?;
+            inodes
+                .insert(ino, attr_data.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::PublishFileManifest {
+                    ino,
+                    blocks: published_blocks.clone(),
+                },
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+            )?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+}
+impl MetaGc for RedbMetaEngine {
+    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(object_id, timestamp)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::AddPendingDeletion {
+                    object_id,
+                    timestamp,
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(PENDING_DELETIONS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .remove(object_id)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemovePendingDeletion { object_id },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(PENDING_DELETIONS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let deletions: Vec<(u64, i64)> = table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k.value(), v.value()))
+            .collect();
+
+        Ok(deletions)
+    }
+
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let committed = txn
+            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let snapshots = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut refs = HashSet::new();
+        for item in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let block: BlockRef = decode(v.value())?;
+            refs.insert(block.object_id);
+        }
+        for item in committed
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let block: BlockRef = decode(v.value())?;
+            refs.insert(block.object_id);
+        }
+        for item in snapshots
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let snapshot: MetadataSnapshot = decode(v.value())?;
+            refs.extend(snapshot.pinned_object_ids);
+        }
+        Ok(refs)
+    }
+}
+impl MetaRecovery for RedbMetaEngine {
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let encoded = encode(record)?;
+            table
+                .insert(record.ino, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(DEFERRED_DELETES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = table
+                .remove(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::remove_undo_logs_for_in_txn(&txn, UndoLogKind::DeferredDelete, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(DEFERRED_DELETES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
+        self.recover_pending_create_intents()
+    }
+
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
+        let mut touched_parents: HashSet<Ino> =
+            self.recover_pending_create_intents()?.into_iter().collect();
+
+        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
+            .list_deferred_deletes()?
+            .into_iter()
+            .map(|record| (record.ino, record))
+            .collect();
+        let undo_logs = self.list_undo_logs()?;
+        if !undo_logs.is_empty() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for record in undo_logs {
+                if record.kind != UndoLogKind::DeferredDelete {
+                    continue;
+                }
+                if record.phase == UndoLogPhase::Completed {
+                    continue;
+                }
+                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
+                    continue;
+                };
+                self.set_undo_log_phase_for(
+                    record.kind.clone(),
+                    record.ino,
+                    UndoLogPhase::Replaying,
+                )?;
+
+                let blocks = match self.get_file_blocks(record.ino) {
+                    Ok(blocks) => blocks,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+                let removed_ids = match self.remove_file_blocks(record.ino) {
+                    Ok(ids) => ids,
+                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                for object_id in removed_ids {
+                    self.add_pending_deletion(object_id, timestamp)?;
+                }
+                if total_bytes > 0 {
+                    let _ = self.decr_counter(counters::USED_SPACE, total_bytes)?;
+                }
+                match self.remove_attr(record.ino) {
+                    Ok(()) => {}
+                    Err(MetaError::InodeNotFound(_)) => {}
+                    Err(err) => return Err(err),
+                }
+                self.remove_deferred_delete(record.ino)?;
+                touched_parents.insert(deferred.parent);
+            }
+        }
+
+        self.cleanup_stale_undo_logs()?;
+        Ok(touched_parents.into_iter().collect())
+    }
+
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
+        self.add_pending_create_intent(record)
+    }
+
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
+        self.remove_pending_create_intent(ino)?;
+        self.cleanup_stale_undo_logs()?;
+        Ok(())
+    }
+
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        self.list_pending_create_intents()
+    }
+
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::append_undo_log_in_txn(&txn, record)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_undo_logs_for_in_txn(&txn, kind, ino)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(decode(v.value())?);
+        }
+        Ok(out)
+    }
+}
+impl MetaSymlink for RedbMetaEngine {
+    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::set_symlink_overlay_in_txn(&txn, ino, target)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetSymlinkTarget {
+                    ino,
+                    target: target.to_vec(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.merged_symlink_target(&txn, ino)?
+            .ok_or(MetaError::InodeNotFound(ino))
+    }
+}
+impl MetaXattr for RedbMetaEngine {
+    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.merged_xattr_value(&txn, ino, name)
+    }
+
+    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
+        let current = self.get_xattr(ino, name)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            if flags & XATTR_CREATE_FLAG != 0 && current.is_some() {
+                return Err(MetaError::EntryExists {
+                    parent: ino,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+            if flags & XATTR_REPLACE_FLAG != 0 && current.is_none() {
+                return Err(MetaError::EntryNotFound {
+                    parent: ino,
+                    name: String::from_utf8_lossy(name).to_string(),
+                });
+            }
+
+            Self::set_xattr_overlay_in_txn(&txn, ino, name, value)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetXattr {
+                    ino,
+                    name: name.to_vec(),
+                    value: value.to_vec(),
+                    flags,
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        if self.get_xattr(ino, name)?.is_none() {
+            return Err(MetaError::EntryNotFound {
+                parent: ino,
+                name: String::from_utf8_lossy(name).to_string(),
+            });
+        }
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::remove_xattr_overlay_in_txn(&txn, ino, name)?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveXattr {
+                    ino,
+                    name: name.to_vec(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut names = std::collections::BTreeSet::<Vec<u8>>::new();
+
+        for key in Self::keys_for_inode_in_table(&txn, BASE_XATTRS_TABLE, ino)? {
+            if !Self::has_slice_marker(&txn, XATTR_TOMBSTONES_TABLE, key.as_slice())? {
+                names.insert(xattr_name_from_key(&key).to_vec());
+            }
+        }
+        for key in Self::keys_for_inode_in_table(&txn, XATTRS_TABLE, ino)? {
+            names.insert(xattr_name_from_key(&key).to_vec());
+        }
+
+        Ok(names.into_iter().collect())
+    }
+}
+impl MetaAcl for RedbMetaEngine {
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
+        let _ = self.get_attr(ino)?;
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut rules = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            rules
+                .insert(key.as_slice(), access_level as u8)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = tombstones.remove(key.as_slice());
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal: principal.to_string(),
+                    access_level,
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut rules = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = rules.remove(key.as_slice());
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones
+                .insert(key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveAclRule {
+                    ino,
+                    principal: principal.to_string(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if Self::has_slice_marker(&txn, ACL_RULE_TOMBSTONES_TABLE, key.as_slice())? {
+            return Ok(None);
+        }
+        let rules = txn
+            .open_table(ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(value) = rules
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            return AccessLevel::from_u8(value.value())
+                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
+                .map(Some);
+        }
+        let base = txn
+            .open_table(BASE_ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match base
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(value) => AccessLevel::from_u8(value.value())
+                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+}
+impl MetaSnapshots for RedbMetaEngine {
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        let root_attr = self.get_attr(root_ino)?;
+        if root_attr.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(root_ino));
+        }
+
+        let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
+        let snapshot_payload = serde_json::to_vec(&self.export_snapshot()?)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+
+        let snapshot = MetadataSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            root_ino,
+            created_at: InodeAttr::now_nanos(),
+            state: SnapshotState::Pending,
+            pinned_object_ids,
+            snapshot_payload,
+        };
+
+        let bytes = encode(&snapshot)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(SNAPSHOTS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(snapshot.id.as_str(), bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::CreateSnapshot {
+                    snapshot: snapshot.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(snapshot)
+    }
+
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut snapshots = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_id, raw) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let snapshot: MetadataSnapshot = decode(raw.value())?;
+            snapshots.push(snapshot);
+        }
+        snapshots.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(snapshots)
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let Some(raw) = table
+            .get(snapshot_id)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let snapshot: MetadataSnapshot = decode(raw.value())?;
+        Ok(Some(snapshot))
+    }
+}
+impl MetaReplication for RedbMetaEngine {
+    fn check_consistency(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn flush_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn sync_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn invalidation_sender_id(&self) -> Option<String> {
+        None
+    }
+
+    fn request_eager_flush(&self) {}
+
+    fn metadata_version_token(&self) -> Option<String> {
+        None
+    }
+
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
+
+    fn replication_backlog(&self) -> MetadataReplicationBacklog {
+        MetadataReplicationBacklog::default()
+    }
+
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        Ok(None)
+    }
+}
+impl crate::engine::MetaEngine for RedbMetaEngine {}
 
 #[cfg(test)]
 mod tests {

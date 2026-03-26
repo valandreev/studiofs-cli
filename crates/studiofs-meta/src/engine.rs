@@ -144,84 +144,37 @@ impl MetadataReplicationBacklog {
     }
 }
 
-/// Abstract metadata engine interface.
+/// Strict backend contract.
+///
+/// This trait is intentionally comprehensive: storage backends implement it once,
+/// while user-facing capability traits below expose focused method groups.
 ///
 /// All operations are synchronous (redb is sync). Async callers should use
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
-pub trait MetaEngine: Send + Sync {
-    /// Verify that the local metadata matches the remote state (e.g. UUID check).
+pub trait MetaEngineCore: Send + Sync + MetaInodes {
+    /// Try to acquire the global janitor lease before contacting remote object storage.
     ///
-    /// Engines that support remote verification should override this.
-    fn check_consistency(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    /// Local-only engines may allow the janitor to proceed immediately. Distributed
+    /// engines should return `Ok(false)` when another client already holds the lease.
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>;
 
-    /// Flush pending metadata mutations to remote store (if any).
-    ///
-    /// Local-only engines can keep the default no-op implementation.
-    fn flush_metadata(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    /// Release the global janitor lease, if one was acquired.
+    fn release_global_janitor_lock(&self) -> MetaResult<()>;
 
-    /// Force metadata synchronization from remote source (if applicable).
-    ///
-    /// Used by strong-consistency paths (e.g. distributed file locks) to
-    /// guarantee refresh-before-lock-grant semantics.
-    fn sync_metadata(&self) -> MetaResult<()> {
-        Ok(())
-    }
+    /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
+}
 
-    /// Stable identifier used for invalidation self-echo suppression.
-    ///
-    /// Engines that publish invalidation events should override this and return
-    /// the same identifier they include in event payloads.
-    fn invalidation_sender_id(&self) -> Option<String> {
-        None
-    }
-
-    /// Request a near-immediate flush of pending metadata mutations.
-    ///
-    /// Called by the VFS after user-visible directory mutations (create,
-    /// unlink, rmdir, rename, …) so that changes reach remote metadata within
-    /// a short batching window (~250 ms) instead of waiting for the full
-    /// `flush_interval` (default 60 s).  The default is a no-op.
-    fn request_eager_flush(&self) {}
-
-    /// Best-effort metadata version token for change detection.
-    ///
-    /// Remote-backed engines can expose a monotonic-ish token (for example,
-    /// an object ETag) so invalidation listeners can tell whether a sync
-    /// actually observed a newer remote snapshot.
-    fn metadata_version_token(&self) -> Option<String> {
-        None
-    }
-
-    /// Best-effort namespace-only version token for dentry/path invalidation.
-    ///
-    /// This token should advance only for namespace mutations (add/remove/rename
-    /// directory entries). By default it falls back to `metadata_version_token()`
-    /// for engines that don't expose finer-grained signals yet.
-    fn namespace_version_token(&self) -> Option<String> {
-        self.metadata_version_token()
-    }
-
-    /// Best-effort count of local metadata mutations not yet durably pushed to
-    /// the shared remote metadata source.
-    fn replication_backlog(&self) -> MetadataReplicationBacklog {
-        MetadataReplicationBacklog::default()
-    }
-
-    // ─── Format / Settings ───────────────────────────────────────────────
-
+pub trait MetaFormat: Send + Sync {
     /// Store format info (called during `studiofs init`).
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()>;
 
     /// Load format info.
     fn get_format_info(&self) -> MetaResult<FormatInfo>;
+}
 
-    // ─── Counters ────────────────────────────────────────────────────────
-
+pub trait MetaInodes: Send + Sync {
     /// Get a counter value, returns 0 if not set.
     fn get_counter(&self, name: &str) -> MetaResult<u64>;
 
@@ -234,8 +187,6 @@ pub trait MetaEngine: Send + Sync {
     /// Set a counter to a specific value.
     fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>;
 
-    // ─── Inodes ──────────────────────────────────────────────────────────
-
     /// Allocate a new inode number.
     fn next_inode(&self) -> MetaResult<Ino>;
 
@@ -243,9 +194,6 @@ pub trait MetaEngine: Send + Sync {
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>;
 
     /// Batch-fetch inode attributes.
-    ///
-    /// Default implementation calls [`MetaEngine::get_attr`] for each inode in
-    /// order and returns results in the same order as `inos`.
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
         let mut attrs = Vec::with_capacity(inos.len());
         for &ino in inos {
@@ -261,9 +209,6 @@ pub trait MetaEngine: Send + Sync {
     fn remove_attr(&self, ino: Ino) -> MetaResult<()>;
 
     /// Enumerate existing inode attributes.
-    ///
-    /// Default implementation scans inode ids in `[ROOT_INO, NEXT_INODE)`.
-    /// Backends can override with a direct table scan for better performance.
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
         let next = self.get_counter(counters::NEXT_INODE)?;
         let mut out = Vec::new();
@@ -276,9 +221,9 @@ pub trait MetaEngine: Send + Sync {
         }
         Ok(out)
     }
+}
 
-    // ─── Directory Entries ───────────────────────────────────────────────
-
+pub trait MetaNamespace: Send + Sync {
     /// Look up a child entry by name in a parent directory.
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
 
@@ -290,9 +235,77 @@ pub trait MetaEngine: Send + Sync {
 
     /// Remove a directory entry by name. Returns the removed entry.
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
+}
 
-    // ─── File Blocks (New Architecture) ──────────────────────────────────
+pub trait MetaFsOps: Send + Sync + MetaInodes {
+    /// Create a new file: allocate inode, set attrs, add dentry.
+    fn create_file(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr>;
 
+    /// Create a new directory: allocate inode, set attrs, add dentry, update parent nlink.
+    fn create_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr>;
+
+    /// Unlink a file: remove dentry, decrement nlink, clean up if nlink=0.
+    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Open-unlink transaction: remove dentry and decrement nlink, but keep inode alive.
+    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Remove an empty directory.
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
+
+    /// Atomic rename: move a directory entry in a single transaction.
+    fn rename_atomic(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> MetaResult<RenameAtomicResult>;
+
+    /// Rename a file or directory (delegates to `rename_atomic`).
+    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
+        self.rename_atomic(parent, name, new_parent, new_name)?;
+        Ok(())
+    }
+
+    /// Create a hard link in a single atomic transaction.
+    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr>;
+
+    /// Create a hard link (validates and delegates to `link_atomic`).
+    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        let attr = self.get_attr(ino)?;
+        if attr.kind == FileType::Directory {
+            return Err(MetaError::IsADirectory(ino));
+        }
+        self.link_atomic(ino, new_parent, new_name)
+    }
+
+    /// Create a symlink: allocate inode, store target, add dentry.
+    fn create_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr>;
+}
+
+pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Get a specific block reference for a file.
     /// Key: (inode, block_index)
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
@@ -368,24 +381,20 @@ pub trait MetaEngine: Send + Sync {
     /// advance remote-visible file size independently from the local write view.
     fn commit_uploaded_block(
         &self,
-        _ino: Ino,
-        _block_index: u32,
-        _expected_epoch: u64,
-        _block: &BlockRef,
-    ) -> MetaResult<bool> {
-        Ok(true)
-    }
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool>;
 
     /// Atomically publish the current file manifest as the new committed head.
     ///
     /// This switches the committed manifest at file granularity and updates the
     /// inode's coarse remote upload state to `ready` when successful.
-    fn publish_file_manifest(&self, _ino: Ino, _expected_epoch: u64) -> MetaResult<bool> {
-        Ok(false)
-    }
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
+}
 
-    // ─── Pending Deletions (GC) ───────────────────────
-
+pub trait MetaGc: Send + Sync {
     /// Add a block to pending deletions (mark for GC).
     /// The timestamp is used for grace period.
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>;
@@ -397,179 +406,55 @@ pub trait MetaEngine: Send + Sync {
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
 
     /// Get currently referenced object IDs from FILE_BLOCKS metadata.
-    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        Err(MetaError::Storage(
-            "get_referenced_object_ids not implemented".to_string(),
-        ))
-    }
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
+}
 
+pub trait MetaRecovery: Send + Sync {
     /// Replay pending create intents and heal dangling namespace entries.
-    ///
     /// Returns parent inode ids whose directory namespace was mutated during replay.
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
-        Ok(Vec::new())
-    }
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>>;
 
     /// Record a pending create intent for crash recovery.
-    fn add_pending_create(&self, _record: &PendingCreateRecord) -> MetaResult<()> {
-        Ok(())
-    }
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()>;
 
     /// Remove a pending create intent.
-    fn remove_pending_create(&self, _ino: Ino) -> MetaResult<()> {
-        Ok(())
-    }
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()>;
 
     /// List pending create intents.
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        Ok(Vec::new())
-    }
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>>;
 
     /// Append an operation into the generic undo log.
-    fn append_undo_log(&self, _record: &UndoLogRecord) -> MetaResult<()> {
-        Ok(())
-    }
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()>;
 
     /// Remove all undo-log records for the `(kind, ino)` tuple.
-    fn remove_undo_logs_for(&self, _kind: UndoLogKind, _ino: Ino) -> MetaResult<()> {
-        Ok(())
-    }
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()>;
 
     /// List undo-log records.
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        Ok(Vec::new())
-    }
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>>;
 
     /// Replay generic undo-log records and heal dangling namespace state.
-    ///
     /// Returns parent inode ids whose directory namespace was mutated during replay.
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        self.recover_pending_creates()
-    }
-
-    /// Try to acquire the global janitor lease before contacting remote object storage.
-    ///
-    /// Local-only engines may allow the janitor to proceed immediately. Distributed
-    /// engines should return `Ok(false)` when another client already holds the lease.
-    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
-        Ok(true)
-    }
-
-    /// Release the global janitor lease, if one was acquired.
-    fn release_global_janitor_lock(&self) -> MetaResult<()> {
-        Ok(())
-    }
-
-    /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
-    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
-        let mut pins = HashSet::new();
-        for snapshot in self.list_snapshots()? {
-            pins.extend(snapshot.pinned_object_ids);
-        }
-        Ok(pins)
-    }
-
-    /// Return the estimated size of remote metadata in bytes, if applicable.
-    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
-        Ok(None)
-    }
-
-    // ─── High-Level Operations ───────────────────────────────────────────
-
-    /// Create a new file: allocate inode, set attrs, add dentry.
-    fn create_file(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr>;
-
-    /// Create a new directory: allocate inode, set attrs, add dentry, update parent nlink.
-    fn create_dir(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr>;
-
-    /// Unlink a file: remove dentry, decrement nlink, clean up if nlink=0.
-    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
-
-    /// Open-unlink transaction: remove dentry and decrement nlink, but keep inode alive.
-    ///
-    /// This is used by VFS when the file still has open handles and final inode/block
-    /// cleanup is deferred until the last handle is released.
-    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>>;
 
     /// Record a deferred delete (open-unlink orphan) for crash-safe cleanup.
-    fn add_deferred_delete(&self, _record: &DeferredDeleteRecord) -> MetaResult<()> {
-        Ok(())
-    }
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()>;
 
     /// Remove a deferred delete record after final cleanup.
-    fn remove_deferred_delete(&self, _ino: Ino) -> MetaResult<()> {
-        Ok(())
-    }
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()>;
 
     /// List deferred delete records pending replay/recovery.
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        Ok(Vec::new())
-    }
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
+}
 
-    /// Remove an empty directory.
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
-
-    /// Atomic rename: move a directory entry in a single transaction.
-    ///
-    /// Returns `Some(displaced_ino)` if the target entry was overwritten
-    /// (the displaced inode's nlink was decremented and — if zero — its
-    /// attr was removed).  The caller (VFS) is responsible for scheduling
-    /// block GC for the displaced inode.
-    fn rename_atomic(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> MetaResult<RenameAtomicResult>;
-
-    /// Rename a file or directory (delegates to `rename_atomic`).
-    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.rename_atomic(parent, name, new_parent, new_name)?;
-        Ok(())
-    }
-
-    // ─── Hardlinks ───────────────────────────────────────────────────────
-
-    /// Create a hard link in a single atomic transaction.
-    ///
-    /// Increments the inode's nlink and adds a new directory entry pointing
-    /// to the existing inode.  Directories cannot be hardlinked.
-    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr>;
-
-    /// Create a hard link (validates and delegates to `link_atomic`).
-    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        let attr = self.get_attr(ino)?;
-        if attr.kind == FileType::Directory {
-            return Err(MetaError::IsADirectory(ino));
-        }
-        self.link_atomic(ino, new_parent, new_name)
-    }
-
-    // ─── Symlinks ────────────────────────────────────────────────────────
-
+pub trait MetaSymlink: Send + Sync {
     /// Store a symlink target for the given inode.
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()>;
 
     /// Get the symlink target for the given inode.
     fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>;
+}
 
-    // ─── Extended Attributes (xattr) ─────────────────────────────────────
-
+pub trait MetaXattr: Send + Sync {
     /// Get an extended attribute value.
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
 
@@ -584,9 +469,9 @@ pub trait MetaEngine: Send + Sync {
 
     /// List all extended attribute names for an inode.
     fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
+}
 
-    // ─── Access Control (ACL) ────────────────────────────────────────────
-
+pub trait MetaAcl: Send + Sync {
     /// Set (create/update) explicit ACL rule for `(ino, principal)`.
     fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()>;
 
@@ -595,33 +480,64 @@ pub trait MetaEngine: Send + Sync {
 
     /// Get explicit ACL rule for `(ino, principal)`, if present.
     fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>>;
+}
 
-    /// Create a symlink: allocate inode, store target, add dentry.
-    fn create_symlink(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        target: &[u8],
-        uid: u32,
-        gid: u32,
-    ) -> MetaResult<InodeAttr>;
-
-    // ─── Snapshots ────────────────────────────────────────────────────────
-
+pub trait MetaSnapshots: Send + Sync {
     /// Create an immutable snapshot rooted at `root_ino`.
-    fn create_snapshot(&self, _root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        Err(MetaError::Storage(
-            "create_snapshot not implemented".to_string(),
-        ))
-    }
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot>;
 
     /// List known snapshots.
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        Ok(Vec::new())
-    }
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>>;
 
     /// Look up snapshot by id.
-    fn get_snapshot(&self, _snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        Ok(None)
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
+}
+
+pub trait MetaReplication: Send + Sync {
+    /// Verify that the local metadata matches the remote state (e.g. UUID check).
+    fn check_consistency(&self) -> MetaResult<()>;
+
+    /// Flush pending metadata mutations to remote store (if any).
+    fn flush_metadata(&self) -> MetaResult<()>;
+
+    /// Force metadata synchronization from remote source (if applicable).
+    fn sync_metadata(&self) -> MetaResult<()>;
+
+    /// Stable identifier used for invalidation self-echo suppression.
+    fn invalidation_sender_id(&self) -> Option<String>;
+
+    /// Request a near-immediate flush of pending metadata mutations.
+    fn request_eager_flush(&self);
+
+    /// Best-effort metadata version token for change detection.
+    fn metadata_version_token(&self) -> Option<String>;
+
+    /// Best-effort namespace-only version token for dentry/path invalidation.
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
     }
+
+    /// Best-effort count of local metadata mutations not yet durably pushed to remote.
+    fn replication_backlog(&self) -> MetadataReplicationBacklog;
+
+    /// Return the estimated size of remote metadata in bytes, if applicable.
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
+}
+
+/// Public aggregate contract for consumers.
+pub trait MetaEngine:
+    MetaEngineCore
+    + MetaFormat
+    + MetaInodes
+    + MetaNamespace
+    + MetaFsOps
+    + MetaBlocks
+    + MetaGc
+    + MetaRecovery
+    + MetaSymlink
+    + MetaXattr
+    + MetaAcl
+    + MetaSnapshots
+    + MetaReplication
+{
 }

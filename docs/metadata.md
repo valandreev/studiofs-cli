@@ -6,6 +6,28 @@
 - `SyncMetaEngineAdapter` (bridges sync engines via blocking execution)
 - `run_meta(...)` in VFS (maps runtime `JoinError` separately from metadata-domain errors)
 
+`MetaEngine` now acts as an aggregate capability contract built from focused
+sub-traits:
+- `MetaFormat`
+- `MetaInodes`
+- `MetaNamespace`
+- `MetaFsOps`
+- `MetaBlocks`
+- `MetaGc`
+- `MetaRecovery`
+- `MetaSymlink`
+- `MetaXattr`
+- `MetaAcl`
+- `MetaSnapshots`
+- `MetaReplication`
+
+`MetaEngineCore` now contains only cross-cutting engine responsibilities
+(global janitor lease + global snapshot pins), while filesystem and metadata
+operations are split across capability traits. Consumers can depend on narrower
+contracts instead of a single god-object surface. Capability traits are opt-in
+per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
+contracts fail at compile time.
+
 ## Engines
 
 ### `RedbMetaEngine`
@@ -586,7 +608,7 @@ use a unified undo-recovery path with explicit intent records.
 
 ### Undo-intent records
 
-`MetaEngine` exposes:
+`MetaRecovery` exposes:
 
 - `pending_creates` (create intent journal)
 - `deferred_deletes` (open-unlink orphan journal)

@@ -1,6 +1,8 @@
 use crate::engine::{
-    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaEngine, MetaError, MetaResult,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore,
+    MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -1782,7 +1784,333 @@ impl PgMetaEngine {
     }
 }
 
-impl MetaEngine for PgMetaEngine {
+impl MetaEngineCore for PgMetaEngine {
+    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        self.try_acquire_pg_janitor_lock()
+    }
+
+    fn release_global_janitor_lock(&self) -> MetaResult<()> {
+        self.release_pg_janitor_lock()
+    }
+
+    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
+        self.load_pg_global_snapshot_pins()
+    }
+}
+
+impl MetaFormat for PgMetaEngine {
+    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
+        self.local.set_format_info(info)
+    }
+
+    fn get_format_info(&self) -> MetaResult<FormatInfo> {
+        self.local.get_format_info()
+    }
+}
+impl MetaInodes for PgMetaEngine {
+    fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        self.local.get_counter(name)
+    }
+
+    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        self.mutate(|local| local.incr_counter(name, delta))
+    }
+
+    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
+        self.mutate(|local| local.decr_counter(name, delta))
+    }
+
+    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
+        self.mutate(|local| local.set_counter(name, value))
+    }
+
+    fn next_inode(&self) -> MetaResult<Ino> {
+        self.mutate(|local| local.next_inode())
+    }
+
+    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        self.local.get_attr(ino)
+    }
+
+    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
+        self.local.get_attrs_batch(inos)
+    }
+
+    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+        self.mutate(|local| local.set_attr(attr))
+    }
+
+    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_attr(ino))
+    }
+
+    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
+        self.local.list_inode_attrs()
+    }
+}
+impl MetaNamespace for PgMetaEngine {
+    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        self.local.lookup(parent, name)
+    }
+
+    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
+        self.local.readdir(parent)
+    }
+
+    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
+        self.mutate(|local| local.add_entry(parent, name, entry))
+    }
+
+    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
+        self.mutate(|local| local.remove_entry(parent, name))
+    }
+}
+impl MetaFsOps for PgMetaEngine {
+    fn create_file(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_file(parent, name, uid, gid, mode))
+    }
+
+    fn create_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_dir(parent, name, uid, gid, mode))
+    }
+
+    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.unlink(parent, name))
+    }
+
+    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.unlink_open_handle(parent, name))
+    }
+
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.rmdir(parent, name))
+    }
+
+    fn rename_atomic(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> MetaResult<RenameAtomicResult> {
+        self.mutate(|local| local.rename_atomic(parent, name, new_parent, new_name))
+    }
+
+    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.rename(parent, name, new_parent, new_name))
+    }
+
+    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.link_atomic(ino, new_parent, new_name))
+    }
+
+    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.link(ino, new_parent, new_name))
+    }
+
+    fn create_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr> {
+        self.mutate(|local| local.create_symlink(parent, name, target, uid, gid))
+    }
+}
+impl MetaBlocks for PgMetaEngine {
+    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
+        self.local.get_file_block(ino, block_index)
+    }
+
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>> {
+        self.mutate(|local| local.set_file_block(ino, block_index, block))
+    }
+
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+        self.local.get_file_blocks(ino)
+    }
+
+    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.mutate(|local| local.remove_file_blocks(ino))
+    }
+
+    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
+        self.mutate(|local| local.remove_file_block(ino, block_index))
+    }
+
+    fn next_block_id(&self) -> MetaResult<u64> {
+        self.mutate(|local| local.next_block_id())
+    }
+
+    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        self.mutate(|local| local.next_block_ids(count))
+    }
+
+    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
+        self.mutate(|local| local.flush_blocks_batch(entries))
+    }
+
+    fn commit_uploaded_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool> {
+        let result = self
+            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+        let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+}
+impl MetaGc for PgMetaEngine {
+    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
+        self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
+    }
+
+    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
+        self.mutate(|local| local.remove_pending_deletion(object_id))
+    }
+
+    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
+        self.local.get_pending_deletions()
+    }
+
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.local.get_referenced_object_ids()
+    }
+}
+impl MetaRecovery for PgMetaEngine {
+    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
+        self.mutate(|local| local.add_deferred_delete(record))
+    }
+
+    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_deferred_delete(ino))
+    }
+
+    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
+        self.local.list_deferred_deletes()
+    }
+
+    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
+        self.mutate(|local| local.recover_pending_creates())
+    }
+
+    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
+        self.mutate(|local| local.add_pending_create(record))
+    }
+
+    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_pending_create(ino))
+    }
+
+    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
+        self.local.list_pending_creates()
+    }
+
+    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
+        self.mutate(|local| local.recover_undo_logs())
+    }
+
+    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
+        self.mutate(|local| local.append_undo_log(record))
+    }
+
+    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
+        self.mutate(|local| local.remove_undo_logs_for(kind, ino))
+    }
+
+    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
+        self.local.list_undo_logs()
+    }
+}
+impl MetaSymlink for PgMetaEngine {
+    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.set_symlink_target(ino, target))
+    }
+
+    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        self.local.get_symlink_target(ino)
+    }
+}
+impl MetaXattr for PgMetaEngine {
+    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        self.local.get_xattr(ino, name)
+    }
+
+    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
+        self.mutate(|local| local.set_xattr(ino, name, value, flags))
+    }
+
+    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        self.mutate(|local| local.remove_xattr(ino, name))
+    }
+
+    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        self.local.list_xattrs(ino)
+    }
+}
+impl MetaAcl for PgMetaEngine {
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
+        self.mutate(|local| local.set_acl_rule(ino, principal, access_level))
+    }
+
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
+        self.mutate(|local| local.remove_acl_rule(ino, principal))
+    }
+
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
+        self.local.get_acl_rule(ino, principal)
+    }
+}
+impl MetaSnapshots for PgMetaEngine {
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        self.mutate(|local| local.create_snapshot(root_ino))
+    }
+
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        let _ = self.sync_metadata();
+        self.local.list_snapshots()
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        let _ = self.sync_metadata();
+        self.local.get_snapshot(snapshot_id)
+    }
+}
+impl MetaReplication for PgMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
         let _guard = self
             .replication_lock
@@ -1878,7 +2206,6 @@ impl MetaEngine for PgMetaEngine {
                             ))
                         })?;
                     let bytes: i64 = row.get(0);
-                    // COALESCE ensures non-negative; saturating conversion handles edge cases
                     Ok(bytes.max(0) as u64)
                 },
             )
@@ -1886,320 +2213,8 @@ impl MetaEngine for PgMetaEngine {
         })?;
         Ok(Some(size))
     }
-
-    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
-        self.local.set_format_info(info)
-    }
-
-    fn get_format_info(&self) -> MetaResult<FormatInfo> {
-        self.local.get_format_info()
-    }
-
-    fn get_counter(&self, name: &str) -> MetaResult<u64> {
-        self.local.get_counter(name)
-    }
-
-    fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        self.mutate(|local| local.incr_counter(name, delta))
-    }
-
-    fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        self.mutate(|local| local.decr_counter(name, delta))
-    }
-
-    fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
-        self.mutate(|local| local.set_counter(name, value))
-    }
-
-    fn next_inode(&self) -> MetaResult<Ino> {
-        self.mutate(|local| local.next_inode())
-    }
-
-    fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
-        self.local.get_attr(ino)
-    }
-
-    fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
-        self.local.get_attrs_batch(inos)
-    }
-
-    fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
-        self.local.list_inode_attrs()
-    }
-
-    fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
-        self.mutate(|local| local.set_attr(attr))
-    }
-
-    fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_attr(ino))
-    }
-
-    fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        self.local.lookup(parent, name)
-    }
-
-    fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>> {
-        self.local.readdir(parent)
-    }
-
-    fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        self.mutate(|local| local.add_entry(parent, name, entry))
-    }
-
-    fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        self.mutate(|local| local.remove_entry(parent, name))
-    }
-
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        self.local.get_file_block(ino, block_index)
-    }
-
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>> {
-        self.mutate(|local| local.set_file_block(ino, block_index, block))
-    }
-
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        self.local.get_file_blocks(ino)
-    }
-
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.remove_file_blocks(ino))
-    }
-
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
-        self.mutate(|local| local.remove_file_block(ino, block_index))
-    }
-
-    fn next_block_id(&self) -> MetaResult<u64> {
-        self.mutate(|local| local.next_block_id())
-    }
-
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.next_block_ids(count))
-    }
-
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        self.mutate(|local| local.flush_blocks_batch(entries))
-    }
-
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let result = self
-            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
-        self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
-    }
-
-    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
-        self.mutate(|local| local.remove_pending_deletion(object_id))
-    }
-
-    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
-        self.local.get_pending_deletions()
-    }
-
-    fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
-        self.mutate(|local| local.add_deferred_delete(record))
-    }
-
-    fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_deferred_delete(ino))
-    }
-
-    fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
-        self.local.list_deferred_deletes()
-    }
-
-    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        self.local.get_referenced_object_ids()
-    }
-
-    fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
-        self.mutate(|local| local.recover_pending_creates())
-    }
-
-    fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
-        self.mutate(|local| local.add_pending_create(record))
-    }
-
-    fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_pending_create(ino))
-    }
-
-    fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {
-        self.local.list_pending_creates()
-    }
-
-    fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        self.mutate(|local| local.recover_undo_logs())
-    }
-
-    fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
-        self.mutate(|local| local.append_undo_log(record))
-    }
-
-    fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_undo_logs_for(kind, ino))
-    }
-
-    fn list_undo_logs(&self) -> MetaResult<Vec<UndoLogRecord>> {
-        self.local.list_undo_logs()
-    }
-
-    fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
-        self.try_acquire_pg_janitor_lock()
-    }
-
-    fn release_global_janitor_lock(&self) -> MetaResult<()> {
-        self.release_pg_janitor_lock()
-    }
-
-    fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
-        self.load_pg_global_snapshot_pins()
-    }
-
-    fn create_file(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_file(parent, name, uid, gid, mode))
-    }
-
-    fn create_dir(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-    ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_dir(parent, name, uid, gid, mode))
-    }
-
-    fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.unlink(parent, name))
-    }
-
-    fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.unlink_open_handle(parent, name))
-    }
-
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.rmdir(parent, name))
-    }
-
-    fn rename_atomic(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> MetaResult<RenameAtomicResult> {
-        self.mutate(|local| local.rename_atomic(parent, name, new_parent, new_name))
-    }
-
-    fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.rename(parent, name, new_parent, new_name))
-    }
-
-    fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.link_atomic(ino, new_parent, new_name))
-    }
-
-    fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.link(ino, new_parent, new_name))
-    }
-
-    fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.set_symlink_target(ino, target))
-    }
-
-    fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
-        self.local.get_symlink_target(ino)
-    }
-
-    fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
-        self.local.get_xattr(ino, name)
-    }
-
-    fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
-        self.mutate(|local| local.set_xattr(ino, name, value, flags))
-    }
-
-    fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.remove_xattr(ino, name))
-    }
-
-    fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
-        self.local.list_xattrs(ino)
-    }
-
-    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
-        self.mutate(|local| local.set_acl_rule(ino, principal, access_level))
-    }
-
-    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
-        self.mutate(|local| local.remove_acl_rule(ino, principal))
-    }
-
-    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
-        self.local.get_acl_rule(ino, principal)
-    }
-
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        self.mutate(|local| local.create_snapshot(root_ino))
-    }
-
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let _ = self.sync_metadata();
-        self.local.list_snapshots()
-    }
-
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let _ = self.sync_metadata();
-        self.local.get_snapshot(snapshot_id)
-    }
-
-    fn create_symlink(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        target: &[u8],
-        uid: u32,
-        gid: u32,
-    ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_symlink(parent, name, target, uid, gid))
-    }
 }
+impl crate::engine::MetaEngine for PgMetaEngine {}
 
 #[cfg(test)]
 mod tests {
