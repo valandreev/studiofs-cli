@@ -483,6 +483,8 @@ Dentry/path shortcut logs also include negative-hit ratio. The summary `upload p
 
 Upload local-I/O tuning notes:
 - upload workers use phase separation: local-cache I/O slots are released immediately after the cache read and are not held during S3 upload waits.
+- adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
+- if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
 - when `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` is configured above `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`, StudioFS clamps it and emits a startup warning.
 - speedometer logs include `foreground_read_p90_present` and `foreground_read_p90_ms` for stable parsing even when no fresh samples exist.
 

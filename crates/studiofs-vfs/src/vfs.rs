@@ -9313,10 +9313,12 @@ impl StudioVfs {
         if self.uploader_shutdown_requested() {
             return Ok(());
         }
+        let mut waited_upload_delay_ms = 0u64;
         if self.upload_delay > Duration::from_millis(0) {
             let age_ms = Self::now_unix_millis().saturating_sub(op.created_unix_ms);
             let delay_ms = self.upload_delay.as_millis() as u64;
             if age_ms < delay_ms {
+                waited_upload_delay_ms = delay_ms - age_ms;
                 tokio::select! {
                     _ = upload_cancel_token.cancelled() => {
                         if self.cancel_upload_if_inode_deleted(&op) {
@@ -9324,7 +9326,7 @@ impl StudioVfs {
                         }
                         return Ok(());
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(delay_ms - age_ms)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(waited_upload_delay_ms)) => {}
                 }
             }
         }
@@ -9347,34 +9349,34 @@ impl StudioVfs {
         // phase so background uploads create real quiet windows for foreground
         // reads instead of a back-to-back disk conveyor.
         let adaptive_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
-        if adaptive_penalty_ms > 0 {
+        let effective_adaptive_penalty_ms =
+            adaptive_penalty_ms.saturating_sub(waited_upload_delay_ms);
+        if effective_adaptive_penalty_ms > 0 {
             tokio::select! {
                 _ = self.state.uploader_shutdown_token.cancelled() => return Ok(()),
                 _ = upload_cancel_token.cancelled() => {
-                    // Per-inode upload token is a child of the uploader shutdown
-                    // token, so cancellation can mean either inode deletion or
-                    // global uploader shutdown. Distinguish the two for clearer
-                    // metrics/log semantics.
-                    if self.state.deleted_inodes.lock().contains(&op.ino)
-                        && self.cancel_upload_if_inode_deleted(&op)
-                    {
+                    if self.cancel_upload_if_inode_deleted(&op) {
                         debug!(
                             ino = op.ino,
                             object_id = op.object_id,
-                            penalty_ms = adaptive_penalty_ms,
+                            penalty_ms = effective_adaptive_penalty_ms,
+                            raw_penalty_ms = adaptive_penalty_ms,
+                            upload_delay_waited_ms = waited_upload_delay_ms,
                             "process_upload cancelled during adaptive pre-read cooldown"
                         );
                     } else {
                         debug!(
                             ino = op.ino,
                             object_id = op.object_id,
-                            penalty_ms = adaptive_penalty_ms,
+                            penalty_ms = effective_adaptive_penalty_ms,
+                            raw_penalty_ms = adaptive_penalty_ms,
+                            upload_delay_waited_ms = waited_upload_delay_ms,
                             "process_upload cancelled during adaptive pre-read cooldown (shutdown/token cancel)"
                         );
                     }
                     return Ok(());
                 }
-                _ = tokio::time::sleep(Duration::from_millis(adaptive_penalty_ms)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(effective_adaptive_penalty_ms)) => {}
             }
         }
 
