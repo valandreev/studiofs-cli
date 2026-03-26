@@ -948,23 +948,27 @@ impl FileSystemContext for StudioFsContext {
                 }
             }
         } else {
-            // Not deleting — flush buffered writes
-            // WinFSP "Cleanup" with no delete flag is the standard place to flush.
+            // Not deleting — flush buffered writes synchronously before WinFSP
+            // proceeds to close() → release_fh().
+            //
+            // Must use spawn_wait (blocking) rather than rt.spawn (fire-and-forget)
+            // because WinFSP calls cleanup() immediately followed by close(), which
+            // calls release_fh() and drops the handle from the table. A background
+            // flush_fh task that races past release_fh will find the handle already
+            // gone, silently skip the flush body, and — critically for
+            // DIRECT_IO/WRITE_THROUGH handles — never call wait_for_ingress_drain,
+            // breaking the direct-IO durability guarantee.
             let vfs = self.vfs.clone();
             let ino = context.ino;
             let fh = context.fh;
             if fh != 0 {
-                self.rt.spawn(async move {
-                    if let Err(e) = vfs.flush_fh(fh).await {
-                        error!(ino, "cleanup flush_fh failed: {:?}", e);
-                    }
-                });
+                if let Err(e) = self.spawn_wait(async move { vfs.flush_fh(fh).await }) {
+                    error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
+                }
             } else {
-                self.rt.spawn(async move {
-                    if let Err(e) = vfs.flush(ino).await {
-                        error!(ino, "cleanup flush failed: {:?}", e);
-                    }
-                });
+                if let Err(e) = self.spawn_wait(async move { vfs.flush(ino).await }) {
+                    error!(ino, "cleanup flush failed: {:?}", e);
+                }
             }
         }
     }
