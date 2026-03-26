@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::task;
 
-use crate::{MetaEngine, MetaError, MetaResult};
+use crate::{MetaEngine, MetaResult};
 
 /// Async boundary for metadata operations.
 ///
@@ -37,9 +37,7 @@ impl AsyncMetaEngine for SyncMetaEngineAdapter {
 pub async fn execute_sync_meta<T: Send + 'static>(
     engine: Arc<dyn AsyncMetaEngine>,
     operation: impl FnOnce(Arc<dyn MetaEngine>) -> MetaResult<T> + Send + 'static,
-) -> MetaResult<T> {
+) -> Result<MetaResult<T>, task::JoinError> {
     let sync_engine = engine.sync_engine();
-    task::spawn_blocking(move || operation(sync_engine))
-        .await
-        .map_err(|err| MetaError::Storage(format!("metadata task join error: {err}")))?
+    task::spawn_blocking(move || operation(sync_engine)).await
 }

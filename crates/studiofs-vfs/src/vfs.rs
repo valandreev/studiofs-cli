@@ -3180,8 +3180,6 @@ enum PrefetchWorkItem {
 
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
 pub struct StudioVfs {
-    /// Metadata engine.
-    meta: Arc<dyn MetaEngine>,
     /// Async boundary for metadata operations.
     meta_async: Arc<dyn AsyncMetaEngine>,
     /// Data store for writes (uploads, deletes, GC).
@@ -3545,11 +3543,11 @@ impl StudioVfs {
     }
 
     fn acl_rule_for_inode(&self, ino: Ino) -> VfsResult<Option<AccessLevel>> {
-        if let Some(level) = self.meta.get_acl_rule(ino, &self.acl_principal)? {
+        if let Some(level) = self.sync_meta().get_acl_rule(ino, &self.acl_principal)? {
             return Ok(Some(level));
         }
         if self.acl_principal != "*" {
-            return Ok(self.meta.get_acl_rule(ino, "*")?);
+            return Ok(self.sync_meta().get_acl_rule(ino, "*")?);
         }
         Ok(None)
     }
@@ -3712,16 +3710,17 @@ impl StudioVfs {
         principal: &str,
         access_level: AccessLevel,
     ) -> VfsResult<()> {
-        self.meta.set_acl_rule(ino, principal, access_level)?;
+        self.sync_meta()
+            .set_acl_rule(ino, principal, access_level)?;
         self.bump_acl_epoch();
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(())
     }
 
     pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
-        self.meta.remove_acl_rule(ino, principal)?;
+        self.sync_meta().remove_acl_rule(ino, principal)?;
         self.bump_acl_epoch();
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(())
     }
 
@@ -3846,7 +3845,7 @@ impl StudioVfs {
             let block_index = block_index_from_offset(op.offset, self.block_size);
             let attr = attrs
                 .entry(op.ino)
-                .or_insert_with(|| self.meta.get_attr(op.ino).ok());
+                .or_insert_with(|| self.sync_meta().get_attr(op.ino).ok());
             let Some(attr) = attr.as_ref() else {
                 continue;
             };
@@ -3854,7 +3853,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let current = match self.meta.get_file_block(op.ino, block_index) {
+            let current = match self.sync_meta().get_file_block(op.ino, block_index) {
                 Ok(Some(block_ref)) => block_ref,
                 _ => continue,
             };
@@ -4228,7 +4227,6 @@ impl StudioVfs {
             );
 
             let vfs = Arc::new(Self {
-                meta,
                 meta_async,
                 data_write,
                 block_cache,
@@ -4606,8 +4604,8 @@ impl StudioVfs {
     }
 
     async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
-        let mut last_namespace_token = self.meta.namespace_version_token();
-        let mut last_metadata_token = self.meta.metadata_version_token();
+        let mut last_namespace_token = self.sync_meta().namespace_version_token();
+        let mut last_metadata_token = self.sync_meta().metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
 
         if last_namespace_token.is_some() || last_metadata_token.is_some() {
@@ -4754,7 +4752,7 @@ impl StudioVfs {
         }
         // Only clear after inode metadata is actually gone. This keeps the
         // marker stable for open-unlink inodes until final orphan cleanup.
-        if self.meta.get_attr(ino).is_ok() {
+        if self.sync_meta().get_attr(ino).is_ok() {
             return;
         }
         self.state.deleted_inodes.lock().remove(&ino);
@@ -6349,19 +6347,23 @@ impl StudioVfs {
         *self.kernel_invalidator.write().unwrap() = None;
     }
 
+    fn sync_meta(&self) -> Arc<dyn MetaEngine> {
+        self.meta_async.sync_engine()
+    }
+
     /// Get metadata engine reference.
-    pub fn meta(&self) -> &dyn MetaEngine {
-        self.meta.as_ref()
+    pub fn meta(&self) -> Arc<dyn MetaEngine> {
+        self.sync_meta()
     }
 
     /// Get volume name.
     pub fn volume_name(&self) -> VfsResult<String> {
-        Ok(self.meta.get_format_info()?.name)
+        Ok(self.sync_meta().get_format_info()?.name)
     }
 
     /// Get volume UUID.
     pub fn uuid(&self) -> VfsResult<String> {
-        Ok(self.meta.get_format_info()?.uuid)
+        Ok(self.sync_meta().get_format_info()?.uuid)
     }
 
     /// Get block size.
@@ -6384,8 +6386,8 @@ impl StudioVfs {
     /// Total capacity is virtual (1 PB) since the backing store is cloud.
     pub fn statfs(&self) -> VfsResult<StatFs> {
         use studiofs_meta::types::counters;
-        let used_inodes = self.meta.get_counter(counters::TOTAL_INODES)?;
-        let used_bytes = self.meta.get_counter(counters::USED_SPACE)?;
+        let used_inodes = self.sync_meta().get_counter(counters::TOTAL_INODES)?;
+        let used_bytes = self.sync_meta().get_counter(counters::USED_SPACE)?;
         let bsize = self.block_size as u64;
 
         // Virtual capacity: 1 PB
@@ -6541,7 +6543,7 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let attr = match self.meta.get_attr(ino) {
+        let attr = match self.sync_meta().get_attr(ino) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
                 self.state
@@ -6716,7 +6718,7 @@ impl StudioVfs {
             self.state.attr_read_cache.lock().remove(ino);
 
             // Commit to metadata
-            self.meta.set_attr(&attr)?;
+            self.sync_meta().set_attr(&attr)?;
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
@@ -6745,13 +6747,14 @@ impl StudioVfs {
             self.clear_pending_block(ino, block_idx);
             self.remove_live_extent(ino, block_idx);
             // Remove the block and get its ID for GC
-            if let Some(object_id) = self.meta.remove_file_block(ino, block_idx)? {
+            if let Some(object_id) = self.sync_meta().remove_file_block(ino, block_idx)? {
                 // Mark old block for deletion (S3 cleanup via background GC)
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                self.meta.add_pending_deletion(object_id, timestamp)?;
+                self.sync_meta()
+                    .add_pending_deletion(object_id, timestamp)?;
                 debug!("marking block {} for deletion (truncate)", object_id);
 
                 // Immediately evict this block from all cache tiers.
@@ -6777,7 +6780,7 @@ impl StudioVfs {
             let last_block_offset = offset_within_block(new_size - 1, self.block_size);
             let new_last_len = last_block_offset as usize + 1;
             let trimmed_local = self.trim_local_block_staging(ino, new_last_block, new_last_len)?;
-            if let Some(mut block_ref) = self.meta.get_file_block(ino, new_last_block)? {
+            if let Some(mut block_ref) = self.sync_meta().get_file_block(ino, new_last_block)? {
                 if !trimmed_local
                     && let Some(bytes) =
                         self.load_local_block_bytes_sync(ino, new_last_block, block_ref.object_id)?
@@ -6791,7 +6794,8 @@ impl StudioVfs {
                 } else {
                     block_ref.flags.remove(BlockFlags::PARTIAL_BLOCK);
                 }
-                self.meta.set_file_block(ino, new_last_block, &block_ref)?;
+                self.sync_meta()
+                    .set_file_block(ino, new_last_block, &block_ref)?;
             }
         }
 
@@ -6803,7 +6807,7 @@ impl StudioVfs {
     // =========================================================================
 
     fn heal_orphaned_dentry(&self, parent: Ino, name: &[u8], ino_hint: Option<Ino>) {
-        match self.meta.remove_entry(parent, name) {
+        match self.sync_meta().remove_entry(parent, name) {
             Ok(removed) => {
                 debug!(
                     parent,
@@ -6851,7 +6855,8 @@ impl StudioVfs {
         }
         if let Some(cached) = self.dentry_cache_lookup(parent, name) {
             match cached {
-                DentryCacheValue::Positive(child_ino) => match self.meta.get_attr(child_ino) {
+                DentryCacheValue::Positive(child_ino) => match self.sync_meta().get_attr(child_ino)
+                {
                     Ok(attr) => return Ok(attr),
                     Err(MetaError::InodeNotFound(_)) => {
                         self.dentry_cache_invalidate(parent, name);
@@ -6866,7 +6871,7 @@ impl StudioVfs {
             }
         }
 
-        let entry = match self.meta.lookup(parent, name) {
+        let entry = match self.sync_meta().lookup(parent, name) {
             Ok(entry) => entry,
             Err(MetaError::EntryNotFound { .. }) => {
                 self.dentry_cache_insert_negative(parent, name);
@@ -6909,7 +6914,7 @@ impl StudioVfs {
             return Ok(Vec::new());
         }
 
-        let mut entries = self.meta.readdir(ino)?;
+        let mut entries = self.sync_meta().readdir(ino)?;
         if ino == ROOT_INO {
             entries.retain(|entry| !is_blocked_root_macos_metadata_dir(&entry.name));
         }
@@ -6963,7 +6968,7 @@ impl StudioVfs {
             return;
         }
 
-        let meta = self.meta.clone();
+        let meta = self.sync_meta();
         let state = self.state.clone();
         let chunk_size = self.readdir_attr_batch_chunk;
         let hydrate = move || {
@@ -7515,14 +7520,14 @@ impl StudioVfs {
             self.bump_namespace_for_parents([new_parent]);
             return Ok(ignored);
         }
-        let attr = self.meta.link(ino, new_parent, new_name)?;
+        let attr = self.sync_meta().link(ino, new_parent, new_name)?;
         self.bump_namespace_for_parents([new_parent]);
         self.bump_acl_namespace_epoch();
         self.dentry_cache_insert_positive(new_parent, new_name, ino);
         // Invalidate attr caches (nlink changed)
         self.state.attr_read_cache.lock().remove(ino);
         self.state.dirty_attrs.lock().remove(&ino);
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(attr)
     }
 
@@ -7544,7 +7549,7 @@ impl StudioVfs {
             return Ok(attr);
         }
         let attr = self
-            .meta
+            .sync_meta()
             .create_file(parent, name, uid, gid, mode & 0o7777)?;
         self.state.inode_incarnations.lock().insert(
             attr.ino,
@@ -7562,7 +7567,7 @@ impl StudioVfs {
         self.dentry_cache_insert_positive(parent, name, attr.ino);
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(parent);
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(attr)
     }
 
@@ -7583,13 +7588,13 @@ impl StudioVfs {
             return Ok(attr);
         }
         let attr = self
-            .meta
+            .sync_meta()
             .create_dir(parent, name, uid, gid, mode & 0o7777)?;
         self.bump_namespace_for_parents([parent]);
         self.dentry_cache_insert_positive(parent, name, attr.ino);
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(parent);
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(attr)
     }
 
@@ -7609,11 +7614,13 @@ impl StudioVfs {
             self.bump_namespace_for_parents([parent]);
             return Ok(attr);
         }
-        let attr = self.meta.create_symlink(parent, name, target, uid, gid)?;
+        let attr = self
+            .sync_meta()
+            .create_symlink(parent, name, target, uid, gid)?;
         self.bump_namespace_for_parents([parent]);
         self.dentry_cache_insert_positive(parent, name, attr.ino);
         self.state.attr_read_cache.lock().remove(parent);
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(attr)
     }
 
@@ -7623,7 +7630,7 @@ impl StudioVfs {
         if matches!(self.ignored_entry_attr(ino), Some(attr) if attr.kind == FileType::Symlink) {
             return Ok(Vec::new());
         }
-        Ok(self.meta.get_symlink_target(ino)?)
+        Ok(self.sync_meta().get_symlink_target(ino)?)
     }
 
     // =========================================================================
@@ -7641,7 +7648,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(None);
         }
-        Ok(self.meta.get_xattr(ino, name)?)
+        Ok(self.sync_meta().get_xattr(ino, name)?)
     }
 
     /// Set an extended attribute.
@@ -7656,7 +7663,7 @@ impl StudioVfs {
                 limit: self.max_xattr_bytes,
             }));
         }
-        self.meta.set_xattr(ino, name, value, flags)?;
+        self.sync_meta().set_xattr(ino, name, value, flags)?;
         Ok(())
     }
 
@@ -7666,7 +7673,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
-        self.meta.remove_xattr(ino, name)?;
+        self.sync_meta().remove_xattr(ino, name)?;
         Ok(())
     }
 
@@ -7681,7 +7688,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(Vec::new());
         }
-        Ok(self.meta.list_xattrs(ino)?)
+        Ok(self.sync_meta().list_xattrs(ino)?)
     }
 
     /// Remove a file.
@@ -7702,14 +7709,14 @@ impl StudioVfs {
         }
 
         // First, look up the entry to get the ino so we can check open handles.
-        let entry = self.meta.lookup(parent, name)?;
+        let entry = self.sync_meta().lookup(parent, name)?;
         let ino = entry.ino;
 
         let open_handles = self.handle_table.open_count(ino);
 
         if open_handles > 0 {
             // Open-unlink: atomically remove dentry + decrement nlink, keep inode alive.
-            let attr = match self.meta.unlink_open_handle(parent, name) {
+            let attr = match self.sync_meta().unlink_open_handle(parent, name) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => {
                     self.heal_orphaned_dentry(parent, name, Some(ino));
@@ -7738,7 +7745,7 @@ impl StudioVfs {
             self.state.attr_read_cache.lock().remove(ino);
         } else {
             // No open handles — immediate full cleanup via meta.unlink()
-            let attr = match self.meta.unlink(parent, name) {
+            let attr = match self.sync_meta().unlink(parent, name) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => {
                     self.heal_orphaned_dentry(parent, name, Some(ino));
@@ -7753,7 +7760,7 @@ impl StudioVfs {
                 self.mark_inode_deleted_for_uploads(attr.ino);
 
                 // Remove all blocks and mark for GC
-                let removed_ids = self.meta.remove_file_blocks(attr.ino)?;
+                let removed_ids = self.sync_meta().remove_file_blocks(attr.ino)?;
                 let l2_before = self.block_cache.l2_bytes();
                 info!(
                     "unlink ino={}: removed {} block refs, object_ids={:?}, l2_before={}",
@@ -7770,13 +7777,14 @@ impl StudioVfs {
                     .unwrap_or(0);
 
                 for object_id in &removed_ids {
-                    self.meta.add_pending_deletion(*object_id, timestamp)?;
+                    self.sync_meta()
+                        .add_pending_deletion(*object_id, timestamp)?;
                     debug!("marking object {} for deletion (unlink)", object_id);
                 }
 
                 // Decrement USED_SPACE by the file's logical size
                 if attr.size > 0 {
-                    self.meta
+                    self.sync_meta()
                         .decr_counter(studiofs_meta::types::counters::USED_SPACE, attr.size)?;
                 }
 
@@ -7812,7 +7820,7 @@ impl StudioVfs {
         self.bump_namespace_for_parents([parent]);
         self.dentry_cache_insert_negative(parent, name);
 
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(())
     }
 
@@ -7824,8 +7832,12 @@ impl StudioVfs {
             self.dentry_cache_insert_negative(parent, name);
             return Ok(());
         }
-        let removed = self.meta.lookup(parent, name).ok().map(|entry| entry.ino);
-        self.meta.rmdir(parent, name)?;
+        let removed = self
+            .sync_meta()
+            .lookup(parent, name)
+            .ok()
+            .map(|entry| entry.ino);
+        self.sync_meta().rmdir(parent, name)?;
         self.bump_namespace_for_parents([parent]);
         if let Some(removed_ino) = removed {
             self.bump_directory_generation(removed_ino);
@@ -7833,7 +7845,7 @@ impl StudioVfs {
         self.dentry_cache_insert_negative(parent, name);
         // Invalidate parent directory's read-through cache (entry count changed)
         self.state.attr_read_cache.lock().remove(parent);
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(())
     }
 
@@ -7886,8 +7898,8 @@ impl StudioVfs {
             return Ok(());
         }
         if target_is_ignored {
-            let source_entry = self.meta.lookup(parent, name)?;
-            let source_attr = self.meta.get_attr(source_entry.ino)?;
+            let source_entry = self.sync_meta().lookup(parent, name)?;
+            let source_attr = self.sync_meta().get_attr(source_entry.ino)?;
             let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
                 && self.ignored_directory_has_probable_trash_ancestor(new_parent);
             if target_is_ignored_trash {
@@ -7915,13 +7927,13 @@ impl StudioVfs {
             return self.unlink_inner(parent, name).await;
         }
         let rename_result = self
-            .meta
+            .sync_meta()
             .rename_atomic(parent, name, new_parent, new_name)?;
         self.bump_namespace_for_parents([parent, new_parent]);
         self.bump_acl_namespace_epoch();
         self.dentry_cache_insert_negative(parent, name);
         self.dentry_cache_insert_positive(new_parent, new_name, rename_result.moved_ino);
-        let moved_attr = self.meta.get_attr(rename_result.moved_ino)?;
+        let moved_attr = self.sync_meta().get_attr(rename_result.moved_ino)?;
         let moved_into_trash = moved_attr.kind == FileType::RegularFile
             && self.directory_has_probable_trash_ancestor(new_parent)?;
 
@@ -7930,17 +7942,18 @@ impl StudioVfs {
             self.mark_inode_deleted_for_uploads(ino);
 
             // Compute total bytes for USED_SPACE before removing blocks
-            let blocks = self.meta.get_file_blocks(ino)?;
+            let blocks = self.sync_meta().get_file_blocks(ino)?;
             let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
 
-            let removed_ids = self.meta.remove_file_blocks(ino)?;
+            let removed_ids = self.sync_meta().remove_file_blocks(ino)?;
             if !removed_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 for &object_id in &removed_ids {
-                    self.meta.add_pending_deletion(object_id, timestamp)?;
+                    self.sync_meta()
+                        .add_pending_deletion(object_id, timestamp)?;
                 }
                 self.state
                     .pending_blocks
@@ -7951,7 +7964,7 @@ impl StudioVfs {
 
             // Decrement USED_SPACE for removed blocks
             if total_bytes > 0 {
-                self.meta
+                self.sync_meta()
                     .decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
             }
 
@@ -7971,7 +7984,7 @@ impl StudioVfs {
         if parent != new_parent {
             self.state.attr_read_cache.lock().remove(new_parent);
         }
-        self.meta.request_eager_flush();
+        self.sync_meta().request_eager_flush();
         Ok(())
     }
 
@@ -8064,7 +8077,7 @@ impl StudioVfs {
 
     async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
         let object_ids: Vec<u64> = self
-            .meta
+            .sync_meta()
             .get_file_blocks(ino)?
             .into_iter()
             .map(|(_, block_ref)| block_ref.object_id)
@@ -8108,7 +8121,7 @@ impl StudioVfs {
             if trash_roots.contains(&current) {
                 return Ok(true);
             }
-            let attr = self.meta.get_attr(current)?;
+            let attr = self.sync_meta().get_attr(current)?;
             let parent = attr.parent;
             if parent == 0 || parent == current {
                 break;
@@ -8125,7 +8138,7 @@ impl StudioVfs {
     fn root_trash_dir_inodes(&self) -> VfsResult<HashSet<Ino>> {
         let mut trash_roots = HashSet::new();
         for entry in self
-            .meta
+            .sync_meta()
             .readdir(ROOT_INO)?
             .into_iter()
             .filter(|entry| entry.kind == FileType::Directory)
@@ -8419,7 +8432,7 @@ impl StudioVfs {
             return Vec::new();
         }
         // Ignore stale hints for inodes that no longer exist.
-        let attr = match self.meta.get_attr(ino) {
+        let attr = match self.sync_meta().get_attr(ino) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
                 self.readahead.evict(ino);
@@ -8693,7 +8706,7 @@ impl StudioVfs {
     }
 
     fn get_file_block_sync(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>> {
-        self.meta
+        self.sync_meta()
             .get_file_block(ino, block_index)
             .map_err(VfsError::Meta)
     }
@@ -9832,7 +9845,7 @@ impl StudioVfs {
             }
             let pending = self.block_cache.pending_upload_count();
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
-            let metadata_backlog = self.meta.replication_backlog();
+            let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
 
             let is_active = Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
@@ -10678,7 +10691,7 @@ impl StudioVfs {
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: persisting metadata"
         );
-        let meta = self.meta.clone();
+        let meta = self.sync_meta();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         match run_sync_with_timeout(metadata_flush_timeout, move || {
             meta.flush_metadata().map_err(VfsError::Meta)

@@ -29,6 +29,7 @@ pub async fn run_meta<T: Send + 'static>(
 ) -> VfsResult<T> {
     execute_sync_meta(engine, operation)
         .await
+        .map_err(VfsError::Join)?
         .map_err(VfsError::Meta)
 }
 
