@@ -272,6 +272,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
         config.upload_cache_io_user_penalty = value as u32;
     }
+    set_size!(
+        "STUDIOFS_TRANSIT_MEMORY_BUDGET",
+        transit_memory_budget_bytes
+    );
     set_u64!(
         "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
         upload_user_idle_grace_ms

@@ -10,11 +10,11 @@
 //!    OpenDAL's internal `RetryLayer`.
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
-use crate::qos::QosController;
+use crate::qos::{QosController, TransitMemoryBudget};
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::StreamExt;
 use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +31,9 @@ use tracing::{debug, error, info, warn};
 
 /// Capacity of the broadcast channel used for singleflight notifications.
 const BROADCAST_CAPACITY: usize = 2;
+/// Cap concurrent fragment GETs per logical object fetch to keep peak
+/// in-flight fragment memory bounded.
+const MAX_FRAGMENT_FETCH_IN_FLIGHT: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -56,6 +59,14 @@ pub enum FetchError {
 
     #[error("corrupt fragment layout for object {object_id}: {reason}")]
     CorruptFragment { object_id: u64, reason: String },
+
+    #[error(
+        "transit memory budget too small: required={required_bytes} bytes, budget={budget_bytes} bytes"
+    )]
+    TransitBudgetTooSmall {
+        required_bytes: usize,
+        budget_bytes: usize,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +150,8 @@ pub struct FetchScheduler {
     /// Independent fetch-stage credits so uploads/materialize cannot consume
     /// all execution capacity even if AIMD window is large.
     qos: Arc<QosController>,
+    /// Shared transit-memory budget to cap active in-flight buffer footprint.
+    transit_memory_budget: Arc<TransitMemoryBudget>,
 }
 
 impl FetchScheduler {
@@ -154,6 +167,7 @@ impl FetchScheduler {
         aimd_config: AimdConfig,
         default_prefetch_reserve_slots: usize,
         qos: Arc<QosController>,
+        transit_memory_budget: Arc<TransitMemoryBudget>,
         config: &VfsConfig,
     ) -> Self {
         let max_fetch_attempts = config.fetch_max_attempts.max(1);
@@ -195,6 +209,7 @@ impl FetchScheduler {
             prefetch_acquire_wait: Duration::from_millis(prefetch_acquire_wait_ms),
             metrics: FetchMetrics::new(),
             qos,
+            transit_memory_budget,
         }
     }
 
@@ -414,18 +429,48 @@ impl FetchScheduler {
         keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
+        let assembled_bytes = keys.len().saturating_mul(CLOUD_FRAGMENT_SIZE);
+        let fragment_window = keys.len().min(MAX_FRAGMENT_FETCH_IN_FLIGHT);
+        let in_flight_headroom_bytes = fragment_window.saturating_mul(CLOUD_FRAGMENT_SIZE);
+        let budget_bytes = assembled_bytes
+            .saturating_add(in_flight_headroom_bytes)
+            .max(1);
+        let budget_limit = self.transit_memory_budget.budget_bytes();
+        if budget_bytes > budget_limit {
+            return Err(FetchError::TransitBudgetTooSmall {
+                required_bytes: budget_bytes,
+                budget_bytes: budget_limit,
+            });
+        }
+        let _transit_credit = match class {
+            FetchClass::Foreground => {
+                self.transit_memory_budget
+                    .acquire_foreground(budget_bytes)
+                    .await
+            }
+            FetchClass::Prefetch => {
+                let wait = tokio::time::timeout(
+                    self.prefetch_acquire_wait,
+                    self.transit_memory_budget.acquire_background(budget_bytes),
+                )
+                .await;
+                match wait {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(FetchError::PrefetchSkipped),
+                }
+            }
+        };
+
         // Fetch fragments concurrently and copy each part into its final offset
         // as soon as it completes to avoid keeping both full `Vec<Bytes>` and
         // final payload in memory at once.
-        let mut in_flight = FuturesUnordered::new();
-        for (fragment_index, key) in keys.iter().enumerate() {
-            let key = key.clone();
-            in_flight.push(async move {
+        let mut in_flight = futures::stream::iter(keys.iter().cloned().enumerate())
+            .map(|(fragment_index, key)| async move {
                 self.fetch_fragment_with_retry(object_id, fragment_index, &key, class)
                     .await
                     .map(|part| (fragment_index, part))
-            });
-        }
+            })
+            .buffer_unordered(fragment_window.max(1));
 
         let mut assembled = vec![0u8; keys.len().saturating_mul(CLOUD_FRAGMENT_SIZE)];
         let mut lengths = vec![0usize; keys.len()];
