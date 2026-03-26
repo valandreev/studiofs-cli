@@ -9550,7 +9550,7 @@ impl StudioVfs {
                 object_id: op.object_id,
                 message: e.to_string(),
             })?;
-        let _transit_credit = if remote_object_visible {
+        let mut transit_credit = if remote_object_visible {
             None
         } else {
             Some(
@@ -9690,6 +9690,10 @@ impl StudioVfs {
                 Some(fragments)
             }
         };
+
+        if object_bytes.is_none() {
+            let _ = transit_credit.take();
+        }
 
         if let Some(object_bytes) = object_bytes {
             let uploads = fragment_keys

@@ -449,9 +449,15 @@ impl FetchScheduler {
                     .await
             }
             FetchClass::Prefetch => {
-                self.transit_memory_budget
-                    .acquire_background(budget_bytes)
-                    .await
+                let wait = tokio::time::timeout(
+                    self.prefetch_acquire_wait,
+                    self.transit_memory_budget.acquire_background(budget_bytes),
+                )
+                .await;
+                match wait {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(FetchError::PrefetchSkipped),
+                }
             }
         };
 
