@@ -932,7 +932,6 @@ fn parse_size_arg(label: &str, raw: &str) -> Result<u64> {
     }
 
     parse_size_bytes(raw)
-        .map(|value| value as u64)
         .or_else(|| raw.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .with_context(|| {

@@ -25,20 +25,9 @@ pub enum L2Profile {
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
-    let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if s.ends_with("TB") {
-        (&s[..s.len() - 2], 1024u64 * 1024 * 1024 * 1024)
-    } else if s.ends_with("GB") {
-        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
-    } else if s.ends_with("MB") {
-        (&s[..s.len() - 2], 1024u64 * 1024)
-    } else if s.ends_with("KB") {
-        (&s[..s.len() - 2], 1024u64)
-    } else {
-        (s.as_str(), 1u64)
-    };
-    let num: u64 = num_str.trim().parse()?;
-    Ok(num * multiplier)
+    let bytes = parse_size_bytes(s)
+        .ok_or_else(|| anyhow::anyhow!("invalid size '{}'", s))?;
+    Ok(bytes)
 }
 
 fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {
@@ -182,7 +171,9 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     macro_rules! set_size {
         ($key:literal, $field:ident) => {
             if let Ok(v) = std::env::var($key)
-                && let Some(bytes) = parse_size_bytes(&v).filter(|v| *v > 0)
+                && let Some(bytes) = parse_size_bytes(&v)
+                && bytes > 0
+                && let Ok(bytes) = usize::try_from(bytes)
             {
                 config.$field = bytes;
             }
@@ -192,9 +183,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
     set_size!("STUDIOFS_MAX_SPILL_BYTES", max_spill_bytes);
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
-        && let Some(bytes) = parse_size_bytes(&v).filter(|v| *v > 0)
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
     {
-        config.max_ingress_segment_bytes = bytes as u64;
+        config.max_ingress_segment_bytes = bytes;
     }
     if let Some(mode) = parse_env_cache_safety_mode("STUDIOFS_CACHE_SAFETY_MODE") {
         config.cache_safety_mode = mode;

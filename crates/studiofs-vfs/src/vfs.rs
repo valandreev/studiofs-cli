@@ -66,62 +66,6 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Parse a human-readable size string into bytes.
-///
-/// Supports plain bytes and `KB`, `MB`, `GB`, and `TB` suffixes.
-pub fn parse_size_bytes(raw: &str) -> Option<usize> {
-    let s = raw.trim().to_ascii_uppercase();
-    if s.is_empty() {
-        return None;
-    }
-    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("TB") {
-        (v, 1024u128 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("GB") {
-        (v, 1024u128 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("MB") {
-        (v, 1024u128 * 1024)
-    } else if let Some(v) = s.strip_suffix("KB") {
-        (v, 1024u128)
-    } else if let Some(v) = s.strip_suffix("B") {
-        (v, 1u128)
-    } else {
-        (s.as_str(), 1u128)
-    };
-    let num_part = num_part.trim();
-    let (int_part, frac_part) = match num_part.split_once('.') {
-        Some((int_part, frac_part)) => (int_part, frac_part),
-        None => (num_part, ""),
-    };
-
-    let int_part = if int_part.is_empty() {
-        0
-    } else {
-        int_part.trim().parse::<u128>().ok()?
-    };
-
-    if int_part == 0 && frac_part.is_empty() {
-        return Some(0);
-    }
-
-    let frac_part = frac_part.trim();
-    let (scaled_num, scale) = if frac_part.is_empty() {
-        (int_part, 1u128)
-    } else {
-        if !frac_part.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-        let frac_value = frac_part.parse::<u128>().ok()?;
-        let scale = 10u128.pow(frac_part.len() as u32);
-        let scaled_int = int_part.checked_mul(scale)?;
-        let scaled_num = scaled_int.checked_add(frac_value)?;
-        (scaled_num, scale)
-    };
-
-    let scaled_bytes = scaled_num.checked_mul(multiplier)?;
-    let bytes = scaled_bytes / scale;
-    usize::try_from(bytes).ok()
-}
-
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -705,26 +649,33 @@ pub struct VfsConfig {
     /// Lock retry max backoff.
     pub lock_retry_max_ms: u64,
     /// Maximum total bytes allowed in the dirty-write memory buffer.
+    /// Parsed from env via `parse_size_bytes` (for example `1.5GB`).
     pub max_dirty_bytes: usize,
     /// Maximum bytes allowed for a single xattr value.
+    /// Parsed from env via `parse_size_bytes` (for example `64KB`).
     pub max_xattr_bytes: usize,
     /// Dentry cache entry budget.
     pub dentry_cache_capacity: usize,
     /// Dentry cache byte budget.
+    /// Parsed from env via `parse_size_bytes` (for example `512MB`).
     pub dentry_cache_bytes: usize,
     /// Path shortcut cache entry budget.
     pub path_shortcut_cache_capacity: usize,
     /// Path shortcut cache byte budget.
+    /// Parsed from env via `parse_size_bytes` (for example `256MB`).
     pub path_shortcut_cache_bytes: usize,
     /// Attr read cache entry budget.
     pub attr_read_cache_capacity: usize,
     /// Attr read cache byte budget.
+    /// Parsed from env via `parse_size_bytes` (for example `128MB`).
     pub attr_read_cache_bytes: usize,
     /// Effective ACL cache entry budget.
     pub effective_acl_cache_capacity: usize,
     /// Maximum bytes allowed in local NVMe spill.
+    /// Parsed from env via `parse_size_bytes` (for example `64GB`).
     pub max_spill_bytes: usize,
     /// Maximum active ingress segment size.
+    /// Parsed from env via `parse_size_bytes` (for example `1GB`).
     pub max_ingress_segment_bytes: u64,
     /// Local cache durability/safety policy.
     pub cache_safety_mode: CacheSafetyMode,
@@ -784,6 +735,7 @@ pub struct VfsConfig {
     /// Upload slot cost when foreground reads are active.
     pub upload_cache_io_user_penalty: u32,
     /// Max active transit-memory bytes used by in-flight read/upload buffers.
+    /// Parsed from env via `parse_size_bytes` (for example `2GB`).
     pub transit_memory_budget_bytes: usize,
     /// User idle grace after the last foreground read.
     pub upload_user_idle_grace_ms: u64,
@@ -10757,13 +10709,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
-
-    #[test]
-    fn parse_size_bytes_accepts_fractional_values() {
-        assert_eq!(parse_size_bytes("1.5MB"), Some(1_572_864));
-        assert_eq!(parse_size_bytes("2.25GB"), Some(2_415_919_104));
-        assert_eq!(parse_size_bytes("0.5KB"), Some(512));
-    }
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
