@@ -1785,110 +1785,6 @@ impl PgMetaEngine {
 }
 
 impl MetaEngineCore for PgMetaEngine {
-    fn flush_metadata(&self) -> MetaResult<()> {
-        let _guard = self
-            .replication_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
-            self.flush_pending_claimed_batch_with_restore(batch)?
-        } else {
-            None
-        };
-        let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
-        self.write_checkpoint_locked()?;
-        Ok(())
-    }
-
-    fn request_eager_flush(&self) {
-        self.request_pending_flush();
-    }
-
-    fn sync_metadata(&self) -> MetaResult<()> {
-        let _guard = self
-            .replication_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let _ = self.pull_foreign_events_locked(None)?;
-        Ok(())
-    }
-
-    fn invalidation_sender_id(&self) -> Option<String> {
-        Some(self.client_id.clone())
-    }
-
-    fn metadata_version_token(&self) -> Option<String> {
-        Some(self.local_version.load(Ordering::SeqCst).to_string())
-    }
-
-    fn namespace_version_token(&self) -> Option<String> {
-        Some(self.namespace_version.load(Ordering::SeqCst).to_string())
-    }
-
-    fn replication_backlog(&self) -> crate::engine::MetadataReplicationBacklog {
-        let pending_ops = self
-            .pending_state
-            .lock()
-            .map(|state| state.ops)
-            .unwrap_or(0);
-        let inflight_ops = self.inflight_replication_ops.load(Ordering::SeqCst);
-        crate::engine::MetadataReplicationBacklog {
-            pending_ops,
-            inflight_ops,
-        }
-    }
-
-    fn check_consistency(&self) -> MetaResult<()> {
-        let local_info = self.local.get_format_info()?;
-        let remote_uuid = self.fetch_remote_uuid(self.volume_id)?;
-        if local_info.uuid != remote_uuid {
-            return Err(MetaError::UuidMismatch {
-                local: local_info.uuid,
-                remote: remote_uuid,
-            });
-        }
-        Ok(())
-    }
-
-    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
-        let postgres_url = self.postgres_url.clone();
-        let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
-        let command_timeout = self.command_timeout;
-        let size = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
-                command_timeout,
-                "fetch remote metadata size",
-                move |client| async move {
-                    let row = client
-                        .query_one(
-                            r#"
-                            SELECT 
-                                (SELECT COALESCE(SUM(pg_column_size(snapshot)), 0) FROM metadata_state WHERE vol = $1) +
-                                (SELECT COALESCE(SUM(pg_column_size(event_payload)), 0) FROM event_log WHERE vol = $1) +
-                                (SELECT COALESCE(SUM(pg_column_size(snapshot_payload)), 0) FROM snapshots WHERE vol = $1)
-                            "#,
-                            &[&volume_id],
-                        )
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres metadata size query failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })?;
-                    let bytes: i64 = row.get(0);
-                    // COALESCE ensures non-negative; saturating conversion handles edge cases
-                    Ok(bytes.max(0) as u64)
-                },
-            )
-            .await
-        })?;
-        Ok(Some(size))
-    }
-
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
         self.local.get_counter(name)
     }
@@ -2213,7 +2109,110 @@ impl MetaSymlink for PgMetaEngine {}
 impl MetaXattr for PgMetaEngine {}
 impl MetaAcl for PgMetaEngine {}
 impl MetaSnapshots for PgMetaEngine {}
-impl MetaReplication for PgMetaEngine {}
+impl MetaReplication for PgMetaEngine {
+    fn flush_metadata(&self) -> MetaResult<()> {
+        let _guard = self
+            .replication_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
+            self.flush_pending_claimed_batch_with_restore(batch)?
+        } else {
+            None
+        };
+        let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
+        self.write_checkpoint_locked()?;
+        Ok(())
+    }
+
+    fn request_eager_flush(&self) {
+        self.request_pending_flush();
+    }
+
+    fn sync_metadata(&self) -> MetaResult<()> {
+        let _guard = self
+            .replication_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let _ = self.pull_foreign_events_locked(None)?;
+        Ok(())
+    }
+
+    fn invalidation_sender_id(&self) -> Option<String> {
+        Some(self.client_id.clone())
+    }
+
+    fn metadata_version_token(&self) -> Option<String> {
+        Some(self.local_version.load(Ordering::SeqCst).to_string())
+    }
+
+    fn namespace_version_token(&self) -> Option<String> {
+        Some(self.namespace_version.load(Ordering::SeqCst).to_string())
+    }
+
+    fn replication_backlog(&self) -> crate::engine::MetadataReplicationBacklog {
+        let pending_ops = self
+            .pending_state
+            .lock()
+            .map(|state| state.ops)
+            .unwrap_or(0);
+        let inflight_ops = self.inflight_replication_ops.load(Ordering::SeqCst);
+        crate::engine::MetadataReplicationBacklog {
+            pending_ops,
+            inflight_ops,
+        }
+    }
+
+    fn check_consistency(&self) -> MetaResult<()> {
+        let local_info = self.local.get_format_info()?;
+        let remote_uuid = self.fetch_remote_uuid(self.volume_id)?;
+        if local_info.uuid != remote_uuid {
+            return Err(MetaError::UuidMismatch {
+                local: local_info.uuid,
+                remote: remote_uuid,
+            });
+        }
+        Ok(())
+    }
+
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let size = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "fetch remote metadata size",
+                move |client| async move {
+                    let row = client
+                        .query_one(
+                            r#"
+                            SELECT 
+                                (SELECT COALESCE(SUM(pg_column_size(snapshot)), 0) FROM metadata_state WHERE vol = $1) +
+                                (SELECT COALESCE(SUM(pg_column_size(event_payload)), 0) FROM event_log WHERE vol = $1) +
+                                (SELECT COALESCE(SUM(pg_column_size(snapshot_payload)), 0) FROM snapshots WHERE vol = $1)
+                            "#,
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres metadata size query failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    let bytes: i64 = row.get(0);
+                    Ok(bytes.max(0) as u64)
+                },
+            )
+            .await
+        })?;
+        Ok(Some(size))
+    }
+}
 impl crate::engine::MetaEngine for PgMetaEngine {}
 
 #[cfg(test)]

@@ -153,56 +153,6 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync {
-    /// Verify that the local metadata matches the remote state (e.g. UUID check).
-    ///
-    /// Engines that support remote verification should override this.
-    fn check_consistency(&self) -> MetaResult<()>;
-
-    /// Flush pending metadata mutations to remote store (if any).
-    ///
-    /// Local-only engines can keep the default no-op implementation.
-    fn flush_metadata(&self) -> MetaResult<()>;
-
-    /// Force metadata synchronization from remote source (if applicable).
-    ///
-    /// Used by strong-consistency paths (e.g. distributed file locks) to
-    /// guarantee refresh-before-lock-grant semantics.
-    fn sync_metadata(&self) -> MetaResult<()>;
-
-    /// Stable identifier used for invalidation self-echo suppression.
-    ///
-    /// Engines that publish invalidation events should override this and return
-    /// the same identifier they include in event payloads.
-    fn invalidation_sender_id(&self) -> Option<String>;
-
-    /// Request a near-immediate flush of pending metadata mutations.
-    ///
-    /// Called by the VFS after user-visible directory mutations (create,
-    /// unlink, rmdir, rename, …) so that changes reach remote metadata within
-    /// a short batching window (~250 ms) instead of waiting for the full
-    /// `flush_interval` (default 60 s).  The default is a no-op.
-    fn request_eager_flush(&self);
-
-    /// Best-effort metadata version token for change detection.
-    ///
-    /// Remote-backed engines can expose a monotonic-ish token (for example,
-    /// an object ETag) so invalidation listeners can tell whether a sync
-    /// actually observed a newer remote snapshot.
-    fn metadata_version_token(&self) -> Option<String>;
-
-    /// Best-effort namespace-only version token for dentry/path invalidation.
-    ///
-    /// This token should advance only for namespace mutations (add/remove/rename
-    /// directory entries). By default it falls back to `metadata_version_token()`
-    /// for engines that don't expose finer-grained signals yet.
-    fn namespace_version_token(&self) -> Option<String> {
-        self.metadata_version_token()
-    }
-
-    /// Best-effort count of local metadata mutations not yet durably pushed to
-    /// the shared remote metadata source.
-    fn replication_backlog(&self) -> MetadataReplicationBacklog;
-
     // ─── Counters ────────────────────────────────────────────────────────
 
     /// Get a counter value, returns 0 if not set.
@@ -418,9 +368,6 @@ pub trait MetaEngineCore: Send + Sync {
     /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
 
-    /// Return the estimated size of remote metadata in bytes, if applicable.
-    fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
-
     // ─── High-Level Operations ───────────────────────────────────────────
 
     /// Create a new file: allocate inode, set attrs, add dentry.
@@ -585,7 +532,36 @@ pub trait MetaAcl: MetaEngineCore {}
 
 pub trait MetaSnapshots: MetaEngineCore {}
 
-pub trait MetaReplication: MetaEngineCore {}
+pub trait MetaReplication: Send + Sync {
+    /// Verify that the local metadata matches the remote state (e.g. UUID check).
+    fn check_consistency(&self) -> MetaResult<()>;
+
+    /// Flush pending metadata mutations to remote store (if any).
+    fn flush_metadata(&self) -> MetaResult<()>;
+
+    /// Force metadata synchronization from remote source (if applicable).
+    fn sync_metadata(&self) -> MetaResult<()>;
+
+    /// Stable identifier used for invalidation self-echo suppression.
+    fn invalidation_sender_id(&self) -> Option<String>;
+
+    /// Request a near-immediate flush of pending metadata mutations.
+    fn request_eager_flush(&self);
+
+    /// Best-effort metadata version token for change detection.
+    fn metadata_version_token(&self) -> Option<String>;
+
+    /// Best-effort namespace-only version token for dentry/path invalidation.
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
+
+    /// Best-effort count of local metadata mutations not yet durably pushed to remote.
+    fn replication_backlog(&self) -> MetadataReplicationBacklog;
+
+    /// Return the estimated size of remote metadata in bytes, if applicable.
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
+}
 
 /// Public aggregate contract for consumers.
 pub trait MetaEngine:

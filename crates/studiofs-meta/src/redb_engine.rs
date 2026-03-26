@@ -3308,36 +3308,6 @@ impl RedbMetaEngine {
 }
 
 impl MetaEngineCore for RedbMetaEngine {
-    fn check_consistency(&self) -> MetaResult<()> {
-        Ok(())
-    }
-
-    fn flush_metadata(&self) -> MetaResult<()> {
-        Ok(())
-    }
-
-    fn sync_metadata(&self) -> MetaResult<()> {
-        Ok(())
-    }
-
-    fn invalidation_sender_id(&self) -> Option<String> {
-        None
-    }
-
-    fn request_eager_flush(&self) {}
-
-    fn metadata_version_token(&self) -> Option<String> {
-        None
-    }
-
-    fn namespace_version_token(&self) -> Option<String> {
-        self.metadata_version_token()
-    }
-
-    fn replication_backlog(&self) -> MetadataReplicationBacklog {
-        MetadataReplicationBacklog::default()
-    }
-
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
         Ok(true)
     }
@@ -3352,10 +3322,6 @@ impl MetaEngineCore for RedbMetaEngine {
             pins.extend(snapshot.pinned_object_ids);
         }
         Ok(pins)
-    }
-
-    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
-        Ok(None)
     }
 
     // ─── Counters ────────────────────────────────────────────────────────
@@ -6199,7 +6165,41 @@ impl MetaSymlink for RedbMetaEngine {}
 impl MetaXattr for RedbMetaEngine {}
 impl MetaAcl for RedbMetaEngine {}
 impl MetaSnapshots for RedbMetaEngine {}
-impl MetaReplication for RedbMetaEngine {}
+impl MetaReplication for RedbMetaEngine {
+    fn check_consistency(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn flush_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn sync_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn invalidation_sender_id(&self) -> Option<String> {
+        None
+    }
+
+    fn request_eager_flush(&self) {}
+
+    fn metadata_version_token(&self) -> Option<String> {
+        None
+    }
+
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
+
+    fn replication_backlog(&self) -> MetadataReplicationBacklog {
+        MetadataReplicationBacklog::default()
+    }
+
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        Ok(None)
+    }
+}
 impl crate::engine::MetaEngine for RedbMetaEngine {}
 
 #[cfg(test)]
