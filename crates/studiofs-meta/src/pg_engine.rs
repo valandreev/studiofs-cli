@@ -1853,32 +1853,6 @@ impl MetaEngineCore for PgMetaEngine {
         self.mutate(|local| local.link(ino, new_parent, new_name))
     }
 
-    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
-        self.mutate(|local| local.set_acl_rule(ino, principal, access_level))
-    }
-
-    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
-        self.mutate(|local| local.remove_acl_rule(ino, principal))
-    }
-
-    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
-        self.local.get_acl_rule(ino, principal)
-    }
-
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        self.mutate(|local| local.create_snapshot(root_ino))
-    }
-
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let _ = self.sync_metadata();
-        self.local.list_snapshots()
-    }
-
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let _ = self.sync_metadata();
-        self.local.get_snapshot(snapshot_id)
-    }
-
     fn create_symlink(
         &self,
         parent: Ino,
@@ -2107,8 +2081,34 @@ impl MetaXattr for PgMetaEngine {
         self.local.list_xattrs(ino)
     }
 }
-impl MetaAcl for PgMetaEngine {}
-impl MetaSnapshots for PgMetaEngine {}
+impl MetaAcl for PgMetaEngine {
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
+        self.mutate(|local| local.set_acl_rule(ino, principal, access_level))
+    }
+
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
+        self.mutate(|local| local.remove_acl_rule(ino, principal))
+    }
+
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
+        self.local.get_acl_rule(ino, principal)
+    }
+}
+impl MetaSnapshots for PgMetaEngine {
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        self.mutate(|local| local.create_snapshot(root_ino))
+    }
+
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        let _ = self.sync_metadata();
+        self.local.list_snapshots()
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        let _ = self.sync_metadata();
+        self.local.get_snapshot(snapshot_id)
+    }
+}
 impl MetaReplication for PgMetaEngine {
     fn flush_metadata(&self) -> MetaResult<()> {
         let _guard = self

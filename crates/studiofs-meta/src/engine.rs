@@ -236,17 +236,6 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         self.link_atomic(ino, new_parent, new_name)
     }
 
-    // ─── Access Control (ACL) ────────────────────────────────────────────
-
-    /// Set (create/update) explicit ACL rule for `(ino, principal)`.
-    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()>;
-
-    /// Remove explicit ACL rule for `(ino, principal)`.
-    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()>;
-
-    /// Get explicit ACL rule for `(ino, principal)`, if present.
-    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>>;
-
     /// Create a symlink: allocate inode, store target, add dentry.
     fn create_symlink(
         &self,
@@ -256,17 +245,6 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         uid: u32,
         gid: u32,
     ) -> MetaResult<InodeAttr>;
-
-    // ─── Snapshots ────────────────────────────────────────────────────────
-
-    /// Create an immutable snapshot rooted at `root_ino`.
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot>;
-
-    /// List known snapshots.
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>>;
-
-    /// Look up snapshot by id.
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
 }
 
 pub trait MetaFormat: Send + Sync {
@@ -506,9 +484,27 @@ pub trait MetaXattr: Send + Sync {
     fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
 }
 
-pub trait MetaAcl: MetaEngineCore {}
+pub trait MetaAcl: Send + Sync {
+    /// Set (create/update) explicit ACL rule for `(ino, principal)`.
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()>;
 
-pub trait MetaSnapshots: MetaEngineCore {}
+    /// Remove explicit ACL rule for `(ino, principal)`.
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()>;
+
+    /// Get explicit ACL rule for `(ino, principal)`, if present.
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>>;
+}
+
+pub trait MetaSnapshots: Send + Sync {
+    /// Create an immutable snapshot rooted at `root_ino`.
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot>;
+
+    /// List known snapshots.
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>>;
+
+    /// Look up snapshot by id.
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
+}
 
 pub trait MetaReplication: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).

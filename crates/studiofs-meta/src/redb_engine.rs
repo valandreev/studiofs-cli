@@ -3525,102 +3525,6 @@ impl MetaEngineCore for RedbMetaEngine {
         Ok(result)
     }
 
-    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
-        let _ = self.get_attr(ino)?;
-        let key = encode_acl_rule_key(ino, principal);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut rules = txn
-                .open_table(ACL_RULES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            rules
-                .insert(key.as_slice(), access_level as u8)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut tombstones = txn
-                .open_table(ACL_RULE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = tombstones.remove(key.as_slice());
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetAclRule {
-                    ino,
-                    principal: principal.to_string(),
-                    access_level,
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
-        let key = encode_acl_rule_key(ino, principal);
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut rules = txn
-                .open_table(ACL_RULES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = rules.remove(key.as_slice());
-            let mut tombstones = txn
-                .open_table(ACL_RULE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            tombstones
-                .insert(key.as_slice(), 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemoveAclRule {
-                    ino,
-                    principal: principal.to_string(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
-        let key = encode_acl_rule_key(ino, principal);
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if Self::has_slice_marker(&txn, ACL_RULE_TOMBSTONES_TABLE, key.as_slice())? {
-            return Ok(None);
-        }
-        let rules = txn
-            .open_table(ACL_RULES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if let Some(value) = rules
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            return AccessLevel::from_u8(value.value())
-                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
-                .map(Some);
-        }
-        let base = txn
-            .open_table(BASE_ACL_RULES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match base
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(value) => AccessLevel::from_u8(value.value())
-                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
-                .map(Some),
-            None => Ok(None),
-        }
-    }
-
     // --- High-Level Operations (ACID Atomicity) --------------------------
 
     fn create_file(
@@ -4240,93 +4144,6 @@ impl MetaEngineCore for RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
-    }
-
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        let root_attr = self.get_attr(root_ino)?;
-        if root_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(root_ino));
-        }
-
-        let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
-        let snapshot_payload = serde_json::to_vec(&self.export_snapshot()?)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-
-        let snapshot = MetadataSnapshot {
-            id: uuid::Uuid::new_v4().to_string(),
-            root_ino,
-            created_at: InodeAttr::now_nanos(),
-            state: SnapshotState::Pending,
-            pinned_object_ids,
-            snapshot_payload,
-        };
-
-        let bytes = encode(&snapshot)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(SNAPSHOTS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(snapshot.id.as_str(), bytes.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::CreateSnapshot {
-                    snapshot: snapshot.clone(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(snapshot)
-    }
-
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut snapshots = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_id, raw) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let snapshot: MetadataSnapshot = decode(raw.value())?;
-            snapshots.push(snapshot);
-        }
-        snapshots.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(snapshots)
-    }
-
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let Some(raw) = table
-            .get(snapshot_id)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        let snapshot: MetadataSnapshot = decode(raw.value())?;
-        Ok(Some(snapshot))
     }
 }
 
@@ -6145,8 +5962,191 @@ impl MetaXattr for RedbMetaEngine {
         Ok(names.into_iter().collect())
     }
 }
-impl MetaAcl for RedbMetaEngine {}
-impl MetaSnapshots for RedbMetaEngine {}
+impl MetaAcl for RedbMetaEngine {
+    fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
+        let _ = self.get_attr(ino)?;
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut rules = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            rules
+                .insert(key.as_slice(), access_level as u8)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = tombstones.remove(key.as_slice());
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal: principal.to_string(),
+                    access_level,
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut rules = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = rules.remove(key.as_slice());
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones
+                .insert(key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveAclRule {
+                    ino,
+                    principal: principal.to_string(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
+        let key = encode_acl_rule_key(ino, principal);
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if Self::has_slice_marker(&txn, ACL_RULE_TOMBSTONES_TABLE, key.as_slice())? {
+            return Ok(None);
+        }
+        let rules = txn
+            .open_table(ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(value) = rules
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            return AccessLevel::from_u8(value.value())
+                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
+                .map(Some);
+        }
+        let base = txn
+            .open_table(BASE_ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match base
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(value) => AccessLevel::from_u8(value.value())
+                .ok_or_else(|| MetaError::Serialization("invalid ACL access_level".to_string()))
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+}
+impl MetaSnapshots for RedbMetaEngine {
+    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
+        let root_attr = self.get_attr(root_ino)?;
+        if root_attr.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(root_ino));
+        }
+
+        let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
+        let snapshot_payload = serde_json::to_vec(&self.export_snapshot()?)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+
+        let snapshot = MetadataSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            root_ino,
+            created_at: InodeAttr::now_nanos(),
+            state: SnapshotState::Pending,
+            pinned_object_ids,
+            snapshot_payload,
+        };
+
+        let bytes = encode(&snapshot)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(SNAPSHOTS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert(snapshot.id.as_str(), bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::CreateSnapshot {
+                    snapshot: snapshot.clone(),
+                },
+            )?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(snapshot)
+    }
+
+    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut snapshots = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_id, raw) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let snapshot: MetadataSnapshot = decode(raw.value())?;
+            snapshots.push(snapshot);
+        }
+        snapshots.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(snapshots)
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SNAPSHOTS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let Some(raw) = table
+            .get(snapshot_id)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let snapshot: MetadataSnapshot = decode(raw.value())?;
+        Ok(Some(snapshot))
+    }
+}
 impl MetaReplication for RedbMetaEngine {
     fn check_consistency(&self) -> MetaResult<()> {
         Ok(())
