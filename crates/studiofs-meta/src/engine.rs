@@ -603,19 +603,3 @@ pub trait MetaEngine:
     + MetaReplication
 {
 }
-
-impl<T> MetaEngine for T where
-    T: MetaEngineCore
-        + MetaFormat
-        + MetaInodes
-        + MetaNamespace
-        + MetaBlocks
-        + MetaGc
-        + MetaRecovery
-        + MetaSymlink
-        + MetaXattr
-        + MetaAcl
-        + MetaSnapshots
-        + MetaReplication
-{
-}

@@ -6200,6 +6200,7 @@ impl MetaXattr for RedbMetaEngine {}
 impl MetaAcl for RedbMetaEngine {}
 impl MetaSnapshots for RedbMetaEngine {}
 impl MetaReplication for RedbMetaEngine {}
+impl crate::engine::MetaEngine for RedbMetaEngine {}
 
 #[cfg(test)]
 mod tests {

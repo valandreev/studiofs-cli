@@ -2214,6 +2214,7 @@ impl MetaXattr for PgMetaEngine {}
 impl MetaAcl for PgMetaEngine {}
 impl MetaSnapshots for PgMetaEngine {}
 impl MetaReplication for PgMetaEngine {}
+impl crate::engine::MetaEngine for PgMetaEngine {}
 
 #[cfg(test)]
 mod tests {
