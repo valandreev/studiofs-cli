@@ -25,20 +25,9 @@ pub enum L2Profile {
 
 /// Parse a human-readable size string like "100GB", "512MB", "1TB".
 fn parse_size(s: &str) -> anyhow::Result<u64> {
-    let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if s.ends_with("TB") {
-        (&s[..s.len() - 2], 1024u64 * 1024 * 1024 * 1024)
-    } else if s.ends_with("GB") {
-        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
-    } else if s.ends_with("MB") {
-        (&s[..s.len() - 2], 1024u64 * 1024)
-    } else if s.ends_with("KB") {
-        (&s[..s.len() - 2], 1024u64)
-    } else {
-        (s.as_str(), 1u64)
-    };
-    let num: u64 = num_str.trim().parse()?;
-    Ok(num * multiplier)
+    let bytes = parse_size_bytes(s)
+        .ok_or_else(|| anyhow::anyhow!("invalid size '{}'", s))?;
+    u64::try_from(bytes).map_err(|_| anyhow::anyhow!("size too large: '{}'", s))
 }
 
 fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {

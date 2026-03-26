@@ -12,6 +12,7 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngine, MetadataBackend,
     MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
 };
+use studiofs_vfs::parse_size_bytes;
 use tracing::info;
 use uuid::Uuid;
 
@@ -20,32 +21,9 @@ use uuid::Uuid;
 /// Parse a size string like "4MB", "1GB" into bytes.
 /// Supports KB, MB, GB, TB suffixes. Defaults to bytes if no suffix.
 fn parse_size(size_str: &str) -> anyhow::Result<u32> {
-    let size_str = size_str.trim().to_uppercase();
-
-    let (num_part, suffix) = if let Some(pos) = size_str.find(|c: char| c.is_alphabetic()) {
-        (&size_str[..pos], &size_str[pos..])
-    } else {
-        (&size_str[..], "")
-    };
-
-    let num: u64 = num_part
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid number in size: {}", size_str))?;
-
-    let multiplier = match suffix {
-        "" => 1,
-        "B" => 1,
-        "KB" => 1024,
-        "MB" => 1024 * 1024,
-        "GB" => 1024 * 1024 * 1024,
-        "TB" => 1024 * 1024 * 1024 * 1024,
-        _ => return Err(anyhow::anyhow!("Unknown size suffix: {}", suffix)),
-    };
-
-    let bytes = num.saturating_mul(multiplier);
-
-    if bytes > u32::MAX as u64 {
+    let bytes = parse_size_bytes(size_str)
+        .ok_or_else(|| anyhow::anyhow!("Invalid size: {}", size_str))?;
+    if bytes > u32::MAX as usize {
         return Err(anyhow::anyhow!(
             "Block size too large: {} (max 4GB)",
             size_str
