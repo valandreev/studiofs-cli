@@ -107,6 +107,11 @@ studiofs mount myvolume Y:
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
 
+Size inputs used by CLI flags and runtime `STUDIOFS_*_BYTES` environment
+variables accept `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` suffixes (binary
+units, `1KB = 1024B`) and fractional values like `1.5GB` (rounded down to
+bytes).
+
 Quick benchmark example:
 
 ```bash

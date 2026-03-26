@@ -382,7 +382,10 @@ studiofs mount projectfs /mnt/studio/projectfs-b
 
 ### Runtime
 
-Size-formatted variables (`*_BYTES` values) accept fractional inputs such as `1.5GB`; parsing rounds down fractional bytes.
+Size-formatted values (for `*_BYTES` variables and size-like CLI flags) accept
+fractional inputs such as `1.5GB`; parsing rounds down fractional bytes.
+Supported suffixes are `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` using binary
+multipliers (`1KB = 1024B`).
 
 | Variable | Default | Description |
 |---|---|---|
