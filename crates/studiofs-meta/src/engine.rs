@@ -153,21 +153,6 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
-    // ─── Pending Deletions (GC) ───────────────────────
-
-    /// Add a block to pending deletions (mark for GC).
-    /// The timestamp is used for grace period.
-    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>;
-
-    /// Remove a block from pending deletions (after GC).
-    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()>;
-
-    /// Get all pending deletions (object_id, timestamp).
-    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
-
-    /// Get currently referenced object IDs from FILE_BLOCKS metadata.
-    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
-
     /// Replay pending create intents and heal dangling namespace entries.
     ///
     /// Returns parent inode ids whose directory namespace was mutated during replay.
@@ -506,7 +491,20 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
 }
 
-pub trait MetaGc: MetaEngineCore {}
+pub trait MetaGc: Send + Sync {
+    /// Add a block to pending deletions (mark for GC).
+    /// The timestamp is used for grace period.
+    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>;
+
+    /// Remove a block from pending deletions (after GC).
+    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()>;
+
+    /// Get all pending deletions (object_id, timestamp).
+    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
+
+    /// Get currently referenced object IDs from FILE_BLOCKS metadata.
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
+}
 
 pub trait MetaRecovery: MetaEngineCore {}
 

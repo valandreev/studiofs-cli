@@ -1785,18 +1785,6 @@ impl PgMetaEngine {
 }
 
 impl MetaEngineCore for PgMetaEngine {
-    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
-        self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
-    }
-
-    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
-        self.mutate(|local| local.remove_pending_deletion(object_id))
-    }
-
-    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
-        self.local.get_pending_deletions()
-    }
-
     fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
         self.mutate(|local| local.add_deferred_delete(record))
     }
@@ -1807,10 +1795,6 @@ impl MetaEngineCore for PgMetaEngine {
 
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
         self.local.list_deferred_deletes()
-    }
-
-    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        self.local.get_referenced_object_ids()
     }
 
     fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
@@ -2103,7 +2087,23 @@ impl MetaBlocks for PgMetaEngine {
         result
     }
 }
-impl MetaGc for PgMetaEngine {}
+impl MetaGc for PgMetaEngine {
+    fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
+        self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
+    }
+
+    fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
+        self.mutate(|local| local.remove_pending_deletion(object_id))
+    }
+
+    fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>> {
+        self.local.get_pending_deletions()
+    }
+
+    fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.local.get_referenced_object_ids()
+    }
+}
 impl MetaRecovery for PgMetaEngine {}
 impl MetaSymlink for PgMetaEngine {}
 impl MetaXattr for PgMetaEngine {}
