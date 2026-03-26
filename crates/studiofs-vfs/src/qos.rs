@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::vfs::VfsConfig;
 use studiofs_meta::Ino;
@@ -80,6 +81,185 @@ pub struct FairInodeScheduler<T> {
     ready_set: HashSet<Ino>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitPriority {
+    Foreground,
+    Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitMemorySnapshot {
+    pub budget_bytes: usize,
+    pub used_bytes: usize,
+    pub available_bytes: usize,
+    pub waiting_foreground: usize,
+    pub waiting_background: usize,
+}
+
+#[derive(Debug)]
+pub struct TransitMemoryBudget {
+    budget_bytes: usize,
+    state: Mutex<TransitMemoryBudgetState>,
+    notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct TransitMemoryBudgetState {
+    used_bytes: usize,
+    waiting_foreground: usize,
+    waiting_background: usize,
+}
+
+#[derive(Debug)]
+pub struct TransitMemoryGuard {
+    budget: Arc<TransitMemoryBudget>,
+    bytes: usize,
+}
+
+impl TransitMemoryBudget {
+    pub fn new(budget_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            budget_bytes: budget_bytes.max(1),
+            state: Mutex::new(TransitMemoryBudgetState::default()),
+            notify: Notify::new(),
+        })
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    pub fn snapshot(&self) -> TransitMemorySnapshot {
+        let state = self.state.lock();
+        TransitMemorySnapshot {
+            budget_bytes: self.budget_bytes,
+            used_bytes: state.used_bytes,
+            available_bytes: self.budget_bytes.saturating_sub(state.used_bytes),
+            waiting_foreground: state.waiting_foreground,
+            waiting_background: state.waiting_background,
+        }
+    }
+
+    pub async fn acquire_foreground(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
+        self.acquire(TransitPriority::Foreground, bytes).await
+    }
+
+    pub async fn acquire_background(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
+        self.acquire(TransitPriority::Background, bytes).await
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        priority: TransitPriority,
+        requested_bytes: usize,
+    ) -> TransitMemoryGuard {
+        let requested_bytes = requested_bytes.max(1).min(self.budget_bytes);
+        let mut waiter = TransitWaiter::new(self, priority);
+
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock();
+                if can_allocate(&state, self.budget_bytes, requested_bytes, priority) {
+                    waiter.disarm(&mut state);
+                    state.used_bytes = state.used_bytes.saturating_add(requested_bytes);
+                    return TransitMemoryGuard {
+                        budget: self.clone(),
+                        bytes: requested_bytes,
+                    };
+                }
+                waiter.ensure_registered(&mut state);
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        {
+            let mut state = self.state.lock();
+            state.used_bytes = state.used_bytes.saturating_sub(bytes);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for TransitMemoryGuard {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+fn can_allocate(
+    state: &TransitMemoryBudgetState,
+    budget_bytes: usize,
+    requested_bytes: usize,
+    priority: TransitPriority,
+) -> bool {
+    if state.used_bytes.saturating_add(requested_bytes) > budget_bytes {
+        return false;
+    }
+    match priority {
+        TransitPriority::Foreground => true,
+        TransitPriority::Background => state.waiting_foreground == 0,
+    }
+}
+
+struct TransitWaiter<'a> {
+    budget: &'a Arc<TransitMemoryBudget>,
+    priority: TransitPriority,
+    registered: bool,
+}
+
+impl<'a> TransitWaiter<'a> {
+    fn new(budget: &'a Arc<TransitMemoryBudget>, priority: TransitPriority) -> Self {
+        Self {
+            budget,
+            priority,
+            registered: false,
+        }
+    }
+
+    fn ensure_registered(&mut self, state: &mut TransitMemoryBudgetState) {
+        if self.registered {
+            return;
+        }
+        self.registered = true;
+        match self.priority {
+            TransitPriority::Foreground => {
+                state.waiting_foreground = state.waiting_foreground.saturating_add(1);
+            }
+            TransitPriority::Background => {
+                state.waiting_background = state.waiting_background.saturating_add(1);
+            }
+        }
+    }
+
+    fn disarm(&mut self, state: &mut TransitMemoryBudgetState) {
+        if !self.registered {
+            return;
+        }
+        self.registered = false;
+        match self.priority {
+            TransitPriority::Foreground => {
+                state.waiting_foreground = state.waiting_foreground.saturating_sub(1);
+            }
+            TransitPriority::Background => {
+                state.waiting_background = state.waiting_background.saturating_sub(1);
+            }
+        }
+    }
+}
+
+impl Drop for TransitWaiter<'_> {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut state = self.budget.state.lock();
+        self.disarm(&mut state);
+    }
+}
+
 impl<T> Default for FairInodeScheduler<T> {
     fn default() -> Self {
         Self {
@@ -136,7 +316,9 @@ impl<T> FairInodeScheduler<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::FairInodeScheduler;
+    use super::{FairInodeScheduler, TransitMemoryBudget};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn round_robin_across_inodes() {
@@ -153,5 +335,43 @@ mod tests {
         }
 
         assert_eq!(out, vec![1, 3, 5, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn transit_memory_budget_prioritizes_foreground_waiters() {
+        let budget = TransitMemoryBudget::new(2);
+        let bg_holder = budget.acquire_background(2).await;
+
+        let bg_budget = budget.clone();
+        let (bg_tx, bg_rx) = oneshot::channel::<()>();
+        let bg_waiter = tokio::spawn(async move {
+            let _guard = bg_budget.acquire_background(2).await;
+            let _ = bg_tx.send(());
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let fg_budget = budget.clone();
+        let (fg_tx, fg_rx) = oneshot::channel::<()>();
+        let fg_waiter = tokio::spawn(async move {
+            let _guard = fg_budget.acquire_foreground(1).await;
+            let _ = fg_tx.send(());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(bg_holder);
+
+        timeout(Duration::from_millis(250), fg_rx)
+            .await
+            .expect("foreground waiter should complete first")
+            .expect("foreground waiter should notify");
+        assert!(timeout(Duration::from_millis(50), bg_rx).await.is_err());
+
+        fg_waiter.await.unwrap();
+        timeout(Duration::from_millis(250), bg_waiter)
+            .await
+            .expect("background waiter should complete after foreground releases")
+            .expect("background waiter join should succeed");
     }
 }

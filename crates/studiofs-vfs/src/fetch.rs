@@ -10,7 +10,7 @@
 //!    OpenDAL's internal `RetryLayer`.
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
-use crate::qos::QosController;
+use crate::qos::{QosController, TransitMemoryBudget};
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -139,6 +139,8 @@ pub struct FetchScheduler {
     /// Independent fetch-stage credits so uploads/materialize cannot consume
     /// all execution capacity even if AIMD window is large.
     qos: Arc<QosController>,
+    /// Shared transit-memory budget to cap active in-flight buffer footprint.
+    transit_memory_budget: Arc<TransitMemoryBudget>,
 }
 
 impl FetchScheduler {
@@ -154,6 +156,7 @@ impl FetchScheduler {
         aimd_config: AimdConfig,
         default_prefetch_reserve_slots: usize,
         qos: Arc<QosController>,
+        transit_memory_budget: Arc<TransitMemoryBudget>,
         config: &VfsConfig,
     ) -> Self {
         let max_fetch_attempts = config.fetch_max_attempts.max(1);
@@ -195,6 +198,7 @@ impl FetchScheduler {
             prefetch_acquire_wait: Duration::from_millis(prefetch_acquire_wait_ms),
             metrics: FetchMetrics::new(),
             qos,
+            transit_memory_budget,
         }
     }
 
@@ -414,6 +418,20 @@ impl FetchScheduler {
         keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
+        let budget_bytes = keys.len().saturating_mul(CLOUD_FRAGMENT_SIZE).max(1);
+        let _transit_credit = match class {
+            FetchClass::Foreground => {
+                self.transit_memory_budget
+                    .acquire_foreground(budget_bytes)
+                    .await
+            }
+            FetchClass::Prefetch => {
+                self.transit_memory_budget
+                    .acquire_background(budget_bytes)
+                    .await
+            }
+        };
+
         // Fetch fragments concurrently and copy each part into its final offset
         // as soon as it completes to avoid keeping both full `Vec<Bytes>` and
         // final payload in memory at once.

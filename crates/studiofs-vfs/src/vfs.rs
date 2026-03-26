@@ -29,7 +29,7 @@ mod materialize;
 use crate::incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
-use crate::qos::{FairInodeScheduler, QosController};
+use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker};
 
 use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
@@ -572,6 +572,7 @@ const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
 const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 1;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
+const DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
@@ -780,6 +781,8 @@ pub struct VfsConfig {
     pub upload_cache_io_slots: usize,
     /// Upload slot cost when foreground reads are active.
     pub upload_cache_io_user_penalty: u32,
+    /// Max active transit-memory bytes used by in-flight read/upload buffers.
+    pub transit_memory_budget_bytes: usize,
     /// User idle grace after the last foreground read.
     pub upload_user_idle_grace_ms: u64,
     /// Foreground-read P90 latency target that triggers upload throttling.
@@ -902,6 +905,7 @@ impl Default for VfsConfig {
             ingress_checkpoint_max_live_segments: DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS,
             upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
             upload_cache_io_user_penalty: DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY,
+            transit_memory_budget_bytes: DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
             upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
             upload_fg_read_latency_target_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
             upload_fg_read_latency_window_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS,
@@ -3257,6 +3261,8 @@ pub struct StudioVfs {
     /// Shared local-I/O budget for upload path reads from cache.
     upload_cache_io_slots: Arc<Semaphore>,
     upload_cache_io_slots_max: u32,
+    /// Global memory-credit budget for active in-flight I/O buffers.
+    transit_memory_budget: Arc<TransitMemoryBudget>,
     qos: Arc<QosController>,
     /// Configured baseline slot cost per upload op when foreground reads are active.
     upload_cache_io_user_penalty_base: u32,
@@ -4119,12 +4125,15 @@ impl StudioVfs {
             };
 
             let qos = Arc::new(QosController::from_config(&config));
+            let transit_memory_budget =
+                TransitMemoryBudget::new(config.transit_memory_budget_bytes);
             let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
                 data_read,
                 block_cache.clone(),
                 fetch_aimd_config,
                 prefetch_foreground_reserve,
                 qos.clone(),
+                transit_memory_budget.clone(),
                 &config,
             ));
 
@@ -4232,6 +4241,7 @@ impl StudioVfs {
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots,
                 upload_cache_io_user_penalty,
+                transit_memory_budget_bytes = config.transit_memory_budget_bytes,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 upload_fg_read_latency_target_ms,
                 upload_fg_read_latency_window_ms,
@@ -4366,6 +4376,7 @@ impl StudioVfs {
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
                 upload_cache_io_slots_max: upload_cache_io_slots as u32,
+                transit_memory_budget,
                 qos,
                 upload_cache_io_user_penalty_base: upload_cache_io_user_penalty,
                 upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
@@ -9539,6 +9550,15 @@ impl StudioVfs {
                 object_id: op.object_id,
                 message: e.to_string(),
             })?;
+        let _transit_credit = if remote_object_visible {
+            None
+        } else {
+            Some(
+                self.transit_memory_budget
+                    .acquire_background(self.block_size as usize)
+                    .await,
+            )
+        };
         // Read raw block payload from cache only when we really need to upload.
         let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
             None
@@ -9882,6 +9902,7 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
+            let transit_memory = self.transit_memory_budget.snapshot();
 
             if should_log {
                 ticks_since_last_log = 0;
@@ -10029,6 +10050,14 @@ impl StudioVfs {
                     attr_read_cache_entry_budget = attr_read_cache.entry_budget,
                     attr_read_cache_byte_budget = attr_read_cache.byte_budget,
                     "upload pipeline counters"
+                );
+                debug!(
+                    transit_memory_budget_bytes = transit_memory.budget_bytes,
+                    transit_memory_used_bytes = transit_memory.used_bytes,
+                    transit_memory_available_bytes = transit_memory.available_bytes,
+                    transit_memory_waiting_foreground = transit_memory.waiting_foreground,
+                    transit_memory_waiting_background = transit_memory.waiting_background,
+                    "upload pipeline transit memory"
                 );
                 debug!(
                     upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
