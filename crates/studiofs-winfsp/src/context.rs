@@ -1253,8 +1253,7 @@ mod tests {
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::MetaError;
     use studiofs_meta::{
-        CURRENT_FORMAT_VERSION, FormatInfo, MetaEngineCore, MetadataConfig, ROOT_INO,
-        RedbMetaEngine,
+        CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, ROOT_INO, RedbMetaEngine,
     };
     use studiofs_vfs::VfsError;
     use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs, VfsConfig};

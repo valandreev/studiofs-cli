@@ -1,7 +1,7 @@
 //! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
 use std::path::Path;
-use studiofs_meta::{FormatInfo, MetaEngineCore, RedbMetaEngine, ensure_studiofs_database};
+use studiofs_meta::{FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database};
 
 fn extract_format_info_from_snapshot(snapshot_bytes: &[u8]) -> anyhow::Result<FormatInfo> {
     let value: serde_json::Value = serde_json::from_slice(snapshot_bytes)

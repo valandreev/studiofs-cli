@@ -14,7 +14,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaEngineCore, MetadataBackend,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetadataBackend,
     MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
 };
 use uuid::Uuid;

@@ -1889,14 +1889,6 @@ impl MetaEngineCore for PgMetaEngine {
         Ok(Some(size))
     }
 
-    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
-        self.local.set_format_info(info)
-    }
-
-    fn get_format_info(&self) -> MetaResult<FormatInfo> {
-        self.local.get_format_info()
-    }
-
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
         self.local.get_counter(name)
     }
@@ -2203,7 +2195,15 @@ impl MetaEngineCore for PgMetaEngine {
     }
 }
 
-impl MetaFormat for PgMetaEngine {}
+impl MetaFormat for PgMetaEngine {
+    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
+        self.local.set_format_info(info)
+    }
+
+    fn get_format_info(&self) -> MetaResult<FormatInfo> {
+        self.local.get_format_info()
+    }
+}
 impl MetaInodes for PgMetaEngine {}
 impl MetaNamespace for PgMetaEngine {}
 impl MetaBlocks for PgMetaEngine {}

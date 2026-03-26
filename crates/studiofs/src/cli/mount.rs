@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
-use studiofs_meta::{
-    MetaEngine, MetaEngineCore, MetadataBackend, RedbMetaEngine, open_meta_engine,
-};
+use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfig, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};

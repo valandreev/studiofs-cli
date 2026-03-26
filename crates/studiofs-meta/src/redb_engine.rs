@@ -3358,44 +3358,6 @@ impl MetaEngineCore for RedbMetaEngine {
         Ok(None)
     }
 
-    // ─── Format / Settings ───────────────────────────────────────────────
-
-    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
-        let json = serde_json::to_vec(info).map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(SETTINGS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert("format", json.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn get_format_info(&self) -> MetaResult<FormatInfo> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SETTINGS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let entry = table
-            .get("format")
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .ok_or(MetaError::NotFormatted)?;
-        let info: FormatInfo = serde_json::from_slice(entry.value())
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        Ok(info)
-    }
-
     // ─── Counters ────────────────────────────────────────────────────────
 
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
@@ -6191,7 +6153,43 @@ impl RedbMetaEngine {
     }
 }
 
-impl MetaFormat for RedbMetaEngine {}
+impl MetaFormat for RedbMetaEngine {
+    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
+        let json = serde_json::to_vec(info).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .insert("format", json.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_format_info(&self) -> MetaResult<FormatInfo> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let entry = table
+            .get("format")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .ok_or(MetaError::NotFormatted)?;
+        let info: FormatInfo = serde_json::from_slice(entry.value())
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        Ok(info)
+    }
+}
 impl MetaInodes for RedbMetaEngine {}
 impl MetaNamespace for RedbMetaEngine {}
 impl MetaBlocks for RedbMetaEngine {}

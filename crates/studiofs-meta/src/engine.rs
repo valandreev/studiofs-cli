@@ -203,14 +203,6 @@ pub trait MetaEngineCore: Send + Sync {
     /// the shared remote metadata source.
     fn replication_backlog(&self) -> MetadataReplicationBacklog;
 
-    // ─── Format / Settings ───────────────────────────────────────────────
-
-    /// Store format info (called during `studiofs init`).
-    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()>;
-
-    /// Load format info.
-    fn get_format_info(&self) -> MetaResult<FormatInfo>;
-
     // ─── Counters ────────────────────────────────────────────────────────
 
     /// Get a counter value, returns 0 if not set.
@@ -567,7 +559,13 @@ pub trait MetaEngineCore: Send + Sync {
     fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
 }
 
-pub trait MetaFormat: MetaEngineCore {}
+pub trait MetaFormat: Send + Sync {
+    /// Store format info (called during `studiofs init`).
+    fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()>;
+
+    /// Load format info.
+    fn get_format_info(&self) -> MetaResult<FormatInfo>;
+}
 
 pub trait MetaInodes: MetaEngineCore {}
 
