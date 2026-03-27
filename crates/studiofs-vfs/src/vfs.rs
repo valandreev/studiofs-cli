@@ -1355,6 +1355,15 @@ trait CachePolicy<K, V> {
         false
     }
     fn on_insert(&mut self, _key: &K, _value: &V, _meta: &Self::Meta) {}
+    fn on_update(
+        &mut self,
+        _key: &K,
+        _old_value: &V,
+        _old_meta: &Self::Meta,
+        _new_value: &V,
+        _new_meta: &Self::Meta,
+    ) {
+    }
     fn on_remove(&mut self, _key: &K, _value: &V, _meta: &Self::Meta) {}
 }
 
@@ -1494,11 +1503,13 @@ where
         }
         let stamp = self.next_stamp();
 
-        if let Some(entry) = self.entries.get_mut(&key) {
+        if let Some(mut entry) = self.entries.remove(&key) {
             if entry.segment == TwoTierSegment::Protected {
                 self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
             }
             self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
+            self.policy
+                .on_update(&key, &entry.value, &entry.meta, &value, &meta);
             entry.value = value;
             entry.meta = meta;
             entry.charge = charge;
@@ -1506,10 +1517,11 @@ where
             self.used_bytes = self.used_bytes.saturating_add(charge);
             if entry.segment == TwoTierSegment::Protected {
                 self.protected_bytes = self.protected_bytes.saturating_add(charge);
-                self.protected_order.push_back((key, stamp));
+                self.protected_order.push_back((key.clone(), stamp));
             } else {
-                self.probationary_order.push_back((key, stamp));
+                self.probationary_order.push_back((key.clone(), stamp));
             }
+            self.entries.insert(key, entry);
             self.maybe_compact_orders();
             self.enforce_limits();
             return;
@@ -1764,6 +1776,8 @@ impl DentryCachePolicy {
                 TwoTierEntry<DentryCacheValue, DentryCacheMeta>,
             >())
             .saturating_add(name_len)
+            // Dentry cache additionally maintains `parent_index` (parent -> key set),
+            // so the per-entry index overhead is intentionally counted twice here.
             .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD * 2)
     }
 
