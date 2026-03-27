@@ -18,8 +18,8 @@ use std::sync::Arc;
 pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
     BatchFlushEntry, BatchFlushResult, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaError,
-    MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult,
-    MetaSnapshots, MetaSymlink, MetaXattr,
+    MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication,
+    MetaResult, MetaSnapshots, MetaSymlink, MetaXattr,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{
@@ -63,25 +63,63 @@ pub fn open_meta_engine_with_options(
     options: MetaOpenOptions,
 ) -> MetaResult<Arc<dyn MetaEngine>> {
     let path = path.as_ref();
-    let redb = RedbMetaEngine::open(path)?;
-    match redb.get_format_info() {
+    match RedbMetaEngine::read_format_info_readonly(path) {
         Ok(info) if info.metadata.backend == MetadataBackend::Postgres => {
             ensure_supported_format_version(&info)?;
-            // Redb holds an exclusive process-local open lock. Release probe handle first.
-            drop(redb);
             let pg = PgMetaEngine::open_with_options(
                 path,
                 PgOpenOptions {
                     background_poll: options.background_poll,
                 },
             )?;
-            ensure_supported_format_version(&pg.get_format_info()?)?;
+            let pg_info = pg.get_format_info()?;
+            ensure_supported_format_version(&pg_info)?;
+            if pg_info.metadata.backend != MetadataBackend::Postgres {
+                return Err(MetaError::Storage(
+                    "metadata backend switched during PgMetaEngine open".to_string(),
+                ));
+            }
             Ok(pg)
         }
         Ok(info) => {
             ensure_supported_format_version(&info)?;
+            let redb = RedbMetaEngine::open(path)?;
+            let redb_info = redb.get_format_info()?;
+            ensure_supported_format_version(&redb_info)?;
+            if redb_info.metadata.backend != info.metadata.backend {
+                return Err(MetaError::Storage(
+                    "metadata backend switched during RedbMetaEngine open".to_string(),
+                ));
+            }
             Ok(Arc::new(redb))
         }
-        Err(_) => Ok(Arc::new(redb)),
+        Err(MetaError::NotFormatted) => {
+            let redb = RedbMetaEngine::open(path)?;
+            Ok(Arc::new(redb))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_meta_engine_missing_file_creates_redb() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing-meta.db");
+        assert!(!path.exists());
+
+        let engine = open_meta_engine_with_options(
+            &path,
+            MetaOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open missing metadata path");
+
+        let info = engine.get_format_info();
+        assert!(matches!(info, Err(MetaError::NotFormatted)));
     }
 }

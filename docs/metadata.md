@@ -52,6 +52,19 @@ Current behavior:
 - local serving view is `overlay over base`
 - `metadata_state` is used as a bootstrap/checkpoint store, not the primary runtime sync channel
 
+### Backend Selection on Open
+
+`open_meta_engine_with_options(...)` selects backend in two phases:
+
+1. Probe `FormatInfo` via `RedbMetaEngine::read_format_info_readonly(path)` (read-only open, no exclusive write lock).
+2. If `metadata.backend == Postgres`, open `PgMetaEngine`; otherwise open `RedbMetaEngine`.
+
+Safety and fallback behavior:
+- If the metadata DB file is missing (`NotFound`), readonly probe is treated as `NotFormatted`, and `RedbMetaEngine::open(...)` creates/opens local metadata.
+- If readonly probe returns `NotFormatted`, `RedbMetaEngine::open(...)` is used.
+- If readonly probe returns a storage/corruption error, the error is returned (no blind RW retry).
+- Post-open validation re-checks format version and backend consistency to reduce TOCTOU risk windows during backend handoff.
+
 ## Volume Identity and UUID Verification
 
 Each StudioFS volume is assigned a unique `disk_uuid` during initialization (`studiofs init`). This UUID is stored in both the remote metadata store (PostgreSQL) and the local metadata file (`.db` via `redb`).
