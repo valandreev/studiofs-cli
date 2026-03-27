@@ -1316,82 +1316,55 @@ struct IgnoredEntryRegistry {
     by_name: HashMap<(Ino, Vec<u8>), Ino>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DentryCacheKey {
-    parent: Ino,
-    name: Arc<[u8]>,
-}
-
-impl DentryCacheKey {
-    fn new(parent: Ino, name: &[u8]) -> Self {
-        Self {
-            parent,
-            name: Arc::from(name),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DentryCacheValue {
-    Positive(Ino),
-    Negative,
-}
-
-#[derive(Debug, Clone)]
-struct DentryCacheEntry {
-    value: DentryCacheValue,
-    segment: DentryCacheSegment,
-    namespace_epoch: u64,
-    parent_generation: u64,
-    charge: usize,
-    stamp: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NamespaceCacheToken {
-    namespace_epoch: u64,
-    parent_generation: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DentryCacheSegment {
+enum TwoTierSegment {
     Probationary,
     Protected,
 }
 
+#[derive(Debug, Clone)]
+struct TwoTierEntry<V, M> {
+    value: V,
+    meta: M,
+    segment: TwoTierSegment,
+    charge: usize,
+    stamp: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
-struct DentryCacheMetrics {
+struct TwoTierMetrics {
     hits: u64,
     protected_hits: u64,
     misses: u64,
     negative_hits: u64,
     evictions: u64,
-    occupancy_entries: usize,
-    occupancy_bytes: usize,
-    protected_occupancy_entries: usize,
-    protected_occupancy_bytes: usize,
-    entry_budget: usize,
-    byte_budget: usize,
 }
 
-impl DentryCacheMetrics {
-    fn negative_hit_ratio(self) -> f64 {
-        if self.hits == 0 {
-            return 0.0;
-        }
-        self.negative_hits as f64 / self.hits as f64
-    }
+trait CachePolicy<K, V> {
+    type Meta;
+    type InsertContext;
+    type LookupContext<'a>
+    where
+        Self: 'a;
 
-    fn hot_hit_ratio(self) -> f64 {
-        if self.hits == 0 {
-            return 0.0;
-        }
-        self.protected_hits as f64 / self.hits as f64
+    fn make_meta(&mut self, key: &K, value: &V, ctx: Self::InsertContext) -> Self::Meta;
+    fn is_stale(&self, key: &K, value: &V, meta: &Self::Meta, ctx: Self::LookupContext<'_>)
+    -> bool;
+    fn estimate_entry_charge(&self, key: &K, value: &V, meta: &Self::Meta) -> usize;
+    fn is_negative(&self, _value: &V) -> bool {
+        false
     }
+    fn on_insert(&mut self, _key: &K, _value: &V, _meta: &Self::Meta) {}
+    fn on_remove(&mut self, _key: &K, _value: &V, _meta: &Self::Meta) {}
 }
 
 #[derive(Debug)]
-struct DentryCache {
+struct TwoTierCache<K, V, P>
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+    P: CachePolicy<K, V>,
+{
     entry_budget: usize,
     byte_budget: usize,
     protected_entry_budget: usize,
@@ -1400,19 +1373,20 @@ struct DentryCache {
     used_bytes: usize,
     protected_entries: usize,
     protected_bytes: usize,
-    hits: u64,
-    protected_hits: u64,
-    misses: u64,
-    negative_hits: u64,
-    evictions: u64,
-    entries: HashMap<DentryCacheKey, DentryCacheEntry>,
-    probationary_order: VecDeque<(DentryCacheKey, u64)>,
-    protected_order: VecDeque<(DentryCacheKey, u64)>,
-    parent_index: HashMap<Ino, HashSet<DentryCacheKey>>,
+    metrics: TwoTierMetrics,
+    entries: HashMap<K, TwoTierEntry<V, P::Meta>>,
+    probationary_order: VecDeque<(K, u64)>,
+    protected_order: VecDeque<(K, u64)>,
+    policy: P,
 }
 
-impl DentryCache {
-    fn new(entry_budget: usize, byte_budget: usize) -> Self {
+impl<K, V, P> TwoTierCache<K, V, P>
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+    P: CachePolicy<K, V>,
+{
+    fn new(entry_budget: usize, byte_budget: usize, policy: P) -> Self {
         let protected_entry_budget = if entry_budget <= 1 {
             0
         } else {
@@ -1432,23 +1406,12 @@ impl DentryCache {
             used_bytes: 0,
             protected_entries: 0,
             protected_bytes: 0,
-            hits: 0,
-            protected_hits: 0,
-            misses: 0,
-            negative_hits: 0,
-            evictions: 0,
+            metrics: TwoTierMetrics::default(),
             entries: HashMap::new(),
             probationary_order: VecDeque::new(),
             protected_order: VecDeque::new(),
-            parent_index: HashMap::new(),
+            policy,
         }
-    }
-
-    fn estimate_entry_charge(name: &[u8]) -> usize {
-        std::mem::size_of::<DentryCacheKey>()
-            .saturating_add(std::mem::size_of::<DentryCacheEntry>())
-            .saturating_add(name.len())
-            .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD * 2)
     }
 
     fn is_enabled(&self) -> bool {
@@ -1461,133 +1424,128 @@ impl DentryCache {
         stamp
     }
 
-    fn metrics(&self) -> DentryCacheMetrics {
-        DentryCacheMetrics {
-            hits: self.hits,
-            protected_hits: self.protected_hits,
-            misses: self.misses,
-            negative_hits: self.negative_hits,
-            evictions: self.evictions,
-            occupancy_entries: self.entries.len(),
-            occupancy_bytes: self.used_bytes,
-            protected_occupancy_entries: self.protected_entries,
-            protected_occupancy_bytes: self.protected_bytes,
-            entry_budget: self.entry_budget,
-            byte_budget: self.byte_budget,
-        }
+    fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
-    fn get(
-        &mut self,
-        parent: Ino,
-        name: &[u8],
-        namespace_epoch: u64,
-        parent_generation: u64,
-    ) -> Option<DentryCacheValue> {
+    fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    fn protected_entries(&self) -> usize {
+        self.protected_entries
+    }
+
+    fn protected_bytes(&self) -> usize {
+        self.protected_bytes
+    }
+
+    fn metrics(&self) -> TwoTierMetrics {
+        self.metrics
+    }
+
+    fn policy_mut(&mut self) -> &mut P {
+        &mut self.policy
+    }
+
+    fn get(&mut self, key: &K, ctx: P::LookupContext<'_>) -> Option<V> {
         if !self.is_enabled() {
-            self.misses = self.misses.saturating_add(1);
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
             return None;
         }
-        let key = DentryCacheKey::new(parent, name);
-        let (value, segment, stale) = match self.entries.get(&key) {
+        let (value, segment, stale) = match self.entries.get(key) {
             Some(entry) => (
-                entry.value,
+                entry.value.clone(),
                 entry.segment,
-                entry.namespace_epoch != namespace_epoch
-                    || entry.parent_generation != parent_generation,
+                self.policy.is_stale(key, &entry.value, &entry.meta, ctx),
             ),
             None => {
-                self.misses = self.misses.saturating_add(1);
+                self.metrics.misses = self.metrics.misses.saturating_add(1);
                 return None;
             }
         };
         if stale {
-            self.remove_entry(&key);
-            self.misses = self.misses.saturating_add(1);
+            self.remove(key);
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
             return None;
         }
-        self.hits = self.hits.saturating_add(1);
-        if matches!(value, DentryCacheValue::Negative) {
-            self.negative_hits = self.negative_hits.saturating_add(1);
+        self.metrics.hits = self.metrics.hits.saturating_add(1);
+        if self.policy.is_negative(&value) {
+            self.metrics.negative_hits = self.metrics.negative_hits.saturating_add(1);
         }
         match segment {
-            DentryCacheSegment::Probationary => self.promote_to_protected(&key),
-            DentryCacheSegment::Protected => {
-                self.protected_hits = self.protected_hits.saturating_add(1);
-                self.touch_protected(&key)
+            TwoTierSegment::Probationary => self.promote_to_protected(key),
+            TwoTierSegment::Protected => {
+                self.metrics.protected_hits = self.metrics.protected_hits.saturating_add(1);
+                self.touch_protected(key);
             }
         }
         Some(value)
     }
 
-    fn put(
-        &mut self,
-        parent: Ino,
-        name: &[u8],
-        value: DentryCacheValue,
-        namespace_epoch: u64,
-        parent_generation: u64,
-    ) {
+    fn put(&mut self, key: K, value: V, ctx: P::InsertContext) {
         if !self.is_enabled() {
             return;
         }
-        let key = DentryCacheKey::new(parent, name);
-        let stamp = self.next_stamp();
-
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.value = value;
-            entry.namespace_epoch = namespace_epoch;
-            entry.parent_generation = parent_generation;
-            entry.stamp = stamp;
-            match entry.segment {
-                DentryCacheSegment::Probationary => self.probationary_order.push_back((key, stamp)),
-                DentryCacheSegment::Protected => self.protected_order.push_back((key, stamp)),
-            }
-            self.maybe_compact_orders();
-            return;
-        }
-
-        let charge = Self::estimate_entry_charge(name);
+        let meta = self.policy.make_meta(&key, &value, ctx);
+        let charge = self.policy.estimate_entry_charge(&key, &value, &meta);
         if charge > self.byte_budget {
             return;
         }
+        let stamp = self.next_stamp();
 
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.segment == TwoTierSegment::Protected {
+                self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
+            }
+            self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
+            entry.value = value;
+            entry.meta = meta;
+            entry.charge = charge;
+            entry.stamp = stamp;
+            self.used_bytes = self.used_bytes.saturating_add(charge);
+            if entry.segment == TwoTierSegment::Protected {
+                self.protected_bytes = self.protected_bytes.saturating_add(charge);
+                self.protected_order.push_back((key, stamp));
+            } else {
+                self.probationary_order.push_back((key, stamp));
+            }
+            self.maybe_compact_orders();
+            self.enforce_limits();
+            return;
+        }
+
+        self.policy.on_insert(&key, &value, &meta);
         self.entries.insert(
             key.clone(),
-            DentryCacheEntry {
+            TwoTierEntry {
                 value,
-                segment: DentryCacheSegment::Probationary,
-                namespace_epoch,
-                parent_generation,
+                meta,
+                segment: TwoTierSegment::Probationary,
                 charge,
                 stamp,
             },
         );
-        self.parent_index
-            .entry(parent)
-            .or_default()
-            .insert(key.clone());
-        self.probationary_order.push_back((key, stamp));
         self.used_bytes = self.used_bytes.saturating_add(charge);
+        self.probationary_order.push_back((key, stamp));
         self.maybe_compact_orders();
         self.enforce_limits();
     }
 
-    fn invalidate(&mut self, parent: Ino, name: &[u8]) {
-        let key = DentryCacheKey::new(parent, name);
-        self.remove_entry(&key);
-    }
-
-    fn invalidate_parent(&mut self, parent: Ino) {
-        let Some(keys) = self.parent_index.remove(&parent) else {
-            return;
+    fn remove(&mut self, key: &K) -> bool {
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
         };
-        for key in keys {
-            self.remove_entry_accounting_only(&key);
+        self.policy.on_remove(key, &entry.value, &entry.meta);
+        self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
+        if entry.segment == TwoTierSegment::Protected {
+            self.protected_entries = self.protected_entries.saturating_sub(1);
+            self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
         }
+        true
     }
 
-    fn touch_protected(&mut self, key: &DentryCacheKey) {
+    fn touch_protected(&mut self, key: &K) {
         let stamp = self.next_stamp();
         if let Some(entry) = self.entries.get_mut(key) {
             entry.stamp = stamp;
@@ -1596,11 +1554,11 @@ impl DentryCache {
         self.maybe_compact_orders();
     }
 
-    fn promote_to_protected(&mut self, key: &DentryCacheKey) {
+    fn promote_to_protected(&mut self, key: &K) {
         let stamp = self.next_stamp();
         if let Some(entry) = self.entries.get_mut(key) {
-            if entry.segment == DentryCacheSegment::Probationary {
-                entry.segment = DentryCacheSegment::Protected;
+            if entry.segment == TwoTierSegment::Probationary {
+                entry.segment = TwoTierSegment::Protected;
                 self.protected_entries = self.protected_entries.saturating_add(1);
                 self.protected_bytes = self.protected_bytes.saturating_add(entry.charge);
             }
@@ -1635,12 +1593,12 @@ impl DentryCache {
             let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
-            if entry.stamp != stamp || entry.segment != DentryCacheSegment::Protected {
+            if entry.stamp != stamp || entry.segment != TwoTierSegment::Protected {
                 continue;
             }
             let demote_stamp = self.next_stamp();
             if let Some(entry) = self.entries.get_mut(&key) {
-                entry.segment = DentryCacheSegment::Probationary;
+                entry.segment = TwoTierSegment::Probationary;
                 entry.stamp = demote_stamp;
                 self.protected_entries = self.protected_entries.saturating_sub(1);
                 self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
@@ -1652,8 +1610,8 @@ impl DentryCache {
     }
 
     fn evict_one(&mut self) -> bool {
-        self.evict_one_from(DentryCacheSegment::Probationary)
-            || self.evict_one_from(DentryCacheSegment::Protected)
+        self.evict_one_from(TwoTierSegment::Probationary)
+            || self.evict_one_from(TwoTierSegment::Protected)
     }
 
     fn maybe_compact_orders(&mut self) {
@@ -1662,7 +1620,7 @@ impl DentryCache {
             .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
             .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
         if self.probationary_order.len() > probationary_limit {
-            self.compact_order(DentryCacheSegment::Probationary);
+            self.compact_order(TwoTierSegment::Probationary);
         }
 
         let protected_limit = self
@@ -1670,12 +1628,12 @@ impl DentryCache {
             .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
             .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
         if self.protected_order.len() > protected_limit {
-            self.compact_order(DentryCacheSegment::Protected);
+            self.compact_order(TwoTierSegment::Protected);
         }
     }
 
-    fn compact_order(&mut self, segment: DentryCacheSegment) {
-        let mut live: Vec<(u64, DentryCacheKey)> = self
+    fn compact_order(&mut self, segment: TwoTierSegment) {
+        let mut live: Vec<(u64, K)> = self
             .entries
             .iter()
             .filter_map(|(key, entry)| {
@@ -1683,62 +1641,292 @@ impl DentryCache {
             })
             .collect();
         live.sort_unstable_by_key(|(stamp, _)| *stamp);
-
         let order = match segment {
-            DentryCacheSegment::Probationary => &mut self.probationary_order,
-            DentryCacheSegment::Protected => &mut self.protected_order,
+            TwoTierSegment::Probationary => &mut self.probationary_order,
+            TwoTierSegment::Protected => &mut self.protected_order,
         };
         order.clear();
         order.extend(live.into_iter().map(|(stamp, key)| (key, stamp)));
     }
 
-    fn evict_one_from(&mut self, segment: DentryCacheSegment) -> bool {
-        let order = match segment {
-            DentryCacheSegment::Probationary => &mut self.probationary_order,
-            DentryCacheSegment::Protected => &mut self.protected_order,
-        };
-        while let Some((key, stamp)) = order.pop_front() {
+    fn evict_one_from(&mut self, segment: TwoTierSegment) -> bool {
+        loop {
+            let next = match segment {
+                TwoTierSegment::Probationary => self.probationary_order.pop_front(),
+                TwoTierSegment::Protected => self.protected_order.pop_front(),
+            };
+            let Some((key, stamp)) = next else {
+                break;
+            };
             let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
             if entry.stamp != stamp || entry.segment != segment {
                 continue;
             }
-            return self.evict_key(&key);
+            if self.remove(&key) {
+                self.metrics.evictions = self.metrics.evictions.saturating_add(1);
+                return true;
+            }
         }
         false
     }
 
-    fn evict_key(&mut self, key: &DentryCacheKey) -> bool {
-        let removed = self.remove_entry(key);
-        if removed {
-            self.evictions = self.evictions.saturating_add(1);
-        }
-        removed
+    #[cfg(test)]
+    fn contains_key(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
     }
 
-    fn remove_entry(&mut self, key: &DentryCacheKey) -> bool {
-        let parent = key.parent;
-        let removed = self.remove_entry_accounting_only(key);
-        if removed && let Some(keys) = self.parent_index.get_mut(&parent) {
+    #[cfg(test)]
+    fn peek(&self, key: &K) -> Option<&TwoTierEntry<V, P::Meta>> {
+        self.entries.get(key)
+    }
+
+    #[cfg(test)]
+    fn protected_order_len(&self) -> usize {
+        self.protected_order.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DentryCacheKey {
+    parent: Ino,
+    name: Arc<[u8]>,
+}
+
+impl DentryCacheKey {
+    fn new(parent: Ino, name: &[u8]) -> Self {
+        Self {
+            parent,
+            name: Arc::from(name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DentryCacheValue {
+    Positive(Ino),
+    Negative,
+}
+
+#[derive(Debug, Clone)]
+struct DentryCacheMeta {
+    namespace_epoch: u64,
+    parent_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NamespaceCacheToken {
+    namespace_epoch: u64,
+    parent_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DentryCacheMetrics {
+    hits: u64,
+    protected_hits: u64,
+    misses: u64,
+    negative_hits: u64,
+    evictions: u64,
+    occupancy_entries: usize,
+    occupancy_bytes: usize,
+    protected_occupancy_entries: usize,
+    protected_occupancy_bytes: usize,
+    entry_budget: usize,
+    byte_budget: usize,
+}
+
+impl DentryCacheMetrics {
+    fn negative_hit_ratio(self) -> f64 {
+        if self.hits == 0 {
+            return 0.0;
+        }
+        self.negative_hits as f64 / self.hits as f64
+    }
+
+    fn hot_hit_ratio(self) -> f64 {
+        if self.hits == 0 {
+            return 0.0;
+        }
+        self.protected_hits as f64 / self.hits as f64
+    }
+}
+
+#[derive(Debug, Default)]
+struct DentryCachePolicy {
+    parent_index: HashMap<Ino, HashSet<DentryCacheKey>>,
+}
+
+impl DentryCachePolicy {
+    fn estimate_entry_charge_for_name(name_len: usize) -> usize {
+        std::mem::size_of::<DentryCacheKey>()
+            .saturating_add(std::mem::size_of::<
+                TwoTierEntry<DentryCacheValue, DentryCacheMeta>,
+            >())
+            .saturating_add(name_len)
+            .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD * 2)
+    }
+
+    fn take_parent_keys(&mut self, parent: Ino) -> Option<HashSet<DentryCacheKey>> {
+        self.parent_index.remove(&parent)
+    }
+}
+
+impl CachePolicy<DentryCacheKey, DentryCacheValue> for DentryCachePolicy {
+    type Meta = DentryCacheMeta;
+    type InsertContext = NamespaceCacheToken;
+    type LookupContext<'a> = NamespaceCacheToken;
+
+    fn make_meta(
+        &mut self,
+        _key: &DentryCacheKey,
+        _value: &DentryCacheValue,
+        ctx: Self::InsertContext,
+    ) -> Self::Meta {
+        DentryCacheMeta {
+            namespace_epoch: ctx.namespace_epoch,
+            parent_generation: ctx.parent_generation,
+        }
+    }
+
+    fn is_stale(
+        &self,
+        _key: &DentryCacheKey,
+        _value: &DentryCacheValue,
+        meta: &Self::Meta,
+        ctx: Self::LookupContext<'_>,
+    ) -> bool {
+        meta.namespace_epoch != ctx.namespace_epoch
+            || meta.parent_generation != ctx.parent_generation
+    }
+
+    fn estimate_entry_charge(
+        &self,
+        key: &DentryCacheKey,
+        _value: &DentryCacheValue,
+        _meta: &Self::Meta,
+    ) -> usize {
+        Self::estimate_entry_charge_for_name(key.name.len())
+    }
+
+    fn is_negative(&self, value: &DentryCacheValue) -> bool {
+        matches!(value, DentryCacheValue::Negative)
+    }
+
+    fn on_insert(&mut self, key: &DentryCacheKey, _value: &DentryCacheValue, _meta: &Self::Meta) {
+        self.parent_index
+            .entry(key.parent)
+            .or_default()
+            .insert(key.clone());
+    }
+
+    fn on_remove(&mut self, key: &DentryCacheKey, _value: &DentryCacheValue, _meta: &Self::Meta) {
+        if let Some(keys) = self.parent_index.get_mut(&key.parent) {
             keys.remove(key);
             if keys.is_empty() {
-                self.parent_index.remove(&parent);
+                self.parent_index.remove(&key.parent);
             }
         }
-        removed
+    }
+}
+
+#[derive(Debug)]
+struct DentryCache {
+    inner: TwoTierCache<DentryCacheKey, DentryCacheValue, DentryCachePolicy>,
+}
+
+impl DentryCache {
+    fn new(entry_budget: usize, byte_budget: usize) -> Self {
+        Self {
+            inner: TwoTierCache::new(entry_budget, byte_budget, DentryCachePolicy::default()),
+        }
     }
 
-    fn remove_entry_accounting_only(&mut self, key: &DentryCacheKey) -> bool {
-        let Some(entry) = self.entries.remove(key) else {
-            return false;
-        };
-        self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
-        if entry.segment == DentryCacheSegment::Protected {
-            self.protected_entries = self.protected_entries.saturating_sub(1);
-            self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
+    #[cfg(test)]
+    fn estimate_entry_charge(name: &[u8]) -> usize {
+        DentryCachePolicy::estimate_entry_charge_for_name(name.len())
+    }
+
+    fn metrics(&self) -> DentryCacheMetrics {
+        let metrics = self.inner.metrics();
+        DentryCacheMetrics {
+            hits: metrics.hits,
+            protected_hits: metrics.protected_hits,
+            misses: metrics.misses,
+            negative_hits: metrics.negative_hits,
+            evictions: metrics.evictions,
+            occupancy_entries: self.inner.entry_count(),
+            occupancy_bytes: self.inner.used_bytes(),
+            protected_occupancy_entries: self.inner.protected_entries(),
+            protected_occupancy_bytes: self.inner.protected_bytes(),
+            entry_budget: self.inner.entry_budget,
+            byte_budget: self.inner.byte_budget,
         }
-        true
+    }
+
+    fn get(
+        &mut self,
+        parent: Ino,
+        name: &[u8],
+        namespace_epoch: u64,
+        parent_generation: u64,
+    ) -> Option<DentryCacheValue> {
+        let key = DentryCacheKey::new(parent, name);
+        self.inner.get(
+            &key,
+            NamespaceCacheToken {
+                namespace_epoch,
+                parent_generation,
+            },
+        )
+    }
+
+    fn put(
+        &mut self,
+        parent: Ino,
+        name: &[u8],
+        value: DentryCacheValue,
+        namespace_epoch: u64,
+        parent_generation: u64,
+    ) {
+        let key = DentryCacheKey::new(parent, name);
+        self.inner.put(
+            key,
+            value,
+            NamespaceCacheToken {
+                namespace_epoch,
+                parent_generation,
+            },
+        );
+    }
+
+    fn invalidate(&mut self, parent: Ino, name: &[u8]) {
+        let key = DentryCacheKey::new(parent, name);
+        self.inner.remove(&key);
+    }
+
+    fn invalidate_parent(&mut self, parent: Ino) {
+        let Some(keys) = self.inner.policy_mut().take_parent_keys(parent) else {
+            return;
+        };
+        for key in keys {
+            self.inner.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_value(&self, key: &DentryCacheKey) -> Option<DentryCacheValue> {
+        self.inner.peek(key).map(|entry| entry.value)
+    }
+
+    #[cfg(test)]
+    fn entry_len(&self) -> usize {
+        self.inner.entry_count()
+    }
+
+    #[cfg(test)]
+    fn protected_order_len(&self) -> usize {
+        self.inner.protected_order_len()
     }
 }
 
@@ -1778,12 +1966,6 @@ enum PathShortcutCacheValue {
     Negative { parent: Ino, name: Arc<[u8]> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathShortcutCacheSegment {
-    Probationary,
-    Protected,
-}
-
 #[derive(Debug, Clone)]
 struct PathShortcutParentToken {
     parent: Ino,
@@ -1791,13 +1973,19 @@ struct PathShortcutParentToken {
 }
 
 #[derive(Debug, Clone)]
-struct PathShortcutCacheEntry {
-    value: PathShortcutCacheValue,
-    segment: PathShortcutCacheSegment,
+struct PathShortcutCacheMeta {
     namespace_epoch: u64,
     parent_tokens: Arc<[PathShortcutParentToken]>,
-    charge: usize,
-    stamp: u64,
+}
+
+struct PathShortcutLookupCtx<'a> {
+    namespace_epoch: u64,
+    generation_of: &'a mut dyn FnMut(Ino) -> u64,
+}
+
+struct PathShortcutInsertCtx {
+    namespace_epoch: u64,
+    parent_tokens: Arc<[PathShortcutParentToken]>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1832,68 +2020,10 @@ impl PathShortcutCacheMetrics {
 }
 
 #[derive(Debug)]
-struct PathShortcutCache {
-    entry_budget: usize,
-    byte_budget: usize,
-    protected_entry_budget: usize,
-    protected_byte_budget: usize,
-    next_stamp: u64,
-    used_bytes: usize,
-    protected_entries: usize,
-    protected_bytes: usize,
-    hits: u64,
-    protected_hits: u64,
-    misses: u64,
-    negative_hits: u64,
-    evictions: u64,
-    entries: HashMap<PathShortcutCacheKey, PathShortcutCacheEntry>,
-    probationary_order: VecDeque<(PathShortcutCacheKey, u64)>,
-    protected_order: VecDeque<(PathShortcutCacheKey, u64)>,
-}
+struct PathShortcutCachePolicy;
 
-impl PathShortcutCache {
-    fn new(entry_budget: usize, byte_budget: usize) -> Self {
-        let protected_entry_budget = if entry_budget <= 1 {
-            0
-        } else {
-            ((entry_budget * METADATA_CACHE_PROTECTED_PERCENT) / 100).clamp(1, entry_budget - 1)
-        };
-        let protected_byte_budget = if byte_budget <= 1 {
-            0
-        } else {
-            ((byte_budget * METADATA_CACHE_PROTECTED_PERCENT) / 100).clamp(1, byte_budget - 1)
-        };
-        Self {
-            entry_budget,
-            byte_budget,
-            protected_entry_budget,
-            protected_byte_budget,
-            next_stamp: 1,
-            used_bytes: 0,
-            protected_entries: 0,
-            protected_bytes: 0,
-            hits: 0,
-            protected_hits: 0,
-            misses: 0,
-            negative_hits: 0,
-            evictions: 0,
-            entries: HashMap::new(),
-            probationary_order: VecDeque::new(),
-            protected_order: VecDeque::new(),
-        }
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.entry_budget > 0 && self.byte_budget > 0
-    }
-
-    fn next_stamp(&mut self) -> u64 {
-        let stamp = self.next_stamp;
-        self.next_stamp = self.next_stamp.saturating_add(1);
-        stamp
-    }
-
-    fn estimate_entry_charge(
+impl PathShortcutCachePolicy {
+    fn estimate_entry_charge_for(
         key: &PathShortcutCacheKey,
         value: &PathShortcutCacheValue,
         parent_tokens: &[PathShortcutParentToken],
@@ -1903,7 +2033,9 @@ impl PathShortcutCache {
             PathShortcutCacheValue::Negative { name, .. } => name.len(),
         };
         std::mem::size_of::<PathShortcutCacheKey>()
-            .saturating_add(std::mem::size_of::<PathShortcutCacheEntry>())
+            .saturating_add(std::mem::size_of::<
+                TwoTierEntry<PathShortcutCacheValue, PathShortcutCacheMeta>,
+            >())
             .saturating_add(key.path.len())
             .saturating_add(negative_name_len)
             .saturating_add(
@@ -1913,20 +2045,94 @@ impl PathShortcutCache {
             )
             .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD)
     }
+}
+
+impl Default for PathShortcutCachePolicy {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl CachePolicy<PathShortcutCacheKey, PathShortcutCacheValue> for PathShortcutCachePolicy {
+    type Meta = PathShortcutCacheMeta;
+    type InsertContext = PathShortcutInsertCtx;
+    type LookupContext<'a> = PathShortcutLookupCtx<'a>;
+
+    fn make_meta(
+        &mut self,
+        _key: &PathShortcutCacheKey,
+        _value: &PathShortcutCacheValue,
+        ctx: Self::InsertContext,
+    ) -> Self::Meta {
+        PathShortcutCacheMeta {
+            namespace_epoch: ctx.namespace_epoch,
+            parent_tokens: ctx.parent_tokens,
+        }
+    }
+
+    fn is_stale(
+        &self,
+        _key: &PathShortcutCacheKey,
+        _value: &PathShortcutCacheValue,
+        meta: &Self::Meta,
+        ctx: Self::LookupContext<'_>,
+    ) -> bool {
+        meta.namespace_epoch != ctx.namespace_epoch
+            || meta
+                .parent_tokens
+                .iter()
+                .any(|token| (ctx.generation_of)(token.parent) != token.generation)
+    }
+
+    fn estimate_entry_charge(
+        &self,
+        key: &PathShortcutCacheKey,
+        value: &PathShortcutCacheValue,
+        meta: &Self::Meta,
+    ) -> usize {
+        Self::estimate_entry_charge_for(key, value, &meta.parent_tokens)
+    }
+
+    fn is_negative(&self, value: &PathShortcutCacheValue) -> bool {
+        matches!(value, PathShortcutCacheValue::Negative { .. })
+    }
+}
+
+#[derive(Debug)]
+struct PathShortcutCache {
+    inner: TwoTierCache<PathShortcutCacheKey, PathShortcutCacheValue, PathShortcutCachePolicy>,
+}
+
+impl PathShortcutCache {
+    fn new(entry_budget: usize, byte_budget: usize) -> Self {
+        Self {
+            inner: TwoTierCache::new(entry_budget, byte_budget, PathShortcutCachePolicy),
+        }
+    }
+
+    #[cfg(test)]
+    fn estimate_entry_charge(
+        key: &PathShortcutCacheKey,
+        value: &PathShortcutCacheValue,
+        parent_tokens: &[PathShortcutParentToken],
+    ) -> usize {
+        PathShortcutCachePolicy::estimate_entry_charge_for(key, value, parent_tokens)
+    }
 
     fn metrics(&self) -> PathShortcutCacheMetrics {
+        let metrics = self.inner.metrics();
         PathShortcutCacheMetrics {
-            hits: self.hits,
-            protected_hits: self.protected_hits,
-            misses: self.misses,
-            negative_hits: self.negative_hits,
-            evictions: self.evictions,
-            occupancy_entries: self.entries.len(),
-            occupancy_bytes: self.used_bytes,
-            protected_occupancy_entries: self.protected_entries,
-            protected_occupancy_bytes: self.protected_bytes,
-            entry_budget: self.entry_budget,
-            byte_budget: self.byte_budget,
+            hits: metrics.hits,
+            protected_hits: metrics.protected_hits,
+            misses: metrics.misses,
+            negative_hits: metrics.negative_hits,
+            evictions: metrics.evictions,
+            occupancy_entries: self.inner.entry_count(),
+            occupancy_bytes: self.inner.used_bytes(),
+            protected_occupancy_entries: self.inner.protected_entries(),
+            protected_occupancy_bytes: self.inner.protected_bytes(),
+            entry_budget: self.inner.entry_budget,
+            byte_budget: self.inner.byte_budget,
         }
     }
 
@@ -1936,45 +2142,13 @@ impl PathShortcutCache {
         namespace_epoch: u64,
         mut generation_of: impl FnMut(Ino) -> u64,
     ) -> Option<PathShortcutCacheValue> {
-        if !self.is_enabled() {
-            self.misses = self.misses.saturating_add(1);
-            return None;
-        }
-
-        let (value, segment, stale) = match self.entries.get(key) {
-            Some(entry) => (
-                entry.value.clone(),
-                entry.segment,
-                entry.namespace_epoch != namespace_epoch
-                    || entry
-                        .parent_tokens
-                        .iter()
-                        .any(|token| generation_of(token.parent) != token.generation),
-            ),
-            None => {
-                self.misses = self.misses.saturating_add(1);
-                return None;
-            }
-        };
-
-        if stale {
-            self.remove_entry(key);
-            self.misses = self.misses.saturating_add(1);
-            return None;
-        }
-
-        self.hits = self.hits.saturating_add(1);
-        if matches!(value, PathShortcutCacheValue::Negative { .. }) {
-            self.negative_hits = self.negative_hits.saturating_add(1);
-        }
-        match segment {
-            PathShortcutCacheSegment::Probationary => self.promote_to_protected(key),
-            PathShortcutCacheSegment::Protected => {
-                self.protected_hits = self.protected_hits.saturating_add(1);
-                self.touch_protected(key);
-            }
-        }
-        Some(value)
+        self.inner.get(
+            key,
+            PathShortcutLookupCtx {
+                namespace_epoch,
+                generation_of: &mut generation_of,
+            },
+        )
     }
 
     fn put(
@@ -1984,209 +2158,61 @@ impl PathShortcutCache {
         namespace_epoch: u64,
         parent_tokens: Vec<PathShortcutParentToken>,
     ) {
-        if !self.is_enabled() {
-            return;
-        }
-
-        let parent_tokens: Arc<[PathShortcutParentToken]> = Arc::from(parent_tokens);
-        let charge = Self::estimate_entry_charge(&key, &value, &parent_tokens);
-        if charge > self.byte_budget {
-            return;
-        }
-
-        let stamp = self.next_stamp();
-        if let Some(entry) = self.entries.get_mut(&key) {
-            if entry.segment == PathShortcutCacheSegment::Protected {
-                self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
-            }
-            self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
-            entry.value = value;
-            entry.namespace_epoch = namespace_epoch;
-            entry.parent_tokens = parent_tokens;
-            entry.charge = charge;
-            entry.stamp = stamp;
-            self.used_bytes = self.used_bytes.saturating_add(charge);
-            if entry.segment == PathShortcutCacheSegment::Protected {
-                self.protected_bytes = self.protected_bytes.saturating_add(charge);
-                self.protected_order.push_back((key, stamp));
-            } else {
-                self.probationary_order.push_back((key, stamp));
-            }
-            self.maybe_compact_orders();
-            self.enforce_limits();
-            return;
-        }
-
-        self.entries.insert(
-            key.clone(),
-            PathShortcutCacheEntry {
-                value,
-                segment: PathShortcutCacheSegment::Probationary,
+        self.inner.put(
+            key,
+            value,
+            PathShortcutInsertCtx {
                 namespace_epoch,
-                parent_tokens,
-                charge,
-                stamp,
+                parent_tokens: Arc::from(parent_tokens),
             },
         );
-        self.used_bytes = self.used_bytes.saturating_add(charge);
-        self.probationary_order.push_back((key, stamp));
-        self.maybe_compact_orders();
-        self.enforce_limits();
     }
 
-    fn remove_entry(&mut self, key: &PathShortcutCacheKey) -> bool {
-        let Some(entry) = self.entries.remove(key) else {
-            return false;
-        };
-        self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
-        if entry.segment == PathShortcutCacheSegment::Protected {
-            self.protected_entries = self.protected_entries.saturating_sub(1);
-            self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
-        }
-        true
+    #[cfg(test)]
+    fn entry_len(&self) -> usize {
+        self.inner.entry_count()
     }
-
-    fn enforce_limits(&mut self) {
-        self.enforce_protected_budget();
-        while self.entries.len() > self.entry_budget || self.used_bytes > self.byte_budget {
-            if !self.evict_one() {
-                break;
-            }
-        }
-    }
-
-    fn enforce_protected_budget(&mut self) {
-        while self.protected_entries > self.protected_entry_budget
-            || self.protected_bytes > self.protected_byte_budget
-        {
-            if !self.demote_one_protected() {
-                break;
-            }
-        }
-    }
-
-    fn touch_protected(&mut self, key: &PathShortcutCacheKey) {
-        let stamp = self.next_stamp();
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.stamp = stamp;
-            self.protected_order.push_back((key.clone(), stamp));
-        }
-        self.maybe_compact_orders();
-    }
-
-    fn promote_to_protected(&mut self, key: &PathShortcutCacheKey) {
-        let stamp = self.next_stamp();
-        if let Some(entry) = self.entries.get_mut(key) {
-            if entry.segment == PathShortcutCacheSegment::Probationary {
-                entry.segment = PathShortcutCacheSegment::Protected;
-                self.protected_entries = self.protected_entries.saturating_add(1);
-                self.protected_bytes = self.protected_bytes.saturating_add(entry.charge);
-            }
-            entry.stamp = stamp;
-            self.protected_order.push_back((key.clone(), stamp));
-        }
-        self.maybe_compact_orders();
-        self.enforce_protected_budget();
-    }
-
-    fn demote_one_protected(&mut self) -> bool {
-        while let Some((key, stamp)) = self.protected_order.pop_front() {
-            let Some(entry) = self.entries.get(&key) else {
-                continue;
-            };
-            if entry.stamp != stamp || entry.segment != PathShortcutCacheSegment::Protected {
-                continue;
-            }
-            let demote_stamp = self.next_stamp();
-            if let Some(entry) = self.entries.get_mut(&key) {
-                entry.segment = PathShortcutCacheSegment::Probationary;
-                entry.stamp = demote_stamp;
-                self.protected_entries = self.protected_entries.saturating_sub(1);
-                self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
-                self.probationary_order.push_back((key, demote_stamp));
-                return true;
-            }
-        }
-        false
-    }
-
-    fn evict_one(&mut self) -> bool {
-        self.evict_one_from(PathShortcutCacheSegment::Probationary)
-            || self.evict_one_from(PathShortcutCacheSegment::Protected)
-    }
-
-    fn evict_one_from(&mut self, segment: PathShortcutCacheSegment) -> bool {
-        loop {
-            let next = match segment {
-                PathShortcutCacheSegment::Probationary => self.probationary_order.pop_front(),
-                PathShortcutCacheSegment::Protected => self.protected_order.pop_front(),
-            };
-            let Some((key, stamp)) = next else {
-                break;
-            };
-            let Some(entry) = self.entries.get(&key) else {
-                continue;
-            };
-            if entry.stamp != stamp || entry.segment != segment {
-                continue;
-            }
-            if self.remove_entry(&key) {
-                self.evictions = self.evictions.saturating_add(1);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn maybe_compact_orders(&mut self) {
-        let probationary_live = self.entries.len().saturating_sub(self.protected_entries);
-        let probationary_limit = probationary_live
-            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
-            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
-        if self.probationary_order.len() > probationary_limit {
-            self.compact_order(PathShortcutCacheSegment::Probationary);
-        }
-
-        let protected_limit = self
-            .protected_entries
-            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
-            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
-        if self.protected_order.len() > protected_limit {
-            self.compact_order(PathShortcutCacheSegment::Protected);
-        }
-    }
-
-    fn compact_order(&mut self, segment: PathShortcutCacheSegment) {
-        let mut live: Vec<(u64, PathShortcutCacheKey)> = self
-            .entries
-            .iter()
-            .filter_map(|(key, entry)| {
-                (entry.segment == segment).then_some((entry.stamp, key.clone()))
-            })
-            .collect();
-        live.sort_unstable_by_key(|(stamp, _)| *stamp);
-        let order = match segment {
-            PathShortcutCacheSegment::Probationary => &mut self.probationary_order,
-            PathShortcutCacheSegment::Protected => &mut self.protected_order,
-        };
-        order.clear();
-        order.extend(live.into_iter().map(|(stamp, key)| (key, stamp)));
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttrReadCacheSegment {
-    Probationary,
-    Protected,
 }
 
 #[derive(Debug, Clone)]
-struct AttrReadCacheEntry {
-    attr: InodeAttr,
+struct AttrReadCacheMeta {
     expires_at: Instant,
-    segment: AttrReadCacheSegment,
-    charge: usize,
-    stamp: u64,
+}
+
+#[derive(Debug, Default)]
+struct AttrReadCachePolicy;
+
+impl CachePolicy<Ino, InodeAttr> for AttrReadCachePolicy {
+    type Meta = AttrReadCacheMeta;
+    type InsertContext = Instant;
+    type LookupContext<'a> = Instant;
+
+    fn make_meta(
+        &mut self,
+        _key: &Ino,
+        _value: &InodeAttr,
+        ctx: Self::InsertContext,
+    ) -> Self::Meta {
+        AttrReadCacheMeta { expires_at: ctx }
+    }
+
+    fn is_stale(
+        &self,
+        _key: &Ino,
+        _value: &InodeAttr,
+        meta: &Self::Meta,
+        ctx: Self::LookupContext<'_>,
+    ) -> bool {
+        ctx >= meta.expires_at
+    }
+
+    fn estimate_entry_charge(&self, _key: &Ino, _value: &InodeAttr, _meta: &Self::Meta) -> usize {
+        std::mem::size_of::<Ino>()
+            .saturating_add(std::mem::size_of::<
+                TwoTierEntry<InodeAttr, AttrReadCacheMeta>,
+            >())
+            .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2214,295 +2240,57 @@ impl AttrReadCacheMetrics {
 
 #[derive(Debug)]
 struct AttrReadCache {
-    entry_budget: usize,
-    byte_budget: usize,
-    protected_entry_budget: usize,
-    protected_byte_budget: usize,
-    next_stamp: u64,
-    used_bytes: usize,
-    protected_entries: usize,
-    protected_bytes: usize,
-    hits: u64,
-    protected_hits: u64,
-    misses: u64,
-    evictions: u64,
-    entries: HashMap<Ino, AttrReadCacheEntry>,
-    probationary_order: VecDeque<(Ino, u64)>,
-    protected_order: VecDeque<(Ino, u64)>,
+    inner: TwoTierCache<Ino, InodeAttr, AttrReadCachePolicy>,
 }
 
 impl AttrReadCache {
     fn new(entry_budget: usize, byte_budget: usize) -> Self {
-        let protected_entry_budget = if entry_budget <= 1 {
-            0
-        } else {
-            ((entry_budget * METADATA_CACHE_PROTECTED_PERCENT) / 100).clamp(1, entry_budget - 1)
-        };
-        let protected_byte_budget = if byte_budget <= 1 {
-            0
-        } else {
-            ((byte_budget * METADATA_CACHE_PROTECTED_PERCENT) / 100).clamp(1, byte_budget - 1)
-        };
         Self {
-            entry_budget,
-            byte_budget,
-            protected_entry_budget,
-            protected_byte_budget,
-            next_stamp: 1,
-            used_bytes: 0,
-            protected_entries: 0,
-            protected_bytes: 0,
-            hits: 0,
-            protected_hits: 0,
-            misses: 0,
-            evictions: 0,
-            entries: HashMap::new(),
-            probationary_order: VecDeque::new(),
-            protected_order: VecDeque::new(),
+            inner: TwoTierCache::new(entry_budget, byte_budget, AttrReadCachePolicy),
         }
     }
 
-    fn is_enabled(&self) -> bool {
-        self.entry_budget > 0 && self.byte_budget > 0
-    }
-
-    fn next_stamp(&mut self) -> u64 {
-        let stamp = self.next_stamp;
-        self.next_stamp = self.next_stamp.saturating_add(1);
-        stamp
-    }
-
+    #[cfg(test)]
     fn estimate_entry_charge() -> usize {
         std::mem::size_of::<Ino>()
-            .saturating_add(std::mem::size_of::<AttrReadCacheEntry>())
+            .saturating_add(std::mem::size_of::<
+                TwoTierEntry<InodeAttr, AttrReadCacheMeta>,
+            >())
             .saturating_add(DENTRY_CACHE_INDEX_NODE_OVERHEAD)
     }
 
     fn metrics(&self) -> AttrReadCacheMetrics {
+        let metrics = self.inner.metrics();
         AttrReadCacheMetrics {
-            hits: self.hits,
-            protected_hits: self.protected_hits,
-            misses: self.misses,
-            evictions: self.evictions,
-            occupancy_entries: self.entries.len(),
-            occupancy_bytes: self.used_bytes,
-            protected_occupancy_entries: self.protected_entries,
-            protected_occupancy_bytes: self.protected_bytes,
-            entry_budget: self.entry_budget,
-            byte_budget: self.byte_budget,
+            hits: metrics.hits,
+            protected_hits: metrics.protected_hits,
+            misses: metrics.misses,
+            evictions: metrics.evictions,
+            occupancy_entries: self.inner.entry_count(),
+            occupancy_bytes: self.inner.used_bytes(),
+            protected_occupancy_entries: self.inner.protected_entries(),
+            protected_occupancy_bytes: self.inner.protected_bytes(),
+            entry_budget: self.inner.entry_budget,
+            byte_budget: self.inner.byte_budget,
         }
     }
 
     fn get(&mut self, ino: Ino, now: Instant) -> Option<InodeAttr> {
-        if !self.is_enabled() {
-            self.misses = self.misses.saturating_add(1);
-            return None;
-        }
-        let (attr, segment, expired) = match self.entries.get(&ino) {
-            Some(entry) => (entry.attr.clone(), entry.segment, now >= entry.expires_at),
-            None => {
-                self.misses = self.misses.saturating_add(1);
-                return None;
-            }
-        };
-        if expired {
-            self.remove(ino);
-            self.misses = self.misses.saturating_add(1);
-            return None;
-        }
-        self.hits = self.hits.saturating_add(1);
-        match segment {
-            AttrReadCacheSegment::Probationary => self.promote_to_protected(ino),
-            AttrReadCacheSegment::Protected => {
-                self.protected_hits = self.protected_hits.saturating_add(1);
-                self.touch_protected(ino);
-            }
-        }
-        Some(attr)
+        self.inner.get(&ino, now)
     }
 
     fn put(&mut self, ino: Ino, attr: InodeAttr, ttl: Duration, now: Instant) {
-        if !self.is_enabled() {
-            return;
-        }
-        let charge = Self::estimate_entry_charge();
-        if charge > self.byte_budget {
-            return;
-        }
-        let stamp = self.next_stamp();
         let expires_at = now.checked_add(ttl).unwrap_or(now);
-        if let Some(entry) = self.entries.get_mut(&ino) {
-            if entry.segment == AttrReadCacheSegment::Protected {
-                self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
-            }
-            self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
-            entry.attr = attr;
-            entry.expires_at = expires_at;
-            entry.charge = charge;
-            entry.stamp = stamp;
-            self.used_bytes = self.used_bytes.saturating_add(charge);
-            if entry.segment == AttrReadCacheSegment::Protected {
-                self.protected_bytes = self.protected_bytes.saturating_add(charge);
-                self.protected_order.push_back((ino, stamp));
-            } else {
-                self.probationary_order.push_back((ino, stamp));
-            }
-            self.maybe_compact_orders();
-            self.enforce_limits();
-            return;
-        }
-
-        self.entries.insert(
-            ino,
-            AttrReadCacheEntry {
-                attr,
-                expires_at,
-                segment: AttrReadCacheSegment::Probationary,
-                charge,
-                stamp,
-            },
-        );
-        self.used_bytes = self.used_bytes.saturating_add(charge);
-        self.probationary_order.push_back((ino, stamp));
-        self.maybe_compact_orders();
-        self.enforce_limits();
+        self.inner.put(ino, attr, expires_at);
     }
 
     fn remove(&mut self, ino: Ino) -> bool {
-        let Some(entry) = self.entries.remove(&ino) else {
-            return false;
-        };
-        self.used_bytes = self.used_bytes.saturating_sub(entry.charge);
-        if entry.segment == AttrReadCacheSegment::Protected {
-            self.protected_entries = self.protected_entries.saturating_sub(1);
-            self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
-        }
-        true
+        self.inner.remove(&ino)
     }
 
-    fn touch_protected(&mut self, ino: Ino) {
-        let stamp = self.next_stamp();
-        if let Some(entry) = self.entries.get_mut(&ino) {
-            entry.stamp = stamp;
-            self.protected_order.push_back((ino, stamp));
-        }
-        self.maybe_compact_orders();
-    }
-
-    fn promote_to_protected(&mut self, ino: Ino) {
-        let stamp = self.next_stamp();
-        if let Some(entry) = self.entries.get_mut(&ino) {
-            if entry.segment == AttrReadCacheSegment::Probationary {
-                entry.segment = AttrReadCacheSegment::Protected;
-                self.protected_entries = self.protected_entries.saturating_add(1);
-                self.protected_bytes = self.protected_bytes.saturating_add(entry.charge);
-            }
-            entry.stamp = stamp;
-            self.protected_order.push_back((ino, stamp));
-        }
-        self.maybe_compact_orders();
-        self.enforce_protected_budget();
-    }
-
-    fn enforce_limits(&mut self) {
-        self.enforce_protected_budget();
-        while self.entries.len() > self.entry_budget || self.used_bytes > self.byte_budget {
-            if !self.evict_one() {
-                break;
-            }
-        }
-    }
-
-    fn enforce_protected_budget(&mut self) {
-        while self.protected_entries > self.protected_entry_budget
-            || self.protected_bytes > self.protected_byte_budget
-        {
-            if !self.demote_one_protected() {
-                break;
-            }
-        }
-    }
-
-    fn demote_one_protected(&mut self) -> bool {
-        while let Some((ino, stamp)) = self.protected_order.pop_front() {
-            let Some(entry) = self.entries.get(&ino) else {
-                continue;
-            };
-            if entry.stamp != stamp || entry.segment != AttrReadCacheSegment::Protected {
-                continue;
-            }
-            let demote_stamp = self.next_stamp();
-            if let Some(entry) = self.entries.get_mut(&ino) {
-                entry.segment = AttrReadCacheSegment::Probationary;
-                entry.stamp = demote_stamp;
-                self.protected_entries = self.protected_entries.saturating_sub(1);
-                self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
-                self.probationary_order.push_back((ino, demote_stamp));
-                return true;
-            }
-        }
-        false
-    }
-
-    fn evict_one(&mut self) -> bool {
-        self.evict_one_from(AttrReadCacheSegment::Probationary)
-            || self.evict_one_from(AttrReadCacheSegment::Protected)
-    }
-
-    fn evict_one_from(&mut self, segment: AttrReadCacheSegment) -> bool {
-        loop {
-            let next = match segment {
-                AttrReadCacheSegment::Probationary => self.probationary_order.pop_front(),
-                AttrReadCacheSegment::Protected => self.protected_order.pop_front(),
-            };
-            let Some((ino, stamp)) = next else {
-                break;
-            };
-            let Some(entry) = self.entries.get(&ino) else {
-                continue;
-            };
-            if entry.stamp != stamp || entry.segment != segment {
-                continue;
-            }
-            if self.remove(ino) {
-                self.evictions = self.evictions.saturating_add(1);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn maybe_compact_orders(&mut self) {
-        let probationary_live = self.entries.len().saturating_sub(self.protected_entries);
-        let probationary_limit = probationary_live
-            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
-            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
-        if self.probationary_order.len() > probationary_limit {
-            self.compact_order(AttrReadCacheSegment::Probationary);
-        }
-
-        let protected_limit = self
-            .protected_entries
-            .saturating_mul(DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER)
-            .saturating_add(DENTRY_CACHE_ORDER_COMPACT_SLACK);
-        if self.protected_order.len() > protected_limit {
-            self.compact_order(AttrReadCacheSegment::Protected);
-        }
-    }
-
-    fn compact_order(&mut self, segment: AttrReadCacheSegment) {
-        let mut live: Vec<(u64, Ino)> = self
-            .entries
-            .iter()
-            .filter_map(|(ino, entry)| (entry.segment == segment).then_some((entry.stamp, *ino)))
-            .collect();
-        live.sort_unstable_by_key(|(stamp, _)| *stamp);
-        let order = match segment {
-            AttrReadCacheSegment::Probationary => &mut self.probationary_order,
-            AttrReadCacheSegment::Protected => &mut self.protected_order,
-        };
-        order.clear();
-        order.extend(live.into_iter().map(|(stamp, ino)| (ino, stamp)));
+    #[cfg(test)]
+    fn contains(&self, ino: Ino) -> bool {
+        self.inner.contains_key(&ino)
     }
 }
 
@@ -11538,7 +11326,7 @@ mod tests {
 
         cache.put(ROOT_INO, b"a", DentryCacheValue::Positive(11), 0, 0);
         cache.put(ROOT_INO, b"b", DentryCacheValue::Negative, 0, 0);
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entry_len(), 2);
         assert_eq!(
             cache.get(ROOT_INO, b"a", 0, 0),
             Some(DentryCacheValue::Positive(11))
@@ -11549,7 +11337,7 @@ mod tests {
         );
 
         cache.put(ROOT_INO, b"c", DentryCacheValue::Positive(33), 0, 0);
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entry_len(), 2);
         assert_eq!(cache.get(ROOT_INO, b"a", 0, 0), None);
         assert_eq!(
             cache.get(ROOT_INO, b"b", 0, 0),
@@ -11631,7 +11419,7 @@ mod tests {
         }
 
         assert!(
-            cache.protected_order.len() <= DENTRY_CACHE_ORDER_COMPACT_SLACK + 2,
+            cache.protected_order_len() <= DENTRY_CACHE_ORDER_COMPACT_SLACK + 2,
             "protected lazy queue should stay compact under steady-state hits"
         );
     }
@@ -11702,7 +11490,7 @@ mod tests {
             0,
             tokens.clone(),
         );
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entry_len(), 2);
         assert!(matches!(
             cache.get(&key_a, 0, |_| 0),
             Some(PathShortcutCacheValue::Positive(11))
@@ -11723,7 +11511,7 @@ mod tests {
             0,
             tokens,
         );
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entry_len(), 2);
         assert!(cache.get(&key_c, 0, |_| 0).is_some());
     }
 
@@ -11853,13 +11641,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut cached_after_readdir = false;
         while Instant::now() < deadline {
-            if vfs
-                .state
-                .attr_read_cache
-                .lock()
-                .entries
-                .contains_key(&created.ino)
-            {
+            if vfs.state.attr_read_cache.lock().contains(created.ino) {
                 cached_after_readdir = true;
                 break;
             }
@@ -11892,10 +11674,7 @@ mod tests {
         );
         {
             let cache = vfs.state.dentry_cache.lock();
-            assert_eq!(
-                cache.entries.get(&key).map(|entry| entry.value),
-                Some(DentryCacheValue::Negative)
-            );
+            assert_eq!(cache.entry_value(&key), Some(DentryCacheValue::Negative));
         }
 
         let created = vfs
@@ -11904,7 +11683,7 @@ mod tests {
         {
             let cache = vfs.state.dentry_cache.lock();
             assert_eq!(
-                cache.entries.get(&key).map(|entry| entry.value),
+                cache.entry_value(&key),
                 Some(DentryCacheValue::Positive(created.ino))
             );
         }
@@ -11913,10 +11692,7 @@ mod tests {
             .expect("unlink file");
         {
             let cache = vfs.state.dentry_cache.lock();
-            assert_eq!(
-                cache.entries.get(&key).map(|entry| entry.value),
-                Some(DentryCacheValue::Negative)
-            );
+            assert_eq!(cache.entry_value(&key), Some(DentryCacheValue::Negative));
         }
     }
 
@@ -11963,7 +11739,7 @@ mod tests {
 
         let cache = vfs.state.dentry_cache.lock();
         assert_eq!(
-            cache.entries.get(&key).map(|entry| entry.value),
+            cache.entry_value(&key),
             Some(DentryCacheValue::Positive(created.ino))
         );
     }
@@ -12006,7 +11782,7 @@ mod tests {
 
         let cache = vfs.state.dentry_cache.lock();
         assert_eq!(
-            cache.entries.get(&key).map(|entry| entry.value),
+            cache.entry_value(&key),
             Some(DentryCacheValue::Positive(created.ino))
         );
     }
