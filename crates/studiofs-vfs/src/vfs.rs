@@ -507,6 +507,7 @@ const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
 const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 16;
 const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 256;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
+const DEFAULT_PREFETCH_CONCURRENCY_MIN: usize = 16;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
 const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
@@ -524,6 +525,40 @@ const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
+const DEFAULT_MAX_DIRTY_BYTES: usize = 12 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_SPILL_BYTES: usize = 64 * 1024 * 1024 * 1024usize;
+const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
+const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
+const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
+const DEFAULT_FETCH_INCREASE_STEP: f64 = 0.0;
+const DEFAULT_FETCH_DECREASE_FACTOR: f64 = 0.85;
+const DEFAULT_FETCH_DECREASE_COOLDOWN_SECS: u64 = 3;
+const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 16.0;
+const DEFAULT_UPLOAD_MIN_WINDOW: f64 = 1.0;
+const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 512.0;
+const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 2.0;
+const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
+const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
+const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
+const DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED: bool = true;
+const DEFAULT_UPLOAD_WORKER_COUNT: usize = 0;
+const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 10;
+const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_UPLOAD_RETRY_BASE_MS: u64 = 200;
+const DEFAULT_UPLOAD_RETRY_MAX_MS: u64 = 5_000;
+const DEFAULT_FETCH_MAX_ATTEMPTS: u32 = 8;
+const DEFAULT_PREFETCH_FETCH_MAX_ATTEMPTS: u32 = 4;
+const DEFAULT_FETCH_REQUEST_TIMEOUT_SECS: u64 = 45;
+const DEFAULT_FETCH_RETRY_BASE_MS: u64 = 50;
+const DEFAULT_FETCH_RETRY_MAX_MS: u64 = 2_000;
+const DEFAULT_FETCH_PREFETCH_RESERVE: usize = 0;
+const DEFAULT_MAX_DRAIN_BATCH: usize = 1024;
+const DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_QOS_ACCEPT_SLOTS: usize = 64;
+const DEFAULT_QOS_MATERIALIZE_SLOTS: usize = 2;
+const DEFAULT_QOS_UPLOAD_SLOTS: usize = 4;
+const DEFAULT_QOS_COMMIT_SLOTS: usize = 4;
+const DEFAULT_QOS_FETCH_SLOTS: usize = 128;
 const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 8;
 const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 400;
 const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
@@ -800,6 +835,7 @@ pub struct VfsConfig {
 /// Parsed user-provided VFS configuration.
 ///
 /// All fields are optional to preserve whether a value was explicitly set.
+/// Field semantics match [`VfsConfig`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsConfigRaw {
@@ -1088,7 +1124,8 @@ impl Default for VfsConfig {
             janitor_lease_ttl_secs: DEFAULT_JANITOR_LEASE_TTL.as_secs(),
             metadata_invalidation_sync_interval_ms: DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS,
             read_buffer_mb: DEFAULT_READ_BUFFER_MB,
-            prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY.max(16),
+            prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY
+                .max(DEFAULT_PREFETCH_CONCURRENCY_MIN),
             readahead_width: DEFAULT_READAHEAD_WIDTH,
             readahead_min_prefetch: DEFAULT_READAHEAD_MIN_PREFETCH,
             readahead_seq_step: DEFAULT_READAHEAD_SEQ_STEP,
@@ -1102,7 +1139,7 @@ impl Default for VfsConfig {
             lock_ttl_secs: DEFAULT_LOCK_LEASE_TTL.as_secs(),
             lock_retry_base_ms: DEFAULT_LOCK_RETRY_BASE_MS,
             lock_retry_max_ms: DEFAULT_LOCK_RETRY_MAX_MS,
-            max_dirty_bytes: 12 * 1024 * 1024 * 1024,
+            max_dirty_bytes: DEFAULT_MAX_DIRTY_BYTES,
             max_xattr_bytes: DEFAULT_XATTR_MAX_BYTES,
             dentry_cache_capacity: DEFAULT_DENTRY_CACHE_CAPACITY,
             dentry_cache_bytes: DEFAULT_DENTRY_CACHE_BYTES,
@@ -1111,29 +1148,29 @@ impl Default for VfsConfig {
             attr_read_cache_capacity: DEFAULT_ATTR_READ_CACHE_CAPACITY,
             attr_read_cache_bytes: DEFAULT_ATTR_READ_CACHE_BYTES,
             effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
-            max_spill_bytes: 64 * 1024 * 1024 * 1024usize,
+            max_spill_bytes: DEFAULT_MAX_SPILL_BYTES,
             max_ingress_segment_bytes: DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
             cache_safety_mode: CacheSafetyMode::Fast,
             principal: "*".to_string(),
-            fetch_initial_window: 0.0,
-            fetch_min_window: 1.0,
-            fetch_max_window: 0.0,
-            fetch_increase_step: 0.0,
-            fetch_decrease_factor: 0.85,
-            fetch_decrease_cooldown_secs: 3,
-            upload_initial_window: 16.0,
-            upload_min_window: 1.0,
-            upload_max_window: 512.0,
-            upload_increase_step: 2.0,
-            upload_decrease_factor: 0.85,
-            upload_decrease_cooldown_secs: 3,
+            fetch_initial_window: DEFAULT_FETCH_INITIAL_WINDOW,
+            fetch_min_window: DEFAULT_FETCH_MIN_WINDOW,
+            fetch_max_window: DEFAULT_FETCH_MAX_WINDOW,
+            fetch_increase_step: DEFAULT_FETCH_INCREASE_STEP,
+            fetch_decrease_factor: DEFAULT_FETCH_DECREASE_FACTOR,
+            fetch_decrease_cooldown_secs: DEFAULT_FETCH_DECREASE_COOLDOWN_SECS,
+            upload_initial_window: DEFAULT_UPLOAD_INITIAL_WINDOW,
+            upload_min_window: DEFAULT_UPLOAD_MIN_WINDOW,
+            upload_max_window: DEFAULT_UPLOAD_MAX_WINDOW,
+            upload_increase_step: DEFAULT_UPLOAD_INCREASE_STEP,
+            upload_decrease_factor: DEFAULT_UPLOAD_DECREASE_FACTOR,
+            upload_decrease_cooldown_secs: DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS,
             upload_delay_ms: DEFAULT_UPLOAD_DELAY_MS,
             upload_requeue_base_ms: DEFAULT_UPLOAD_REQUEUE_BASE_MS,
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
             upload_l2_lookup_spike_threshold_ms: DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS,
-            slab_flush_interval_ms: 10,
-            background_slab_flush_enabled: true,
+            slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
+            background_slab_flush_enabled: DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED,
             ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
             ingress_checkpoint_min_append_bytes: DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES,
             ingress_checkpoint_min_mutations: DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS,
@@ -1146,30 +1183,30 @@ impl Default for VfsConfig {
             upload_fg_read_latency_target_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
             upload_fg_read_latency_window_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS,
             upload_fg_read_latency_sticky_windows: DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS,
-            upload_worker_count: 0,
-            upload_max_attempts: 10,
-            upload_request_timeout_secs: 120,
-            upload_retry_base_ms: 200,
-            upload_retry_max_ms: 5_000,
-            fetch_max_attempts: 8,
-            prefetch_fetch_max_attempts: 4,
-            fetch_request_timeout_secs: 45,
-            fetch_retry_base_ms: 50,
-            fetch_retry_max_ms: 2_000,
-            fetch_prefetch_reserve: 0,
+            upload_worker_count: DEFAULT_UPLOAD_WORKER_COUNT,
+            upload_max_attempts: DEFAULT_UPLOAD_MAX_ATTEMPTS,
+            upload_request_timeout_secs: DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS,
+            upload_retry_base_ms: DEFAULT_UPLOAD_RETRY_BASE_MS,
+            upload_retry_max_ms: DEFAULT_UPLOAD_RETRY_MAX_MS,
+            fetch_max_attempts: DEFAULT_FETCH_MAX_ATTEMPTS,
+            prefetch_fetch_max_attempts: DEFAULT_PREFETCH_FETCH_MAX_ATTEMPTS,
+            fetch_request_timeout_secs: DEFAULT_FETCH_REQUEST_TIMEOUT_SECS,
+            fetch_retry_base_ms: DEFAULT_FETCH_RETRY_BASE_MS,
+            fetch_retry_max_ms: DEFAULT_FETCH_RETRY_MAX_MS,
+            fetch_prefetch_reserve: DEFAULT_FETCH_PREFETCH_RESERVE,
             fetch_prefetch_acquire_wait_ms: DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
-            max_drain_batch: 1024,
+            max_drain_batch: DEFAULT_MAX_DRAIN_BATCH,
             l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
             l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
             l2_read_timeout_ms: DEFAULT_L2_READ_TIMEOUT_MS,
             l2_write_timeout_ms: DEFAULT_L2_WRITE_TIMEOUT_MS,
-            publish_visibility_timeout_secs: 30,
+            publish_visibility_timeout_secs: DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
-            qos_accept_slots: 64,
-            qos_materialize_slots: 2,
-            qos_upload_slots: 4,
-            qos_commit_slots: 4,
-            qos_fetch_slots: 128,
+            qos_accept_slots: DEFAULT_QOS_ACCEPT_SLOTS,
+            qos_materialize_slots: DEFAULT_QOS_MATERIALIZE_SLOTS,
+            qos_upload_slots: DEFAULT_QOS_UPLOAD_SLOTS,
+            qos_commit_slots: DEFAULT_QOS_COMMIT_SLOTS,
+            qos_fetch_slots: DEFAULT_QOS_FETCH_SLOTS,
         }
     }
 }
@@ -11067,6 +11104,79 @@ mod tests {
         assert_eq!(block_index_from_offset(1, block_size), 0);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024, block_size), 1);
         assert_eq!(block_index_from_offset(4 * 1024 * 1024 + 1, block_size), 1);
+    }
+
+    #[test]
+    fn vfs_config_raw_validate_applies_defaults() {
+        let validated = VfsConfigRaw::default()
+            .validate()
+            .expect("validate defaults");
+        let defaults = VfsConfig::default();
+
+        assert_eq!(
+            validated.janitor_interval_secs,
+            defaults.janitor_interval_secs
+        );
+        assert_eq!(validated.max_dirty_bytes, defaults.max_dirty_bytes);
+        assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
+        assert_eq!(
+            validated.upload_worker_count, 4,
+            "validation should materialize upload worker default"
+        );
+    }
+
+    #[test]
+    fn vfs_config_raw_validate_overlays_explicit_values() {
+        let validated = VfsConfigRaw {
+            read_buffer_mb: Some(8192),
+            upload_cache_io_slots: Some(11),
+            upload_cache_io_user_penalty: Some(7),
+            principal: Some("dev-user".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .expect("validate explicit values");
+
+        assert_eq!(validated.read_buffer_mb, 8192);
+        assert_eq!(validated.upload_cache_io_slots, 11);
+        assert_eq!(validated.upload_cache_io_user_penalty, 7);
+        assert_eq!(validated.principal, "dev-user");
+    }
+
+    #[test]
+    fn vfs_config_raw_validate_rejects_invalid_slot_relationship() {
+        let err = VfsConfigRaw {
+            upload_cache_io_slots: Some(2),
+            upload_cache_io_user_penalty: Some(3),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("penalty above slots must fail");
+
+        assert!(
+            err.to_string().contains("upload_cache_io_user_penalty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vfs_config_raw_validate_clamps_and_normalizes() {
+        let validated = VfsConfigRaw {
+            janitor_interval_secs: Some(0),
+            prefetch_concurrency: Some(0),
+            slab_flush_interval_ms: Some(0),
+            upload_worker_count: Some(0),
+            principal: Some("   ".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .expect("validate clamping");
+
+        assert_eq!(validated.janitor_interval_secs, 1);
+        assert_eq!(validated.prefetch_concurrency, 1);
+        assert_eq!(validated.slab_flush_interval_ms, 1);
+        assert_eq!(validated.upload_worker_count, 4);
+        assert_eq!(validated.principal, "*");
     }
 
     #[test]
