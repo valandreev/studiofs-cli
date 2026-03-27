@@ -5858,9 +5858,10 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         meta.init_root(0, 0).unwrap();
         meta.set_format_info(&format_info).unwrap();
 
+        let base_config = test_vfs_config_from_env().into_inner();
         let vfs_config = VfsConfig {
             cache_safety_mode: mode,
-            ..VfsConfig::default()
+            ..base_config
         };
         let vfs = StudioVfs::new(
             meta,
