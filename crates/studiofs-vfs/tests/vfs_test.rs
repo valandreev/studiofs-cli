@@ -35,8 +35,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig, VfsError,
-    VfsIngressLane, VfsUploadState, parse_size_bytes,
+    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig,
+    VfsConfigValidated, VfsError, VfsIngressLane, VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -169,7 +169,11 @@ fn parse_env_bool(key: &str) -> Option<bool> {
     Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
-fn test_vfs_config_from_env() -> VfsConfig {
+fn validate_test_vfs_config(config: VfsConfig) -> VfsConfigValidated {
+    config.try_into().expect("test VFS config should validate")
+}
+
+fn test_vfs_config_from_env() -> VfsConfigValidated {
     load_test_env();
     // Keep existing integration tests on durable semantics unless overridden.
     let mut config = VfsConfig {
@@ -447,7 +451,7 @@ fn test_vfs_config_from_env() -> VfsConfig {
     } else if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
         config.upload_worker_count = value;
     }
-    config
+    validate_test_vfs_config(config)
 }
 
 fn load_test_env() {
@@ -2075,7 +2079,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config,
+                validate_test_vfs_config(vfs_config),
             )
             .unwrap();
             let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
@@ -2122,7 +2126,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config,
+                validate_test_vfs_config(vfs_config),
             )
             .unwrap();
 
@@ -3211,7 +3215,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                online_vfs_config,
+                validate_test_vfs_config(online_vfs_config),
             )
             .unwrap();
 
@@ -3264,7 +3268,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config,
+                validate_test_vfs_config(vfs_config),
             )
             .unwrap();
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
@@ -3298,7 +3302,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                offline_vfs_config,
+                validate_test_vfs_config(offline_vfs_config),
             )
             .unwrap();
             let blocks = vfs.meta().get_file_blocks(ino).unwrap();
@@ -5854,7 +5858,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         meta.init_root(0, 0).unwrap();
         meta.set_format_info(&format_info).unwrap();
 
-        let mut vfs_config = test_vfs_config_from_env();
+        let mut vfs_config = VfsConfig::default();
         vfs_config.cache_safety_mode = mode;
         let vfs = StudioVfs::new(
             meta,
@@ -5862,7 +5866,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            vfs_config,
+            validate_test_vfs_config(vfs_config),
         )
         .unwrap();
         (vfs, vec![0x39u8; 512 * 1024])
@@ -5971,7 +5975,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            vfs_config,
+            validate_test_vfs_config(vfs_config),
         )
         .unwrap();
 
@@ -6198,7 +6202,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            vfs_config,
+            validate_test_vfs_config(vfs_config),
         )
         .unwrap();
         let writer_count = 4usize;
@@ -6290,7 +6294,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config,
+                validate_test_vfs_config(vfs_config),
             )
             .unwrap();
 
@@ -6390,7 +6394,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config,
+                validate_test_vfs_config(vfs_config),
             )
             .unwrap();
             let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();
@@ -6435,7 +6439,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config,
+                validate_test_vfs_config(vfs_config),
             )
             .unwrap();
             let data =

@@ -48,7 +48,9 @@ fn make_test_vfs(
         cache_dir.to_str().expect("cache dir str"),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
-        VfsConfig::default(),
+        VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate"),
     )
     .expect("create vfs")
 }

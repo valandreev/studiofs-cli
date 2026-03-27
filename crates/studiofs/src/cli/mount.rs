@@ -424,7 +424,10 @@ pub fn run(
     let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
     vfs_config_raw = overlay_vfs_env(vfs_config_raw);
     vfs_config_raw = apply_l2_profile(vfs_config_raw, l2_profile);
-    let mut vfs_config = vfs_config_raw
+    if let Some(principal) = principal {
+        vfs_config_raw.principal = Some(principal.to_string());
+    }
+    let vfs_config = vfs_config_raw
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     info!(
@@ -565,7 +568,6 @@ pub fn run(
         unsafe {
             std::env::set_var("STUDIOFS_PRINCIPAL", principal);
         }
-        vfs_config.principal = principal.to_string();
     }
 
     // ── Guard against double-mount ──────────────────────────────────────────

@@ -929,11 +929,40 @@ pub struct VfsConfigRaw {
     pub qos_fetch_slots: Option<usize>,
 }
 
-pub type VfsConfigValidated = VfsConfig;
+#[derive(Debug, Clone)]
+pub struct VfsConfigValidated(VfsConfig);
+
+impl VfsConfigValidated {
+    pub fn into_inner(self) -> VfsConfig {
+        self.0
+    }
+}
+
+impl std::ops::Deref for VfsConfigValidated {
+    type Target = VfsConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<VfsConfig> for VfsConfigValidated {
+    fn as_ref(&self) -> &VfsConfig {
+        &self.0
+    }
+}
+
+impl TryFrom<VfsConfig> for VfsConfigValidated {
+    type Error = VfsError;
+
+    fn try_from(value: VfsConfig) -> Result<Self, Self::Error> {
+        normalize_and_validate_config(value)
+    }
+}
 
 impl VfsConfigRaw {
     pub fn validate(self) -> VfsResult<VfsConfigValidated> {
-        let mut cfg = VfsConfigValidated::default();
+        let mut cfg = VfsConfig::default();
         macro_rules! overlay {
             ($($field:ident),+ $(,)?) => {
                 $(if let Some(value) = self.$field { cfg.$field = value; })+
@@ -1030,89 +1059,91 @@ impl VfsConfigRaw {
             qos_fetch_slots,
         );
 
-        cfg.janitor_interval_secs = cfg.janitor_interval_secs.max(1);
-        cfg.janitor_max_deletes = cfg.janitor_max_deletes.max(1);
-        cfg.janitor_lease_ttl_secs = cfg.janitor_lease_ttl_secs.max(1);
-        cfg.metadata_invalidation_sync_interval_ms =
-            cfg.metadata_invalidation_sync_interval_ms.max(1);
-        cfg.read_buffer_mb = cfg.read_buffer_mb.max(1);
-        cfg.prefetch_concurrency = cfg.prefetch_concurrency.max(1);
-        cfg.readahead_width = cfg.readahead_width.max(1);
-        cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
-        cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
-        cfg.readahead_random_penalty = cfg.readahead_random_penalty.max(1);
-        cfg.dir_prefetch_max_batch = cfg.dir_prefetch_max_batch.max(1);
-        cfg.readdir_attr_batch_chunk = cfg.readdir_attr_batch_chunk.max(1);
-        cfg.readdir_attr_batch_max_inodes = cfg.readdir_attr_batch_max_inodes.max(1);
-        cfg.prefetch_foreground_reserve = cfg.prefetch_foreground_reserve.max(1);
-        cfg.prefetch_max_per_cycle = cfg.prefetch_max_per_cycle.max(1);
-        cfg.lock_ttl_secs = cfg.lock_ttl_secs.max(1);
-        cfg.lock_retry_base_ms = cfg.lock_retry_base_ms.max(1);
-        cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
-        cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
-        cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
-        cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
-        cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
-        cfg.path_shortcut_cache_capacity = cfg.path_shortcut_cache_capacity.max(1);
-        cfg.path_shortcut_cache_bytes = cfg.path_shortcut_cache_bytes.max(1);
-        cfg.attr_read_cache_capacity = cfg.attr_read_cache_capacity.max(1);
-        cfg.attr_read_cache_bytes = cfg.attr_read_cache_bytes.max(1);
-        cfg.effective_acl_cache_capacity = cfg.effective_acl_cache_capacity.max(1);
-        cfg.max_spill_bytes = cfg.max_spill_bytes.max(1);
-        cfg.max_ingress_segment_bytes = cfg.max_ingress_segment_bytes.max(1);
-        cfg.fetch_min_window = cfg.fetch_min_window.max(1.0);
-        cfg.fetch_decrease_cooldown_secs = cfg.fetch_decrease_cooldown_secs.max(1);
-        cfg.upload_min_window = cfg.upload_min_window.max(1.0);
-        cfg.upload_max_window = cfg.upload_max_window.max(cfg.upload_min_window);
-        cfg.upload_increase_step = cfg.upload_increase_step.max(0.000_001);
-        cfg.upload_decrease_factor = cfg.upload_decrease_factor.max(0.000_001);
-        cfg.upload_decrease_cooldown_secs = cfg.upload_decrease_cooldown_secs.max(1);
-        cfg.upload_requeue_base_ms = cfg.upload_requeue_base_ms.max(1);
-        cfg.upload_requeue_max_ms = cfg.upload_requeue_max_ms.max(cfg.upload_requeue_base_ms);
-        cfg.upload_stats_interval_secs = cfg.upload_stats_interval_secs.max(1);
-        cfg.slab_flush_interval_ms = cfg.slab_flush_interval_ms.max(1);
-        cfg.ingress_checkpoint_interval_secs = cfg.ingress_checkpoint_interval_secs.max(1);
-        cfg.upload_cache_io_slots = cfg.upload_cache_io_slots.max(1);
-        cfg.upload_cache_io_user_penalty = cfg.upload_cache_io_user_penalty.max(1);
-        cfg.upload_fg_read_latency_target_ms = cfg
-            .upload_fg_read_latency_target_ms
-            .max(cfg.upload_l2_lookup_spike_threshold_ms.max(1));
-        cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
-        cfg.upload_fg_read_latency_sticky_windows =
-            cfg.upload_fg_read_latency_sticky_windows.max(1);
-        cfg.max_drain_batch = cfg.max_drain_batch.max(1);
-        cfg.l2_commit_workers = cfg.l2_commit_workers.max(1);
-        cfg.l2_commit_queue_capacity = cfg.l2_commit_queue_capacity.max(1);
-        cfg.l2_read_timeout_ms = cfg.l2_read_timeout_ms.max(1);
-        cfg.l2_write_timeout_ms = cfg.l2_write_timeout_ms.max(1);
-        cfg.publish_visibility_timeout_secs = cfg.publish_visibility_timeout_secs.max(1);
-        cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
-        cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
-        cfg.qos_materialize_slots = cfg.qos_materialize_slots.max(1);
-        cfg.qos_upload_slots = cfg.qos_upload_slots.max(1);
-        cfg.qos_commit_slots = cfg.qos_commit_slots.max(1);
-        cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
-
-        if cfg.upload_cache_io_user_penalty > cfg.upload_cache_io_slots as u32 {
-            return Err(VfsError::Other(format!(
-                "upload_cache_io_user_penalty ({}) exceeds upload_cache_io_slots ({})",
-                cfg.upload_cache_io_user_penalty, cfg.upload_cache_io_slots
-            )));
-        }
-
-        if cfg.upload_worker_count == 0 {
-            cfg.upload_worker_count = 4;
-        }
-
-        let principal = cfg.principal.trim();
-        cfg.principal = if principal.is_empty() {
-            "*".to_string()
-        } else {
-            principal.to_string()
-        };
-
-        Ok(cfg)
+        normalize_and_validate_config(cfg)
     }
+}
+
+fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValidated> {
+    cfg.janitor_interval_secs = cfg.janitor_interval_secs.max(1);
+    cfg.janitor_max_deletes = cfg.janitor_max_deletes.max(1);
+    cfg.janitor_lease_ttl_secs = cfg.janitor_lease_ttl_secs.max(1);
+    cfg.metadata_invalidation_sync_interval_ms = cfg.metadata_invalidation_sync_interval_ms.max(1);
+    cfg.read_buffer_mb = cfg.read_buffer_mb.max(1);
+    cfg.prefetch_concurrency = cfg.prefetch_concurrency.max(1);
+    cfg.readahead_width = cfg.readahead_width.max(1);
+    cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
+    cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
+    cfg.readahead_random_penalty = cfg.readahead_random_penalty.max(1);
+    cfg.dir_prefetch_max_batch = cfg.dir_prefetch_max_batch.max(1);
+    cfg.readdir_attr_batch_chunk = cfg.readdir_attr_batch_chunk.max(1);
+    cfg.readdir_attr_batch_max_inodes = cfg.readdir_attr_batch_max_inodes.max(1);
+    cfg.prefetch_foreground_reserve = cfg.prefetch_foreground_reserve.max(1);
+    cfg.prefetch_max_per_cycle = cfg.prefetch_max_per_cycle.max(1);
+    cfg.lock_ttl_secs = cfg.lock_ttl_secs.max(1);
+    cfg.lock_retry_base_ms = cfg.lock_retry_base_ms.max(1);
+    cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
+    cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
+    cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
+    cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
+    cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
+    cfg.path_shortcut_cache_capacity = cfg.path_shortcut_cache_capacity.max(1);
+    cfg.path_shortcut_cache_bytes = cfg.path_shortcut_cache_bytes.max(1);
+    cfg.attr_read_cache_capacity = cfg.attr_read_cache_capacity.max(1);
+    cfg.attr_read_cache_bytes = cfg.attr_read_cache_bytes.max(1);
+    cfg.effective_acl_cache_capacity = cfg.effective_acl_cache_capacity.max(1);
+    cfg.max_spill_bytes = cfg.max_spill_bytes.max(1);
+    cfg.max_ingress_segment_bytes = cfg.max_ingress_segment_bytes.max(1);
+    cfg.fetch_min_window = cfg.fetch_min_window.max(1.0);
+    cfg.fetch_decrease_cooldown_secs = cfg.fetch_decrease_cooldown_secs.max(1);
+    cfg.upload_min_window = cfg.upload_min_window.max(1.0);
+    cfg.upload_max_window = cfg.upload_max_window.max(cfg.upload_min_window);
+    cfg.upload_increase_step = cfg.upload_increase_step.max(0.000_001);
+    cfg.upload_decrease_factor = cfg.upload_decrease_factor.max(0.000_001);
+    cfg.upload_decrease_cooldown_secs = cfg.upload_decrease_cooldown_secs.max(1);
+    cfg.upload_requeue_base_ms = cfg.upload_requeue_base_ms.max(1);
+    cfg.upload_requeue_max_ms = cfg.upload_requeue_max_ms.max(cfg.upload_requeue_base_ms);
+    cfg.upload_stats_interval_secs = cfg.upload_stats_interval_secs.max(1);
+    cfg.slab_flush_interval_ms = cfg.slab_flush_interval_ms.max(1);
+    cfg.ingress_checkpoint_interval_secs = cfg.ingress_checkpoint_interval_secs.max(1);
+    cfg.upload_cache_io_slots = cfg.upload_cache_io_slots.max(1);
+    cfg.upload_cache_io_user_penalty = cfg.upload_cache_io_user_penalty.max(1);
+    cfg.upload_fg_read_latency_target_ms = cfg
+        .upload_fg_read_latency_target_ms
+        .max(cfg.upload_l2_lookup_spike_threshold_ms.max(1));
+    cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
+    cfg.upload_fg_read_latency_sticky_windows = cfg.upload_fg_read_latency_sticky_windows.max(1);
+    cfg.max_drain_batch = cfg.max_drain_batch.max(1);
+    cfg.l2_commit_workers = cfg.l2_commit_workers.max(1);
+    cfg.l2_commit_queue_capacity = cfg.l2_commit_queue_capacity.max(1);
+    cfg.l2_read_timeout_ms = cfg.l2_read_timeout_ms.max(1);
+    cfg.l2_write_timeout_ms = cfg.l2_write_timeout_ms.max(1);
+    cfg.publish_visibility_timeout_secs = cfg.publish_visibility_timeout_secs.max(1);
+    cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
+    cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
+    cfg.qos_materialize_slots = cfg.qos_materialize_slots.max(1);
+    cfg.qos_upload_slots = cfg.qos_upload_slots.max(1);
+    cfg.qos_commit_slots = cfg.qos_commit_slots.max(1);
+    cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
+
+    if cfg.upload_cache_io_user_penalty > cfg.upload_cache_io_slots as u32 {
+        return Err(VfsError::Other(format!(
+            "upload_cache_io_user_penalty ({}) exceeds upload_cache_io_slots ({})",
+            cfg.upload_cache_io_user_penalty, cfg.upload_cache_io_slots
+        )));
+    }
+
+    if cfg.upload_worker_count == 0 {
+        cfg.upload_worker_count = 4;
+    }
+
+    let principal = cfg.principal.trim();
+    cfg.principal = if principal.is_empty() {
+        "*".to_string()
+    } else {
+        principal.to_string()
+    };
+
+    Ok(VfsConfigValidated(cfg))
 }
 
 impl Default for VfsConfig {
@@ -4208,7 +4239,7 @@ impl StudioVfs {
         cache_dir: &str,
         cache_size: u64,
         memory_limit: u64,
-        config: VfsConfig,
+        config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>> {
         {
             let meta_async: Arc<dyn AsyncMetaEngine> =
@@ -11090,7 +11121,9 @@ mod tests {
             cache_dir.to_str().expect("cache dir str"),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
-            VfsConfig::default(),
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
         )
         .expect("create vfs");
         (rt, vfs, meta)
