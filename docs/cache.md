@@ -26,6 +26,24 @@ The cache subsystem (`studiofs-cache`) implements a two-level block cache design
 
 ## Components
 
+### Metadata Lookup Caches (`studiofs-vfs/src/vfs.rs`)
+
+In addition to block caching, VFS keeps three bounded metadata lookup caches:
+
+- `DentryCache` for `(parent ino, name) -> child ino | negative`
+- `PathShortcutCache` for full-path shortcut resolution
+- `AttrReadCache` for read-through inode attributes with TTL
+
+These caches now share one generic two-tier implementation:
+
+- `TwoTierCache<K, V, P>`: shared probationary/protected queues, promotion/demotion,
+  eviction, lazy queue compaction, and metrics accounting
+- `CachePolicy<K, V>`: per-cache behavior hooks for charge estimation, staleness
+  checks, and index bookkeeping
+
+This removes duplicated eviction/compaction logic and ensures fixes in the
+two-tier algorithm apply consistently to all metadata caches.
+
 ### L1 Memory Cache (`l1_mem.rs`)
 
 In-memory block store using 64 sharded `HashMap<u64, Bytes>`.
