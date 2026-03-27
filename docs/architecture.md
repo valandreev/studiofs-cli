@@ -58,6 +58,7 @@ Core invariants:
 4. `flush(ino)`/`close(ino)` applies the configured cache safety policy:
    - `durable`: appends accepted records to ingress (durable local accept path),
    - `fast`: skips ingress payload persistence and relies on best-effort self-heal on restart.
+   - ingress implementation details live in `crates/studiofs-vfs/src/ingress_wal.rs`.
 5. Background workers materialize accepted records and upload each logical block as four independent cloud fragments.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
@@ -86,6 +87,11 @@ Reads prefer local state in this order:
 3. ingress live index (`ingress_spill/segments/`, `durable` mode)
 4. cache (L1/L2)
 5. S3 fetch
+
+Ingress WAL metadata format:
+- Checkpoint/state metadata is persisted in binary `postcard` format with file-level
+  magic headers (`IWC1` / `IWS1`).
+- Recovery accepts legacy JSON metadata files for backward compatibility.
 
 Metadata lookups are served from local `redb`, where local staged blocks
 override committed blocks, and local overlay attrs/dentries/symlinks/xattrs override the remote-visible base view.
