@@ -97,7 +97,6 @@ pub fn open_meta_engine_with_options(
             let redb = RedbMetaEngine::open(path)?;
             Ok(Arc::new(redb))
         }
-        Err(MetaError::Storage(err)) => Err(MetaError::Storage(err)),
         Err(err) => Err(err),
     }
 }
