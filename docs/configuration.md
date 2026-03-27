@@ -463,7 +463,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
 | `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
-| `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Per-upload slot cost when foreground reads are active; clamped to `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` |
+| `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Per-upload slot cost when foreground reads are active; must be `<= STUDIOFS_UPLOAD_CACHE_IO_SLOTS` (invalid config fails validation before mount) |
 | `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `80% of memory limit` | Global transit-memory credit budget for active in-flight fetch/upload buffers |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `50` | Foreground-read P90 latency target for upload throttling |
@@ -491,10 +491,15 @@ Upload local-I/O tuning notes:
 - upload workers use phase separation: local-cache I/O slots are released immediately after the cache read and are not held during S3 upload waits.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
-- when `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` is configured above `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`, StudioFS clamps it and emits a startup warning.
+- when `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` is configured above `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`, StudioFS fails config validation before VFS startup.
 - fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
 - if a single fetch request exceeds `STUDIOFS_TRANSIT_MEMORY_BUDGET`, StudioFS returns a fetch error instead of silently clamping the credit request.
 - speedometer logs include `foreground_read_p90_present` and `foreground_read_p90_ms` for stable parsing even when no fresh samples exist.
+
+Configuration validation notes:
+- StudioFS resolves user input through a raw/validated configuration pipeline before creating `StudioVfs`.
+- `STUDIOFS_PREFETCH_CONCURRENCY` is normalized to a minimum of `16` when an explicit lower value is supplied in raw config.
+- `STUDIOFS_UPLOAD_WORKER_COUNT=0` is treated as "use runtime default", which resolves to `4` workers.
 
 ### Testing
 
