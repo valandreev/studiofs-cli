@@ -7,6 +7,7 @@ use crate::types::*;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::debug;
@@ -406,8 +407,19 @@ impl RedbMetaEngine {
 
     /// Probe format info from an existing redb database without opening it for writes.
     pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
-        let db = ReadOnlyDatabase::open(path.as_ref())
-            .map_err(|e| MetaError::Storage(format!("failed to open redb read-only: {e}")))?;
+        let db = match ReadOnlyDatabase::open(path.as_ref()) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::Storage(redb::StorageError::Io(err)))
+                if err.kind() == ErrorKind::NotFound =>
+            {
+                return Err(MetaError::NotFormatted);
+            }
+            Err(e) => {
+                return Err(MetaError::Storage(format!(
+                    "failed to open redb read-only: {e}"
+                )));
+            }
+        };
         let txn = db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

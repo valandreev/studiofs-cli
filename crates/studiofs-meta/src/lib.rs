@@ -14,7 +14,6 @@ pub mod types;
 
 use std::path::Path;
 use std::sync::Arc;
-use tracing::warn;
 
 pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
@@ -85,21 +84,43 @@ pub fn open_meta_engine_with_options(
         Ok(info) => {
             ensure_supported_format_version(&info)?;
             let redb = RedbMetaEngine::open(path)?;
+            let redb_info = redb.get_format_info()?;
+            ensure_supported_format_version(&redb_info)?;
+            if redb_info.metadata.backend != info.metadata.backend {
+                return Err(MetaError::Storage(
+                    "metadata backend switched during RedbMetaEngine open".to_string(),
+                ));
+            }
             Ok(Arc::new(redb))
         }
         Err(MetaError::NotFormatted) => {
             let redb = RedbMetaEngine::open(path)?;
             Ok(Arc::new(redb))
         }
-        Err(MetaError::Storage(err)) => {
-            warn!(
-                path = %path.display(),
-                error = %err,
-                "readonly metadata probe failed; falling back to redb open"
-            );
-            let redb = RedbMetaEngine::open(path)?;
-            Ok(Arc::new(redb))
-        }
+        Err(MetaError::Storage(err)) => Err(MetaError::Storage(err)),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_meta_engine_missing_file_creates_redb() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing-meta.db");
+        assert!(!path.exists());
+
+        let engine = open_meta_engine_with_options(
+            &path,
+            MetaOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open missing metadata path");
+
+        let info = engine.get_format_info();
+        assert!(matches!(info, Err(MetaError::NotFormatted)));
     }
 }
