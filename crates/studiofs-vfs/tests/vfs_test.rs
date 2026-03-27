@@ -2075,7 +2075,9 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config.validate().expect("test VFS config should validate"),
+                vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
             let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
@@ -2122,7 +2124,9 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config.validate().expect("test VFS config should validate"),
+                vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
 
@@ -3211,7 +3215,9 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                online_vfs_config.validate().expect("test VFS config should validate"),
+                online_vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
 
@@ -3264,7 +3270,9 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config.validate().expect("test VFS config should validate"),
+                vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
@@ -5863,7 +5871,9 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            vfs_config.validate().expect("test VFS config should validate"),
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
         )
         .unwrap();
         (vfs, vec![0x39u8; 512 * 1024])
@@ -5972,7 +5982,9 @@ fn test_write_fast_mode_no_spill_artifacts() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            vfs_config.validate().expect("test VFS config should validate"),
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
         )
         .unwrap();
 
@@ -6291,7 +6303,9 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config.validate().expect("test VFS config should validate"),
+                vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
 
@@ -6391,7 +6405,9 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config.validate().expect("test VFS config should validate"),
+                vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
             let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();

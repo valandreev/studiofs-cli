@@ -277,3 +277,64 @@ Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
    - Windows: `cargo test -p studiofs-winfsp`
    - Unix: `cargo test -p studiofs-fuse`
 6. **Update AGENTS.md** when adding new conventions or patterns
+
+## VfsState Decomposition (SFS-96)
+
+### Overview
+
+The monolithic `VfsState` struct (68 fields) was decomposed into 11 cohesive, independently lockable subsystems to improve maintainability, reduce lock contention, and clarify ownership boundaries.
+
+### Subsystems
+
+```
+VfsState (composed of 11 subsystems)
+├── ingress: IngressState          # Ingress WAL, spill tracking, segment management
+├── dirty_buffer: DirtyBufferState # Dirty memory buffer, spill state, drain coordination
+├── upload: UploadState            # Upload queue, cancellation, pending evictions
+├── namespace: NamespaceState       # Dentry cache, path shortcuts, attr cache
+├── acl: AclState                  # ACL state (minimal, placeholder)
+├── incarnation: IncarnationState  # Inode incarnation tracking
+├── write_buffer: WriteBufferState # Pending blocks for writes
+├── read: ReadState                # Foreground read tracking, P90 latency, prefetch hints
+├── file_lock: FileLockState       # File locking state
+├── shutdown: ShutdownState        # Shutdown flags, tokens, task handles
+└── metrics: MetricsState          # Runtime metrics and counters
+```
+
+### Lock Ordering Policy
+
+To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest priority):
+
+1. **Tier 1**: `ShutdownState` — shutdown flags are checked before any other operation
+2. **Tier 2**: `WriteBufferState` — pending write blocks
+3. **Tier 3**: `DirtyBufferState` — dirty memory buffer and spill state
+4. **Tier 4**: `IngressState` — ingress WAL and spill entries
+5. **Tier 5**: `NamespaceState` — dentry/attr caches
+6. **Tier 6**: `IncarnationState` — inode incarnation tracking
+7. **Tier 7**: `UploadState` — upload queue and cancellations
+8. **Tier 8**: `AclState` — ACL state
+9. **Tier 9**: `FileLockState` — file locks
+10. **Tier 10**: `MetricsState` — metrics (rarely needs locking)
+
+### VfsState::new Pattern
+
+The `VfsState::new()` constructor accepts `&VfsConfig` for cache/limit parameters rather than individual arguments:
+
+```rust
+fn new(
+    recovered_spill: RecoveredSpillMap,
+    recovered_spill_bytes: usize,
+    active_segment_id: u64,
+    recovered_spill_seq: u64,
+    initial_checkpoint_meta: Option<(u64, u64, u64)>,
+    cfg: &VfsConfig,
+) -> Self
+```
+
+### Key Patterns
+
+1. **State access**: Use `self.state.subsystem.field` instead of direct fields on `VfsState`
+2. **Lock release before IO**: Always release mutex locks before performing IO operations (file deletions, WAL appends)
+3. **Batch operations**: Use batch methods like `remove_spill_entries_batch()` for efficiency
+4. **Atomic ordering**: Use `Release`/`Acquire` for critical data (throttling metrics), `Relaxed` for non-critical counters
+5. **notify_waiters outside lock**: Always call `notify_waiters()` after releasing the mutex to avoid lock contention
