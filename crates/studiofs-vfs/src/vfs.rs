@@ -541,7 +541,8 @@ const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
 const DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED: bool = true;
-const DEFAULT_UPLOAD_WORKER_COUNT: usize = 0;
+const DEFAULT_UPLOAD_WORKER_COUNT: usize = 4;
+const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 10;
 const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_UPLOAD_RETRY_BASE_MS: u64 = 200;
@@ -961,7 +962,7 @@ impl TryFrom<VfsConfig> for VfsConfigValidated {
 }
 
 impl VfsConfigRaw {
-    pub fn validate(self) -> VfsResult<VfsConfigValidated> {
+    fn resolve_defaults(self) -> VfsConfig {
         let mut cfg = VfsConfig::default();
         macro_rules! overlay {
             ($($field:ident),+ $(,)?) => {
@@ -1059,6 +1060,11 @@ impl VfsConfigRaw {
             qos_fetch_slots,
         );
 
+        cfg
+    }
+
+    pub fn validate(self) -> VfsResult<VfsConfigValidated> {
+        let cfg = self.resolve_defaults();
         normalize_and_validate_config(cfg)
     }
 }
@@ -1069,7 +1075,9 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.janitor_lease_ttl_secs = cfg.janitor_lease_ttl_secs.max(1);
     cfg.metadata_invalidation_sync_interval_ms = cfg.metadata_invalidation_sync_interval_ms.max(1);
     cfg.read_buffer_mb = cfg.read_buffer_mb.max(1);
-    cfg.prefetch_concurrency = cfg.prefetch_concurrency.max(1);
+    cfg.prefetch_concurrency = cfg
+        .prefetch_concurrency
+        .max(DEFAULT_PREFETCH_CONCURRENCY_MIN);
     cfg.readahead_width = cfg.readahead_width.max(1);
     cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
     cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
@@ -1132,9 +1140,11 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
         )));
     }
 
-    if cfg.upload_worker_count == 0 {
-        cfg.upload_worker_count = 4;
-    }
+    cfg.upload_worker_count = if cfg.upload_worker_count == 0 {
+        DEFAULT_UPLOAD_WORKER_COUNT
+    } else {
+        cfg.upload_worker_count.max(MIN_UPLOAD_WORKER_COUNT)
+    };
 
     let principal = cfg.principal.trim();
     cfg.principal = if principal.is_empty() {
@@ -11206,7 +11216,10 @@ mod tests {
         .expect("validate clamping");
 
         assert_eq!(validated.janitor_interval_secs, 1);
-        assert_eq!(validated.prefetch_concurrency, 1);
+        assert_eq!(
+            validated.prefetch_concurrency,
+            DEFAULT_PREFETCH_CONCURRENCY_MIN
+        );
         assert_eq!(validated.slab_flush_interval_ms, 1);
         assert_eq!(validated.upload_worker_count, 4);
         assert_eq!(validated.principal, "*");
