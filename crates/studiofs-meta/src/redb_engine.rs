@@ -6281,6 +6281,24 @@ mod tests {
     }
 
     #[test]
+    fn test_read_format_info_readonly_reports_serialization_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-invalid-format.db");
+
+        let engine = RedbMetaEngine::open(&path).unwrap();
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(SETTINGS_TABLE).unwrap();
+            table.insert("format", b"{not-json".as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+        drop(engine);
+
+        let result = RedbMetaEngine::read_format_info_readonly(&path);
+        assert!(matches!(result, Err(MetaError::Serialization(_))));
+    }
+
+    #[test]
     fn test_snapshot_pins_objects_and_is_listed() {
         let engine = temp_engine();
         let file = engine

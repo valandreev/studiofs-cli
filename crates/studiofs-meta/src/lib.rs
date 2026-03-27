@@ -14,6 +14,7 @@ pub mod types;
 
 use std::path::Path;
 use std::sync::Arc;
+use tracing::warn;
 
 pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
@@ -72,18 +73,33 @@ pub fn open_meta_engine_with_options(
                     background_poll: options.background_poll,
                 },
             )?;
-            ensure_supported_format_version(&pg.get_format_info()?)?;
+            let pg_info = pg.get_format_info()?;
+            ensure_supported_format_version(&pg_info)?;
+            if pg_info.metadata.backend != MetadataBackend::Postgres {
+                return Err(MetaError::Storage(
+                    "metadata backend switched during PgMetaEngine open".to_string(),
+                ));
+            }
             Ok(pg)
         }
-        probe_result => {
+        Ok(info) => {
+            ensure_supported_format_version(&info)?;
             let redb = RedbMetaEngine::open(path)?;
-            match probe_result {
-                Ok(info) => {
-                    ensure_supported_format_version(&info)?;
-                    Ok(Arc::new(redb))
-                }
-                Err(_) => Ok(Arc::new(redb)),
-            }
+            Ok(Arc::new(redb))
         }
+        Err(MetaError::NotFormatted) => {
+            let redb = RedbMetaEngine::open(path)?;
+            Ok(Arc::new(redb))
+        }
+        Err(MetaError::Storage(err)) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "readonly metadata probe failed; falling back to redb open"
+            );
+            let redb = RedbMetaEngine::open(path)?;
+            Ok(Arc::new(redb))
+        }
+        Err(err) => Err(err),
     }
 }
