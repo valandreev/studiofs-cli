@@ -6,6 +6,10 @@ on:
       - "**"
   pull_request:
 
+env:
+  # Enable additional lints for better code quality
+  RUSTFLAGS: "-Dwarnings"
+
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -25,8 +29,16 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets
+      - name: cargo clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --all-targets -- --nocapture
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-Dwarnings"

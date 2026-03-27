@@ -111,6 +111,7 @@ struct TransitMemoryBudgetState {
 }
 
 #[derive(Debug)]
+#[must_use = "guard must be held to maintain transit memory budget reservation"]
 pub struct TransitMemoryGuard {
     budget: Arc<TransitMemoryBudget>,
     bytes: usize,

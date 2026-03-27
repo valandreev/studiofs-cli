@@ -1145,6 +1145,11 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
     cfg.foreground_read_speedometer_shards = cfg.foreground_read_speedometer_shards.max(1);
 
+    // Safe cast: upload_cache_io_slots is validated to fit in u32
+    debug_assert!(
+        cfg.upload_cache_io_slots <= u32::MAX as usize,
+        "upload_cache_io_slots overflow"
+    );
     if cfg.upload_cache_io_user_penalty > cfg.upload_cache_io_slots as u32 {
         return Err(VfsError::Other(format!(
             "upload_cache_io_user_penalty ({}) exceeds upload_cache_io_slots ({})",
@@ -4152,7 +4157,11 @@ impl StudioVfs {
                 ingress_checkpoint_max_segment_lag,
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
-                upload_cache_io_slots_max: upload_cache_io_slots as u32,
+                // Safe cast: upload_cache_io_slots is validated earlier to fit in u32
+                upload_cache_io_slots_max: {
+                    debug_assert!(upload_cache_io_slots <= u32::MAX as usize);
+                    upload_cache_io_slots as u32
+                },
                 transit_memory_budget,
                 qos,
                 upload_cache_io_user_penalty_base: upload_cache_io_user_penalty,
@@ -4686,7 +4695,8 @@ impl StudioVfs {
             return (0, 0);
         }
         ages.sort_unstable();
-        let p95_idx = ((ages.len() - 1) * 95) / 100;
+        // Safe percentile calculation: use checked arithmetic to avoid overflow
+        let p95_idx = ((ages.len() - 1).saturating_mul(95)) / 100;
         let p95 = ages[p95_idx];
         let max = *ages.last().unwrap_or(&0);
         (p95, max)

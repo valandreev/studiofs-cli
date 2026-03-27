@@ -272,6 +272,7 @@ impl AimdController {
 /// **Must** be consumed via [`success()`](Self::success) or
 /// [`failure()`](Self::failure).  If dropped without either call the slot
 /// is released neutrally (window unchanged).
+#[must_use = "permit must be consumed via success() or failure() to maintain correct AIMD state"]
 pub struct AimdPermit<'a> {
     controller: &'a AimdController,
     /// Set to `true` once `success()` or `failure()` has been called.

@@ -258,6 +258,7 @@ pub struct L2CommitSchedulerStats {
     backpressure_wait_histogram: LatencyHistogram,
 }
 
+#[must_use = "guard tracks active worker count for metrics accuracy"]
 pub struct L2CommitWorkerGuard<'a> {
     stats: &'a L2CommitSchedulerStats,
 }
@@ -382,6 +383,7 @@ pub struct BlockingTaskStats {
     execution_histogram: LatencyHistogram,
 }
 
+#[must_use = "guard tracks active task count and execution time for metrics accuracy"]
 pub struct BlockingTaskExecutionGuard<'a> {
     stats: &'a BlockingTaskStats,
     started_at: Instant,

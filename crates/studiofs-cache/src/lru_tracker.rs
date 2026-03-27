@@ -388,7 +388,10 @@ impl LruTracker {
 
         let now = Instant::now();
         let max_back_secs = Self::max_subtractable_secs(now);
-        let denom = (entries.len() - 1) as u128;
+        // Safe calculation: use saturating arithmetic to avoid overflow.
+        // entries.len() >= 1 here (checked above), but saturating_sub defends
+        // against future code changes.
+        let denom = entries.len().saturating_sub(1) as u128;
 
         for (i, ce) in entries.iter().enumerate() {
             let shard_idx = (ce.object_id as usize) % SHARD_COUNT;
@@ -397,7 +400,9 @@ impl LruTracker {
             let offset_secs = if denom == 0 || max_back_secs == 0 {
                 0
             } else {
-                let oldest_rank = (entries.len() - 1 - i) as u128;
+                // Safe subtraction: entries.len() > i since we're iterating.
+                // Use saturating_sub for consistency and defense-in-depth.
+                let oldest_rank = entries.len().saturating_sub(1 + i) as u128;
                 ((oldest_rank * max_back_secs as u128) / denom) as u64
             };
             let access = now

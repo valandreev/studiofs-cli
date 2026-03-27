@@ -435,7 +435,9 @@ fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool 
                 had_invalid_utf8 = true;
                 let valid_up_to = err.valid_up_to();
                 if valid_up_to > 0 {
-                    // SAFETY: `valid_up_to` prefix is guaranteed valid UTF-8 by `Utf8Error`.
+                    // SAFETY: `valid_up_to` is guaranteed by `Utf8Error` to mark
+                    // the end of the valid UTF-8 prefix. The slice `&rest[..valid_up_to]`
+                    // contains only valid UTF-8 bytes by contract of `from_utf8`'s error.
                     let valid = unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) };
                     out.extend(valid.encode_utf16());
                 }

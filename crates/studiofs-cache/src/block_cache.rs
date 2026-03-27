@@ -1208,9 +1208,29 @@ impl BlockCache {
         let entries = self.lru.snapshot_for_checkpoint();
         let count = entries.len() as u32;
 
-        let mut buf = Vec::with_capacity(
-            checkpoint::MAGIC.len() + 2 + 4 + 4 + entries.len() * checkpoint::ENTRY_SIZE,
+        // Safe size calculation with overflow checking.
+        // Header: MAGIC(6) + VERSION(2) + COUNT(4) + CRC_PLACEHOLDER(4) = 16 bytes
+        const HEADER_SIZE: usize = 16;
+        // Each entry: object_id(8) + size(4) + location(1) + pinned(1) + padding(4) = 18 bytes
+        const ENTRY_SIZE: usize = 18;
+
+        // Compile-time verification that ENTRY_SIZE matches the checkpoint module constant.
+        // This ensures our manual size calculation stays in sync with the actual format.
+        const _: () = assert!(
+            ENTRY_SIZE == checkpoint::ENTRY_SIZE,
+            "ENTRY_SIZE mismatch: local constant does not match checkpoint::ENTRY_SIZE"
         );
+
+        // Calculate total size with overflow check.
+        let entries_size = entries
+            .len()
+            .checked_mul(ENTRY_SIZE)
+            .expect("checkpoint entries size overflow");
+        let total_size = HEADER_SIZE
+            .checked_add(entries_size)
+            .expect("checkpoint total size overflow");
+
+        let mut buf = Vec::with_capacity(total_size);
 
         // Header.
         buf.extend_from_slice(checkpoint::MAGIC);

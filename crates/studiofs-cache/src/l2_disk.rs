@@ -323,6 +323,19 @@ pub struct L2DiskCache {
     sync_direct_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
 }
 
+impl Drop for L2DiskCache {
+    fn drop(&mut self) {
+        // Clear FD caches to ensure all file descriptors are closed before shutdown.
+        // This prevents FD leaks in long-running processes and ensures clean shutdown.
+        let mut cache = self.sync_read_fd_cache.lock();
+        cache.clear();
+        drop(cache);
+
+        let mut direct_cache = self.sync_direct_read_fd_cache.lock();
+        direct_cache.clear();
+    }
+}
+
 impl L2DiskCache {
     fn unique_tmp_path(path: &Path) -> PathBuf {
         static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
