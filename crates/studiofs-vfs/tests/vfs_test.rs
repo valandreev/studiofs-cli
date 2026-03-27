@@ -35,7 +35,7 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfig,
+    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw,
     VfsConfigValidated, VfsError, VfsIngressLane, VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
@@ -169,289 +169,285 @@ fn parse_env_bool(key: &str) -> Option<bool> {
     Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
-fn validate_test_vfs_config(config: VfsConfig) -> VfsConfigValidated {
-    config.try_into().expect("test VFS config should validate")
-}
-
 fn test_vfs_config_from_env() -> VfsConfigValidated {
     load_test_env();
     // Keep existing integration tests on durable semantics unless overridden.
-    let mut config = VfsConfig {
-        cache_safety_mode: CacheSafetyMode::Durable,
-        ..VfsConfig::default()
+    let mut config = VfsConfigRaw {
+        cache_safety_mode: Some(CacheSafetyMode::Durable),
+        ..VfsConfigRaw::default()
     };
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
-        config.max_dirty_bytes = bytes;
+        config.max_dirty_bytes = Some(bytes);
     }
     if let Ok(v) = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
-        config.max_spill_bytes = bytes;
+        config.max_spill_bytes = Some(bytes);
     }
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
     {
-        config.max_ingress_segment_bytes = bytes;
+        config.max_ingress_segment_bytes = Some(bytes);
     }
     if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
-        config.background_slab_flush_enabled = !disable;
+        config.background_slab_flush_enabled = Some(!disable);
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
-        config.slab_flush_interval_ms = ms;
+        config.slab_flush_interval_ms = Some(ms);
     }
     if let Some(secs) = parse_env_u64("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS") {
-        config.shutdown_metadata_flush_timeout_secs = secs;
+        config.shutdown_metadata_flush_timeout_secs = Some(secs);
     }
     if let Ok(v) = std::env::var("STUDIOFS_PRINCIPAL") {
         let v = v.trim();
         if !v.is_empty() {
-            config.principal = v.to_string();
+            config.principal = Some(v.to_string());
         }
     }
     if let Some(secs) = parse_env_u64("STUDIOFS_JANITOR_INTERVAL_SECS") {
-        config.janitor_interval_secs = secs;
+        config.janitor_interval_secs = Some(secs);
     }
     if let Some(secs) = parse_env_u64_any("STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
-        config.janitor_skip_newer_secs = secs;
+        config.janitor_skip_newer_secs = Some(secs);
     }
     if let Some(count) = parse_env_u64("STUDIOFS_JANITOR_MAX_DELETES") {
-        config.janitor_max_deletes = count;
+        config.janitor_max_deletes = Some(count);
     }
     if let Some(secs) = parse_env_u64("STUDIOFS_JANITOR_LEASE_TTL_SECS") {
-        config.janitor_lease_ttl_secs = secs;
+        config.janitor_lease_ttl_secs = Some(secs);
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS") {
-        config.metadata_invalidation_sync_interval_ms = ms;
+        config.metadata_invalidation_sync_interval_ms = Some(ms);
     }
     if let Some(mb) = parse_env_u64("STUDIOFS_READ_BUFFER_MB") {
-        config.read_buffer_mb = mb;
+        config.read_buffer_mb = Some(mb);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_CONCURRENCY") {
-        config.prefetch_concurrency = value;
+        config.prefetch_concurrency = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_WIDTH") {
-        config.readahead_width = value as u32;
+        config.readahead_width = Some(value as u32);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_MIN_PREFETCH") {
-        config.readahead_min_prefetch = value as u32;
+        config.readahead_min_prefetch = Some(value as u32);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_SEQ_STEP") {
-        config.readahead_seq_step = value as u8;
+        config.readahead_seq_step = Some(value as u8);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_RANDOM_PENALTY") {
-        config.readahead_random_penalty = value as u8;
+        config.readahead_random_penalty = Some(value as u8);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_DIR_PREFETCH_MAX_BATCH") {
-        config.dir_prefetch_max_batch = value;
+        config.dir_prefetch_max_batch = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READDIR_ATTR_BATCH_CHUNK") {
-        config.readdir_attr_batch_chunk = value;
+        config.readdir_attr_batch_chunk = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES") {
-        config.readdir_attr_batch_max_inodes = value;
+        config.readdir_attr_batch_max_inodes = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_FOREGROUND_RESERVE") {
-        config.prefetch_foreground_reserve = value;
+        config.prefetch_foreground_reserve = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_MAX_PER_CYCLE") {
-        config.prefetch_max_per_cycle = value;
+        config.prefetch_max_per_cycle = Some(value);
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS") {
-        config.prefetch_pause_on_neterr_ms = ms;
+        config.prefetch_pause_on_neterr_ms = Some(ms);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_MAX_DRAIN_BATCH") {
-        config.max_drain_batch = value;
+        config.max_drain_batch = Some(value);
     }
     if let Some(secs) = parse_env_u64("STUDIOFS_LOCK_TTL_SECS") {
-        config.lock_ttl_secs = secs;
+        config.lock_ttl_secs = Some(secs);
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_LOCK_RETRY_BASE_MS") {
-        config.lock_retry_base_ms = ms;
+        config.lock_retry_base_ms = Some(ms);
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_LOCK_RETRY_MAX_MS") {
-        config.lock_retry_max_ms = ms;
+        config.lock_retry_max_ms = Some(ms);
     }
     if let Ok(v) = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
-        config.max_xattr_bytes = bytes;
+        config.max_xattr_bytes = Some(bytes);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_DENTRY_CACHE_CAPACITY") {
-        config.dentry_cache_capacity = value;
+        config.dentry_cache_capacity = Some(value);
     }
     if let Ok(v) = std::env::var("STUDIOFS_DENTRY_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
-        config.dentry_cache_bytes = bytes;
+        config.dentry_cache_bytes = Some(bytes);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY") {
-        config.path_shortcut_cache_capacity = value;
+        config.path_shortcut_cache_capacity = Some(value);
     }
     if let Ok(v) = std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
-        config.path_shortcut_cache_bytes = bytes;
+        config.path_shortcut_cache_bytes = Some(bytes);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_ATTR_READ_CACHE_CAPACITY") {
-        config.attr_read_cache_capacity = value;
+        config.attr_read_cache_capacity = Some(value);
     }
     if let Ok(v) = std::env::var("STUDIOFS_ATTR_READ_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
-        config.attr_read_cache_bytes = bytes;
+        config.attr_read_cache_bytes = Some(bytes);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_SLOTS") {
-        config.upload_cache_io_slots = value;
+        config.upload_cache_io_slots = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
-        config.upload_cache_io_user_penalty = value as u32;
+        config.upload_cache_io_user_penalty = Some(value as u32);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS") {
-        config.upload_user_idle_grace_ms = value;
+        config.upload_user_idle_grace_ms = Some(value);
     }
     if let Some(value) = parse_env_u64_any("STUDIOFS_UPLOAD_DELAY_MS") {
-        config.upload_delay_ms = value;
+        config.upload_delay_ms = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_REQUEUE_BASE_MS") {
-        config.upload_requeue_base_ms = value;
+        config.upload_requeue_base_ms = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_REQUEUE_MAX_MS") {
-        config.upload_requeue_max_ms = value;
+        config.upload_requeue_max_ms = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_STATS_INTERVAL_SECS") {
-        config.upload_stats_interval_secs = value;
+        config.upload_stats_interval_secs = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
-        config.upload_max_attempts = value as u32;
+        config.upload_max_attempts = Some(value as u32);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS") {
-        config.upload_request_timeout_secs = value;
+        config.upload_request_timeout_secs = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_RETRY_BASE_MS") {
-        config.upload_retry_base_ms = value;
+        config.upload_retry_base_ms = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_RETRY_MAX_MS") {
-        config.upload_retry_max_ms = value;
+        config.upload_retry_max_ms = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS") {
-        config.publish_visibility_timeout_secs = value;
+        config.publish_visibility_timeout_secs = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_INITIAL_WINDOW") {
-        config.upload_initial_window = value;
+        config.upload_initial_window = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_MIN_WINDOW") {
-        config.upload_min_window = value;
+        config.upload_min_window = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_MAX_WINDOW") {
-        config.upload_max_window = value;
+        config.upload_max_window = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_INCREASE_STEP") {
-        config.upload_increase_step = value;
+        config.upload_increase_step = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_UPLOAD_DECREASE_FACTOR") {
-        config.upload_decrease_factor = value;
+        config.upload_decrease_factor = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_DECREASE_COOLDOWN_SECS") {
-        config.upload_decrease_cooldown_secs = value;
+        config.upload_decrease_cooldown_secs = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_FETCH_INITIAL_WINDOW") {
-        config.fetch_initial_window = value;
+        config.fetch_initial_window = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_FETCH_MIN_WINDOW") {
-        config.fetch_min_window = value;
+        config.fetch_min_window = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_FETCH_MAX_WINDOW") {
-        config.fetch_max_window = value;
+        config.fetch_max_window = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_FETCH_INCREASE_STEP") {
-        config.fetch_increase_step = value;
+        config.fetch_increase_step = Some(value);
     }
     if let Some(value) = parse_env_f64("STUDIOFS_FETCH_DECREASE_FACTOR") {
-        config.fetch_decrease_factor = value;
+        config.fetch_decrease_factor = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS") {
-        config.fetch_decrease_cooldown_secs = value;
+        config.fetch_decrease_cooldown_secs = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_FETCH_MAX_ATTEMPTS") {
-        config.fetch_max_attempts = value as u32;
+        config.fetch_max_attempts = Some(value as u32);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
-        config.prefetch_fetch_max_attempts = value as u32;
+        config.prefetch_fetch_max_attempts = Some(value as u32);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS") {
-        config.fetch_request_timeout_secs = value;
+        config.fetch_request_timeout_secs = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_FETCH_RETRY_BASE_MS") {
-        config.fetch_retry_base_ms = value;
+        config.fetch_retry_base_ms = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_FETCH_RETRY_MAX_MS") {
-        config.fetch_retry_max_ms = value;
+        config.fetch_retry_max_ms = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_FETCH_PREFETCH_RESERVE") {
-        config.fetch_prefetch_reserve = value;
+        config.fetch_prefetch_reserve = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS") {
-        config.fetch_prefetch_acquire_wait_ms = value;
+        config.fetch_prefetch_acquire_wait_ms = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_ACCEPT_SLOTS") {
-        config.qos_accept_slots = value;
+        config.qos_accept_slots = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_MATERIALIZE_SLOTS") {
-        config.qos_materialize_slots = value;
+        config.qos_materialize_slots = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_UPLOAD_SLOTS") {
-        config.qos_upload_slots = value;
+        config.qos_upload_slots = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_COMMIT_SLOTS") {
-        config.qos_commit_slots = value;
+        config.qos_commit_slots = Some(value);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_FETCH_SLOTS") {
-        config.qos_fetch_slots = value;
+        config.qos_fetch_slots = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS") {
-        config.ingress_checkpoint_interval_secs = value;
+        config.ingress_checkpoint_interval_secs = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES") {
-        config.ingress_checkpoint_min_append_bytes = value;
+        config.ingress_checkpoint_min_append_bytes = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS") {
-        config.ingress_checkpoint_min_mutations = value;
+        config.ingress_checkpoint_min_mutations = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG") {
-        config.ingress_checkpoint_max_segment_lag = value;
+        config.ingress_checkpoint_max_segment_lag = Some(value);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS") {
-        config.ingress_checkpoint_max_live_segments = value;
+        config.ingress_checkpoint_max_live_segments = Some(value);
     }
     if let Ok(value) = std::env::var("STUDIOFS_CACHE_SAFETY_MODE") {
         let value = value.trim().to_ascii_lowercase();
         if value == "fast" {
-            config.cache_safety_mode = CacheSafetyMode::Fast;
+            config.cache_safety_mode = Some(CacheSafetyMode::Fast);
         } else if value == "durable" {
-            config.cache_safety_mode = CacheSafetyMode::Durable;
+            config.cache_safety_mode = Some(CacheSafetyMode::Durable);
         }
     }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
-        config.upload_worker_count = value;
+        config.upload_worker_count = Some(value);
     } else if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
-        config.upload_worker_count = value;
+        config.upload_worker_count = Some(value);
     }
-    validate_test_vfs_config(config)
+    config.validate().expect("test VFS config should validate")
 }
 
 fn load_test_env() {
@@ -2066,12 +2062,12 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                background_slab_flush_enabled: true,
-                ..VfsConfig::default()
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                background_slab_flush_enabled: Some(true),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -2079,7 +2075,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(vfs_config),
+                vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
             let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
@@ -2113,12 +2109,12 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                background_slab_flush_enabled: false,
-                ..VfsConfig::default()
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                background_slab_flush_enabled: Some(false),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -2126,7 +2122,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(vfs_config),
+                vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
 
@@ -3202,12 +3198,12 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let online_vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                background_slab_flush_enabled: true,
-                ..VfsConfig::default()
+            let online_vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                background_slab_flush_enabled: Some(true),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -3215,7 +3211,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(online_vfs_config),
+                online_vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
 
@@ -3255,12 +3251,12 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                background_slab_flush_enabled: false,
-                ..VfsConfig::default()
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                background_slab_flush_enabled: Some(false),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -3268,7 +3264,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(vfs_config),
+                vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
@@ -3289,12 +3285,12 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let offline_vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                background_slab_flush_enabled: false,
-                ..VfsConfig::default()
+            let offline_vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                background_slab_flush_enabled: Some(false),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -3302,7 +3298,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(offline_vfs_config),
+                offline_vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
             let blocks = vfs.meta().get_file_blocks(ino).unwrap();
@@ -5858,18 +5854,16 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         meta.init_root(0, 0).unwrap();
         meta.set_format_info(&format_info).unwrap();
 
-        let base_config = test_vfs_config_from_env().into_inner();
-        let vfs_config = VfsConfig {
-            cache_safety_mode: mode,
-            ..base_config
-        };
+        let mut base_raw: VfsConfigRaw = test_vfs_config_from_env().into_inner().into();
+        base_raw.cache_safety_mode = Some(mode);
+        let vfs_config = base_raw;
         let vfs = StudioVfs::new(
             meta,
             &data_config,
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            validate_test_vfs_config(vfs_config),
+            vfs_config.validate().expect("test VFS config should validate"),
         )
         .unwrap();
         (vfs, vec![0x39u8; 512 * 1024])
@@ -5965,12 +5959,12 @@ fn test_write_fast_mode_no_spill_artifacts() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let vfs_config = VfsConfig {
-            cache_safety_mode: CacheSafetyMode::Fast,
-            max_dirty_bytes: 32 * 1024 * 1024,
-            max_spill_bytes: 64 * 1024 * 1024,
-            background_slab_flush_enabled: true,
-            ..VfsConfig::default()
+        let vfs_config = VfsConfigRaw {
+            cache_safety_mode: Some(CacheSafetyMode::Fast),
+            max_dirty_bytes: Some(32 * 1024 * 1024),
+            max_spill_bytes: Some(64 * 1024 * 1024),
+            background_slab_flush_enabled: Some(true),
+            ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
             meta.clone(),
@@ -5978,7 +5972,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            validate_test_vfs_config(vfs_config),
+            vfs_config.validate().expect("test VFS config should validate"),
         )
         .unwrap();
 
@@ -6191,13 +6185,13 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         .unwrap();
     rt.block_on(async {
         ensure_bucket().await;
-        let vfs_config = VfsConfig {
-            max_dirty_bytes: 1,
-            max_spill_bytes: 4 * 1024 * 1024,
-            cache_safety_mode: CacheSafetyMode::Durable,
-            slab_flush_interval_ms: 5000,
-            background_slab_flush_enabled: false,
-            ..VfsConfig::default()
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(1),
+            max_spill_bytes: Some(4 * 1024 * 1024),
+            cache_safety_mode: Some(CacheSafetyMode::Durable),
+            slab_flush_interval_ms: Some(5000),
+            background_slab_flush_enabled: Some(false),
+            ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
             meta,
@@ -6205,7 +6199,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             &cache_dir_str,
             1024 * 1024 * 1024,
             512 * 1024 * 1024,
-            validate_test_vfs_config(vfs_config),
+            vfs_config.validate().expect("test VFS config should validate"),
         )
         .unwrap();
         let writer_count = 4usize;
@@ -6283,13 +6277,13 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             .unwrap();
         rt.block_on(async {
             ensure_bucket().await;
-            let vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 8 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                slab_flush_interval_ms: 5000,
-                background_slab_flush_enabled: false,
-                ..VfsConfig::default()
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(8 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                slab_flush_interval_ms: Some(5000),
+                background_slab_flush_enabled: Some(false),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -6297,7 +6291,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(vfs_config),
+                vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
 
@@ -6385,11 +6379,11 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                ..VfsConfig::default()
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -6397,7 +6391,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(vfs_config),
+                vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
             let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();
@@ -6430,11 +6424,11 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let vfs_config = VfsConfig {
-                max_dirty_bytes: 1,
-                max_spill_bytes: 16 * 1024 * 1024,
-                cache_safety_mode: CacheSafetyMode::Durable,
-                ..VfsConfig::default()
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(1),
+                max_spill_bytes: Some(16 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
@@ -6442,7 +6436,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                validate_test_vfs_config(vfs_config),
+                vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
             let data =
