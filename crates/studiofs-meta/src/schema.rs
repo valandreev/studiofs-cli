@@ -598,12 +598,6 @@ pub fn offset_within_block(offset: u64, block_size: u32) -> u32 {
     (offset % block_size as u64) as u32
 }
 
-/// Calculate the number of blocks needed for a file of given size.
-#[inline]
-pub fn blocks_for_size(size: u64, block_size: u32) -> u32 {
-    size.div_ceil(block_size as u64) as u32
-}
-
 // =============================================================================
 // Directory Entries (with Name)
 // =============================================================================
@@ -688,17 +682,6 @@ mod tests {
         assert_eq!(offset_within_block(100, block_size), 100);
         assert_eq!(offset_within_block(4 * 1024 * 1024, block_size), 0);
         assert_eq!(offset_within_block(4 * 1024 * 1024 + 100, block_size), 100);
-    }
-
-    #[test]
-    fn test_blocks_for_size() {
-        let block_size = 4 * 1024 * 1024; // 4MB
-
-        assert_eq!(blocks_for_size(0, block_size), 0);
-        assert_eq!(blocks_for_size(1, block_size), 1);
-        assert_eq!(blocks_for_size(4 * 1024 * 1024, block_size), 1);
-        assert_eq!(blocks_for_size(4 * 1024 * 1024 + 1, block_size), 2);
-        assert_eq!(blocks_for_size(16 * 1024 * 1024, block_size), 4);
     }
 
     #[test]

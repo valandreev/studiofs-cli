@@ -557,18 +557,6 @@ pub fn parse_object_id_from_key(key: &str) -> Result<u64, ObjectError> {
 // Legacy Types (Deprecated - for backward compatibility during migration)
 // =============================================================================
 
-/// Legacy: Calculate XXH64 hash and return as hex string.
-///
-/// In the new architecture, blocks use sequential IDs instead of content hashes.
-#[deprecated(
-    since = "0.2.0",
-    note = "Use sequential block IDs instead of content hashes"
-)]
-pub fn hash_object(data: &[u8]) -> String {
-    let hash = xxh64(data, 0);
-    format!("{:016x}", hash)
-}
-
 /// Legacy: Object kind enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[deprecated(since = "0.2.0", note = "New architecture uses simple block storage")]

@@ -32,14 +32,6 @@ pub fn split_into_blocks(data: &[u8], start_offset: u32) -> Vec<(u32, Bytes)> {
     blocks
 }
 
-/// Calculate block index and offset within block for a given offset within a slice.
-pub fn block_position(offset_in_slice: u32) -> (u32, u32) {
-    let bs = DEFAULT_BLOCK_SIZE;
-    let block_idx = offset_in_slice / bs;
-    let offset_in_block = offset_in_slice % bs;
-    (block_idx, offset_in_block)
-}
-
 /// Calculate how many blocks a slice of given size spans.
 pub fn block_count(slice_size: u32) -> u32 {
     let bs = DEFAULT_BLOCK_SIZE;
@@ -81,13 +73,6 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, 3);
         assert_eq!(blocks[0].1.len(), bs / 2);
-    }
-
-    #[test]
-    fn test_block_position() {
-        assert_eq!(block_position(0), (0, 0));
-        assert_eq!(block_position(DEFAULT_BLOCK_SIZE), (1, 0));
-        assert_eq!(block_position(DEFAULT_BLOCK_SIZE + 1024), (1, 1024));
     }
 
     #[test]
