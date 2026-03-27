@@ -136,6 +136,14 @@ Crash semantics note:
   materialized can be lost (typically the last materializer window).
 - `durable` mode keeps WAL/checkpoint-backed restart recovery for accepted ingress.
 
+Ingress WAL internals:
+- The WAL subsystem is implemented in [`crates/studiofs-vfs/src/ingress_wal.rs`].
+- `vfs.rs` interacts with it through `IngressWal`, `IngressLiveIndex`, and `SpillEntry`
+  instead of owning segment-format details.
+- WAL metadata files (`ingress_spill/state.json`, `ingress_spill/checkpoints/latest.json`)
+  are encoded as binary `postcard` payloads with magic prefixes (`IWS1` / `IWC1`).
+- Startup recovery remains backward-compatible with legacy JSON metadata files.
+
 ### 3. Background Materializer (`drain_dirty_mem` lineage)
 
 Runs every 10ms, processes continuously while data exists:

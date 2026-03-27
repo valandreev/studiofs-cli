@@ -5,6 +5,7 @@
 pub mod aimd;
 pub mod fetch;
 pub mod incarnation;
+pub(crate) mod ingress_wal;
 pub mod qos;
 pub mod readahead;
 mod runtime;
