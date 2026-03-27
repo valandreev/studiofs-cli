@@ -18,8 +18,8 @@ use std::sync::Arc;
 pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
     BatchFlushEntry, BatchFlushResult, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaError,
-    MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult,
-    MetaSnapshots, MetaSymlink, MetaXattr,
+    MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication,
+    MetaResult, MetaSnapshots, MetaSymlink, MetaXattr,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{
@@ -63,12 +63,9 @@ pub fn open_meta_engine_with_options(
     options: MetaOpenOptions,
 ) -> MetaResult<Arc<dyn MetaEngine>> {
     let path = path.as_ref();
-    let redb = RedbMetaEngine::open(path)?;
-    match redb.get_format_info() {
+    match RedbMetaEngine::read_format_info_readonly(path) {
         Ok(info) if info.metadata.backend == MetadataBackend::Postgres => {
             ensure_supported_format_version(&info)?;
-            // Redb holds an exclusive process-local open lock. Release probe handle first.
-            drop(redb);
             let pg = PgMetaEngine::open_with_options(
                 path,
                 PgOpenOptions {
@@ -78,10 +75,15 @@ pub fn open_meta_engine_with_options(
             ensure_supported_format_version(&pg.get_format_info()?)?;
             Ok(pg)
         }
-        Ok(info) => {
-            ensure_supported_format_version(&info)?;
-            Ok(Arc::new(redb))
+        probe_result => {
+            let redb = RedbMetaEngine::open(path)?;
+            match probe_result {
+                Ok(info) => {
+                    ensure_supported_format_version(&info)?;
+                    Ok(Arc::new(redb))
+                }
+                Err(_) => Ok(Arc::new(redb)),
+            }
         }
-        Err(_) => Ok(Arc::new(redb)),
     }
 }

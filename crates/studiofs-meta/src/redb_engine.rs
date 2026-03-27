@@ -4,7 +4,7 @@
 
 use crate::engine::*;
 use crate::types::*;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
@@ -402,6 +402,23 @@ impl RedbMetaEngine {
         let engine = Self { db: Arc::new(db) };
         let _ = engine.recover_undo_logs()?;
         Ok(engine)
+    }
+
+    /// Probe format info from an existing redb database without opening it for writes.
+    pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
+        let db = ReadOnlyDatabase::open(path.as_ref())
+            .map_err(|e| MetaError::Storage(format!("failed to open redb read-only: {e}")))?;
+        let txn = db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let entry = table
+            .get("format")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .ok_or(MetaError::NotFormatted)?;
+        serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
     }
 
     /// Initialize a fresh filesystem with root inode.
@@ -6220,6 +6237,47 @@ mod tests {
         let loaded = engine.get_format_info().unwrap();
         assert_eq!(loaded.name, "test-vol");
         assert_eq!(loaded.endpoint, "http://localhost:9000");
+    }
+
+    #[test]
+    fn test_read_format_info_readonly_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.db");
+
+        let engine = RedbMetaEngine::open(&path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        let info = FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: "probe-vol".into(),
+            uuid: "probe-uuid".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "probe-bucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "probe-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&info).unwrap();
+        drop(engine);
+
+        let loaded = RedbMetaEngine::read_format_info_readonly(&path).unwrap();
+        assert_eq!(loaded.name, "probe-vol");
+        assert_eq!(loaded.uuid, "probe-uuid");
+    }
+
+    #[test]
+    fn test_read_format_info_readonly_returns_not_formatted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-not-formatted.db");
+
+        let engine = RedbMetaEngine::open(&path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        drop(engine);
+
+        let result = RedbMetaEngine::read_format_info_readonly(&path);
+        assert!(matches!(result, Err(MetaError::NotFormatted)));
     }
 
     #[test]
