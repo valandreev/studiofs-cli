@@ -1355,6 +1355,11 @@ trait CachePolicy<K, V> {
         false
     }
     fn on_insert(&mut self, _key: &K, _value: &V, _meta: &Self::Meta) {}
+    /// Called when an existing key is updated via `TwoTierCache::put`.
+    ///
+    /// Note: during this callback the entry is temporarily removed from
+    /// `TwoTierCache.entries` (remove/update/reinsert flow), so policy logic
+    /// must not assume the key is currently present in the main map.
     fn on_update(
         &mut self,
         _key: &K,
@@ -1504,6 +1509,8 @@ where
         let stamp = self.next_stamp();
 
         if let Some(mut entry) = self.entries.remove(&key) {
+            // Deliberately bypass `self.remove(...)` here: this is an in-place
+            // update, not a logical deletion, so policy `on_remove` must not fire.
             if entry.segment == TwoTierSegment::Protected {
                 self.protected_bytes = self.protected_bytes.saturating_sub(entry.charge);
             }
