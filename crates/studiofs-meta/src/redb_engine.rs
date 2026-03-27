@@ -362,6 +362,12 @@ pub struct RedbMetaEngine {
 impl RedbMetaEngine {
     /// Open or create a metadata database at the given path.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
+        // Ensure the parent directory exists before opening the database
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MetaError::Storage(format!("failed to create directory for redb: {e}")))?;
+        }
+        
         let db = Database::create(path.as_ref())
             .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
