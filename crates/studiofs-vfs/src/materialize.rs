@@ -56,7 +56,12 @@ impl Materializer {
                 }
                 _ = timer.tick() => {}
             }
-            if vfs.state.slab_flusher_stopped.load(Ordering::Acquire) {
+            if vfs
+                .state
+                .shutdown
+                .slab_flusher_stopped
+                .load(Ordering::Acquire)
+            {
                 break;
             }
             Self::drain(vfs.as_ref()).await;
@@ -65,7 +70,7 @@ impl Materializer {
     }
 
     pub(super) async fn drain(vfs: &StudioVfs) {
-        let _guard = vfs.state.dirty_drain_lock.lock().await;
+        let _guard = vfs.state.dirty_buffer.dirty_drain_lock.lock().await;
         let _qos = match vfs.qos.acquire_materialize().await {
             Ok(permit) => permit,
             Err(e) => {
@@ -73,7 +78,8 @@ impl Materializer {
                 return;
             }
         };
-        let _inflight_guard = MaterializeInflightGuard::new(&vfs.state.materialize_batch_stats);
+        let _inflight_guard =
+            MaterializeInflightGuard::new(&vfs.state.metrics.materialize_batch_stats);
         Self::drain_inner(vfs).await;
     }
 
@@ -97,7 +103,7 @@ impl Materializer {
             };
 
             let batch_len = Self::apply_batch(vfs, extents, results, manifests).await;
-            vfs.state.materialize_batch_stats.record_batch(
+            vfs.state.metrics.materialize_batch_stats.record_batch(
                 batch_blocks,
                 batch_bytes,
                 batch_started.elapsed(),
@@ -113,7 +119,7 @@ impl Materializer {
         max_drain_batch: usize,
     ) -> Option<(Vec<MaterializedExtent>, Vec<BatchFlushResult>)> {
         let keys: Vec<(Ino, u32)> = {
-            let dirty = vfs.state.dirty_mem.lock();
+            let dirty = vfs.state.dirty_buffer.dirty_mem.lock();
             let mut fair = FairInodeScheduler::default();
             let mut seen = std::collections::HashSet::new();
             for key in dirty.keys() {
@@ -122,7 +128,7 @@ impl Materializer {
                 }
             }
             if fair.len() < max_drain_batch {
-                let spill = vfs.state.ingress_live.lock();
+                let spill = vfs.state.ingress.ingress_live.lock();
                 for key in spill.keys() {
                     if seen.insert(*key) {
                         fair.push(key.0, *key);
@@ -143,13 +149,13 @@ impl Materializer {
         }
 
         let mut dirty_snapshot: HashMap<(Ino, u32), Bytes> = {
-            let dirty = vfs.state.dirty_mem.lock();
+            let dirty = vfs.state.dirty_buffer.dirty_mem.lock();
             keys.iter()
                 .filter_map(|key| dirty.get(key).cloned().map(|data| (*key, data)))
                 .collect()
         };
         let mut ingress_snapshot: HashMap<(Ino, u32), SpillEntry> = {
-            let ingress = vfs.state.ingress_live.lock();
+            let ingress = vfs.state.ingress.ingress_live.lock();
             keys.iter()
                 .filter_map(|key| ingress.get_cloned(key).map(|entry| (*key, entry)))
                 .collect()
@@ -157,18 +163,24 @@ impl Materializer {
 
         let mut work: Vec<(Ino, u32, Bytes, bool, Option<u64>)> = Vec::with_capacity(keys.len());
         for (ino, block_index) in keys {
-            if vfs.state.deleted_inodes.lock().contains(&ino) {
+            if vfs.state.upload.deleted_inodes.lock().contains(&ino) {
                 // `dirty_mem` is `DirtyMemIndex`: remove() updates both payload map
                 // and per-inode counters atomically.
-                let removed = vfs.state.dirty_mem.lock().remove(&(ino, block_index));
+                let removed = vfs
+                    .state
+                    .dirty_buffer
+                    .dirty_mem
+                    .lock()
+                    .remove(&(ino, block_index));
                 if let Some(data) = removed {
                     vfs.state
+                        .dirty_buffer
                         .dirty_bytes
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                             Some(v.saturating_sub(data.len()))
                         })
                         .ok();
-                    vfs.state.dirty_drained_notify.notify_waiters();
+                    vfs.state.dirty_buffer.dirty_drained_notify.notify_waiters();
                 }
                 let _ = vfs.remove_spill_entry((ino, block_index));
                 debug!(
@@ -356,7 +368,7 @@ impl Materializer {
             );
 
             {
-                let mut dirty = vfs.state.dirty_mem.lock();
+                let mut dirty = vfs.state.dirty_buffer.dirty_mem.lock();
                 let key = (extent.ino, extent.block_index);
                 let remove_match = dirty
                     .get(&key)
@@ -370,6 +382,7 @@ impl Materializer {
 
             let should_remove_spill = extent.spill_seq.is_some_and(|expected_seq| {
                 vfs.state
+                    .ingress
                     .ingress_live
                     .lock()
                     .get_cloned(&(extent.ino, extent.block_index))
@@ -410,32 +423,37 @@ impl Materializer {
         vfs.block_cache.submit_uploads_batch(&upload_ops);
 
         vfs.state
+            .dirty_buffer
             .dirty_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(freed_bytes))
             })
             .ok();
         vfs.state
+            .metrics
             .drained_mem_blocks
             .fetch_add(drained_mem_blocks, Ordering::Relaxed);
         vfs.state
+            .metrics
             .drained_mem_bytes
             .fetch_add(drained_mem_bytes, Ordering::Relaxed);
         vfs.state
+            .metrics
             .drained_spill_blocks
             .fetch_add(drained_spill_blocks, Ordering::Relaxed);
         vfs.state
+            .metrics
             .drained_spill_bytes
             .fetch_add(drained_spill_bytes, Ordering::Relaxed);
 
-        vfs.state.dirty_drained_notify.notify_waiters();
+        vfs.state.dirty_buffer.dirty_drained_notify.notify_waiters();
 
         let batch_len = l2_work.len();
         debug!(
             "materializer: drained {} blocks ({} bytes), dirty_bytes={}, mem_blocks={}, mem_bytes={}, spill_blocks={}, spill_bytes={}",
             batch_len,
             freed_bytes,
-            vfs.state.dirty_bytes.load(Ordering::Relaxed),
+            vfs.state.dirty_buffer.dirty_bytes.load(Ordering::Relaxed),
             drained_mem_blocks,
             drained_mem_bytes,
             drained_spill_blocks,
