@@ -797,6 +797,288 @@ pub struct VfsConfig {
     pub qos_fetch_slots: usize,
 }
 
+/// Parsed user-provided VFS configuration.
+///
+/// All fields are optional to preserve whether a value was explicitly set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VfsConfigRaw {
+    pub janitor_interval_secs: Option<u64>,
+    pub janitor_skip_newer_secs: Option<u64>,
+    pub janitor_max_deletes: Option<u64>,
+    pub janitor_lease_ttl_secs: Option<u64>,
+    pub metadata_invalidation_sync_interval_ms: Option<u64>,
+    pub read_buffer_mb: Option<u64>,
+    pub prefetch_concurrency: Option<usize>,
+    pub readahead_width: Option<u32>,
+    pub readahead_min_prefetch: Option<u32>,
+    pub readahead_seq_step: Option<u8>,
+    pub readahead_random_penalty: Option<u8>,
+    pub dir_prefetch_max_batch: Option<usize>,
+    pub readdir_attr_batch_chunk: Option<usize>,
+    pub readdir_attr_batch_max_inodes: Option<usize>,
+    pub prefetch_foreground_reserve: Option<usize>,
+    pub prefetch_max_per_cycle: Option<usize>,
+    pub prefetch_pause_on_neterr_ms: Option<u64>,
+    pub lock_ttl_secs: Option<u64>,
+    pub lock_retry_base_ms: Option<u64>,
+    pub lock_retry_max_ms: Option<u64>,
+    pub max_dirty_bytes: Option<usize>,
+    pub max_xattr_bytes: Option<usize>,
+    pub dentry_cache_capacity: Option<usize>,
+    pub dentry_cache_bytes: Option<usize>,
+    pub path_shortcut_cache_capacity: Option<usize>,
+    pub path_shortcut_cache_bytes: Option<usize>,
+    pub attr_read_cache_capacity: Option<usize>,
+    pub attr_read_cache_bytes: Option<usize>,
+    pub effective_acl_cache_capacity: Option<usize>,
+    pub max_spill_bytes: Option<usize>,
+    pub max_ingress_segment_bytes: Option<u64>,
+    pub cache_safety_mode: Option<CacheSafetyMode>,
+    pub principal: Option<String>,
+    pub fetch_initial_window: Option<f64>,
+    pub fetch_min_window: Option<f64>,
+    pub fetch_max_window: Option<f64>,
+    pub fetch_increase_step: Option<f64>,
+    pub fetch_decrease_factor: Option<f64>,
+    pub fetch_decrease_cooldown_secs: Option<u64>,
+    pub upload_initial_window: Option<f64>,
+    pub upload_min_window: Option<f64>,
+    pub upload_max_window: Option<f64>,
+    pub upload_increase_step: Option<f64>,
+    pub upload_decrease_factor: Option<f64>,
+    pub upload_decrease_cooldown_secs: Option<u64>,
+    pub upload_delay_ms: Option<u64>,
+    pub upload_requeue_base_ms: Option<u64>,
+    pub upload_requeue_max_ms: Option<u64>,
+    pub upload_stats_interval_secs: Option<u64>,
+    pub upload_l2_lookup_spike_threshold_ms: Option<u64>,
+    pub slab_flush_interval_ms: Option<u64>,
+    pub background_slab_flush_enabled: Option<bool>,
+    pub ingress_checkpoint_interval_secs: Option<u64>,
+    pub ingress_checkpoint_min_append_bytes: Option<u64>,
+    pub ingress_checkpoint_min_mutations: Option<u64>,
+    pub ingress_checkpoint_max_segment_lag: Option<u64>,
+    pub ingress_checkpoint_max_live_segments: Option<u64>,
+    pub upload_cache_io_slots: Option<usize>,
+    pub upload_cache_io_user_penalty: Option<u32>,
+    pub transit_memory_budget_bytes: Option<usize>,
+    pub upload_user_idle_grace_ms: Option<u64>,
+    pub upload_fg_read_latency_target_ms: Option<u64>,
+    pub upload_fg_read_latency_window_ms: Option<u64>,
+    pub upload_fg_read_latency_sticky_windows: Option<u64>,
+    pub upload_worker_count: Option<usize>,
+    pub upload_max_attempts: Option<u32>,
+    pub upload_request_timeout_secs: Option<u64>,
+    pub upload_retry_base_ms: Option<u64>,
+    pub upload_retry_max_ms: Option<u64>,
+    pub fetch_max_attempts: Option<u32>,
+    pub prefetch_fetch_max_attempts: Option<u32>,
+    pub fetch_request_timeout_secs: Option<u64>,
+    pub fetch_retry_base_ms: Option<u64>,
+    pub fetch_retry_max_ms: Option<u64>,
+    pub fetch_prefetch_reserve: Option<usize>,
+    pub fetch_prefetch_acquire_wait_ms: Option<u64>,
+    pub max_drain_batch: Option<usize>,
+    pub l2_commit_workers: Option<usize>,
+    pub l2_commit_queue_capacity: Option<usize>,
+    pub l2_read_timeout_ms: Option<u64>,
+    pub l2_write_timeout_ms: Option<u64>,
+    pub publish_visibility_timeout_secs: Option<u64>,
+    pub shutdown_metadata_flush_timeout_secs: Option<u64>,
+    pub qos_accept_slots: Option<usize>,
+    pub qos_materialize_slots: Option<usize>,
+    pub qos_upload_slots: Option<usize>,
+    pub qos_commit_slots: Option<usize>,
+    pub qos_fetch_slots: Option<usize>,
+}
+
+pub type VfsConfigValidated = VfsConfig;
+
+impl VfsConfigRaw {
+    pub fn validate(self) -> VfsResult<VfsConfigValidated> {
+        let mut cfg = VfsConfigValidated::default();
+        macro_rules! overlay {
+            ($($field:ident),+ $(,)?) => {
+                $(if let Some(value) = self.$field { cfg.$field = value; })+
+            };
+        }
+        overlay!(
+            janitor_interval_secs,
+            janitor_skip_newer_secs,
+            janitor_max_deletes,
+            janitor_lease_ttl_secs,
+            metadata_invalidation_sync_interval_ms,
+            read_buffer_mb,
+            prefetch_concurrency,
+            readahead_width,
+            readahead_min_prefetch,
+            readahead_seq_step,
+            readahead_random_penalty,
+            dir_prefetch_max_batch,
+            readdir_attr_batch_chunk,
+            readdir_attr_batch_max_inodes,
+            prefetch_foreground_reserve,
+            prefetch_max_per_cycle,
+            prefetch_pause_on_neterr_ms,
+            lock_ttl_secs,
+            lock_retry_base_ms,
+            lock_retry_max_ms,
+            max_dirty_bytes,
+            max_xattr_bytes,
+            dentry_cache_capacity,
+            dentry_cache_bytes,
+            path_shortcut_cache_capacity,
+            path_shortcut_cache_bytes,
+            attr_read_cache_capacity,
+            attr_read_cache_bytes,
+            effective_acl_cache_capacity,
+            max_spill_bytes,
+            max_ingress_segment_bytes,
+            cache_safety_mode,
+            principal,
+            fetch_initial_window,
+            fetch_min_window,
+            fetch_max_window,
+            fetch_increase_step,
+            fetch_decrease_factor,
+            fetch_decrease_cooldown_secs,
+            upload_initial_window,
+            upload_min_window,
+            upload_max_window,
+            upload_increase_step,
+            upload_decrease_factor,
+            upload_decrease_cooldown_secs,
+            upload_delay_ms,
+            upload_requeue_base_ms,
+            upload_requeue_max_ms,
+            upload_stats_interval_secs,
+            upload_l2_lookup_spike_threshold_ms,
+            slab_flush_interval_ms,
+            background_slab_flush_enabled,
+            ingress_checkpoint_interval_secs,
+            ingress_checkpoint_min_append_bytes,
+            ingress_checkpoint_min_mutations,
+            ingress_checkpoint_max_segment_lag,
+            ingress_checkpoint_max_live_segments,
+            upload_cache_io_slots,
+            upload_cache_io_user_penalty,
+            transit_memory_budget_bytes,
+            upload_user_idle_grace_ms,
+            upload_fg_read_latency_target_ms,
+            upload_fg_read_latency_window_ms,
+            upload_fg_read_latency_sticky_windows,
+            upload_worker_count,
+            upload_max_attempts,
+            upload_request_timeout_secs,
+            upload_retry_base_ms,
+            upload_retry_max_ms,
+            fetch_max_attempts,
+            prefetch_fetch_max_attempts,
+            fetch_request_timeout_secs,
+            fetch_retry_base_ms,
+            fetch_retry_max_ms,
+            fetch_prefetch_reserve,
+            fetch_prefetch_acquire_wait_ms,
+            max_drain_batch,
+            l2_commit_workers,
+            l2_commit_queue_capacity,
+            l2_read_timeout_ms,
+            l2_write_timeout_ms,
+            publish_visibility_timeout_secs,
+            shutdown_metadata_flush_timeout_secs,
+            qos_accept_slots,
+            qos_materialize_slots,
+            qos_upload_slots,
+            qos_commit_slots,
+            qos_fetch_slots,
+        );
+
+        cfg.janitor_interval_secs = cfg.janitor_interval_secs.max(1);
+        cfg.janitor_max_deletes = cfg.janitor_max_deletes.max(1);
+        cfg.janitor_lease_ttl_secs = cfg.janitor_lease_ttl_secs.max(1);
+        cfg.metadata_invalidation_sync_interval_ms =
+            cfg.metadata_invalidation_sync_interval_ms.max(1);
+        cfg.read_buffer_mb = cfg.read_buffer_mb.max(1);
+        cfg.prefetch_concurrency = cfg.prefetch_concurrency.max(1);
+        cfg.readahead_width = cfg.readahead_width.max(1);
+        cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
+        cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
+        cfg.readahead_random_penalty = cfg.readahead_random_penalty.max(1);
+        cfg.dir_prefetch_max_batch = cfg.dir_prefetch_max_batch.max(1);
+        cfg.readdir_attr_batch_chunk = cfg.readdir_attr_batch_chunk.max(1);
+        cfg.readdir_attr_batch_max_inodes = cfg.readdir_attr_batch_max_inodes.max(1);
+        cfg.prefetch_foreground_reserve = cfg.prefetch_foreground_reserve.max(1);
+        cfg.prefetch_max_per_cycle = cfg.prefetch_max_per_cycle.max(1);
+        cfg.lock_ttl_secs = cfg.lock_ttl_secs.max(1);
+        cfg.lock_retry_base_ms = cfg.lock_retry_base_ms.max(1);
+        cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
+        cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
+        cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
+        cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
+        cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
+        cfg.path_shortcut_cache_capacity = cfg.path_shortcut_cache_capacity.max(1);
+        cfg.path_shortcut_cache_bytes = cfg.path_shortcut_cache_bytes.max(1);
+        cfg.attr_read_cache_capacity = cfg.attr_read_cache_capacity.max(1);
+        cfg.attr_read_cache_bytes = cfg.attr_read_cache_bytes.max(1);
+        cfg.effective_acl_cache_capacity = cfg.effective_acl_cache_capacity.max(1);
+        cfg.max_spill_bytes = cfg.max_spill_bytes.max(1);
+        cfg.max_ingress_segment_bytes = cfg.max_ingress_segment_bytes.max(1);
+        cfg.fetch_min_window = cfg.fetch_min_window.max(1.0);
+        cfg.fetch_decrease_cooldown_secs = cfg.fetch_decrease_cooldown_secs.max(1);
+        cfg.upload_min_window = cfg.upload_min_window.max(1.0);
+        cfg.upload_max_window = cfg.upload_max_window.max(cfg.upload_min_window);
+        cfg.upload_increase_step = cfg.upload_increase_step.max(0.000_001);
+        cfg.upload_decrease_factor = cfg.upload_decrease_factor.max(0.000_001);
+        cfg.upload_decrease_cooldown_secs = cfg.upload_decrease_cooldown_secs.max(1);
+        cfg.upload_requeue_base_ms = cfg.upload_requeue_base_ms.max(1);
+        cfg.upload_requeue_max_ms = cfg.upload_requeue_max_ms.max(cfg.upload_requeue_base_ms);
+        cfg.upload_stats_interval_secs = cfg.upload_stats_interval_secs.max(1);
+        cfg.slab_flush_interval_ms = cfg.slab_flush_interval_ms.max(1);
+        cfg.ingress_checkpoint_interval_secs = cfg.ingress_checkpoint_interval_secs.max(1);
+        cfg.upload_cache_io_slots = cfg.upload_cache_io_slots.max(1);
+        cfg.upload_cache_io_user_penalty = cfg.upload_cache_io_user_penalty.max(1);
+        cfg.upload_fg_read_latency_target_ms = cfg
+            .upload_fg_read_latency_target_ms
+            .max(cfg.upload_l2_lookup_spike_threshold_ms.max(1));
+        cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
+        cfg.upload_fg_read_latency_sticky_windows =
+            cfg.upload_fg_read_latency_sticky_windows.max(1);
+        cfg.max_drain_batch = cfg.max_drain_batch.max(1);
+        cfg.l2_commit_workers = cfg.l2_commit_workers.max(1);
+        cfg.l2_commit_queue_capacity = cfg.l2_commit_queue_capacity.max(1);
+        cfg.l2_read_timeout_ms = cfg.l2_read_timeout_ms.max(1);
+        cfg.l2_write_timeout_ms = cfg.l2_write_timeout_ms.max(1);
+        cfg.publish_visibility_timeout_secs = cfg.publish_visibility_timeout_secs.max(1);
+        cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
+        cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
+        cfg.qos_materialize_slots = cfg.qos_materialize_slots.max(1);
+        cfg.qos_upload_slots = cfg.qos_upload_slots.max(1);
+        cfg.qos_commit_slots = cfg.qos_commit_slots.max(1);
+        cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
+
+        if cfg.upload_cache_io_user_penalty > cfg.upload_cache_io_slots as u32 {
+            return Err(VfsError::Other(format!(
+                "upload_cache_io_user_penalty ({}) exceeds upload_cache_io_slots ({})",
+                cfg.upload_cache_io_user_penalty, cfg.upload_cache_io_slots
+            )));
+        }
+
+        if cfg.upload_worker_count == 0 {
+            cfg.upload_worker_count = 4;
+        }
+
+        let principal = cfg.principal.trim();
+        cfg.principal = if principal.is_empty() {
+            "*".to_string()
+        } else {
+            principal.to_string()
+        };
+
+        Ok(cfg)
+    }
+}
+
 impl Default for VfsConfig {
     fn default() -> Self {
         Self {
@@ -3914,14 +4196,14 @@ impl StudioVfs {
                     CLOUD_FRAGMENT_SIZE
                 )));
             }
-            let janitor_interval = Duration::from_secs(config.janitor_interval_secs.max(1));
+            let janitor_interval = Duration::from_secs(config.janitor_interval_secs);
             let janitor_skip_newer_than = Duration::from_secs(config.janitor_skip_newer_secs);
-            let janitor_max_deletes_per_run = config.janitor_max_deletes.max(1);
-            let janitor_lease_ttl = Duration::from_secs(config.janitor_lease_ttl_secs.max(1));
+            let janitor_max_deletes_per_run = config.janitor_max_deletes;
+            let janitor_lease_ttl = Duration::from_secs(config.janitor_lease_ttl_secs);
             let metadata_invalidation_sync_interval =
-                Duration::from_millis(config.metadata_invalidation_sync_interval_ms.max(1));
-            let read_buffer_mb = config.read_buffer_mb.max(1);
-            let block_size_nonzero = block_size.max(1) as u128;
+                Duration::from_millis(config.metadata_invalidation_sync_interval_ms);
+            let read_buffer_mb = config.read_buffer_mb;
+            let block_size_nonzero = block_size as u128;
             // Block indices in the read path are u32; verify practical
             // addressable range at mount-time to avoid silent undersizing when
             // very small block sizes are configured.
@@ -3947,40 +4229,40 @@ impl StudioVfs {
                 blocks as u32
             };
             let buffer_blocks_default = mb_to_blocks(read_buffer_mb).max(32);
-            let prefetch_concurrency = config.prefetch_concurrency.max(1);
-            let readahead_base_width = config.readahead_width.max(1);
+            let prefetch_concurrency = config.prefetch_concurrency;
+            let readahead_base_width = config.readahead_width;
             // Keep base conservative while allowing velocity-based expansion
             // for sustained sequential readers.
             let readahead_max_width = buffer_blocks_default
                 .max(readahead_base_width.saturating_mul(8))
                 .max(256);
-            let readahead_min_prefetch = config.readahead_min_prefetch.max(1);
-            let readahead_seq_step = config.readahead_seq_step.max(1);
-            let readahead_random_penalty = config.readahead_random_penalty.max(1);
-            let dir_prefetch_max_batch = config.dir_prefetch_max_batch.max(1);
-            let readdir_attr_batch_chunk = config.readdir_attr_batch_chunk.max(1);
-            let readdir_attr_batch_max_inodes = config.readdir_attr_batch_max_inodes.max(1);
-            let prefetch_foreground_reserve = config.prefetch_foreground_reserve.max(1);
-            let prefetch_max_per_cycle = config.prefetch_max_per_cycle.max(1);
+            let readahead_min_prefetch = config.readahead_min_prefetch;
+            let readahead_seq_step = config.readahead_seq_step;
+            let readahead_random_penalty = config.readahead_random_penalty;
+            let dir_prefetch_max_batch = config.dir_prefetch_max_batch;
+            let readdir_attr_batch_chunk = config.readdir_attr_batch_chunk;
+            let readdir_attr_batch_max_inodes = config.readdir_attr_batch_max_inodes;
+            let prefetch_foreground_reserve = config.prefetch_foreground_reserve;
+            let prefetch_max_per_cycle = config.prefetch_max_per_cycle;
             let prefetch_pause_on_neterr =
                 Duration::from_millis(config.prefetch_pause_on_neterr_ms);
-            let _lock_lease_ttl = Duration::from_secs(config.lock_ttl_secs.max(1));
-            let lock_retry_base_ms = config.lock_retry_base_ms.max(1);
-            let _lock_retry_max_ms = config.lock_retry_max_ms.max(lock_retry_base_ms);
+            let _lock_lease_ttl = Duration::from_secs(config.lock_ttl_secs);
+            let _lock_retry_base_ms = config.lock_retry_base_ms;
+            let _lock_retry_max_ms = config.lock_retry_max_ms;
 
             let janitor_lease = None;
             let distributed_flock = None;
-            let max_dirty_bytes = config.max_dirty_bytes.max(1);
-            let max_xattr_bytes = config.max_xattr_bytes.max(1);
-            let dentry_cache_capacity = config.dentry_cache_capacity.max(1);
-            let dentry_cache_bytes = config.dentry_cache_bytes.max(1);
-            let path_shortcut_cache_capacity = config.path_shortcut_cache_capacity.max(1);
-            let path_shortcut_cache_bytes = config.path_shortcut_cache_bytes.max(1);
-            let attr_read_cache_capacity = config.attr_read_cache_capacity.max(1);
-            let attr_read_cache_bytes = config.attr_read_cache_bytes.max(1);
-            let effective_acl_cache_capacity = config.effective_acl_cache_capacity.max(1);
-            let max_spill_bytes = config.max_spill_bytes.max(1);
-            let max_ingress_segment_bytes = config.max_ingress_segment_bytes.max(1);
+            let max_dirty_bytes = config.max_dirty_bytes;
+            let max_xattr_bytes = config.max_xattr_bytes;
+            let dentry_cache_capacity = config.dentry_cache_capacity;
+            let dentry_cache_bytes = config.dentry_cache_bytes;
+            let path_shortcut_cache_capacity = config.path_shortcut_cache_capacity;
+            let path_shortcut_cache_bytes = config.path_shortcut_cache_bytes;
+            let attr_read_cache_capacity = config.attr_read_cache_capacity;
+            let attr_read_cache_bytes = config.attr_read_cache_bytes;
+            let effective_acl_cache_capacity = config.effective_acl_cache_capacity;
+            let max_spill_bytes = config.max_spill_bytes;
+            let max_ingress_segment_bytes = config.max_ingress_segment_bytes;
             let cache_safety_mode = config.cache_safety_mode;
             let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
             std::fs::create_dir_all(&spill_dir).map_err(VfsError::Io)?;
@@ -3988,12 +4270,7 @@ impl StudioVfs {
             std::fs::create_dir_all(&ingress_segment_dir).map_err(VfsError::Io)?;
             let ingress_checkpoint_dir = spill_dir.join("checkpoints");
             std::fs::create_dir_all(&ingress_checkpoint_dir).map_err(VfsError::Io)?;
-            let acl_principal = config.principal.trim().to_string();
-            let acl_principal = if acl_principal.is_empty() {
-                "*".to_string()
-            } else {
-                acl_principal
-            };
+            let acl_principal = config.principal.clone();
             let (
                 recovered_spill,
                 recovered_spill_bytes,
@@ -4009,11 +4286,10 @@ impl StudioVfs {
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
-            cache_config.l2_commit_workers = config.l2_commit_workers.max(1);
-            cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity.max(1);
-            cache_config.l2_read_timeout = Duration::from_millis(config.l2_read_timeout_ms.max(1));
-            cache_config.l2_write_timeout =
-                Duration::from_millis(config.l2_write_timeout_ms.max(1));
+            cache_config.l2_commit_workers = config.l2_commit_workers;
+            cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity;
+            cache_config.l2_read_timeout = Duration::from_millis(config.l2_read_timeout_ms);
+            cache_config.l2_write_timeout = Duration::from_millis(config.l2_write_timeout_ms);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
             block_cache.spawn_background_tasks();
 
@@ -4063,7 +4339,7 @@ impl StudioVfs {
                 } else {
                     fetch_initial_window_default
                 };
-                let min = config.fetch_min_window.max(1.0);
+                let min = config.fetch_min_window;
                 let max = if config.fetch_max_window > 0.0 {
                     config.fetch_max_window
                 } else {
@@ -4079,7 +4355,7 @@ impl StudioVfs {
                 } else {
                     0.85
                 };
-                let cooldown_secs = config.fetch_decrease_cooldown_secs.max(1);
+                let cooldown_secs = config.fetch_decrease_cooldown_secs;
                 crate::aimd::AimdConfig {
                     initial_window: initial,
                     min_window: min,
@@ -4139,7 +4415,7 @@ impl StudioVfs {
                 } else {
                     0.85
                 };
-                let cooldown_secs = config.upload_decrease_cooldown_secs.max(1);
+                let cooldown_secs = config.upload_decrease_cooldown_secs;
                 crate::aimd::AimdConfig {
                     initial_window: initial,
                     min_window: min,
@@ -4156,52 +4432,31 @@ impl StudioVfs {
             ));
             let upload_delay = Duration::from_millis(config.upload_delay_ms);
             let upload_requeue_base = Duration::from_millis(config.upload_requeue_base_ms);
-            let upload_requeue_max = Duration::from_millis(
-                config
-                    .upload_requeue_max_ms
-                    .max(upload_requeue_base.as_millis() as u64),
-            );
-            let upload_stats_interval =
-                Duration::from_secs(config.upload_stats_interval_secs.max(1));
-            let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms.max(1));
+            let upload_requeue_max = Duration::from_millis(config.upload_requeue_max_ms);
+            let upload_stats_interval = Duration::from_secs(config.upload_stats_interval_secs);
+            let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms);
             let shutdown_metadata_flush_timeout =
-                Duration::from_secs(config.shutdown_metadata_flush_timeout_secs.max(1));
+                Duration::from_secs(config.shutdown_metadata_flush_timeout_secs);
             let disable_background_slab_flush = !config.background_slab_flush_enabled;
             let ingress_checkpoint_interval =
-                Duration::from_secs(config.ingress_checkpoint_interval_secs.max(1));
+                Duration::from_secs(config.ingress_checkpoint_interval_secs);
             let ingress_checkpoint_min_append_bytes = config.ingress_checkpoint_min_append_bytes;
             let ingress_checkpoint_min_mutations = config.ingress_checkpoint_min_mutations;
             let ingress_checkpoint_max_segment_lag = config.ingress_checkpoint_max_segment_lag;
             let ingress_checkpoint_max_live_segments = config.ingress_checkpoint_max_live_segments;
-            let upload_cache_io_slots = config.upload_cache_io_slots.max(1);
-            let requested_upload_cache_io_user_penalty = config.upload_cache_io_user_penalty.max(1);
-            let upload_cache_io_user_penalty =
-                requested_upload_cache_io_user_penalty.min(upload_cache_io_slots as u32);
-            if requested_upload_cache_io_user_penalty > upload_cache_io_slots as u32 {
-                warn!(
-                    requested_upload_cache_io_user_penalty,
-                    upload_cache_io_slots,
-                    clamped_upload_cache_io_user_penalty = upload_cache_io_user_penalty,
-                    "upload_cache_io_user_penalty exceeds upload_cache_io_slots; clamping"
-                );
-            }
+            let upload_cache_io_slots = config.upload_cache_io_slots;
+            let upload_cache_io_user_penalty = config.upload_cache_io_user_penalty;
             let upload_user_idle_grace = Duration::from_millis(config.upload_user_idle_grace_ms);
-            let upload_fg_read_latency_target_ms = config
-                .upload_fg_read_latency_target_ms
-                .max(config.upload_l2_lookup_spike_threshold_ms.max(1));
-            let upload_fg_read_latency_window_ms = config.upload_fg_read_latency_window_ms.max(100);
+            let upload_fg_read_latency_target_ms = config.upload_fg_read_latency_target_ms;
+            let upload_fg_read_latency_window_ms = config.upload_fg_read_latency_window_ms;
             let upload_fg_read_latency_sticky_windows =
-                config.upload_fg_read_latency_sticky_windows.max(1);
+                config.upload_fg_read_latency_sticky_windows;
             let upload_fg_read_latency_sticky_window_ms = upload_fg_read_latency_window_ms
                 .saturating_mul(upload_fg_read_latency_sticky_windows);
-            let upload_worker_count = if config.upload_worker_count > 0 {
-                config.upload_worker_count
-            } else {
-                4
-            };
-            let max_drain_batch = config.max_drain_batch.max(1);
+            let upload_worker_count = config.upload_worker_count;
+            let max_drain_batch = config.max_drain_batch;
             let publish_visibility_timeout =
-                Duration::from_secs(config.publish_visibility_timeout_secs.max(1));
+                Duration::from_secs(config.publish_visibility_timeout_secs);
             debug!(
                 writeback = true,
                 upload_delay_ms = upload_delay.as_millis() as u64,
@@ -8652,11 +8907,11 @@ impl StudioVfs {
             }
             written += to_copy;
 
-
             // Promote to L1 if budget allows (consistent with async path).
             // We only promote if the read was full and valid.
             if read == to_copy {
-                self.block_cache.promote_to_l1(block_ref.object_id, Bytes::copy_from_slice(&dst[..read]));
+                self.block_cache
+                    .promote_to_l1(block_ref.object_id, Bytes::copy_from_slice(&dst[..read]));
             }
         }
 

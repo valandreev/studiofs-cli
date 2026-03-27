@@ -7,7 +7,7 @@ use std::sync::Arc;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
-use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfig, parse_size_bytes};
+use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
 
@@ -105,14 +105,14 @@ fn parse_env_u64(key: &str) -> Option<u64> {
         .filter(|v| *v > 0)
 }
 
-fn apply_l2_profile(mut config: VfsConfig, profile: L2Profile) -> VfsConfig {
+fn apply_l2_profile(mut config: VfsConfigRaw, profile: L2Profile) -> VfsConfigRaw {
     match profile {
         L2Profile::Default => config,
         L2Profile::Usb => {
-            config.l2_commit_workers = USB_L2_COMMIT_WORKERS;
-            config.l2_commit_queue_capacity = USB_L2_COMMIT_QUEUE_CAPACITY;
-            config.l2_read_timeout_ms = USB_L2_IO_TIMEOUT_MS;
-            config.l2_write_timeout_ms = USB_L2_IO_TIMEOUT_MS;
+            config.l2_commit_workers = Some(USB_L2_COMMIT_WORKERS);
+            config.l2_commit_queue_capacity = Some(USB_L2_COMMIT_QUEUE_CAPACITY);
+            config.l2_read_timeout_ms = Some(USB_L2_IO_TIMEOUT_MS);
+            config.l2_write_timeout_ms = Some(USB_L2_IO_TIMEOUT_MS);
             config
         }
     }
@@ -145,25 +145,25 @@ fn parse_env_cache_safety_mode(key: &str) -> Option<CacheSafetyMode> {
     }
 }
 
-fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
+fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     macro_rules! set_usize {
         ($key:literal, $field:ident) => {
             if let Some(value) = parse_env_usize($key) {
-                config.$field = value;
+                config.$field = Some(value);
             }
         };
     }
     macro_rules! set_u64 {
         ($key:literal, $field:ident) => {
             if let Some(value) = parse_env_u64($key) {
-                config.$field = value;
+                config.$field = Some(value);
             }
         };
     }
     macro_rules! set_f64 {
         ($key:literal, $field:ident) => {
             if let Some(value) = parse_env_f64($key) {
-                config.$field = value;
+                config.$field = Some(value);
             }
         };
     }
@@ -173,7 +173,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
                 && let Ok(bytes) = parse_positive_size_arg(&v)
                 && let Ok(bytes) = usize::try_from(bytes)
             {
-                config.$field = bytes;
+                config.$field = Some(bytes);
             }
         };
     }
@@ -183,10 +183,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Ok(bytes) = parse_positive_size_arg(&v)
     {
-        config.max_ingress_segment_bytes = bytes;
+        config.max_ingress_segment_bytes = Some(bytes);
     }
     if let Some(mode) = parse_env_cache_safety_mode("STUDIOFS_CACHE_SAFETY_MODE") {
-        config.cache_safety_mode = mode;
+        config.cache_safety_mode = Some(mode);
     }
     set_u64!(
         "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS",
@@ -195,16 +195,16 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_u64!("STUDIOFS_READ_BUFFER_MB", read_buffer_mb);
     set_usize!("STUDIOFS_PREFETCH_CONCURRENCY", prefetch_concurrency);
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_WIDTH") {
-        config.readahead_width = value as u32;
+        config.readahead_width = Some(value as u32);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_MIN_PREFETCH") {
-        config.readahead_min_prefetch = value as u32;
+        config.readahead_min_prefetch = Some(value as u32);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_SEQ_STEP") {
-        config.readahead_seq_step = value as u8;
+        config.readahead_seq_step = Some(value as u8);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_RANDOM_PENALTY") {
-        config.readahead_random_penalty = value as u8;
+        config.readahead_random_penalty = Some(value as u8);
     }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
     set_usize!(
@@ -253,13 +253,13 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_size!("STUDIOFS_ATTR_READ_CACHE_BYTES", attr_read_cache_bytes);
     set_u64!("STUDIOFS_JANITOR_INTERVAL_SECS", janitor_interval_secs);
     if let Some(value) = parse_env_u64_any("STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
-        config.janitor_skip_newer_secs = value;
+        config.janitor_skip_newer_secs = Some(value);
     }
     set_u64!("STUDIOFS_JANITOR_MAX_DELETES", janitor_max_deletes);
     set_u64!("STUDIOFS_JANITOR_LEASE_TTL_SECS", janitor_lease_ttl_secs);
     set_usize!("STUDIOFS_UPLOAD_CACHE_IO_SLOTS", upload_cache_io_slots);
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
-        config.upload_cache_io_user_penalty = value as u32;
+        config.upload_cache_io_user_penalty = Some(value as u32);
     }
     set_size!(
         "STUDIOFS_TRANSIT_MEMORY_BUDGET",
@@ -270,7 +270,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         upload_user_idle_grace_ms
     );
     if let Some(value) = parse_env_u64_any("STUDIOFS_UPLOAD_DELAY_MS") {
-        config.upload_delay_ms = value;
+        config.upload_delay_ms = Some(value);
     }
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", upload_requeue_base_ms);
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", upload_requeue_max_ms);
@@ -295,7 +295,7 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         upload_fg_read_latency_sticky_windows
     );
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
-        config.upload_max_attempts = value as u32;
+        config.upload_max_attempts = Some(value as u32);
     }
     set_u64!(
         "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
@@ -305,13 +305,13 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     set_u64!("STUDIOFS_UPLOAD_RETRY_MAX_MS", upload_retry_max_ms);
     if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
         if interval_ms > 0 {
-            config.slab_flush_interval_ms = interval_ms;
+            config.slab_flush_interval_ms = Some(interval_ms);
         } else {
-            config.background_slab_flush_enabled = false;
+            config.background_slab_flush_enabled = Some(false);
         }
     }
     if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
-        config.background_slab_flush_enabled = !disable;
+        config.background_slab_flush_enabled = Some(!disable);
     }
     set_u64!(
         "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
@@ -331,10 +331,10 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
         fetch_decrease_cooldown_secs
     );
     if let Some(value) = parse_env_usize("STUDIOFS_FETCH_MAX_ATTEMPTS") {
-        config.fetch_max_attempts = value as u32;
+        config.fetch_max_attempts = Some(value as u32);
     }
     if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
-        config.prefetch_fetch_max_attempts = value as u32;
+        config.prefetch_fetch_max_attempts = Some(value as u32);
     }
     set_u64!(
         "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
@@ -384,13 +384,13 @@ fn overlay_vfs_env(mut config: VfsConfig) -> VfsConfig {
     if let Ok(principal) = std::env::var("STUDIOFS_PRINCIPAL") {
         let principal = principal.trim();
         if !principal.is_empty() {
-            config.principal = principal.to_string();
+            config.principal = Some(principal.to_string());
         }
     }
     if let Some(worker_count) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
-        config.upload_worker_count = worker_count;
+        config.upload_worker_count = Some(worker_count);
     } else if let Some(max_spawned) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
-        config.upload_worker_count = max_spawned;
+        config.upload_worker_count = Some(max_spawned);
     }
     config
 }
@@ -421,9 +421,12 @@ pub fn run(
         )?;
 
     let cache_dir = resolved_cache_dir;
-    let mut vfs_config = super::settings::load_studiofs_config()?.vfs;
-    vfs_config = overlay_vfs_env(vfs_config);
-    vfs_config = apply_l2_profile(vfs_config, l2_profile);
+    let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
+    vfs_config_raw = overlay_vfs_env(vfs_config_raw);
+    vfs_config_raw = apply_l2_profile(vfs_config_raw, l2_profile);
+    let mut vfs_config = vfs_config_raw
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     info!(
         l2_profile = ?l2_profile,
         l2_commit_workers = vfs_config.l2_commit_workers,

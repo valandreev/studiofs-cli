@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
-use studiofs_vfs::{CacheSafetyMode, VfsConfig};
+use studiofs_vfs::{CacheSafetyMode, VfsConfigRaw};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_CACHE_SIZE: &str = "100GB";
@@ -17,7 +17,7 @@ pub struct StudioFsConfig {
     pub memory_limit: Option<String>,
     pub cache_size: Option<String>,
     #[serde(default)]
-    pub vfs: VfsConfig,
+    pub vfs: VfsConfigRaw,
 }
 
 #[derive(Debug, Args, Default)]
@@ -260,29 +260,35 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
 
     if let Some(interval_ms) = args.slab_flush_interval_ms {
         if interval_ms > 0 {
-            config.vfs.slab_flush_interval_ms = interval_ms;
+            config.vfs.slab_flush_interval_ms = Some(interval_ms);
             changed = true;
         } else {
-            config.vfs.background_slab_flush_enabled = false;
+            config.vfs.background_slab_flush_enabled = Some(false);
             changed = true;
             eprintln!("warning: slab flush interval 0 disables background slab flush");
         }
     }
 
     if args.enable_bg_slab_flush {
-        config.vfs.background_slab_flush_enabled = true;
+        config.vfs.background_slab_flush_enabled = Some(true);
         changed = true;
     }
 
     if args.disable_bg_slab_flush {
-        config.vfs.background_slab_flush_enabled = false;
+        config.vfs.background_slab_flush_enabled = Some(false);
         changed = true;
     }
 
     if let Some(mode) = args.cache_safety_mode {
-        config.vfs.cache_safety_mode = mode.into();
+        config.vfs.cache_safety_mode = Some(mode.into());
         changed = true;
     }
+
+    let resolved_vfs = config
+        .vfs
+        .clone()
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid VFS settings: {e}"))?;
 
     if changed {
         save_studiofs_config(&config)?;
@@ -316,11 +322,11 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     );
     println!(
         "  slab-flush-interval-ms: {}",
-        config.vfs.slab_flush_interval_ms
+        resolved_vfs.slab_flush_interval_ms
     );
     println!(
         "  background-slab-flush: {}",
-        if config.vfs.background_slab_flush_enabled {
+        if resolved_vfs.background_slab_flush_enabled {
             "enabled"
         } else {
             "disabled"
@@ -328,7 +334,7 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     );
     println!(
         "  cache-safety-mode: {}",
-        match config.vfs.cache_safety_mode {
+        match resolved_vfs.cache_safety_mode {
             CacheSafetyMode::Fast => "fast",
             CacheSafetyMode::Durable => "durable",
         }
