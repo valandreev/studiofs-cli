@@ -2787,10 +2787,12 @@ struct UploadState {
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
+    /// Dynamic slot cost adjusted from cache-latency feedback.
+    upload_cache_io_user_penalty: AtomicU32,
 }
 
 impl UploadState {
-    fn new() -> Self {
+    fn new(upload_cache_io_user_penalty: u32) -> Self {
         Self {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
             upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
@@ -2799,6 +2801,7 @@ impl UploadState {
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
+            upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
         }
     }
 }
@@ -2899,6 +2902,12 @@ struct ReadState {
     foreground_read_shard_cursor: AtomicU64,
     sync_read_fast_path_hits: AtomicU64,
     sync_read_fast_path_misses: AtomicU64,
+    /// Last observed foreground P90 (ns), used as sticky fallback.
+    upload_fg_read_last_p90_ns: AtomicU64,
+    /// Timestamp of the last observed foreground P90.
+    upload_fg_read_last_p90_at_ms: AtomicU64,
+    /// Last queued block range per inode to suppress duplicate read hints.
+    prefetch_last_hint: Mutex<HashMap<Ino, (u32, u32)>>,
 }
 
 impl ReadState {
@@ -2912,6 +2921,9 @@ impl ReadState {
             foreground_read_shard_cursor: AtomicU64::new(0),
             sync_read_fast_path_hits: AtomicU64::new(0),
             sync_read_fast_path_misses: AtomicU64::new(0),
+            upload_fg_read_last_p90_ns: AtomicU64::new(0),
+            upload_fg_read_last_p90_at_ms: AtomicU64::new(0),
+            prefetch_last_hint: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -2998,6 +3010,7 @@ impl VfsState {
         path_shortcut_cache_bytes: usize,
         attr_read_cache_capacity: usize,
         attr_read_cache_bytes: usize,
+        upload_cache_io_user_penalty: u32,
     ) -> Self {
         Self {
             ingress: IngressState::new(
@@ -3008,7 +3021,7 @@ impl VfsState {
                 initial_checkpoint_meta,
             ),
             dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
-            upload: UploadState::new(),
+            upload: UploadState::new(upload_cache_io_user_penalty),
             namespace: NamespaceState::new(
                 dentry_cache_capacity,
                 dentry_cache_bytes,
@@ -3115,18 +3128,12 @@ pub struct StudioVfs {
     qos: Arc<QosController>,
     /// Configured baseline slot cost per upload op when foreground reads are active.
     upload_cache_io_user_penalty_base: u32,
-    /// Dynamic slot cost adjusted from cache-latency feedback.
-    upload_cache_io_user_penalty: AtomicU32,
     /// Foreground read latency target (P90) used by the upload throttle loop.
     upload_fg_read_latency_target_ns: u64,
     /// Sliding window for foreground speedometer samples.
     upload_fg_read_latency_window: Duration,
     /// Sticky horizon for using last known foreground P90 in the throttle loop.
     upload_fg_read_latency_sticky_window: Duration,
-    /// Last observed foreground P90 (ns), used as sticky fallback.
-    upload_fg_read_last_p90_ns: AtomicU64,
-    /// Timestamp of the last observed foreground P90.
-    upload_fg_read_last_p90_at_ms: AtomicU64,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
@@ -3140,8 +3147,6 @@ pub struct StudioVfs {
     /// Channel sender for background prefetch planning and execution.
     /// The receiver lives in a spawned task that has an Arc<Self>.
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
-    /// Last queued block range per inode to suppress duplicate read hints.
-    prefetch_last_hint: Mutex<HashMap<Ino, (u32, u32)>>,
     /// Signal sender to wake the background flusher when new dirty blocks
     /// are buffered.
     dirty_flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -4138,6 +4143,7 @@ impl StudioVfs {
                     path_shortcut_cache_bytes,
                     attr_read_cache_capacity,
                     attr_read_cache_bytes,
+                    upload_cache_io_user_penalty,
                 )),
                 upload_scheduler,
                 upload_delay,
@@ -4156,7 +4162,6 @@ impl StudioVfs {
                 transit_memory_budget,
                 qos,
                 upload_cache_io_user_penalty_base: upload_cache_io_user_penalty,
-                upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
                 upload_fg_read_latency_target_ns: Duration::from_millis(
                     upload_fg_read_latency_target_ms,
                 )
@@ -4169,8 +4174,6 @@ impl StudioVfs {
                 upload_fg_read_latency_sticky_window: Duration::from_millis(
                     upload_fg_read_latency_sticky_window_ms,
                 ),
-                upload_fg_read_last_p90_ns: AtomicU64::new(0),
-                upload_fg_read_last_p90_at_ms: AtomicU64::new(0),
                 upload_user_idle_grace,
                 upload_worker_count,
                 max_drain_batch,
@@ -4178,7 +4181,6 @@ impl StudioVfs {
                 readahead: readahead.clone(),
                 dir_prefetch,
                 prefetch_tx,
-                prefetch_last_hint: Mutex::new(HashMap::new()),
                 dirty_flush_tx,
                 max_dirty_bytes,
                 max_xattr_bytes,
@@ -4954,9 +4956,13 @@ impl StudioVfs {
         }
         let p90_ns = Self::p90_ns(samples_all);
         if let Some(p90) = p90_ns {
-            self.upload_fg_read_last_p90_ns
+            self.state
+                .read
+                .upload_fg_read_last_p90_ns
                 .store(p90, Ordering::Relaxed);
-            self.upload_fg_read_last_p90_at_ms
+            self.state
+                .read
+                .upload_fg_read_last_p90_at_ms
                 .store(now_ms, Ordering::Relaxed);
         }
         (p90_ns, total_samples)
@@ -4964,7 +4970,11 @@ impl StudioVfs {
 
     fn foreground_sticky_p90_latency_ns(&self) -> Option<u64> {
         let now_ms = Self::now_unix_millis();
-        let last_at = self.upload_fg_read_last_p90_at_ms.load(Ordering::Relaxed);
+        let last_at = self
+            .state
+            .read
+            .upload_fg_read_last_p90_at_ms
+            .load(Ordering::Relaxed);
         if last_at == 0 {
             return None;
         }
@@ -4975,14 +4985,22 @@ impl StudioVfs {
         if now_ms.saturating_sub(last_at) > sticky_window_ms {
             return None;
         }
-        let p90 = self.upload_fg_read_last_p90_ns.load(Ordering::Relaxed);
+        let p90 = self
+            .state
+            .read
+            .upload_fg_read_last_p90_ns
+            .load(Ordering::Relaxed);
         if p90 == 0 { None } else { Some(p90) }
     }
 
     fn update_upload_io_penalty(&self, congested: bool) -> u32 {
         let base_penalty = self.upload_cache_io_user_penalty_base.max(1);
         let max_penalty = self.upload_cache_io_slots_max.max(base_penalty);
-        let current = self.upload_cache_io_user_penalty.load(Ordering::Relaxed);
+        let current = self
+            .state
+            .upload
+            .upload_cache_io_user_penalty
+            .load(Ordering::Relaxed);
         let next = if congested {
             current.saturating_add(1).min(max_penalty)
         } else if current > base_penalty {
@@ -4990,7 +5008,9 @@ impl StudioVfs {
         } else {
             base_penalty
         };
-        self.upload_cache_io_user_penalty
+        self.state
+            .upload
+            .upload_cache_io_user_penalty
             .store(next, Ordering::Relaxed);
         next
     }
@@ -8049,6 +8069,7 @@ impl StudioVfs {
     /// disk / RAM space without waiting for the next background GC run.
     async fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
+        let mut notify_needed = false;
         {
             let mut dirty = self.state.dirty_buffer.dirty_mem.lock();
             let removed_bytes = dirty.remove_inode(ino);
@@ -8060,15 +8081,18 @@ impl StudioVfs {
                         Some(v.saturating_sub(removed_bytes))
                     })
                     .ok();
-                self.state
-                    .dirty_buffer
-                    .dirty_drained_notify
-                    .notify_waiters();
+                notify_needed = true;
                 debug!(
                     "evict_inode L1.5: ino={} freed {} bytes from dirty_mem",
                     ino, removed_bytes
                 );
             }
+        }
+        if notify_needed {
+            self.state
+                .dirty_buffer
+                .dirty_drained_notify
+                .notify_waiters();
         }
         {
             let spill_keys: Vec<(Ino, u32)> = self
@@ -8092,33 +8116,38 @@ impl StudioVfs {
         // so they are cleaned up once the upload completes (or is cancelled by
         // the uploader when it detects the inode is deleted).
         let mut evicted = Vec::new();
-        let mut deferred_pinned = 0;
+        let mut deferred_pinned = Vec::new();
         for &object_id in object_ids {
             if self.block_cache.is_pinned(object_id) {
                 // Record for post-upload cleanup instead of silently skipping.
-                self.state.upload.pending_evictions.lock().insert(object_id);
-                deferred_pinned += 1;
-                continue;
+                deferred_pinned.push(object_id);
+            } else {
+                evicted.push(object_id);
             }
-            evicted.push(object_id);
+        }
+        if !deferred_pinned.is_empty() {
+            let mut pending_evictions = self.state.upload.pending_evictions.lock();
+            for object_id in deferred_pinned.iter() {
+                pending_evictions.insert(*object_id);
+            }
         }
         if !evicted.is_empty() {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
         }
-        if !evicted.is_empty() || deferred_pinned > 0 {
+        if !evicted.is_empty() || !deferred_pinned.is_empty() {
             debug!(
                 "evict_inode: ino={} evicted {} blocks, deferred pinned={}",
                 ino,
                 evicted.len(),
-                deferred_pinned
+                deferred_pinned.len()
             );
         }
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
-        self.prefetch_last_hint.lock().remove(&ino);
+        self.state.read.prefetch_last_hint.lock().remove(&ino);
     }
 
     async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
@@ -8130,13 +8159,20 @@ impl StudioVfs {
             .collect();
         let mut evicted = Vec::new();
         let mut deferred_pinned = 0;
+        let mut pending_evictions_to_add = Vec::new();
         for object_id in object_ids {
             if self.block_cache.is_pinned(object_id) {
-                self.state.upload.pending_evictions.lock().insert(object_id);
+                pending_evictions_to_add.push(object_id);
                 deferred_pinned += 1;
                 continue;
             }
             evicted.push(object_id);
+        }
+        if !pending_evictions_to_add.is_empty() {
+            let mut pending_evictions = self.state.upload.pending_evictions.lock();
+            for object_id in pending_evictions_to_add {
+                pending_evictions.insert(object_id);
+            }
         }
         if !evicted.is_empty() {
             self.block_cache
@@ -8152,7 +8188,7 @@ impl StudioVfs {
             );
         }
         self.readahead.evict(ino);
-        self.prefetch_last_hint.lock().remove(&ino);
+        self.state.read.prefetch_last_hint.lock().remove(&ino);
         Ok(())
     }
 
@@ -8442,7 +8478,7 @@ impl StudioVfs {
         let first_block = blocks_needed[0].0;
         let last_block = blocks_needed.last().unwrap().0;
         {
-            let mut last_hints = self.prefetch_last_hint.lock();
+            let mut last_hints = self.state.read.prefetch_last_hint.lock();
             if let Some((prev_first, prev_last)) = last_hints.get(&ino).copied() {
                 // Suppress redundant hints fully covered by the previous range.
                 if first_block >= prev_first && last_block <= prev_last {
@@ -8486,7 +8522,7 @@ impl StudioVfs {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
                 self.readahead.evict(ino);
-                self.prefetch_last_hint.lock().remove(&ino);
+                self.state.read.prefetch_last_hint.lock().remove(&ino);
                 return Vec::new();
             }
             Err(_) => return Vec::new(),
@@ -9620,7 +9656,9 @@ impl StudioVfs {
                 // multiple local I/O slots, effectively shrinking upload pressure
                 // and preserving read latency/throughput for foreground ops.
                 let upload_io_cost = if self.foreground_read_active() {
-                    self.upload_cache_io_user_penalty
+                    self.state
+                        .upload
+                        .upload_cache_io_user_penalty
                         .load(Ordering::Relaxed)
                         .max(1)
                 } else {
@@ -10129,8 +10167,11 @@ impl StudioVfs {
                 );
                 debug!(
                     upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
-                    upload_io_penalty_dynamic =
-                        self.upload_cache_io_user_penalty.load(Ordering::Relaxed),
+                    upload_io_penalty_dynamic = self
+                        .state
+                        .upload
+                        .upload_cache_io_user_penalty
+                        .load(Ordering::Relaxed),
                     foreground_read_p90_present = foreground_read_p90_ns.is_some(),
                     foreground_read_p90_ms = foreground_read_p90_ns
                         .map(|ns| ns.saturating_div(1_000_000))
