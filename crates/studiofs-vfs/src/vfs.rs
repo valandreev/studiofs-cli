@@ -838,6 +838,8 @@ pub struct VfsConfig {
     pub qos_commit_slots: usize,
     /// QoS slots for fetches.
     pub qos_fetch_slots: usize,
+    /// Number of shards for foreground read speedometer.
+    pub foreground_read_speedometer_shards: usize,
 }
 
 /// Parsed user-provided VFS configuration.
@@ -935,6 +937,7 @@ pub struct VfsConfigRaw {
     pub qos_upload_slots: Option<usize>,
     pub qos_commit_slots: Option<usize>,
     pub qos_fetch_slots: Option<usize>,
+    pub foreground_read_speedometer_shards: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1065,6 +1068,7 @@ impl VfsConfigRaw {
             qos_upload_slots,
             qos_commit_slots,
             qos_fetch_slots,
+            foreground_read_speedometer_shards,
         );
 
         cfg
@@ -1139,6 +1143,7 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.qos_upload_slots = cfg.qos_upload_slots.max(1);
     cfg.qos_commit_slots = cfg.qos_commit_slots.max(1);
     cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
+    cfg.foreground_read_speedometer_shards = cfg.foreground_read_speedometer_shards.max(1);
 
     if cfg.upload_cache_io_user_penalty > cfg.upload_cache_io_slots as u32 {
         return Err(VfsError::Other(format!(
@@ -1256,6 +1261,7 @@ impl From<VfsConfig> for VfsConfigRaw {
             qos_upload_slots: Some(cfg.qos_upload_slots),
             qos_commit_slots: Some(cfg.qos_commit_slots),
             qos_fetch_slots: Some(cfg.qos_fetch_slots),
+            foreground_read_speedometer_shards: Some(cfg.foreground_read_speedometer_shards),
         }
     }
 }
@@ -1352,6 +1358,7 @@ impl Default for VfsConfig {
             qos_upload_slots: DEFAULT_QOS_UPLOAD_SLOTS,
             qos_commit_slots: DEFAULT_QOS_COMMIT_SLOTS,
             qos_fetch_slots: DEFAULT_QOS_FETCH_SLOTS,
+            foreground_read_speedometer_shards: FOREGROUND_READ_SPEEDOMETER_SHARDS,
         }
     }
 }
@@ -2997,20 +3004,13 @@ impl MetricsState {
 // =============================================================================
 
 impl VfsState {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         recovered_spill: RecoveredSpillMap,
         recovered_spill_bytes: usize,
         active_segment_id: u64,
         recovered_spill_seq: u64,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
-        dentry_cache_capacity: usize,
-        dentry_cache_bytes: usize,
-        path_shortcut_cache_capacity: usize,
-        path_shortcut_cache_bytes: usize,
-        attr_read_cache_capacity: usize,
-        attr_read_cache_bytes: usize,
-        upload_cache_io_user_penalty: u32,
+        cfg: &VfsConfig,
     ) -> Self {
         Self {
             ingress: IngressState::new(
@@ -3021,19 +3021,19 @@ impl VfsState {
                 initial_checkpoint_meta,
             ),
             dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
-            upload: UploadState::new(upload_cache_io_user_penalty),
+            upload: UploadState::new(cfg.upload_cache_io_user_penalty),
             namespace: NamespaceState::new(
-                dentry_cache_capacity,
-                dentry_cache_bytes,
-                path_shortcut_cache_capacity,
-                path_shortcut_cache_bytes,
-                attr_read_cache_capacity,
-                attr_read_cache_bytes,
+                cfg.dentry_cache_capacity,
+                cfg.dentry_cache_bytes,
+                cfg.path_shortcut_cache_capacity,
+                cfg.path_shortcut_cache_bytes,
+                cfg.attr_read_cache_capacity,
+                cfg.attr_read_cache_bytes,
             ),
             acl: AclState::new(),
             incarnation: IncarnationState::new(),
             write_buffer: WriteBufferState::new(),
-            read: ReadState::new(FOREGROUND_READ_SPEEDOMETER_SHARDS),
+            read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
@@ -4137,13 +4137,7 @@ impl StudioVfs {
                     active_ingress_segment_id,
                     recovered_spill_seq,
                     initial_checkpoint_meta,
-                    dentry_cache_capacity,
-                    dentry_cache_bytes,
-                    path_shortcut_cache_capacity,
-                    path_shortcut_cache_bytes,
-                    attr_read_cache_capacity,
-                    attr_read_cache_bytes,
-                    upload_cache_io_user_penalty,
+                    &config,
                 )),
                 upload_scheduler,
                 upload_delay,
@@ -4959,11 +4953,11 @@ impl StudioVfs {
             self.state
                 .read
                 .upload_fg_read_last_p90_ns
-                .store(p90, Ordering::Relaxed);
+                .store(p90, Ordering::Release);
             self.state
                 .read
                 .upload_fg_read_last_p90_at_ms
-                .store(now_ms, Ordering::Relaxed);
+                .store(now_ms, Ordering::Release);
         }
         (p90_ns, total_samples)
     }
@@ -4974,7 +4968,7 @@ impl StudioVfs {
             .state
             .read
             .upload_fg_read_last_p90_at_ms
-            .load(Ordering::Relaxed);
+            .load(Ordering::Acquire);
         if last_at == 0 {
             return None;
         }
@@ -4989,7 +4983,7 @@ impl StudioVfs {
             .state
             .read
             .upload_fg_read_last_p90_ns
-            .load(Ordering::Relaxed);
+            .load(Ordering::Acquire);
         if p90 == 0 { None } else { Some(p90) }
     }
 
@@ -5069,6 +5063,76 @@ impl StudioVfs {
                 .notify_waiters();
         }
         removed
+    }
+
+    /// Batch remove spill entries for a given inode.
+    /// Holds the lock once to extract all entries, then performs
+    /// IO operations (WAL writes, file deletions) after releasing the lock.
+    fn remove_spill_entries_batch(&self, ino: Ino) -> usize {
+        // Phase 1: Acquire lock, extract all entries for this inode, release lock.
+        let removed: Vec<((Ino, u32), SpillEntry)> = {
+            let mut ingress_live = self.state.ingress.ingress_live.lock();
+            let keys: Vec<(Ino, u32)> = ingress_live
+                .keys()
+                .filter(|(i, _)| *i == ino)
+                .cloned()
+                .collect();
+
+            let mut result = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(entry) = ingress_live.remove(&key) {
+                    result.push((key, entry));
+                }
+            }
+            result
+        };
+        // Lock released here.
+
+        if removed.is_empty() {
+            return 0;
+        }
+
+        // Phase 2: Process removed entries outside the lock.
+        let mut spill_files_to_delete = Vec::new();
+        let mut total_spill_bytes_freed = 0;
+        let now_ms = Self::now_unix_millis();
+
+        for (key, entry) in &removed {
+            let seq = self.state.ingress.spill_seq.fetch_add(1, Ordering::Relaxed);
+            let _ = self.append_ingress_record_live(
+                *key,
+                seq,
+                now_ms,
+                IngressRecordKind::Invalidate,
+                &[],
+            );
+            total_spill_bytes_freed += entry.len;
+
+            if entry.path.extension().is_some_and(|ext| ext == "spill") {
+                spill_files_to_delete.push(entry.path.clone());
+            }
+        }
+
+        if total_spill_bytes_freed > 0 {
+            self.state
+                .dirty_buffer
+                .dirty_spill_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(total_spill_bytes_freed))
+                })
+                .ok();
+            self.state
+                .dirty_buffer
+                .dirty_drained_notify
+                .notify_waiters();
+        }
+
+        // Phase 3: Delete spill files (IO operation) — done last, outside any lock.
+        for path in spill_files_to_delete {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        removed.len()
     }
 
     fn load_spill_block(&self, key: (Ino, u32)) -> VfsResult<Option<Bytes>> {
@@ -8094,19 +8158,14 @@ impl StudioVfs {
                 .dirty_drained_notify
                 .notify_waiters();
         }
-        {
-            let spill_keys: Vec<(Ino, u32)> = self
-                .state
-                .ingress
-                .ingress_live
-                .lock()
-                .keys()
-                .filter(|(i, _)| *i == ino)
-                .cloned()
-                .collect();
-            for key in spill_keys {
-                let _ = self.remove_spill_entry(key);
-            }
+
+        // L1.5 spill — batch remove all spill entries for this inode.
+        let spill_removed = self.remove_spill_entries_batch(ino);
+        if spill_removed > 0 {
+            debug!(
+                "evict_inode L1.5: ino={} removed {} spill entries",
+                ino, spill_removed
+            );
         }
 
         self.remove_live_extents_for_inode(ino);
