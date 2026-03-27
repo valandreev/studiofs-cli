@@ -66,10 +66,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::ingress_wal::{
-    INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressRecordKind, IngressWal, RecoveredSpillMap,
-    SpillEntry, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
-    read_ingress_entry_bytes, recover_spill_dir, reset_ingress_artifacts_for_fast_mode,
-    scan_ingress_artifacts, write_ingress_checkpoint, write_ingress_state,
+    AppendOutcome, INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressRecordKind, IngressWal,
+    RecoveredSpillMap, SpillEntry, latest_ingress_checkpoint_path,
+    load_latest_ingress_checkpoint_meta, read_ingress_entry_bytes, recover_spill_dir,
+    reset_ingress_artifacts_for_fast_mode, scan_ingress_artifacts, write_ingress_checkpoint,
+    write_ingress_state,
 };
 
 // =============================================================================
@@ -4592,7 +4593,7 @@ impl StudioVfs {
         created_unix_ms: u64,
         kind: IngressRecordKind,
         payload: &[u8],
-    ) -> VfsResult<(u64, PathBuf)> {
+    ) -> VfsResult<AppendOutcome> {
         let started = Instant::now();
         let _guard = self.state.ingress_segment_write_lock.lock();
         let append = self.ingress_wal.append(
@@ -4607,7 +4608,7 @@ impl StudioVfs {
         self.state
             .ingress_append_stats
             .record(append.record_bytes, started.elapsed());
-        Ok((append.offset, append.path))
+        Ok(append)
     }
 
     fn upload_requeue_delay(&self, op: &PendingUpload) -> Duration {
@@ -4792,7 +4793,7 @@ impl StudioVfs {
     fn spill_block(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
         let seq = self.state.spill_seq.fetch_add(1, Ordering::Relaxed);
         let created_unix_ms = Self::now_unix_millis();
-        let (segment_offset, segment_path) = self.append_ingress_record_live(
+        let append = self.append_ingress_record_live(
             key,
             seq,
             created_unix_ms,
@@ -4804,8 +4805,9 @@ impl StudioVfs {
             key,
             SpillEntry {
                 seq,
-                path: segment_path,
-                offset: segment_offset,
+                segment_id: append.segment_id,
+                path: append.path,
+                offset: append.offset,
                 len: data.len(),
                 created_unix_ms,
             },
@@ -5508,6 +5510,7 @@ impl StudioVfs {
                 key,
                 SpillEntry {
                     seq,
+                    segment_id: append.segment_id,
                     path: append.path,
                     offset: append.offset,
                     len: data.len(),
@@ -11387,6 +11390,7 @@ mod tests {
             (1, 0),
             SpillEntry {
                 seq: 1,
+                segment_id: 0,
                 path: PathBuf::from("a.spill"),
                 offset: 0,
                 len: 4,
@@ -11397,6 +11401,7 @@ mod tests {
             (1, 1),
             SpillEntry {
                 seq: 2,
+                segment_id: 0,
                 path: PathBuf::from("b.spill"),
                 offset: 0,
                 len: 4,

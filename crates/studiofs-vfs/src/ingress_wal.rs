@@ -46,6 +46,7 @@ impl IngressRecordKind {
 #[derive(Debug, Clone)]
 pub(crate) struct SpillEntry {
     pub(crate) seq: u64,
+    pub(crate) segment_id: u64,
     pub(crate) path: PathBuf,
     pub(crate) offset: u64,
     pub(crate) len: usize,
@@ -67,9 +68,7 @@ impl IngressLiveIndex {
             *by_ino_counts.entry(*ino).or_insert(0) += 1;
         }
         for entry in entries.values() {
-            if let Some(segment_id) = parse_ingress_segment_id(&entry.path) {
-                *live_segment_counts.entry(segment_id).or_insert(0) += 1;
-            }
+            *live_segment_counts.entry(entry.segment_id).or_insert(0) += 1;
         }
         Self {
             entries,
@@ -91,7 +90,7 @@ impl IngressLiveIndex {
     }
 
     pub(crate) fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
-        let new_segment_id = parse_ingress_segment_id(&entry.path);
+        let new_segment_id = entry.segment_id;
         let old = self.entries.insert(key, entry);
         if old.is_none() {
             *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
@@ -99,9 +98,7 @@ impl IngressLiveIndex {
         if let Some(old) = old.as_ref() {
             self.dec_segment(old);
         }
-        if let Some(segment_id) = new_segment_id {
-            *self.live_segment_counts.entry(segment_id).or_insert(0) += 1;
-        }
+        *self.live_segment_counts.entry(new_segment_id).or_insert(0) += 1;
         old
     }
 
@@ -139,9 +136,7 @@ impl IngressLiveIndex {
     }
 
     fn dec_segment(&mut self, entry: &SpillEntry) {
-        let Some(segment_id) = parse_ingress_segment_id(&entry.path) else {
-            return;
-        };
+        let segment_id = entry.segment_id;
         let count = self
             .live_segment_counts
             .get(&segment_id)
@@ -166,6 +161,7 @@ pub(crate) struct IngressWal {
 #[derive(Debug, Clone)]
 pub(crate) struct AppendOutcome {
     pub(crate) offset: u64,
+    pub(crate) segment_id: u64,
     pub(crate) path: PathBuf,
     pub(crate) record_bytes: u64,
 }
@@ -226,19 +222,11 @@ impl IngressWal {
         )?;
         Ok(AppendOutcome {
             offset,
+            segment_id,
             path: ingress_segment_path(self.segment_dir(), segment_id),
             record_bytes,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-struct RecoveredIngressRecord {
-    seq: u64,
-    path: PathBuf,
-    offset: u64,
-    len: usize,
-    created_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,7 +262,7 @@ struct IngressStateFile {
     next_seq: u64,
 }
 
-type RecoveredIngressMap = HashMap<(Ino, u32), RecoveredIngressRecord>;
+type RecoveredIngressMap = HashMap<(Ino, u32), SpillEntry>;
 pub(crate) type RecoveredSpillMap = HashMap<(Ino, u32), SpillEntry>;
 pub(crate) type RecoveredSpillState = (RecoveredSpillMap, usize, u64, u64);
 
@@ -440,14 +428,11 @@ pub(crate) fn write_ingress_checkpoint(
         .unwrap_or(0);
     let mut entries = Vec::with_capacity(ingress_live.len());
     for (&(ino, block_index), entry) in ingress_live.iter() {
-        let Some(segment_id) = parse_ingress_segment_id(&entry.path) else {
-            continue;
-        };
         entries.push(IngressCheckpointEntry {
             ino,
             block_index,
             seq: entry.seq,
-            segment_id,
+            segment_id: entry.segment_id,
             offset: entry.offset,
             len: entry.len,
             created_unix_ms: entry.created_unix_ms,
@@ -577,8 +562,9 @@ fn replay_ingress_segment_records(
                     if should_replace {
                         recovered.insert(
                             key,
-                            RecoveredIngressRecord {
+                            SpillEntry {
                                 seq,
+                                segment_id: id,
                                 path: path.clone(),
                                 offset: payload_offset,
                                 len: payload_len,
@@ -595,8 +581,9 @@ fn replay_ingress_segment_records(
                     if should_replace {
                         recovered.insert(
                             key,
-                            RecoveredIngressRecord {
+                            SpillEntry {
                                 seq,
+                                segment_id: id,
                                 path: path.clone(),
                                 offset: payload_offset,
                                 len: 0,
@@ -641,8 +628,9 @@ pub(crate) fn recover_spill_dir(spill_dir: &Path) -> VfsResult<RecoveredSpillSta
             next_seq = next_seq.max(entry.seq.saturating_add(1));
             recovered.insert(
                 (entry.ino, entry.block_index),
-                RecoveredIngressRecord {
+                SpillEntry {
                     seq: entry.seq,
+                    segment_id: entry.segment_id,
                     path: ingress_segment_path(&segment_dir, entry.segment_id),
                     offset: entry.offset,
                     len: entry.len,
@@ -657,15 +645,8 @@ pub(crate) fn recover_spill_dir(spill_dir: &Path) -> VfsResult<RecoveredSpillSta
     let mut spill_entries = RecoveredSpillMap::new();
     for (key, record) in recovered {
         next_seq = next_seq.max(record.seq.saturating_add(1));
-        let spill = SpillEntry {
-            seq: record.seq,
-            path: record.path,
-            offset: record.offset,
-            len: record.len,
-            created_unix_ms: record.created_unix_ms,
-        };
-        total_bytes = total_bytes.saturating_add(spill.len);
-        spill_entries.insert(key, spill);
+        total_bytes = total_bytes.saturating_add(record.len);
+        spill_entries.insert(key, record);
     }
 
     active_segment_id = active_segment_id.max(current_active_ingress_segment_id(&segment_dir)?);
@@ -800,6 +781,7 @@ mod tests {
 
         let bytes = read_ingress_entry_bytes(&SpillEntry {
             seq: 2,
+            segment_id: 1,
             path: segment_path,
             offset: second_offset,
             len: "second-payload".len(),
@@ -946,6 +928,7 @@ mod tests {
             (42, 7),
             SpillEntry {
                 seq: 1,
+                segment_id: 1,
                 path: active_ingress_segment_path(&segment_dir, 1),
                 offset: first_offset,
                 len: "first".len(),
@@ -1002,6 +985,7 @@ mod tests {
             (42, 7),
             SpillEntry {
                 seq: 7,
+                segment_id: 1,
                 path: active_ingress_segment_path(&segment_dir, 1),
                 offset: first_offset,
                 len: "payload".len(),
@@ -1059,6 +1043,7 @@ mod tests {
             (1, 1),
             SpillEntry {
                 seq: 2,
+                segment_id: 2,
                 path: ingress_segment_path(&segment_dir, 2),
                 offset: new_offset,
                 len: 3,
@@ -1155,6 +1140,7 @@ mod tests {
             (42, 7),
             SpillEntry {
                 seq: 9,
+                segment_id: 2,
                 path: ingress_segment_path(&segment_dir, 2),
                 offset,
                 len: "payload".len(),
@@ -1216,6 +1202,7 @@ mod tests {
             (10, 0),
             SpillEntry {
                 seq: 1,
+                segment_id: 1,
                 path: seg1.clone(),
                 offset: 0,
                 len: 1,
@@ -1226,6 +1213,7 @@ mod tests {
             (10, 1),
             SpillEntry {
                 seq: 2,
+                segment_id: 1,
                 path: seg1,
                 offset: 0,
                 len: 1,
@@ -1238,6 +1226,7 @@ mod tests {
             (11, 0),
             SpillEntry {
                 seq: 3,
+                segment_id: 2,
                 path: seg2,
                 offset: 0,
                 len: 1,
@@ -1250,6 +1239,7 @@ mod tests {
             (11, 0),
             SpillEntry {
                 seq: 4,
+                segment_id: 3,
                 path: seg3,
                 offset: 0,
                 len: 1,
