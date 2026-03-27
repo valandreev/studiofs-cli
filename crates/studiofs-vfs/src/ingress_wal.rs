@@ -1,16 +1,201 @@
-use super::{IngressLiveIndex, SpillEntry, VfsError, VfsResult};
+use crate::vfs::{VfsError, VfsResult};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::Ino;
 
-pub(super) const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
+pub(crate) const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
-pub(super) const INGRESS_RECORD_PUT: u8 = 1;
-pub(super) const INGRESS_RECORD_INVALIDATE: u8 = 2;
-pub(super) const INGRESS_RECORD_HEADER_LEN: usize = 37;
+const INGRESS_RECORD_PUT: u8 = 1;
+const INGRESS_RECORD_INVALIDATE: u8 = 2;
+const INGRESS_RECORD_HEADER_LEN: usize = 37;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngressRecordKind {
+    Put,
+    Invalidate,
+}
+
+impl IngressRecordKind {
+    fn as_byte(self) -> u8 {
+        match self {
+            Self::Put => INGRESS_RECORD_PUT,
+            Self::Invalidate => INGRESS_RECORD_INVALIDATE,
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            INGRESS_RECORD_PUT => Some(Self::Put),
+            INGRESS_RECORD_INVALIDATE => Some(Self::Invalidate),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SpillEntry {
+    pub(crate) seq: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) offset: u64,
+    pub(crate) len: usize,
+    pub(crate) created_unix_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct IngressLiveIndex {
+    entries: HashMap<(Ino, u32), SpillEntry>,
+    by_ino_counts: HashMap<Ino, usize>,
+}
+
+impl IngressLiveIndex {
+    pub(crate) fn from_entries(entries: HashMap<(Ino, u32), SpillEntry>) -> Self {
+        let mut by_ino_counts = HashMap::new();
+        for (ino, _) in entries.keys() {
+            *by_ino_counts.entry(*ino).or_insert(0) += 1;
+        }
+        Self {
+            entries,
+            by_ino_counts,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn get_cloned(&self, key: &(Ino, u32)) -> Option<SpillEntry> {
+        self.entries.get(key).cloned()
+    }
+
+    pub(crate) fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
+        let old = self.entries.insert(key, entry);
+        if old.is_none() {
+            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
+        }
+        old
+    }
+
+    pub(crate) fn remove(&mut self, key: &(Ino, u32)) -> Option<SpillEntry> {
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            let ino = key.0;
+            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
+            if count <= 1 {
+                self.by_ino_counts.remove(&ino);
+            } else {
+                self.by_ino_counts.insert(ino, count - 1);
+            }
+        }
+        removed
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
+        self.entries.keys()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&(Ino, u32), &SpillEntry)> {
+        self.entries.iter()
+    }
+
+    pub(crate) fn live_segment_count(&self) -> u64 {
+        let mut ids = std::collections::HashSet::new();
+        for entry in self.entries.values() {
+            if let Some(segment_id) = parse_ingress_segment_id(&entry.path) {
+                ids.insert(segment_id);
+            }
+        }
+        ids.len() as u64
+    }
+
+    pub(crate) fn has_ino(&self, ino: Ino) -> bool {
+        self.by_ino_counts.contains_key(&ino)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IngressWal {
+    spill_dir: PathBuf,
+    segment_dir: PathBuf,
+    checkpoint_dir: PathBuf,
+    max_segment_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AppendOutcome {
+    pub(crate) offset: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) record_bytes: u64,
+}
+
+impl IngressWal {
+    pub(crate) fn new(spill_dir: PathBuf, max_segment_bytes: u64) -> Self {
+        Self {
+            segment_dir: spill_dir.join("segments"),
+            checkpoint_dir: spill_dir.join("checkpoints"),
+            spill_dir,
+            max_segment_bytes,
+        }
+    }
+
+    pub(crate) fn spill_dir(&self) -> &Path {
+        &self.spill_dir
+    }
+
+    pub(crate) fn segment_dir(&self) -> &Path {
+        &self.segment_dir
+    }
+
+    pub(crate) fn checkpoint_dir(&self) -> &Path {
+        &self.checkpoint_dir
+    }
+
+    pub(crate) fn max_segment_bytes(&self) -> u64 {
+        self.max_segment_bytes
+    }
+
+    pub(crate) fn append(
+        &self,
+        active_segment_id: &AtomicU64,
+        key: (Ino, u32),
+        seq: u64,
+        created_unix_ms: u64,
+        kind: IngressRecordKind,
+        payload: &[u8],
+    ) -> VfsResult<AppendOutcome> {
+        let record_bytes = INGRESS_RECORD_HEADER_LEN as u64 + payload.len() as u64;
+        let mut segment_id = active_segment_id.load(Ordering::Relaxed);
+        let active_path = active_ingress_segment_path(self.segment_dir(), segment_id);
+        let active_len = std::fs::metadata(&active_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if active_len > 0 && active_len.saturating_add(record_bytes) > self.max_segment_bytes() {
+            segment_id = segment_id.saturating_add(1);
+            active_segment_id.store(segment_id, Ordering::Relaxed);
+        }
+        let offset = append_ingress_record(
+            self.segment_dir(),
+            segment_id,
+            key,
+            seq,
+            created_unix_ms,
+            kind,
+            payload,
+        )?;
+        Ok(AppendOutcome {
+            offset,
+            path: ingress_segment_path(self.segment_dir(), segment_id),
+            record_bytes,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RecoveredIngressRecord {
@@ -42,9 +227,9 @@ struct IngressCheckpointFile {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct IngressCheckpointMeta {
-    pub(super) covered_segment_id: u64,
-    pub(super) covered_offset: u64,
+pub(crate) struct IngressCheckpointMeta {
+    pub(crate) covered_segment_id: u64,
+    pub(crate) covered_offset: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +240,10 @@ struct IngressStateFile {
 }
 
 type RecoveredIngressMap = HashMap<(Ino, u32), RecoveredIngressRecord>;
-pub(super) type RecoveredSpillMap = HashMap<(Ino, u32), SpillEntry>;
-pub(super) type RecoveredSpillState = (RecoveredSpillMap, usize, u64, u64);
+pub(crate) type RecoveredSpillMap = HashMap<(Ino, u32), SpillEntry>;
+pub(crate) type RecoveredSpillState = (RecoveredSpillMap, usize, u64, u64);
 
-pub(super) fn read_ingress_entry_bytes(entry: &SpillEntry) -> VfsResult<Bytes> {
+pub(crate) fn read_ingress_entry_bytes(entry: &SpillEntry) -> VfsResult<Bytes> {
     let mut file = std::fs::File::open(&entry.path)?;
     file.seek(SeekFrom::Start(entry.offset))?;
     let mut buf = vec![0u8; entry.len];
@@ -66,11 +251,11 @@ pub(super) fn read_ingress_entry_bytes(entry: &SpillEntry) -> VfsResult<Bytes> {
     Ok(Bytes::from(buf))
 }
 
-pub(super) fn ingress_segment_path(dir: &Path, segment_id: u64) -> PathBuf {
+pub(crate) fn ingress_segment_path(dir: &Path, segment_id: u64) -> PathBuf {
     dir.join(format!("{segment_id:016x}.seg"))
 }
 
-pub(super) fn list_ingress_segment_files(segment_dir: &Path) -> VfsResult<Vec<(u64, PathBuf)>> {
+pub(crate) fn list_ingress_segment_files(segment_dir: &Path) -> VfsResult<Vec<(u64, PathBuf)>> {
     let mut files: Vec<(u64, PathBuf)> = match std::fs::read_dir(segment_dir) {
         Ok(entries) => entries
             .filter_map(Result::ok)
@@ -90,7 +275,7 @@ pub(super) fn list_ingress_segment_files(segment_dir: &Path) -> VfsResult<Vec<(u
     Ok(files)
 }
 
-pub(super) fn current_active_ingress_segment_id(segment_dir: &Path) -> VfsResult<u64> {
+pub(crate) fn current_active_ingress_segment_id(segment_dir: &Path) -> VfsResult<u64> {
     let files = list_ingress_segment_files(segment_dir)?;
     Ok(files
         .last()
@@ -98,19 +283,19 @@ pub(super) fn current_active_ingress_segment_id(segment_dir: &Path) -> VfsResult
         .unwrap_or(INITIAL_INGRESS_SEGMENT_ID))
 }
 
-pub(super) fn active_ingress_segment_path(dir: &Path, active_segment_id: u64) -> PathBuf {
+pub(crate) fn active_ingress_segment_path(dir: &Path, active_segment_id: u64) -> PathBuf {
     ingress_segment_path(dir, active_segment_id)
 }
 
-pub(super) fn latest_ingress_checkpoint_path(dir: &Path) -> PathBuf {
+pub(crate) fn latest_ingress_checkpoint_path(dir: &Path) -> PathBuf {
     dir.join("latest.json")
 }
 
-pub(super) fn ingress_state_path(spill_dir: &Path) -> PathBuf {
+pub(crate) fn ingress_state_path(spill_dir: &Path) -> PathBuf {
     spill_dir.join("state.json")
 }
 
-pub(super) fn parse_ingress_segment_id(path: &Path) -> Option<u64> {
+pub(crate) fn parse_ingress_segment_id(path: &Path) -> Option<u64> {
     let stem = path.file_stem()?.to_str()?;
     u64::from_str_radix(stem, 16).ok()
 }
@@ -145,7 +330,7 @@ fn load_latest_ingress_checkpoint(
     Ok(Some(checkpoint))
 }
 
-pub(super) fn load_latest_ingress_checkpoint_meta(
+pub(crate) fn load_latest_ingress_checkpoint_meta(
     checkpoint_dir: &Path,
     segment_dir: &Path,
 ) -> VfsResult<Option<IngressCheckpointMeta>> {
@@ -174,7 +359,7 @@ fn load_ingress_state(spill_dir: &Path) -> VfsResult<Option<IngressStateFile>> {
     Ok(Some(state))
 }
 
-pub(super) fn write_ingress_state(
+pub(crate) fn write_ingress_state(
     spill_dir: &Path,
     active_segment_id: u64,
     next_seq: u64,
@@ -194,7 +379,7 @@ pub(super) fn write_ingress_state(
     Ok(())
 }
 
-pub(super) fn write_ingress_checkpoint(
+pub(crate) fn write_ingress_checkpoint(
     checkpoint_dir: &Path,
     ingress_live: &IngressLiveIndex,
     segment_dir: &Path,
@@ -250,13 +435,13 @@ pub(super) fn write_ingress_checkpoint(
     })
 }
 
-pub(super) fn append_ingress_record(
+pub(crate) fn append_ingress_record(
     segment_dir: &Path,
     segment_id: u64,
     key: (Ino, u32),
     seq: u64,
     created_unix_ms: u64,
-    kind: u8,
+    kind: IngressRecordKind,
     payload: &[u8],
 ) -> VfsResult<u64> {
     std::fs::create_dir_all(segment_dir)?;
@@ -268,7 +453,7 @@ pub(super) fn append_ingress_record(
         .open(path)?;
     let start = file.seek(SeekFrom::End(0))?;
     file.write_all(&INGRESS_SEGMENT_MAGIC)?;
-    file.write_all(&[kind])?;
+    file.write_all(&[kind.as_byte()])?;
     file.write_all(&key.0.to_le_bytes())?;
     file.write_all(&key.1.to_le_bytes())?;
     file.write_all(&seq.to_le_bytes())?;
@@ -280,7 +465,7 @@ pub(super) fn append_ingress_record(
     // Durable mode relies on PUT records surviving power loss once
     // `flush_fh()` observes ingress drain completion. Invalidate records are
     // recovery optimizations and can be checkpointed asynchronously.
-    if kind == INGRESS_RECORD_PUT {
+    if kind == IngressRecordKind::Put {
         file.sync_data()?;
     }
     Ok(start + INGRESS_RECORD_HEADER_LEN as u64)
@@ -322,7 +507,11 @@ fn replay_ingress_segment_records(
             if header[0..4] != INGRESS_SEGMENT_MAGIC {
                 return Err(VfsError::Other("invalid ingress segment magic".into()));
             }
-            let kind = header[4];
+            let Some(kind) = IngressRecordKind::from_byte(header[4]) else {
+                return Err(VfsError::Other(
+                    "unknown ingress segment record kind".into(),
+                ));
+            };
             let ino = u64::from_le_bytes(header[5..13].try_into().unwrap());
             let block_index = u32::from_le_bytes(header[13..17].try_into().unwrap());
             let seq = u64::from_le_bytes(header[17..25].try_into().unwrap());
@@ -335,7 +524,7 @@ fn replay_ingress_segment_records(
             }
             let key = (ino, block_index);
             match kind {
-                INGRESS_RECORD_PUT => {
+                IngressRecordKind::Put => {
                     let should_replace = recovered
                         .get(&key)
                         .map(|current| seq >= current.seq)
@@ -353,7 +542,7 @@ fn replay_ingress_segment_records(
                         );
                     }
                 }
-                INGRESS_RECORD_INVALIDATE => {
+                IngressRecordKind::Invalidate => {
                     let should_replace = recovered
                         .get(&key)
                         .map(|current| seq >= current.seq)
@@ -371,11 +560,6 @@ fn replay_ingress_segment_records(
                         );
                     }
                 }
-                _ => {
-                    return Err(VfsError::Other(
-                        "unknown ingress segment record kind".into(),
-                    ));
-                }
             }
         }
     }
@@ -392,7 +576,7 @@ fn recover_ingress_segment_records(segment_dir: &Path) -> VfsResult<(RecoveredIn
     Ok((recovered, next_seq))
 }
 
-pub(super) fn recover_spill_dir(spill_dir: &Path) -> VfsResult<RecoveredSpillState> {
+pub(crate) fn recover_spill_dir(spill_dir: &Path) -> VfsResult<RecoveredSpillState> {
     let segment_dir = spill_dir.join("segments");
     let checkpoint_dir = spill_dir.join("checkpoints");
     let mut recovered = RecoveredIngressMap::new();
@@ -443,7 +627,7 @@ pub(super) fn recover_spill_dir(spill_dir: &Path) -> VfsResult<RecoveredSpillSta
     Ok((spill_entries, total_bytes, next_seq, active_segment_id))
 }
 
-pub(super) fn reset_ingress_artifacts_for_fast_mode(spill_dir: &Path) -> VfsResult<()> {
+pub(crate) fn reset_ingress_artifacts_for_fast_mode(spill_dir: &Path) -> VfsResult<()> {
     std::fs::create_dir_all(spill_dir)?;
     let segment_dir = spill_dir.join("segments");
     let checkpoint_dir = spill_dir.join("checkpoints");
@@ -477,7 +661,7 @@ pub(super) fn reset_ingress_artifacts_for_fast_mode(spill_dir: &Path) -> VfsResu
     Ok(())
 }
 
-pub(super) fn scan_ingress_artifacts(spill_dir: &Path) -> VfsResult<(usize, usize, bool)> {
+pub(crate) fn scan_ingress_artifacts(spill_dir: &Path) -> VfsResult<(usize, usize, bool)> {
     let segment_dir = spill_dir.join("segments");
     let checkpoint_dir = spill_dir.join("checkpoints");
     let segment_count = list_ingress_segment_files(&segment_dir)?.len();
@@ -492,7 +676,6 @@ pub(super) fn scan_ingress_artifacts(spill_dir: &Path) -> VfsResult<(usize, usiz
 
 #[cfg(test)]
 mod tests {
-    use super::super::{IngressLiveIndex, SpillEntry};
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -507,7 +690,7 @@ mod tests {
             (42, 7),
             1,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"newer-data",
         )
         .unwrap();
@@ -517,7 +700,7 @@ mod tests {
             (42, 8),
             3,
             300,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"other",
         )
         .unwrap();
@@ -554,7 +737,7 @@ mod tests {
             (42, 7),
             1,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"first",
         )
         .unwrap();
@@ -564,7 +747,7 @@ mod tests {
             (42, 8),
             2,
             200,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"second-payload",
         )
         .unwrap();
@@ -586,15 +769,23 @@ mod tests {
     fn test_recover_ingress_segment_records_keeps_latest_put() {
         let dir = tempfile::tempdir().unwrap();
         let segment_dir = dir.path().join("segments");
-        append_ingress_record(&segment_dir, 1, (42, 7), 1, 100, INGRESS_RECORD_PUT, b"old")
-            .unwrap();
+        append_ingress_record(
+            &segment_dir,
+            1,
+            (42, 7),
+            1,
+            100,
+            IngressRecordKind::Put,
+            b"old",
+        )
+        .unwrap();
         append_ingress_record(
             &segment_dir,
             1,
             (42, 7),
             2,
             200,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"newer",
         )
         .unwrap();
@@ -604,7 +795,7 @@ mod tests {
             (42, 8),
             3,
             300,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"other",
         )
         .unwrap();
@@ -636,7 +827,7 @@ mod tests {
             (42, 7),
             1,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"payload",
         )
         .unwrap();
@@ -646,7 +837,7 @@ mod tests {
             (42, 7),
             2,
             200,
-            INGRESS_RECORD_INVALIDATE,
+            IngressRecordKind::Invalidate,
             &[],
         )
         .unwrap();
@@ -670,7 +861,7 @@ mod tests {
             (42, 7),
             5,
             123,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"segment-data",
         )
         .unwrap();
@@ -701,7 +892,7 @@ mod tests {
             (42, 7),
             1,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"first",
         )
         .unwrap();
@@ -724,7 +915,7 @@ mod tests {
             (42, 8),
             2,
             200,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"second",
         )
         .unwrap();
@@ -757,7 +948,7 @@ mod tests {
             (42, 7),
             7,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"payload",
         )
         .unwrap();
@@ -779,7 +970,7 @@ mod tests {
             (42, 7),
             8,
             200,
-            INGRESS_RECORD_INVALIDATE,
+            IngressRecordKind::Invalidate,
             &[],
         )
         .unwrap();
@@ -798,10 +989,26 @@ mod tests {
         let spill_dir = dir.path();
         let segment_dir = spill_dir.join("segments");
         let checkpoint_dir = spill_dir.join("checkpoints");
-        append_ingress_record(&segment_dir, 1, (1, 0), 1, 100, INGRESS_RECORD_PUT, b"old").unwrap();
-        let new_offset =
-            append_ingress_record(&segment_dir, 2, (1, 1), 2, 200, INGRESS_RECORD_PUT, b"new")
-                .unwrap();
+        append_ingress_record(
+            &segment_dir,
+            1,
+            (1, 0),
+            1,
+            100,
+            IngressRecordKind::Put,
+            b"old",
+        )
+        .unwrap();
+        let new_offset = append_ingress_record(
+            &segment_dir,
+            2,
+            (1, 1),
+            2,
+            200,
+            IngressRecordKind::Put,
+            b"new",
+        )
+        .unwrap();
         let mut ingress_live = IngressLiveIndex::default();
         ingress_live.insert(
             (1, 1),
@@ -847,7 +1054,7 @@ mod tests {
             (42, 7),
             9,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"payload",
         )
         .unwrap();
@@ -874,7 +1081,7 @@ mod tests {
             (42, 7),
             9,
             100,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"payload",
         )
         .unwrap();
@@ -914,7 +1121,7 @@ mod tests {
             (7, 1),
             1,
             42,
-            INGRESS_RECORD_PUT,
+            IngressRecordKind::Put,
             b"payload",
         )
         .unwrap();

@@ -23,8 +23,6 @@
 
 #[path = "commit.rs"]
 mod commit;
-#[path = "ingress_wal.rs"]
-mod ingress_wal;
 #[path = "materialize.rs"]
 mod materialize;
 
@@ -67,13 +65,11 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use ingress_wal::{
-    INGRESS_RECORD_HEADER_LEN, INGRESS_RECORD_INVALIDATE, INGRESS_RECORD_PUT,
-    INITIAL_INGRESS_SEGMENT_ID, RecoveredSpillMap, active_ingress_segment_path,
-    append_ingress_record, ingress_segment_path, latest_ingress_checkpoint_path,
-    load_latest_ingress_checkpoint_meta, parse_ingress_segment_id, read_ingress_entry_bytes,
-    recover_spill_dir, reset_ingress_artifacts_for_fast_mode, scan_ingress_artifacts,
-    write_ingress_checkpoint, write_ingress_state,
+use crate::ingress_wal::{
+    INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressRecordKind, IngressWal, RecoveredSpillMap,
+    SpillEntry, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
+    read_ingress_entry_bytes, recover_spill_dir, reset_ingress_artifacts_for_fast_mode,
+    scan_ingress_artifacts, write_ingress_checkpoint, write_ingress_state,
 };
 
 // =============================================================================
@@ -2428,90 +2424,6 @@ struct ExtentRecordId {
     content_epoch: u64,
 }
 
-#[derive(Debug, Clone)]
-struct SpillEntry {
-    seq: u64,
-    path: PathBuf,
-    offset: u64,
-    len: usize,
-    created_unix_ms: u64,
-}
-
-#[derive(Debug, Default)]
-struct IngressLiveIndex {
-    entries: HashMap<(Ino, u32), SpillEntry>,
-    by_ino_counts: HashMap<Ino, usize>,
-}
-
-impl IngressLiveIndex {
-    fn from_entries(entries: HashMap<(Ino, u32), SpillEntry>) -> Self {
-        let mut by_ino_counts = HashMap::new();
-        for (ino, _) in entries.keys() {
-            *by_ino_counts.entry(*ino).or_insert(0) += 1;
-        }
-        Self {
-            entries,
-            by_ino_counts,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    fn get_cloned(&self, key: &(Ino, u32)) -> Option<SpillEntry> {
-        self.entries.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
-        let old = self.entries.insert(key, entry);
-        if old.is_none() {
-            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
-        }
-        old
-    }
-
-    fn remove(&mut self, key: &(Ino, u32)) -> Option<SpillEntry> {
-        let removed = self.entries.remove(key);
-        if removed.is_some() {
-            let ino = key.0;
-            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
-            if count <= 1 {
-                self.by_ino_counts.remove(&ino);
-            } else {
-                self.by_ino_counts.insert(ino, count - 1);
-            }
-        }
-        removed
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
-        self.entries.keys()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&(Ino, u32), &SpillEntry)> {
-        self.entries.iter()
-    }
-
-    fn live_segment_count(&self) -> u64 {
-        let mut ids = std::collections::HashSet::new();
-        for entry in self.entries.values() {
-            if let Some(segment_id) = parse_ingress_segment_id(&entry.path) {
-                ids.insert(segment_id);
-            }
-        }
-        ids.len() as u64
-    }
-
-    fn has_ino(&self, ino: Ino) -> bool {
-        self.by_ino_counts.contains_key(&ino)
-    }
-}
-
 #[derive(Debug, Default)]
 struct DirtyMemIndex {
     entries: HashMap<(Ino, u32), Bytes>,
@@ -2636,21 +2548,21 @@ type IngressRecoveryInit = (RecoveredSpillMap, usize, u64, u64, Option<(u64, u64
 
 fn init_ingress_recovery_state(
     cache_safety_mode: CacheSafetyMode,
-    spill_dir: &std::path::Path,
-    ingress_checkpoint_dir: &std::path::Path,
-    ingress_segment_dir: &std::path::Path,
+    ingress_wal: &IngressWal,
 ) -> VfsResult<IngressRecoveryInit> {
     if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
-        let existing_checkpoint =
-            load_latest_ingress_checkpoint_meta(ingress_checkpoint_dir, ingress_segment_dir)?;
+        let existing_checkpoint = load_latest_ingress_checkpoint_meta(
+            ingress_wal.checkpoint_dir(),
+            ingress_wal.segment_dir(),
+        )?;
         let (
             recovered_spill,
             recovered_spill_bytes,
             recovered_spill_seq,
             active_ingress_segment_id,
-        ) = recover_spill_dir(spill_dir)?;
+        ) = recover_spill_dir(ingress_wal.spill_dir())?;
         let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
-            let checkpoint_path = latest_ingress_checkpoint_path(ingress_checkpoint_dir);
+            let checkpoint_path = latest_ingress_checkpoint_path(ingress_wal.checkpoint_dir());
             let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
                 .ok()
                 .and_then(|meta| meta.modified().ok())
@@ -2672,7 +2584,8 @@ fn init_ingress_recovery_state(
         ));
     }
 
-    let (segment_count, checkpoint_count, state_present) = scan_ingress_artifacts(spill_dir)?;
+    let (segment_count, checkpoint_count, state_present) =
+        scan_ingress_artifacts(ingress_wal.spill_dir())?;
     if segment_count > 0 || checkpoint_count > 0 || state_present {
         warn!(
             mode = "fast",
@@ -2682,7 +2595,7 @@ fn init_ingress_recovery_state(
             "startup detected durable ingress artifacts; fast mode will discard them during self-heal"
         );
     }
-    reset_ingress_artifacts_for_fast_mode(spill_dir)?;
+    reset_ingress_artifacts_for_fast_mode(ingress_wal.spill_dir())?;
     Ok((
         RecoveredSpillMap::new(),
         0,
@@ -2964,12 +2877,7 @@ pub struct StudioVfs {
     /// Maximum total bytes allowed in local NVMe spill before foreground
     /// writes block waiting for the pipeline to catch up.
     max_spill_bytes: usize,
-    max_ingress_segment_bytes: u64,
-    ingress_spill_dir: PathBuf,
-    /// Append-only ingress segment directory for the next storage phase.
-    ingress_segment_dir: PathBuf,
-    /// Checkpoint directory for bounded ingress replay recovery.
-    ingress_checkpoint_dir: PathBuf,
+    ingress_wal: IngressWal,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Optional distributed lease for janitor leader election.
@@ -3686,14 +3594,12 @@ impl StudioVfs {
             let attr_read_cache_bytes = config.attr_read_cache_bytes;
             let effective_acl_cache_capacity = config.effective_acl_cache_capacity;
             let max_spill_bytes = config.max_spill_bytes;
-            let max_ingress_segment_bytes = config.max_ingress_segment_bytes;
             let cache_safety_mode = config.cache_safety_mode;
             let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
-            std::fs::create_dir_all(&spill_dir).map_err(VfsError::Io)?;
-            let ingress_segment_dir = spill_dir.join("segments");
-            std::fs::create_dir_all(&ingress_segment_dir).map_err(VfsError::Io)?;
-            let ingress_checkpoint_dir = spill_dir.join("checkpoints");
-            std::fs::create_dir_all(&ingress_checkpoint_dir).map_err(VfsError::Io)?;
+            let ingress_wal = IngressWal::new(spill_dir, config.max_ingress_segment_bytes);
+            std::fs::create_dir_all(ingress_wal.spill_dir()).map_err(VfsError::Io)?;
+            std::fs::create_dir_all(ingress_wal.segment_dir()).map_err(VfsError::Io)?;
+            std::fs::create_dir_all(ingress_wal.checkpoint_dir()).map_err(VfsError::Io)?;
             let acl_principal = config.principal.clone();
             let (
                 recovered_spill,
@@ -3701,12 +3607,7 @@ impl StudioVfs {
                 recovered_spill_seq,
                 active_ingress_segment_id,
                 initial_checkpoint_meta,
-            ) = init_ingress_recovery_state(
-                cache_safety_mode,
-                &spill_dir,
-                &ingress_checkpoint_dir,
-                &ingress_segment_dir,
-            )?;
+            ) = init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
             // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
@@ -4060,10 +3961,7 @@ impl StudioVfs {
                 max_dirty_bytes,
                 max_xattr_bytes,
                 max_spill_bytes,
-                max_ingress_segment_bytes,
-                ingress_spill_dir: spill_dir,
-                ingress_segment_dir,
-                ingress_checkpoint_dir,
+                ingress_wal,
                 handle_table: HandleTable::new(),
                 janitor_lease,
                 janitor_interval,
@@ -4633,16 +4531,14 @@ impl StudioVfs {
 
     fn persist_ingress_recovery_state_owned(
         state: Arc<VfsState>,
-        ingress_checkpoint_dir: PathBuf,
-        ingress_segment_dir: PathBuf,
-        ingress_spill_dir: PathBuf,
+        ingress_wal: IngressWal,
     ) -> VfsResult<()> {
         let _writer_guard = state.ingress_segment_write_lock.lock();
         let ingress_live = state.ingress_live.lock();
         let meta = write_ingress_checkpoint(
-            &ingress_checkpoint_dir,
+            ingress_wal.checkpoint_dir(),
             &ingress_live,
-            &ingress_segment_dir,
+            ingress_wal.segment_dir(),
             state.active_ingress_segment_id.load(Ordering::Relaxed),
             state.spill_seq.load(Ordering::Relaxed),
         )?;
@@ -4665,7 +4561,7 @@ impl StudioVfs {
             .ingress_checkpoint_pending_mutations
             .store(0, Ordering::Relaxed);
         write_ingress_state(
-            &ingress_spill_dir,
+            ingress_wal.spill_dir(),
             state.active_ingress_segment_id.load(Ordering::Relaxed),
             state.spill_seq.load(Ordering::Relaxed),
         )
@@ -4694,41 +4590,24 @@ impl StudioVfs {
         key: (Ino, u32),
         seq: u64,
         created_unix_ms: u64,
-        kind: u8,
+        kind: IngressRecordKind,
         payload: &[u8],
     ) -> VfsResult<(u64, PathBuf)> {
         let started = Instant::now();
         let _guard = self.state.ingress_segment_write_lock.lock();
-        let record_len = INGRESS_RECORD_HEADER_LEN as u64 + payload.len() as u64;
-        let mut active_segment_id = self.state.active_ingress_segment_id.load(Ordering::Relaxed);
-        let active_path = active_ingress_segment_path(&self.ingress_segment_dir, active_segment_id);
-        let active_len = std::fs::metadata(&active_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        if active_len > 0 && active_len.saturating_add(record_len) > self.max_ingress_segment_bytes
-        {
-            active_segment_id = active_segment_id.saturating_add(1);
-            self.state
-                .active_ingress_segment_id
-                .store(active_segment_id, Ordering::Relaxed);
-        }
-        let offset = append_ingress_record(
-            &self.ingress_segment_dir,
-            active_segment_id,
+        let append = self.ingress_wal.append(
+            &self.state.active_ingress_segment_id,
             key,
             seq,
             created_unix_ms,
             kind,
             payload,
         )?;
-        self.note_ingress_checkpoint_churn(record_len);
+        self.note_ingress_checkpoint_churn(append.record_bytes);
         self.state
             .ingress_append_stats
-            .record(record_len, started.elapsed());
-        Ok((
-            offset,
-            ingress_segment_path(&self.ingress_segment_dir, active_segment_id),
-        ))
+            .record(append.record_bytes, started.elapsed());
+        Ok((append.offset, append.path))
     }
 
     fn upload_requeue_delay(&self, op: &PendingUpload) -> Duration {
@@ -4885,7 +4764,7 @@ impl StudioVfs {
                 key,
                 seq,
                 Self::now_unix_millis(),
-                INGRESS_RECORD_INVALIDATE,
+                IngressRecordKind::Invalidate,
                 &[],
             );
             self.state
@@ -4913,8 +4792,13 @@ impl StudioVfs {
     fn spill_block(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
         let seq = self.state.spill_seq.fetch_add(1, Ordering::Relaxed);
         let created_unix_ms = Self::now_unix_millis();
-        let (segment_offset, segment_path) =
-            self.append_ingress_record_live(key, seq, created_unix_ms, INGRESS_RECORD_PUT, &data)?;
+        let (segment_offset, segment_path) = self.append_ingress_record_live(
+            key,
+            seq,
+            created_unix_ms,
+            IngressRecordKind::Put,
+            &data,
+        )?;
 
         if let Some(old) = self.state.ingress_live.lock().insert(
             key,
@@ -5603,48 +5487,29 @@ impl StudioVfs {
 
     async fn spill_block_async(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
         let state = self.state.clone();
-        let ingress_segment_dir = self.ingress_segment_dir.clone();
-        let max_ingress_segment_bytes = self.max_ingress_segment_bytes;
+        let ingress_wal = self.ingress_wal.clone();
         run_blocking(move || {
-            let (seq, created_unix_ms, segment_id, offset) = {
+            let (seq, created_unix_ms, append) = {
                 let _guard = state.ingress_segment_write_lock.lock();
                 let seq = state.spill_seq.fetch_add(1, Ordering::Relaxed);
                 let created_unix_ms = StudioVfs::now_unix_millis();
-
-                let mut segment_id = state.active_ingress_segment_id.load(Ordering::Relaxed);
-                let active_path = active_ingress_segment_path(&ingress_segment_dir, segment_id);
-                let active_len = std::fs::metadata(&active_path)
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
-                if active_len > 0
-                    && active_len
-                        .saturating_add(INGRESS_RECORD_HEADER_LEN as u64 + data.len() as u64)
-                        > max_ingress_segment_bytes
-                {
-                    segment_id = segment_id.saturating_add(1);
-                    state
-                        .active_ingress_segment_id
-                        .store(segment_id, Ordering::Relaxed);
-                }
-
-                let offset = append_ingress_record(
-                    &ingress_segment_dir,
-                    segment_id,
+                let append = ingress_wal.append(
+                    &state.active_ingress_segment_id,
                     key,
                     seq,
                     created_unix_ms,
-                    INGRESS_RECORD_PUT,
+                    IngressRecordKind::Put,
                     &data,
                 )?;
-                (seq, created_unix_ms, segment_id, offset)
+                (seq, created_unix_ms, append)
             };
 
             if let Some(old) = state.ingress_live.lock().insert(
                 key,
                 SpillEntry {
                     seq,
-                    path: ingress_segment_path(&ingress_segment_dir, segment_id),
-                    offset,
+                    path: append.path,
+                    offset: append.offset,
                     len: data.len(),
                     created_unix_ms,
                 },
@@ -9798,18 +9663,10 @@ impl StudioVfs {
                 continue;
             }
             let state = self.state.clone();
-            let ingress_checkpoint_dir = self.ingress_checkpoint_dir.clone();
-            let ingress_segment_dir = self.ingress_segment_dir.clone();
-            let ingress_spill_dir = self.ingress_spill_dir.clone();
-            if let Err(e) = run_blocking(move || {
-                Self::persist_ingress_recovery_state_owned(
-                    state,
-                    ingress_checkpoint_dir,
-                    ingress_segment_dir,
-                    ingress_spill_dir,
-                )
-            })
-            .await
+            let ingress_wal = self.ingress_wal.clone();
+            if let Err(e) =
+                run_blocking(move || Self::persist_ingress_recovery_state_owned(state, ingress_wal))
+                    .await
             {
                 self.state
                     .ingress_checkpoint_failures
@@ -10333,25 +10190,17 @@ impl StudioVfs {
         );
         if self.durable_cache_safety_mode() {
             let state = self.state.clone();
-            let ingress_checkpoint_dir = self.ingress_checkpoint_dir.clone();
-            let ingress_segment_dir = self.ingress_segment_dir.clone();
-            let ingress_spill_dir = self.ingress_spill_dir.clone();
-            if let Err(e) = run_blocking(move || {
-                Self::persist_ingress_recovery_state_owned(
-                    state,
-                    ingress_checkpoint_dir,
-                    ingress_segment_dir,
-                    ingress_spill_dir,
-                )
-            })
-            .await
+            let ingress_wal = self.ingress_wal.clone();
+            if let Err(e) =
+                run_blocking(move || Self::persist_ingress_recovery_state_owned(state, ingress_wal))
+                    .await
             {
                 self.state
                     .ingress_checkpoint_failures
                     .fetch_add(1, Ordering::Relaxed);
                 warn!("VFS shutdown: ingress recovery state persist failed: {}", e);
             }
-        } else if let Err(e) = reset_ingress_artifacts_for_fast_mode(&self.ingress_spill_dir) {
+        } else if let Err(e) = reset_ingress_artifacts_for_fast_mode(self.ingress_wal.spill_dir()) {
             warn!(
                 "VFS shutdown: failed to self-heal ingress artifacts in fast mode: {}",
                 e
