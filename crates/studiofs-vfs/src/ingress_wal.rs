@@ -2,6 +2,7 @@ use crate::vfs::{VfsError, VfsResult};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,30 +10,36 @@ use studiofs_meta::Ino;
 
 pub(crate) const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
+const INGRESS_STATE_MAGIC: [u8; 4] = *b"IWS1";
+const INGRESS_CHECKPOINT_MAGIC: [u8; 4] = *b"IWC1";
 const INGRESS_RECORD_PUT: u8 = 1;
 const INGRESS_RECORD_INVALIDATE: u8 = 2;
 const INGRESS_RECORD_HEADER_LEN: usize = 37;
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IngressRecordKind {
-    Put,
-    Invalidate,
+    Put = INGRESS_RECORD_PUT,
+    Invalidate = INGRESS_RECORD_INVALIDATE,
+}
+
+impl TryFrom<u8> for IngressRecordKind {
+    type Error = VfsError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            INGRESS_RECORD_PUT => Ok(Self::Put),
+            INGRESS_RECORD_INVALIDATE => Ok(Self::Invalidate),
+            _ => Err(VfsError::Other(
+                "unknown ingress segment record kind".into(),
+            )),
+        }
+    }
 }
 
 impl IngressRecordKind {
     fn as_byte(self) -> u8 {
-        match self {
-            Self::Put => INGRESS_RECORD_PUT,
-            Self::Invalidate => INGRESS_RECORD_INVALIDATE,
-        }
-    }
-
-    fn from_byte(value: u8) -> Option<Self> {
-        match value {
-            INGRESS_RECORD_PUT => Some(Self::Put),
-            INGRESS_RECORD_INVALIDATE => Some(Self::Invalidate),
-            _ => None,
-        }
+        self as u8
     }
 }
 
@@ -49,17 +56,25 @@ pub(crate) struct SpillEntry {
 pub(crate) struct IngressLiveIndex {
     entries: HashMap<(Ino, u32), SpillEntry>,
     by_ino_counts: HashMap<Ino, usize>,
+    live_segment_counts: HashMap<u64, usize>,
 }
 
 impl IngressLiveIndex {
     pub(crate) fn from_entries(entries: HashMap<(Ino, u32), SpillEntry>) -> Self {
         let mut by_ino_counts = HashMap::new();
+        let mut live_segment_counts = HashMap::new();
         for (ino, _) in entries.keys() {
             *by_ino_counts.entry(*ino).or_insert(0) += 1;
+        }
+        for entry in entries.values() {
+            if let Some(segment_id) = parse_ingress_segment_id(&entry.path) {
+                *live_segment_counts.entry(segment_id).or_insert(0) += 1;
+            }
         }
         Self {
             entries,
             by_ino_counts,
+            live_segment_counts,
         }
     }
 
@@ -76,9 +91,16 @@ impl IngressLiveIndex {
     }
 
     pub(crate) fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
+        let new_segment_id = parse_ingress_segment_id(&entry.path);
         let old = self.entries.insert(key, entry);
         if old.is_none() {
             *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
+        }
+        if let Some(old) = old.as_ref() {
+            self.dec_segment(old);
+        }
+        if let Some(segment_id) = new_segment_id {
+            *self.live_segment_counts.entry(segment_id).or_insert(0) += 1;
         }
         old
     }
@@ -93,6 +115,9 @@ impl IngressLiveIndex {
             } else {
                 self.by_ino_counts.insert(ino, count - 1);
             }
+            if let Some(entry) = removed.as_ref() {
+                self.dec_segment(entry);
+            }
         }
         removed
     }
@@ -106,17 +131,27 @@ impl IngressLiveIndex {
     }
 
     pub(crate) fn live_segment_count(&self) -> u64 {
-        let mut ids = std::collections::HashSet::new();
-        for entry in self.entries.values() {
-            if let Some(segment_id) = parse_ingress_segment_id(&entry.path) {
-                ids.insert(segment_id);
-            }
-        }
-        ids.len() as u64
+        self.live_segment_counts.len() as u64
     }
 
     pub(crate) fn has_ino(&self, ino: Ino) -> bool {
         self.by_ino_counts.contains_key(&ino)
+    }
+
+    fn dec_segment(&mut self, entry: &SpillEntry) {
+        let Some(segment_id) = parse_ingress_segment_id(&entry.path) else {
+            return;
+        };
+        let count = self
+            .live_segment_counts
+            .get(&segment_id)
+            .copied()
+            .unwrap_or(0);
+        if count <= 1 {
+            self.live_segment_counts.remove(&segment_id);
+        } else {
+            self.live_segment_counts.insert(segment_id, count - 1);
+        }
     }
 }
 
@@ -310,8 +345,13 @@ fn load_latest_ingress_checkpoint(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(VfsError::Io(e)),
     };
-    let checkpoint: IngressCheckpointFile = serde_json::from_slice(&bytes)
-        .map_err(|e| VfsError::Other(format!("invalid ingress checkpoint: {e}")))?;
+    let checkpoint: IngressCheckpointFile = if bytes.starts_with(&INGRESS_CHECKPOINT_MAGIC) {
+        postcard::from_bytes(&bytes[INGRESS_CHECKPOINT_MAGIC.len()..])
+            .map_err(|e| VfsError::Other(format!("invalid ingress checkpoint: {e}")))?
+    } else {
+        serde_json::from_slice(&bytes)
+            .map_err(|e| VfsError::Other(format!("invalid ingress checkpoint: {e}")))?
+    };
     if checkpoint.version != 1 {
         return Err(VfsError::Other(format!(
             "unsupported ingress checkpoint version {}",
@@ -348,8 +388,13 @@ fn load_ingress_state(spill_dir: &Path) -> VfsResult<Option<IngressStateFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(VfsError::Io(e)),
     };
-    let state: IngressStateFile = serde_json::from_slice(&bytes)
-        .map_err(|e| VfsError::Other(format!("invalid ingress state: {e}")))?;
+    let state: IngressStateFile = if bytes.starts_with(&INGRESS_STATE_MAGIC) {
+        postcard::from_bytes(&bytes[INGRESS_STATE_MAGIC.len()..])
+            .map_err(|e| VfsError::Other(format!("invalid ingress state: {e}")))?
+    } else {
+        serde_json::from_slice(&bytes)
+            .map_err(|e| VfsError::Other(format!("invalid ingress state: {e}")))?
+    };
     if state.version != 1 {
         return Err(VfsError::Other(format!(
             "unsupported ingress state version {}",
@@ -372,8 +417,10 @@ pub(crate) fn write_ingress_state(
     };
     let tmp = spill_dir.join("state.json.tmp");
     let path = ingress_state_path(spill_dir);
-    let bytes = serde_json::to_vec_pretty(&state)
+    let mut bytes = Vec::from(INGRESS_STATE_MAGIC);
+    let payload = postcard::to_stdvec(&state)
         .map_err(|e| VfsError::Other(format!("encode ingress state failed: {e}")))?;
+    bytes.extend_from_slice(&payload);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(tmp, path)?;
     Ok(())
@@ -415,8 +462,10 @@ pub(crate) fn write_ingress_checkpoint(
     };
     let tmp = checkpoint_dir.join("latest.json.tmp");
     let path = latest_ingress_checkpoint_path(checkpoint_dir);
-    let bytes = serde_json::to_vec_pretty(&checkpoint)
+    let mut bytes = Vec::from(INGRESS_CHECKPOINT_MAGIC);
+    let payload = postcard::to_stdvec(&checkpoint)
         .map_err(|e| VfsError::Other(format!("encode ingress checkpoint failed: {e}")))?;
+    bytes.extend_from_slice(&payload);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(tmp, path)?;
     let live_segment_ids: HashSet<u64> = checkpoint
@@ -507,11 +556,7 @@ fn replay_ingress_segment_records(
             if header[0..4] != INGRESS_SEGMENT_MAGIC {
                 return Err(VfsError::Other("invalid ingress segment magic".into()));
             }
-            let Some(kind) = IngressRecordKind::from_byte(header[4]) else {
-                return Err(VfsError::Other(
-                    "unknown ingress segment record kind".into(),
-                ));
-            };
+            let kind = IngressRecordKind::try_from(header[4])?;
             let ino = u64::from_le_bytes(header[5..13].try_into().unwrap());
             let block_index = u32::from_le_bytes(header[13..17].try_into().unwrap());
             let seq = u64::from_le_bytes(header[17..25].try_into().unwrap());
@@ -1043,6 +1088,26 @@ mod tests {
     }
 
     #[test]
+    fn test_recover_spill_dir_accepts_legacy_json_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill_dir = dir.path();
+        std::fs::create_dir_all(spill_dir).unwrap();
+        std::fs::write(
+            ingress_state_path(spill_dir),
+            br#"{"version":1,"active_segment_id":7,"next_seq":13}"#,
+        )
+        .unwrap();
+
+        let (recovered, total_bytes, next_seq, active_segment_id) =
+            recover_spill_dir(spill_dir).unwrap();
+
+        assert!(recovered.is_empty());
+        assert_eq!(total_bytes, 0);
+        assert_eq!(next_seq, 13);
+        assert_eq!(active_segment_id, 7);
+    }
+
+    #[test]
     fn test_recover_spill_dir_prefers_replayed_seq_over_stale_state_file() {
         let dir = tempfile::tempdir().unwrap();
         let spill_dir = dir.path();
@@ -1137,5 +1202,67 @@ mod tests {
         assert!(list_ingress_segment_files(&segment_dir).unwrap().is_empty());
         assert!(!ingress_state_path(spill_dir).exists());
         assert!(!spill_dir.join("legacy.spill").exists());
+    }
+
+    #[test]
+    fn test_live_segment_count_is_updated_incrementally() {
+        let mut idx = IngressLiveIndex::default();
+        let base = tempfile::tempdir().unwrap();
+        let seg1 = ingress_segment_path(base.path(), 1);
+        let seg2 = ingress_segment_path(base.path(), 2);
+        let seg3 = ingress_segment_path(base.path(), 3);
+
+        idx.insert(
+            (10, 0),
+            SpillEntry {
+                seq: 1,
+                path: seg1.clone(),
+                offset: 0,
+                len: 1,
+                created_unix_ms: 1,
+            },
+        );
+        idx.insert(
+            (10, 1),
+            SpillEntry {
+                seq: 2,
+                path: seg1,
+                offset: 0,
+                len: 1,
+                created_unix_ms: 2,
+            },
+        );
+        assert_eq!(idx.live_segment_count(), 1);
+
+        idx.insert(
+            (11, 0),
+            SpillEntry {
+                seq: 3,
+                path: seg2,
+                offset: 0,
+                len: 1,
+                created_unix_ms: 3,
+            },
+        );
+        assert_eq!(idx.live_segment_count(), 2);
+
+        idx.insert(
+            (11, 0),
+            SpillEntry {
+                seq: 4,
+                path: seg3,
+                offset: 0,
+                len: 1,
+                created_unix_ms: 4,
+            },
+        );
+        assert_eq!(idx.live_segment_count(), 2);
+
+        idx.remove(&(10, 0));
+        assert_eq!(idx.live_segment_count(), 2);
+        idx.remove(&(10, 1));
+        assert_eq!(idx.live_segment_count(), 1);
+        idx.remove(&(11, 0));
+        assert_eq!(idx.live_segment_count(), 0);
     }
 }
