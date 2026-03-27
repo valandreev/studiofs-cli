@@ -57,8 +57,13 @@ use studiofs_data::object::{
     parse_object_id_from_key, read_object, validate_cloud_fragment_layout,
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
-use studiofs_meta::types::{BlockFlags, block_index_from_offset, offset_within_block};
-use studiofs_meta::*;
+use studiofs_meta::engine::{BatchFlushEntry, BatchFlushResult};
+use studiofs_meta::schema::{DirEntry, ROOT_INO, SetattrArgs, UploadState as MetaUploadState};
+use studiofs_meta::types::{
+    AccessLevel, BlockFlags, BlockRef, FileType, Ino, InodeAttr, block_index_from_offset,
+    offset_within_block,
+};
+use studiofs_meta::{AsyncMetaEngine, MetaEngine, MetaError, MetaResult, SyncMetaEngineAdapter};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
@@ -2590,17 +2595,6 @@ impl DirtyMemIndex {
     }
 }
 
-fn oldest_spill_age_ms(
-    now_ms: u64,
-    spill: &std::collections::HashMap<(Ino, u32), SpillEntry>,
-) -> u64 {
-    spill
-        .values()
-        .map(|entry| now_ms.saturating_sub(entry.created_unix_ms))
-        .max()
-        .unwrap_or(0)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn ingress_checkpoint_due_with_policy(
     pending_bytes: u64,
@@ -2785,7 +2779,7 @@ impl DirtyBufferState {
     }
 }
 
-struct UploadSubState {
+struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
     upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
@@ -2795,7 +2789,7 @@ struct UploadSubState {
     upload_canceled_stale: AtomicU64,
 }
 
-impl UploadSubState {
+impl UploadState {
     fn new() -> Self {
         Self {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
@@ -2990,11 +2984,54 @@ impl MetricsState {
 // Internal State (composed subsystems)
 // =============================================================================
 
-/// Internal state that can be cloned and shared.
+impl VfsState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        recovered_spill: RecoveredSpillMap,
+        recovered_spill_bytes: usize,
+        active_segment_id: u64,
+        recovered_spill_seq: u64,
+        initial_checkpoint_meta: Option<(u64, u64, u64)>,
+        dentry_cache_capacity: usize,
+        dentry_cache_bytes: usize,
+        path_shortcut_cache_capacity: usize,
+        path_shortcut_cache_bytes: usize,
+        attr_read_cache_capacity: usize,
+        attr_read_cache_bytes: usize,
+    ) -> Self {
+        Self {
+            ingress: IngressState::new(
+                recovered_spill,
+                recovered_spill_bytes,
+                active_segment_id,
+                recovered_spill_seq,
+                initial_checkpoint_meta,
+            ),
+            dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
+            upload: UploadState::new(),
+            namespace: NamespaceState::new(
+                dentry_cache_capacity,
+                dentry_cache_bytes,
+                path_shortcut_cache_capacity,
+                path_shortcut_cache_bytes,
+                attr_read_cache_capacity,
+                attr_read_cache_bytes,
+            ),
+            acl: AclState::new(),
+            incarnation: IncarnationState::new(),
+            write_buffer: WriteBufferState::new(),
+            read: ReadState::new(FOREGROUND_READ_SPEEDOMETER_SHARDS),
+            file_lock: FileLockState::new(),
+            shutdown: ShutdownState::new(),
+            metrics: MetricsState::new(),
+        }
+    }
+}
+
 struct VfsState {
     ingress: IngressState,
     dirty_buffer: DirtyBufferState,
-    upload: UploadSubState,
+    upload: UploadState,
     namespace: NamespaceState,
     acl: AclState,
     incarnation: IncarnationState,
@@ -4089,32 +4126,19 @@ impl StudioVfs {
                 cache_safety_mode,
                 acl_principal,
                 effective_acl_cache_capacity,
-                state: Arc::new(VfsState {
-                    ingress: IngressState::new(
-                        recovered_spill,
-                        recovered_spill_bytes,
-                        active_ingress_segment_id,
-                        recovered_spill_seq,
-                        initial_checkpoint_meta,
-                    ),
-                    dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
-                    upload: UploadSubState::new(),
-                    namespace: NamespaceState::new(
-                        dentry_cache_capacity,
-                        dentry_cache_bytes,
-                        path_shortcut_cache_capacity,
-                        path_shortcut_cache_bytes,
-                        attr_read_cache_capacity,
-                        attr_read_cache_bytes,
-                    ),
-                    acl: AclState::new(),
-                    incarnation: IncarnationState::new(),
-                    write_buffer: WriteBufferState::new(),
-                    read: ReadState::new(FOREGROUND_READ_SPEEDOMETER_SHARDS),
-                    file_lock: FileLockState::new(),
-                    shutdown: ShutdownState::new(),
-                    metrics: MetricsState::new(),
-                }),
+                state: Arc::new(VfsState::new(
+                    recovered_spill,
+                    recovered_spill_bytes,
+                    active_ingress_segment_id,
+                    recovered_spill_seq,
+                    initial_checkpoint_meta,
+                    dentry_cache_capacity,
+                    dentry_cache_bytes,
+                    path_shortcut_cache_capacity,
+                    path_shortcut_cache_bytes,
+                    attr_read_cache_capacity,
+                    attr_read_cache_bytes,
+                )),
                 upload_scheduler,
                 upload_delay,
                 upload_requeue_base,
@@ -4675,9 +4699,12 @@ impl StudioVfs {
     fn spill_age_stats_ms(&self) -> (usize, u64) {
         let ingress_live = self.state.ingress.ingress_live.lock();
         let count = ingress_live.len();
-        let spill: HashMap<(Ino, u32), SpillEntry> =
-            ingress_live.iter().map(|(k, v)| (*k, v.clone())).collect();
-        let oldest_age_ms = oldest_spill_age_ms(Self::now_unix_millis(), &spill);
+        let now_ms = Self::now_unix_millis();
+        let oldest_age_ms = ingress_live
+            .iter()
+            .map(|(_, entry)| now_ms.saturating_sub(entry.created_unix_ms))
+            .max()
+            .unwrap_or(0);
         (count, oldest_age_ms)
     }
 
@@ -5537,7 +5564,7 @@ impl StudioVfs {
 
     fn remote_upload_placeholder_visible(&self, ino: Ino, attr: &InodeAttr) -> bool {
         attr.kind == FileType::RegularFile
-            && attr.upload_state == UploadState::Uploading
+            && attr.upload_state == MetaUploadState::Uploading
             && attr.size == 0
             && attr.committed_size == 0
             && !self.inode_has_local_overlay(ino)
@@ -6518,8 +6545,8 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
-            return Ok(attr.clone());
+        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
+            return Ok(attr);
         }
 
         if let Some(attr) = self
@@ -10787,6 +10814,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use studiofs_meta::engine::MetaFsOps;
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -11890,35 +11919,6 @@ mod tests {
         assert!(is_probable_trash_component(b".Trash-501"));
         assert!(!is_probable_trash_component(b"Trash"));
         assert!(!is_probable_trash_component(b".Trashcan"));
-    }
-
-    #[test]
-    fn test_oldest_spill_age_ms_uses_oldest_record() {
-        let mut spill = std::collections::HashMap::new();
-        spill.insert(
-            (1, 0),
-            SpillEntry {
-                seq: 1,
-                segment_id: 0,
-                path: PathBuf::from("a.spill"),
-                offset: 0,
-                len: 4,
-                created_unix_ms: 1_000,
-            },
-        );
-        spill.insert(
-            (1, 1),
-            SpillEntry {
-                seq: 2,
-                segment_id: 0,
-                path: PathBuf::from("b.spill"),
-                offset: 0,
-                len: 4,
-                created_unix_ms: 4_000,
-            },
-        );
-
-        assert_eq!(oldest_spill_age_ms(10_000, &spill), 9_000);
     }
 
     #[test]
