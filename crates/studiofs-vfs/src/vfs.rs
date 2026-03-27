@@ -1479,6 +1479,7 @@ where
             }
         };
         if stale {
+            // Stale invalidation is a cache-miss cleanup, not an eviction.
             self.remove(key);
             self.metrics.misses = self.metrics.misses.saturating_add(1);
             return None;
@@ -11471,6 +11472,11 @@ mod tests {
             None,
             "stale entry should be removed on first stale hit"
         );
+        assert_eq!(
+            cache.metrics().evictions,
+            0,
+            "stale invalidation should not count as eviction"
+        );
     }
 
     #[test]
@@ -11576,6 +11582,11 @@ mod tests {
                 .is_none(),
             "parent generation drift must invalidate cached path"
         );
+        assert_eq!(
+            cache.metrics().evictions,
+            0,
+            "stale invalidation should not count as eviction"
+        );
     }
 
     #[test]
@@ -11643,6 +11654,26 @@ mod tests {
         assert!(metrics.protected_occupancy_entries >= 1);
         assert!(metrics.protected_hits >= 1);
         assert!(metrics.hot_hit_ratio() > 0.0);
+    }
+
+    #[test]
+    fn attr_read_cache_expired_entries_do_not_increment_evictions() {
+        let mut cache = AttrReadCache::new(8, AttrReadCache::estimate_entry_charge() * 8);
+        let now = Instant::now();
+        cache.put(
+            1,
+            InodeAttr::new_file(1, ROOT_INO, 1000, 1000, 0o644),
+            Duration::from_millis(10),
+            now,
+        );
+
+        assert!(
+            cache.get(1, now + Duration::from_secs(1)).is_none(),
+            "expired entry should be treated as stale miss"
+        );
+        let metrics = cache.metrics();
+        assert_eq!(metrics.evictions, 0);
+        assert_eq!(metrics.misses, 1);
     }
 
     #[test]
