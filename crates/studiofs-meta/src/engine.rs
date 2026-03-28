@@ -394,7 +394,7 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     ///
     /// The default implementation snapshots the current manifest before
     /// entering the backend transaction and delegates to
-    /// [`MetaEngine::publish_file_manifest_if_matches`]. Callers that need an
+    /// [`MetaBlocks::publish_file_manifest_if_matches`]. Callers that need an
     /// in-transaction race check should prefer that lower-level API directly.
     fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
         let expected_manifest = self.get_file_blocks(ino)?;

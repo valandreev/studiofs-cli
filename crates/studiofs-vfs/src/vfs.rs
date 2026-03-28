@@ -2990,7 +2990,6 @@ impl AclState {
 struct IncarnationState {
     inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
     live_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
-    uploaded_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
 }
 
 impl IncarnationState {
@@ -2998,7 +2997,6 @@ impl IncarnationState {
         Self {
             inode_incarnations: Mutex::new(std::collections::HashMap::new()),
             live_extent_records: Mutex::new(std::collections::HashMap::new()),
-            uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -5971,9 +5969,10 @@ impl StudioVfs {
             }
         };
 
+        let should_queue_finalization = Self::needs_epoch_finalization(attr);
         states.insert(ino, next_state.clone());
         drop(states);
-        if Self::needs_epoch_finalization(attr) {
+        if should_queue_finalization {
             self.queue_epoch_finalization(ino, attr.content_epoch);
         }
         next_state
@@ -6100,22 +6099,12 @@ impl StudioVfs {
                 content_epoch,
             },
         );
-        self.state
-            .incarnation
-            .uploaded_extent_records
-            .lock()
-            .remove(&(ino, block_index));
     }
 
     fn remove_live_extent(&self, ino: Ino, block_index: u32) {
         self.state
             .incarnation
             .live_extent_records
-            .lock()
-            .remove(&(ino, block_index));
-        self.state
-            .incarnation
-            .uploaded_extent_records
             .lock()
             .remove(&(ino, block_index));
     }
@@ -6126,24 +6115,12 @@ impl StudioVfs {
             .live_extent_records
             .lock()
             .retain(|(candidate, _), _| *candidate != ino);
-        self.state
-            .incarnation
-            .uploaded_extent_records
-            .lock()
-            .retain(|(candidate, _), _| *candidate != ino);
     }
 
     fn remove_live_extents_for_inode_epoch(&self, ino: Ino, content_epoch: u64) {
         self.state
             .incarnation
             .live_extent_records
-            .lock()
-            .retain(|(candidate, _), extent| {
-                *candidate != ino || extent.content_epoch != content_epoch
-            });
-        self.state
-            .incarnation
-            .uploaded_extent_records
             .lock()
             .retain(|(candidate, _), extent| {
                 *candidate != ino || extent.content_epoch != content_epoch
