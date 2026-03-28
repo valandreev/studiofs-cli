@@ -37,7 +37,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures::{FutureExt, future::join_all};
 use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -3087,6 +3087,56 @@ enum PrefetchWorkItem {
     },
 }
 
+struct StartupChannels {
+    prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
+    dirty_flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupStatus {
+    Uninitialized,
+    Starting,
+    Running,
+    Failed,
+}
+
+struct StartupLifecycle {
+    status: StartupStatus,
+    channels: Option<StartupChannels>,
+}
+
+struct StartupState {
+    lifecycle: Mutex<StartupLifecycle>,
+    lifecycle_notify: Condvar,
+    metadata_invalidation_sync_interval: Duration,
+    background_slab_flush_enabled: bool,
+}
+
+impl StartupState {
+    fn new(
+        prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
+        dirty_flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
+        metadata_invalidation_sync_interval: Duration,
+        background_slab_flush_enabled: bool,
+    ) -> Self {
+        Self {
+            lifecycle: Mutex::new(StartupLifecycle {
+                status: StartupStatus::Uninitialized,
+                channels: Some(StartupChannels {
+                    prefetch_rx,
+                    dirty_flush_rx,
+                    upload_rx,
+                }),
+            }),
+            lifecycle_notify: Condvar::new(),
+            metadata_invalidation_sync_interval,
+            background_slab_flush_enabled,
+        }
+    }
+}
+
 // =============================================================================
 // StudioVfs Implementation
 // =============================================================================
@@ -3155,6 +3205,8 @@ pub struct StudioVfs {
     /// Signal sender to wake the background flusher when new dirty blocks
     /// are buffered.
     dirty_flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// One-time startup state used by `start()` to spawn background workers.
+    startup: StartupState,
     /// Maximum total bytes allowed in the dirty-write memory buffer before
     /// `flush()` / `write()` apply backpressure.
     max_dirty_bytes: usize,
@@ -3928,7 +3980,6 @@ impl StudioVfs {
             cache_config.l2_read_timeout = Duration::from_millis(config.l2_read_timeout_ms);
             cache_config.l2_write_timeout = Duration::from_millis(config.l2_write_timeout_ms);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
-            block_cache.spawn_background_tasks();
 
             // Init ReadAhead tracker + prefetch channel
             let readahead = Arc::new(ReadAheadTracker::new_with_bounds(
@@ -3940,7 +3991,7 @@ impl StudioVfs {
                 4,
             ));
             let dir_prefetch = Arc::new(DirAccessTracker::new(2));
-            let (prefetch_tx, mut prefetch_rx) =
+            let (prefetch_tx, prefetch_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
 
             // Dirty-write memory buffer + background flusher channel.
@@ -4074,7 +4125,7 @@ impl StudioVfs {
             let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms);
             let shutdown_metadata_flush_timeout =
                 Duration::from_secs(config.shutdown_metadata_flush_timeout_secs);
-            let disable_background_slab_flush = !config.background_slab_flush_enabled;
+            let background_slab_flush_enabled = config.background_slab_flush_enabled;
             let ingress_checkpoint_interval =
                 Duration::from_secs(config.ingress_checkpoint_interval_secs);
             let ingress_checkpoint_min_append_bytes = config.ingress_checkpoint_min_append_bytes;
@@ -4185,6 +4236,13 @@ impl StudioVfs {
                 dir_prefetch,
                 prefetch_tx,
                 dirty_flush_tx,
+                startup: StartupState::new(
+                    prefetch_rx,
+                    dirty_flush_rx,
+                    upload_rx,
+                    metadata_invalidation_sync_interval,
+                    background_slab_flush_enabled,
+                ),
                 max_dirty_bytes,
                 max_xattr_bytes,
                 max_spill_bytes,
@@ -4209,152 +4267,251 @@ impl StudioVfs {
 
             vfs.restore_live_extents_from_pending_uploads();
 
-            // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
-            let vfs_for_prefetch = vfs.clone();
-            let prefetch_limit = vfs.prefetch_concurrency.max(1);
-            vfs.track_background_task(tokio::spawn(async move {
-                let worker = async {
-                    let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
-                    let mut pending_queue: VecDeque<(Ino, u32)> = VecDeque::new();
-                    let mut pending_set: HashSet<(Ino, u32)> = HashSet::new();
-                    let mut inflight = JoinSet::new();
-                    loop {
-                        // Launch as many queued prefetches as permits allow without
-                        // blocking the worker event loop.
-                        while let Some((ino, block_idx)) = pending_queue.front().copied() {
-                            if vfs_for_prefetch.shutdown_requested() {
-                                pending_queue.clear();
-                                pending_set.clear();
-                                break;
-                            }
-                            let permit = match prefetch_sem.clone().try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(_) => break,
-                            };
-                            let _ = pending_queue.pop_front();
-                            pending_set.remove(&(ino, block_idx));
-                            if !vfs_for_prefetch.readahead.start_prefetch(ino, block_idx) {
-                                continue;
-                            }
-                            let v = vfs_for_prefetch.clone();
-                            inflight.spawn(async move {
-                                let _permit = permit;
-                                let _ = v.read_block_for_prefetch(ino, block_idx).await;
-                            });
-                        }
+            Ok(vfs)
+        }
+    }
 
-                        tokio::select! {
-                            _ = vfs_for_prefetch.state.shutdown.shutdown_notify.notified() => {
-                                inflight.abort_all();
-                                while inflight.join_next().await.is_some() {}
-                                break;
-                            }
-                            Some(work_item) = prefetch_rx.recv() => {
-                                if vfs_for_prefetch.shutdown_requested() {
-                                    continue;
-                                }
-                                let planned: Vec<(Ino, u32)> = match work_item {
-                                    PrefetchWorkItem::ReadHint {
-                                        ino,
-                                        first_block,
-                                        last_block,
-                                    } => vfs_for_prefetch
-                                        .plan_prefetch_blocks_from_hint(ino, first_block, last_block),
-                                    PrefetchWorkItem::Block { ino, block_idx } => {
-                                        vec![(ino, block_idx)]
-                                    }
-                                };
-                                for (ino, block_idx) in planned {
-                                    if pending_set.insert((ino, block_idx)) {
-                                        pending_queue.push_back((ino, block_idx));
-                                    }
-                                }
-                            }
-                            joined = inflight.join_next(), if !inflight.is_empty() => {
-                                if joined.is_none() {
-                                    break;
-                                }
+    /// Start background workers for this VFS instance.
+    ///
+    /// `new()` is side-effect free and only builds the object graph. Call
+    /// `start()` once after construction to spawn uploader, prefetch, janitor,
+    /// and other maintenance tasks.
+    pub fn start(self: &Arc<Self>) -> VfsResult<()> {
+        if self
+            .state
+            .shutdown
+            .shutdown_requested
+            .load(Ordering::Acquire)
+            || self
+                .state
+                .shutdown
+                .shutdown_completed
+                .load(Ordering::Acquire)
+        {
+            return Err(VfsError::Other(
+                "cannot start StudioVfs after shutdown has begun".to_string(),
+            ));
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(VfsError::Other(
+                "StudioVfs::start requires an active Tokio runtime".to_string(),
+            ));
+        }
+
+        let StartupChannels {
+            mut prefetch_rx,
+            dirty_flush_rx,
+            upload_rx,
+        } = {
+            let mut lifecycle = self.startup.lifecycle.lock();
+            loop {
+                match lifecycle.status {
+                    StartupStatus::Running => return Ok(()),
+                    StartupStatus::Failed => {
+                        return Err(VfsError::Other(
+                            "StudioVfs background worker startup previously failed".to_string(),
+                        ));
+                    }
+                    StartupStatus::Starting => self.startup.lifecycle_notify.wait(&mut lifecycle),
+                    StartupStatus::Uninitialized => {
+                        lifecycle.status = StartupStatus::Starting;
+                        match lifecycle.channels.take() {
+                            Some(channels) => break channels,
+                            None => {
+                                lifecycle.status = StartupStatus::Failed;
+                                self.startup.lifecycle_notify.notify_all();
+                                return Err(VfsError::Other(
+                                    "StudioVfs startup channels are unavailable".to_string(),
+                                ));
                             }
                         }
                     }
-                };
-                if let Err(panic_payload) = std::panic::AssertUnwindSafe(worker).catch_unwind().await
-                {
-                    let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
-                        *msg
-                    } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
-                        msg.as_str()
-                    } else {
-                        "unknown panic payload"
-                    };
-                    error!("prefetch worker panicked: {}", panic_msg);
                 }
-            }));
-
-            // Spawn Upload Worker
-            let vfs_clone = vfs.clone();
-            vfs.set_uploader_task(tokio::spawn(async move {
-                vfs_clone.background_uploader(upload_rx).await;
-            }));
-
-            // Spawn upload stats logger.
-            let vfs_clone = vfs.clone();
-            vfs.track_background_task(tokio::spawn(async move {
-                vfs_clone.background_upload_stats().await;
-            }));
-
-            // Spawn periodic ingress checkpoint worker.
-            let vfs_clone = vfs.clone();
-            vfs.track_background_task(tokio::spawn(async move {
-                vfs_clone.background_ingress_checkpoint().await;
-            }));
-
-            // Warm up the HTTP GET connection pool asynchronously.
-            // Avoid blocking here: `Handle::block_on` from another thread can
-            // deadlock when `StudioVfs::new` is called under a current-thread runtime
-            // (which is exactly how several integration tests execute).
-            {
-                let fs = fetch_scheduler.clone();
-                let timeout = Duration::from_secs(3);
-                vfs.track_background_task(tokio::spawn(async move {
-                    let _ = fs.warmup(timeout).await;
-                }));
             }
+        };
 
-            // Spawn GC Worker
-            let vfs_clone = vfs.clone();
-            vfs.track_background_task(tokio::spawn(async move {
-                vfs_clone.background_gc().await;
-            }));
+        let start_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> VfsResult<()> {
+                self.block_cache.spawn_background_tasks();
 
-            // Spawn periodic metadata sync watcher that turns remote metadata
-            // version changes into kernel inode invalidations for the mounted FS.
-            let vfs_clone = vfs.clone();
-            vfs.track_background_task(tokio::spawn(async move {
-                vfs_clone
-                    .background_metadata_invalidation(metadata_invalidation_sync_interval)
-                    .await;
-            }));
+                // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
+                let vfs_for_prefetch = self.clone();
+                let prefetch_limit = self.prefetch_concurrency.max(1);
+                self.track_background_task(tokio::spawn(async move {
+                    let worker = async {
+                        let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
+                        let mut pending_queue: VecDeque<(Ino, u32)> = VecDeque::new();
+                        let mut pending_set: HashSet<(Ino, u32)> = HashSet::new();
+                        let mut inflight = JoinSet::new();
+                        loop {
+                            // Launch as many queued prefetches as permits allow without
+                            // blocking the worker event loop.
+                            while let Some((ino, block_idx)) = pending_queue.front().copied() {
+                                if vfs_for_prefetch.shutdown_requested() {
+                                    pending_queue.clear();
+                                    pending_set.clear();
+                                    break;
+                                }
+                                let permit = match prefetch_sem.clone().try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => break,
+                                };
+                                let _ = pending_queue.pop_front();
+                                pending_set.remove(&(ino, block_idx));
+                                if !vfs_for_prefetch.readahead.start_prefetch(ino, block_idx) {
+                                    continue;
+                                }
+                                let v = vfs_for_prefetch.clone();
+                                inflight.spawn(async move {
+                                    let _permit = permit;
+                                    let _ = v.read_block_for_prefetch(ino, block_idx).await;
+                                });
+                            }
 
-            // Spawn Janitor Worker (automatic orphan scan/cleanup)
-            let vfs_clone = vfs.clone();
-            vfs.track_background_task(tokio::spawn(async move {
-                vfs_clone.background_janitor().await;
-            }));
-
-            // Spawn Background Slab Flusher
-            // Drains dirty_mem → slab → upload queue asynchronously after flush() returns.
-            if disable_background_slab_flush {
-                drop(dirty_flush_rx);
-            } else {
-                let vfs_clone = vfs.clone();
-                vfs.track_background_task(tokio::spawn(async move {
-                    vfs_clone.background_slab_flusher(dirty_flush_rx).await;
+                            tokio::select! {
+                                _ = vfs_for_prefetch.state.shutdown.shutdown_notify.notified() => {
+                                    inflight.abort_all();
+                                    while inflight.join_next().await.is_some() {}
+                                    break;
+                                }
+                                Some(work_item) = prefetch_rx.recv() => {
+                                    if vfs_for_prefetch.shutdown_requested() {
+                                        continue;
+                                    }
+                                    let planned: Vec<(Ino, u32)> = match work_item {
+                                        PrefetchWorkItem::ReadHint {
+                                            ino,
+                                            first_block,
+                                            last_block,
+                                        } => vfs_for_prefetch
+                                            .plan_prefetch_blocks_from_hint(ino, first_block, last_block),
+                                        PrefetchWorkItem::Block { ino, block_idx } => {
+                                            vec![(ino, block_idx)]
+                                        }
+                                    };
+                                    for (ino, block_idx) in planned {
+                                        if pending_set.insert((ino, block_idx)) {
+                                            pending_queue.push_back((ino, block_idx));
+                                        }
+                                    }
+                                }
+                                joined = inflight.join_next(), if !inflight.is_empty() => {
+                                    if joined.is_none() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if let Err(panic_payload) =
+                        std::panic::AssertUnwindSafe(worker).catch_unwind().await
+                    {
+                        let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+                            *msg
+                        } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
+                            msg.as_str()
+                        } else {
+                            "unknown panic payload"
+                        };
+                        error!("prefetch worker panicked: {}", panic_msg);
+                    }
                 }));
-            }
 
-            Ok(vfs)
-        }
+                // Spawn Upload Worker
+                let vfs_clone = self.clone();
+                self.set_uploader_task(tokio::spawn(async move {
+                    vfs_clone.background_uploader(upload_rx).await;
+                }));
+
+                // Spawn upload stats logger.
+                let vfs_clone = self.clone();
+                self.track_background_task(tokio::spawn(async move {
+                    vfs_clone.background_upload_stats().await;
+                }));
+
+                // Spawn periodic ingress checkpoint worker.
+                let vfs_clone = self.clone();
+                self.track_background_task(tokio::spawn(async move {
+                    vfs_clone.background_ingress_checkpoint().await;
+                }));
+
+                // Warm up the HTTP GET connection pool asynchronously.
+                // Avoid blocking here: `Handle::block_on` from another thread can
+                // deadlock when `StudioVfs::new` is called under a current-thread runtime
+                // (which is exactly how several integration tests execute).
+                {
+                    let fs = self.fetch_scheduler.clone();
+                    let timeout = Duration::from_secs(3);
+                    self.track_background_task(tokio::spawn(async move {
+                        let _ = fs.warmup(timeout).await;
+                    }));
+                }
+
+                // Spawn GC Worker
+                let vfs_clone = self.clone();
+                self.track_background_task(tokio::spawn(async move {
+                    vfs_clone.background_gc().await;
+                }));
+
+                // Spawn periodic metadata sync watcher that turns remote metadata
+                // version changes into kernel inode invalidations for the mounted FS.
+                let vfs_clone = self.clone();
+                let metadata_invalidation_sync_interval =
+                    self.startup.metadata_invalidation_sync_interval;
+                self.track_background_task(tokio::spawn(async move {
+                    vfs_clone
+                        .background_metadata_invalidation(metadata_invalidation_sync_interval)
+                        .await;
+                }));
+
+                // Spawn Janitor Worker (automatic orphan scan/cleanup)
+                let vfs_clone = self.clone();
+                self.track_background_task(tokio::spawn(async move {
+                    vfs_clone.background_janitor().await;
+                }));
+
+                // Spawn Background Slab Flusher
+                // Drains dirty_mem → slab → upload queue asynchronously after flush() returns.
+                if !self.startup.background_slab_flush_enabled {
+                    drop(dirty_flush_rx);
+                } else {
+                    let vfs_clone = self.clone();
+                    self.track_background_task(tokio::spawn(async move {
+                        vfs_clone.background_slab_flusher(dirty_flush_rx).await;
+                    }));
+                }
+
+                Ok(())
+            },
+        )) {
+            Ok(result) => result,
+            Err(panic_payload) => {
+                let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+                    *msg
+                } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
+                    msg.as_str()
+                } else {
+                    "unknown panic payload"
+                };
+                error!(
+                    "StudioVfs::start panicked during background startup: {}",
+                    panic_msg
+                );
+                Err(VfsError::Other(format!(
+                    "StudioVfs::start panicked during background startup: {panic_msg}"
+                )))
+            }
+        };
+
+        let mut lifecycle = self.startup.lifecycle.lock();
+        lifecycle.status = if start_result.is_ok() {
+            StartupStatus::Running
+        } else {
+            StartupStatus::Failed
+        };
+        self.startup.lifecycle_notify.notify_all();
+        drop(lifecycle);
+        start_result
     }
 
     fn track_background_task(&self, handle: JoinHandle<()>) {
@@ -10972,7 +11129,50 @@ mod tests {
                 .expect("default VFS config should validate"),
         )
         .expect("create vfs");
+        vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn studio_vfs_new_does_not_spawn_background_workers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info("new-no-start");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+
+        let startup = vfs.startup.lifecycle.lock();
+        assert!(
+            matches!(startup.status, StartupStatus::Uninitialized),
+            "constructor should keep startup lifecycle uninitialized"
+        );
+        assert!(
+            vfs.state.shutdown.background_tasks.lock().is_empty(),
+            "constructor should not spawn background tasks"
+        );
+        assert!(
+            vfs.state.shutdown.uploader_task.lock().is_none(),
+            "constructor should not spawn uploader task"
+        );
+        drop(startup);
     }
 
     #[test]

@@ -214,6 +214,8 @@ pub struct BlockCache {
     shutdown_notify: Arc<Notify>,
     /// Bounded scheduler for asynchronous L2 commits.
     l2_commit_scheduler: L2CommitScheduler,
+    /// Ensures background task bundle is spawned at most once.
+    background_tasks_started: AtomicBool,
     /// Cache-pipeline observability for throughput/latency/queue depth.
     metrics: CachePipelineMetrics,
     /// Last persisted checkpoint signature: `(entry_count, crc32(entries))`.
@@ -309,6 +311,7 @@ impl BlockCache {
             evict_notify,
             shutdown_notify,
             l2_commit_scheduler,
+            background_tasks_started: AtomicBool::new(false),
             metrics,
             last_checkpoint_signature: std::sync::Mutex::new(initial_checkpoint_signature),
             l2_read_breaker_open_until: std::sync::Mutex::new(None),
@@ -322,6 +325,10 @@ impl BlockCache {
     ///
     /// Must be called after `open()` from within a tokio runtime.
     pub fn spawn_background_tasks(self: &Arc<Self>) {
+        if self.background_tasks_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
         if self.l2_commit_scheduler.mark_started() {
             for worker_id in 0..self.l2_commit_scheduler.workers() {
                 let cache = self.clone();
@@ -1413,6 +1420,27 @@ mod tests {
         let got = cache.get(10).await.unwrap();
         assert_eq!(got, data);
         assert!(cache.l1.contains(10));
+    }
+
+    #[tokio::test]
+    async fn spawn_background_tasks_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _rx) = BlockCache::open(test_config(dir.path())).unwrap();
+
+        cache.spawn_background_tasks();
+        cache.spawn_background_tasks();
+
+        assert!(
+            cache.background_tasks_started.load(Ordering::Acquire),
+            "background task bundle should be marked as started"
+        );
+        assert!(
+            cache
+                .l2_commit_scheduler
+                .workers_started
+                .load(Ordering::Acquire),
+            "L2 commit worker scheduler should be started exactly once"
+        );
     }
 
     #[tokio::test]
