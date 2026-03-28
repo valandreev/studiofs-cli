@@ -21,6 +21,16 @@ Holds all runtime state:
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Open files, dirty buffers, backpressure |
 
+### Lifecycle
+
+`StudioVfs` startup is now explicit and two-phase:
+
+1. `StudioVfs::new(...)` builds state only (no background workers are spawned).
+2. `vfs.start()` starts background workers (uploader, prefetch, GC, janitor, checkpoint loop, etc.).
+
+Callers must invoke `start()` exactly once after successful construction and before serving IO.
+Repeated `start()` calls are safe and treated as idempotent once the instance is already running.
+
 Notes:
 - Sync metadata access still exists via `sync_meta()` for explicitly blocking-safe contexts.
 - Async call paths should use `run_meta(self.meta_async.clone(), ...)` so blocking work stays behind one boundary.
@@ -336,7 +346,7 @@ Additional sync-fast-path counters are emitted in `upload pipeline counters`:
 ### Connection Warmup
 
 On startup, `warmup(timeout)` primes the HTTP connection pool by issuing 4 parallel lightweight S3 requests.
-Warmup runs in a background task and does not block `StudioVfs::new`.
+Warmup runs in a background task scheduled by `StudioVfs::start()` and does not block `StudioVfs::new`.
 
 ## ReadAhead (`readahead.rs`)
 
