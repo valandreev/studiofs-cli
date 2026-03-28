@@ -682,7 +682,7 @@ impl L2DiskCache {
         results
     }
 
-    /// Read a block synchronously (for non-async contexts like upload workers).
+    /// Read a block synchronously for local, latency-sensitive read paths.
     pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
         let path = self.block_path(object_id);
         match Self::read_block_sync(&path, None, L2IoPriority::Foreground) {
