@@ -21,6 +21,8 @@
 //!   blocking call instead of two.
 //! - **Batch put/get:** `put_batch` and `get_batch` amortise thread-pool
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
+//! - **Priority-aware reads:** foreground reads avoid 1MB chunk throttling,
+//!   background reads keep chunking to preserve foreground latency under upload/eviction load.
 
 use bytes::{Bytes, BytesMut};
 use lru::LruCache;
@@ -129,6 +131,7 @@ fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut
 fn try_read_direct_block(
     path: &Path,
     expected_len_hint: Option<usize>,
+    priority: L2IoPriority,
 ) -> io::Result<Option<Bytes>> {
     let Some(std_file) = platform_direct_io::open_block_direct_read(path)? else {
         return Ok(None);
@@ -141,7 +144,7 @@ fn try_read_direct_block(
     let mut direct_buf =
         aligned_bytes_mut_uninit(expected_len, platform_direct_io::DIRECT_IO_ALIGNMENT)?;
     if let Some(read_len) =
-        platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf)?
+        platform_direct_io::read_block_direct_from_file(std_file, &mut direct_buf, priority)?
     {
         if read_len > expected_len {
             return Err(io::Error::new(
@@ -273,7 +276,11 @@ fn apply_l2_read_close_hints(file: &File) {
     }
 }
 
-fn read_block_buffered(path: &Path, expected_len_hint: Option<usize>) -> io::Result<Bytes> {
+fn read_block_buffered(
+    path: &Path,
+    expected_len_hint: Option<usize>,
+    priority: L2IoPriority,
+) -> io::Result<Bytes> {
     let mut file = open_sync_read_file(path)?;
 
     let capacity = match expected_len_hint {
@@ -285,14 +292,16 @@ fn read_block_buffered(path: &Path, expected_len_hint: Option<usize>) -> io::Res
     };
     let mut out = Vec::with_capacity(capacity);
 
-    // Read in 1MB chunks to avoid saturating the disk queue with a single massive
-    // I/O request. This allows the OS to interleave smaller foreground client
-    // reads, preventing up to 10x latency spikes during background S3 uploads.
-    let chunk_size = 1024 * 1024;
-    loop {
-        let n = (&mut file).take(chunk_size as u64).read_to_end(&mut out)?;
-        if n == 0 {
-            break;
+    if priority == L2IoPriority::Foreground {
+        file.read_to_end(&mut out)?;
+    } else {
+        // Keep 1MB chunking for background work so foreground reads can interleave.
+        let chunk_size = platform_direct_io::IO_CHUNK_SIZE_BACKGROUND as u64;
+        loop {
+            let n = (&mut file).take(chunk_size).read_to_end(&mut out)?;
+            if n == 0 {
+                break;
+            }
         }
     }
 
@@ -494,11 +503,15 @@ impl L2DiskCache {
         Ok(found)
     }
 
-    fn read_block_sync(path: &Path, expected_len_hint: Option<usize>) -> io::Result<Bytes> {
-        if let Some(bytes) = try_read_direct_block(path, expected_len_hint)? {
+    fn read_block_sync(
+        path: &Path,
+        expected_len_hint: Option<usize>,
+        priority: L2IoPriority,
+    ) -> io::Result<Bytes> {
+        if let Some(bytes) = try_read_direct_block(path, expected_len_hint, priority)? {
             return Ok(bytes);
         }
-        read_block_buffered(path, expected_len_hint)
+        read_block_buffered(path, expected_len_hint, priority)
     }
 
     async fn acquire_io_permit(&self, priority: L2IoPriority) -> io::Result<OwnedSemaphorePermit> {
@@ -525,7 +538,7 @@ impl L2DiskCache {
         let permit = self.acquire_io_permit(priority).await?;
         crate::runtime::spawn_blocking_profiled("l2_read", move || {
             let _permit = permit;
-            Self::read_block_sync(&path, expected_len_hint)
+            Self::read_block_sync(&path, expected_len_hint, priority)
         })
         .await
         .map_err(io::Error::other)?
@@ -625,7 +638,11 @@ impl L2DiskCache {
                     let read_result =
                         match crate::runtime::spawn_blocking_profiled("l2_read_batch", move || {
                             let _permit = permit;
-                            Self::read_block_sync(&path, size_hint.map(|len| len as usize))
+                            Self::read_block_sync(
+                                &path,
+                                size_hint.map(|len| len as usize),
+                                priority,
+                            )
                         })
                         .await
                         {
@@ -667,10 +684,10 @@ impl L2DiskCache {
         results
     }
 
-    /// Read a block synchronously (for non-async contexts like upload workers).
-    pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
+    /// Read a block synchronously with explicit L2 I/O priority.
+    pub fn get_sync_with_priority(&self, object_id: u64, priority: L2IoPriority) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match Self::read_block_sync(&path, None) {
+        match Self::read_block_sync(&path, None, priority) {
             Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -678,6 +695,11 @@ impl L2DiskCache {
                 None
             }
         }
+    }
+
+    /// Read a block synchronously using background I/O priority by default.
+    pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
+        self.get_sync_with_priority(object_id, L2IoPriority::Background)
     }
 
     /// Read a block synchronously into a provided output slice at an offset.

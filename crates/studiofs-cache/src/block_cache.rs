@@ -492,17 +492,19 @@ impl BlockCache {
         );
     }
 
-    /// Read a block synchronously (for upload workers that need re-read).
+    /// Read a block synchronously for latency-sensitive local read paths.
     pub fn get_sync(&self, object_id: ObjectId) -> Option<Bytes> {
         if let Some(data) = self.l1.get(object_id) {
             return Some(data);
         }
-        self.l2.get_sync(object_id)
+        self.l2
+            .get_sync_with_priority(object_id, L2IoPriority::Foreground)
     }
 
     /// Read a block synchronously from L2 only (never from L1).
     pub fn get_sync_l2_only(&self, object_id: ObjectId) -> Option<Bytes> {
-        self.l2.get_sync(object_id)
+        self.l2
+            .get_sync_with_priority(object_id, L2IoPriority::Foreground)
     }
 
     /// Read a block with an explicit L2 QoS priority.
