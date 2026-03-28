@@ -682,10 +682,10 @@ impl L2DiskCache {
         results
     }
 
-    /// Read a block synchronously for local, latency-sensitive read paths.
-    pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
+    /// Read a block synchronously with explicit L2 I/O priority.
+    pub fn get_sync_with_priority(&self, object_id: u64, priority: L2IoPriority) -> Option<Bytes> {
         let path = self.block_path(object_id);
-        match Self::read_block_sync(&path, None, L2IoPriority::Foreground) {
+        match Self::read_block_sync(&path, None, priority) {
             Ok(data) => Some(data),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -693,6 +693,11 @@ impl L2DiskCache {
                 None
             }
         }
+    }
+
+    /// Read a block synchronously using background I/O priority by default.
+    pub fn get_sync(&self, object_id: u64) -> Option<Bytes> {
+        self.get_sync_with_priority(object_id, L2IoPriority::Background)
     }
 
     /// Read a block synchronously into a provided output slice at an offset.
