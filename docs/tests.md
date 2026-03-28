@@ -113,6 +113,11 @@ cargo test --workspace --all-targets -- --nocapture
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
+When a test owns an explicit Tokio runtime around `StudioVfs`, shut the VFS
+down inside `block_on(...)` before calling `rt.shutdown_background()`. This
+avoids teardown-only panics from background timer tasks trying to observe a
+runtime that is already shutting down.
+
 ## Platform Bridge Smoke Tests
 
 The bridge mount/unmount smoke tests are intentionally `#[ignore]` because they

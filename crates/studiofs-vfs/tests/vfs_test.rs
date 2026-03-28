@@ -3181,6 +3181,9 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
             "remote VFS attr cache must refresh after a pure metadata publish"
         );
         assert_eq!(refreshed.committed_size, payload.len() as u64);
+
+        writer_vfs.shutdown(Duration::from_secs(15)).await;
+        remote_vfs.shutdown(Duration::from_secs(15)).await;
     });
     rt.shutdown_background();
 }
