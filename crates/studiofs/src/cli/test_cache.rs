@@ -2053,7 +2053,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit, params.l2_limit);
     let (cache, _rx) = BlockCache::open(cache_config)
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
-    let cache = Arc::new(cache);
+    cache.spawn_background_tasks();
 
     let size_class_bounds = SizeClassBounds {
         small_max: params.size_class_small_max,
