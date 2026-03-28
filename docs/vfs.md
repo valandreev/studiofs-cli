@@ -207,6 +207,47 @@ PendingUpload received
   └─ On failure: requeue with backoff
 ```
 
+Upload worker responsibility is intentionally narrow:
+- it is the data plane for block payloads only;
+- it does not publish file manifests or decide when an inode incarnation becomes
+  remote-visible;
+- once an extent upload succeeds, later file-version publication is handled by a
+  separate epoch finalizer.
+
+### 5. Background Epoch Finalizer
+
+Runs independently from upload workers and is responsible for control-plane
+publication of file versions:
+
+```
+queued (ino, content_epoch)
+  │
+  ├─ Skip/requeue if the inode still has local overlay state
+  │  (`pending_blocks`, dirty memory, ingress/WAL data)
+  ├─ Read the current block list for that epoch from metadata
+  ├─ Wait until every referenced object is remote-visible
+  ├─ Publish the manifest only if metadata still matches the verified block list
+  │  (`publish_file_manifest_if_matches`)
+  └─ On transient mismatch / visibility delay:
+       requeue with backoff
+```
+
+Why this split exists:
+- `flush()` / `close()` stay focused on accepting data locally and making it
+  crash-recoverable;
+- `--direct-io` can keep its write-through responsiveness without forcing the
+  last partial block on a file to synchronously publish the whole incarnation;
+- manifest publication no longer depends on a "special" last upload op, which
+  avoids the classic "1 pending block per file" tail behavior.
+
+Consistency rules:
+- finalization is blocked while any local overlay remains for the inode,
+  including live ingress/WAL state;
+- remote visibility is checked before publication;
+- publication is conditional on the verified manifest still matching metadata,
+  so a newer materialization pass cannot race an older verified block list into
+  a stale manifest.
+
 Deleted-inode cancellation behavior:
 - VFS tracks unlinked inodes in an in-memory `deleted_inodes` set and cancels
   queued/in-flight uploads via `CancellationToken`.

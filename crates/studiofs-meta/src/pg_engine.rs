@@ -1986,8 +1986,15 @@ impl MetaBlocks for PgMetaEngine {
         result
     }
 
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        let result = self.mutate(|local| local.publish_file_manifest(ino, expected_epoch));
+    fn publish_file_manifest_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        expected_manifest: &[(u32, BlockRef)],
+    ) -> MetaResult<bool> {
+        let result = self.mutate(|local| {
+            local.publish_file_manifest_if_matches(ino, expected_epoch, expected_manifest)
+        });
         if matches!(result, Ok(true)) {
             self.request_pending_flush();
         }

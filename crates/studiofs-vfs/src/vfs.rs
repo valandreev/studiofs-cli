@@ -2795,6 +2795,8 @@ struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
     upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    pending_epoch_finalizations: Mutex<BTreeSet<(Ino, u64)>>,
+    pending_epoch_finalizations_notify: tokio::sync::Notify,
     staged_payloads: Mutex<UploadPayloadStage>,
     upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
     upload_requeues: AtomicU64,
@@ -2916,6 +2918,8 @@ impl UploadState {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
             upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
             pending_evictions: Mutex::new(std::collections::HashSet::new()),
+            pending_epoch_finalizations: Mutex::new(BTreeSet::new()),
+            pending_epoch_finalizations_notify: tokio::sync::Notify::new(),
             staged_payloads: Mutex::new(UploadPayloadStage::new(
                 staged_payload_min_bytes,
                 staged_payload_max_bytes,
@@ -2986,7 +2990,6 @@ impl AclState {
 struct IncarnationState {
     inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
     live_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
-    uploaded_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
 }
 
 impl IncarnationState {
@@ -2994,7 +2997,6 @@ impl IncarnationState {
         Self {
             inode_incarnations: Mutex::new(std::collections::HashMap::new()),
             live_extent_records: Mutex::new(std::collections::HashMap::new()),
-            uploaded_extent_records: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -4544,6 +4546,13 @@ impl StudioVfs {
                     vfs_clone.background_uploader(upload_rx).await;
                 }));
 
+                self.seed_epoch_finalizations_from_meta();
+
+                let vfs_clone = self.clone();
+                self.track_background_task(tokio::spawn(async move {
+                    vfs_clone.background_epoch_finalizer().await;
+                }));
+
                 // Spawn upload stats logger.
                 let vfs_clone = self.clone();
                 self.track_background_task(tokio::spawn(async move {
@@ -4641,6 +4650,62 @@ impl StudioVfs {
 
     fn set_uploader_task(&self, handle: JoinHandle<()>) {
         *self.state.shutdown.uploader_task.lock() = Some(handle);
+    }
+
+    async fn background_epoch_finalizer(self: Arc<Self>) {
+        loop {
+            let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
+                tokio::select! {
+                    _ = self.state.shutdown.shutdown_notify.notified() => break,
+                    _ = self.state.upload.pending_epoch_finalizations_notify.notified() => {}
+                }
+                continue;
+            };
+
+            match commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch).await {
+                Ok(commit::EpochFinalizeStatus::Published)
+                | Ok(commit::EpochFinalizeStatus::Skipped) => {}
+                Ok(commit::EpochFinalizeStatus::Deferred) => {
+                    let retry_delay = self.upload_requeue_base.max(Duration::from_millis(25));
+                    self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                }
+                Err(err) => {
+                    if self.shutdown_requested() {
+                        break;
+                    }
+                    warn!(
+                        ino,
+                        content_epoch,
+                        error = %err,
+                        "epoch finalization failed, will retry"
+                    );
+                    self.schedule_epoch_finalization_retry(
+                        ino,
+                        content_epoch,
+                        self.upload_requeue_base,
+                    );
+                }
+            }
+        }
+    }
+
+    fn schedule_epoch_finalization_retry(
+        self: &Arc<Self>,
+        ino: Ino,
+        content_epoch: u64,
+        delay: Duration,
+    ) {
+        let vfs = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = vfs.state.shutdown.shutdown_notify.notified() => {}
+                _ = tokio::time::sleep(delay) => {
+                    if !vfs.shutdown_requested() {
+                        vfs.queue_epoch_finalization(ino, content_epoch);
+                    }
+                }
+            }
+        });
     }
 
     fn kernel_invalidator(&self) -> Option<Arc<dyn KernelInvalidator>> {
@@ -5699,6 +5764,40 @@ impl StudioVfs {
             .any(|(candidate, _)| *candidate == ino)
     }
 
+    fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
+        if self
+            .state
+            .write_buffer
+            .pending_blocks
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+        {
+            return true;
+        }
+        if self
+            .state
+            .dirty_buffer
+            .dirty_mem
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+        {
+            return true;
+        }
+
+        // Any live WAL/spill entry means this inode still has data that has not
+        // been fully materialized into the current metadata manifest. Matching
+        // by block index is not sufficient here because a newer write to the
+        // same logical block can coexist with an older live extent.
+        self.state
+            .ingress
+            .ingress_live
+            .lock()
+            .keys()
+            .any(|(candidate, _)| *candidate == ino)
+    }
+
     fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
         self.block_cache.has_pending_uploads_for_ino(ino)
     }
@@ -5870,7 +5969,12 @@ impl StudioVfs {
             }
         };
 
+        let should_queue_finalization = Self::needs_epoch_finalization(attr);
         states.insert(ino, next_state.clone());
+        drop(states);
+        if should_queue_finalization {
+            self.queue_epoch_finalization(ino, attr.content_epoch);
+        }
         next_state
     }
 
@@ -5927,6 +6031,61 @@ impl StudioVfs {
         Ok(())
     }
 
+    fn needs_epoch_finalization(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state != MetaUploadState::Ready
+            && (attr.content_epoch != attr.committed_content_epoch
+                || attr.size != attr.committed_size)
+    }
+
+    fn queue_epoch_finalization(&self, ino: Ino, content_epoch: u64) {
+        let inserted = self
+            .state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .insert((ino, content_epoch));
+        if inserted {
+            self.state
+                .upload
+                .pending_epoch_finalizations_notify
+                .notify_one();
+        }
+    }
+
+    fn pop_epoch_finalization(&self) -> Option<(Ino, u64)> {
+        self.state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .pop_first()
+    }
+
+    fn seed_epoch_finalizations_from_meta(&self) {
+        let attrs = match self.sync_meta().list_inode_attrs() {
+            Ok(attrs) => attrs,
+            Err(err) => {
+                warn!(error = %err, "failed to seed epoch finalizer queue from metadata");
+                return;
+            }
+        };
+
+        let mut queued = 0usize;
+        for attr in attrs {
+            if Self::needs_epoch_finalization(&attr) {
+                self.queue_epoch_finalization(attr.ino, attr.content_epoch);
+                queued = queued.saturating_add(1);
+            }
+        }
+
+        if queued > 0 {
+            info!(
+                queued_epochs = queued,
+                "seeded epoch finalizer queue from metadata"
+            );
+        }
+    }
+
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
         let attr = self.getattr_async(ino).await?;
         Ok(self.refresh_inode_incarnation_state_from_attr(ino, &attr))
@@ -5940,11 +6099,6 @@ impl StudioVfs {
                 content_epoch,
             },
         );
-        self.state
-            .incarnation
-            .uploaded_extent_records
-            .lock()
-            .remove(&(ino, block_index));
     }
 
     fn remove_live_extent(&self, ino: Ino, block_index: u32) {
@@ -5953,22 +6107,12 @@ impl StudioVfs {
             .live_extent_records
             .lock()
             .remove(&(ino, block_index));
-        self.state
-            .incarnation
-            .uploaded_extent_records
-            .lock()
-            .remove(&(ino, block_index));
     }
 
     fn remove_live_extents_for_inode(&self, ino: Ino) {
         self.state
             .incarnation
             .live_extent_records
-            .lock()
-            .retain(|(candidate, _), _| *candidate != ino);
-        self.state
-            .incarnation
-            .uploaded_extent_records
             .lock()
             .retain(|(candidate, _), _| *candidate != ino);
     }
@@ -5981,33 +6125,6 @@ impl StudioVfs {
             .retain(|(candidate, _), extent| {
                 *candidate != ino || extent.content_epoch != content_epoch
             });
-        self.state
-            .incarnation
-            .uploaded_extent_records
-            .lock()
-            .retain(|(candidate, _), extent| {
-                *candidate != ino || extent.content_epoch != content_epoch
-            });
-    }
-
-    fn record_uploaded_extent(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        object_id: u64,
-        content_epoch: u64,
-    ) {
-        self.state
-            .incarnation
-            .uploaded_extent_records
-            .lock()
-            .insert(
-                (ino, block_index),
-                ExtentRecordId {
-                    object_id,
-                    content_epoch,
-                },
-            );
     }
 
     fn remote_upload_placeholder_visible(&self, ino: Ino, attr: &InodeAttr) -> bool {
@@ -10305,7 +10422,6 @@ impl StudioVfs {
                     .await
                     .unwrap_or(false) =>
             {
-                commit::CommitCoordinator::finish_extent_upload(self, &op, block_index).await?;
                 self.block_cache.complete_upload(&op);
                 self.discard_staged_upload_payload(op.object_id);
                 debug!(

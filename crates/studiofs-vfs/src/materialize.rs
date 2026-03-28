@@ -413,6 +413,7 @@ impl Materializer {
         }
 
         for manifest in manifests {
+            vfs.queue_epoch_finalization(manifest.ino, manifest.content_epoch);
             debug!(
                 ino = manifest.ino,
                 content_epoch = manifest.content_epoch,

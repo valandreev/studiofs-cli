@@ -391,7 +391,24 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     ///
     /// This switches the committed manifest at file granularity and updates the
     /// inode's coarse remote upload state to `ready` when successful.
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
+    ///
+    /// The default implementation snapshots the current manifest before
+    /// entering the backend transaction and delegates to
+    /// [`MetaBlocks::publish_file_manifest_if_matches`]. Callers that need an
+    /// in-transaction race check should prefer that lower-level API directly.
+    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+        let expected_manifest = self.get_file_blocks(ino)?;
+        self.publish_file_manifest_if_matches(ino, expected_epoch, &expected_manifest)
+    }
+
+    /// Publish only if the current manifest still matches the verified block
+    /// list observed by the caller.
+    fn publish_file_manifest_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        expected_manifest: &[(u32, BlockRef)],
+    ) -> MetaResult<bool>;
 }
 
 pub trait MetaGc: Send + Sync {
