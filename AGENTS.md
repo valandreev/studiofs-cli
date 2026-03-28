@@ -234,6 +234,14 @@ test: add destroy tests fixes
 2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
 3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
 
+### L2 Read Priority Policy (SFS-110)
+
+- `L2IoPriority::Foreground`: no artificial 1MB throttling in the block read hot path.
+- `L2IoPriority::Background`: keeps 1MB chunked reads to reduce queue starvation risk for foreground I/O.
+- `L2DiskCache::get_sync` defaults to `Background` for safer generic sync usage.
+- `BlockCache` user-facing sync fast paths explicitly request `Foreground` via
+  `get_sync_with_priority(..., L2IoPriority::Foreground)`.
+
 ### Environment Variables
 
 Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):

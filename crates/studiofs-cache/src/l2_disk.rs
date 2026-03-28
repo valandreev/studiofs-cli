@@ -21,6 +21,8 @@
 //!   blocking call instead of two.
 //! - **Batch put/get:** `put_batch` and `get_batch` amortise thread-pool
 //!   scheduling overhead by processing multiple blocks per `spawn_blocking`.
+//! - **Priority-aware reads:** foreground reads avoid 1MB chunk throttling,
+//!   background reads keep chunking to preserve foreground latency under upload/eviction load.
 
 use bytes::{Bytes, BytesMut};
 use lru::LruCache;
