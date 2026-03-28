@@ -112,6 +112,8 @@ Notes:
   - handles opened with `FILE_NO_INTERMEDIATE_BUFFERING`/`FILE_WRITE_THROUGH` are treated as unbuffered in VFS.
   - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; fetched blocks are cached in L2 for potential re-reads.
   - writes buffer data as normal; synchronous confirmation at `flush()`/`close()` waits for local ingress durability (NVMe/WAL), not S3 upload completion.
+  - remote manifest publication is handled asynchronously by the background epoch finalizer after all blocks for the file version are uploaded and visible in object storage.
+  - `FlushFileBuffers`/`flush()` therefore means "accepted locally and recoverable on this client", not "already visible to other clients through a published manifest".
   - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write ingress-drain timeout (default `120` seconds).
   - if asynchronous S3 upload fails, StudioFS records a sticky inode upload error; the next `flush`/`fsync` reports `EIO` and consumes that error.
   - this mode is intended for storage benchmarking and strict write-through workflows.

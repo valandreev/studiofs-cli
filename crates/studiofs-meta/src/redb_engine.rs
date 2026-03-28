@@ -5491,7 +5491,12 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(true)
     }
 
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+    fn publish_file_manifest_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        expected_manifest: &[(u32, BlockRef)],
+    ) -> MetaResult<bool> {
         let txn = self
             .db
             .begin_write()
@@ -5515,6 +5520,9 @@ impl MetaBlocks for RedbMetaEngine {
             }
 
             published_blocks = Self::current_manifest_in_txn(&txn, ino)?;
+            if published_blocks.as_slice() != expected_manifest {
+                return Ok(false);
+            }
 
             let mut committed = txn
                 .open_table(COMMITTED_FILE_BLOCKS_TABLE)
@@ -7916,6 +7924,36 @@ mod tests {
         assert_eq!(remote_attr.upload_state, UploadState::Updating);
         let remote_block = remote.get_file_block(file.ino, 0).unwrap().unwrap();
         assert_eq!(remote_block.object_id, 301);
+    }
+
+    #[test]
+    fn redb_publish_file_manifest_if_matches_rejects_manifest_changes() {
+        let engine = temp_engine();
+
+        let file = engine
+            .create_file(ROOT_INO, b"publish-race.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 8192;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+
+        let block0 = BlockRef::new_partial(501, 4096);
+        engine.set_file_block(file.ino, 0, &block0).unwrap();
+        let verified_manifest = engine.get_file_blocks(file.ino).unwrap();
+
+        let block1 = BlockRef::new_partial(502, 4096);
+        engine.set_file_block(file.ino, 1, &block1).unwrap();
+
+        assert!(
+            !engine
+                .publish_file_manifest_if_matches(file.ino, 1, &verified_manifest)
+                .unwrap()
+        );
+
+        let attr_after = engine.get_attr(file.ino).unwrap();
+        assert_eq!(attr_after.upload_state, UploadState::Uploading);
+        assert_eq!(attr_after.committed_content_epoch, 0);
     }
 
     #[test]

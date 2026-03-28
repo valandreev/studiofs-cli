@@ -98,13 +98,20 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Skipped);
         }
 
+        let expected_manifest = required_blocks.clone();
         let published = run_meta(
             vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.publish_file_manifest(ino, content_epoch),
+            move |engine: Arc<dyn MetaEngine>| {
+                engine.publish_file_manifest_if_matches(
+                    ino,
+                    content_epoch,
+                    expected_manifest.as_slice(),
+                )
+            },
         )
         .await?;
         if !published {
-            return Ok(EpochFinalizeStatus::Skipped);
+            return Ok(EpochFinalizeStatus::Deferred);
         }
 
         vfs.remove_live_extents_for_inode_epoch(ino, content_epoch);

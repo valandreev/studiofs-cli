@@ -4666,8 +4666,11 @@ impl StudioVfs {
 
             match commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch).await {
                 Ok(commit::EpochFinalizeStatus::Published)
-                | Ok(commit::EpochFinalizeStatus::Deferred)
                 | Ok(commit::EpochFinalizeStatus::Skipped) => {}
+                Ok(commit::EpochFinalizeStatus::Deferred) => {
+                    let retry_delay = self.upload_requeue_base.max(Duration::from_millis(25));
+                    self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                }
                 Err(err) => {
                     if self.shutdown_requested() {
                         break;
@@ -4678,17 +4681,33 @@ impl StudioVfs {
                         error = %err,
                         "epoch finalization failed, will retry"
                     );
-                    tokio::select! {
-                        _ = self.state.shutdown.shutdown_notify.notified() => break,
-                        _ = tokio::time::sleep(self.upload_requeue_base) => {}
-                    }
-                    if self.shutdown_requested() {
-                        break;
-                    }
-                    self.queue_epoch_finalization(ino, content_epoch);
+                    self.schedule_epoch_finalization_retry(
+                        ino,
+                        content_epoch,
+                        self.upload_requeue_base,
+                    );
                 }
             }
         }
+    }
+
+    fn schedule_epoch_finalization_retry(
+        self: &Arc<Self>,
+        ino: Ino,
+        content_epoch: u64,
+        delay: Duration,
+    ) {
+        let vfs = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = vfs.state.shutdown.shutdown_notify.notified() => {}
+                _ = tokio::time::sleep(delay) => {
+                    if !vfs.shutdown_requested() {
+                        vfs.queue_epoch_finalization(ino, content_epoch);
+                    }
+                }
+            }
+        });
     }
 
     fn kernel_invalidator(&self) -> Option<Arc<dyn KernelInvalidator>> {
@@ -5769,17 +5788,10 @@ impl StudioVfs {
             return true;
         }
 
-        let has_live_extents = self
-            .state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino);
-        if has_live_extents || self.inode_has_pending_uploads(ino) {
-            return false;
-        }
-
+        // Any live WAL/spill entry means this inode still has data that has not
+        // been fully materialized into the current metadata manifest. Matching
+        // by block index is not sufficient here because a newer write to the
+        // same logical block can coexist with an older live extent.
         self.state
             .ingress
             .ingress_live

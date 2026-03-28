@@ -230,7 +230,7 @@ test: add destroy tests fixes
 
 ### Data Flow
 
-1. **Write Path**: Application → VFS → Block staging → Ingress journal → S3 upload
+1. **Write Path**: Application → VFS → Block staging → Ingress journal → S3 upload → Background epoch finalizer publish
 2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
 3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
 

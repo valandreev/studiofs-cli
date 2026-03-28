@@ -128,6 +128,12 @@ Current signature includes additional policy controls:
 - `direct_io` enables per-handle unbuffered I/O path on Windows (write-through drain moved to flush/close).
 - `shutdown_event_name` allows external graceful shutdown signal integration.
 
+`direct_io` visibility semantics:
+- `cleanup` / `flush` wait for local ingress durability only.
+- Block upload and manifest publication continue asynchronously after that point.
+- Remote readers see the new file version only after the background epoch finalizer
+  verifies object visibility and publishes the incarnation manifest.
+
 ## FUSE Bridge (`studiofs-fuse`)
 
 ### Requirements
