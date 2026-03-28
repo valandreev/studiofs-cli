@@ -4983,6 +4983,122 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
 }
 
 #[test]
+fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads() {
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("restart-finalizer-no-pending-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let baseline_payload = vec![0x21u8; 512 * 1024];
+    let replacement_payload = vec![0x91u8; 512 * 1024];
+    let mut ino = 0u64;
+    let mut replacement_object_id = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &meta,
+                &format_info,
+                b"restart-finalizer-no-pending.bin",
+                &baseline_payload,
+            )
+            .await;
+            ino = seeded_ino;
+
+            let mut staged_attr = meta.get_attr(ino).unwrap();
+            staged_attr.size = replacement_payload.len() as u64;
+            staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+            meta.set_attr(&staged_attr).unwrap();
+
+            replacement_object_id = meta.next_block_ids(1).unwrap()[0];
+            let store = DataStore::new(&data_config).unwrap();
+            put_fragmented_object(
+                &store,
+                &format_info.data_prefix,
+                replacement_object_id,
+                Bytes::copy_from_slice(&replacement_payload),
+            )
+            .await
+            .unwrap();
+
+            let replacement_block =
+                BlockRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
+            meta.set_file_block(ino, 0, &replacement_block).unwrap();
+
+            let unpublished_attr = meta.get_attr(ino).unwrap();
+            assert_eq!(unpublished_attr.upload_state, UploadState::Updating);
+            assert_ne!(
+                unpublished_attr.committed_content_epoch,
+                unpublished_attr.content_epoch
+            );
+        });
+        rt.shutdown_background();
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "recovery setup should rely on metadata-only finalization with an empty upload journal"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                meta.get_attr(ino)
+                    .map(|attr| {
+                        attr.upload_state == UploadState::Ready
+                            && attr.committed_content_epoch == attr.content_epoch
+                    })
+                    .unwrap_or(false)
+            })
+            .await,
+            "background epoch finalizer should publish the unpublished epoch without pending uploads"
+        );
+
+        let published_blocks = meta.get_file_blocks(ino).unwrap();
+        assert_eq!(published_blocks.len(), 1);
+        assert_eq!(published_blocks[0].1.object_id, replacement_object_id);
+
+        let data = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+        assert_eq!(data.as_ref(), replacement_payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn offline_s3_does_not_break_local_read_after_write() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");

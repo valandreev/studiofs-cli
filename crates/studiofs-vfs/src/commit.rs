@@ -2,79 +2,112 @@ use super::*;
 
 pub(super) struct CommitCoordinator;
 
+pub(super) enum EpochFinalizeStatus {
+    Published,
+    Deferred,
+    Skipped,
+}
+
 impl CommitCoordinator {
-    pub(super) async fn finish_extent_upload(
+    pub(super) async fn finalize_inode_epoch(
         vfs: &StudioVfs,
-        op: &PendingUpload,
-        block_index: u32,
-    ) -> VfsResult<()> {
+        ino: Ino,
+        content_epoch: u64,
+    ) -> VfsResult<EpochFinalizeStatus> {
         let _commit_qos = vfs
             .qos
             .acquire_commit()
             .await
             .map_err(|e| VfsError::Other(format!("commit qos permit failed: {e}")))?;
-        vfs.record_uploaded_extent(op.ino, block_index, op.object_id, op.content_epoch);
 
-        let pending_same_epoch =
-            vfs.block_cache
-                .snapshot_pending_uploads()
-                .into_iter()
-                .any(|pending| {
-                    pending.ino == op.ino
-                        && pending.content_epoch == op.content_epoch
-                        && pending.object_id != op.object_id
-                });
-        if pending_same_epoch {
-            return Ok(());
+        let attr = match run_meta(
+            vfs.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
+        )
+        .await
+        {
+            Ok(attr) => attr,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                vfs.clear_inode_incarnation(ino);
+                return Ok(EpochFinalizeStatus::Skipped);
+            }
+            Err(err) => return Err(err),
+        };
+        if attr.content_epoch != content_epoch
+            || attr.upload_state == MetaUploadState::Ready
+            || !StudioVfs::needs_epoch_finalization(&attr)
+        {
+            return Ok(EpochFinalizeStatus::Skipped);
         }
 
-        let ino = op.ino;
+        if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
+
+        let pending_same_epoch = vfs
+            .block_cache
+            .snapshot_pending_uploads()
+            .into_iter()
+            .any(|pending| pending.ino == ino && pending.content_epoch == content_epoch);
+        if pending_same_epoch {
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
+
         let required_blocks = run_meta(
             vfs.meta_async.clone(),
             move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
         )
         .await?;
-        if required_blocks.is_empty() {
-            return Ok(());
+        if !required_blocks.is_empty() {
+            let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
+                .iter()
+                .map(|(block_index, block_ref)| {
+                    (
+                        *block_index,
+                        ExtentRecordId {
+                            object_id: block_ref.object_id,
+                            content_epoch,
+                        },
+                    )
+                })
+                .collect();
+            if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
+            {
+                requeue_missing_manifest_uploads(vfs, ino, content_epoch, &required_blocks).await;
+                return Err(err);
+            }
         }
 
-        let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
-            .iter()
-            .map(|(block_index, block_ref)| {
-                (
-                    *block_index,
-                    ExtentRecordId {
-                        object_id: block_ref.object_id,
-                        content_epoch: op.content_epoch,
-                    },
-                )
-            })
-            .collect();
-        if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await {
-            requeue_missing_manifest_uploads(vfs, op.ino, op.content_epoch, &required_blocks).await;
-            return Err(err);
-        }
-
-        let attr = run_meta(
+        let current_attr = match run_meta(
             vfs.meta_async.clone(),
             move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
         )
-        .await?;
-        if attr.content_epoch != op.content_epoch {
-            return Ok(());
+        .await
+        {
+            Ok(attr) => attr,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                vfs.clear_inode_incarnation(ino);
+                return Ok(EpochFinalizeStatus::Skipped);
+            }
+            Err(err) => return Err(err),
+        };
+        if current_attr.content_epoch != content_epoch
+            || current_attr.upload_state == MetaUploadState::Ready
+            || !StudioVfs::needs_epoch_finalization(&current_attr)
+        {
+            return Ok(EpochFinalizeStatus::Skipped);
         }
 
-        let content_epoch = op.content_epoch;
         let published = run_meta(
             vfs.meta_async.clone(),
             move |engine: Arc<dyn MetaEngine>| engine.publish_file_manifest(ino, content_epoch),
         )
         .await?;
         if !published {
-            return Ok(());
+            return Ok(EpochFinalizeStatus::Skipped);
         }
 
-        vfs.remove_live_extents_for_inode_epoch(op.ino, op.content_epoch);
+        vfs.remove_live_extents_for_inode_epoch(ino, content_epoch);
         if let Ok(attr) = run_meta(
             vfs.meta_async.clone(),
             move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
@@ -86,7 +119,7 @@ impl CommitCoordinator {
             vfs.clear_inode_incarnation(ino);
         }
 
-        Ok(())
+        Ok(EpochFinalizeStatus::Published)
     }
 
     async fn wait_until_remote_objects_visible(
@@ -143,6 +176,7 @@ impl CommitCoordinator {
         }
     }
 }
+
 async fn requeue_missing_manifest_uploads(
     vfs: &StudioVfs,
     ino: Ino,
