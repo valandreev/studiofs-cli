@@ -18,16 +18,17 @@ fn read_all(
     dst: &mut [u8],
     priority: L2IoPriority,
 ) -> io::Result<usize> {
-    if priority == L2IoPriority::Foreground {
-        return std_file.read(dst);
-    }
-
     let mut filled = 0usize;
+    let chunk_size = match priority {
+        // Foreground path: no artificial chunk throttling.
+        L2IoPriority::Foreground => dst.len().max(1),
+        L2IoPriority::Background => IO_CHUNK_SIZE_BACKGROUND,
+    };
     // Break into chunks to yield the device queue to other threads/requests.
     // This allows the OS disk scheduler to interleave smaller foreground client
     // reads, preventing massive latency spikes during background S3 uploads.
     while filled < dst.len() {
-        let end = (filled + IO_CHUNK_SIZE_BACKGROUND).min(dst.len());
+        let end = (filled + chunk_size).min(dst.len());
         match std_file.read(&mut dst[filled..end]) {
             Ok(0) => break,
             Ok(n) => filled += n,
