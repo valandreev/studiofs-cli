@@ -3,21 +3,31 @@ use std::io::{Read, Write};
 use std::path::Path;
 use tracing::debug;
 
+use crate::l2_disk::L2IoPriority;
+
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
-pub(crate) const IO_CHUNK_SIZE: usize = 1024 * 1024;
+pub(crate) const IO_CHUNK_SIZE_BACKGROUND: usize = 1024 * 1024;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn is_aligned(ptr: *const (), alignment: usize) -> bool {
     (ptr as usize).is_multiple_of(alignment)
 }
 
-fn read_all(mut std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
+fn read_all(
+    mut std_file: std::fs::File,
+    dst: &mut [u8],
+    priority: L2IoPriority,
+) -> io::Result<usize> {
+    if priority == L2IoPriority::Foreground {
+        return std_file.read(dst);
+    }
+
     let mut filled = 0usize;
     // Break into chunks to yield the device queue to other threads/requests.
     // This allows the OS disk scheduler to interleave smaller foreground client
     // reads, preventing massive latency spikes during background S3 uploads.
     while filled < dst.len() {
-        let end = (filled + IO_CHUNK_SIZE).min(dst.len());
+        let end = (filled + IO_CHUNK_SIZE_BACKGROUND).min(dst.len());
         match std_file.read(&mut dst[filled..end]) {
             Ok(0) => break,
             Ok(n) => filled += n,
@@ -29,7 +39,11 @@ fn read_all(mut std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io::Result<usize> {
+fn read_from_std_file_direct_into(
+    std_file: std::fs::File,
+    dst: &mut [u8],
+    priority: L2IoPriority,
+) -> io::Result<usize> {
     if dst.is_empty() {
         return Ok(0);
     }
@@ -38,7 +52,7 @@ fn read_from_std_file_direct_into(std_file: std::fs::File, dst: &mut [u8]) -> io
     let len_aligned = dst.len().is_multiple_of(DIRECT_IO_ALIGNMENT);
 
     if dst_aligned && len_aligned {
-        let filled = read_all(std_file, dst)?;
+        let filled = read_all(std_file, dst, priority)?;
         if filled == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -224,8 +238,9 @@ pub(crate) fn open_block_direct_read(path: &Path) -> io::Result<Option<std::fs::
 pub(crate) fn read_block_direct_from_file(
     std_file: std::fs::File,
     dst: &mut [u8],
+    priority: L2IoPriority,
 ) -> io::Result<Option<usize>> {
-    match read_from_std_file_direct_into(std_file, dst) {
+    match read_from_std_file_direct_into(std_file, dst, priority) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if should_fallback_from_direct_io(&e) => {
             debug!(
@@ -242,11 +257,12 @@ pub(crate) fn read_block_direct_from_file(
 pub(crate) fn read_block_direct_from_file(
     std_file: std::fs::File,
     dst: &mut [u8],
+    priority: L2IoPriority,
 ) -> io::Result<Option<usize>> {
     if dst.is_empty() {
         return Ok(Some(0));
     }
-    match read_all(std_file, dst) {
+    match read_all(std_file, dst, priority) {
         Ok(0) => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "direct read returned EOF before data",
@@ -300,6 +316,7 @@ pub(crate) fn open_block_direct_read(_path: &Path) -> io::Result<Option<std::fs:
 pub(crate) fn read_block_direct_from_file(
     _std_file: std::fs::File,
     _dst: &mut [u8],
+    _priority: L2IoPriority,
 ) -> io::Result<Option<usize>> {
     Ok(None)
 }
