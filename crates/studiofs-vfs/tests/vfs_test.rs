@@ -544,7 +544,7 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
     let cache_dir_str = cache_dir.to_str().unwrap();
     let cache_size = 1024 * 1024 * 1024; // 1 GiB
 
-    StudioVfs::new(
+    let vfs = StudioVfs::new(
         meta,
         &data_config,
         cache_dir_str,
@@ -552,7 +552,10 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
         512 * 1024 * 1024,
         test_vfs_config_from_env(),
     )
-    .expect("failed to create StudioVfs")
+    .expect("failed to create StudioVfs");
+    vfs.start()
+        .expect("failed to start StudioVfs background workers");
+    vfs
 }
 
 #[allow(dead_code)]
@@ -562,7 +565,7 @@ fn make_vfs_from_meta(
     cache_dir_str: &str,
 ) -> Arc<StudioVfs> {
     let data_config = DataStoreConfig::from(format_info);
-    StudioVfs::new(
+    let vfs = StudioVfs::new(
         meta,
         &data_config,
         cache_dir_str,
@@ -570,7 +573,10 @@ fn make_vfs_from_meta(
         512 * 1024 * 1024,
         test_vfs_config_from_env(),
     )
-    .expect("failed to create StudioVfs")
+    .expect("failed to create StudioVfs");
+    vfs.start()
+        .expect("failed to start StudioVfs background workers");
+    vfs
 }
 
 fn make_vfs_with_meta(
@@ -581,7 +587,7 @@ fn make_vfs_with_meta(
     meta.set_format_info(format_info)
         .expect("failed to set format info");
     let data_config = DataStoreConfig::from(format_info);
-    StudioVfs::new(
+    let vfs = StudioVfs::new(
         meta,
         &data_config,
         cache_dir_str,
@@ -589,7 +595,10 @@ fn make_vfs_with_meta(
         512 * 1024 * 1024,
         test_vfs_config_from_env(),
     )
-    .expect("failed to create StudioVfs")
+    .expect("failed to create StudioVfs");
+    vfs.start()
+        .expect("failed to start StudioVfs background workers");
+    vfs
 }
 
 #[allow(dead_code)]
@@ -1926,6 +1935,8 @@ fn test_crash_recovery_replays_pending_journal() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"crash.bin", 0, 0, 0o644).unwrap();
             crash_file_ino = attr.ino;
             let payload = vec![0x5Au8; 2 * 1024 * 1024];
@@ -1984,6 +1995,8 @@ fn test_crash_recovery_replays_pending_journal() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        _vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
         assert!(!blocks.is_empty(), "file blocks must exist in metadata");
@@ -2080,6 +2093,8 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                     .expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"spill-restart.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
@@ -2129,6 +2144,8 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                     .expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let before = meta.get_file_blocks(ino).unwrap();
             assert_eq!(
@@ -2182,6 +2199,8 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let blocks = meta.get_file_blocks(ino).unwrap();
             assert_eq!(
@@ -2248,6 +2267,8 @@ fn writer_reads_full_file_before_any_remote_commit() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"local-full-read.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
@@ -2313,6 +2334,8 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"restart-local.bin", 0, 0, 0o644).unwrap();
             inode = attr.ino;
             vfs.write(inode, 0, &payload).await.unwrap();
@@ -2342,6 +2365,8 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
             assert_eq!(
                 read.as_ref(),
@@ -2523,6 +2548,8 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
         let attr = vfs
             .create(1, b"sfs9-local-finalize.bin", 0, 0, 0o644)
             .unwrap();
@@ -3220,6 +3247,8 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                     .expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let attr = vfs
                 .create(1, b"remote-fetch-block.bin", 0, 0, 0o644)
@@ -3275,6 +3304,8 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                     .expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
             assert!(
@@ -3309,6 +3340,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 offline_vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start().expect("failed to start StudioVfs background workers");
             let blocks = vfs.meta().get_file_blocks(ino).unwrap();
             assert_eq!(
                 blocks[0].1.object_id, baseline_object_id,
@@ -3498,6 +3530,8 @@ fn new_file_enters_uploading_state() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"pending-new.bin", 0, 0, 0o644).unwrap();
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
@@ -3565,6 +3599,8 @@ fn committed_file_mutation_enters_updating_state() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"updating.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
@@ -3604,6 +3640,8 @@ fn committed_file_mutation_enters_updating_state() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             vfs.write(ino, 0, &patch).await.unwrap();
 
             let state = vfs.inode_incarnation_state(ino).await.unwrap();
@@ -3674,6 +3712,8 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"overlay-read.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
@@ -3712,6 +3752,8 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             vfs.write(ino, 0, &patch).await.unwrap();
             vfs.flush(ino).await.unwrap();
 
@@ -3775,6 +3817,8 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs
             .create(1, b"pending-fast-read.bin", 0, 0, 0o644)
@@ -3852,6 +3896,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
         test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start().expect("failed to start StudioVfs background workers");
 
         let attr = vfs
             .create(1, b"pending-partial-base.bin", 0, 0, 0o644)
@@ -3933,6 +3978,8 @@ fn single_inode_never_has_two_pending_incarnations() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"single-pending.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
@@ -3971,6 +4018,7 @@ fn single_inode_never_has_two_pending_incarnations() {
             test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start().expect("failed to start StudioVfs background workers");
 
             vfs.write(ino, 0, &patch_a).await.unwrap();
             let first = vfs
@@ -4043,6 +4091,8 @@ fn large_file_unlink_cancels_pending_uploads() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"unlink-cancel.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
@@ -4120,6 +4170,8 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs
             .create(1, b"open-unlink-cancel.bin", 0, 0, 0o644)
@@ -4245,6 +4297,8 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             vfs.write(ino, 0, &patch_a).await.unwrap();
             vfs.write(ino, (block_size * 2) as u64, &patch_b)
@@ -4361,6 +4415,8 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             vfs.write(ino, 0, &patch_a).await.unwrap();
             vfs.flush(ino).await.unwrap();
@@ -4413,6 +4469,8 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             assert!(
                 wait_until(Duration::from_secs(45), || {
@@ -4482,6 +4540,8 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"rename-source.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
@@ -4659,6 +4719,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
         test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start().expect("failed to start StudioVfs background workers");
 
         vfs.write(ino, block_size as u64, &patch).await.unwrap();
         vfs.flush(ino).await.unwrap();
@@ -4740,6 +4801,8 @@ fn restart_replays_only_live_pending_extents() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let attr = vfs
                 .create(1, b"restart-live-only.bin", 0, 0, 0o644)
@@ -4776,6 +4839,8 @@ fn restart_replays_only_live_pending_extents() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
         assert_eq!(
@@ -4844,6 +4909,8 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let attr = vfs
                 .create(1, b"restart-publish-ready.bin", 0, 0, 0o644)
@@ -4886,6 +4953,8 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         assert!(
             wait_until(Duration::from_secs(20), || {
@@ -4957,6 +5026,8 @@ fn offline_s3_does_not_break_local_read_after_write() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs
             .create(1, b"offline-local-read.bin", 0, 0, 0o644)
@@ -5065,6 +5136,8 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
@@ -5112,6 +5185,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
             test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start().expect("failed to start StudioVfs background workers");
 
             assert!(
                 wait_until(Duration::from_secs(20), || {
@@ -5241,6 +5315,8 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let backlog = vfs.create(1, b"slow-backlog.bin", 0, 0, 0o644).unwrap();
         vfs.write(backlog.ino, 0, &backlog_payload).await.unwrap();
@@ -5338,6 +5414,8 @@ fn backpressure_only_on_local_budget_exhaustion() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             for idx in 0..4 {
                 assert_eq!(
@@ -5402,6 +5480,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
             test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start().expect("failed to start StudioVfs background workers");
 
             let attr = vfs.create(1, b"budget-full.bin", 0, 0, 0o644).unwrap();
             vfs.write(attr.ino, 0, &payload).await.unwrap();
@@ -5473,6 +5552,8 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let large = vfs.create(1, b"large-upload.bin", 0, 0, 0o644).unwrap();
         vfs.write(large.ino, 0, &large_payload).await.unwrap();
@@ -5590,6 +5671,8 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
@@ -5627,6 +5710,8 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let read = vfs
                 .read(ino, 0, replacement_payload.len() as u32)
@@ -5715,6 +5800,8 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let backlog = vfs.create(1, b"soak-backlog.bin", 0, 0, 0o644).unwrap();
         vfs.write(backlog.ino, 0, &backlog_payload).await.unwrap();
@@ -5800,6 +5887,7 @@ fn test_ingress_prefers_spill_before_backpressure() {
         test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start().expect("failed to start StudioVfs background workers");
         let attr = vfs.create(1, b"spill-first.bin", 0, 0, 0o644).unwrap();
         let payload = vec![0x33u8; 512 * 1024];
 
@@ -5876,6 +5964,8 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
                 .expect("test VFS config should validate"),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
         (vfs, vec![0x39u8; 512 * 1024])
     }
 
@@ -5987,6 +6077,8 @@ fn test_write_fast_mode_no_spill_artifacts() {
                 .expect("test VFS config should validate"),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"fast-no-spill.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
@@ -6072,6 +6164,8 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
             test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
         let attr = vfs
             .create(1, b"spill-backpressure.bin", 0, 0, 0o644)
             .unwrap();
@@ -6138,6 +6232,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
         test_vfs_config_from_env(),
         )
         .unwrap();
+        vfs.start().expect("failed to start StudioVfs background workers");
 
         let payload = vec![0x55u8; 512 * 1024];
 
@@ -6214,6 +6309,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             vfs_config.validate().expect("test VFS config should validate"),
         )
         .unwrap();
+        vfs.start().expect("failed to start StudioVfs background workers");
         let writer_count = 4usize;
         let payload = vec![0x66u8; 256 * 1024];
 
@@ -6308,6 +6404,8 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                     .expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             let mut tasks = Vec::new();
             for idx in 0..writer_count {
@@ -6354,6 +6452,8 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 test_vfs_config_from_env(),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
 
             for (ino, payload) in &files {
                 let data = vfs.read(*ino, 0, payload.len() as u32).await.unwrap();
@@ -6410,6 +6510,8 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                     .expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
             let attr = vfs.create(1, b"segment-replay.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             tokio::time::timeout(Duration::from_secs(15), vfs.write(ino, 0, &payload))
@@ -6455,6 +6557,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 vfs_config.validate().expect("test VFS config should validate"),
             )
             .unwrap();
+            vfs.start().expect("failed to start StudioVfs background workers");
             let data =
                 tokio::time::timeout(Duration::from_secs(20), vfs.read(ino, 0, payload.len() as u32))
                     .await

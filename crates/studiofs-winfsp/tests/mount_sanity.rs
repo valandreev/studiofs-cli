@@ -42,7 +42,7 @@ fn make_test_vfs(
 
     let cache_dir = tmp.path().join("cache");
     let _guard = rt.enter();
-    StudioVfs::new(
+    let vfs = StudioVfs::new(
         meta,
         &data_config,
         cache_dir.to_str().expect("cache dir str"),
@@ -52,7 +52,9 @@ fn make_test_vfs(
             .try_into()
             .expect("default VFS config should validate"),
     )
-    .expect("create vfs")
+    .expect("create vfs");
+    vfs.start().expect("start vfs background workers");
+    vfs
 }
 
 fn signal_named_event(name: &str) {

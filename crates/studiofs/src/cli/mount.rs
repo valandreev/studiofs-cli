@@ -712,6 +712,8 @@ pub fn run(
         vfs_config,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
+    vfs.start()
+        .map_err(|e| anyhow::anyhow!("failed to start vfs background workers: {e}"))?;
 
     println!(
         "✓ Volume '{}' ready to mount at '{}'",
@@ -729,7 +731,7 @@ pub fn run(
         println!("  Snapshot:     {} (read-only)", snapshot_id);
     }
 
-    // Background tasks (uploader + GC) are spawned internally by StudioVfs::new
+    // Background tasks are started explicitly after StudioVfs construction.
 
     // Write PID file so `studiofs umount` can find us
     let _ = super::utils::write_pid_file(&actual_mount_path, name, std::process::id());
