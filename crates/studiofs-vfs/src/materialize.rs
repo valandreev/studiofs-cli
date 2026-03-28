@@ -349,9 +349,12 @@ impl Materializer {
         let mut drained_spill_blocks = 0u64;
         let mut drained_spill_bytes = 0u64;
 
+        vfs.retune_staged_upload_payload_budget(extents.len(), false);
+
         for (idx, extent) in extents.into_iter().enumerate() {
             let data = extent.data;
             vfs.block_cache.stage_l1(extent.object_id, data.clone());
+            vfs.stage_upload_payload(extent.object_id, data.clone());
 
             let file_offset = (extent.block_index as u64) * vfs.block_size as u64;
             upload_ops.push((

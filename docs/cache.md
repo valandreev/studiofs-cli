@@ -275,12 +275,19 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   │
   ├─ Take batch of up to 1024 blocks
   ├─ stage_l1() for each block          ← immediate L1 insert
+  ├─ stage upload payload window        ← retry-friendly transient RAM source for uploader
   ├─ Batch metadata commit (local staged refs only)
   ├─ commit_l2_batch() enqueue          ← consumes owned batch, bounded queue + fixed workers
   └─ submit_upload(..., content_epoch)  ← journal + S3 queue
 ```
 
 The background flusher runs every 10ms and drains continuously (keeps processing while data exists).
+Freshly materialized blocks now also seed a bounded transient upload-payload
+stage in RAM. Upload workers clone payloads from that stage first and only fall
+back to L1/L2 rereads when the stage entry was evicted or the upload was
+recovered from journal after restart. The stage budget is adaptive rather than
+fixed: it tracks the upload dispatch window, expands under queue pressure or
+staging misses, and contracts again when foreground pressure drops.
 
 ## Performance Characteristics
 
@@ -309,6 +316,8 @@ benchmarks:
   - lifecycle (`submitted`, `completed`, `failed`)
   - backpressure (`backpressure_events`, backpressure wait totals/max/histogram)
 - queue depth metrics for upload queue (`pending_depth`, `pending_depth_peak`)
+- staged upload payload metrics (`hits`, `misses`, `evictions`, `target_bytes`,
+  `min_bytes`, `max_bytes`)
 - backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
 - transit-memory budget snapshot (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, foreground/background waiter counts)
 - blocking-task pressure metrics for cache hot paths:

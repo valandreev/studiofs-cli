@@ -2795,24 +2795,138 @@ struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
     upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    staged_payloads: Mutex<UploadPayloadStage>,
     upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
+    staged_payload_hits: AtomicU64,
+    staged_payload_misses: AtomicU64,
+    staged_payload_evictions: AtomicU64,
     /// Dynamic slot cost adjusted from cache-latency feedback.
     upload_cache_io_user_penalty: AtomicU32,
 }
 
+struct UploadPayloadStage {
+    by_object: HashMap<u64, Bytes>,
+    insertion_order: VecDeque<u64>,
+    total_bytes: usize,
+    min_bytes: usize,
+    target_bytes: usize,
+    max_bytes: usize,
+}
+
+impl UploadPayloadStage {
+    fn new(min_bytes: usize, max_bytes: usize) -> Self {
+        let min_bytes = min_bytes.max(1);
+        let max_bytes = max_bytes.max(min_bytes);
+        Self {
+            by_object: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            total_bytes: 0,
+            min_bytes,
+            target_bytes: min_bytes,
+            max_bytes,
+        }
+    }
+
+    fn stage(&mut self, object_id: u64, data: Bytes) -> usize {
+        if let Some(previous) = self.by_object.remove(&object_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(data.len());
+        self.by_object.insert(object_id, data);
+        self.insertion_order.push_back(object_id);
+
+        self.evict_to_target()
+    }
+
+    fn retarget(&mut self, desired_bytes: usize) -> usize {
+        self.target_bytes = desired_bytes.clamp(self.min_bytes, self.max_bytes);
+        self.evict_to_target()
+    }
+
+    fn evict_to_target(&mut self) -> usize {
+        let mut evicted = 0usize;
+        while self.total_bytes > self.target_bytes {
+            let Some(evict_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            let Some(evicted_payload) = self.by_object.remove(&evict_id) else {
+                continue;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(evicted_payload.len());
+            evicted = evicted.saturating_add(1);
+        }
+        evicted
+    }
+
+    fn get_cloned(&self, object_id: u64) -> Option<Bytes> {
+        self.by_object.get(&object_id).cloned()
+    }
+
+    fn remove(&mut self, object_id: u64) -> bool {
+        let Some(payload) = self.by_object.remove(&object_id) else {
+            return false;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(payload.len());
+        true
+    }
+
+    fn target_bytes(&self) -> usize {
+        self.target_bytes
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.by_object.len(),
+            self.total_bytes,
+            self.target_bytes,
+            self.min_bytes,
+            self.max_bytes,
+        )
+    }
+}
+
+fn staged_upload_payload_budget_bounds(
+    block_size: u32,
+    upload_worker_count: usize,
+    max_dirty_bytes: usize,
+) -> (usize, usize) {
+    let dispatch_capacity = upload_worker_count.max(1).saturating_mul(4);
+    let min_bytes = (block_size as usize)
+        .saturating_mul(dispatch_capacity)
+        .max(block_size as usize);
+    let max_by_workers = min_bytes.saturating_mul(8);
+    let max_by_dirty = max_dirty_bytes.saturating_div(4).max(min_bytes);
+    let max_bytes = max_by_workers.min(max_by_dirty).max(min_bytes);
+    (min_bytes, max_bytes)
+}
+
 impl UploadState {
-    fn new(upload_cache_io_user_penalty: u32) -> Self {
+    fn new(
+        upload_cache_io_user_penalty: u32,
+        block_size: u32,
+        upload_worker_count: usize,
+        max_dirty_bytes: usize,
+    ) -> Self {
+        let (staged_payload_min_bytes, staged_payload_max_bytes) =
+            staged_upload_payload_budget_bounds(block_size, upload_worker_count, max_dirty_bytes);
         Self {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
             upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
             pending_evictions: Mutex::new(std::collections::HashSet::new()),
+            staged_payloads: Mutex::new(UploadPayloadStage::new(
+                staged_payload_min_bytes,
+                staged_payload_max_bytes,
+            )),
             upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
+            staged_payload_hits: AtomicU64::new(0),
+            staged_payload_misses: AtomicU64::new(0),
+            staged_payload_evictions: AtomicU64::new(0),
             upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
         }
     }
@@ -3015,6 +3129,7 @@ impl VfsState {
         active_segment_id: u64,
         recovered_spill_seq: u64,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
+        block_size: u32,
         cfg: &VfsConfig,
     ) -> Self {
         Self {
@@ -3026,7 +3141,12 @@ impl VfsState {
                 initial_checkpoint_meta,
             ),
             dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
-            upload: UploadState::new(cfg.upload_cache_io_user_penalty),
+            upload: UploadState::new(
+                cfg.upload_cache_io_user_penalty,
+                block_size,
+                cfg.upload_worker_count,
+                cfg.max_dirty_bytes,
+            ),
             namespace: NamespaceState::new(
                 cfg.dentry_cache_capacity,
                 cfg.dentry_cache_bytes,
@@ -4193,6 +4313,7 @@ impl StudioVfs {
                     active_ingress_segment_id,
                     recovered_spill_seq,
                     initial_checkpoint_meta,
+                    block_size,
                     &config,
                 )),
                 upload_scheduler,
@@ -4706,6 +4827,7 @@ impl StudioVfs {
 
     fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
+        self.discard_staged_upload_payload(op.object_id);
         self.block_cache.cancel_upload(op, !has_open_handles);
         self.state
             .upload
@@ -5048,6 +5170,81 @@ impl StudioVfs {
         let jitter_seed = op.object_id ^ Self::now_unix_millis();
         let jitter_ms = jitter_seed % jitter_max;
         capped.saturating_add(Duration::from_millis(jitter_ms))
+    }
+
+    fn stage_upload_payload(&self, object_id: u64, data: Bytes) {
+        let evicted = self
+            .state
+            .upload
+            .staged_payloads
+            .lock()
+            .stage(object_id, data);
+        if evicted > 0 {
+            self.state
+                .upload
+                .staged_payload_evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn retune_staged_upload_payload_budget(&self, additional_pending: usize, miss_hint: bool) {
+        let pending_uploads = self
+            .block_cache
+            .pending_upload_count()
+            .saturating_add(additional_pending)
+            .max(1);
+        let dispatch_capacity = self.upload_worker_count.max(1).saturating_mul(4);
+        let dispatch_bytes = (self.block_size as usize)
+            .saturating_mul(dispatch_capacity)
+            .max(self.block_size as usize);
+        let mut desired_bytes = (self.block_size as usize)
+            .saturating_mul(pending_uploads)
+            .max(dispatch_bytes);
+        if self.foreground_read_active() {
+            desired_bytes = desired_bytes.saturating_add(dispatch_bytes);
+        }
+
+        let evicted = {
+            let mut stage = self.state.upload.staged_payloads.lock();
+            if miss_hint {
+                desired_bytes =
+                    desired_bytes.max(stage.target_bytes().saturating_add(dispatch_bytes));
+            }
+            stage.retarget(desired_bytes)
+        };
+        if evicted > 0 {
+            self.state
+                .upload
+                .staged_payload_evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn take_staged_upload_payload(&self, object_id: u64) -> Option<Bytes> {
+        let payload = self
+            .state
+            .upload
+            .staged_payloads
+            .lock()
+            .get_cloned(object_id);
+        let counter = if payload.is_some() {
+            &self.state.upload.staged_payload_hits
+        } else {
+            &self.state.upload.staged_payload_misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if payload.is_none() {
+            self.retune_staged_upload_payload_budget(0, true);
+        }
+        payload
+    }
+
+    fn discard_staged_upload_payload(&self, object_id: u64) {
+        self.state.upload.staged_payloads.lock().remove(object_id);
+    }
+
+    fn staged_upload_payload_snapshot(&self) -> (usize, usize, usize, usize, usize) {
+        self.state.upload.staged_payloads.lock().snapshot()
     }
 
     fn p90_ns(mut values: Vec<u64>) -> Option<u64> {
@@ -9730,6 +9927,7 @@ impl StudioVfs {
                 .upload
                 .upload_canceled_stale
                 .fetch_add(1, Ordering::Relaxed);
+            self.discard_staged_upload_payload(op.object_id);
             debug!(
                 object_id = op.object_id,
                 ino = op.ino,
@@ -9764,6 +9962,7 @@ impl StudioVfs {
                 .upload
                 .upload_canceled_stale
                 .fetch_add(1, Ordering::Relaxed);
+            self.discard_staged_upload_payload(op.object_id);
             debug!(
                 object_id = op.object_id,
                 current_object_id = current.object_id,
@@ -9863,6 +10062,7 @@ impl StudioVfs {
                 message: e.to_string(),
             })?;
         let mut transit_credit = if remote_object_visible {
+            self.discard_staged_upload_payload(op.object_id);
             None
         } else {
             Some(
@@ -9875,12 +10075,18 @@ impl StudioVfs {
         let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
             None
         } else {
-            // Hold local upload I/O slots strictly around the L2 read phase.
-            // Never keep them during network visibility checks or S3 uploads.
-            let raw_payload = {
-                // Upload QoS: when user reads are active, each upload consumes
-                // multiple local I/O slots, effectively shrinking upload pressure
-                // and preserving read latency/throughput for foreground ops.
+            let raw_payload = if let Some(payload) = self.take_staged_upload_payload(op.object_id) {
+                debug!(
+                    ino = op.ino,
+                    object_id = op.object_id,
+                    block_index,
+                    payload_len = payload.len(),
+                    "process_upload using staged payload"
+                );
+                Some(payload)
+            } else {
+                // Hold local upload I/O slots strictly around the L2 read phase.
+                // Never keep them during network visibility checks or S3 uploads.
                 let upload_io_cost = if self.foreground_read_active() {
                     self.state
                         .upload
@@ -10101,6 +10307,7 @@ impl StudioVfs {
             {
                 commit::CommitCoordinator::finish_extent_upload(self, &op, block_index).await?;
                 self.block_cache.complete_upload(&op);
+                self.discard_staged_upload_payload(op.object_id);
                 debug!(
                     ino = op.ino,
                     object_id = op.object_id,
@@ -10120,6 +10327,7 @@ impl StudioVfs {
                     "upload completed for stale block, marked for deletion"
                 );
                 self.block_cache.complete_upload(&op);
+                self.discard_staged_upload_payload(op.object_id);
                 debug!(
                     ino = op.ino,
                     object_id = op.object_id,
@@ -10231,6 +10439,14 @@ impl StudioVfs {
             let (foreground_read_p90_ns, foreground_read_speedometer_samples) =
                 self.foreground_speedometer_snapshot();
             self.adjust_upload_backpressure_from_metrics(foreground_read_p90_ns);
+            self.retune_staged_upload_payload_budget(0, false);
+            let (
+                staged_payload_count,
+                staged_payload_bytes,
+                staged_payload_target_bytes,
+                staged_payload_min_bytes,
+                staged_payload_max_bytes,
+            ) = self.staged_upload_payload_snapshot();
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
@@ -10382,6 +10598,29 @@ impl StudioVfs {
                     attr_read_cache_entry_budget = attr_read_cache.entry_budget,
                     attr_read_cache_byte_budget = attr_read_cache.byte_budget,
                     "upload pipeline counters"
+                );
+                debug!(
+                    upload_staged_payload_count = staged_payload_count,
+                    upload_staged_payload_bytes = staged_payload_bytes,
+                    upload_staged_payload_target_bytes = staged_payload_target_bytes,
+                    upload_staged_payload_min_bytes = staged_payload_min_bytes,
+                    upload_staged_payload_max_bytes = staged_payload_max_bytes,
+                    upload_staged_payload_hits = self
+                        .state
+                        .upload
+                        .staged_payload_hits
+                        .load(Ordering::Relaxed),
+                    upload_staged_payload_misses = self
+                        .state
+                        .upload
+                        .staged_payload_misses
+                        .load(Ordering::Relaxed),
+                    upload_staged_payload_evictions = self
+                        .state
+                        .upload
+                        .staged_payload_evictions
+                        .load(Ordering::Relaxed),
+                    "upload pipeline staged payloads"
                 );
                 debug!(
                     transit_memory_budget_bytes = transit_memory.budget_bytes,
@@ -11311,6 +11550,61 @@ mod tests {
         StudioVfs::trim_foreground_latency_samples(&mut samples, 400, Duration::from_millis(150));
         let kept: Vec<(u64, u64)> = samples.into_iter().collect();
         assert_eq!(kept, vec![(350, 30)]);
+    }
+
+    #[test]
+    fn staged_upload_payload_stage_evicts_oldest_entries() {
+        let mut stage = UploadPayloadStage::new(8, 8);
+
+        assert_eq!(stage.stage(1, Bytes::from_static(b"abcd")), 0);
+        assert_eq!(stage.stage(2, Bytes::from_static(b"efgh")), 0);
+        assert_eq!(stage.snapshot(), (2, 8, 8, 8, 8));
+
+        assert_eq!(stage.stage(3, Bytes::from_static(b"ijkl")), 1);
+        assert_eq!(stage.snapshot(), (2, 8, 8, 8, 8));
+        assert!(stage.get_cloned(1).is_none());
+        assert_eq!(stage.get_cloned(2), Some(Bytes::from_static(b"efgh")));
+        assert_eq!(stage.get_cloned(3), Some(Bytes::from_static(b"ijkl")));
+    }
+
+    #[test]
+    fn staged_upload_payload_take_releases_tracked_bytes() {
+        let mut stage = UploadPayloadStage::new(16, 16);
+
+        assert_eq!(stage.stage(99, Bytes::from_static(b"payload")), 0);
+        assert_eq!(stage.snapshot(), (1, 7, 16, 16, 16));
+        assert_eq!(stage.get_cloned(99), Some(Bytes::from_static(b"payload")));
+        assert_eq!(stage.snapshot(), (1, 7, 16, 16, 16));
+        assert!(stage.remove(99));
+        assert_eq!(stage.snapshot(), (0, 0, 16, 16, 16));
+    }
+
+    #[test]
+    fn staged_upload_payload_retargets_within_bounds() {
+        let mut stage = UploadPayloadStage::new(8, 16);
+
+        assert_eq!(stage.stage(1, Bytes::from_static(b"abcd")), 0);
+        assert_eq!(stage.stage(2, Bytes::from_static(b"efgh")), 0);
+        assert_eq!(stage.retarget(16), 0);
+        assert_eq!(stage.stage(3, Bytes::from_static(b"ijkl")), 0);
+        assert_eq!(stage.snapshot(), (3, 12, 16, 8, 16));
+
+        assert_eq!(stage.retarget(8), 1);
+        assert_eq!(stage.snapshot(), (2, 8, 8, 8, 16));
+        assert!(stage.get_cloned(1).is_none());
+    }
+
+    #[test]
+    fn staged_upload_payload_clone_preserves_retry_source_until_discarded() {
+        let mut stage = UploadPayloadStage::new(16, 16);
+
+        assert_eq!(stage.stage(7, Bytes::from_static(b"retry-me")), 0);
+        assert_eq!(stage.get_cloned(7), Some(Bytes::from_static(b"retry-me")));
+        assert_eq!(stage.get_cloned(7), Some(Bytes::from_static(b"retry-me")));
+        assert_eq!(stage.snapshot(), (1, 8, 16, 16, 16));
+
+        assert!(stage.remove(7));
+        assert!(stage.get_cloned(7).is_none());
     }
 
     #[test]
