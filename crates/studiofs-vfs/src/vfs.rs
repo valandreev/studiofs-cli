@@ -621,6 +621,7 @@ const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS: u64 = 40;
 const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
 const FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES: usize = 4_096;
+const FOREGROUND_READ_THROUGHPUT_MIN_COVERAGE_MS: u64 = 100;
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = 8;
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 65_536;
 const DEFAULT_DENTRY_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -5682,6 +5683,20 @@ impl StudioVfs {
         (p90_ns, total_samples, window_bytes, window_coverage_ms)
     }
 
+    fn foreground_throughput_bytes_per_sec(
+        speedometer_samples: usize,
+        window_bytes: u64,
+        window_coverage_ms: u64,
+    ) -> f64 {
+        if speedometer_samples == 0 || window_coverage_ms == 0 {
+            0.0
+        } else {
+            let effective_window_coverage_ms =
+                window_coverage_ms.max(FOREGROUND_READ_THROUGHPUT_MIN_COVERAGE_MS);
+            window_bytes as f64 * 1000.0 / effective_window_coverage_ms as f64
+        }
+    }
+
     fn foreground_sticky_p90_latency_ns(&self) -> Option<u64> {
         let now_ms = Self::now_unix_millis();
         let last_at = self
@@ -6722,11 +6737,11 @@ impl StudioVfs {
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
         let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) =
             self.foreground_speedometer_snapshot();
-        let throughput_bytes_per_sec = if window_coverage_ms == 0 {
-            0.0
-        } else {
-            window_bytes as f64 * 1000.0 / window_coverage_ms as f64
-        };
+        let throughput_bytes_per_sec = Self::foreground_throughput_bytes_per_sec(
+            speedometer_samples,
+            window_bytes,
+            window_coverage_ms,
+        );
 
         VfsForegroundReadProtectionStats {
             p90_latency_ns,
@@ -12202,6 +12217,18 @@ mod tests {
         StudioVfs::trim_foreground_latency_samples(&mut samples, 400, Duration::from_millis(150));
         let kept: Vec<(u64, u64, u64)> = samples.into_iter().collect();
         assert_eq!(kept, vec![(350, 30, 4_096)]);
+    }
+
+    #[test]
+    fn foreground_throughput_uses_minimum_coverage_floor_for_short_windows() {
+        let throughput = StudioVfs::foreground_throughput_bytes_per_sec(1, 1_048_576, 10);
+        assert_eq!(throughput, 10_485_760.0);
+    }
+
+    #[test]
+    fn foreground_throughput_is_zero_without_samples() {
+        let throughput = StudioVfs::foreground_throughput_bytes_per_sec(0, 1_048_576, 10);
+        assert_eq!(throughput, 0.0);
     }
 
     #[test]
