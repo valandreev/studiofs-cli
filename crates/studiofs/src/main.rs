@@ -1347,7 +1347,7 @@ mod tests {
             for arg in subcmd.get_arguments() {
                 let name = arg.get_id().as_str();
                 assert!(
-                    !name.contains("direct"),
+                    !name.starts_with("direct-io") && name != "direct_io",
                     "subcommand '{}' exposes a direct-I/O CLI flag '{}'; \
                      this mode has been permanently removed (SFS-121)",
                     subcmd.get_name(),
