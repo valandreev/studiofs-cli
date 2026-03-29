@@ -1090,7 +1090,18 @@ async fn put_fragmented_object(
     Ok(())
 }
 
-async fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
+async fn wait_until<F>(timeout: Duration, predicate: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    wait_until_with_interval(timeout, Duration::from_millis(100), predicate).await
+}
+
+async fn wait_until_with_interval<F>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut predicate: F,
+) -> bool
 where
     F: FnMut() -> bool,
 {
@@ -1102,7 +1113,7 @@ where
         if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -10585,7 +10596,7 @@ fn local_reads_through_upload_with_partial_tail_block() {
         vfs.flush(attr.ino).await.unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(10), || {
+            wait_until_with_interval(Duration::from_secs(10), Duration::from_millis(5), || {
                 !vfs.pending_uploads_for_inode(attr.ino).is_empty()
             })
             .await,
@@ -10710,7 +10721,7 @@ fn concurrent_reads_through_upload_finalization() {
         vfs.flush(attr.ino).await.unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(10), || {
+            wait_until_with_interval(Duration::from_secs(10), Duration::from_millis(5), || {
                 !vfs.pending_uploads_for_inode(attr.ino).is_empty()
             })
             .await,

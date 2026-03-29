@@ -53,6 +53,14 @@ const MAX_SCORE: u8 = 255;
 const VELOCITY_SAMPLE_ALPHA: f64 = 0.25;
 const VELOCITY_SAMPLE_MIN_AGE_US: u64 = 1_000;
 const VELOCITY_SAMPLE_MAX_AGE_US: u64 = 2_000_000;
+/// Idle gap beyond which velocity and score begin soft-decaying instead of
+/// hard-resetting.  Media players frequently pause for 2–5 seconds during
+/// user interaction, scrubbing, or re-buffering; a hard reset at 2 s forces
+/// the prefetch window to restart from scratch.  The soft-decay range
+/// [VELOCITY_SAMPLE_MAX_AGE_US .. VELOCITY_SOFT_DECAY_LIMIT_US] halves the
+/// EMA velocity, cuts score by 75 %, and collapses the width, preserving
+/// enough state so the next sequential read can recover quickly.
+const VELOCITY_SOFT_DECAY_LIMIT_US: u64 = 10_000_000; // 10 s
 const LARGE_SEEK_RESET_BLOCK_DELTA: u32 = 256;
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
@@ -173,11 +181,22 @@ impl ReadAheadTracker {
         if state.last_read_at_micros > 0
             && now_micros.saturating_sub(state.last_read_at_micros) > VELOCITY_SAMPLE_MAX_AGE_US
         {
-            // Previous throughput signal is stale after long idle periods.
-            state.score = 0;
-            state.sequential_streak = 0;
-            state.current_width = base_width;
-            state.velocity_blocks_per_sec_ema = 0.0;
+            let idle_us = now_micros.saturating_sub(state.last_read_at_micros);
+            if idle_us > VELOCITY_SOFT_DECAY_LIMIT_US {
+                // Hard reset: idle exceeded the soft-decay window.
+                state.score = 0;
+                state.sequential_streak = 0;
+                state.current_width = base_width;
+                state.velocity_blocks_per_sec_ema = 0.0;
+            } else {
+                // Soft decay: preserve partial state so resumed sequential
+                // reads recover quickly after short media-player pauses.
+                state.score /= 4;
+                state.sequential_streak /= 2;
+                state.current_width = state.current_width.max(base_width) / 2;
+                state.current_width = state.current_width.max(base_width);
+                state.velocity_blocks_per_sec_ema *= 0.5;
+            }
             // Re-seed anchor with "now" so resumed sequential reads can build
             // fresh velocity samples immediately after idle reset.
             state.velocity_sample_anchor_micros = now_micros;
@@ -428,7 +447,8 @@ impl ReadAheadTracker {
     /// Remove all state for an inode (e.g. on file close or delete).
     pub fn evict(&self, ino: Ino) {
         self.states.retain(|candidate, _| candidate.ino != ino);
-        self.inflight.retain(|(candidate_ino, _), _| *candidate_ino != ino);
+        self.inflight
+            .retain(|(candidate_ino, _), _| *candidate_ino != ino);
     }
 
     #[cfg(test)]
@@ -823,6 +843,34 @@ mod tests {
         assert!(
             tracker.debug_width(1).unwrap_or(16) > 16,
             "velocity-based widening should recover after pause/resume"
+        );
+    }
+
+    #[test]
+    fn test_soft_decay_preserves_partial_state_for_media_player_pause() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let mut t = 1_000_000u64;
+        let _ = tracker.record_read_at_micros(1, 0, 0, t);
+
+        // Build up sequential score and velocity.
+        for block in 1..=32u32 {
+            t = t.saturating_add(1_000);
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+        }
+        let pre_width = tracker.debug_width(1).unwrap_or(16);
+        assert!(pre_width > 16, "should have ramped up before pause");
+
+        // Simulate a media-player pause: idle for 5 seconds (within soft-decay
+        // range: 2s < 5s < 10s).
+        t = t.saturating_add(5_000_000);
+        let p = tracker.record_read_at_micros(1, 33, 33, t);
+
+        // Soft decay should preserve *some* score so sequential continues.
+        // With the soft path the score is reduced to score/4 (still > 0 for
+        // high prior scores), so prefetch should still produce blocks.
+        assert!(
+            !p.is_empty(),
+            "soft-decayed state should still produce prefetch suggestions after short pause"
         );
     }
 }

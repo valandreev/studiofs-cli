@@ -26,11 +26,11 @@ mod commit;
 #[path = "materialize.rs"]
 mod materialize;
 
-use crate::incarnation::{
-    CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
-};
 use crate::access::{
     AccessClass, AccessClassifierConfig, AccessDecision, AccessPolicy, HandleAccessState,
+};
+use crate::incarnation::{
+    CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
 use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
@@ -190,6 +190,8 @@ pub struct VfsIngressStats {
     /// the block in cache.  Non-zero values indicate the retry budget may be
     /// too tight for the current hardware / I/O pressure profile.
     pub local_overlay_cache_miss_retry_exhaustions: u64,
+    /// Current depth of the prefetch worker's pending queue.
+    pub prefetch_queue_depth: u64,
     /// Successful ingress checkpoint persists since startup.
     pub checkpoint_persists: u64,
     /// Failed ingress checkpoint persist attempts since startup.
@@ -1469,12 +1471,7 @@ impl OpenFile {
         self.current_access_class().as_str()
     }
 
-    fn observe_read(
-        &self,
-        offset: u64,
-        len: usize,
-        cfg: AccessClassifierConfig,
-    ) -> AccessDecision {
+    fn observe_read(&self, offset: u64, len: usize, cfg: AccessClassifierConfig) -> AccessDecision {
         self.access_state.lock().observe_read(offset, len, cfg)
     }
 
@@ -3428,6 +3425,9 @@ struct MetricsState {
     /// indicates the 50 ms retry budget may be too tight under the observed
     /// L2 commit latency profile.
     local_overlay_cache_miss_retry_exhaustions: AtomicU64,
+    /// Current number of items queued in the prefetch worker's pending queue.
+    /// Useful for detecting backpressure under high handle-count workloads.
+    prefetch_queue_depth: AtomicU64,
 }
 
 impl MetricsState {
@@ -3442,6 +3442,7 @@ impl MetricsState {
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             local_overlay_cache_miss_retries: AtomicU64::new(0),
             local_overlay_cache_miss_retry_exhaustions: AtomicU64::new(0),
+            prefetch_queue_depth: AtomicU64::new(0),
         }
     }
 }
@@ -4815,8 +4816,8 @@ impl StudioVfs {
             }
         };
 
-        let start_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> VfsResult<()> {
+        let start_result =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> VfsResult<()> {
                 self.block_cache.spawn_background_tasks();
 
                 // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
@@ -4831,7 +4832,9 @@ impl StudioVfs {
                         loop {
                             // Launch as many queued prefetches as permits allow without
                             // blocking the worker event loop.
-                            while let Some((ino, stream_id, block_idx)) = pending_queue.front().copied() {
+                            while let Some((ino, stream_id, block_idx)) =
+                                pending_queue.front().copied()
+                            {
                                 if vfs_for_prefetch.shutdown_requested() {
                                     pending_queue.clear();
                                     pending_set.clear();
@@ -4849,7 +4852,8 @@ impl StudioVfs {
                                 let v = vfs_for_prefetch.clone();
                                 inflight.spawn(async move {
                                     let _permit = permit;
-                                    let _ = v.read_block_for_prefetch(ino, stream_id, block_idx).await;
+                                    let _ =
+                                        v.read_block_for_prefetch(ino, stream_id, block_idx).await;
                                 });
                             }
 
@@ -4888,6 +4892,8 @@ impl StudioVfs {
                                             pending_queue.push_back((ino, stream_id, block_idx));
                                         }
                                     }
+                                    vfs_for_prefetch.state.metrics.prefetch_queue_depth
+                                        .store(pending_queue.len() as u64, Ordering::Relaxed);
                                 }
                                 joined = inflight.join_next(), if !inflight.is_empty() => {
                                     if joined.is_none() {
@@ -4983,26 +4989,25 @@ impl StudioVfs {
                 }
 
                 Ok(())
-            },
-        )) {
-            Ok(result) => result,
-            Err(panic_payload) => {
-                let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
-                    *msg
-                } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
-                    msg.as_str()
-                } else {
-                    "unknown panic payload"
-                };
-                error!(
-                    "StudioVfs::start panicked during background startup: {}",
-                    panic_msg
-                );
-                Err(VfsError::Other(format!(
-                    "StudioVfs::start panicked during background startup: {panic_msg}"
-                )))
-            }
-        };
+            })) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+                        *msg
+                    } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
+                        msg.as_str()
+                    } else {
+                        "unknown panic payload"
+                    };
+                    error!(
+                        "StudioVfs::start panicked during background startup: {}",
+                        panic_msg
+                    );
+                    Err(VfsError::Other(format!(
+                        "StudioVfs::start panicked during background startup: {panic_msg}"
+                    )))
+                }
+            };
 
         let mut lifecycle = self.startup.lifecycle.lock();
         lifecycle.status = if start_result.is_ok() {
@@ -5715,7 +5720,10 @@ impl StudioVfs {
     ) {
         let window_ms = window.as_millis().clamp(1, u64::MAX as u128) as u64;
         let cutoff = now_ms.saturating_sub(window_ms);
-        while samples.front().is_some_and(|sample| sample.timestamp_ms < cutoff) {
+        while samples
+            .front()
+            .is_some_and(|sample| sample.timestamp_ms < cutoff)
+        {
             samples.pop_front();
         }
         while samples.len() > FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES {
@@ -5779,7 +5787,8 @@ impl StudioVfs {
                 samples_all.push(sample.latency_ns);
                 window_bytes = window_bytes.saturating_add(sample.bytes_read);
                 let latency_ms = sample.latency_ns.saturating_div(1_000_000).max(1);
-                oldest_start_ms = oldest_start_ms.min(sample.timestamp_ms.saturating_sub(latency_ms));
+                oldest_start_ms =
+                    oldest_start_ms.min(sample.timestamp_ms.saturating_sub(latency_ms));
                 newest_end_ms = newest_end_ms.max(sample.timestamp_ms);
             }
         }
@@ -5816,8 +5825,8 @@ impl StudioVfs {
             );
             for sample in samples.iter() {
                 let class_idx = sample.access_class.index();
-                bytes_by_class[class_idx] = bytes_by_class[class_idx]
-                    .saturating_add(sample.bytes_read.max(1));
+                bytes_by_class[class_idx] =
+                    bytes_by_class[class_idx].saturating_add(sample.bytes_read.max(1));
                 latest_policy_by_class[class_idx] = sample.policy;
             }
         }
@@ -6740,15 +6749,13 @@ impl StudioVfs {
     ) -> AccessDecision {
         if let Some(open_file) = fh.and_then(|handle| self.handle_table.get(handle)) {
             let decision = open_file.observe_read(offset, len, self.access_classifier);
-            self.record_access_class_transition(
-                decision.previous_class,
-                decision.class,
-                true,
-            );
+            self.record_access_class_transition(decision.previous_class, decision.class, true);
             return decision;
         }
         let state = self.fallback_access_state(ino, false);
-        let decision = state.lock().observe_read(offset, len, self.access_classifier);
+        let decision = state
+            .lock()
+            .observe_read(offset, len, self.access_classifier);
         self.record_access_class_transition(decision.previous_class, decision.class, false);
         decision
     }
@@ -6762,15 +6769,13 @@ impl StudioVfs {
     ) -> AccessDecision {
         if let Some(open_file) = fh.and_then(|handle| self.handle_table.get(handle)) {
             let decision = open_file.observe_write(offset, len, self.access_classifier);
-            self.record_access_class_transition(
-                decision.previous_class,
-                decision.class,
-                true,
-            );
+            self.record_access_class_transition(decision.previous_class, decision.class, true);
             return decision;
         }
         let state = self.fallback_access_state(ino, true);
-        let decision = state.lock().observe_write(offset, len, self.access_classifier);
+        let decision = state
+            .lock()
+            .observe_write(offset, len, self.access_classifier);
         self.record_access_class_transition(decision.previous_class, decision.class, false);
         decision
     }
@@ -7087,7 +7092,8 @@ impl StudioVfs {
                 .access_class_active_count(AccessClass::SequentialMediaRead),
             active_random_interactive_reads: self
                 .access_class_active_count(AccessClass::RandomInteractiveRead),
-            active_sequential_writers: self.access_class_active_count(AccessClass::SequentialWriter),
+            active_sequential_writers: self
+                .access_class_active_count(AccessClass::SequentialWriter),
             active_random_writers: self.access_class_active_count(AccessClass::RandomWriter),
             staged_payload_hits: self
                 .state
@@ -7976,6 +7982,11 @@ impl StudioVfs {
                 .metrics
                 .local_overlay_cache_miss_retry_exhaustions
                 .load(Ordering::Relaxed),
+            prefetch_queue_depth: self
+                .state
+                .metrics
+                .prefetch_queue_depth
+                .load(Ordering::Relaxed),
             checkpoint_persists: self
                 .state
                 .ingress
@@ -8630,13 +8641,11 @@ impl StudioVfs {
             && attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
         {
-            let _ = self
-                .prefetch_tx
-                .send(PrefetchWorkItem::Block {
-                    ino,
-                    stream_id: open_file.stream_id(),
-                    block_idx: 0,
-                });
+            let _ = self.prefetch_tx.send(PrefetchWorkItem::Block {
+                ino,
+                stream_id: open_file.stream_id(),
+                block_idx: 0,
+            });
         }
 
         Ok(fh)
@@ -9984,7 +9993,11 @@ impl StudioVfs {
             return;
         }
         if !policy.prefetch_enabled {
-            self.state.read.prefetch_last_hint.lock().remove(&(ino, stream_id));
+            self.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .remove(&(ino, stream_id));
             return;
         }
         let first_block = blocks_needed[0].0;
@@ -10038,7 +10051,11 @@ impl StudioVfs {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
                 self.readahead.evict(ino);
-                self.state.read.prefetch_last_hint.lock().remove(&(ino, stream_id));
+                self.state
+                    .read
+                    .prefetch_last_hint
+                    .lock()
+                    .remove(&(ino, stream_id));
                 return Vec::new();
             }
             Err(_) => return Vec::new(),

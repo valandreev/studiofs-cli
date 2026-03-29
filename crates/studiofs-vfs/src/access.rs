@@ -222,7 +222,9 @@ impl HandleAccessState {
             && self
                 .last_first_block
                 .is_some_and(|prev_first| first_block >= prev_first);
-        let overlapping_window = self.last_last_block.is_some_and(|prev_last| first_block <= prev_last)
+        let overlapping_window = self
+            .last_last_block
+            .is_some_and(|prev_last| first_block <= prev_last)
             && self
                 .last_first_block
                 .is_some_and(|prev_first| last_block >= prev_first);
@@ -289,7 +291,11 @@ impl HandleAccessState {
             || span_blocks >= LARGE_SEQUENTIAL_SPAN_BLOCKS;
 
         let next_class = if append_like {
-            self.bump_sequential(if span_blocks >= LARGE_SEQUENTIAL_SPAN_BLOCKS { 3 } else { 2 });
+            self.bump_sequential(if span_blocks >= LARGE_SEQUENTIAL_SPAN_BLOCKS {
+                3
+            } else {
+                2
+            });
             self.random_score = self.random_score.saturating_sub(1);
             if self.sequential_score >= WRITE_SEQUENTIAL_PROMOTION_THRESHOLD {
                 AccessClass::SequentialWriter
@@ -316,10 +322,14 @@ impl HandleAccessState {
 
     fn prepare_for_operation(&mut self, next_op: AccessOperation) {
         if self.last_op != Some(next_op) {
+            // Soft reset: clear scores but preserve block position so that the
+            // first observation after a Read↔Write switch can still detect
+            // contiguous-forward progress instead of starting from scratch.
+            // This matters for mixed workloads (e.g. append-then-read logs)
+            // that would otherwise never reach the sequential promotion
+            // threshold.
             self.sequential_score = 0;
             self.random_score = 0;
-            self.last_first_block = None;
-            self.last_last_block = None;
             self.last_op = Some(next_op);
         }
     }
@@ -401,5 +411,34 @@ mod tests {
         assert_eq!(first.class, AccessClass::SequentialWriter);
         assert_eq!(second.class, AccessClass::SequentialWriter);
         assert!(second.policy.cache_promotion_on_read);
+    }
+
+    #[test]
+    fn mixed_workload_preserves_block_position_across_operation_switch() {
+        let mut state = HandleAccessState::new(10, OpenFlags::RDWR);
+        let cfg = config();
+        // Write blocks 0, 1, 2. The first write is non-append (random), so
+        // sequential_score starts negative; by block 2 it reaches +2 which is
+        // below WRITE_SEQUENTIAL_PROMOTION_THRESHOLD(3), leaving class as
+        // RandomWriter and current_class = RandomWriter throughout.
+        state.observe_write(0, 1024, cfg);
+        state.observe_write(1024, 1024, cfg);
+        state.observe_write(2048, 1024, cfg);
+        assert_eq!(state.current_class(), AccessClass::RandomWriter);
+
+        // Switch to read at the next contiguous position — block 3.
+        // With the soft reset, last_last_block=Some(2) is preserved, so the
+        // classifier detects contiguous-forward from the very first read.
+        let r1 = state.observe_read(3072, 1024, cfg);
+        // gain=2 → sequential_score=2, below threshold(4) → inherits RandomWriter.
+        assert_eq!(r1.class, AccessClass::RandomWriter);
+
+        // Second contiguous read at block 4: gain=2 → seq=4 ≥ threshold(4).
+        let r2 = state.observe_read(4096, 1024, cfg);
+        assert_eq!(
+            r2.class,
+            AccessClass::SequentialMediaRead,
+            "soft reset: promotion after 2 contiguous reads (vs 3 with full reset)"
+        );
     }
 }
