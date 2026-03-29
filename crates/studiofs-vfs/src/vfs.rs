@@ -5931,7 +5931,7 @@ impl StudioVfs {
         let foreground_active = self.foreground_read_active();
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
-        let pressure_boost = u64::from(upload_pressure_boost.max(1));
+        let pressure_boost = u64::from(upload_pressure_boost);
 
         let current_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
         let next_penalty_ms = if congested {
