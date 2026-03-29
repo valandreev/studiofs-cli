@@ -101,9 +101,10 @@ The current architecture relies on these focused regressions:
 - metadata hotset promotion:
   - `dentry_cache_tracks_hotset_occupancy_and_hits`
   - `attr_read_cache_is_bounded_and_tracks_hotset_hits`
-- SFS-121 / SFS-123 buffered-first correctness and performance:
+- Buffered-first correctness and performance (manual S3 tests; not covered by the `sfs121_`-filtered SFS-121 suite):
   - `local_reads_through_upload_with_partial_tail_block` *(requires S3)*
   - `concurrent_reads_through_upload_finalization` *(requires S3)*
+- SFS-121 buffered-first regression suite (tests prefixed `sfs121_`, covered by the “Buffered-first” commands):
   - `sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle` *(requires S3)*
   - `sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum` *(requires S3)*
   - `sfs121_warm_cache_sequential_read_bounded_latency_after_write`
