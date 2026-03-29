@@ -119,7 +119,7 @@ Handle-aware write path:
   - `wait_for_ingress_drain(ino, timeout)` which waits only for local ingress to drain for that inode.
 - This provides synchronous local durability confirmation for unbuffered callers at natural sync boundaries; S3 upload remains asynchronous.
 - In `cache_safety_mode=durable`, ingress WAL appends are forced with local `sync_data()`, so this confirmation is resilient to process crash and OS-page-cache loss scenarios.
-- Asynchronous upload failures are tracked as sticky inode errors; the next `flush_fh`/`fsync` reports `EIO` and consumes that sticky error (new async failures can set it again).
+- Asynchronous upload failures are tracked as sticky inode errors; `flush_fh` / `fsync` report `EIO` deterministically until the async pipeline recovers and clears the sticky state.
 - `flush_fh`/`fsync` report sticky upload errors only after finishing the current local sync step, so newly written data is still persisted locally before `EIO` is returned.
 
 ### 2. `flush(ino)` / `close(ino)`
@@ -145,6 +145,26 @@ Crash semantics note:
   (`SIGKILL`/process crash), very recent accepted writes that were not yet
   materialized can be lost (typically the last materializer window).
 - `durable` mode keeps WAL/checkpoint-backed restart recovery for accepted ingress.
+
+### File Session Ordering Model
+
+- Active regular-file transitions are owned by a per-inode file-session gate in VFS core.
+- `read` operations use a shared session lock (parallel reads on the same inode are allowed).
+- `write`, `flush`, `fsync`, and `release` use an exclusive session lock (state-changing barriers).
+- Background stages (`materialize`, `upload`, `finalize`) publish explicit per-inode transition events through the same file-session state.
+- Open-handle counts are mirrored into file-session state on `open_file` / `release_fh` so lifecycle state and operation ordering live in one authority.
+- Session registry is stored as `HashMap<Ino, Weak<FileSessionEntry>>`; active operations/handles keep strong `Arc` ownership.
+- Idle sessions are garbage-collected lazily by pruning dead `Weak` entries (no strong owners remain).
+- Observability is exposed through `file_session_stats()`:
+  - active sessions,
+  - open handles,
+  - queued operations,
+  - max queue depth,
+  - wait events / wait milliseconds,
+  - transition counts,
+  - wait reasons by operation class.
+- Session observability counters are maintained incrementally via atomics, so
+  `file_session_stats()` does not need a full-table scan of active sessions.
 
 Ingress WAL internals:
 - The WAL subsystem is implemented in [`crates/studiofs-vfs/src/ingress_wal.rs`].
