@@ -34,6 +34,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use studiofs_meta::types::Ino;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReadStreamKey {
+    pub ino: Ino,
+    pub stream_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReadAheadPolicy {
+    pub base_width: u32,
+    pub max_width: u32,
+    pub min_prefetch_on_seq: u32,
+    pub prefetch_enabled: bool,
+}
+
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
 const MAX_SCORE: u8 = 255;
 const VELOCITY_SAMPLE_ALPHA: f64 = 0.25;
@@ -72,7 +86,7 @@ struct ReadState {
 /// Tracks per-inode sequential read patterns and manages in-flight prefetch state.
 pub struct ReadAheadTracker {
     /// Per-inode state.
-    states: DashMap<Ino, ReadState>,
+    states: DashMap<ReadStreamKey, ReadState>,
     /// Blocks that are already being prefetched — avoids duplicate work.
     inflight: DashMap<(Ino, u32), ()>,
     /// Maximum blocks ahead to fetch when fully ramped-up.
@@ -93,6 +107,15 @@ pub struct ReadAheadTracker {
 }
 
 impl ReadAheadTracker {
+    fn default_policy(&self) -> ReadAheadPolicy {
+        ReadAheadPolicy {
+            base_width: self.base_width,
+            max_width: self.width,
+            min_prefetch_on_seq: self.min_prefetch_on_seq,
+            prefetch_enabled: true,
+        }
+    }
+
     fn monotonic_now_micros() -> u64 {
         static START: OnceLock<Instant> = OnceLock::new();
         START
@@ -102,9 +125,9 @@ impl ReadAheadTracker {
             .min(u64::MAX as u128) as u64
     }
 
-    fn velocity_width_target(&self, blocks_per_sec: f64) -> u32 {
+    fn velocity_width_target(&self, blocks_per_sec: f64, base_width: u32, max_width: u32) -> u32 {
         if !blocks_per_sec.is_finite() || blocks_per_sec <= 0.0 {
-            return self.base_width;
+            return base_width;
         }
         let multiplier: u32 = if blocks_per_sec >= 512.0 {
             8
@@ -119,24 +142,28 @@ impl ReadAheadTracker {
         } else {
             1
         };
-        self.base_width
+        base_width
             .saturating_mul(multiplier)
-            .clamp(self.base_width, self.width)
+            .clamp(base_width, max_width)
     }
 
     fn record_read_with_stamp(
         &self,
-        ino: Ino,
+        key: ReadStreamKey,
         first_block: u32,
         last_block: u32,
+        policy: ReadAheadPolicy,
         now_micros: u64,
     ) -> Vec<u32> {
         let now_micros = now_micros.max(1);
-        let mut state = self.states.entry(ino).or_insert(ReadState {
+        let base_width = policy.base_width.max(1);
+        let max_width = policy.max_width.max(base_width);
+        let min_prefetch_on_seq = policy.min_prefetch_on_seq.max(1).min(max_width);
+        let mut state = self.states.entry(key).or_insert(ReadState {
             last_block: u32::MAX,
             score: 0,
             sequential_streak: 0,
-            current_width: self.base_width,
+            current_width: base_width,
             last_read_at_micros: 0,
             velocity_blocks_per_sec_ema: 0.0,
             velocity_sample_anchor_micros: 0,
@@ -149,7 +176,7 @@ impl ReadAheadTracker {
             // Previous throughput signal is stale after long idle periods.
             state.score = 0;
             state.sequential_streak = 0;
-            state.current_width = self.base_width;
+            state.current_width = base_width;
             state.velocity_blocks_per_sec_ema = 0.0;
             // Re-seed anchor with "now" so resumed sequential reads can build
             // fresh velocity samples immediately after idle reset.
@@ -197,7 +224,7 @@ impl ReadAheadTracker {
                 for _ in 0..ramp_steps {
                     next_width = next_width.saturating_mul(2);
                 }
-                state.current_width = next_width.clamp(self.base_width, self.width);
+                state.current_width = next_width.clamp(base_width, max_width);
             }
             if state.last_read_at_micros > 0 {
                 if state.velocity_sample_anchor_micros == 0 {
@@ -222,12 +249,15 @@ impl ReadAheadTracker {
                             };
                         state.velocity_sample_anchor_micros = now_micros;
                         state.velocity_sample_blocks = 0;
-                        let velocity_width =
-                            self.velocity_width_target(state.velocity_blocks_per_sec_ema);
+                        let velocity_width = self.velocity_width_target(
+                            state.velocity_blocks_per_sec_ema,
+                            base_width,
+                            max_width,
+                        );
                         state.current_width = state
                             .current_width
                             .max(velocity_width)
-                            .clamp(self.base_width, self.width);
+                            .clamp(base_width, max_width);
                     }
                 }
             }
@@ -244,7 +274,7 @@ impl ReadAheadTracker {
                 state.velocity_blocks_per_sec_ema *= 0.5;
             }
             state.sequential_streak = 0;
-            state.current_width = self.base_width;
+            state.current_width = base_width;
             state.velocity_sample_anchor_micros = 0;
             state.velocity_sample_blocks = 0;
         }
@@ -252,10 +282,10 @@ impl ReadAheadTracker {
         state.last_block = last_block;
         state.last_read_at_micros = now_micros;
         let score = state.score;
-        let current_width = state.current_width.clamp(self.base_width, self.width);
+        let current_width = state.current_width.clamp(base_width, max_width);
         drop(state);
 
-        if score == 0 {
+        if score == 0 || !policy.prefetch_enabled {
             return Vec::new();
         }
 
@@ -264,12 +294,12 @@ impl ReadAheadTracker {
         if (is_sequential || is_same_block) && score > 0 {
             // For small sequential reads over high-latency links, keep a
             // minimum look-ahead window to avoid throughput oscillation.
-            prefetch_count = prefetch_count.max(self.min_prefetch_on_seq.min(current_width));
+            prefetch_count = prefetch_count.max(min_prefetch_on_seq.min(current_width));
         }
         (1..=prefetch_count)
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
-                if self.inflight.contains_key(&(ino, block)) {
+                if self.inflight.contains_key(&(key.ino, block)) {
                     None // Already in-flight
                 } else {
                     Some(block)
@@ -336,7 +366,28 @@ impl ReadAheadTracker {
     /// Returns the list of *upcoming* block indices that the caller should
     /// schedule for prefetch.  Only blocks not already in-flight are returned.
     pub fn record_read(&self, ino: Ino, first_block: u32, last_block: u32) -> Vec<u32> {
-        self.record_read_with_stamp(ino, first_block, last_block, Self::monotonic_now_micros())
+        self.record_read_for_stream(
+            ReadStreamKey { ino, stream_id: 0 },
+            first_block,
+            last_block,
+            self.default_policy(),
+        )
+    }
+
+    pub fn record_read_for_stream(
+        &self,
+        key: ReadStreamKey,
+        first_block: u32,
+        last_block: u32,
+        policy: ReadAheadPolicy,
+    ) -> Vec<u32> {
+        self.record_read_with_stamp(
+            key,
+            first_block,
+            last_block,
+            policy,
+            Self::monotonic_now_micros(),
+        )
     }
 
     /// Mark a block as in-flight for prefetch.
@@ -361,7 +412,11 @@ impl ReadAheadTracker {
     /// can still be in flight. Dropping those stale tasks improves seek
     /// responsiveness for interactive video playback.
     pub fn is_prefetch_relevant(&self, ino: Ino, block: u32) -> bool {
-        let Some(state) = self.states.get(&ino) else {
+        self.is_prefetch_relevant_for_stream(ReadStreamKey { ino, stream_id: 0 }, block)
+    }
+
+    pub fn is_prefetch_relevant_for_stream(&self, key: ReadStreamKey, block: u32) -> bool {
+        let Some(state) = self.states.get(&key) else {
             return true;
         };
         let head = state.last_block;
@@ -372,12 +427,15 @@ impl ReadAheadTracker {
 
     /// Remove all state for an inode (e.g. on file close or delete).
     pub fn evict(&self, ino: Ino) {
-        self.states.remove(&ino);
+        self.states.retain(|candidate, _| candidate.ino != ino);
+        self.inflight.retain(|(candidate_ino, _), _| *candidate_ino != ino);
     }
 
     #[cfg(test)]
     fn debug_width(&self, ino: Ino) -> Option<u32> {
-        self.states.get(&ino).map(|s| s.current_width)
+        self.states
+            .get(&ReadStreamKey { ino, stream_id: 0 })
+            .map(|s| s.current_width)
     }
 
     #[cfg(test)]
@@ -388,7 +446,13 @@ impl ReadAheadTracker {
         last_block: u32,
         at_micros: u64,
     ) -> Vec<u32> {
-        self.record_read_with_stamp(ino, first_block, last_block, at_micros)
+        self.record_read_with_stamp(
+            ReadStreamKey { ino, stream_id: 0 },
+            first_block,
+            last_block,
+            self.default_policy(),
+            at_micros,
+        )
     }
 }
 

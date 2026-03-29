@@ -722,8 +722,12 @@ impl Filesystem for StudioFuseFs {
             }
         }
 
-        match self.rt.block_on(self.vfs.read(ino, offset as u64, size)) {
-            Ok(data) => reply.data(&data),
+        let mut out = vec![0u8; size as usize];
+        match self
+            .rt
+            .block_on(self.vfs.read_into_fh(fh, ino, offset as u64, &mut out))
+        {
+            Ok(n) => reply.data(&out[..n as usize]),
             Err(e) => {
                 error!("read({ino}, off={offset}, sz={size}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
@@ -735,7 +739,7 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -743,7 +747,10 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match self.rt.block_on(self.vfs.write(ino, offset as u64, data)) {
+        match self
+            .rt
+            .block_on(self.vfs.write_fh(fh, ino, offset as u64, data))
+        {
             Ok(written) => reply.written(written),
             Err(e) => {
                 error!("write({ino}, off={offset}) -> {e}");
