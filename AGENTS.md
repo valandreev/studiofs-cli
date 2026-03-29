@@ -2,7 +2,7 @@
 
 ## Rust router
 
-Always use your /rust-router skill for any code work
+If you are using an agent or internal tooling that provides a `/rust-router` capability, prefer that for routing and organizing Rust-related tasks. Human contributors who do not have such a tool can safely ignore this and work directly with the standard Rust workspace and `cargo` commands described below.
 
 ## Project Structure & Module Organization
 
