@@ -4984,6 +4984,12 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
 
 #[test]
 fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
+    apply_test_online_s3_env();
+
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

@@ -369,6 +369,11 @@ impl Materializer {
                 extent.object_id,
                 extent.content_epoch,
             );
+            vfs.note_file_session_background_transition(
+                extent.ino,
+                FileSessionOperation::Materialize,
+                "drained",
+            );
 
             {
                 let mut dirty = vfs.state.dirty_buffer.dirty_mem.lock();
@@ -425,6 +430,13 @@ impl Materializer {
         }
 
         vfs.block_cache.submit_uploads_batch(&upload_ops);
+        for (ino, _, _, _) in &upload_ops {
+            vfs.note_file_session_background_transition(
+                *ino,
+                FileSessionOperation::Upload,
+                "queued",
+            );
+        }
 
         vfs.state
             .dirty_buffer
