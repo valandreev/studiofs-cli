@@ -179,6 +179,14 @@ pub struct VfsIngressStats {
     pub drained_spill_blocks: u64,
     /// Total bytes drained from spill accepted state into metadata/cache.
     pub drained_spill_bytes: u64,
+    /// Retry attempts made when a locally-accepted block was found in
+    /// `live_extent_records` but was transiently absent from the block cache
+    /// (bounded local-stage recovery between L1 unpin and L2 commit).
+    pub local_overlay_cache_miss_retries: u64,
+    /// Number of times the bounded retry loop was exhausted without finding
+    /// the block in cache.  Non-zero values indicate the retry budget may be
+    /// too tight for the current hardware / I/O pressure profile.
+    pub local_overlay_cache_miss_retry_exhaustions: u64,
     /// Successful ingress checkpoint persists since startup.
     pub checkpoint_persists: u64,
     /// Failed ingress checkpoint persist attempts since startup.
@@ -617,6 +625,15 @@ const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const DEFAULT_DIRECT_IO_SYNC_TIMEOUT_SECS: u64 = 120;
 const DIRECT_IO_SYNC_WAIT_WITH_INGRESS_MS: u64 = 25;
+/// Maximum retry attempts when a locally-accepted block is found in
+/// `live_extent_records` but is transiently absent from the block cache.
+/// This covers the narrow window between `complete_upload` (L1 unpin) and
+/// the corresponding `commit_l2_batch` write completing on local NVMe.
+/// Budget: 5 × 10 ms = 50 ms, which comfortably covers NVMe commit latency
+/// under high I/O pressure while remaining well within application read timeouts.
+const LOCAL_OVERLAY_CACHE_MISS_MAX_RETRIES: u32 = 5;
+/// Per-retry sleep duration in milliseconds for local overlay cache-miss recovery.
+const LOCAL_OVERLAY_CACHE_MISS_WAIT_MS: u64 = 10;
 
 fn direct_io_sync_timeout() -> Duration {
     let secs = std::env::var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS")
@@ -3313,6 +3330,15 @@ struct MetricsState {
     materialize_batch_stats: MaterializeBatchStats,
     ignored_entries: Mutex<IgnoredEntryRegistry>,
     next_ignored_ino: AtomicU64,
+    /// Retry attempts made when a locally-accepted block was present in
+    /// `live_extent_records` but transiently absent from the block cache
+    /// (bounded recovery between L1 unpin and L2 commit).
+    local_overlay_cache_miss_retries: AtomicU64,
+    /// Number of times the bounded retry loop was exhausted and a locally-accepted
+    /// block was still absent from cache after all attempts.  A non-zero value
+    /// indicates the 50 ms retry budget may be too tight under the observed
+    /// L2 commit latency profile.
+    local_overlay_cache_miss_retry_exhaustions: AtomicU64,
 }
 
 impl MetricsState {
@@ -3325,6 +3351,8 @@ impl MetricsState {
             materialize_batch_stats: MaterializeBatchStats::default(),
             ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
+            local_overlay_cache_miss_retries: AtomicU64::new(0),
+            local_overlay_cache_miss_retry_exhaustions: AtomicU64::new(0),
         }
     }
 }
@@ -5886,6 +5914,7 @@ impl StudioVfs {
         block_index: u32,
         pending_content_epoch: Option<u64>,
     ) -> VfsResult<Option<Bytes>> {
+        // Stage 1 — write-buffer: unflushed pending_blocks (active write accumulation).
         if let Some(pending_block) = self
             .state
             .write_buffer
@@ -5895,6 +5924,7 @@ impl StudioVfs {
         {
             return Ok(Some(pending_block.data.clone().freeze()));
         }
+        // Stage 2 — RAM-accepted: dirty_mem (after flush_ordered, before Materializer::drain).
         if let Some(data) = self
             .state
             .dirty_buffer
@@ -5904,12 +5934,34 @@ impl StudioVfs {
         {
             return Ok(Some(data.clone()));
         }
+        // Stage 3 — live-extent: materialized in block cache under stage_l1 pin.
+        // Invariant: dirty_mem is cleared only AFTER record_live_extent + stage_l1 succeed,
+        // so both stages are never simultaneously absent.  The pin is held through
+        // submit_uploads_batch; it is released by complete_upload.  Between complete_upload
+        // and commit_l2_batch finishing, the block may be absent from cache — the async
+        // variant handles this with bounded retries.
+        //
+        // Safety of cache miss here: this sync function is called exclusively from two
+        // contexts:
+        //   (a) read_into_sync_cached_with_mode / probe_sync_cached_blocks — a cache miss
+        //       causes the caller to return None, which makes read_into_fh_sync_cached
+        //       fall through to the async read path where the bounded retry applies.
+        //   (b) load_local_block_bytes_sync (truncation only) — a miss falls through to the
+        //       committed block_cache lookup; all read paths clamp output to attr.size so
+        //       no user-visible data regression occurs.
+        // In both cases accepting a miss here is safe and correct.
         if let Some(extent) =
             self.pending_live_extent_record(ino, block_index, pending_content_epoch)
             && let Some(data) = self.block_cache.get_sync(extent.object_id)
         {
             return Ok(Some(data));
         }
+        // Stage 4 — spill WAL: CacheSafetyMode::Durable or forced-spill overflow.
+        // Note: apply_batch removes the spill entry AFTER stage_l1 + record_live_extent,
+        // so a block cannot be simultaneously absent from Stage 3 and present in Stage 4
+        // during normal materialization.  Stage 4 is therefore relevant only for blocks
+        // that were never materialized (durable mode path or blocks still in original
+        // spill WAL before any drain cycle).
         if let Some(data) = self.load_spill_block((ino, block_index))? {
             return Ok(Some(data));
         }
@@ -5922,6 +5974,7 @@ impl StudioVfs {
         block_index: u32,
         pending_content_epoch: Option<u64>,
     ) -> VfsResult<Option<Bytes>> {
+        // Stage 1 — write-buffer: unflushed pending_blocks (active write accumulation).
         if let Some(pending_block) = self
             .state
             .write_buffer
@@ -5931,6 +5984,7 @@ impl StudioVfs {
         {
             return Ok(Some(pending_block.data.clone().freeze()));
         }
+        // Stage 2 — RAM-accepted: dirty_mem (after flush_ordered, before Materializer::drain).
         if let Some(data) = self
             .state
             .dirty_buffer
@@ -5940,12 +5994,53 @@ impl StudioVfs {
         {
             return Ok(Some(data.clone()));
         }
+        // Stage 3 — live-extent: block is materialized in the block cache.
+        //
+        // The pipeline ordering guarantees:
+        //   apply_batch: stage_l1 (pin) → record_live_extent → dirty_mem.remove
+        //   upload path: submit_uploads_batch (re-pin) → complete_upload (unpin)
+        //   L2 path:     commit_l2_batch (async NVMe write, scheduled after stage_l1)
+        //   finalization: remove_live_extents_for_inode_epoch (after publish_file_manifest)
+        //
+        // Normal case: block is pinned in L1 (stage_l1 through complete_upload) or already
+        // written to L2.  Fast path returns immediately.
         if let Some(extent) =
             self.pending_live_extent_record(ino, block_index, pending_content_epoch)
-            && let Some(data) = self.block_cache.get(extent.object_id).await
         {
-            return Ok(Some(data));
+            if let Some(data) = self.block_cache.get(extent.object_id).await {
+                return Ok(Some(data));
+            }
+            // Slow path: the live extent is present but the block is transiently absent
+            // from cache.  This is the narrow window between complete_upload releasing the
+            // L1 pin and commit_l2_batch finishing the NVMe write.  Apply bounded retries
+            // to preserve local-path semantics before falling through to the remote path.
+            for _ in 0..LOCAL_OVERLAY_CACHE_MISS_MAX_RETRIES {
+                self.state
+                    .metrics
+                    .local_overlay_cache_miss_retries
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(LOCAL_OVERLAY_CACHE_MISS_WAIT_MS)).await;
+                if let Some(data) = self.block_cache.get(extent.object_id).await {
+                    return Ok(Some(data));
+                }
+            }
+            // Retries exhausted.  The block is committed to metadata / S3; fall through
+            // to Stage 4 and then the committed remote path.  This is safe because
+            // apply_batch calls flush_blocks_batch (metadata commit) before record_live_extent,
+            // guaranteeing the block_ref is discoverable via get_file_block_async and
+            // the S3 object exists (upload completed before complete_upload ran).
+            self.state
+                .metrics
+                .local_overlay_cache_miss_retry_exhaustions
+                .fetch_add(1, Ordering::Relaxed);
         }
+        // Stage 4 — spill WAL: CacheSafetyMode::Durable or forced-spill overflow.
+        // Note: apply_batch removes the spill entry AFTER stage_l1 + record_live_extent,
+        // so a block that reached Stage 3 will not be found here.  Stage 4 catches blocks
+        // that were never materialized (still in original spill WAL) or that arrived via
+        // the durable-mode fast path.  After Stage 4, returning None sends the caller to
+        // read_block, which is always valid here because flush_blocks_batch in apply_batch
+        // commits the block_ref to metadata before record_live_extent fires.
         if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
             return Ok(Some(data));
         }
@@ -7401,6 +7496,16 @@ impl StudioVfs {
                 .state
                 .metrics
                 .drained_spill_bytes
+                .load(Ordering::Relaxed),
+            local_overlay_cache_miss_retries: self
+                .state
+                .metrics
+                .local_overlay_cache_miss_retries
+                .load(Ordering::Relaxed),
+            local_overlay_cache_miss_retry_exhaustions: self
+                .state
+                .metrics
+                .local_overlay_cache_miss_retry_exhaustions
                 .load(Ordering::Relaxed),
             checkpoint_persists: self
                 .state
