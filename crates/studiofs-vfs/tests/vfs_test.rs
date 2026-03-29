@@ -36,7 +36,8 @@ use studiofs_meta::{
 };
 use studiofs_vfs::{
     CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw,
-    VfsConfigValidated, VfsError, VfsIngressLane, VfsUploadState, parse_size_bytes,
+    VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
+    VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -313,9 +314,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_SLOTS") {
         config.upload_cache_io_slots = Some(value);
-    }
-    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
-        config.upload_cache_io_user_penalty = Some(value as u32);
     }
     if let Some(value) = parse_env_u64("STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS") {
         config.upload_user_idle_grace_ms = Some(value);
@@ -1101,6 +1099,34 @@ where
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn measure_foreground_read_phase(
+    vfs: &Arc<StudioVfs>,
+    ino: u64,
+    expected: &[u8],
+    read_passes: usize,
+    per_read_timeout: Duration,
+    phase_name: &str,
+) -> (Duration, f64, VfsForegroundReadProtectionStats) {
+    let sweep_start = Instant::now();
+    for pass in 0..read_passes {
+        let bytes = tokio::time::timeout(per_read_timeout, vfs.read(ino, 0, expected.len() as u32))
+            .await
+            .unwrap_or_else(|_| panic!("{phase_name} read timed out on pass {pass}"))
+            .unwrap_or_else(|err| panic!("{phase_name} read failed on pass {pass}: {err}"));
+        assert_eq!(
+            bytes.as_ref(),
+            expected,
+            "{phase_name} pass {pass}: data mismatch"
+        );
+    }
+    let sweep_elapsed = sweep_start.elapsed();
+    let throughput_mib_s = (read_passes * expected.len()) as f64
+        / (1024.0 * 1024.0)
+        / sweep_elapsed.as_secs_f64();
+    let protection_stats = vfs.foreground_read_protection_stats();
+    (sweep_elapsed, throughput_mib_s, protection_stats)
 }
 
 fn l2_cache_block_bytes(cache_dir: &std::path::Path) -> u64 {
@@ -3542,7 +3568,6 @@ impl ScopedTestEnv {
             "STUDIOFS_UPLOAD_RETRY_BASE_MS",
             "STUDIOFS_UPLOAD_RETRY_MAX_MS",
             "STUDIOFS_UPLOAD_CACHE_IO_SLOTS",
-            "STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY",
             "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
             "STUDIOFS_UPLOAD_INITIAL_WINDOW",
             "STUDIOFS_UPLOAD_MIN_WINDOW",
@@ -9015,6 +9040,176 @@ fn sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum() {
             throughput_mib_s >= 4.0,
             "foreground sequential read throughput during upload too low: \
              {throughput_mib_s:.2} MiB/s (minimum: 4.0 MiB/s)"
+        );
+    });
+    rt.shutdown_background();
+}
+
+/// Compare buffered foreground-read performance across the three scheduler
+/// phases that matter for buffered-first regressions:
+/// - steady-state read with no pending upload
+/// - read while a new overwrite is uploading
+/// - read again after that upload fully drains
+///
+/// The test keeps the same inode hot so the automated check exercises the
+/// exact QoS path users hit after an overwrite on Windows/macOS.
+#[test]
+#[ignore = "requires S3 backend; compares buffered foreground read baseline/during/post upload"]
+fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
+    let _env = setup_online_sfs121_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("sfs121-phases-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 1024 * 1024;
+
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let full_size = block_size * 4;
+    let baseline_payload: Vec<u8> = (0..full_size).map(|i| (i as u8) ^ 0x37).collect();
+    let updated_payload: Vec<u8> = (0..full_size)
+        .map(|i| (i as u8).wrapping_mul(0x5B).wrapping_add(0x11))
+        .collect();
+
+    const READ_PASSES: usize = 8;
+    const MAX_SWEEP_DURATION: Duration = Duration::from_secs(10);
+    const PHASE_RESET_DELAY: Duration = Duration::from_millis(1700);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let attr = vfs.create(1, b"sfs121-phases.bin", 0, 0, 0o644).unwrap();
+
+        vfs.write(attr.ino, 0, &baseline_payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                let current_attr = vfs.getattr(attr.ino).unwrap();
+                vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    && current_attr.upload_state == UploadState::Ready
+            })
+            .await,
+            "initial upload did not drain before baseline sweep"
+        );
+
+        let (baseline_elapsed, baseline_throughput_mib_s, baseline_stats) =
+            measure_foreground_read_phase(
+                &vfs,
+                attr.ino,
+                &baseline_payload,
+                READ_PASSES,
+                MAX_SWEEP_DURATION,
+                "baseline",
+            )
+            .await;
+        assert!(
+            baseline_stats.speedometer_samples > 0,
+            "baseline foreground protection stats must contain samples"
+        );
+
+        tokio::time::sleep(PHASE_RESET_DELAY).await;
+
+        vfs.write(attr.ino, 0, &updated_payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must be populated before during-upload sweep begins"
+        );
+
+        let (during_elapsed, during_throughput_mib_s, during_stats) =
+            measure_foreground_read_phase(
+                &vfs,
+                attr.ino,
+                &updated_payload,
+                READ_PASSES,
+                MAX_SWEEP_DURATION,
+                "during-upload",
+            )
+            .await;
+
+        assert!(
+            during_stats.speedometer_samples > 0,
+            "during-upload foreground protection stats must contain samples"
+        );
+        assert!(
+            during_stats.window_bytes > 0,
+            "during-upload foreground protection stats must capture window bytes"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                let current_attr = vfs.getattr(attr.ino).unwrap();
+                vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    && current_attr.upload_state == UploadState::Ready
+            })
+            .await,
+            "overwrite upload did not drain before post-upload sweep"
+        );
+
+        tokio::time::sleep(PHASE_RESET_DELAY).await;
+
+        let (post_elapsed, post_throughput_mib_s, post_stats) = measure_foreground_read_phase(
+            &vfs,
+            attr.ino,
+            &updated_payload,
+            READ_PASSES,
+            MAX_SWEEP_DURATION,
+            "post-upload",
+        )
+        .await;
+
+        assert!(
+            post_stats.speedometer_samples > 0,
+            "post-upload foreground protection stats must contain samples"
+        );
+        assert!(
+            during_elapsed <= MAX_SWEEP_DURATION,
+            "during-upload sweep exceeded {MAX_SWEEP_DURATION:?}: baseline={baseline_elapsed:?}, during={during_elapsed:?}, post={post_elapsed:?}"
+        );
+        assert!(
+            post_elapsed <= MAX_SWEEP_DURATION,
+            "post-upload sweep exceeded {MAX_SWEEP_DURATION:?}: baseline={baseline_elapsed:?}, during={during_elapsed:?}, post={post_elapsed:?}"
+        );
+        assert!(
+            during_throughput_mib_s >= 4.0
+                || during_throughput_mib_s >= baseline_throughput_mib_s * 0.25,
+            "foreground read degraded too far during upload: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s, during_p90_ms={}, during_penalty_ms={}, during_cost={}",
+            during_stats
+                .p90_latency_ns
+                .map(|ns| ns / 1_000_000)
+                .unwrap_or(0),
+            during_stats.upload_scheduler_penalty_ms,
+            during_stats.upload_cache_io_foreground_cost,
+        );
+        assert!(
+            post_throughput_mib_s >= 4.0,
+            "post-upload throughput too low: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
+        );
+        assert!(
+            post_throughput_mib_s >= during_throughput_mib_s * 0.8,
+            "post-upload throughput failed to recover after upload drained: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
         );
     });
     rt.shutdown_background();

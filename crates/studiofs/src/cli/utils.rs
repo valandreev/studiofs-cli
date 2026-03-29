@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
@@ -58,12 +58,25 @@ pub fn pid_file_path(mount_point: &str) -> Result<PathBuf> {
 
 /// Write a JSON PID file for a mount.
 pub fn write_pid_file(mount_point: &str, volume: &str, pid: u32) -> Result<()> {
+    write_pid_file_with_cache_path(mount_point, volume, pid, None)
+}
+
+/// Write a JSON PID file for a mount, optionally including the resolved cache path.
+pub fn write_pid_file_with_cache_path(
+    mount_point: &str,
+    volume: &str,
+    pid: u32,
+    cache_path: Option<&Path>,
+) -> Result<()> {
     let path = pid_file_path(mount_point)?;
-    let info = serde_json::json!({
+    let mut info = serde_json::json!({
         "pid": pid,
         "mount_point": mount_point,
         "volume": volume,
     });
+    if let Some(cache_path) = cache_path.and_then(Path::to_str) {
+        info["cache_path"] = serde_json::Value::String(cache_path.to_string());
+    }
     std::fs::write(&path, serde_json::to_string_pretty(&info)?)?;
     Ok(())
 }

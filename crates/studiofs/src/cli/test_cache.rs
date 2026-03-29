@@ -70,6 +70,7 @@ struct TestCacheParams {
 struct ActiveMount {
     mount_point: PathBuf,
     volume: String,
+    cache_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +82,7 @@ enum ResolvedRunMode {
         volume: String,
         mount_point: PathBuf,
         work_root: PathBuf,
+        cache_path: Option<PathBuf>,
     },
 }
 
@@ -190,9 +192,29 @@ struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     advanced_metrics: Option<AdvancedMetricsReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    buffered_read_comparison: Option<MountedBufferedReadComparisonReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream_results: Option<Vec<StreamResultReport>>,
     writes: OpReport,
     reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+struct MountedBufferedReadComparisonReport {
+    cache_path: String,
+    upload_dir: String,
+    phases: Vec<MountedBufferedReadPhaseReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct MountedBufferedReadPhaseReport {
+    phase: String,
+    wait_target: String,
+    target_state_observed: bool,
+    wait_ms: f64,
+    pending_uploads_before: usize,
+    pending_uploads_after: usize,
+    results: OpReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -1231,6 +1253,152 @@ fn stream_reports_from_telemetry(
     )
 }
 
+#[derive(Clone, Copy)]
+enum PendingUploadTarget {
+    Active,
+    Idle,
+}
+
+impl PendingUploadTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Idle => "idle",
+        }
+    }
+
+    fn matches(self, pending_uploads: usize) -> bool {
+        match self {
+            Self::Active => pending_uploads > 0,
+            Self::Idle => pending_uploads == 0,
+        }
+    }
+}
+
+struct PendingUploadObservation {
+    target: PendingUploadTarget,
+    observed: bool,
+    waited: Duration,
+    pending_uploads: usize,
+}
+
+fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(upload_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err).with_context(|| format!("read {}", upload_dir.display())),
+    };
+
+    Ok(entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pending"))
+        .count())
+}
+
+async fn wait_for_pending_upload_target(
+    upload_dir: &Path,
+    target: PendingUploadTarget,
+    timeout: Duration,
+) -> Result<PendingUploadObservation> {
+    let start = Instant::now();
+    loop {
+        let pending_uploads = scan_pending_uploads(upload_dir)?;
+        if target.matches(pending_uploads) {
+            return Ok(PendingUploadObservation {
+                target,
+                observed: true,
+                waited: start.elapsed(),
+                pending_uploads,
+            });
+        }
+        if start.elapsed() >= timeout {
+            return Ok(PendingUploadObservation {
+                target,
+                observed: false,
+                waited: start.elapsed(),
+                pending_uploads,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn run_mounted_write_phase(
+    params: &TestCacheParams,
+    files: &[WorkFile],
+    order: &[usize],
+    size_class_bounds: SizeClassBounds,
+) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
+    if params.sequential_streams {
+        let writes_by_stream = run_filesystem_writes_sequential_streams(
+            files,
+            order,
+            params.concurrency,
+            params.io_depth,
+            size_class_bounds,
+        )
+        .await?;
+        let mut merged = PhaseTelemetry::default();
+        for stream in &writes_by_stream {
+            merged.merge_from_ref(stream);
+        }
+        Ok((merged, writes_by_stream))
+    } else {
+        Ok((
+            run_filesystem_writes(
+                files,
+                order,
+                params.io_depth,
+                params.concurrency,
+                size_class_bounds,
+            )
+            .await?,
+            Vec::new(),
+        ))
+    }
+}
+
+async fn run_mounted_read_phase(
+    params: &TestCacheParams,
+    files: &[WorkFile],
+    order: &[usize],
+    size_class_bounds: SizeClassBounds,
+) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
+    if params.sequential_streams {
+        let reads_by_stream = run_filesystem_reads_sequential_streams(
+            files,
+            order,
+            params.concurrency,
+            params.io_depth,
+            params.read_size,
+            size_class_bounds,
+        )
+        .await?;
+        let mut merged = PhaseTelemetry::default();
+        for stream in &reads_by_stream {
+            merged.merge_from_ref(stream);
+        }
+        Ok((merged, reads_by_stream))
+    } else {
+        Ok((
+            run_filesystem_reads(
+                files,
+                order,
+                params.io_depth,
+                params.concurrency,
+                params.read_size,
+                size_class_bounds,
+            )
+            .await?,
+            Vec::new(),
+        ))
+    }
+}
+
+fn phase_telemetry_to_report(telemetry: &PhaseTelemetry, wall_elapsed: Duration) -> OpReport {
+    telemetry.overall.to_report(wall_elapsed.as_secs_f64() * 1000.0)
+}
+
 async fn run_l2_writes(
     cache: Arc<BlockCache>,
     sizes: &[u64],
@@ -1927,12 +2095,17 @@ fn active_mounts() -> Result<Vec<ActiveMount>> {
             .get("volume")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let cache_path = parsed
+            .get("cache_path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from);
         if !super::utils::is_process_running(pid as u32) {
             continue;
         }
         mounts.push(ActiveMount {
             mount_point: PathBuf::from(mount_point),
             volume: volume.to_string(),
+            cache_path,
         });
     }
     Ok(mounts)
@@ -1957,6 +2130,7 @@ fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
             volume: active.volume,
             mount_point: active.mount_point,
             work_root: target.join(".studiofs-test-cache"),
+            cache_path: active.cache_path,
         })
     } else {
         Ok(ResolvedRunMode::DirectL2 {
@@ -2278,6 +2452,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         cache_pipeline: Some(cache_pipeline),
         profile,
         advanced_metrics: Some(advanced_metrics),
+        buffered_read_comparison: None,
         stream_results,
         work_root: None,
         writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
@@ -2293,6 +2468,7 @@ async fn run_mounted_end_to_end(
     volume: &str,
     mount_point: &Path,
     work_root: &Path,
+    cache_path: Option<&Path>,
 ) -> Result<BenchmarkReport> {
     let benchmark_result = async {
         clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
@@ -2317,43 +2493,54 @@ async fn run_mounted_end_to_end(
                 total_warmups = params.warmup_runs,
                 "cache benchmark warm-up cycle started"
             );
-            if params.sequential_streams {
-                let _ = run_filesystem_writes_sequential_streams(
-                    &files,
-                    &order,
-                    params.concurrency,
-                    params.io_depth,
-                    size_class_bounds,
-                )
-                .await?;
-                let _ = run_filesystem_reads_sequential_streams(
-                    &files,
-                    &order,
-                    params.concurrency,
-                    params.io_depth,
-                    params.read_size,
-                    size_class_bounds,
-                )
-                .await?;
-            } else {
-                let _ = run_filesystem_writes(
-                    &files,
-                    &order,
-                    params.io_depth,
-                    params.concurrency,
-                    size_class_bounds,
-                )
-                .await?;
-                let _ = run_filesystem_reads(
-                    &files,
-                    &order,
-                    params.io_depth,
-                    params.concurrency,
-                    params.read_size,
-                    size_class_bounds,
-                )
-                .await?;
-            }
+            let _ = run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
+            let _ = run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
+        }
+
+        let cache_upload_dir = cache_path.map(|path| path.join("upload"));
+        let mut baseline_buffered_read_phase = None;
+        if let Some(upload_dir) = cache_upload_dir.as_deref() {
+            tracing::info!(
+                target: "studiofs.cache.profile",
+                run_id = %params.run_id,
+                phase = "e2e-baseline-seed-write",
+                cache_path = %upload_dir.display(),
+                "cache benchmark phase start"
+            );
+            let _ = run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
+            let _ = wait_for_pending_upload_target(
+                upload_dir,
+                PendingUploadTarget::Active,
+                Duration::from_secs(10),
+            )
+            .await?;
+            let idle_before_baseline = wait_for_pending_upload_target(
+                upload_dir,
+                PendingUploadTarget::Idle,
+                Duration::from_secs(60),
+            )
+            .await?;
+
+            tracing::info!(
+                target: "studiofs.cache.profile",
+                run_id = %params.run_id,
+                phase = "e2e-baseline-read",
+                cache_path = %upload_dir.display(),
+                "cache benchmark phase start"
+            );
+            let baseline_wall_start = Instant::now();
+            let (baseline_reads, _) =
+                run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
+            let baseline_wall = baseline_wall_start.elapsed();
+            baseline_buffered_read_phase = Some(MountedBufferedReadPhaseReport {
+                phase: "baseline-read".to_string(),
+                wait_target: idle_before_baseline.target.label().to_string(),
+                target_state_observed: idle_before_baseline.observed,
+                wait_ms: idle_before_baseline.waited.as_secs_f64() * 1000.0,
+                pending_uploads_before: idle_before_baseline.pending_uploads,
+                pending_uploads_after: scan_pending_uploads(upload_dir)?,
+                results: phase_telemetry_to_report(&baseline_reads, baseline_wall),
+            });
         }
 
         let started = Instant::now();
@@ -2368,39 +2555,27 @@ async fn run_mounted_end_to_end(
         );
         let writes_wall_start = Instant::now();
         let writes_cpu_start = process_cpu_time();
-        let (writes, writes_by_stream) = if params.sequential_streams {
-            let writes_by_stream = run_filesystem_writes_sequential_streams(
-                &files,
-                &order,
-                params.concurrency,
-                params.io_depth,
-                size_class_bounds,
-            )
-            .await?;
-            let mut merged = PhaseTelemetry::default();
-            for stream in &writes_by_stream {
-                merged.merge_from_ref(stream);
-            }
-            (merged, writes_by_stream)
-        } else {
-            (
-                run_filesystem_writes(
-                    &files,
-                    &order,
-                    params.io_depth,
-                    params.concurrency,
-                    size_class_bounds,
-                )
-                .await?,
-                Vec::new(),
-            )
-        };
+        let (writes, writes_by_stream) =
+            run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
         let writes_wall = writes_wall_start.elapsed();
         let writes_cpu = writes_cpu_start
             .and_then(|start_cpu| {
                 process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
             })
             .unwrap_or_default();
+
+        let during_upload_observation = if let Some(upload_dir) = cache_upload_dir.as_deref() {
+            Some(
+                wait_for_pending_upload_target(
+                    upload_dir,
+                    PendingUploadTarget::Active,
+                    Duration::from_secs(10),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         tracing::info!(
             target: "studiofs.cache.profile",
@@ -2410,35 +2585,8 @@ async fn run_mounted_end_to_end(
         );
         let reads_wall_start = Instant::now();
         let reads_cpu_start = process_cpu_time();
-        let (reads, reads_by_stream) = if params.sequential_streams {
-            let reads_by_stream = run_filesystem_reads_sequential_streams(
-                &files,
-                &order,
-                params.concurrency,
-                params.io_depth,
-                params.read_size,
-                size_class_bounds,
-            )
-            .await?;
-            let mut merged = PhaseTelemetry::default();
-            for stream in &reads_by_stream {
-                merged.merge_from_ref(stream);
-            }
-            (merged, reads_by_stream)
-        } else {
-            (
-                run_filesystem_reads(
-                    &files,
-                    &order,
-                    params.io_depth,
-                    params.concurrency,
-                    params.read_size,
-                    size_class_bounds,
-                )
-                .await?,
-                Vec::new(),
-            )
-        };
+        let (reads, reads_by_stream) =
+            run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
         let reads_wall = reads_wall_start.elapsed();
         let reads_cpu = reads_cpu_start
             .and_then(|start_cpu| {
@@ -2466,6 +2614,69 @@ async fn run_mounted_end_to_end(
             artifacts: Vec::new(),
             warnings: Vec::new(),
         });
+        let buffered_read_comparison = match (
+            cache_path,
+            cache_upload_dir.as_deref(),
+            baseline_buffered_read_phase,
+        ) {
+            (Some(cache_path), Some(upload_dir), Some(baseline_phase)) => {
+                let during_phase = MountedBufferedReadPhaseReport {
+                    phase: "during-upload-read".to_string(),
+                    wait_target: during_upload_observation
+                        .as_ref()
+                        .map(|observation| observation.target.label().to_string())
+                        .unwrap_or_else(|| PendingUploadTarget::Active.label().to_string()),
+                    target_state_observed: during_upload_observation
+                        .as_ref()
+                        .map(|observation| observation.observed)
+                        .unwrap_or(false),
+                    wait_ms: during_upload_observation
+                        .as_ref()
+                        .map(|observation| observation.waited.as_secs_f64() * 1000.0)
+                        .unwrap_or_default(),
+                    pending_uploads_before: during_upload_observation
+                        .as_ref()
+                        .map(|observation| observation.pending_uploads)
+                        .unwrap_or_default(),
+                    pending_uploads_after: scan_pending_uploads(upload_dir)?,
+                    results: phase_telemetry_to_report(&reads, reads_wall),
+                };
+
+                let idle_before_post = wait_for_pending_upload_target(
+                    upload_dir,
+                    PendingUploadTarget::Idle,
+                    Duration::from_secs(60),
+                )
+                .await?;
+                tracing::info!(
+                    target: "studiofs.cache.profile",
+                    run_id = %params.run_id,
+                    phase = "e2e-post-upload-read",
+                    cache_path = %upload_dir.display(),
+                    "cache benchmark phase start"
+                );
+                let post_wall_start = Instant::now();
+                let (post_reads, _) =
+                    run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
+                let post_wall = post_wall_start.elapsed();
+                let post_phase = MountedBufferedReadPhaseReport {
+                    phase: "post-upload-read".to_string(),
+                    wait_target: idle_before_post.target.label().to_string(),
+                    target_state_observed: idle_before_post.observed,
+                    wait_ms: idle_before_post.waited.as_secs_f64() * 1000.0,
+                    pending_uploads_before: idle_before_post.pending_uploads,
+                    pending_uploads_after: scan_pending_uploads(upload_dir)?,
+                    results: phase_telemetry_to_report(&post_reads, post_wall),
+                };
+
+                Some(MountedBufferedReadComparisonReport {
+                    cache_path: cache_path.display().to_string(),
+                    upload_dir: upload_dir.display().to_string(),
+                    phases: vec![baseline_phase, during_phase, post_phase],
+                })
+            }
+            _ => None,
+        };
         let advanced_metrics = build_advanced_metrics(
             size_class_bounds,
             &writes,
@@ -2516,6 +2727,7 @@ async fn run_mounted_end_to_end(
             profile,
             advanced_metrics: Some(advanced_metrics),
             stream_results,
+            buffered_read_comparison,
             writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
             reads: reads.overall.to_report(reads_wall.as_secs_f64() * 1000.0),
         })
@@ -2900,6 +3112,54 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             &operation_rows,
         )
     );
+
+    if let Some(comparison) = &report.buffered_read_comparison {
+        out.push('\n');
+        let _ = writeln!(&mut out, "Buffered-first read comparison");
+        let _ = writeln!(&mut out, "Cache path: {}", comparison.cache_path);
+        let _ = writeln!(&mut out, "Upload dir: {}", comparison.upload_dir);
+        let rows: Vec<Vec<String>> = comparison
+            .phases
+            .iter()
+            .map(|phase| {
+                vec![
+                    phase.phase.clone(),
+                    phase.results.operations.to_string(),
+                    format_bytes(phase.results.bytes),
+                    format_throughput(phase.results.throughput_bytes_per_sec),
+                    format_duration_ms(phase.results.p95_ms),
+                    phase.wait_target.clone(),
+                    if phase.target_state_observed {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                    format_duration_ms(phase.wait_ms),
+                    phase.pending_uploads_before.to_string(),
+                    phase.pending_uploads_after.to_string(),
+                ]
+            })
+            .collect();
+        let _ = write!(
+            &mut out,
+            "{}",
+            format_table(
+                &[
+                    "Phase",
+                    "Ops",
+                    "Data",
+                    "Throughput",
+                    "P95",
+                    "Target",
+                    "Observed",
+                    "Wait",
+                    "Pending before",
+                    "Pending after"
+                ],
+                &rows,
+            )
+        );
+    }
 
     if let Some(advanced) = &report.advanced_metrics {
         out.push('\n');
@@ -3365,7 +3625,11 @@ pub fn run(
                 volume,
                 mount_point,
                 work_root,
-            } => run_mounted_end_to_end(&params, volume, mount_point, work_root).await,
+                cache_path,
+            } => {
+                run_mounted_end_to_end(&params, volume, mount_point, work_root, cache_path.as_deref())
+                    .await
+            }
         }
     })?;
 
@@ -3694,6 +3958,7 @@ mod tests {
                     },
                 }),
             }),
+            buffered_read_comparison: None,
             stream_results: None,
             writes: OpReport {
                 operations: 16,
@@ -3946,5 +4211,79 @@ mod tests {
         assert!(summary.contains("Upload queue:"));
         assert!(!summary.contains("\"cache_pipeline\""));
         assert!(!summary.contains("\"mode\""));
+    }
+
+    #[test]
+    fn render_human_summary_includes_buffered_read_comparison_when_present() {
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.buffered_read_comparison = Some(MountedBufferedReadComparisonReport {
+            cache_path: r"D:\test-cache\vol-123".to_string(),
+            upload_dir: r"D:\test-cache\vol-123\upload".to_string(),
+            phases: vec![
+                MountedBufferedReadPhaseReport {
+                    phase: "baseline-read".to_string(),
+                    wait_target: "idle".to_string(),
+                    target_state_observed: true,
+                    wait_ms: 120.0,
+                    pending_uploads_before: 0,
+                    pending_uploads_after: 0,
+                    results: OpReport {
+                        operations: 16,
+                        bytes: 128 * 1024 * 1024,
+                        elapsed_ms: 72.0,
+                        avg_latency_ms: 4.4,
+                        p50_ms: 4.1,
+                        p95_ms: 7.3,
+                        p99_ms: 7.8,
+                        throughput_bytes_per_sec: 1_700.0 * 1024.0 * 1024.0,
+                    },
+                },
+                MountedBufferedReadPhaseReport {
+                    phase: "during-upload-read".to_string(),
+                    wait_target: "active".to_string(),
+                    target_state_observed: true,
+                    wait_ms: 18.0,
+                    pending_uploads_before: 3,
+                    pending_uploads_after: 2,
+                    results: OpReport {
+                        operations: 16,
+                        bytes: 128 * 1024 * 1024,
+                        elapsed_ms: 81.0,
+                        avg_latency_ms: 5.0,
+                        p50_ms: 4.8,
+                        p95_ms: 8.4,
+                        p99_ms: 9.0,
+                        throughput_bytes_per_sec: 1_500.0 * 1024.0 * 1024.0,
+                    },
+                },
+                MountedBufferedReadPhaseReport {
+                    phase: "post-upload-read".to_string(),
+                    wait_target: "idle".to_string(),
+                    target_state_observed: true,
+                    wait_ms: 240.0,
+                    pending_uploads_before: 0,
+                    pending_uploads_after: 0,
+                    results: OpReport {
+                        operations: 16,
+                        bytes: 128 * 1024 * 1024,
+                        elapsed_ms: 74.0,
+                        avg_latency_ms: 4.5,
+                        p50_ms: 4.2,
+                        p95_ms: 7.5,
+                        p99_ms: 7.9,
+                        throughput_bytes_per_sec: 1_650.0 * 1024.0 * 1024.0,
+                    },
+                },
+            ],
+        });
+
+        let summary = render_human_summary(&report);
+
+        assert!(summary.contains("Buffered-first read comparison"));
+        assert!(summary.contains("baseline-read"));
+        assert!(summary.contains("during-upload-read"));
+        assert!(summary.contains("post-upload-read"));
+        assert!(summary.contains("Pending before"));
     }
 }

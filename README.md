@@ -137,6 +137,10 @@ The JSON report also contains an `advanced_metrics` section with per-size-class
 latency/throughput (small/medium/large), configurable boundaries, queue
 backpressure percentiles, and (in direct-l2 mode) L1/L2 hit-miss and bytes-served
 breakdown with per-level latency distributions.
+On mounts started by newer StudioFS builds, `test-cache` `e2e` mode also emits
+`buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
+`post-upload-read` phases, and the terminal summary renders the same mounted
+comparison as a `Buffered-first read comparison` table.
 
 ## Development
 
@@ -164,6 +168,12 @@ Infra-heavy ignored suite:
 
 ```bash
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
+```
+
+Focused buffered-first regression:
+
+```bash
+cargo test -p studiofs-vfs --test vfs_test sfs121_foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
 ```
 
 Local development and infra-backed tests use RustFS as the default

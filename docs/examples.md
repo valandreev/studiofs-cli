@@ -210,5 +210,12 @@ Notes:
 - `direct-l2` `advanced_metrics.cache_levels` adds explicit L1/L2 hit/miss
   counters, bytes served from each level, and per-level lookup latency
   distributions.
-- `e2e` mode keeps filesystem-level read/write reports; cache internals are
-  emitted through mount logs (`upload pipeline counters`).
+- On mounts started by newer StudioFS builds, `e2e` JSON output also includes
+  `buffered_read_comparison`, which records `baseline-read`,
+  `during-upload-read`, and `post-upload-read` phases plus the pending-upload
+  wait observations used to bracket them.
+- The terminal summary shows the same mounted comparison as a
+  `Buffered-first read comparison` table, including wait target/observation and
+  pending upload counts before and after each read phase.
+- `e2e` mode still keeps filesystem-level read/write reports; cache internals
+  continue to be emitted through mount logs (`upload pipeline counters`).

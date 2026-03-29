@@ -71,10 +71,9 @@ the capacity limit is reached.
 | `l2_read_timeout_ms` | 5000 | Max wait for local L2 read before cache-miss fallback |
 | `l2_write_timeout_ms` | 5000 | Max wait for local L2 write attempt |
 | `upload_stats_interval_secs` | 1 | Upload pipeline/adaptive-control tick interval |
-| `upload_fg_read_latency_target_ms` | 50 | Foreground-read P90 latency target for upload throttling |
-| `upload_fg_read_latency_window_ms` | 3000 | Foreground-read speedometer sliding window |
+| `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 latency target for upload throttling |
+| `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |
 | `upload_fg_read_latency_sticky_windows` | 2 | Keep last observed P90 for this many windows when samples pause |
-| `upload_l2_lookup_spike_threshold_ms` | 10 | Legacy compatibility floor for `upload_fg_read_latency_target_ms` |
 
 Mount profile note:
 - `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
@@ -94,7 +93,7 @@ Adaptive upload throttling overrides:
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` sets the foreground P90 target.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` sets the speedometer sampling window.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` controls how long last P90 is retained.
-- `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` is kept for compatibility and acts as a floor for the new target.
+- upload worker foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` and current congestion instead of being user-configured separately.
 - `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers (default `80%` of memory limit).
 
 ## Write Path

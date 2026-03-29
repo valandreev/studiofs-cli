@@ -258,9 +258,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     set_u64!("STUDIOFS_JANITOR_MAX_DELETES", janitor_max_deletes);
     set_u64!("STUDIOFS_JANITOR_LEASE_TTL_SECS", janitor_lease_ttl_secs);
     set_usize!("STUDIOFS_UPLOAD_CACHE_IO_SLOTS", upload_cache_io_slots);
-    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY") {
-        config.upload_cache_io_user_penalty = Some(value as u32);
-    }
     set_size!(
         "STUDIOFS_TRANSIT_MEMORY_BUDGET",
         transit_memory_budget_bytes
@@ -277,10 +274,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     set_u64!(
         "STUDIOFS_UPLOAD_STATS_INTERVAL_SECS",
         upload_stats_interval_secs
-    );
-    set_u64!(
-        "STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS",
-        upload_l2_lookup_spike_threshold_ms
     );
     set_u64!(
         "STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS",
@@ -731,7 +724,12 @@ pub fn run(
     // Background tasks are started explicitly after StudioVfs construction.
 
     // Write PID file so `studiofs umount` can find us
-    let _ = super::utils::write_pid_file(&actual_mount_path, name, std::process::id());
+    let _ = super::utils::write_pid_file_with_cache_path(
+        &actual_mount_path,
+        name,
+        std::process::id(),
+        Some(&cache_path),
+    );
 
     // Start platform-specific FUSE mount
     #[cfg(windows)]

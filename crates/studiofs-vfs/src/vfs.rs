@@ -252,6 +252,27 @@ pub struct VfsReadFastPathStats {
     pub sync_fast_path_misses: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct VfsForegroundReadProtectionStats {
+    pub p90_latency_ns: Option<u64>,
+    pub throughput_bytes_per_sec: f64,
+    pub speedometer_samples: usize,
+    pub window_bytes: u64,
+    pub window_coverage_ms: u64,
+    pub staged_payload_hits: u64,
+    pub staged_payload_misses: u64,
+    pub staged_payload_evictions: u64,
+    pub upload_fallback_rereads: u64,
+    pub upload_fallback_reread_bytes: u64,
+    pub upload_fallback_reread_cache_misses: u64,
+    pub upload_fallback_wait_ns: u64,
+    pub upload_fallback_wait_max_ns: u64,
+    pub upload_fallback_read_ns: u64,
+    pub upload_fallback_read_max_ns: u64,
+    pub upload_cache_io_foreground_cost: u32,
+    pub upload_scheduler_penalty_ms: u64,
+}
+
 pub type VfsResult<T> = Result<T, VfsError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -548,15 +569,13 @@ const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 5000;
 const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
 const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 1;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
-const DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY: u32 = 4;
 const DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES: usize = 0;
 const DEFAULT_TRANSIT_MEMORY_BUDGET_RATIO_PERCENT: u64 = 80;
 const DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS: u64 = 75;
-const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 250;
-const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 50;
-const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 3_000;
+const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 500;
+const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
+const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
-const DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS: u64 = 10;
 const DEFAULT_MAX_DIRTY_BYTES: usize = 12 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_SPILL_BYTES: usize = 64 * 1024 * 1024 * 1024usize;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
@@ -592,11 +611,14 @@ const DEFAULT_QOS_MATERIALIZE_SLOTS: usize = 2;
 const DEFAULT_QOS_UPLOAD_SLOTS: usize = 4;
 const DEFAULT_QOS_COMMIT_SLOTS: usize = 4;
 const DEFAULT_QOS_FETCH_SLOTS: usize = 128;
-const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 8;
-const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 400;
+const UPLOAD_CACHE_IO_FOREGROUND_BASE_DIVISOR: u32 = 4;
+const UPLOAD_CACHE_IO_FOREGROUND_BASE_MAX: u32 = 8;
+const UPLOAD_CACHE_IO_FOREGROUND_STEP_DIVISOR: u32 = 8;
+const UPLOAD_CACHE_IO_FOREGROUND_STEP_MAX: u32 = 4;
+const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 16;
+const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 240;
 const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
-const UPLOAD_SCHEDULER_PENALTY_DECAY_NUM: u64 = 3;
-const UPLOAD_SCHEDULER_PENALTY_DECAY_DEN: u64 = 4;
+const UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS: u64 = 40;
 const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
 const FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES: usize = 4_096;
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = 8;
@@ -775,9 +797,6 @@ pub struct VfsConfig {
     pub upload_requeue_max_ms: u64,
     /// Upload metrics log interval.
     pub upload_stats_interval_secs: u64,
-    /// Legacy throttle threshold knob kept for backward compatibility.
-    /// The speedometer now uses foreground-read P90 latency.
-    pub upload_l2_lookup_spike_threshold_ms: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
     /// Whether background slab flushing is enabled.
@@ -794,8 +813,6 @@ pub struct VfsConfig {
     pub ingress_checkpoint_max_live_segments: u64,
     /// Upload local-cache I/O slots.
     pub upload_cache_io_slots: usize,
-    /// Upload slot cost when foreground reads are active.
-    pub upload_cache_io_user_penalty: u32,
     /// Max active transit-memory bytes used by in-flight read/upload buffers.
     /// Parsed from env via `parse_size_bytes` (for example `2GB`).
     pub transit_memory_budget_bytes: usize,
@@ -917,7 +934,6 @@ pub struct VfsConfigRaw {
     pub upload_requeue_base_ms: Option<u64>,
     pub upload_requeue_max_ms: Option<u64>,
     pub upload_stats_interval_secs: Option<u64>,
-    pub upload_l2_lookup_spike_threshold_ms: Option<u64>,
     pub slab_flush_interval_ms: Option<u64>,
     pub background_slab_flush_enabled: Option<bool>,
     pub ingress_checkpoint_interval_secs: Option<u64>,
@@ -926,7 +942,6 @@ pub struct VfsConfigRaw {
     pub ingress_checkpoint_max_segment_lag: Option<u64>,
     pub ingress_checkpoint_max_live_segments: Option<u64>,
     pub upload_cache_io_slots: Option<usize>,
-    pub upload_cache_io_user_penalty: Option<u32>,
     pub transit_memory_budget_bytes: Option<usize>,
     pub upload_user_idle_grace_ms: Option<u64>,
     pub upload_fg_read_latency_target_ms: Option<u64>,
@@ -1048,7 +1063,6 @@ impl VfsConfigRaw {
             upload_requeue_base_ms,
             upload_requeue_max_ms,
             upload_stats_interval_secs,
-            upload_l2_lookup_spike_threshold_ms,
             slab_flush_interval_ms,
             background_slab_flush_enabled,
             ingress_checkpoint_interval_secs,
@@ -1057,7 +1071,6 @@ impl VfsConfigRaw {
             ingress_checkpoint_max_segment_lag,
             ingress_checkpoint_max_live_segments,
             upload_cache_io_slots,
-            upload_cache_io_user_penalty,
             transit_memory_budget_bytes,
             upload_user_idle_grace_ms,
             upload_fg_read_latency_target_ms,
@@ -1144,10 +1157,7 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.slab_flush_interval_ms = cfg.slab_flush_interval_ms.max(1);
     cfg.ingress_checkpoint_interval_secs = cfg.ingress_checkpoint_interval_secs.max(1);
     cfg.upload_cache_io_slots = cfg.upload_cache_io_slots.max(1);
-    cfg.upload_cache_io_user_penalty = cfg.upload_cache_io_user_penalty.max(1);
-    cfg.upload_fg_read_latency_target_ms = cfg
-        .upload_fg_read_latency_target_ms
-        .max(cfg.upload_l2_lookup_spike_threshold_ms.max(1));
+    cfg.upload_fg_read_latency_target_ms = cfg.upload_fg_read_latency_target_ms.max(1);
     cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
     cfg.upload_fg_read_latency_sticky_windows = cfg.upload_fg_read_latency_sticky_windows.max(1);
     cfg.max_drain_batch = cfg.max_drain_batch.max(1);
@@ -1163,18 +1173,6 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.qos_commit_slots = cfg.qos_commit_slots.max(1);
     cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
     cfg.foreground_read_speedometer_shards = cfg.foreground_read_speedometer_shards.max(1);
-
-    // Safe cast: upload_cache_io_slots is validated to fit in u32
-    debug_assert!(
-        cfg.upload_cache_io_slots <= u32::MAX as usize,
-        "upload_cache_io_slots overflow"
-    );
-    if cfg.upload_cache_io_user_penalty > cfg.upload_cache_io_slots as u32 {
-        return Err(VfsError::Other(format!(
-            "upload_cache_io_user_penalty ({}) exceeds upload_cache_io_slots ({})",
-            cfg.upload_cache_io_user_penalty, cfg.upload_cache_io_slots
-        )));
-    }
 
     cfg.upload_worker_count = if cfg.upload_worker_count == 0 {
         DEFAULT_UPLOAD_WORKER_COUNT
@@ -1246,7 +1244,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             upload_requeue_base_ms: Some(cfg.upload_requeue_base_ms),
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
             upload_stats_interval_secs: Some(cfg.upload_stats_interval_secs),
-            upload_l2_lookup_spike_threshold_ms: Some(cfg.upload_l2_lookup_spike_threshold_ms),
             slab_flush_interval_ms: Some(cfg.slab_flush_interval_ms),
             background_slab_flush_enabled: Some(cfg.background_slab_flush_enabled),
             ingress_checkpoint_interval_secs: Some(cfg.ingress_checkpoint_interval_secs),
@@ -1255,7 +1252,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             ingress_checkpoint_max_segment_lag: Some(cfg.ingress_checkpoint_max_segment_lag),
             ingress_checkpoint_max_live_segments: Some(cfg.ingress_checkpoint_max_live_segments),
             upload_cache_io_slots: Some(cfg.upload_cache_io_slots),
-            upload_cache_io_user_penalty: Some(cfg.upload_cache_io_user_penalty),
             transit_memory_budget_bytes: Some(cfg.transit_memory_budget_bytes),
             upload_user_idle_grace_ms: Some(cfg.upload_user_idle_grace_ms),
             upload_fg_read_latency_target_ms: Some(cfg.upload_fg_read_latency_target_ms),
@@ -1343,7 +1339,6 @@ impl Default for VfsConfig {
             upload_requeue_base_ms: DEFAULT_UPLOAD_REQUEUE_BASE_MS,
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
-            upload_l2_lookup_spike_threshold_ms: DEFAULT_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS,
             slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
             background_slab_flush_enabled: DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED,
             ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
@@ -1352,7 +1347,6 @@ impl Default for VfsConfig {
             ingress_checkpoint_max_segment_lag: DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG,
             ingress_checkpoint_max_live_segments: DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS,
             upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
-            upload_cache_io_user_penalty: DEFAULT_UPLOAD_CACHE_IO_USER_PENALTY,
             transit_memory_budget_bytes: DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
             upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
             upload_fg_read_latency_target_ms: DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
@@ -3011,8 +3005,15 @@ struct UploadState {
     staged_payload_hits: AtomicU64,
     staged_payload_misses: AtomicU64,
     staged_payload_evictions: AtomicU64,
-    /// Dynamic slot cost adjusted from cache-latency feedback.
-    upload_cache_io_user_penalty: AtomicU32,
+    upload_fallback_rereads: AtomicU64,
+    upload_fallback_reread_bytes: AtomicU64,
+    upload_fallback_reread_cache_misses: AtomicU64,
+    upload_fallback_wait_ns: AtomicU64,
+    upload_fallback_wait_max_ns: AtomicU64,
+    upload_fallback_read_ns: AtomicU64,
+    upload_fallback_read_max_ns: AtomicU64,
+    /// Dynamic slot cost adjusted from buffered-first foreground-read pressure.
+    upload_cache_io_foreground_cost: AtomicU32,
 }
 
 struct UploadPayloadStage {
@@ -3111,9 +3112,25 @@ fn staged_upload_payload_budget_bounds(
     (min_bytes, max_bytes)
 }
 
+fn derive_upload_cache_io_foreground_cost_base(upload_cache_io_slots: usize) -> u32 {
+    let slots = upload_cache_io_slots.clamp(1, u32::MAX as usize) as u32;
+    slots
+        .div_ceil(UPLOAD_CACHE_IO_FOREGROUND_BASE_DIVISOR.max(1))
+        .clamp(1, UPLOAD_CACHE_IO_FOREGROUND_BASE_MAX)
+        .min(slots)
+}
+
+fn derive_upload_cache_io_foreground_cost_step(upload_cache_io_slots: usize) -> u32 {
+    let slots = upload_cache_io_slots.clamp(1, u32::MAX as usize) as u32;
+    slots
+        .div_ceil(UPLOAD_CACHE_IO_FOREGROUND_STEP_DIVISOR.max(1))
+        .clamp(1, UPLOAD_CACHE_IO_FOREGROUND_STEP_MAX)
+        .min(slots)
+}
+
 impl UploadState {
     fn new(
-        upload_cache_io_user_penalty: u32,
+        upload_cache_io_foreground_cost: u32,
         block_size: u32,
         upload_worker_count: usize,
         max_dirty_bytes: usize,
@@ -3137,7 +3154,14 @@ impl UploadState {
             staged_payload_hits: AtomicU64::new(0),
             staged_payload_misses: AtomicU64::new(0),
             staged_payload_evictions: AtomicU64::new(0),
-            upload_cache_io_user_penalty: AtomicU32::new(upload_cache_io_user_penalty),
+            upload_fallback_rereads: AtomicU64::new(0),
+            upload_fallback_reread_bytes: AtomicU64::new(0),
+            upload_fallback_reread_cache_misses: AtomicU64::new(0),
+            upload_fallback_wait_ns: AtomicU64::new(0),
+            upload_fallback_wait_max_ns: AtomicU64::new(0),
+            upload_fallback_read_ns: AtomicU64::new(0),
+            upload_fallback_read_max_ns: AtomicU64::new(0),
+            upload_cache_io_foreground_cost: AtomicU32::new(upload_cache_io_foreground_cost),
         }
     }
 }
@@ -3232,7 +3256,7 @@ impl WriteBufferState {
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
-    foreground_read_latency_shards: Vec<Mutex<VecDeque<(u64, u64)>>>,
+    foreground_read_latency_shards: Vec<Mutex<VecDeque<(u64, u64, u64)>>>,
     foreground_read_shard_cursor: AtomicU64,
     sync_read_fast_path_hits: AtomicU64,
     sync_read_fast_path_misses: AtomicU64,
@@ -3349,6 +3373,7 @@ impl VfsState {
         recovered_spill_seq: u64,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
         block_size: u32,
+        upload_cache_io_foreground_cost_base: u32,
         cfg: &VfsConfig,
     ) -> Self {
         Self {
@@ -3361,7 +3386,7 @@ impl VfsState {
             ),
             dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
             upload: UploadState::new(
-                cfg.upload_cache_io_user_penalty,
+                upload_cache_io_foreground_cost_base,
                 block_size,
                 cfg.upload_worker_count,
                 cfg.max_dirty_bytes,
@@ -3522,8 +3547,10 @@ pub struct StudioVfs {
     /// Global memory-credit budget for active in-flight I/O buffers.
     transit_memory_budget: Arc<TransitMemoryBudget>,
     qos: Arc<QosController>,
-    /// Configured baseline slot cost per upload op when foreground reads are active.
-    upload_cache_io_user_penalty_base: u32,
+    /// Baseline slot cost per upload op while foreground reads are active.
+    upload_cache_io_foreground_cost_base: u32,
+    /// Cost increase step applied when foreground reads degrade under upload.
+    upload_cache_io_foreground_cost_step: u32,
     /// Foreground read latency target (P90) used by the upload throttle loop.
     upload_fg_read_latency_target_ns: u64,
     /// Sliding window for foreground speedometer samples.
@@ -3585,6 +3612,7 @@ struct ForegroundReadScope<'a> {
     vfs: &'a StudioVfs,
     started: Instant,
     shard_idx: usize,
+    bytes_read: u64,
 }
 
 impl<'a> ForegroundReadScope<'a> {
@@ -3595,14 +3623,22 @@ impl<'a> ForegroundReadScope<'a> {
             vfs,
             started: Instant::now(),
             shard_idx,
+            bytes_read: 0,
         }
+    }
+
+    fn record_bytes(&mut self, bytes_read: u64) {
+        self.bytes_read = bytes_read;
     }
 }
 
 impl Drop for ForegroundReadScope<'_> {
     fn drop(&mut self) {
-        self.vfs
-            .record_foreground_read_latency(self.shard_idx, self.started.elapsed());
+        self.vfs.record_foreground_read_latency(
+            self.shard_idx,
+            self.bytes_read,
+            self.started.elapsed(),
+        );
         self.vfs.unmark_foreground_read();
     }
 }
@@ -4474,7 +4510,10 @@ impl StudioVfs {
             let ingress_checkpoint_max_segment_lag = config.ingress_checkpoint_max_segment_lag;
             let ingress_checkpoint_max_live_segments = config.ingress_checkpoint_max_live_segments;
             let upload_cache_io_slots = config.upload_cache_io_slots;
-            let upload_cache_io_user_penalty = config.upload_cache_io_user_penalty;
+            let upload_cache_io_foreground_cost_base =
+                derive_upload_cache_io_foreground_cost_base(upload_cache_io_slots);
+            let upload_cache_io_foreground_cost_step =
+                derive_upload_cache_io_foreground_cost_step(upload_cache_io_slots);
             let upload_user_idle_grace = Duration::from_millis(config.upload_user_idle_grace_ms);
             let upload_fg_read_latency_target_ms = config.upload_fg_read_latency_target_ms;
             let upload_fg_read_latency_window_ms = config.upload_fg_read_latency_window_ms;
@@ -4499,7 +4538,8 @@ impl StudioVfs {
                 ingress_checkpoint_max_segment_lag,
                 ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots,
-                upload_cache_io_user_penalty,
+                upload_cache_io_foreground_cost_base,
+                upload_cache_io_foreground_cost_step,
                 transit_memory_budget_bytes,
                 upload_user_idle_grace_ms = upload_user_idle_grace.as_millis() as u64,
                 upload_fg_read_latency_target_ms,
@@ -4535,6 +4575,7 @@ impl StudioVfs {
                     recovered_spill_seq,
                     initial_checkpoint_meta,
                     block_size,
+                    upload_cache_io_foreground_cost_base,
                     &config,
                 )),
                 upload_scheduler,
@@ -4557,7 +4598,8 @@ impl StudioVfs {
                 },
                 transit_memory_budget,
                 qos,
-                upload_cache_io_user_penalty_base: upload_cache_io_user_penalty,
+                upload_cache_io_foreground_cost_base,
+                upload_cache_io_foreground_cost_step,
                 upload_fg_read_latency_target_ns: Duration::from_millis(
                     upload_fg_read_latency_target_ms,
                 )
@@ -5557,7 +5599,7 @@ impl StudioVfs {
     }
 
     fn trim_foreground_latency_samples(
-        samples: &mut VecDeque<(u64, u64)>,
+        samples: &mut VecDeque<(u64, u64, u64)>,
         now_ms: u64,
         window: Duration,
     ) {
@@ -5565,7 +5607,7 @@ impl StudioVfs {
         let cutoff = now_ms.saturating_sub(window_ms);
         while samples
             .front()
-            .is_some_and(|(timestamp_ms, _)| *timestamp_ms < cutoff)
+            .is_some_and(|(timestamp_ms, _, _)| *timestamp_ms < cutoff)
         {
             samples.pop_front();
         }
@@ -5584,7 +5626,7 @@ impl StudioVfs {
             % shard_count
     }
 
-    fn record_foreground_read_latency(&self, shard_idx: usize, elapsed: Duration) {
+    fn record_foreground_read_latency(&self, shard_idx: usize, bytes_read: u64, elapsed: Duration) {
         let now_ms = Self::now_unix_millis();
         let elapsed_ns = elapsed.as_nanos().clamp(1, u64::MAX as u128) as u64;
         let shard_count = self.state.read.foreground_read_latency_shards.len().max(1);
@@ -5595,13 +5637,16 @@ impl StudioVfs {
             now_ms,
             self.upload_fg_read_latency_window,
         );
-        samples.push_back((now_ms, elapsed_ns));
+        samples.push_back((now_ms, elapsed_ns, bytes_read));
     }
 
-    fn foreground_speedometer_snapshot(&self) -> (Option<u64>, usize) {
+    fn foreground_speedometer_snapshot(&self) -> (Option<u64>, usize, u64, u64) {
         let now_ms = Self::now_unix_millis();
         let mut samples_all = Vec::with_capacity(FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES);
         let mut total_samples = 0usize;
+        let mut window_bytes = 0u64;
+        let mut oldest_start_ms = u64::MAX;
+        let mut newest_end_ms = 0u64;
         for shard in &self.state.read.foreground_read_latency_shards {
             let mut samples = shard.lock();
             Self::trim_foreground_latency_samples(
@@ -5610,7 +5655,13 @@ impl StudioVfs {
                 self.upload_fg_read_latency_window,
             );
             total_samples = total_samples.saturating_add(samples.len());
-            samples_all.extend(samples.iter().map(|(_, latency_ns)| *latency_ns));
+            for (timestamp_ms, latency_ns, bytes_read) in samples.iter() {
+                samples_all.push(*latency_ns);
+                window_bytes = window_bytes.saturating_add(*bytes_read);
+                let latency_ms = latency_ns.saturating_div(1_000_000).max(1);
+                oldest_start_ms = oldest_start_ms.min(timestamp_ms.saturating_sub(latency_ms));
+                newest_end_ms = newest_end_ms.max(*timestamp_ms);
+            }
         }
         let p90_ns = Self::p90_ns(samples_all);
         if let Some(p90) = p90_ns {
@@ -5623,7 +5674,12 @@ impl StudioVfs {
                 .upload_fg_read_last_p90_at_ms
                 .store(now_ms, Ordering::Release);
         }
-        (p90_ns, total_samples)
+        let window_coverage_ms = if total_samples == 0 {
+            0
+        } else {
+            newest_end_ms.saturating_sub(oldest_start_ms).max(1)
+        };
+        (p90_ns, total_samples, window_bytes, window_coverage_ms)
     }
 
     fn foreground_sticky_p90_latency_ns(&self) -> Option<u64> {
@@ -5651,24 +5707,25 @@ impl StudioVfs {
         if p90 == 0 { None } else { Some(p90) }
     }
 
-    fn update_upload_io_penalty(&self, congested: bool) -> u32 {
-        let base_penalty = self.upload_cache_io_user_penalty_base.max(1);
-        let max_penalty = self.upload_cache_io_slots_max.max(base_penalty);
+    fn update_upload_io_foreground_cost(&self, congested: bool) -> u32 {
+        let base_cost = self.upload_cache_io_foreground_cost_base.max(1);
+        let step_cost = self.upload_cache_io_foreground_cost_step.max(1);
+        let max_cost = self.upload_cache_io_slots_max.max(base_cost);
         let current = self
             .state
             .upload
-            .upload_cache_io_user_penalty
+            .upload_cache_io_foreground_cost
             .load(Ordering::Relaxed);
         let next = if congested {
-            current.saturating_add(1).min(max_penalty)
-        } else if current > base_penalty {
-            (current / 2).max(base_penalty)
+            current.saturating_add(step_cost).min(max_cost)
+        } else if current > base_cost {
+            current.saturating_sub(step_cost).max(base_cost)
         } else {
-            base_penalty
+            base_cost
         };
         self.state
             .upload
-            .upload_cache_io_user_penalty
+            .upload_cache_io_foreground_cost
             .store(next, Ordering::Relaxed);
         next
     }
@@ -5677,7 +5734,7 @@ impl StudioVfs {
         let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
-        let io_penalty = self.update_upload_io_penalty(congested);
+        let io_cost = self.update_upload_io_foreground_cost(congested);
 
         let current_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
         let next_penalty_ms = if congested {
@@ -5686,15 +5743,13 @@ impl StudioVfs {
                 .saturating_div(threshold_ns)
                 .clamp(1, UPLOAD_SCHEDULER_OVERSHOOT_MAX);
             let step = overshoot
-                .saturating_mul(io_penalty as u64)
+                .saturating_mul(io_cost as u64)
                 .saturating_mul(UPLOAD_SCHEDULER_PENALTY_STEP_MS);
             current_penalty_ms
                 .saturating_add(step)
                 .min(UPLOAD_SCHEDULER_PENALTY_MAX_MS)
         } else {
-            let decayed = current_penalty_ms.saturating_mul(UPLOAD_SCHEDULER_PENALTY_DECAY_NUM)
-                / UPLOAD_SCHEDULER_PENALTY_DECAY_DEN;
-            if decayed <= 1 { 0 } else { decayed }
+            current_penalty_ms.saturating_sub(UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS)
         };
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
@@ -6661,6 +6716,76 @@ impl StudioVfs {
                 .read
                 .sync_read_fast_path_misses
                 .load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
+        let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) =
+            self.foreground_speedometer_snapshot();
+        let throughput_bytes_per_sec = if window_coverage_ms == 0 {
+            0.0
+        } else {
+            window_bytes as f64 * 1000.0 / window_coverage_ms as f64
+        };
+
+        VfsForegroundReadProtectionStats {
+            p90_latency_ns,
+            throughput_bytes_per_sec,
+            speedometer_samples,
+            window_bytes,
+            window_coverage_ms,
+            staged_payload_hits: self.state.upload.staged_payload_hits.load(Ordering::Relaxed),
+            staged_payload_misses: self
+                .state
+                .upload
+                .staged_payload_misses
+                .load(Ordering::Relaxed),
+            staged_payload_evictions: self
+                .state
+                .upload
+                .staged_payload_evictions
+                .load(Ordering::Relaxed),
+            upload_fallback_rereads: self
+                .state
+                .upload
+                .upload_fallback_rereads
+                .load(Ordering::Relaxed),
+            upload_fallback_reread_bytes: self
+                .state
+                .upload
+                .upload_fallback_reread_bytes
+                .load(Ordering::Relaxed),
+            upload_fallback_reread_cache_misses: self
+                .state
+                .upload
+                .upload_fallback_reread_cache_misses
+                .load(Ordering::Relaxed),
+            upload_fallback_wait_ns: self
+                .state
+                .upload
+                .upload_fallback_wait_ns
+                .load(Ordering::Relaxed),
+            upload_fallback_wait_max_ns: self
+                .state
+                .upload
+                .upload_fallback_wait_max_ns
+                .load(Ordering::Relaxed),
+            upload_fallback_read_ns: self
+                .state
+                .upload
+                .upload_fallback_read_ns
+                .load(Ordering::Relaxed),
+            upload_fallback_read_max_ns: self
+                .state
+                .upload
+                .upload_fallback_read_max_ns
+                .load(Ordering::Relaxed),
+            upload_cache_io_foreground_cost: self
+                .state
+                .upload
+                .upload_cache_io_foreground_cost
+                .load(Ordering::Relaxed),
+            upload_scheduler_penalty_ms: self.upload_scheduler.adaptive_penalty_ms(),
         }
     }
 
@@ -9362,7 +9487,7 @@ impl StudioVfs {
             return Ok(len as u32);
         }
 
-        let _guard = ForegroundReadScope::new(self);
+        let mut guard = ForegroundReadScope::new(self);
         let attr = self.getattr_async(ino).await?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
             return Err(VfsError::RemoteContentPending);
@@ -9396,11 +9521,13 @@ impl StudioVfs {
                         buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
                     }
                     self.enqueue_prefetch_hint(ino, &blocks_needed);
+                    guard.record_bytes(copy_len as u64);
                     Ok(copy_len as u32)
                 }
                 Err(VfsError::BlockNotFound(_, _)) => {
                     buffer[..to_copy].fill(0u8);
                     self.enqueue_prefetch_hint(ino, &blocks_needed);
+                    guard.record_bytes(to_copy as u64);
                     Ok(to_copy as u32)
                 }
                 Err(e) => Err(e),
@@ -9447,6 +9574,7 @@ impl StudioVfs {
         }
 
         self.enqueue_prefetch_hint(ino, &blocks_needed);
+        guard.record_bytes(written as u64);
         Ok(written as u32)
     }
 
@@ -9603,7 +9731,7 @@ impl StudioVfs {
             return Ok(Some(0));
         }
 
-        let _guard = ForegroundReadScope::new(self);
+        let mut guard = ForegroundReadScope::new(self);
 
         let attr = self.getattr(ino)?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
@@ -9675,6 +9803,7 @@ impl StudioVfs {
         }
 
         self.enqueue_prefetch_hint(ino, &blocks_needed);
+        guard.record_bytes(written as u64);
 
         Ok(Some(written as u32))
     }
@@ -10563,12 +10692,13 @@ impl StudioVfs {
                 let upload_io_cost = if self.foreground_read_active() {
                     self.state
                         .upload
-                        .upload_cache_io_user_penalty
+                        .upload_cache_io_foreground_cost
                         .load(Ordering::Relaxed)
                         .max(1)
                 } else {
                     1
                 };
+                let wait_started = Instant::now();
                 let upload_io_permit = self
                     .upload_cache_io_slots
                     .clone()
@@ -10579,11 +10709,48 @@ impl StudioVfs {
                         object_id: op.object_id,
                         message: e.to_string(),
                     })?;
+                let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+                let read_started = Instant::now();
                 let read_result = self
                     .block_cache
                     .get_with_priority(op.object_id, L2IoPriority::Background)
                     .await;
+                let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
                 drop(upload_io_permit);
+                self.state
+                    .upload
+                    .upload_fallback_rereads
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_wait_ns
+                    .fetch_add(wait_ns, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_wait_max_ns
+                    .fetch_max(wait_ns, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_read_ns
+                    .fetch_add(read_ns, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_read_max_ns
+                    .fetch_max(read_ns, Ordering::Relaxed);
+                match &read_result {
+                    Some(payload) => {
+                        self.state
+                            .upload
+                            .upload_fallback_reread_bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                    None => {
+                        self.state
+                            .upload
+                            .upload_fallback_reread_cache_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 read_result
             };
 
@@ -10913,9 +11080,10 @@ impl StudioVfs {
             let ingress_append = self.state.ingress.ingress_append_stats.snapshot();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
             let cache_pipeline = self.block_cache.cache_pipeline_metrics();
-            let (foreground_read_p90_ns, foreground_read_speedometer_samples) =
-                self.foreground_speedometer_snapshot();
-            self.adjust_upload_backpressure_from_metrics(foreground_read_p90_ns);
+            let foreground_read_protection = self.foreground_read_protection_stats();
+            self.adjust_upload_backpressure_from_metrics(
+                foreground_read_protection.p90_latency_ns,
+            );
             self.retune_staged_upload_payload_budget(0, false);
             let (
                 staged_payload_count,
@@ -11097,21 +11265,16 @@ impl StudioVfs {
                     upload_staged_payload_target_bytes = staged_payload_target_bytes,
                     upload_staged_payload_min_bytes = staged_payload_min_bytes,
                     upload_staged_payload_max_bytes = staged_payload_max_bytes,
-                    upload_staged_payload_hits = self
-                        .state
-                        .upload
-                        .staged_payload_hits
-                        .load(Ordering::Relaxed),
-                    upload_staged_payload_misses = self
-                        .state
-                        .upload
-                        .staged_payload_misses
-                        .load(Ordering::Relaxed),
-                    upload_staged_payload_evictions = self
-                        .state
-                        .upload
-                        .staged_payload_evictions
-                        .load(Ordering::Relaxed),
+                    upload_staged_payload_hits = foreground_read_protection.staged_payload_hits,
+                    upload_staged_payload_misses = foreground_read_protection.staged_payload_misses,
+                    upload_staged_payload_evictions = foreground_read_protection.staged_payload_evictions,
+                    upload_fallback_rereads = foreground_read_protection.upload_fallback_rereads,
+                    upload_fallback_reread_bytes = foreground_read_protection.upload_fallback_reread_bytes,
+                    upload_fallback_reread_cache_misses = foreground_read_protection.upload_fallback_reread_cache_misses,
+                    upload_fallback_wait_ms = foreground_read_protection.upload_fallback_wait_ns / 1_000_000,
+                    upload_fallback_wait_max_ms = foreground_read_protection.upload_fallback_wait_max_ns / 1_000_000,
+                    upload_fallback_read_ms = foreground_read_protection.upload_fallback_read_ns / 1_000_000,
+                    upload_fallback_read_max_ms = foreground_read_protection.upload_fallback_read_max_ns / 1_000_000,
                     "upload pipeline staged payloads"
                 );
                 debug!(
@@ -11123,21 +11286,23 @@ impl StudioVfs {
                     "upload pipeline transit memory"
                 );
                 debug!(
-                    upload_io_penalty_base = self.upload_cache_io_user_penalty_base,
-                    upload_io_penalty_dynamic = self
-                        .state
-                        .upload
-                        .upload_cache_io_user_penalty
-                        .load(Ordering::Relaxed),
-                    foreground_read_p90_present = foreground_read_p90_ns.is_some(),
-                    foreground_read_p90_ms = foreground_read_p90_ns
+                    upload_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,
+                    upload_io_foreground_cost_step = self.upload_cache_io_foreground_cost_step,
+                    upload_io_foreground_cost_dynamic = foreground_read_protection
+                        .upload_cache_io_foreground_cost,
+                    foreground_read_p90_present = foreground_read_protection.p90_latency_ns.is_some(),
+                    foreground_read_p90_ms = foreground_read_protection
+                        .p90_latency_ns
                         .map(|ns| ns.saturating_div(1_000_000))
                         .unwrap_or(0),
-                    foreground_read_speedometer_samples,
+                    foreground_read_speedometer_samples = foreground_read_protection.speedometer_samples,
+                    foreground_read_window_bytes = foreground_read_protection.window_bytes,
+                    foreground_read_window_coverage_ms = foreground_read_protection.window_coverage_ms,
+                    foreground_read_throughput_bytes_per_sec = foreground_read_protection.throughput_bytes_per_sec,
                     foreground_read_target_ms = self
                         .upload_fg_read_latency_target_ns
                         .saturating_div(1_000_000),
-                    upload_scheduler_penalty_ms = self.upload_scheduler.adaptive_penalty_ms(),
+                    upload_scheduler_penalty_ms = foreground_read_protection.upload_scheduler_penalty_ms,
                     "upload pipeline adaptive throttle"
                 );
             }
@@ -11940,7 +12105,6 @@ mod tests {
         let validated = VfsConfigRaw {
             read_buffer_mb: Some(8192),
             upload_cache_io_slots: Some(11),
-            upload_cache_io_user_penalty: Some(7),
             principal: Some("dev-user".to_string()),
             ..Default::default()
         }
@@ -11949,24 +12113,17 @@ mod tests {
 
         assert_eq!(validated.read_buffer_mb, 8192);
         assert_eq!(validated.upload_cache_io_slots, 11);
-        assert_eq!(validated.upload_cache_io_user_penalty, 7);
         assert_eq!(validated.principal, "dev-user");
     }
 
     #[test]
-    fn vfs_config_raw_validate_rejects_invalid_slot_relationship() {
-        let err = VfsConfigRaw {
-            upload_cache_io_slots: Some(2),
-            upload_cache_io_user_penalty: Some(3),
-            ..Default::default()
-        }
-        .validate()
-        .expect_err("penalty above slots must fail");
-
-        assert!(
-            err.to_string().contains("upload_cache_io_user_penalty"),
-            "unexpected error: {err}"
-        );
+    fn upload_cache_io_foreground_cost_derivation_scales_with_slot_budget() {
+        assert_eq!(derive_upload_cache_io_foreground_cost_base(1), 1);
+        assert_eq!(derive_upload_cache_io_foreground_cost_base(8), 2);
+        assert_eq!(derive_upload_cache_io_foreground_cost_base(32), 8);
+        assert_eq!(derive_upload_cache_io_foreground_cost_step(1), 1);
+        assert_eq!(derive_upload_cache_io_foreground_cost_step(8), 1);
+        assert_eq!(derive_upload_cache_io_foreground_cost_step(32), 4);
     }
 
     #[test]
@@ -12037,11 +12194,14 @@ mod tests {
 
     #[test]
     fn foreground_speedometer_trim_drops_expired_samples() {
-        let mut samples =
-            std::collections::VecDeque::from([(100, 10_u64), (200, 20_u64), (350, 30_u64)]);
+        let mut samples = std::collections::VecDeque::from([
+            (100, 10_u64, 4_096_u64),
+            (200, 20_u64, 4_096_u64),
+            (350, 30_u64, 4_096_u64),
+        ]);
         StudioVfs::trim_foreground_latency_samples(&mut samples, 400, Duration::from_millis(150));
-        let kept: Vec<(u64, u64)> = samples.into_iter().collect();
-        assert_eq!(kept, vec![(350, 30)]);
+        let kept: Vec<(u64, u64, u64)> = samples.into_iter().collect();
+        assert_eq!(kept, vec![(350, 30, 4_096)]);
     }
 
     #[test]
