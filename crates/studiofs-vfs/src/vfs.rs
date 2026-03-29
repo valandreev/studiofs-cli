@@ -5793,6 +5793,48 @@ impl StudioVfs {
         Duration::from_millis(delay_ms)
     }
 
+    async fn defer_upload_fallback_reread(
+        &self,
+        op: &PendingUpload,
+        upload_cancel_token: &CancellationToken,
+        block_index: u32,
+        reason: &'static str,
+    ) -> VfsResult<()> {
+        let defer_delay = self.upload_fallback_defer_delay();
+        self.state
+            .upload
+            .upload_fallback_deferrals
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .upload
+            .upload_requeues
+            .fetch_add(1, Ordering::Relaxed);
+        debug!(
+            ino = op.ino,
+            object_id = op.object_id,
+            block_index,
+            delay_ms = defer_delay.as_millis() as u64,
+            reason,
+            "process_upload deferring fallback L2 reread while foreground demand is active"
+        );
+        let should_requeue = tokio::select! {
+            _ = self.state.shutdown.uploader_shutdown_token.cancelled() => false,
+            _ = upload_cancel_token.cancelled() => false,
+            _ = tokio::time::sleep(defer_delay) => !self.uploader_shutdown_requested(),
+        };
+        if !should_requeue {
+            self.cancel_upload_if_inode_deleted(op);
+            return Ok(());
+        }
+        if !self.block_cache.requeue_upload(op.clone()) {
+            return Err(VfsError::Other(format!(
+                "failed to requeue deferred upload op {}",
+                op.object_id
+            )));
+        }
+        Ok(())
+    }
+
     fn remove_spill_entry(&self, key: (Ino, u32)) -> Option<SpillEntry> {
         let removed = self.state.ingress.ingress_live.lock().remove(&key);
         if let Some(ref entry) = removed {
@@ -6772,7 +6814,11 @@ impl StudioVfs {
             speedometer_samples,
             window_bytes,
             window_coverage_ms,
-            staged_payload_hits: self.state.upload.staged_payload_hits.load(Ordering::Relaxed),
+            staged_payload_hits: self
+                .state
+                .upload
+                .staged_payload_hits
+                .load(Ordering::Relaxed),
             staged_payload_misses: self
                 .state
                 .upload
@@ -9583,7 +9629,10 @@ impl StudioVfs {
             .iter()
             .map(|(idx, _, _)| {
                 let block_idx = *idx;
-                async move { self.read_block_or_pending(ino, block_idx, pending_content_epoch).await }
+                async move {
+                    self.read_block_or_pending(ino, block_idx, pending_content_epoch)
+                        .await
+                }
             })
             .collect();
 
@@ -9851,7 +9900,12 @@ impl StudioVfs {
         Ok(Some(written as u32))
     }
 
-    fn can_read_sync_cached_impl(&self, ino: Ino, offset: u64, buffer_len: usize) -> VfsResult<bool> {
+    fn can_read_sync_cached_impl(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer_len: usize,
+    ) -> VfsResult<bool> {
         if self.ignored_entry_attr(ino).is_some() || buffer_len == 0 {
             return Ok(true);
         }
@@ -10719,42 +10773,16 @@ impl StudioVfs {
                 "process_upload using L1 payload after staged miss"
             );
             Some(payload)
-        } else {
-            if self.foreground_read_active() {
-                let defer_delay = self.upload_fallback_defer_delay();
-                self.state
-                    .upload
-                    .upload_fallback_deferrals
-                    .fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_requeues
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    ino = op.ino,
-                    object_id = op.object_id,
+        } else if self.foreground_read_active() {
+            return self
+                .defer_upload_fallback_reread(
+                    &op,
+                    &upload_cancel_token,
                     block_index,
-                    delay_ms = defer_delay.as_millis() as u64,
-                    "process_upload deferring fallback L2 reread while foreground demand is active"
-                );
-                let should_requeue = tokio::select! {
-                    _ = self.state.shutdown.uploader_shutdown_token.cancelled() => false,
-                    _ = upload_cancel_token.cancelled() => false,
-                    _ = tokio::time::sleep(defer_delay) => !self.uploader_shutdown_requested(),
-                };
-                if !should_requeue {
-                    self.cancel_upload_if_inode_deleted(&op);
-                    return Ok(());
-                }
-                if !self.block_cache.requeue_upload(op.clone()) {
-                    return Err(VfsError::Other(format!(
-                        "failed to requeue deferred upload op {}",
-                        op.object_id
-                    )));
-                }
-                return Ok(());
-            }
-
+                    "foreground already active before fallback permit acquisition",
+                )
+                .await;
+        } else {
             // Hold local upload I/O slots strictly around the L2 read phase.
             // Never keep them during network visibility checks or S3 uploads.
             let upload_io_cost = if self.foreground_read_active() {
@@ -10778,126 +10806,136 @@ impl StudioVfs {
                     message: e.to_string(),
                 })?;
             let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-            let read_started = Instant::now();
-            let (read_result, read_trace) = self
-                .block_cache
-                .get_with_trace_and_priority(op.object_id, L2IoPriority::Background)
-                .await;
-            let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-            drop(upload_io_permit);
-            self.state
-                .upload
-                .upload_fallback_wait_ns
-                .fetch_add(wait_ns, Ordering::Relaxed);
-            self.state
-                .upload
-                .upload_fallback_wait_max_ns
-                .fetch_max(wait_ns, Ordering::Relaxed);
-            self.state
-                .upload
-                .upload_fallback_read_ns
-                .fetch_add(read_ns, Ordering::Relaxed);
-            self.state
-                .upload
-                .upload_fallback_read_max_ns
-                .fetch_max(read_ns, Ordering::Relaxed);
-            match read_trace.level {
-                CacheReadLevel::L2 => {
-                    self.state
-                        .upload
-                        .upload_fallback_rereads
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(payload) = &read_result {
+            if let Some(payload) = self.block_cache.get_l1_only(op.object_id) {
+                drop(upload_io_permit);
+                debug!(
+                    ino = op.ino,
+                    object_id = op.object_id,
+                    block_index,
+                    payload_len = payload.len(),
+                    "process_upload using L1 payload after upload slot wait"
+                );
+                Some(payload)
+            } else if self.foreground_read_active() {
+                drop(upload_io_permit);
+                return self
+                    .defer_upload_fallback_reread(
+                        &op,
+                        &upload_cancel_token,
+                        block_index,
+                        "foreground became active before fallback L2 read",
+                    )
+                    .await;
+            } else {
+                let read_started = Instant::now();
+                let (read_result, read_trace) = self
+                    .block_cache
+                    .get_l2_only_with_trace_and_priority(op.object_id, L2IoPriority::Background)
+                    .await;
+                let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+                drop(upload_io_permit);
+                self.state
+                    .upload
+                    .upload_fallback_wait_ns
+                    .fetch_add(wait_ns, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_wait_max_ns
+                    .fetch_max(wait_ns, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_read_ns
+                    .fetch_add(read_ns, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_fallback_read_max_ns
+                    .fetch_max(read_ns, Ordering::Relaxed);
+                match read_trace.level {
+                    CacheReadLevel::L2 => {
                         self.state
                             .upload
-                            .upload_fallback_reread_bytes
-                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            .upload_fallback_rereads
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(payload) = &read_result {
+                            self.state
+                                .upload
+                                .upload_fallback_reread_bytes
+                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        }
+                    }
+                    CacheReadLevel::Miss => {
+                        self.state
+                            .upload
+                            .upload_fallback_rereads
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.state
+                            .upload
+                            .upload_fallback_reread_cache_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    CacheReadLevel::L1 => {
+                        debug_assert!(
+                            false,
+                            "L2-only upload fallback unexpectedly reported an L1 hit"
+                        );
                     }
                 }
-                CacheReadLevel::Miss => {
-                    self.state
-                        .upload
-                        .upload_fallback_rereads
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.state
-                        .upload
-                        .upload_fallback_reread_cache_misses
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                CacheReadLevel::L1 => {}
+                read_result
             }
-            read_result
         };
 
         let raw_payload = match raw_payload {
-                Some(data) => data,
+            Some(data) => data,
             None if remote_object_visible => Bytes::new(),
-                None => {
-                    // Block data is missing from cache. If remote already has
-                    // this object, we can still continue with commit reconcile.
-                    if op.retry_count > 0 {
-                        let checks = fragment_keys.iter().map(|key| {
-                            let cancel_token = upload_cancel_token.clone();
-                            async move {
-                                let result = run_with_timeout_or_cancel(
-                                    &cancel_token,
-                                    Duration::from_secs(5),
-                                    self.fetch_scheduler.data_store().exists(key),
-                                )
-                                .await;
-                                (key, result)
-                            }
-                        });
-                        let results = futures::future::join_all(checks).await;
-                        let mut all_visible = true;
-                        for (_key, result) in results {
-                            match result {
-                                TimeoutOrCancel::Completed(Ok(true)) => {}
-                                TimeoutOrCancel::Completed(Ok(false))
-                                | TimeoutOrCancel::Completed(Err(_))
-                                | TimeoutOrCancel::TimedOut => {
-                                    all_visible = false;
-                                    break;
-                                }
-                                // Shutdown cancellation: exit quietly so worker
-                                // loop does not requeue/log as transient failure.
-                                TimeoutOrCancel::Cancelled => {
-                                    self.cancel_upload_if_inode_deleted(&op);
-                                    return Ok(());
-                                }
-                            }
+            None => {
+                // Block data is missing from cache. If remote already has
+                // this object, we can still continue with commit reconcile.
+                if op.retry_count > 0 {
+                    let checks = fragment_keys.iter().map(|key| {
+                        let cancel_token = upload_cancel_token.clone();
+                        async move {
+                            let result = run_with_timeout_or_cancel(
+                                &cancel_token,
+                                Duration::from_secs(5),
+                                self.fetch_scheduler.data_store().exists(key),
+                            )
+                            .await;
+                            (key, result)
                         }
-                        if all_visible {
-                            debug!(
-                                object_id = op.object_id,
-                                ino = op.ino,
-                                block_index,
-                                retry_count = op.retry_count,
-                                "upload reconcile: cache entry missing but remote object exists"
-                            );
-                            remote_object_visible = true;
-                            Bytes::new()
-                        } else {
-                            // If the inode was deleted between our checks
-                            // (race), cancel cleanly. Otherwise this remains a
-                            // genuine error and will be retried.
-                            if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                                self.block_cache.cancel_upload(&op, false);
-                                self.state
-                                    .upload
-                                    .pending_evictions
-                                    .lock()
-                                    .remove(&op.object_id);
+                    });
+                    let results = futures::future::join_all(checks).await;
+                    let mut all_visible = true;
+                    for (_key, result) in results {
+                        match result {
+                            TimeoutOrCancel::Completed(Ok(true)) => {}
+                            TimeoutOrCancel::Completed(Ok(false))
+                            | TimeoutOrCancel::Completed(Err(_))
+                            | TimeoutOrCancel::TimedOut => {
+                                all_visible = false;
+                                break;
+                            }
+                            // Shutdown cancellation: exit quietly so worker
+                            // loop does not requeue/log as transient failure.
+                            TimeoutOrCancel::Cancelled => {
+                                self.cancel_upload_if_inode_deleted(&op);
                                 return Ok(());
                             }
-                            return Err(VfsError::Other(format!(
-                                "object {} missing from cache",
-                                op.object_id
-                            )));
                         }
+                    }
+                    if all_visible {
+                        debug!(
+                            object_id = op.object_id,
+                            ino = op.ino,
+                            block_index,
+                            retry_count = op.retry_count,
+                            "upload reconcile: cache entry missing but remote object exists"
+                        );
+                        remote_object_visible = true;
+                        Bytes::new()
                     } else {
-                        // First attempt without cache data is unexpected; retry
-                        // through normal error path.
+                        // If the inode was deleted between our checks
+                        // (race), cancel cleanly. Otherwise this remains a
+                        // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                             self.block_cache.cancel_upload(&op, false);
                             self.state
@@ -10912,8 +10950,25 @@ impl StudioVfs {
                             op.object_id
                         )));
                     }
+                } else {
+                    // First attempt without cache data is unexpected; retry
+                    // through normal error path.
+                    if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
+                        self.block_cache.cancel_upload(&op, false);
+                        self.state
+                            .upload
+                            .pending_evictions
+                            .lock()
+                            .remove(&op.object_id);
+                        return Ok(());
+                    }
+                    return Err(VfsError::Other(format!(
+                        "object {} missing from cache",
+                        op.object_id
+                    )));
                 }
-            };
+            }
+        };
 
         let mut transit_credit = if remote_object_visible {
             None
@@ -10950,15 +11005,15 @@ impl StudioVfs {
         }
 
         if let Some(object_bytes) = object_bytes {
-            let _upload_qos = self
-                .qos
-                .acquire_upload()
-                .await
-                .map_err(|e| VfsError::QosFailure {
-                    stage: Cow::Borrowed("upload_qos"),
-                    object_id: op.object_id,
-                    message: e.to_string(),
-                })?;
+            let _upload_qos =
+                self.qos
+                    .acquire_upload()
+                    .await
+                    .map_err(|e| VfsError::QosFailure {
+                        stage: Cow::Borrowed("upload_qos"),
+                        object_id: op.object_id,
+                        message: e.to_string(),
+                    })?;
             let uploads = fragment_keys
                 .iter()
                 .zip(object_bytes.into_iter())
@@ -11176,9 +11231,7 @@ impl StudioVfs {
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
             let cache_pipeline = self.block_cache.cache_pipeline_metrics();
             let foreground_read_protection = self.foreground_read_protection_stats();
-            self.adjust_upload_backpressure_from_metrics(
-                foreground_read_protection.p90_latency_ns,
-            );
+            self.adjust_upload_backpressure_from_metrics(foreground_read_protection.p90_latency_ns);
             self.retune_staged_upload_payload_budget(0, false);
             let (
                 staged_payload_count,
@@ -11362,15 +11415,23 @@ impl StudioVfs {
                     upload_staged_payload_max_bytes = staged_payload_max_bytes,
                     upload_staged_payload_hits = foreground_read_protection.staged_payload_hits,
                     upload_staged_payload_misses = foreground_read_protection.staged_payload_misses,
-                    upload_staged_payload_evictions = foreground_read_protection.staged_payload_evictions,
-                    upload_fallback_deferrals = foreground_read_protection.upload_fallback_deferrals,
+                    upload_staged_payload_evictions =
+                        foreground_read_protection.staged_payload_evictions,
+                    upload_fallback_deferrals =
+                        foreground_read_protection.upload_fallback_deferrals,
                     upload_fallback_rereads = foreground_read_protection.upload_fallback_rereads,
-                    upload_fallback_reread_bytes = foreground_read_protection.upload_fallback_reread_bytes,
-                    upload_fallback_reread_cache_misses = foreground_read_protection.upload_fallback_reread_cache_misses,
-                    upload_fallback_wait_ms = foreground_read_protection.upload_fallback_wait_ns / 1_000_000,
-                    upload_fallback_wait_max_ms = foreground_read_protection.upload_fallback_wait_max_ns / 1_000_000,
-                    upload_fallback_read_ms = foreground_read_protection.upload_fallback_read_ns / 1_000_000,
-                    upload_fallback_read_max_ms = foreground_read_protection.upload_fallback_read_max_ns / 1_000_000,
+                    upload_fallback_reread_bytes =
+                        foreground_read_protection.upload_fallback_reread_bytes,
+                    upload_fallback_reread_cache_misses =
+                        foreground_read_protection.upload_fallback_reread_cache_misses,
+                    upload_fallback_wait_ms =
+                        foreground_read_protection.upload_fallback_wait_ns / 1_000_000,
+                    upload_fallback_wait_max_ms =
+                        foreground_read_protection.upload_fallback_wait_max_ns / 1_000_000,
+                    upload_fallback_read_ms =
+                        foreground_read_protection.upload_fallback_read_ns / 1_000_000,
+                    upload_fallback_read_max_ms =
+                        foreground_read_protection.upload_fallback_read_max_ns / 1_000_000,
                     "upload pipeline staged payloads"
                 );
                 debug!(
@@ -11384,21 +11445,26 @@ impl StudioVfs {
                 debug!(
                     upload_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,
                     upload_io_foreground_cost_step = self.upload_cache_io_foreground_cost_step,
-                    upload_io_foreground_cost_dynamic = foreground_read_protection
-                        .upload_cache_io_foreground_cost,
-                    foreground_read_p90_present = foreground_read_protection.p90_latency_ns.is_some(),
+                    upload_io_foreground_cost_dynamic =
+                        foreground_read_protection.upload_cache_io_foreground_cost,
+                    foreground_read_p90_present =
+                        foreground_read_protection.p90_latency_ns.is_some(),
                     foreground_read_p90_ms = foreground_read_protection
                         .p90_latency_ns
                         .map(|ns| ns.saturating_div(1_000_000))
                         .unwrap_or(0),
-                    foreground_read_speedometer_samples = foreground_read_protection.speedometer_samples,
+                    foreground_read_speedometer_samples =
+                        foreground_read_protection.speedometer_samples,
                     foreground_read_window_bytes = foreground_read_protection.window_bytes,
-                    foreground_read_window_coverage_ms = foreground_read_protection.window_coverage_ms,
-                    foreground_read_throughput_bytes_per_sec = foreground_read_protection.throughput_bytes_per_sec,
+                    foreground_read_window_coverage_ms =
+                        foreground_read_protection.window_coverage_ms,
+                    foreground_read_throughput_bytes_per_sec =
+                        foreground_read_protection.throughput_bytes_per_sec,
                     foreground_read_target_ms = self
                         .upload_fg_read_latency_target_ns
                         .saturating_div(1_000_000),
-                    upload_scheduler_penalty_ms = foreground_read_protection.upload_scheduler_penalty_ms,
+                    upload_scheduler_penalty_ms =
+                        foreground_read_protection.upload_scheduler_penalty_ms,
                     "upload pipeline adaptive throttle"
                 );
             }
