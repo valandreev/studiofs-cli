@@ -9495,7 +9495,7 @@ async fn sfs121_file_session_flush_ordering_is_deterministic() {
     vfs.flush(attr_b.ino).await.unwrap();
 
     // A post-flush read must reflect the flushed content.
-    let read_a = vfs.read(attr_a.ino, 0, block_size as u32).await.unwrap();
+    let read_a = vfs.read(attr_a.ino, 0, block_size).await.unwrap();
     assert_eq!(
         read_a.as_ref(),
         payload_a1.as_slice(),
@@ -9503,7 +9503,7 @@ async fn sfs121_file_session_flush_ordering_is_deterministic() {
     );
 
     // B must not contain any bytes from A's write.
-    let read_b = vfs.read(attr_b.ino, 0, block_size as u32).await.unwrap();
+    let read_b = vfs.read(attr_b.ino, 0, block_size).await.unwrap();
     assert_eq!(
         read_b.as_ref(),
         payload_b.as_slice(),
@@ -9515,7 +9515,7 @@ async fn sfs121_file_session_flush_ordering_is_deterministic() {
     vfs.flush(attr_a.ino).await.unwrap();
 
     // A must now reflect the updated payload.
-    let read_a2 = vfs.read(attr_a.ino, 0, block_size as u32).await.unwrap();
+    let read_a2 = vfs.read(attr_a.ino, 0, block_size).await.unwrap();
     assert_eq!(
         read_a2.as_ref(),
         payload_a2.as_slice(),
@@ -9523,7 +9523,7 @@ async fn sfs121_file_session_flush_ordering_is_deterministic() {
     );
 
     // B must still reflect the original payload; no cross-contamination.
-    let read_b2 = vfs.read(attr_b.ino, 0, block_size as u32).await.unwrap();
+    let read_b2 = vfs.read(attr_b.ino, 0, block_size).await.unwrap();
     assert_eq!(
         read_b2.as_ref(),
         payload_b.as_slice(),
@@ -9532,8 +9532,8 @@ async fn sfs121_file_session_flush_ordering_is_deterministic() {
 
     // ── Stability: repeated reads return the same data ────────────────────
     for pass in 0..3 {
-        let ra = vfs.read(attr_a.ino, 0, block_size as u32).await.unwrap();
-        let rb = vfs.read(attr_b.ino, 0, block_size as u32).await.unwrap();
+        let ra = vfs.read(attr_a.ino, 0, block_size).await.unwrap();
+        let rb = vfs.read(attr_b.ino, 0, block_size).await.unwrap();
         assert_eq!(
             ra.as_ref(),
             payload_a2.as_slice(),

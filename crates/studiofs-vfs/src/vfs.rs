@@ -3374,7 +3374,6 @@ impl VfsState {
         recovered_spill_seq: u64,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
         block_size: u32,
-        upload_cache_io_foreground_cost_base: u32,
         cfg: &VfsConfig,
     ) -> Self {
         Self {
@@ -3387,7 +3386,7 @@ impl VfsState {
             ),
             dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
             upload: UploadState::new(
-                upload_cache_io_foreground_cost_base,
+                derive_upload_cache_io_foreground_cost_base(cfg.upload_cache_io_slots),
                 block_size,
                 cfg.upload_worker_count,
                 cfg.max_dirty_bytes,
@@ -4576,7 +4575,6 @@ impl StudioVfs {
                     recovered_spill_seq,
                     initial_checkpoint_meta,
                     block_size,
-                    upload_cache_io_foreground_cost_base,
                     &config,
                 )),
                 upload_scheduler,
