@@ -601,6 +601,115 @@ fn make_vfs_with_meta(
     vfs
 }
 
+/// RAII guard that captures and restores all SFS-121 offline test env vars on drop.
+/// The explicit `_lock` field holds the global env lock for the **entire** test
+/// duration, preventing other parallel tests from observing a partially-set env.
+struct OfflineTestEnv {
+    _guards: Vec<ScopedEnvVar>,
+    _lock: ReentrantMutexGuard<'static, ()>,
+}
+
+/// Capture current env state and install the standard offline S3 config for
+/// SFS-121 tests: unreachable endpoint + fast upload-retry timeouts.
+///
+/// The global env lock is acquired **before** any captures so that no other
+/// test can observe the environment mid-setup.  The returned guard holds the
+/// lock and restores all captured variables when dropped.
+fn setup_offline_sfs121_env() -> OfflineTestEnv {
+    let lock = acquire_test_env_lock();
+    let guards = vec![
+        ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES"),
+        ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES"),
+        ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT"),
+        ScopedEnvVar::capture("STUDIOFS_S3_BUCKET"),
+        ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY"),
+        ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY"),
+        ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS"),
+        ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS"),
+        ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS"),
+        ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS"),
+    ];
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_BUCKET", "studiofs-test");
+        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        std::env::set_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+    OfflineTestEnv { _guards: guards, _lock: lock }
+}
+
+/// RAII guard that captures and restores all SFS-121 S3-backed test env vars on drop.
+/// The explicit `_lock` field holds the global env lock for the **entire** test
+/// duration, preventing other parallel tests from observing a partially-set env.
+struct OnlineTestEnv {
+    _guards: Vec<ScopedEnvVar>,
+    _lock: ReentrantMutexGuard<'static, ()>,
+}
+
+/// Capture current env state and install S3 connection vars for SFS-121 tests
+/// that require a real S3 backend.
+///
+/// Upload timing vars (`STUDIOFS_MAX_DIRTY_BYTES`, `STUDIOFS_MAX_SPILL_BYTES`,
+/// `STUDIOFS_UPLOAD_DELAY_MS`, `STUDIOFS_UPLOAD_WORKER_COUNT`) are intentionally
+/// left unset — they differ per test and must be set by the caller under the
+/// held lock.  All captured vars are restored when the returned guard is dropped.
+fn setup_online_sfs121_env() -> OnlineTestEnv {
+    let lock = acquire_test_env_lock();
+    let guards = vec![
+        ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES"),
+        ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES"),
+        ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT"),
+        ScopedEnvVar::capture("STUDIOFS_S3_BUCKET"),
+        ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY"),
+        ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY"),
+        ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS"),
+        ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT"),
+    ];
+    let env = test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", &env.endpoint);
+        std::env::set_var("STUDIOFS_S3_BUCKET", &env.bucket);
+        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
+        std::env::set_var("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
+    }
+    OnlineTestEnv { _guards: guards, _lock: lock }
+}
+
+/// Create a VFS wired to an unreachable S3 endpoint for SFS-121 offline tests.
+/// Returns `(format_info, vfs)` so callers can derive block sizes and volume
+/// names without reconstructing format info.
+///
+/// Assumes `setup_offline_sfs121_env()` has already been called in the test.
+fn make_offline_vfs_sfs121(
+    tmp: &tempfile::TempDir,
+    suffix: &str,
+    block_size_override: Option<u32>,
+) -> (FormatInfo, Arc<StudioVfs>) {
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("sfs121-{suffix}-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    if let Some(bs) = block_size_override {
+        format_info.block_size = bs;
+    }
+    let meta = Arc::new(
+        RedbMetaEngine::open(tmp.path().join("meta.redb")).expect("failed to open meta"),
+    );
+    meta.init_root(0, 0).unwrap();
+    let vfs = make_vfs_with_meta(
+        meta,
+        &format_info,
+        tmp.path().join("cache").to_str().unwrap(),
+    );
+    (format_info, vfs)
+}
+
 #[allow(dead_code)]
 fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -8675,6 +8784,568 @@ async fn test_xattr_on_directory() {
     assert_eq!(&names[0][..], b"user.tag");
 }
 
+// =============================================================================
+// Buffered-first correctness and performance coverage (SFS-121)
+//
+// These tests encode the target user experience for the buffered-first
+// architecture on Windows and macOS: background upload must not break or
+// heavily degrade foreground local reading, and the entire write→flush→upload
+// finalization lifecycle must be transparent to readers.
+//
+// Correctness tests run without a real S3 backend where possible (unreachable
+// endpoint forces the upload path to retry/backoff while reads stay local).
+// Performance/lifecycle tests that require upload completion are #[ignore] and
+// need S3 + PostgreSQL infra.
+// =============================================================================
+
+/// Verify that a large file with multiple full-size blocks plus a partial tail
+/// can be read back correctly at every point in the upload lifecycle —
+/// including the window between `complete_upload` releasing the L1 pin and
+/// `commit_l2_batch` finishing the NVMe write.
+///
+/// This extends `local_reads_through_upload_with_partial_tail_block` (SFS-123)
+/// to a larger file and validates sustained sequential reads across the
+/// complete write→flush→upload→finalize path (SFS-121).
+#[test]
+#[ignore = "requires S3 backend and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 or valid .env"]
+fn sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
+    let _env = setup_online_sfs121_env();
+    unsafe {
+        // Force immediate materialization and keep the upload window open.
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "40");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("sfs121-large-lifecycle-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 512 * 1024; // 512 KiB blocks
+
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+
+    // 6 full blocks + one partial tail (3/4 of a block).
+    let block_size = format_info.block_size as usize;
+    let full_size = block_size * 6 + block_size * 3 / 4;
+    let payload: Vec<u8> = (0..full_size)
+        .map(|i| ((i as u64).wrapping_mul(6364136223846793005) >> 40) as u8)
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let attr = vfs
+            .create(1, b"sfs121-large-lifecycle.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must be populated before the read loop begins"
+        );
+
+        // Continuously read the full file until the upload pipeline has
+        // published the final epoch (UploadState::Ready).  No read must ever
+        // fail; the data must equal the written payload on every iteration.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut read_passes = 0usize;
+        loop {
+            let bytes = match vfs.read(attr.ino, 0, full_size as u32).await {
+                Ok(b) => b,
+                Err(VfsError::RemoteContentPending) => {
+                    panic!(
+                        "read pass {read_passes}: local read must not surface \
+                         RemoteContentPending during background upload"
+                    );
+                }
+                Err(err) => {
+                    panic!("read pass {read_passes}: unexpected error: {err}");
+                }
+            };
+            assert_eq!(
+                bytes.len(),
+                full_size,
+                "read pass {read_passes}: wrong byte count"
+            );
+            assert_eq!(
+                bytes.as_ref(),
+                payload.as_slice(),
+                "read pass {read_passes}: data mismatch during upload lifecycle"
+            );
+            read_passes += 1;
+
+            let current_attr = vfs.getattr(attr.ino).unwrap();
+            if vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                && current_attr.upload_state == UploadState::Ready
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "upload pipeline did not stabilize in time (after {read_passes} read passes)"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // At least one read pass must have occurred during the upload window
+        // (not just after finalization) to validate interleaving correctness.
+        assert!(
+            read_passes >= 2,
+            "expected multiple read passes during upload lifecycle, got {read_passes}"
+        );
+    });
+    rt.shutdown_background();
+}
+
+/// Measure and enforce a minimum sustained foreground sequential read
+/// throughput while a background upload is concurrently active.
+///
+/// The test writes a multi-block file, waits for the upload queue to populate,
+/// then times N sequential full-file reads.  The total elapsed time for the
+/// read sweep must not exceed a generous upper bound, proving that the buffered
+/// foreground path is not stalled by background upload activity.
+///
+/// Pass/fail threshold: all reads of a ~4 MiB file must complete in ≤ 10 s
+/// regardless of the simulated upload delay.  The time-bounded assertion
+/// (8 × 4 MiB in ≤ 10 s) implies ≥ 3.2 MiB/s; the explicit floor of
+/// **4 MiB/s** hardens this expectation and matches the `assert!` below.
+#[test]
+#[ignore = "requires S3 backend; validates foreground throughput during background upload"]
+fn sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum() {
+    let _env = setup_online_sfs121_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        // Deliberately slow upload so the read sweep overlaps the active upload
+        // window rather than racing to beat it.
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("sfs121-throughput-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 1024 * 1024; // 1 MiB blocks
+
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+
+    // 4 MiB file (4 × 1 MiB blocks).
+    let block_size = format_info.block_size as usize;
+    let full_size = block_size * 4;
+    let payload: Vec<u8> = (0..full_size).map(|i| (i as u8) ^ 0x37).collect();
+
+    const READ_PASSES: usize = 8;
+    const MAX_SWEEP_DURATION: Duration = Duration::from_secs(10);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+
+        let attr = vfs.create(1, b"sfs121-throughput.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        // Ensure upload is actively in progress before starting the read sweep.
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must be populated before throughput sweep begins"
+        );
+
+        let sweep_start = Instant::now();
+        for pass in 0..READ_PASSES {
+            let bytes = tokio::time::timeout(
+                MAX_SWEEP_DURATION,
+                vfs.read(attr.ino, 0, full_size as u32),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "foreground read timed out on pass {pass} — \
+                     upload pipeline must not stall local buffered reads"
+                )
+            })
+            .unwrap_or_else(|err| {
+                panic!("foreground read failed on pass {pass}: {err}")
+            });
+            assert_eq!(
+                bytes.len(),
+                full_size,
+                "pass {pass}: wrong byte count"
+            );
+        }
+        let sweep_elapsed = sweep_start.elapsed();
+
+        assert!(
+            sweep_elapsed <= MAX_SWEEP_DURATION,
+            "{READ_PASSES} sequential reads of {}B should complete within {MAX_SWEEP_DURATION:?} \
+             during background upload; took {sweep_elapsed:?}",
+            full_size
+        );
+
+        let throughput_mib_s =
+            (READ_PASSES * full_size) as f64 / (1024.0 * 1024.0) / sweep_elapsed.as_secs_f64();
+        assert!(
+            throughput_mib_s >= 4.0,
+            "foreground sequential read throughput during upload too low: \
+             {throughput_mib_s:.2} MiB/s (minimum: 4.0 MiB/s)"
+        );
+    });
+    rt.shutdown_background();
+}
+
+/// Validate warm-cache vs cold-cache buffered read behavior.
+///
+/// After a write + flush, data lives in the dirty buffer (pending overlay).
+/// A first sequential read populates the L1 cache.  Subsequent reads
+/// (warm cache) must complete within a consistent bounded latency that
+/// does not regress relative to the first cold-ish read.
+///
+/// This test uses an unreachable S3 endpoint so no actual upload completes;
+/// all reads are served from local buffers (pending overlay → dirty buffer →
+/// L1 memory cache).
+#[test]
+fn sfs121_warm_cache_sequential_read_bounded_latency_after_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = setup_offline_sfs121_env();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (format_info, vfs) = make_offline_vfs_sfs121(&tmp, "warm-cache", Some(512 * 1024));
+
+        // 3 blocks — large enough to measure, small enough for deterministic timing.
+        let block_size = format_info.block_size as usize;
+        let full_size = block_size * 3;
+        let payload: Vec<u8> = (0..full_size).map(|i| (i as u8).wrapping_mul(0xB7)).collect();
+
+        const WARM_PASSES: usize = 5;
+        // Cold + warm reads must each individually complete well within 5 s.
+        const MAX_SINGLE_READ_DURATION: Duration = Duration::from_secs(5);
+
+        let attr = vfs.create(1, b"sfs121-warm-cache.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        // First read: cold path — data served from pending overlay / dirty buffer.
+        let t_cold_start = Instant::now();
+        let bytes = tokio::time::timeout(
+            MAX_SINGLE_READ_DURATION,
+            vfs.read(attr.ino, 0, full_size as u32),
+        )
+        .await
+        .expect("cold-path read timed out")
+        .expect("cold-path read failed");
+        let t_cold = t_cold_start.elapsed();
+        assert_eq!(bytes.as_ref(), payload.as_slice(), "cold read: data mismatch");
+
+        // Warm reads: data is now residing in L1 memory cache.
+        let mut warm_durations = Vec::with_capacity(WARM_PASSES);
+        for pass in 0..WARM_PASSES {
+            let t_start = Instant::now();
+            let bytes = tokio::time::timeout(
+                MAX_SINGLE_READ_DURATION,
+                vfs.read(attr.ino, 0, full_size as u32),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("warm read pass {pass} timed out"))
+            .unwrap_or_else(|err| panic!("warm read pass {pass} failed: {err}"));
+            let t_warm = t_start.elapsed();
+            assert_eq!(bytes.as_ref(), payload.as_slice(), "warm read {pass}: data mismatch");
+            warm_durations.push(t_warm);
+        }
+
+        // Each individual warm read must be bounded.
+        for (pass, dur) in warm_durations.iter().enumerate() {
+            assert!(
+                *dur <= MAX_SINGLE_READ_DURATION,
+                "warm read pass {pass} took {dur:?}, exceeds {MAX_SINGLE_READ_DURATION:?}"
+            );
+        }
+
+        // Warm reads must not be dramatically slower than the cold read.
+        // Allow up to 10× cold latency as a very generous regression gate.
+        let cold_ceiling = t_cold.saturating_mul(10).max(Duration::from_millis(200));
+        for (pass, dur) in warm_durations.iter().enumerate() {
+            assert!(
+                *dur <= cold_ceiling,
+                "warm read pass {pass} took {dur:?} (cold was {t_cold:?}, ceiling {cold_ceiling:?}); \
+                 warm cache path regressed vs cold"
+            );
+        }
+    });
+    rt.shutdown_background();
+}
+
+/// Verify that concurrent sequential, random-offset, and mixed readers all
+/// observe correct data while a background upload is active.
+///
+/// This covers the "mixed workload classification" requirement from SFS-121:
+/// sequential stream, random seeks, mixed patterns, and concurrent readers
+/// must all work correctly simultaneously.
+///
+/// Uses an unreachable S3 endpoint so local buffered reads must succeed
+/// independently of the upload outcome.
+#[test]
+fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = setup_offline_sfs121_env();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (format_info, vfs) = make_offline_vfs_sfs121(&tmp, "mixed-workload", None);
+
+        let block_size = format_info.block_size as usize;
+        // Use 4 blocks so random-offset reads land at block boundaries, midpoints,
+        // and across block boundaries (cross-block sequential pattern).
+        let full_size = block_size * 4;
+        let payload: Vec<u8> = (0..full_size)
+            .map(|i| ((i as u64).wrapping_mul(2654435761) >> 32) as u8)
+            .collect();
+
+        let attr = vfs.create(1, b"sfs121-mixed-workload.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        // Upload is queued but the S3 endpoint is unreachable — local reads
+        // must be fully self-contained and not depend on upload success.
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must be populated for mixed workload test"
+        );
+
+        const PASSES_PER_READER: usize = 6;
+        let deadline = Duration::from_secs(15);
+
+        // — Sequential reader: reads the entire file from beginning to end.
+        let vfs_seq = vfs.clone();
+        let payload_seq = payload.clone();
+        let seq_handle = tokio::spawn(async move {
+            for pass in 0..PASSES_PER_READER {
+                let bytes = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    vfs_seq.read(attr.ino, 0, full_size as u32),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("sequential reader pass {pass} timed out"))
+                .unwrap_or_else(|err| panic!("sequential reader pass {pass} failed: {err}"));
+                assert_eq!(bytes.len(), full_size, "sequential reader {pass}: wrong length");
+                assert_eq!(
+                    bytes.as_ref(),
+                    payload_seq.as_slice(),
+                    "sequential reader {pass}: data mismatch"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // — Random-offset reader: reads at block midpoints and cross-block offsets.
+        let vfs_rand = vfs.clone();
+        let payload_rand = payload.clone();
+        let rand_handle = tokio::spawn(async move {
+            // Offsets: block 0 midpoint, block 1 start, cross block 1→2, block 3 end.
+            let read_specs: &[(u64, u32)] = &[
+                (block_size as u64 / 2, block_size as u32),
+                (block_size as u64, block_size as u32),
+                (block_size as u64 + block_size as u64 / 2, block_size as u32),
+                ((full_size - block_size / 4) as u64, block_size as u32 / 4),
+            ];
+            for pass in 0..PASSES_PER_READER {
+                for &(offset, length) in read_specs {
+                    let bytes = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        vfs_rand.read(attr.ino, offset, length),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("random reader pass {pass} offset {offset} timed out")
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!("random reader pass {pass} offset {offset} failed: {err}")
+                    });
+                    let start = offset as usize;
+                    let end = (start + length as usize).min(full_size);
+                    assert_eq!(
+                        bytes.as_ref(),
+                        &payload_rand[start..end],
+                        "random reader pass {pass} offset {offset}: data mismatch"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        });
+
+        // — Mixed-pattern reader: alternates between head, tail, and full reads.
+        let vfs_mixed = vfs.clone();
+        let payload_mixed = payload.clone();
+        let mixed_handle = tokio::spawn(async move {
+            let patterns: &[(u64, u32)] = &[
+                (0, (block_size * 2) as u32),                             // head
+                ((full_size - block_size) as u64, block_size as u32),     // tail
+                (0, full_size as u32),                                     // full
+                (block_size as u64, (block_size * 2) as u32),             // middle
+            ];
+            for pass in 0..PASSES_PER_READER {
+                for &(offset, length) in patterns {
+                    let bytes = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        vfs_mixed.read(attr.ino, offset, length),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("mixed reader pass {pass} offset {offset} timed out")
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!("mixed reader pass {pass} offset {offset} failed: {err}")
+                    });
+                    let start = offset as usize;
+                    let end = (start + length as usize).min(full_size);
+                    assert_eq!(
+                        bytes.as_ref(),
+                        &payload_mixed[start..end],
+                        "mixed reader pass {pass} offset {offset}: data mismatch"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+        });
+
+        tokio::time::timeout(deadline, seq_handle)
+            .await
+            .expect("sequential reader task timed out")
+            .expect("sequential reader task panicked");
+        tokio::time::timeout(deadline, rand_handle)
+            .await
+            .expect("random-offset reader task timed out")
+            .expect("random-offset reader task panicked");
+        tokio::time::timeout(deadline, mixed_handle)
+            .await
+            .expect("mixed-pattern reader task timed out")
+            .expect("mixed-pattern reader task panicked");
+    });
+    rt.shutdown_background();
+}
+
+/// Verify that per-file flush ordering is deterministic: a flush followed by
+/// a read must always observe the last flushed state, and interleaved writes
+/// to different inodes must not cross-contaminate.
+///
+/// This encodes the "deterministic file-session ordering" requirement from
+/// SFS-121: write/flush/finalize transitions must produce a consistent
+/// observable state for readers on the same client.
+///
+/// Does not require a real S3 backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sfs121_file_session_flush_ordering_is_deterministic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = setup_offline_sfs121_env();
+    let (_format_info, vfs) = make_offline_vfs_sfs121(&tmp, "session-order", None);
+
+    // Use a modest block size so the test runs quickly on any machine.
+    let block_size = 128 * 1024usize;
+    let payload_a1: Vec<u8> = (0..block_size).map(|i| (i as u8) ^ 0xAA).collect();
+    let payload_a2: Vec<u8> = (0..block_size).map(|i| (i as u8) ^ 0xBB).collect();
+    let payload_b: Vec<u8> = (0..block_size).map(|i| (i as u8) ^ 0xCC).collect();
+
+    let attr_a = vfs.create(1, b"session-a.bin", 0, 0, 0o644).unwrap();
+    let attr_b = vfs.create(1, b"session-b.bin", 0, 0, 0o644).unwrap();
+
+    // ── First write session ───────────────────────────────────────────────
+    vfs.write(attr_a.ino, 0, &payload_a1).await.unwrap();
+    vfs.flush(attr_a.ino).await.unwrap();
+
+    vfs.write(attr_b.ino, 0, &payload_b).await.unwrap();
+    vfs.flush(attr_b.ino).await.unwrap();
+
+    // A post-flush read must reflect the flushed content.
+    let read_a = vfs.read(attr_a.ino, 0, block_size as u32).await.unwrap();
+    assert_eq!(
+        read_a.as_ref(),
+        payload_a1.as_slice(),
+        "file A must reflect first session write after flush"
+    );
+
+    // B must not contain any bytes from A's write.
+    let read_b = vfs.read(attr_b.ino, 0, block_size as u32).await.unwrap();
+    assert_eq!(
+        read_b.as_ref(),
+        payload_b.as_slice(),
+        "file B must not be contaminated by writes to file A"
+    );
+
+    // ── Second write session on A ─────────────────────────────────────────
+    vfs.write(attr_a.ino, 0, &payload_a2).await.unwrap();
+    vfs.flush(attr_a.ino).await.unwrap();
+
+    // A must now reflect the updated payload.
+    let read_a2 = vfs.read(attr_a.ino, 0, block_size as u32).await.unwrap();
+    assert_eq!(
+        read_a2.as_ref(),
+        payload_a2.as_slice(),
+        "file A must reflect second session write after second flush"
+    );
+
+    // B must still reflect the original payload; no cross-contamination.
+    let read_b2 = vfs.read(attr_b.ino, 0, block_size as u32).await.unwrap();
+    assert_eq!(
+        read_b2.as_ref(),
+        payload_b.as_slice(),
+        "file B must not be contaminated by second write session to file A"
+    );
+
+    // ── Stability: repeated reads return the same data ────────────────────
+    for pass in 0..3 {
+        let ra = vfs.read(attr_a.ino, 0, block_size as u32).await.unwrap();
+        let rb = vfs.read(attr_b.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(
+            ra.as_ref(),
+            payload_a2.as_slice(),
+            "A stability pass {pass}: data changed without a write"
+        );
+        assert_eq!(
+            rb.as_ref(),
+            payload_b.as_slice(),
+            "B stability pass {pass}: data changed without a write"
+        );
+    }
+}
+
 /// Getattr on non-existent inode should return an error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
@@ -9612,6 +10283,8 @@ fn local_reads_through_upload_with_partial_tail_block() {
 /// A background reader task continuously polls the full file while the writer
 /// waits for epoch finalization.  Neither task must ever see `RemoteContentPending`
 /// or incorrect data.
+///
+/// This is part of the SFS-121 / SFS-123 buffered-first coverage suite.
 #[test]
 fn concurrent_reads_through_upload_finalization() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");

@@ -83,6 +83,12 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   Direct-read opens the file in direct mode, then derives block size from
   either size hint or opened-file metadata (`std_file.metadata()`), avoiding
   extra path-based `stat` races.
+  > **Note (SFS-121):** This platform direct-I/O applies exclusively to reads
+  > and writes of **L2 block-cache files** on the local NVMe/disk cache.  It
+  > is entirely independent of the VFS bridge read/write path, which is
+  > buffered-first on all platforms.  The former Windows/macOS
+  > "direct-I/O product mode" at the VFS bridge layer has been permanently
+  > removed; the FUSE and WinFSP bridges exclusively use the buffered path.
 - **Robust fallback** — when a platform/filesystem rejects direct I/O for a
   file, read path transparently falls back to async buffered file reads.
   Linux buffered fallback emits `posix_fadvise(..., POSIX_FADV_DONTNEED)` after
