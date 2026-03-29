@@ -9275,14 +9275,20 @@ fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
 async fn sfs121_file_session_flush_ordering_is_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
-    let (_format_info, vfs) = make_offline_vfs_sfs121(&tmp, "session-order", None);
-
     // Use a modest block size so the test runs quickly on any machine.
-    let block_size = 128 * 1024usize;
-    let payload_a1: Vec<u8> = (0..block_size).map(|i| (i as u8) ^ 0xAA).collect();
-    let payload_a2: Vec<u8> = (0..block_size).map(|i| (i as u8) ^ 0xBB).collect();
-    let payload_b: Vec<u8> = (0..block_size).map(|i| (i as u8) ^ 0xCC).collect();
+    let block_size: u32 = 128 * 1024;
+    let (_format_info, vfs) =
+        make_offline_vfs_sfs121(&tmp, "session-order", Some(block_size));
 
+    let payload_a1: Vec<u8> = (0..block_size as usize)
+        .map(|i| (i as u8) ^ 0xAA)
+        .collect();
+    let payload_a2: Vec<u8> = (0..block_size as usize)
+        .map(|i| (i as u8) ^ 0xBB)
+        .collect();
+    let payload_b: Vec<u8> = (0..block_size as usize)
+        .map(|i| (i as u8) ^ 0xCC)
+        .collect();
     let attr_a = vfs.create(1, b"session-a.bin", 0, 0, 0o644).unwrap();
     let attr_b = vfs.create(1, b"session-b.bin", 0, 0, 0o644).unwrap();
 
