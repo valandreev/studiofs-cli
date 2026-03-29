@@ -1282,17 +1282,25 @@ struct PendingUploadObservation {
     pending_uploads: usize,
 }
 
-fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
-    let entries = match std::fs::read_dir(upload_dir) {
+async fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
+    let mut entries = match fs::read_dir(upload_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(err).with_context(|| format!("read {}", upload_dir.display())),
     };
 
-    Ok(entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pending"))
-        .count())
+    let mut pending_uploads = 0usize;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("read {}", upload_dir.display()))?
+    {
+        if entry.path().extension().is_some_and(|ext| ext == "pending") {
+            pending_uploads = pending_uploads.saturating_add(1);
+        }
+    }
+
+    Ok(pending_uploads)
 }
 
 async fn wait_for_pending_upload_target(
@@ -1302,7 +1310,7 @@ async fn wait_for_pending_upload_target(
 ) -> Result<PendingUploadObservation> {
     let start = Instant::now();
     loop {
-        let pending_uploads = scan_pending_uploads(upload_dir)?;
+        let pending_uploads = scan_pending_uploads(upload_dir).await?;
         if target.matches(pending_uploads) {
             return Ok(PendingUploadObservation {
                 target,
@@ -2500,11 +2508,13 @@ async fn run_mounted_end_to_end(
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
         let mut baseline_buffered_read_phase = None;
         if let Some(upload_dir) = cache_upload_dir.as_deref() {
+            let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
             tracing::info!(
                 target: "studiofs.cache.profile",
                 run_id = %params.run_id,
                 phase = "e2e-baseline-seed-write",
-                cache_path = %upload_dir.display(),
+                cache_path = %cache_path_for_log.display(),
+                upload_dir = %upload_dir.display(),
                 "cache benchmark phase start"
             );
             let _ = run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
@@ -2525,7 +2535,8 @@ async fn run_mounted_end_to_end(
                 target: "studiofs.cache.profile",
                 run_id = %params.run_id,
                 phase = "e2e-baseline-read",
-                cache_path = %upload_dir.display(),
+                cache_path = %cache_path_for_log.display(),
+                upload_dir = %upload_dir.display(),
                 "cache benchmark phase start"
             );
             let baseline_wall_start = Instant::now();
@@ -2538,7 +2549,7 @@ async fn run_mounted_end_to_end(
                 target_state_observed: idle_before_baseline.observed,
                 wait_ms: idle_before_baseline.waited.as_secs_f64() * 1000.0,
                 pending_uploads_before: idle_before_baseline.pending_uploads,
-                pending_uploads_after: scan_pending_uploads(upload_dir)?,
+                pending_uploads_after: scan_pending_uploads(upload_dir).await?,
                 results: phase_telemetry_to_report(&baseline_reads, baseline_wall),
             });
         }
@@ -2638,7 +2649,7 @@ async fn run_mounted_end_to_end(
                         .as_ref()
                         .map(|observation| observation.pending_uploads)
                         .unwrap_or_default(),
-                    pending_uploads_after: scan_pending_uploads(upload_dir)?,
+                    pending_uploads_after: scan_pending_uploads(upload_dir).await?,
                     results: phase_telemetry_to_report(&reads, reads_wall),
                 };
 
@@ -2648,11 +2659,13 @@ async fn run_mounted_end_to_end(
                     Duration::from_secs(60),
                 )
                 .await?;
+                let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
                 tracing::info!(
                     target: "studiofs.cache.profile",
                     run_id = %params.run_id,
                     phase = "e2e-post-upload-read",
-                    cache_path = %upload_dir.display(),
+                    cache_path = %cache_path_for_log.display(),
+                    upload_dir = %upload_dir.display(),
                     "cache benchmark phase start"
                 );
                 let post_wall_start = Instant::now();
@@ -2665,7 +2678,7 @@ async fn run_mounted_end_to_end(
                     target_state_observed: idle_before_post.observed,
                     wait_ms: idle_before_post.waited.as_secs_f64() * 1000.0,
                     pending_uploads_before: idle_before_post.pending_uploads,
-                    pending_uploads_after: scan_pending_uploads(upload_dir)?,
+                    pending_uploads_after: scan_pending_uploads(upload_dir).await?,
                     results: phase_telemetry_to_report(&post_reads, post_wall),
                 };
 

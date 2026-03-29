@@ -74,8 +74,8 @@ pub fn write_pid_file_with_cache_path(
         "mount_point": mount_point,
         "volume": volume,
     });
-    if let Some(cache_path) = cache_path.and_then(Path::to_str) {
-        info["cache_path"] = serde_json::Value::String(cache_path.to_string());
+    if let Some(cache_path) = cache_path {
+        info["cache_path"] = serde_json::Value::String(cache_path.to_string_lossy().into_owned());
     }
     std::fs::write(&path, serde_json::to_string_pretty(&info)?)?;
     Ok(())
