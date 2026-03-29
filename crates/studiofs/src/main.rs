@@ -1339,22 +1339,27 @@ mod tests {
     /// silently reintroduced in future refactors by asserting that every
     /// subcommand's argument list is free of any `direct` or `direct_io`
     /// identifier.
+    fn assert_no_direct_io_in_command(cmd: &clap::Command) {
+        for arg in cmd.get_arguments() {
+            let name = arg.get_id().as_str();
+            assert!(
+                !name.starts_with("direct-io") && name != "direct_io",
+                "command '{}' exposes a direct-I/O CLI flag '{}'; \
+                 this mode has been permanently removed (SFS-121)",
+                cmd.get_name(),
+                name
+            );
+        }
+        for subcmd in cmd.get_subcommands() {
+            assert_no_direct_io_in_command(subcmd);
+        }
+    }
+
     #[test]
     fn no_direct_io_flag_in_any_subcommand() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        for subcmd in cmd.get_subcommands() {
-            for arg in subcmd.get_arguments() {
-                let name = arg.get_id().as_str();
-                assert!(
-                    !name.starts_with("direct-io") && name != "direct_io",
-                    "subcommand '{}' exposes a direct-I/O CLI flag '{}'; \
-                     this mode has been permanently removed (SFS-121)",
-                    subcmd.get_name(),
-                    name
-                );
-            }
-        }
+        assert_no_direct_io_in_command(&cmd);
     }
 
     /// Confirm the `mount` subcommand specifically has no `--direct-io` flag
