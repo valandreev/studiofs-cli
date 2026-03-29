@@ -5,6 +5,12 @@ const ACCESS_SCORE_MAX: i16 = 12;
 const READ_SEQUENTIAL_PROMOTION_THRESHOLD: i16 = 4;
 const READ_RANDOM_PROMOTION_THRESHOLD: i16 = 3;
 const WRITE_SEQUENTIAL_PROMOTION_THRESHOLD: i16 = 3;
+/// A read or write spanning ≥ 4 blocks is treated as a "broad scan" — it earns
+/// a triple sequential score bonus and can immediately promote to
+/// `SequentialMediaRead` / `SequentialWriter` without waiting for the normal
+/// contiguous-run threshold.  The value matches the eager-prefetch look-ahead
+/// width (4 × block_size) so a single large I/O is indistinguishable from the
+/// first steps of a genuine sequential stream.
 const LARGE_SEQUENTIAL_SPAN_BLOCKS: u32 = 4;
 const LARGE_RANDOM_JUMP_BLOCKS: u32 = 8;
 

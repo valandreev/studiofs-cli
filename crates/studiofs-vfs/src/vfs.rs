@@ -2782,6 +2782,19 @@ impl HandleTable {
     fn take_orphan(&self, ino: Ino) -> bool {
         self.orphans.lock().remove(&ino)
     }
+
+    /// Return the [`AccessClass`] of every currently open file handle.
+    ///
+    /// Used during shutdown to drain `active_access_classes` counters for
+    /// handles that were never explicitly closed via `release_fh` (e.g. the
+    /// kernel unmounted the filesystem without flushing all file descriptors).
+    fn collect_open_access_classes(&self) -> Vec<AccessClass> {
+        self.handles
+            .read()
+            .values()
+            .map(|f| f.current_access_class())
+            .collect()
+    }
 }
 
 // =============================================================================
@@ -6720,6 +6733,20 @@ impl StudioVfs {
             .ok();
     }
 
+    /// Atomically transition the active-handle count from `from` to `to`.
+    ///
+    /// Performing both operations in a single helper avoids a window where the
+    /// decrement has landed but the increment has not, which could briefly make
+    /// policy decisions based on misleading class counts (e.g. SequentialMedia
+    /// momentarily showing 0 active handles mid-transition).
+    fn transition_active_access_class(&self, from: AccessClass, to: AccessClass) {
+        if from == to {
+            return;
+        }
+        self.decrement_active_access_class(from);
+        self.increment_active_access_class(to);
+    }
+
     fn access_class_active_count(&self, class: AccessClass) -> u64 {
         self.state.read.active_access_classes[class.index()].load(Ordering::Relaxed)
     }
@@ -6735,8 +6762,7 @@ impl StudioVfs {
         }
         self.state.read.access_class_transitions[next.index()].fetch_add(1, Ordering::Relaxed);
         if update_active_handles {
-            self.decrement_active_access_class(previous);
-            self.increment_active_access_class(next);
+            self.transition_active_access_class(previous, next);
         }
     }
 
@@ -12345,6 +12371,14 @@ impl StudioVfs {
             .notify_waiters();
         let _ = self.dirty_flush_tx.send(());
         self.join_background_tasks(background_join_timeout).await;
+
+        // Reset the active-access-class telemetry counters for any handles that
+        // were never explicitly closed via release_fh (e.g. force-unmount).
+        // The shutdown flag is already set, so no new open_file() calls can
+        // increment the counters after this point.
+        for class in self.handle_table.collect_open_access_classes() {
+            self.decrement_active_access_class(class);
+        }
 
         // Phase 1: flush pending write buffer → dirty_mem.
         let dirty_before = self.state.dirty_buffer.dirty_bytes.load(Ordering::Relaxed);
