@@ -21,10 +21,25 @@ fn unique_slice_id() -> u64 {
     pid * 10_000 + seq + 100_000
 }
 
+fn workspace_env_path() -> std::path::PathBuf {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(manifest_dir)
+        .join(".env")
+}
+
 fn load_test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     let _ = ONCE.get_or_init(|| {
-        let _ = dotenvy::dotenv();
+        let env_path = workspace_env_path();
+        if env_path.is_file() {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
     });
 }
 

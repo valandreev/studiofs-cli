@@ -362,12 +362,44 @@ impl BlockCache {
             .0
     }
 
+    /// Read a block from L1 only. Returns `None` when the payload is no longer
+    /// resident in memory.
+    pub fn get_l1_only(&self, object_id: ObjectId) -> Option<Bytes> {
+        let data = self.l1.get(object_id)?;
+        self.lru.touch(object_id);
+        Some(data)
+    }
+
     /// Read a block and return per-level lookup trace for observability.
     ///
     /// This does not change cache behavior; it only exposes lookup timing and
     /// the level that served the payload.
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
-        self.get_with_qos(object_id, L2IoPriority::Foreground).await
+        self.get_with_trace_and_priority(object_id, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Read a block and return per-level lookup trace with an explicit L2 QoS
+    /// priority.
+    pub async fn get_with_trace_and_priority(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> (Option<Bytes>, CacheReadTrace) {
+        self.get_with_qos(object_id, priority).await
+    }
+
+    /// Read a block from L2 only and return lookup trace for observability.
+    ///
+    /// This intentionally skips an L1 probe so callers can distinguish a true
+    /// L2 fallback attempt from a late L1 promotion race.
+    pub async fn get_l2_only_with_trace_and_priority(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> (Option<Bytes>, CacheReadTrace) {
+        self.get_from_l2_with_trace(object_id, priority, Duration::from_secs(0))
+            .await
     }
 
     async fn get_with_qos(
@@ -387,6 +419,16 @@ impl BlockCache {
         }
         let l1_lookup_latency = l1_started.elapsed();
 
+        self.get_from_l2_with_trace(object_id, priority, l1_lookup_latency)
+            .await
+    }
+
+    async fn get_from_l2_with_trace(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+        l1_lookup_latency: Duration,
+    ) -> (Option<Bytes>, CacheReadTrace) {
         let l2_started = Instant::now();
         if self.is_l2_read_breaker_open() {
             return (
@@ -573,7 +615,6 @@ impl BlockCache {
         self.metrics
             .l2_write
             .record(data.len() as u64, started.elapsed());
-
         // Insert into L1 (RAM).
         self.l1.insert(object_id, data);
 
@@ -1530,5 +1571,4 @@ mod tests {
         assert!(cache.get(1).await.is_some());
         assert!(cache.get(2).await.is_some());
     }
-
 }

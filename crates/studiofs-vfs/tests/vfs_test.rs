@@ -36,8 +36,8 @@ use studiofs_meta::{
 };
 use studiofs_vfs::{
     CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw,
-    VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
-    VfsUploadState, parse_size_bytes,
+    VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane, VfsUploadState,
+    parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -639,7 +639,10 @@ fn setup_offline_sfs121_env() -> OfflineTestEnv {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
     }
-    OfflineTestEnv { _guards: guards, _lock: lock }
+    OfflineTestEnv {
+        _guards: guards,
+        _lock: lock,
+    }
 }
 
 /// RAII guard that captures and restores all SFS-121 S3-backed test env vars on drop.
@@ -676,7 +679,10 @@ fn setup_online_sfs121_env() -> OnlineTestEnv {
         std::env::set_var("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
         std::env::set_var("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
     }
-    OnlineTestEnv { _guards: guards, _lock: lock }
+    OnlineTestEnv {
+        _guards: guards,
+        _lock: lock,
+    }
 }
 
 /// Create a VFS wired to an unreachable S3 endpoint for SFS-121 offline tests.
@@ -696,9 +702,8 @@ fn make_offline_vfs_sfs121(
     if let Some(bs) = block_size_override {
         format_info.block_size = bs;
     }
-    let meta = Arc::new(
-        RedbMetaEngine::open(tmp.path().join("meta.redb")).expect("failed to open meta"),
-    );
+    let meta =
+        Arc::new(RedbMetaEngine::open(tmp.path().join("meta.redb")).expect("failed to open meta"));
     meta.init_root(0, 0).unwrap();
     let vfs = make_vfs_with_meta(
         meta,
@@ -1122,9 +1127,8 @@ async fn measure_foreground_read_phase(
         );
     }
     let sweep_elapsed = sweep_start.elapsed();
-    let throughput_mib_s = (read_passes * expected.len()) as f64
-        / (1024.0 * 1024.0)
-        / sweep_elapsed.as_secs_f64();
+    let throughput_mib_s =
+        (read_passes * expected.len()) as f64 / (1024.0 * 1024.0) / sweep_elapsed.as_secs_f64();
     let protection_stats = vfs.foreground_read_protection_stats();
     (sweep_elapsed, throughput_mib_s, protection_stats)
 }
@@ -8990,7 +8994,9 @@ fn sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum() {
         ensure_bucket().await;
         let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
 
-        let attr = vfs.create(1, b"sfs121-throughput.bin", 0, 0, 0o644).unwrap();
+        let attr = vfs
+            .create(1, b"sfs121-throughput.bin", 0, 0, 0o644)
+            .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
@@ -9005,25 +9011,17 @@ fn sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum() {
 
         let sweep_start = Instant::now();
         for pass in 0..READ_PASSES {
-            let bytes = tokio::time::timeout(
-                MAX_SWEEP_DURATION,
-                vfs.read(attr.ino, 0, full_size as u32),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "foreground read timed out on pass {pass} — \
+            let bytes =
+                tokio::time::timeout(MAX_SWEEP_DURATION, vfs.read(attr.ino, 0, full_size as u32))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "foreground read timed out on pass {pass} — \
                      upload pipeline must not stall local buffered reads"
-                )
-            })
-            .unwrap_or_else(|err| {
-                panic!("foreground read failed on pass {pass}: {err}")
-            });
-            assert_eq!(
-                bytes.len(),
-                full_size,
-                "pass {pass}: wrong byte count"
-            );
+                        )
+                    })
+                    .unwrap_or_else(|err| panic!("foreground read failed on pass {pass}: {err}"));
+            assert_eq!(bytes.len(), full_size, "pass {pass}: wrong byte count");
         }
         let sweep_elapsed = sweep_start.elapsed();
 
@@ -9215,6 +9213,86 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
     rt.shutdown_background();
 }
 
+/// Force a staged-payload backlog larger than the transient budget and verify
+/// the uploader still preserves queue-head payloads instead of immediately
+/// falling back to local rereads.
+#[test]
+fn sfs124_staged_payload_queue_head_survives_backlog_without_l2_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = setup_offline_sfs121_env();
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (format_info, vfs) =
+            make_offline_vfs_sfs121(&tmp, "sfs124-stage-head", Some(64 * 1024));
+        let block_size = format_info.block_size as usize;
+        let full_size = block_size * 8;
+        let payload: Vec<u8> = (0..full_size)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+
+        let attr = vfs
+            .create(1, b"sfs124-stage-head.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must populate before staged-payload observation"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.foreground_read_protection_stats()
+                    .staged_payload_evictions
+                    > 0
+            })
+            .await,
+            "expected staged payload backlog to evict newer entries before queue-head upload"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let stats = vfs.foreground_read_protection_stats();
+                stats.staged_payload_hits > 0 || stats.upload_fallback_rereads > 0
+            })
+            .await,
+            "expected at least one upload source decision"
+        );
+
+        let stats = vfs.foreground_read_protection_stats();
+        assert!(
+            stats.staged_payload_evictions > 0,
+            "test setup must force staged backlog eviction; stats={stats:?}"
+        );
+        assert!(
+            stats.staged_payload_hits > 0,
+            "queue-head uploads should consume staged payload under backlog; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.upload_fallback_rereads, 0,
+            "queue-head backlog should not force immediate L2 fallback; stats={stats:?}"
+        );
+    });
+    rt.shutdown_background();
+}
+
 /// Validate warm-cache vs cold-cache buffered read behavior.
 ///
 /// After a write + flush, data lives in the dirty buffer (pending overlay).
@@ -9331,7 +9409,9 @@ fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
             .map(|i| ((i as u64).wrapping_mul(2654435761) >> 32) as u8)
             .collect();
 
-        let attr = vfs.create(1, b"sfs121-mixed-workload.bin", 0, 0, 0o644).unwrap();
+        let attr = vfs
+            .create(1, b"sfs121-mixed-workload.bin", 0, 0, 0o644)
+            .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
@@ -9360,7 +9440,11 @@ fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
                 .await
                 .unwrap_or_else(|_| panic!("sequential reader pass {pass} timed out"))
                 .unwrap_or_else(|err| panic!("sequential reader pass {pass} failed: {err}"));
-                assert_eq!(bytes.len(), full_size, "sequential reader {pass}: wrong length");
+                assert_eq!(
+                    bytes.len(),
+                    full_size,
+                    "sequential reader {pass}: wrong length"
+                );
                 assert_eq!(
                     bytes.as_ref(),
                     payload_seq.as_slice(),
@@ -9411,10 +9495,10 @@ fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
         let payload_mixed = payload.clone();
         let mixed_handle = tokio::spawn(async move {
             let patterns: &[(u64, u32)] = &[
-                (0, (block_size * 2) as u32),                             // head
-                ((full_size - block_size) as u64, block_size as u32),     // tail
-                (0, full_size as u32),                                     // full
-                (block_size as u64, (block_size * 2) as u32),             // middle
+                (0, (block_size * 2) as u32),                         // head
+                ((full_size - block_size) as u64, block_size as u32), // tail
+                (0, full_size as u32),                                // full
+                (block_size as u64, (block_size * 2) as u32),         // middle
             ];
             for pass in 0..PASSES_PER_READER {
                 for &(offset, length) in patterns {
@@ -9472,18 +9556,11 @@ async fn sfs121_file_session_flush_ordering_is_deterministic() {
     let _env = setup_offline_sfs121_env();
     // Use a modest block size so the test runs quickly on any machine.
     let block_size: u32 = 128 * 1024;
-    let (_format_info, vfs) =
-        make_offline_vfs_sfs121(&tmp, "session-order", Some(block_size));
+    let (_format_info, vfs) = make_offline_vfs_sfs121(&tmp, "session-order", Some(block_size));
 
-    let payload_a1: Vec<u8> = (0..block_size as usize)
-        .map(|i| (i as u8) ^ 0xAA)
-        .collect();
-    let payload_a2: Vec<u8> = (0..block_size as usize)
-        .map(|i| (i as u8) ^ 0xBB)
-        .collect();
-    let payload_b: Vec<u8> = (0..block_size as usize)
-        .map(|i| (i as u8) ^ 0xCC)
-        .collect();
+    let payload_a1: Vec<u8> = (0..block_size as usize).map(|i| (i as u8) ^ 0xAA).collect();
+    let payload_a2: Vec<u8> = (0..block_size as usize).map(|i| (i as u8) ^ 0xBB).collect();
+    let payload_b: Vec<u8> = (0..block_size as usize).map(|i| (i as u8) ^ 0xCC).collect();
     let attr_a = vfs.create(1, b"session-a.bin", 0, 0, 0o644).unwrap();
     let attr_b = vfs.create(1, b"session-b.bin", 0, 0, 0o644).unwrap();
 
@@ -10405,7 +10482,9 @@ fn local_reads_through_upload_with_partial_tail_block() {
     // 4 full blocks + a partial tail (block_size / 2 bytes).
     let block_size = format_info.block_size as usize;
     let full_size = block_size * 4 + block_size / 2;
-    let payload: Vec<u8> = (0..full_size).map(|i| (i as u8).wrapping_mul(3) ^ 0xA7).collect();
+    let payload: Vec<u8> = (0..full_size)
+        .map(|i| (i as u8).wrapping_mul(3) ^ 0xA7)
+        .collect();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -10526,7 +10605,9 @@ fn concurrent_reads_through_upload_finalization() {
     // 3 full blocks + partial tail.
     let block_size = format_info.block_size as usize;
     let full_size = block_size * 3 + block_size / 3;
-    let payload: Vec<u8> = (0..full_size).map(|i| (i as u8).wrapping_add(0x5B)).collect();
+    let payload: Vec<u8> = (0..full_size)
+        .map(|i| (i as u8).wrapping_add(0x5B))
+        .collect();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
