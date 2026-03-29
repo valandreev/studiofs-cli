@@ -29,5 +29,5 @@ pub use vfs::{
     CacheSafetyMode, KernelInvalidator, LockKind, NamespaceParent, NamespacePathStyle,
     NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsConfigRaw,
     VfsConfigValidated, VfsError, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsReadFastPathStats, VfsResult, VfsUploadStats,
+    VfsForegroundReadProtectionStats, VfsReadFastPathStats, VfsResult, VfsUploadStats,
 };

@@ -107,6 +107,7 @@ The current architecture relies on these focused regressions:
 - SFS-121 buffered-first regression suite (tests prefixed `sfs121_`, covered by the “Buffered-first” commands):
   - `sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle` *(requires S3)*
   - `sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum` *(requires S3)*
+  - `sfs121_foreground_read_baseline_during_and_post_upload_are_comparable` *(requires S3; compares read-alone vs during-upload vs post-upload in one run)*
   - `sfs121_warm_cache_sequential_read_bounded_latency_after_write`
   - `sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors`
   - `sfs121_file_session_flush_ordering_is_deterministic`
@@ -119,6 +120,7 @@ Run a single focused regression:
 ```bash
 cargo test -p studiofs-meta test_pg_checkpoint_excludes_uncommitted_local_blocks -- --ignored --nocapture
 cargo test -p studiofs-vfs --test vfs_test test_truncate_shrink_then_extend_zero_fills_old_tail -- --ignored --nocapture
+cargo test -p studiofs-vfs --test vfs_test sfs121_foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
 ```
 
 ## Recommended Local Flow

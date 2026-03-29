@@ -287,6 +287,12 @@ Notes:
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
   - `queue_backpressure` with L2 commit queue depth/worker/backpressure percentiles
   - direct-l2 only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
+- On mounts started by newer StudioFS builds, `e2e` JSON output also includes
+  `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
+  `post-upload-read` rows plus the pending-upload observations used to gate
+  each phase.
+- The terminal summary prints the same `Buffered-first read comparison` table
+  when that mounted upload-state metadata is available.
 - `--profile=pyroscope` enables on-demand Pyroscope profiling. The run still
   completes if profiling backends or the endpoint are missing; the command emits
   warnings and continues.
@@ -456,13 +462,11 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
 | `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
-| `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` | `4` | Per-upload slot cost when foreground reads are active; must be `<= STUDIOFS_UPLOAD_CACHE_IO_SLOTS` (invalid config fails validation before mount) |
 | `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `80% of memory limit` | Global transit-memory credit budget for active in-flight fetch/upload buffers |
-| `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `250` | User idle grace |
-| `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `50` | Foreground-read P90 latency target for upload throttling |
-| `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `3000` | Foreground-read speedometer window |
+| `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
+| `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `35` | Foreground-read P90 latency target for upload throttling |
+| `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `1500` | Foreground-read speedometer window |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` | `2` | Keep last P90 for this many windows when samples pause |
-| `STUDIOFS_UPLOAD_L2_LOOKUP_SPIKE_THRESHOLD_MS` | `10` | Legacy compatibility floor for `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` |
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Max graceful upload-drain wait before forced uploader cancellation |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
 
@@ -477,6 +481,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
 - staged upload payload metrics (`upload_staged_payload_hits`, `upload_staged_payload_misses`, `upload_staged_payload_evictions`, `upload_staged_payload_target_bytes`, `upload_staged_payload_min_bytes`, `upload_staged_payload_max_bytes`)
+- upload fallback reread metrics (`upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
@@ -484,12 +489,12 @@ Dentry/path shortcut logs also include negative-hit ratio. The summary `upload p
 Upload local-I/O tuning notes:
 - upload workers first try a transient staged payload seeded by the materializer; local-cache I/O slots are only used on staging miss and are released immediately after the cache read.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
+- per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
-- when `STUDIOFS_UPLOAD_CACHE_IO_USER_PENALTY` is configured above `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`, StudioFS fails config validation before VFS startup.
 - staged upload payload sizing is internal and adaptive rather than a user-facing knob; it is anchored to upload dispatch capacity and bounded by dirty-memory budget.
 - fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
 - if a single fetch request exceeds `STUDIOFS_TRANSIT_MEMORY_BUDGET`, StudioFS returns a fetch error instead of silently clamping the credit request.
-- speedometer logs include `foreground_read_p90_present` and `foreground_read_p90_ms` for stable parsing even when no fresh samples exist.
+- speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.
 
 Configuration validation notes:
 - StudioFS resolves user input through a raw/validated configuration pipeline before creating `StudioVfs`.
