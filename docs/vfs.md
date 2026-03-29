@@ -358,8 +358,8 @@ Notes:
   and fall back to the async read path; this preserves fast sync probes while
   the async path provides bounded recovery for transient L1→L2 handover.
 - The retry budget is intentionally bounded and observable; operators can
-  monitor the exhaustion counter and increase the budget if their hardware
-  requires it.
+  monitor the exhaustion counter to detect when the fixed (build-time)
+  retry budget may be insufficient for their hardware profile.
 
 
 Handle-aware read path:
