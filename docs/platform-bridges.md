@@ -42,9 +42,9 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | 512 bytes |
 | Allocation unit size | 16384 bytes |
 | Max component length | 255 |
-| File info timeout | `1000 ms` by default; `u32::MAX` in direct-io mode (NT Cache Manager delegation). Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
-| Dir info timeout | `1000 ms` by default; `u32::MAX` in direct-io mode. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
-| Volume info timeout | `1000 ms` by default; `u32::MAX` in direct-io mode. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| File info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
 | Persistent ACLs | Yes |
@@ -65,7 +65,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 - `ino` — inode number
 - `is_dir` — directory flag
 - `fh` — VFS file handle
-- `open_flags` — VFS open flags derived from WinFSP `CreateOptions`
+- `open_flags` — VFS open flags stored with the handle
 - `dir_buffer` — WinFSP directory buffer for readdir
 
 **Key mappings:**
@@ -74,10 +74,10 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 |-----------------|------------|
 | `get_volume_info` | `statfs()` |
 | `get_security_by_name` | `NamespaceResolver::resolve_path()` |
-| `open` | `NamespaceResolver::resolve_path()` + `open()` (records `DIRECT_IO` / `WRITE_THROUGH` intent) |
+| `open` | `NamespaceResolver::resolve_path()` + `open()` |
 | `close` | `release()` |
 | `read` | `read_into_fh_sync_cached()` fast path, then `read_into_fh()` fallback |
-| `write` | `write_fh()` (unbuffered backend drain deferred to flush/close) |
+| `write` | `write_fh()` |
 | `cleanup` | `flush()` |
 | `flush` | `flush()` |
 | `get_file_info` | `getattr()` |
@@ -110,7 +110,7 @@ I/O buffer behavior on Windows callbacks:
 ### Mount Lifecycle
 
 ```
-mount_and_serve(vfs, rt, mount_point, volume_label, foreground, read_only, direct_io, shutdown_event_name, profiling)
+mount_and_serve(vfs, rt, mount_point, volume_label, foreground, read_only, shutdown_event_name, profiling)
   │
   ├─ Configure VolumeParams
   ├─ Create FileSystemHost
@@ -125,14 +125,8 @@ mount_and_serve(vfs, rt, mount_point, volume_label, foreground, read_only, direc
 
 Current signature includes additional policy controls:
 - `read_only` toggles read-only mount behavior.
-- `direct_io` enables per-handle unbuffered I/O path on Windows (write-through drain moved to flush/close).
 - `shutdown_event_name` allows external graceful shutdown signal integration.
-
-`direct_io` visibility semantics:
-- `cleanup` / `flush` wait for local ingress durability only.
-- Block upload and manifest publication continue asynchronously after that point.
-- Remote readers see the new file version only after the background epoch finalizer
-  verifies object visibility and publishes the incarnation manifest.
+- WinFSP forwards caller buffers into the shared buffered VFS read/write paths; there is no Windows-specific alternate data path.
 
 ## FUSE Bridge (`studiofs-fuse`)
 

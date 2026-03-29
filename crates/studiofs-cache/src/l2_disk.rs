@@ -24,7 +24,9 @@
 //! - **Priority-aware reads:** foreground reads avoid 1MB chunk throttling,
 //!   background reads keep chunking to preserve foreground latency under upload/eviction load.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(target_os = "linux")]
+use bytes::BytesMut;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::fs::File;
@@ -61,12 +63,9 @@ const DEFAULT_L2_READ_BATCH_MAX_IN_FLIGHT: usize = 256;
 const DEFAULT_L2_SYNC_FD_CACHE_CAPACITY: usize = 16_384;
 const DEFAULT_BUFFERED_READ_CAPACITY: usize = 16 * 1024 * 1024;
 const L2_SYNC_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY";
-const L2_SYNC_DIRECT_FD_CACHE_CAPACITY_ENV: &str = "STUDIOFS_L2_SYNC_DIRECT_FD_CACHE_CAPACITY";
 const L2_READ_BATCH_MAX_IN_FLIGHT_ENV: &str = "STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT";
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
-#[cfg(windows)]
-const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
 type PutBatchWorkerOutput = (usize, u64, u64, io::Result<(io::Result<()>, u64)>);
 type RemoveBatchWorkerOutput = (usize, u64, io::Result<u64>);
 
@@ -77,6 +76,7 @@ pub enum L2IoPriority {
     Background,
 }
 
+#[cfg(target_os = "linux")]
 fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut> {
     if alignment == 0 {
         return Err(io::Error::new(
@@ -128,6 +128,7 @@ fn aligned_bytes_mut_uninit(len: usize, alignment: usize) -> io::Result<BytesMut
     Ok(raw)
 }
 
+#[cfg(target_os = "linux")]
 fn try_read_direct_block(
     path: &Path,
     expected_len_hint: Option<usize>,
@@ -197,15 +198,6 @@ fn sync_fd_cache_capacity() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_L2_SYNC_FD_CACHE_CAPACITY)
-}
-
-fn direct_sync_fd_cache_capacity(total_capacity: usize) -> usize {
-    std::env::var(L2_SYNC_DIRECT_FD_CACHE_CAPACITY_ENV)
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(total_capacity / 2)
-        .clamp(1, total_capacity.saturating_sub(1))
 }
 
 fn read_batch_max_in_flight() -> usize {
@@ -328,8 +320,6 @@ pub struct L2DiskCache {
     read_batch_max_in_flight: usize,
     /// Small LRU of open file descriptors used by synchronous read fast-path.
     sync_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
-    /// Small LRU of open direct-I/O descriptors used by unbuffered sync reads.
-    sync_direct_read_fd_cache: Mutex<LruCache<u64, Arc<File>>>,
 }
 
 impl Drop for L2DiskCache {
@@ -338,10 +328,6 @@ impl Drop for L2DiskCache {
         // This prevents FD leaks in long-running processes and ensures clean shutdown.
         let mut cache = self.sync_read_fd_cache.lock();
         cache.clear();
-        drop(cache);
-
-        let mut direct_cache = self.sync_direct_read_fd_cache.lock();
-        direct_cache.clear();
     }
 }
 
@@ -403,22 +389,17 @@ impl L2DiskCache {
             dir
         });
 
-        // Keep total open-FD budget bounded even with separate buffered/direct
-        // sync caches by splitting one configured capacity across both.
-        let total_fd_cache_capacity = sync_fd_cache_capacity().max(2);
+        let fd_cache_capacity = sync_fd_cache_capacity().max(1);
         if let Some(nofile_soft_limit) = current_nofile_soft_limit()
-            && total_fd_cache_capacity as u64 >= nofile_soft_limit
+            && fd_cache_capacity as u64 >= nofile_soft_limit
         {
             warn!(
-                fd_cache_capacity = total_fd_cache_capacity,
+                fd_cache_capacity,
                 nofile_soft_limit,
                 env = L2_SYNC_FD_CACHE_CAPACITY_ENV,
                 "L2 sync FD cache capacity is near/above process nofile soft limit; consider lowering cache capacity or increasing ulimit -n"
             );
         }
-        let direct_fd_cache_capacity = direct_sync_fd_cache_capacity(total_fd_cache_capacity);
-        let buffered_fd_cache_capacity =
-            total_fd_cache_capacity.saturating_sub(direct_fd_cache_capacity);
 
         let this = Self {
             cache_dir,
@@ -433,12 +414,8 @@ impl L2DiskCache {
             )),
             read_batch_max_in_flight: read_batch_max_in_flight().max(1),
             sync_read_fd_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(buffered_fd_cache_capacity)
+                NonZeroUsize::new(fd_cache_capacity)
                     .expect("sync fd cache capacity must be non-zero"),
-            )),
-            sync_direct_read_fd_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(direct_fd_cache_capacity)
-                    .expect("sync direct fd cache capacity must be non-zero"),
             )),
         };
 
@@ -508,9 +485,11 @@ impl L2DiskCache {
         expected_len_hint: Option<usize>,
         priority: L2IoPriority,
     ) -> io::Result<Bytes> {
+        #[cfg(target_os = "linux")]
         if let Some(bytes) = try_read_direct_block(path, expected_len_hint, priority)? {
             return Ok(bytes);
         }
+
         read_block_buffered(path, expected_len_hint, priority)
     }
 
@@ -546,9 +525,6 @@ impl L2DiskCache {
 
     /// Read a block from disk. Returns `None` if not cached.
     ///
-    /// Direct-I/O probing is delegated to `platform_direct_io`.
-    /// If a platform/filesystem rejects direct mode for this block, read falls
-    /// back to async buffered I/O.
     pub async fn get(&self, object_id: u64) -> Option<Bytes> {
         self.get_with_priority(object_id, L2IoPriority::Foreground)
             .await
@@ -561,8 +537,8 @@ impl L2DiskCache {
 
     /// Read a block using a known payload size hint from cache metadata.
     ///
-    /// When `size_hint` is present, platform direct-I/O can skip per-read
-    /// metadata/stat calls on the hot path.
+    /// When `size_hint` is present, the read path can skip per-read metadata/stat
+    /// calls on the hot path.
     pub async fn get_with_size_hint(
         &self,
         object_id: u64,
@@ -726,41 +702,6 @@ impl L2DiskCache {
         };
         let read = read_into_slice_at(file.as_ref(), offset, out)?;
         Ok(Some(read))
-    }
-
-    /// Read a block synchronously into `out` using platform direct-I/O.
-    ///
-    /// Returns `Ok(None)` when direct-I/O is unavailable for this block/path
-    /// (including alignment constraints and platform/filesystem limitations).
-    pub fn read_into_sync_direct(
-        &self,
-        object_id: u64,
-        offset: u64,
-        out: &mut [u8],
-    ) -> io::Result<Option<usize>> {
-        #[cfg(windows)]
-        if !offset.is_multiple_of(platform_direct_io::DIRECT_IO_ALIGNMENT as u64) {
-            return Ok(None);
-        }
-        let file = match self.direct_fd_cache_get(object_id) {
-            Some(file) => file,
-            None => {
-                let path = self.block_path(object_id);
-                let opened = match platform_direct_io::open_block_direct_read(&path)? {
-                    Some(file) => Arc::new(file),
-                    None => return Ok(None),
-                };
-                self.direct_fd_cache_insert(object_id, Arc::clone(&opened));
-                opened
-            }
-        };
-        match read_into_slice_at(file.as_ref(), offset, out) {
-            Ok(read) => Ok(Some(read)),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(None),
-            #[cfg(windows)]
-            Err(e) if matches!(e.raw_os_error(), Some(WINDOWS_ERROR_INVALID_PARAMETER)) => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 
     /// Write a block to disk (decompressed data) from an owned `Bytes` buffer.
@@ -1176,18 +1117,6 @@ impl L2DiskCache {
 
     fn fd_cache_invalidate(&self, object_id: u64) {
         let _ = self.sync_read_fd_cache.lock().pop(&object_id);
-        let _ = self.sync_direct_read_fd_cache.lock().pop(&object_id);
-    }
-
-    fn direct_fd_cache_get(&self, object_id: u64) -> Option<Arc<File>> {
-        self.sync_direct_read_fd_cache
-            .lock()
-            .get(&object_id)
-            .cloned()
-    }
-
-    fn direct_fd_cache_insert(&self, object_id: u64, file: Arc<File>) {
-        self.sync_direct_read_fd_cache.lock().put(object_id, file);
     }
 }
 
@@ -1349,21 +1278,17 @@ mod tests {
     }
 
     #[test]
-    fn sync_fd_budget_is_split_across_buffered_and_direct_caches() {
+    fn sync_fd_cache_uses_configured_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
 
-        let buffered = cache.sync_read_fd_cache.lock().cap().get();
-        let direct = cache.sync_direct_read_fd_cache.lock().cap().get();
-        let total = sync_fd_cache_capacity().max(2);
+        let configured = sync_fd_cache_capacity().max(1);
 
-        assert_eq!(buffered + direct, total);
-        assert!(buffered > 0);
-        assert!(direct > 0);
+        assert_eq!(cache.sync_read_fd_cache.lock().cap().get(), configured);
     }
 
     #[test]
-    fn fd_cache_invalidate_clears_both_buffered_and_direct_entries() {
+    fn fd_cache_invalidate_clears_cached_entry() {
         let dir = tempfile::tempdir().unwrap();
         let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
         let object_id = 0x1200_0000_0000_0001;
@@ -1374,25 +1299,12 @@ mod tests {
         std::fs::write(&path, b"fd-cache-test").unwrap();
 
         let file = Arc::new(File::open(&path).unwrap());
-        cache.fd_cache_insert(object_id, Arc::clone(&file));
-        cache.direct_fd_cache_insert(object_id, file);
+        cache.fd_cache_insert(object_id, file);
 
         assert!(cache.fd_cache_get(object_id).is_some());
-        assert!(cache.direct_fd_cache_get(object_id).is_some());
 
         cache.fd_cache_invalidate(object_id);
 
         assert!(cache.fd_cache_get(object_id).is_none());
-        assert!(cache.direct_fd_cache_get(object_id).is_none());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn read_into_sync_direct_rejects_unaligned_offset() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = L2DiskCache::open(dir.path(), 1024 * 1024 * 1024).unwrap();
-        let mut out = [0u8; 4096];
-        let result = cache.read_into_sync_direct(1, 1, &mut out).unwrap();
-        assert!(result.is_none());
     }
 }

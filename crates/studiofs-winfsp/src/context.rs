@@ -25,8 +25,6 @@ use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
-const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
-const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -115,15 +113,14 @@ impl SendConstBuffer {
     }
 }
 
-fn open_flags_from_create_options(create_options: u32) -> OpenFlags {
-    let mut flags = OpenFlags::RDWR;
-    if create_options & FILE_NO_INTERMEDIATE_BUFFERING_OPTION != 0 {
-        flags = flags | OpenFlags::DIRECT_IO;
-    }
-    if create_options & FILE_WRITE_THROUGH_OPTION != 0 {
-        flags = flags | OpenFlags::WRITE_THROUGH;
-    }
-    flags
+/// Map WinFSP create options to the single supported Windows handle mode.
+///
+/// As part of SFS-122, StudioFS removed the Windows direct-I/O product surface.
+/// `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` therefore no longer
+/// select an alternate VFS path and are intentionally ignored here so all
+/// Windows handles use the buffered runtime model.
+fn open_flags_from_create_options(_create_options: u32) -> OpenFlags {
+    OpenFlags::RDWR
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -584,7 +581,6 @@ impl FileSystemContext for StudioFsContext {
             fh,
             is_dir,
             open_flags = open_flags.bits(),
-            unbuffered = open_flags.requests_unbuffered_io(),
             "open"
         );
         Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
@@ -669,7 +665,6 @@ impl FileSystemContext for StudioFsContext {
             is_dir,
             fh,
             open_flags = open_flags.bits(),
-            unbuffered = open_flags.requests_unbuffered_io(),
             "create {:?}",
             file_name.to_string_lossy()
         );
@@ -704,7 +699,6 @@ impl FileSystemContext for StudioFsContext {
                 offset,
                 n,
                 open_flags = context.open_flags.bits(),
-                unbuffered = context.open_flags.requests_unbuffered_io(),
                 "read (sync cache fast-path)"
             );
             return Ok(n);
@@ -736,7 +730,6 @@ impl FileSystemContext for StudioFsContext {
                     offset,
                     n,
                     open_flags = context.open_flags.bits(),
-                    unbuffered = context.open_flags.requests_unbuffered_io(),
                     "read"
                 );
                 Ok(n)
@@ -801,7 +794,6 @@ impl FileSystemContext for StudioFsContext {
             offset = actual_offset,
             written,
             open_flags = context.open_flags.bits(),
-            unbuffered = context.open_flags.requests_unbuffered_io(),
             "write"
         );
         Ok(written)
@@ -957,9 +949,7 @@ impl FileSystemContext for StudioFsContext {
             // because WinFSP calls cleanup() immediately followed by close(), which
             // calls release_fh() and drops the handle from the table. A background
             // flush_fh task that races past release_fh will find the handle already
-            // gone, silently skip the flush body, and — critically for
-            // DIRECT_IO/WRITE_THROUGH handles — never call wait_for_ingress_drain,
-            // breaking the direct-IO durability guarantee.
+            // gone and silently skip the flush body.
             let vfs = self.vfs.clone();
             let ino = context.ino;
             let fh = context.fh;
@@ -1247,12 +1237,12 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        FILE_ACTION_MODIFIED, FILE_NO_INTERMEDIATE_BUFFERING_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
-        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-        FILE_NOTIFY_CHANGE_SIZE, FILE_WRITE_THROUGH_OPTION, STATUS_ACCESS_DENIED,
-        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_NOT_FOUND,
-        StudioFsContext, WinfspKernelInvalidator, build_notify_info, ino_to_windows_path,
-        notify_filter_for_kind, open_flags_from_create_options, vfs_to_winfsp_err,
+        FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        STATUS_ACCESS_DENIED, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
+        STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator,
+        build_notify_info, ino_to_windows_path, notify_filter_for_kind,
+        open_flags_from_create_options, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1336,18 +1326,17 @@ mod tests {
     }
 
     #[test]
-    fn create_options_map_to_unbuffered_open_flags() {
+    fn create_options_ignore_unbuffered_bits() {
+        const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
+        const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
+
         let plain = open_flags_from_create_options(0);
-        assert!(!plain.contains(OpenFlags::DIRECT_IO));
-        assert!(!plain.contains(OpenFlags::WRITE_THROUGH));
-        assert!(!plain.requests_unbuffered_io());
+        assert_eq!(plain.bits(), OpenFlags::RDWR.bits());
 
         let unbuffered = open_flags_from_create_options(
             FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
         );
-        assert!(unbuffered.contains(OpenFlags::DIRECT_IO));
-        assert!(unbuffered.contains(OpenFlags::WRITE_THROUGH));
-        assert!(unbuffered.requests_unbuffered_io());
+        assert_eq!(unbuffered.bits(), OpenFlags::RDWR.bits());
     }
 
     #[test]

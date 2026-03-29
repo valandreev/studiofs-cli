@@ -6879,45 +6879,6 @@ async fn test_open_file_and_release() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn test_flush_fh_direct_io_does_not_wait_for_pending_uploads() {
-    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    let _restore_sync_timeout = ScopedEnvVar::capture("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-        std::env::set_var("STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS", "1");
-    }
-
-    ensure_bucket().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "direct-io-flush");
-    let attr = vfs.create(1, b"direct-io-flush.bin", 0, 0, 0o644).unwrap();
-    let ino = attr.ino;
-    let fh = vfs
-        .open_file(ino, OpenFlags::RDWR | OpenFlags::DIRECT_IO, false)
-        .unwrap();
-
-    let payload = vec![0xABu8; 512 * 1024];
-    vfs.write_fh(fh, ino, 0, &payload).await.unwrap();
-
-    match tokio::time::timeout(Duration::from_secs(5), vfs.flush_fh(fh)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => panic!("flush_fh failed unexpectedly: {err}"),
-        Err(_) => panic!("flush_fh timed out while uploads are intentionally delayed"),
-    }
-
-    assert!(
-        wait_until(Duration::from_secs(10), || !vfs
-            .pending_uploads_for_inode(ino)
-            .is_empty())
-        .await,
-        "test setup must keep at least one upload pending while flush_fh has already returned"
-    );
-
-    vfs.release_fh(fh).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
 async fn test_open_trunc() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();

@@ -110,7 +110,6 @@ fn winfsp_mount_unmount_smoke() {
             "StudioFS-Test",
             true,
             false,
-            false,
             Some(&event_for_thread),
             None,
         )
