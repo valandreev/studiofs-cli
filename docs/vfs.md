@@ -280,11 +280,15 @@ Adaptive upload control:
 - foreground-read latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
 - staged upload payload budget is adaptive: it starts from the current upload dispatch window,
   grows on backlog/staging-miss pressure, and shrinks again when foreground demand subsides.
+- staged payload eviction preserves the upload queue head and drops newest backlog entries first,
+  so the steady-state uploader keeps reusing transient payloads instead of turning queue head into
+  routine L2 rereads under backlog.
 - adaptive sleep is applied in `process_upload` before local-cache I/O permit acquisition, so disk quiet windows happen before L2 reads.
 - when `upload_delay_ms` already slept for the current op, the pre-read adaptive sleep uses the remaining budget only:
   `effective_penalty_ms = max(adaptive_penalty_ms - waited_upload_delay_ms, 0)`.
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
-- recovered journal uploads and staging evictions still fall back to normal cache rereads, so L2 remains the correctness fallback rather than the hot path.
+- upload workers probe L1 before taking upload local-I/O slots, and true L2 fallback rereads are deferred while foreground demand is active.
+- recovered journal uploads and staging evictions still fall back to normal cache rereads when needed, so L2 remains the correctness fallback rather than the hot path.
 - local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
 - QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.
 - shutdown path suppresses noisy requeue/warn loops for QoS failures triggered by uploader cancellation.

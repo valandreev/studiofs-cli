@@ -46,8 +46,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{
-    BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
-    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
+    BlockCache, BlockCacheConfig, CacheReadLevel, DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
+    DEFAULT_L2_COMMIT_WORKERS, DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
 use studiofs_cache::l2_disk::L2IoPriority;
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
@@ -262,6 +262,7 @@ pub struct VfsForegroundReadProtectionStats {
     pub staged_payload_hits: u64,
     pub staged_payload_misses: u64,
     pub staged_payload_evictions: u64,
+    pub upload_fallback_deferrals: u64,
     pub upload_fallback_rereads: u64,
     pub upload_fallback_reread_bytes: u64,
     pub upload_fallback_reread_cache_misses: u64,
@@ -615,10 +616,13 @@ const UPLOAD_CACHE_IO_FOREGROUND_BASE_DIVISOR: u32 = 4;
 const UPLOAD_CACHE_IO_FOREGROUND_BASE_MAX: u32 = 8;
 const UPLOAD_CACHE_IO_FOREGROUND_STEP_DIVISOR: u32 = 8;
 const UPLOAD_CACHE_IO_FOREGROUND_STEP_MAX: u32 = 4;
+const STAGED_UPLOAD_PAYLOAD_MAX_DISPATCH_WINDOWS: usize = 32;
 const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 16;
 const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 240;
 const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS: u64 = 40;
+const UPLOAD_FALLBACK_DEFER_MIN_MS: u64 = 25;
+const UPLOAD_FALLBACK_DEFER_MAX_MS: u64 = 250;
 const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
 const FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES: usize = 4_096;
 const FOREGROUND_READ_THROUGHPUT_MIN_COVERAGE_MS: u64 = 100;
@@ -3006,6 +3010,7 @@ struct UploadState {
     staged_payload_hits: AtomicU64,
     staged_payload_misses: AtomicU64,
     staged_payload_evictions: AtomicU64,
+    upload_fallback_deferrals: AtomicU64,
     upload_fallback_rereads: AtomicU64,
     upload_fallback_reread_bytes: AtomicU64,
     upload_fallback_reread_cache_misses: AtomicU64,
@@ -3059,7 +3064,10 @@ impl UploadPayloadStage {
     fn evict_to_target(&mut self) -> usize {
         let mut evicted = 0usize;
         while self.total_bytes > self.target_bytes {
-            let Some(evict_id) = self.insertion_order.pop_front() else {
+            // Preserve the queue head because upload workers consume older
+            // pending ops first; evicting the newest payloads maximizes staged
+            // hit rate under backlog instead of turning queue head into L2 rereads.
+            let Some(evict_id) = self.insertion_order.pop_back() else {
                 break;
             };
             let Some(evicted_payload) = self.by_object.remove(&evict_id) else {
@@ -3107,8 +3115,8 @@ fn staged_upload_payload_budget_bounds(
     let min_bytes = (block_size as usize)
         .saturating_mul(dispatch_capacity)
         .max(block_size as usize);
-    let max_by_workers = min_bytes.saturating_mul(8);
-    let max_by_dirty = max_dirty_bytes.saturating_div(4).max(min_bytes);
+    let max_by_workers = min_bytes.saturating_mul(STAGED_UPLOAD_PAYLOAD_MAX_DISPATCH_WINDOWS);
+    let max_by_dirty = max_dirty_bytes.saturating_div(2).max(min_bytes);
     let max_bytes = max_by_workers.min(max_by_dirty).max(min_bytes);
     (min_bytes, max_bytes)
 }
@@ -3155,6 +3163,7 @@ impl UploadState {
             staged_payload_hits: AtomicU64::new(0),
             staged_payload_misses: AtomicU64::new(0),
             staged_payload_evictions: AtomicU64::new(0),
+            upload_fallback_deferrals: AtomicU64::new(0),
             upload_fallback_rereads: AtomicU64::new(0),
             upload_fallback_reread_bytes: AtomicU64::new(0),
             upload_fallback_reread_cache_misses: AtomicU64::new(0),
@@ -5720,10 +5729,11 @@ impl StudioVfs {
         if p90 == 0 { None } else { Some(p90) }
     }
 
-    fn update_upload_io_foreground_cost(&self, congested: bool) -> u32 {
+    fn update_upload_io_foreground_cost(&self, congested: bool, foreground_active: bool) -> u32 {
         let base_cost = self.upload_cache_io_foreground_cost_base.max(1);
         let step_cost = self.upload_cache_io_foreground_cost_step.max(1);
         let max_cost = self.upload_cache_io_slots_max.max(base_cost);
+        let proactive_floor = base_cost.saturating_add(step_cost).min(max_cost);
         let current = self
             .state
             .upload
@@ -5731,6 +5741,8 @@ impl StudioVfs {
             .load(Ordering::Relaxed);
         let next = if congested {
             current.saturating_add(step_cost).min(max_cost)
+        } else if foreground_active {
+            current.max(proactive_floor)
         } else if current > base_cost {
             current.saturating_sub(step_cost).max(base_cost)
         } else {
@@ -5746,8 +5758,9 @@ impl StudioVfs {
     fn adjust_upload_backpressure_from_metrics(&self, p90_latency_ns: Option<u64>) {
         let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
+        let foreground_active = self.foreground_read_active();
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
-        let io_cost = self.update_upload_io_foreground_cost(congested);
+        let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
 
         let current_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
         let next_penalty_ms = if congested {
@@ -5766,6 +5779,18 @@ impl StudioVfs {
         };
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
+    }
+
+    fn upload_fallback_defer_delay(&self) -> Duration {
+        let idle_grace_ms = self
+            .upload_user_idle_grace
+            .as_millis()
+            .clamp(1, u64::MAX as u128) as u64;
+        let adaptive_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
+        let delay_ms = adaptive_penalty_ms
+            .max(idle_grace_ms.saturating_div(2))
+            .clamp(UPLOAD_FALLBACK_DEFER_MIN_MS, UPLOAD_FALLBACK_DEFER_MAX_MS);
+        Duration::from_millis(delay_ms)
     }
 
     fn remove_spill_entry(&self, key: (Ino, u32)) -> Option<SpillEntry> {
@@ -6757,6 +6782,11 @@ impl StudioVfs {
                 .state
                 .upload
                 .staged_payload_evictions
+                .load(Ordering::Relaxed),
+            upload_fallback_deferrals: self
+                .state
+                .upload
+                .upload_fallback_deferrals
                 .load(Ordering::Relaxed),
             upload_fallback_rereads: self
                 .state
@@ -10667,108 +10697,141 @@ impl StudioVfs {
             }
         }
 
-        let _upload_qos = self
-            .qos
-            .acquire_upload()
-            .await
-            .map_err(|e| VfsError::QosFailure {
-                stage: Cow::Borrowed("upload_qos"),
-                object_id: op.object_id,
-                message: e.to_string(),
-            })?;
-        let mut transit_credit = if remote_object_visible {
+        // Read raw block payload from cache only when we really need to upload.
+        let raw_payload: Option<Bytes> = if remote_object_visible {
             self.discard_staged_upload_payload(op.object_id);
             None
+        } else if let Some(payload) = self.take_staged_upload_payload(op.object_id) {
+            debug!(
+                ino = op.ino,
+                object_id = op.object_id,
+                block_index,
+                payload_len = payload.len(),
+                "process_upload using staged payload"
+            );
+            Some(payload)
+        } else if let Some(payload) = self.block_cache.get_l1_only(op.object_id) {
+            debug!(
+                ino = op.ino,
+                object_id = op.object_id,
+                block_index,
+                payload_len = payload.len(),
+                "process_upload using L1 payload after staged miss"
+            );
+            Some(payload)
         } else {
-            Some(
-                self.transit_memory_budget
-                    .acquire_background(self.block_size as usize)
-                    .await,
-            )
-        };
-        // Read raw block payload from cache only when we really need to upload.
-        let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
-            None
-        } else {
-            let raw_payload = if let Some(payload) = self.take_staged_upload_payload(op.object_id) {
+            if self.foreground_read_active() {
+                let defer_delay = self.upload_fallback_defer_delay();
+                self.state
+                    .upload
+                    .upload_fallback_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .upload
+                    .upload_requeues
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(
                     ino = op.ino,
                     object_id = op.object_id,
                     block_index,
-                    payload_len = payload.len(),
-                    "process_upload using staged payload"
+                    delay_ms = defer_delay.as_millis() as u64,
+                    "process_upload deferring fallback L2 reread while foreground demand is active"
                 );
-                Some(payload)
+                let should_requeue = tokio::select! {
+                    _ = self.state.shutdown.uploader_shutdown_token.cancelled() => false,
+                    _ = upload_cancel_token.cancelled() => false,
+                    _ = tokio::time::sleep(defer_delay) => !self.uploader_shutdown_requested(),
+                };
+                if !should_requeue {
+                    self.cancel_upload_if_inode_deleted(&op);
+                    return Ok(());
+                }
+                if !self.block_cache.requeue_upload(op.clone()) {
+                    return Err(VfsError::Other(format!(
+                        "failed to requeue deferred upload op {}",
+                        op.object_id
+                    )));
+                }
+                return Ok(());
+            }
+
+            // Hold local upload I/O slots strictly around the L2 read phase.
+            // Never keep them during network visibility checks or S3 uploads.
+            let upload_io_cost = if self.foreground_read_active() {
+                self.state
+                    .upload
+                    .upload_cache_io_foreground_cost
+                    .load(Ordering::Relaxed)
+                    .max(1)
             } else {
-                // Hold local upload I/O slots strictly around the L2 read phase.
-                // Never keep them during network visibility checks or S3 uploads.
-                let upload_io_cost = if self.foreground_read_active() {
+                1
+            };
+            let wait_started = Instant::now();
+            let upload_io_permit = self
+                .upload_cache_io_slots
+                .clone()
+                .acquire_many_owned(upload_io_cost)
+                .await
+                .map_err(|e| VfsError::QosFailure {
+                    stage: Cow::Borrowed("upload_cache_io_slots"),
+                    object_id: op.object_id,
+                    message: e.to_string(),
+                })?;
+            let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+            let read_started = Instant::now();
+            let (read_result, read_trace) = self
+                .block_cache
+                .get_with_trace_and_priority(op.object_id, L2IoPriority::Background)
+                .await;
+            let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+            drop(upload_io_permit);
+            self.state
+                .upload
+                .upload_fallback_wait_ns
+                .fetch_add(wait_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_wait_max_ns
+                .fetch_max(wait_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_read_ns
+                .fetch_add(read_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_read_max_ns
+                .fetch_max(read_ns, Ordering::Relaxed);
+            match read_trace.level {
+                CacheReadLevel::L2 => {
                     self.state
                         .upload
-                        .upload_cache_io_foreground_cost
-                        .load(Ordering::Relaxed)
-                        .max(1)
-                } else {
-                    1
-                };
-                let wait_started = Instant::now();
-                let upload_io_permit = self
-                    .upload_cache_io_slots
-                    .clone()
-                    .acquire_many_owned(upload_io_cost)
-                    .await
-                    .map_err(|e| VfsError::QosFailure {
-                        stage: Cow::Borrowed("upload_cache_io_slots"),
-                        object_id: op.object_id,
-                        message: e.to_string(),
-                    })?;
-                let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-                let read_started = Instant::now();
-                let read_result = self
-                    .block_cache
-                    .get_with_priority(op.object_id, L2IoPriority::Background)
-                    .await;
-                let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-                drop(upload_io_permit);
-                self.state
-                    .upload
-                    .upload_fallback_rereads
-                    .fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_wait_ns
-                    .fetch_add(wait_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_wait_max_ns
-                    .fetch_max(wait_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_read_ns
-                    .fetch_add(read_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_read_max_ns
-                    .fetch_max(read_ns, Ordering::Relaxed);
-                match &read_result {
-                    Some(payload) => {
+                        .upload_fallback_rereads
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(payload) = &read_result {
                         self.state
                             .upload
                             .upload_fallback_reread_bytes
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
                     }
-                    None => {
-                        self.state
-                            .upload
-                            .upload_fallback_reread_cache_misses
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
                 }
-                read_result
-            };
+                CacheReadLevel::Miss => {
+                    self.state
+                        .upload
+                        .upload_fallback_rereads
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.state
+                        .upload
+                        .upload_fallback_reread_cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                CacheReadLevel::L1 => {}
+            }
+            read_result
+        };
 
-            let raw_payload = match raw_payload {
+        let raw_payload = match raw_payload {
                 Some(data) => data,
+            None if remote_object_visible => Bytes::new(),
                 None => {
                     // Block data is missing from cache. If remote already has
                     // this object, we can still continue with commit reconcile.
@@ -10851,25 +10914,35 @@ impl StudioVfs {
                     }
                 }
             };
-            // Re-check visibility because the reconcile branch above may flip
-            // `remote_object_visible = true` when cache is missing but remote
-            // already has this object.
-            if remote_object_visible {
-                None
-            } else {
-                let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
-                for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
-                    let start = fragment_index * CLOUD_FRAGMENT_SIZE;
-                    let end = (start + CLOUD_FRAGMENT_SIZE).min(raw_payload.len());
-                    let fragment_payload = if start < raw_payload.len() {
-                        raw_payload.slice(start..end)
-                    } else {
-                        Bytes::new()
-                    };
-                    fragments.push(create_object_buffer(fragment_payload)?);
-                }
-                Some(fragments)
+
+        let mut transit_credit = if remote_object_visible {
+            None
+        } else {
+            Some(
+                self.transit_memory_budget
+                    .acquire_background(raw_payload.len().max(1))
+                    .await,
+            )
+        };
+
+        // Re-check visibility because the reconcile branch above may flip
+        // `remote_object_visible = true` when cache is missing but remote
+        // already has this object.
+        let object_bytes: Option<Vec<Buffer>> = if remote_object_visible {
+            None
+        } else {
+            let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
+            for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
+                let start = fragment_index * CLOUD_FRAGMENT_SIZE;
+                let end = (start + CLOUD_FRAGMENT_SIZE).min(raw_payload.len());
+                let fragment_payload = if start < raw_payload.len() {
+                    raw_payload.slice(start..end)
+                } else {
+                    Bytes::new()
+                };
+                fragments.push(create_object_buffer(fragment_payload)?);
             }
+            Some(fragments)
         };
 
         if object_bytes.is_none() {
@@ -10877,6 +10950,15 @@ impl StudioVfs {
         }
 
         if let Some(object_bytes) = object_bytes {
+            let _upload_qos = self
+                .qos
+                .acquire_upload()
+                .await
+                .map_err(|e| VfsError::QosFailure {
+                    stage: Cow::Borrowed("upload_qos"),
+                    object_id: op.object_id,
+                    message: e.to_string(),
+                })?;
             let uploads = fragment_keys
                 .iter()
                 .zip(object_bytes.into_iter())
@@ -11281,6 +11363,7 @@ impl StudioVfs {
                     upload_staged_payload_hits = foreground_read_protection.staged_payload_hits,
                     upload_staged_payload_misses = foreground_read_protection.staged_payload_misses,
                     upload_staged_payload_evictions = foreground_read_protection.staged_payload_evictions,
+                    upload_fallback_deferrals = foreground_read_protection.upload_fallback_deferrals,
                     upload_fallback_rereads = foreground_read_protection.upload_fallback_rereads,
                     upload_fallback_reread_bytes = foreground_read_protection.upload_fallback_reread_bytes,
                     upload_fallback_reread_cache_misses = foreground_read_protection.upload_fallback_reread_cache_misses,
@@ -12230,7 +12313,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_upload_payload_stage_evicts_oldest_entries() {
+    fn staged_upload_payload_stage_evicts_newest_entries() {
         let mut stage = UploadPayloadStage::new(8, 8);
 
         assert_eq!(stage.stage(1, Bytes::from_static(b"abcd")), 0);
@@ -12239,9 +12322,22 @@ mod tests {
 
         assert_eq!(stage.stage(3, Bytes::from_static(b"ijkl")), 1);
         assert_eq!(stage.snapshot(), (2, 8, 8, 8, 8));
-        assert!(stage.get_cloned(1).is_none());
+        assert!(stage.get_cloned(3).is_none());
+        assert_eq!(stage.get_cloned(1), Some(Bytes::from_static(b"abcd")));
         assert_eq!(stage.get_cloned(2), Some(Bytes::from_static(b"efgh")));
-        assert_eq!(stage.get_cloned(3), Some(Bytes::from_static(b"ijkl")));
+    }
+
+    #[test]
+    fn staged_upload_payload_budget_bounds_expand_for_backlog() {
+        let block_size = 4 * 1024 * 1024;
+        let workers = 4;
+        let max_dirty_bytes = 12 * 1024 * 1024 * 1024usize;
+
+        let (min_bytes, max_bytes) =
+            staged_upload_payload_budget_bounds(block_size, workers, max_dirty_bytes);
+
+        assert_eq!(min_bytes, 64 * 1024 * 1024);
+        assert_eq!(max_bytes, 2 * 1024 * 1024 * 1024usize);
     }
 
     #[test]
@@ -12268,7 +12364,9 @@ mod tests {
 
         assert_eq!(stage.retarget(8), 1);
         assert_eq!(stage.snapshot(), (2, 8, 8, 8, 16));
-        assert!(stage.get_cloned(1).is_none());
+        assert!(stage.get_cloned(3).is_none());
+        assert_eq!(stage.get_cloned(1), Some(Bytes::from_static(b"abcd")));
+        assert_eq!(stage.get_cloned(2), Some(Bytes::from_static(b"efgh")));
     }
 
     #[test]

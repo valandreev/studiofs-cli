@@ -9215,6 +9215,70 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
     rt.shutdown_background();
 }
 
+/// Force a staged-payload backlog larger than the transient budget and verify
+/// the uploader still preserves queue-head payloads instead of immediately
+/// falling back to local rereads.
+#[test]
+fn sfs124_staged_payload_queue_head_survives_backlog_without_l2_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = setup_offline_sfs121_env();
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (format_info, vfs) =
+            make_offline_vfs_sfs121(&tmp, "sfs124-stage-head", Some(64 * 1024));
+        let block_size = format_info.block_size as usize;
+        let full_size = block_size * 8;
+        let payload: Vec<u8> = (0..full_size)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+
+        let attr = vfs.create(1, b"sfs124-stage-head.bin", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must populate before staged-payload observation"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let stats = vfs.foreground_read_protection_stats();
+                stats.staged_payload_hits > 0 || stats.upload_fallback_rereads > 0
+            })
+            .await,
+            "expected at least one upload source decision"
+        );
+
+        let stats = vfs.foreground_read_protection_stats();
+        assert!(
+            stats.staged_payload_hits > 0,
+            "queue-head uploads should consume staged payload under backlog; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.upload_fallback_rereads, 0,
+            "queue-head backlog should not force immediate L2 fallback; stats={stats:?}"
+        );
+    });
+    rt.shutdown_background();
+}
+
 /// Validate warm-cache vs cold-cache buffered read behavior.
 ///
 /// After a write + flush, data lives in the dirty buffer (pending overlay).

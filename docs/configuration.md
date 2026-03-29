@@ -481,13 +481,15 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
 - staged upload payload metrics (`upload_staged_payload_hits`, `upload_staged_payload_misses`, `upload_staged_payload_evictions`, `upload_staged_payload_target_bytes`, `upload_staged_payload_min_bytes`, `upload_staged_payload_max_bytes`)
-- upload fallback reread metrics (`upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
+- upload fallback reread metrics (`upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
 
 Upload local-I/O tuning notes:
 - upload workers first try a transient staged payload seeded by the materializer; local-cache I/O slots are only used on staging miss and are released immediately after the cache read.
+- queue-head staged payloads are preserved under backlog by evicting the newest staged entries first; the bounded transient stage is expanded more aggressively against the dirty-memory budget before falling back to L2.
+- upload workers check L1 before consuming upload local-I/O slots, and actual L2 fallback rereads are deferred while foreground reads are still active.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.

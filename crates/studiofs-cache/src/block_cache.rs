@@ -362,12 +362,31 @@ impl BlockCache {
             .0
     }
 
+    /// Read a block from L1 only. Returns `None` when the payload is no longer
+    /// resident in memory.
+    pub fn get_l1_only(&self, object_id: ObjectId) -> Option<Bytes> {
+        let data = self.l1.get(object_id)?;
+        self.lru.touch(object_id);
+        Some(data)
+    }
+
     /// Read a block and return per-level lookup trace for observability.
     ///
     /// This does not change cache behavior; it only exposes lookup timing and
     /// the level that served the payload.
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
-        self.get_with_qos(object_id, L2IoPriority::Foreground).await
+        self.get_with_trace_and_priority(object_id, L2IoPriority::Foreground)
+            .await
+    }
+
+    /// Read a block and return per-level lookup trace with an explicit L2 QoS
+    /// priority.
+    pub async fn get_with_trace_and_priority(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+    ) -> (Option<Bytes>, CacheReadTrace) {
+        self.get_with_qos(object_id, priority).await
     }
 
     async fn get_with_qos(
