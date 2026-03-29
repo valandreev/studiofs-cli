@@ -9520,3 +9520,281 @@ async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
     let root_entries = vfs.readdir(1).unwrap();
     assert!(!root_entries.iter().any(|e| e.name == b"secret"));
 }
+
+// =============================================================================
+// SFS-123: completion-aware local read semantics during background upload
+// =============================================================================
+
+/// Verify that local reads return correct data through the full upload pipeline
+/// when the last block is a partial (non–block-size-aligned) tail.
+///
+/// Covers the transient window in which a block is present in `live_extent_records`
+/// (materialized stage) but may be temporarily absent from the block cache
+/// between `complete_upload` releasing the L1 pin and `commit_l2_batch`
+/// finishing the NVMe write.
+#[test]
+fn local_reads_through_upload_with_partial_tail_block() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("sfs123-partial-tail-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 512 * 1024; // 512 KiB blocks
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    // 4 full blocks + a partial tail (block_size / 2 bytes).
+    let block_size = format_info.block_size as usize;
+    let full_size = block_size * 4 + block_size / 2;
+    let payload: Vec<u8> = (0..full_size).map(|i| (i as u8).wrapping_mul(3) ^ 0xA7).collect();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"sfs123-partial-tail.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "test setup: queued uploads must appear for the new file"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match vfs.read(attr.ino, 0, full_size as u32).await {
+                Ok(bytes) => {
+                    assert_eq!(
+                        bytes.len(),
+                        full_size,
+                        "read returned wrong byte count (including partial tail)"
+                    );
+                    assert_eq!(
+                        bytes.as_ref(),
+                        payload.as_slice(),
+                        "read data mismatch — partial tail corrupted during upload pipeline"
+                    );
+                }
+                Err(VfsError::RemoteContentPending) => {
+                    panic!("local read with partial tail must not surface RemoteContentPending");
+                }
+                Err(err) => {
+                    panic!("local read failed during upload finalization: {err}");
+                }
+            }
+
+            let current_attr = vfs.getattr(attr.ino).unwrap();
+            if vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                && current_attr.upload_state == UploadState::Ready
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "upload pipeline did not stabilize before timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    rt.shutdown_background();
+}
+
+/// Verify that a concurrent reader observes correct data while the upload
+/// pipeline finalizes a multi-block file that includes a partial tail block.
+///
+/// A background reader task continuously polls the full file while the writer
+/// waits for epoch finalization.  Neither task must ever see `RemoteContentPending`
+/// or incorrect data.
+#[test]
+fn concurrent_reads_through_upload_finalization() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
+    let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
+    let _restore_secret_key = ScopedEnvVar::capture("STUDIOFS_S3_SECRET_KEY");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "30");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("sfs123-concurrent-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 512 * 1024; // 512 KiB blocks
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    // 3 full blocks + partial tail.
+    let block_size = format_info.block_size as usize;
+    let full_size = block_size * 3 + block_size / 3;
+    let payload: Vec<u8> = (0..full_size).map(|i| (i as u8).wrapping_add(0x5B)).collect();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = Arc::new(
+            StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap(),
+        );
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"sfs123-concurrent.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "test setup: queued uploads must appear for the new file"
+        );
+
+        // Spawn a concurrent reader that polls the full file until signalled to stop.
+        //
+        // The reader uses an adaptive sleep: normal reads sleep 5 ms, but once
+        // `pending_uploads_for_inode` starts shrinking (uploads are completing) it
+        // switches to yield-only polling to maximize the probability of hitting the
+        // narrow "complete_upload unpinned L1 but commit_l2_batch not done" window that
+        // the bounded retry in `read_pending_overlay_block_async` is designed to cover.
+        let vfs_reader = vfs.clone();
+        let payload_reader = payload.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let initial_upload_count = vfs.pending_uploads_for_inode(attr.ino).len();
+        let initial_upload_count_shared = Arc::new(initial_upload_count);
+        let initial_uploads_for_reader = initial_upload_count_shared.clone();
+        let reader_handle = tokio::spawn(async move {
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                match vfs_reader.read(attr.ino, 0, full_size as u32).await {
+                    Ok(bytes) => {
+                        assert_eq!(
+                            bytes.len(),
+                            full_size,
+                            "concurrent reader: wrong byte count"
+                        );
+                        assert_eq!(
+                            bytes.as_ref(),
+                            payload_reader.as_slice(),
+                            "concurrent reader: data mismatch during upload finalization"
+                        );
+                    }
+                    Err(VfsError::RemoteContentPending) => {
+                        panic!(
+                            "concurrent local reader must not see RemoteContentPending during upload"
+                        );
+                    }
+                    Err(err) => {
+                        panic!("concurrent reader failed: {err}");
+                    }
+                }
+                // Switch to aggressive (yield-only) polling once uploads start completing
+                // so the reader is likely to interleave with L1 unpin / L2 commit.
+                let current_pending = vfs_reader.pending_uploads_for_inode(attr.ino).len();
+                if current_pending < *initial_uploads_for_reader && current_pending > 0 {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+
+        // Wait for epoch finalization on the main task.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let current_attr = vfs.getattr(attr.ino).unwrap();
+            if vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                && current_attr.upload_state == UploadState::Ready
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "upload pipeline did not stabilize before timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Signal the concurrent reader to stop and wait for it.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader_handle.await.expect("concurrent reader task panicked");
+    });
+    rt.shutdown_background();
+}

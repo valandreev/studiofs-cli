@@ -183,6 +183,11 @@ Useful test/runtime variables include:
 - `STUDIOFS_S3_BUCKET`
 - `STUDIOFS_TEST_PG_DSN`
 
+Recent notes:
+- Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md].
+  This documents the 4-stage local overlay model, the bounded async retry for
+  the L1→L2 handover window, and the new observability counters.
+
 ## Documentation
 
 Project docs live in [docs/](docs/):

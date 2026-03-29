@@ -329,6 +329,39 @@ local metadata view ──┬─ pending incarnation extents
   assemble response bytes
 ```
 
+**Completion-aware local read semantics (SFS-123)**
+
+StudioFS uses a four-stage local-data availability model to guarantee
+local-read correctness while background uploads and L2 commits complete.
+The stages are:
+
+- Stage 1 — `pending_blocks`: unflushed per-handle write buffer (in-memory).
+- Stage 2 — `dirty_mem`: accepted in-RAM staging after `flush_ordered`.
+- Stage 3 — `live_extent_records` + block cache: materialized L1/L2 entries
+  created by the materializer (`stage_l1` + `record_live_extent`) and pinned
+  until `complete_upload`.
+- Stage 4 — ingress spill WAL: durable spill entries used in `durable` mode
+  or when materialization has not yet occurred.
+
+To cover the narrow window between `complete_upload` (L1 unpin) and the
+corresponding L2/NVMe commit finishing, the async read path applies a bounded
+retry when a live-extent exists but the block is absent from cache. The
+default retry budget is 5 attempts × 10 ms = ~50 ms total. The following
+observability counters were added to `VfsIngressStats`:
+
+- `local_overlay_cache_miss_retries` — total retry attempts performed
+- `local_overlay_cache_miss_retry_exhaustions` — number of times the retry
+  budget was exhausted without locating the block in cache
+
+Notes:
+- Synchronous cache-only probes intentionally accept an immediate cache miss
+  and fall back to the async read path; this preserves fast sync probes while
+  the async path provides bounded recovery for transient L1→L2 handover.
+- The retry budget is intentionally bounded and observable; operators can
+  monitor the exhaustion counter and increase the budget if their hardware
+  requires it.
+
+
 Handle-aware read path:
 - `read_into_fh(fh, ino, ...)` checks `OpenFlags` from the handle table.
 - If `DIRECT_IO` or `WRITE_THROUGH` is set, VFS uses unbuffered mode:
