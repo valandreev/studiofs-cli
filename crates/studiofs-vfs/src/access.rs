@@ -424,7 +424,7 @@ mod tests {
         let mut state = HandleAccessState::new(10, OpenFlags::RDWR);
         let cfg = config();
         // Write blocks 0, 1, 2. The first write is non-append (random), so
-        // sequential_score starts negative; by block 2 it reaches +2 which is
+        // sequential_score is still only +2 by block 2, which is
         // below WRITE_SEQUENTIAL_PROMOTION_THRESHOLD(3), leaving class as
         // RandomWriter and current_class = RandomWriter throughout.
         state.observe_write(0, 1024, cfg);
