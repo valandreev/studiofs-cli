@@ -85,7 +85,6 @@ studiofs mount <name> [<mount-point>] \
   [--cache-size <e.g. 100GB>] \
   [--memory-limit <e.g. 1GB>] \
   [--l2-profile <default|usb>] \
-  [--direct-io] \
   [--principal <name>] \
   [--snapshot-id <uuid>] \
   [--foreground] \
@@ -108,15 +107,7 @@ Notes:
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--memory-limit` and `--cache-size` use the shared size parser and accept fractional values (for example `1.5GB`); both values must be greater than `0`.
-- `--direct-io` enables unbuffered I/O behavior for Windows WinFSP mounts:
-  - handles opened with `FILE_NO_INTERMEDIATE_BUFFERING`/`FILE_WRITE_THROUGH` are treated as unbuffered in VFS.
-  - reads bypass best-effort prefetch and avoid L1 promotion for committed blocks; fetched blocks are cached in L2 for potential re-reads.
-  - writes buffer data as normal; synchronous confirmation at `flush()`/`close()` waits for local ingress durability (NVMe/WAL), not S3 upload completion.
-  - remote manifest publication is handled asynchronously by the background epoch finalizer after all blocks for the file version are uploaded and visible in object storage.
-  - `FlushFileBuffers`/`flush()` therefore means "accepted locally and recoverable on this client", not "already visible to other clients through a published manifest".
-  - `STUDIOFS_DIRECT_IO_SYNC_TIMEOUT_SECS` overrides the direct-write ingress-drain timeout (default `120` seconds).
-  - if asynchronous S3 upload fails, StudioFS records a sticky inode upload error; the next `flush`/`fsync` reports `EIO` and consumes that error.
-  - this mode is intended for storage benchmarking and strict write-through workflows.
+- On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
 - `--profile=off` disables profiling explicitly, even if `STUDIOFS_PROFILE` is set.
@@ -419,9 +410,9 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
 | `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
 | `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` | `4096` | Capacity of L2 sync-read open-file descriptor LRU cache (set lower on hosts with strict FD limits) |
-| `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` (`u32::MAX` when `--direct-io`) | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
-| `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` | `1000` (`u32::MAX` when `--direct-io`) | WinFSP DirInfo metadata timeout; accepts milliseconds or `-1` / `max` |
-| `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` (`u32::MAX` when `--direct-io`) | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
+| `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
+| `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` | `1000` | WinFSP DirInfo metadata timeout; accepts milliseconds or `-1` / `max` |
+| `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |

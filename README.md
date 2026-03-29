@@ -73,13 +73,12 @@ Mount it:
 
 ```bash
 studiofs mount myvolume Z:
-studiofs mount myvolume Z: --direct-io
 studiofs mount myvolume /mnt/studio
 ```
 
-`--direct-io` is primarily for Windows benchmarking and strict write-through
-workloads. It disables WinFSP metadata cache timeouts and routes unbuffered
-handle I/O through the VFS direct path.
+Windows and macOS use the buffered-first runtime path for mounts. Foreground
+I/O follows the standard buffered read/write flow while upload and manifest
+publication continue asynchronously in the background.
 
 Attach another client to an existing volume:
 

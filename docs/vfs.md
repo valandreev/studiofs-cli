@@ -112,12 +112,8 @@ data arrives
 
 Handle-aware write path:
 - `write_fh(fh, ino, offset, data)` buffers data identically to `write()`.
-- The synchronous backend drain for `DIRECT_IO` / `WRITE_THROUGH` handles is
-  deferred to `flush_fh()` / `close()`, so individual writes do not block on S3 round-trips.
-- At flush/close time, `flush_fh()` calls:
-  - `flush(ino)` to stage accepted data,
-  - `wait_for_ingress_drain(ino, timeout)` which waits only for local ingress to drain for that inode.
-- This provides synchronous local durability confirmation for unbuffered callers at natural sync boundaries; S3 upload remains asynchronous.
+- `flush_fh()` runs the normal ordered flush for the inode and then surfaces any sticky async-upload error for that inode.
+- Foreground `flush()` / `close()` keep local staging and error reporting deterministic without waiting for remote upload or manifest publication.
 - In `cache_safety_mode=durable`, ingress WAL appends are forced with local `sync_data()`, so this confirmation is resilient to process crash and OS-page-cache loss scenarios.
 - Asynchronous upload failures are tracked as sticky inode errors; `flush_fh` / `fsync` report `EIO` deterministically until the async pipeline recovers and clears the sticky state.
 - `flush_fh`/`fsync` report sticky upload errors only after finishing the current local sync step, so newly written data is still persisted locally before `EIO` is returned.
@@ -255,8 +251,8 @@ queued (ino, content_epoch)
 Why this split exists:
 - `flush()` / `close()` stay focused on accepting data locally and making it
   crash-recoverable;
-- `--direct-io` can keep its write-through responsiveness without forcing the
-  last partial block on a file to synchronously publish the whole incarnation;
+- buffered foreground I/O does not force the last partial block on a file to
+  synchronously publish the whole incarnation;
 - manifest publication no longer depends on a "special" last upload op, which
   avoids the classic "1 pending block per file" tail behavior.
 
@@ -363,29 +359,19 @@ Notes:
 
 
 Handle-aware read path:
-- `read_into_fh(fh, ino, ...)` checks `OpenFlags` from the handle table.
-- If `DIRECT_IO` or `WRITE_THROUGH` is set, VFS uses unbuffered mode:
-  - disables best-effort prefetch for that read,
-  - resolves committed blocks through an L2-only direct path (no L1 lookup/promotion),
-  - blocks fetched from S3 are cached in L2 (disk cache) to avoid repeat remote fetches.
+- `read_into_fh(fh, ino, ...)` uses the same buffered-first read pipeline for every handle.
+- Best-effort prefetch and the normal L1/L2 lookup path stay enabled for committed blocks regardless of platform or caller open style.
 - VFS also provides a synchronous cache-only fast path (`read_into_fh_sync_cached`):
   - probes all requested blocks first,
   - serves synchronously only when the full request can be satisfied locally,
   - reads L2 hits directly into caller-provided output slices,
-  - on Windows with unbuffered handles, it first attempts direct L2 reads through
-    `FILE_FLAG_NO_BUFFERING` descriptors and falls back to buffered L2 reads when
-    direct constraints are not met (for example unaligned offset/length/buffer),
   - returns fallback (`None`) on miss so S3/object-store fetch remains async.
 - WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
 - FUSE bridge uses `can_read_fh_sync_cached(...)` as a cheap probe to avoid
   output-buffer allocation on sync-cache misses.
 
 L2 sync descriptor cache budget:
-- `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` is treated as the total sync read FD budget.
-- Budget is split across buffered and direct sync FD caches to avoid doubling open
-  descriptor pressure.
-- `STUDIOFS_L2_SYNC_DIRECT_FD_CACHE_CAPACITY` optionally overrides the direct cache
-  share (still clamped within the total budget).
+- `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` bounds the buffered sync-read open-file descriptor cache used by the local cache fast path.
 
 ## FetchScheduler (`fetch.rs`)
 

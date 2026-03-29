@@ -131,10 +131,6 @@ impl IngressLiveIndex {
         self.live_segment_counts.len() as u64
     }
 
-    pub(crate) fn has_ino(&self, ino: Ino) -> bool {
-        self.by_ino_counts.contains_key(&ino)
-    }
-
     fn dec_segment(&mut self, entry: &SpillEntry) {
         let segment_id = entry.segment_id;
         let count = self

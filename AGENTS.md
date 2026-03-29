@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Rust router
+
+Always use your /rust-router skill for any code work
+
 ## Project Structure & Module Organization
 
 StudioFS is a Rust workspace with the following structure:

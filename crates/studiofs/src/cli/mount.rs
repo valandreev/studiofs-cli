@@ -407,7 +407,6 @@ pub fn run(
     foreground: bool,
     detach: bool,
     l2_profile: L2Profile,
-    direct_io: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
@@ -547,8 +546,6 @@ pub fn run(
     } else {
         "daemon"
     };
-    #[cfg(not(windows))]
-    let _ = direct_io;
 
     #[cfg(windows)]
     let platform = "windows";
@@ -749,7 +746,6 @@ pub fn run(
             &format_info.name,
             run_in_foreground,
             read_only_mount,
-            direct_io,
             Some(&event_name),
             profiling,
         )
