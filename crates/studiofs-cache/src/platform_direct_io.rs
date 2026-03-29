@@ -11,7 +11,9 @@ use crate::l2_disk::L2IoPriority;
 
 #[cfg(target_os = "linux")]
 pub(crate) const DIRECT_IO_ALIGNMENT: usize = 4096;
-#[cfg(target_os = "linux")]
+/// Chunk size for background L2 reads on all platforms (1 MiB).
+/// Chunking at this granularity allows foreground reads to interleave between
+/// background chunks without requiring platform-specific scheduling primitives.
 pub(crate) const IO_CHUNK_SIZE_BACKGROUND: usize = 1024 * 1024;
 
 #[cfg(target_os = "linux")]

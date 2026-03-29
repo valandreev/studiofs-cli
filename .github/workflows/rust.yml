@@ -38,6 +38,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets -- --nocapture
 
+      - name: cargo test (SFS-121 offline fast suite)
+        # Explicit gate for the SFS-121 buffered-first offline tests.
+        # These are already included in the workspace run above; this step
+        # makes failures immediately attributable to the SFS-121 suite in CI.
+        run: cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --nocapture
+
       - name: cargo doc
         run: cargo doc --workspace --no-deps
         env:

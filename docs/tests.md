@@ -31,6 +31,9 @@ S3-compatible side unless a test explicitly checks another provider.
 | Full ignored integration suite | `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1` |
 | PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1` |
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
+| Buffered-first fast suite (no S3) | `cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --nocapture` |
+| Buffered-first infra suite (S3 required) | `cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --ignored --nocapture --test-threads=1` |
+| CLI surface enforcement | `cargo test -p studiofs -- --nocapture` |
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
 | Destroy command integration suite | `cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1` |
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
@@ -98,6 +101,18 @@ The current architecture relies on these focused regressions:
 - metadata hotset promotion:
   - `dentry_cache_tracks_hotset_occupancy_and_hits`
   - `attr_read_cache_is_bounded_and_tracks_hotset_hits`
+- Buffered-first correctness and performance (manual S3 tests; not covered by the `sfs121_`-filtered SFS-121 suite):
+  - `local_reads_through_upload_with_partial_tail_block` *(requires S3)*
+  - `concurrent_reads_through_upload_finalization` *(requires S3)*
+- SFS-121 buffered-first regression suite (tests prefixed `sfs121_`, covered by the “Buffered-first” commands):
+  - `sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle` *(requires S3)*
+  - `sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum` *(requires S3)*
+  - `sfs121_warm_cache_sequential_read_bounded_latency_after_write`
+  - `sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors`
+  - `sfs121_file_session_flush_ordering_is_deterministic`
+- SFS-121 CLI surface enforcement (regression gate against re-introducing `--direct-io`):
+  - `no_direct_io_flag_in_any_subcommand`
+  - `mount_subcommand_has_no_direct_io_flag`
 
 Run a single focused regression:
 

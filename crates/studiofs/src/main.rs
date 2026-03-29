@@ -1329,4 +1329,52 @@ mod tests {
             other => panic!("expected TestCache, got {other:?}"),
         }
     }
+
+    // ── SFS-121: buffered-first CLI surface enforcement ──────────────────────
+
+    /// Verify that no subcommand exposes a `--direct-io` (or any variant) flag.
+    ///
+    /// The direct-I/O product mode has been permanently removed from
+    /// Windows and macOS (SFS-121).  This test prevents the flag from being
+    /// silently reintroduced in future refactors by asserting that every
+    /// subcommand's argument list is free of any `direct` or `direct_io`
+    /// identifier.
+    fn assert_no_direct_io_in_command(cmd: &clap::Command) {
+        for arg in cmd.get_arguments() {
+            let name = arg.get_id().as_str();
+            assert!(
+                !name.starts_with("direct-io") && name != "direct_io",
+                "command '{}' exposes a direct-I/O CLI flag '{}'; \
+                 this mode has been permanently removed (SFS-121)",
+                cmd.get_name(),
+                name
+            );
+        }
+        for subcmd in cmd.get_subcommands() {
+            assert_no_direct_io_in_command(subcmd);
+        }
+    }
+
+    #[test]
+    fn no_direct_io_flag_in_any_subcommand() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        assert_no_direct_io_in_command(&cmd);
+    }
+
+    /// Confirm the `mount` subcommand specifically has no `--direct-io` flag
+    /// and that buffered-first is the only available I/O mode.
+    #[test]
+    fn mount_subcommand_has_no_direct_io_flag() {
+        let err = parse(&["mount", "vol", "Z:", "--direct-io"]);
+        assert!(
+            err.is_err(),
+            "mount --direct-io must be rejected: direct-I/O mode has been removed (SFS-121)"
+        );
+        let err = parse(&["mount", "vol", "Z:", "--no-buffering"]);
+        assert!(
+            err.is_err(),
+            "mount --no-buffering must be rejected: direct-I/O mode has been removed (SFS-121)"
+        );
+    }
 }
