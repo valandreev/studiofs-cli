@@ -604,7 +604,8 @@ impl BlockCache {
             Ok(Some(read)) => {
                 self.record_l2_read_completion();
                 self.metrics.l2_read.record(read as u64, started.elapsed());
-                if promote_on_l2_hit && read > 0 {
+                // Only promote when we have a full-object read starting at offset 0.
+                if promote_on_l2_hit && offset == 0 && read == out.len() && read > 0 {
                     let promoted = Bytes::copy_from_slice(&out[..read]);
                     self.promote_to_l1(object_id, promoted);
                 }
