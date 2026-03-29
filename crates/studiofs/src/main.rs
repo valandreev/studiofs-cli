@@ -219,9 +219,9 @@ ENV TUNING:
   STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS  Max time to wait for uploaded objects to become visible before publishing manifests (default: 30).
   STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
   STUDIOFS_TRANSIT_MEMORY_BUDGET    Max active read/upload transit buffers (default: 80% of --memory-limit).
-    STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 500).
-    STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS  Foreground read P90 target for upload throttling (default: 35).
-    STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS  Foreground read speedometer window (default: 1500).
+  STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 500).
+  STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS  Foreground read P90 target for upload throttling (default: 35).
+  STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS  Foreground read speedometer window (default: 1500).
   STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS  Keep last P90 for this many windows when samples pause (default: 2).
   STUDIOFS_UPLOAD_MAX_ATTEMPTS      Max upload retries (default: 10).
   STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS  Per-upload request timeout (default: 120).
