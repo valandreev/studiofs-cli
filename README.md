@@ -184,7 +184,7 @@ Useful test/runtime variables include:
 - `STUDIOFS_TEST_PG_DSN`
 
 Recent notes:
-- Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md].
+- Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md](docs/vfs.md).
   This documents the 4-stage local overlay model, the bounded async retry for
   the L1→L2 handover window, and the new observability counters.
 
