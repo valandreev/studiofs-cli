@@ -18,10 +18,15 @@ const USB_L2_IO_TIMEOUT_MS: u64 = 10_000;
 /// Initial L1 RAM budget before the adaptive envelope takes over.
 /// Capped at 25 % of total RAM so low-memory machines don't overshoot.
 fn initial_l1_bytes() -> u64 {
+    const DEFAULT_L1: u64 = 4 * 1024 * 1024 * 1024;
     let mut sys = System::new();
     sys.refresh_memory();
-    let quarter_ram = sys.total_memory() / 4;
-    const DEFAULT_L1: u64 = 4 * 1024 * 1024 * 1024;
+    let total_ram = sys.total_memory();
+    if total_ram == 0 {
+        // Fall back to a sane default if sysinfo fails to report total memory.
+        return DEFAULT_L1;
+    }
+    let quarter_ram = total_ram / 4;
     quarter_ram.min(DEFAULT_L1)
 }
 

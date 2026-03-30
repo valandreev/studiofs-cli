@@ -421,9 +421,9 @@ impl FetchScheduler {
     }
 
     /// Adjust the prefetch acquire-wait timeout at runtime.
+    /// `0` means "skip immediately" — prefetch attempts will not wait at all.
     pub fn set_prefetch_acquire_wait_ms(&self, ms: u64) {
-        self.prefetch_acquire_wait_ms
-            .store(ms.max(1), Ordering::Release);
+        self.prefetch_acquire_wait_ms.store(ms, Ordering::Release);
     }
 
     /// True if a send-request network error happened recently.

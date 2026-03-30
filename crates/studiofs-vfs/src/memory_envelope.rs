@@ -102,10 +102,6 @@ pub struct PressureSignals {
     pub l1_eviction_count: u64,
     pub l1_hits: u64,
     pub l2_hits: u64,
-    pub prefetch_skips: u64,
-    pub drained_mem_bytes: u64,
-    pub drained_spill_bytes: u64,
-    pub overlay_miss_exhaustions: u64,
     pub dirty_mem_bytes: usize,
     pub aimd_window: f64,
 }
@@ -122,13 +118,20 @@ pub struct SubsystemFloors {
 }
 
 impl SubsystemFloors {
-    /// Compute floors from the block size.
-    pub fn from_block_size(block_size: u64) -> Self {
+    /// Compute floors from the block size and upload worker count.
+    ///
+    /// The staged floor must match the effective minimum of
+    /// `UploadPayloadStage::retarget`, which clamps to
+    /// `block_size × upload_workers × 4`.  Using a lower floor here would
+    /// create a dead zone where the envelope cannot actually shrink staged
+    /// below the stage's internal clamp.
+    pub fn new(block_size: u64, upload_worker_count: usize) -> Self {
+        let dispatch_capacity = upload_worker_count.max(1) as u64 * 4;
         Self {
             l1: 32 * block_size,                         // ~512 MB at 16 MB blocks
             transit: 4 * (block_size + 8 * 1024 * 1024), // ~128 MB (+ headroom)
             dirty: block_size,                           // 16 MB
-            staged: 2 * block_size,                      // 32 MB
+            staged: block_size * dispatch_capacity,      // 256 MB at 16 MB blocks, 4 workers
         }
     }
 
@@ -185,11 +188,7 @@ struct PhaseState {
     emergency_exit_ticks: u32,
     // ── delta tracking (previous tick's counter values) ──────
     prev_write_bp_events: u64,
-    prev_drained_mem_bytes: u64,
-    prev_drained_spill_bytes: u64,
-    prev_overlay_miss_exhaustions: u64,
     prev_l1_eviction_count: u64,
-    prev_prefetch_skips: u64,
 }
 
 impl PhaseState {
@@ -202,11 +201,7 @@ impl PhaseState {
             emergency: false,
             emergency_exit_ticks: 0,
             prev_write_bp_events: 0,
-            prev_drained_mem_bytes: 0,
-            prev_drained_spill_bytes: 0,
-            prev_overlay_miss_exhaustions: 0,
             prev_l1_eviction_count: 0,
-            prev_prefetch_skips: 0,
         }
     }
 }
@@ -231,28 +226,48 @@ impl MemoryEnvelope {
     /// - `soft_target_bytes`: Absolute soft target in bytes (e.g. 4 GiB).
     /// - `ceiling_pct`: Hard ceiling as fraction of total RAM (e.g. 0.50).
     /// - `block_size`: VFS block size in bytes (typically 16 MiB).
+    /// - `upload_worker_count`: Number of upload workers (for staged floor).
     /// - `block_cache`: Shared block cache handle.
     /// - `transit_budget`: Shared transit memory budget handle.
     /// - `fetch_scheduler`: Shared fetch scheduler handle.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         total_ram: u64,
         soft_target_bytes: u64,
         ceiling_pct: f64,
         block_size: u64,
+        upload_worker_count: usize,
         block_cache: Arc<BlockCache>,
         transit_budget: Arc<TransitMemoryBudget>,
         fetch_scheduler: Arc<FetchScheduler>,
     ) -> Self {
-        let soft_target = soft_target_bytes;
         let hard_ceiling = (total_ram as f64 * ceiling_pct) as u64;
-        let floors = SubsystemFloors::from_block_size(block_size);
+        let floors = SubsystemFloors::new(block_size, upload_worker_count);
 
         // Ensure soft target is at least enough to meet all floor constraints.
         let minimum_grant = floors.total() + FIXED_OVERHEAD_BYTES;
-        let soft_target = soft_target.max(minimum_grant);
-        let hard_ceiling = hard_ceiling.max(soft_target);
 
-        if minimum_grant > soft_target_bytes {
+        // Respect the configured ceiling percentage by clamping the soft target
+        // down to the computed ceiling, unless the minimum floors+overhead exceed
+        // that ceiling, in which case we must raise both.
+        let (soft_target, hard_ceiling) = if hard_ceiling < minimum_grant {
+            // Floors+overhead exceed the ceiling percentage — lift both.
+            if minimum_grant > soft_target_bytes {
+                warn!(
+                    total_ram_mb = total_ram / (1024 * 1024),
+                    floor_total_mb = floors.total() / (1024 * 1024),
+                    effective_soft_mb = minimum_grant / (1024 * 1024),
+                    "soft target and ceiling too low for floor constraints — raised to floor sum"
+                );
+            }
+            (minimum_grant, minimum_grant)
+        } else {
+            // Normal case: apply ceiling percentage.
+            let soft = soft_target_bytes.max(minimum_grant).min(hard_ceiling);
+            (soft, hard_ceiling)
+        };
+
+        if minimum_grant > soft_target_bytes && hard_ceiling >= minimum_grant {
             warn!(
                 total_ram_mb = total_ram / (1024 * 1024),
                 floor_total_mb = floors.total() / (1024 * 1024),
@@ -342,22 +357,13 @@ impl MemoryEnvelope {
         let write_bp_delta = signals
             .write_bp_events
             .saturating_sub(ps.prev_write_bp_events);
-        let _drained_delta = (signals.drained_mem_bytes + signals.drained_spill_bytes)
-            .saturating_sub(ps.prev_drained_mem_bytes + ps.prev_drained_spill_bytes);
-        let _overlay_miss_delta = signals
-            .overlay_miss_exhaustions
-            .saturating_sub(ps.prev_overlay_miss_exhaustions);
         let eviction_delta = signals
             .l1_eviction_count
             .saturating_sub(ps.prev_l1_eviction_count);
 
         // Update previous counters.
         ps.prev_write_bp_events = signals.write_bp_events;
-        ps.prev_drained_mem_bytes = signals.drained_mem_bytes;
-        ps.prev_drained_spill_bytes = signals.drained_spill_bytes;
-        ps.prev_overlay_miss_exhaustions = signals.overlay_miss_exhaustions;
         ps.prev_l1_eviction_count = signals.l1_eviction_count;
-        ps.prev_prefetch_skips = signals.prefetch_skips;
 
         // ── Emergency mode check ──
 
@@ -462,14 +468,6 @@ impl MemoryEnvelope {
             l1_eviction_count: vfs.block_cache().l1_eviction_count(),
             l1_hits: vfs.block_cache().l1_hit_count(),
             l2_hits: vfs.block_cache().l2_hit_count(),
-            prefetch_skips: vfs
-                .fetch_scheduler()
-                .metrics
-                .prefetch_skips
-                .load(Ordering::Relaxed),
-            drained_mem_bytes: ingress.drained_mem_bytes,
-            drained_spill_bytes: ingress.drained_spill_bytes,
-            overlay_miss_exhaustions: ingress.local_overlay_cache_miss_retry_exhaustions,
             dirty_mem_bytes: ingress.dirty_mem_bytes,
             aimd_window: vfs.fetch_scheduler().window(),
         }
@@ -548,18 +546,35 @@ impl MemoryEnvelope {
 
     fn compute_budgets(&self, grant: u64, phase: WorkloadPhase) -> (u64, u64, u64, u64) {
         let allocatable = grant.saturating_sub(FIXED_OVERHEAD_BYTES);
-        let (r_l1, r_transit, r_dirty, r_staged) = phase.ratios();
+        if allocatable == 0 {
+            return (0, 0, 0, 0);
+        }
 
-        let raw_l1 = (allocatable as f64 * r_l1) as u64;
-        let raw_transit = (allocatable as f64 * r_transit) as u64;
-        let raw_dirty = (allocatable as f64 * r_dirty) as u64;
-        let raw_staged = (allocatable as f64 * r_staged) as u64;
+        let (r_l1, r_transit, r_dirty, _r_staged) = phase.ratios();
+        let floor_total = self.floors.total();
 
-        // Enforce floors.
-        let l1 = raw_l1.max(self.floors.l1);
-        let transit = raw_transit.max(self.floors.transit);
-        let dirty = raw_dirty.max(self.floors.dirty);
-        let staged = raw_staged.max(self.floors.staged);
+        if allocatable <= floor_total {
+            // Not enough for floors — scale them down proportionally.
+            let l1 = self.floors.l1.saturating_mul(allocatable) / floor_total;
+            let transit = self.floors.transit.saturating_mul(allocatable) / floor_total;
+            let dirty = self.floors.dirty.saturating_mul(allocatable) / floor_total;
+            let staged = allocatable.saturating_sub(l1 + transit + dirty);
+            return (l1, transit, dirty, staged);
+        }
+
+        // Floors fit — give each subsystem its floor, then distribute the
+        // remaining bytes proportionally by phase ratios.
+        let remaining = allocatable - floor_total;
+        let extra_l1 = (remaining as f64 * r_l1) as u64;
+        let extra_transit = (remaining as f64 * r_transit) as u64;
+        let extra_dirty = (remaining as f64 * r_dirty) as u64;
+        // Give rounding leftovers to staged (smallest subsystem).
+        let extra_staged = remaining.saturating_sub(extra_l1 + extra_transit + extra_dirty);
+
+        let l1 = self.floors.l1 + extra_l1;
+        let transit = self.floors.transit + extra_transit;
+        let dirty = self.floors.dirty + extra_dirty;
+        let staged = self.floors.staged + extra_staged;
 
         (l1, transit, dirty, staged)
     }
@@ -702,10 +717,11 @@ mod tests {
     #[test]
     fn floors_from_block_size() {
         let block_size = 16 * 1024 * 1024; // 16 MiB
-        let floors = SubsystemFloors::from_block_size(block_size);
+        let floors = SubsystemFloors::new(block_size, 4);
         assert_eq!(floors.l1, 512 * 1024 * 1024);
         assert_eq!(floors.dirty, 16 * 1024 * 1024);
-        assert_eq!(floors.staged, 32 * 1024 * 1024);
+        // staged = 16 MiB * (4 workers * 4) = 256 MiB
+        assert_eq!(floors.staged, 256 * 1024 * 1024);
         // transit = 4 * (16 MiB + 8 MiB) = 96 MiB
         assert_eq!(floors.transit, 4 * (16 + 8) * 1024 * 1024);
     }
@@ -754,10 +770,6 @@ mod tests {
             l1_eviction_count: 0,
             l1_hits: 0,
             l2_hits: 0,
-            prefetch_skips: 0,
-            drained_mem_bytes: 0,
-            drained_spill_bytes: 0,
-            overlay_miss_exhaustions: 0,
             dirty_mem_bytes: 0,
             aimd_window: 4.0,
         }

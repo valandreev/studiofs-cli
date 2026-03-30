@@ -168,13 +168,16 @@ impl TransitMemoryBudget {
         requested_bytes: usize,
     ) -> TransitMemoryGuard {
         let budget = self.budget_bytes();
-        let requested_bytes = requested_bytes.max(1).min(budget);
+        let mut requested_bytes = requested_bytes.max(1).min(budget);
         let mut waiter = TransitWaiter::new(self, priority);
 
         loop {
             let notified = self.notify.notified();
             {
                 let current_budget = self.budget_bytes();
+                // Re-clamp after a potential budget shrink so we don't block
+                // forever waiting for a grant larger than the current budget.
+                requested_bytes = requested_bytes.min(current_budget);
                 let mut state = self.state.lock();
                 if can_allocate(&state, current_budget, requested_bytes, priority) {
                     waiter.disarm(&mut state);
