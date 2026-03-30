@@ -437,10 +437,6 @@ ACL PRINCIPAL:
         #[arg(long)]
         cache_size: Option<String>,
 
-        /// Maximum in-memory cache size (e.g. 1GB, 512MB, 4GB)
-        #[arg(long)]
-        memory_limit: Option<String>,
-
         /// Principal identity used for ACL checks in this mount instance.
         #[arg(long)]
         principal: Option<String>,
@@ -474,6 +470,7 @@ ACL PRINCIPAL:
         /// This override only applies to the current process and is NOT saved.
         #[arg(long)]
         endpoint: Option<String>,
+
     },
 
     /// Unmount a previously mounted filesystem volume
@@ -750,7 +747,6 @@ fn main() -> anyhow::Result<()> {
             mount_point,
             cache_dir,
             cache_size,
-            memory_limit,
             principal,
             foreground,
             detach,
@@ -769,7 +765,6 @@ fn main() -> anyhow::Result<()> {
                 &meta_dir,
                 cache_dir.as_deref(),
                 cache_size.as_deref(),
-                memory_limit.as_deref(),
                 principal.as_deref(),
                 foreground,
                 detach,
@@ -978,8 +973,6 @@ mod tests {
             "mount",
             "vol",
             "Z:",
-            "--memory-limit",
-            "4GB",
             "--cache-size",
             "200GB",
             "-d",
@@ -988,12 +981,10 @@ mod tests {
         match cli.command {
             Commands::Mount {
                 detach,
-                memory_limit,
                 cache_size,
                 ..
             } => {
                 assert!(detach);
-                assert_eq!(memory_limit.unwrap(), "4GB");
                 assert_eq!(cache_size.unwrap(), "200GB");
             }
             other => panic!("expected Mount, got {other:?}"),
@@ -1052,8 +1043,6 @@ mod tests {
             "settings",
             "--cache-dir",
             "/tmp/studio-cache",
-            "--memory-limit",
-            "4GB",
             "--cache-size",
             "100GB",
         ])
@@ -1064,7 +1053,6 @@ mod tests {
                     settings.cache_dir.unwrap(),
                     PathBuf::from("/tmp/studio-cache")
                 );
-                assert_eq!(settings.memory_limit.unwrap(), "4GB");
                 assert_eq!(settings.cache_size.unwrap(), "100GB");
             }
             other => panic!("expected Settings, got {other:?}"),

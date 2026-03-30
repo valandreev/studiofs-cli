@@ -81,6 +81,7 @@ pub struct FetchMetrics {
     pub singleflight_joins: AtomicU64,
     pub retries: AtomicU64,
     pub bytes_downloaded: AtomicU64,
+    pub prefetch_skips: AtomicU64,
 }
 
 impl FetchMetrics {
@@ -92,6 +93,7 @@ impl FetchMetrics {
             singleflight_joins: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
+            prefetch_skips: AtomicU64::new(0),
         }
     }
 }
@@ -100,13 +102,14 @@ impl std::fmt::Display for FetchMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={}",
+            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={}",
             self.cache_hits.load(Ordering::Relaxed),
             self.s3_fetches.load(Ordering::Relaxed),
             self.s3_errors.load(Ordering::Relaxed),
             self.singleflight_joins.load(Ordering::Relaxed),
             self.retries.load(Ordering::Relaxed),
             self.bytes_downloaded.load(Ordering::Relaxed),
+            self.prefetch_skips.load(Ordering::Relaxed),
         )
     }
 }
@@ -143,8 +146,8 @@ pub struct FetchScheduler {
     last_send_error_ms: AtomicU64,
     /// Keep this many AIMD slots free for foreground demand reads.
     prefetch_reserve_slots: usize,
-    /// Max time prefetch waits to acquire an AIMD slot before skipping.
-    prefetch_acquire_wait: Duration,
+    /// Max time (ms) prefetch waits to acquire an AIMD slot before skipping.
+    prefetch_acquire_wait_ms: AtomicU64,
     /// Metrics.
     pub metrics: FetchMetrics,
     /// Independent fetch-stage credits so uploads/materialize cannot consume
@@ -206,7 +209,7 @@ impl FetchScheduler {
             retry_max_delay: Duration::from_millis(retry_max_ms),
             last_send_error_ms: AtomicU64::new(0),
             prefetch_reserve_slots,
-            prefetch_acquire_wait: Duration::from_millis(prefetch_acquire_wait_ms),
+            prefetch_acquire_wait_ms: AtomicU64::new(prefetch_acquire_wait_ms),
             metrics: FetchMetrics::new(),
             qos,
             transit_memory_budget,
@@ -254,6 +257,7 @@ impl FetchScheduler {
         }
 
         if matches!(class, FetchClass::Prefetch) && !self.prefetch_admission_open() {
+            self.metrics.prefetch_skips.fetch_add(1, Ordering::Relaxed);
             return Err(FetchError::PrefetchSkipped);
         }
 
@@ -411,6 +415,17 @@ impl FetchScheduler {
         &self.data_store
     }
 
+    /// Current prefetch acquire-wait timeout in milliseconds.
+    pub fn prefetch_acquire_wait_ms(&self) -> u64 {
+        self.prefetch_acquire_wait_ms.load(Ordering::Acquire)
+    }
+
+    /// Adjust the prefetch acquire-wait timeout at runtime.
+    /// `0` means "skip immediately" — prefetch attempts will not wait at all.
+    pub fn set_prefetch_acquire_wait_ms(&self, ms: u64) {
+        self.prefetch_acquire_wait_ms.store(ms, Ordering::Release);
+    }
+
     /// True if a send-request network error happened recently.
     pub fn recent_send_error(&self, within: Duration) -> bool {
         let ts = self.last_send_error_ms.load(Ordering::Relaxed);
@@ -450,13 +465,16 @@ impl FetchScheduler {
             }
             FetchClass::Prefetch => {
                 let wait = tokio::time::timeout(
-                    self.prefetch_acquire_wait,
+                    Duration::from_millis(self.prefetch_acquire_wait_ms.load(Ordering::Acquire)),
                     self.transit_memory_budget.acquire_background(budget_bytes),
                 )
                 .await;
                 match wait {
                     Ok(guard) => guard,
-                    Err(_) => return Err(FetchError::PrefetchSkipped),
+                    Err(_) => {
+                        self.metrics.prefetch_skips.fetch_add(1, Ordering::Relaxed);
+                        return Err(FetchError::PrefetchSkipped);
+                    }
                 }
             }
         };
@@ -526,7 +544,10 @@ impl FetchScheduler {
             let permit = match class {
                 FetchClass::Foreground => self.aimd.acquire().await,
                 FetchClass::Prefetch => {
-                    let deadline = Instant::now() + self.prefetch_acquire_wait;
+                    let deadline = Instant::now()
+                        + Duration::from_millis(
+                            self.prefetch_acquire_wait_ms.load(Ordering::Acquire),
+                        );
                     loop {
                         let notified = self.aimd.notified();
                         if let Some(permit) = self.try_acquire_prefetch_permit() {
@@ -534,10 +555,12 @@ impl FetchScheduler {
                         }
                         let now = Instant::now();
                         if now >= deadline {
+                            self.metrics.prefetch_skips.fetch_add(1, Ordering::Relaxed);
                             return Err(FetchError::PrefetchSkipped);
                         }
                         let remaining = deadline.saturating_duration_since(now);
                         if tokio::time::timeout(remaining, notified).await.is_err() {
+                            self.metrics.prefetch_skips.fetch_add(1, Ordering::Relaxed);
                             return Err(FetchError::PrefetchSkipped);
                         }
                     }

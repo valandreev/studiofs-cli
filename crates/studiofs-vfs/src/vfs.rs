@@ -897,6 +897,10 @@ pub struct VfsConfig {
     pub qos_fetch_slots: usize,
     /// Number of shards for foreground read speedometer.
     pub foreground_read_speedometer_shards: usize,
+    /// Enable adaptive memory controller (SFS-130).
+    pub memory_adaptive: bool,
+    /// Total system RAM in bytes (detected at mount time, 0 = auto).
+    pub total_ram: u64,
 }
 
 /// Parsed user-provided VFS configuration.
@@ -993,6 +997,8 @@ pub struct VfsConfigRaw {
     pub qos_commit_slots: Option<usize>,
     pub qos_fetch_slots: Option<usize>,
     pub foreground_read_speedometer_shards: Option<usize>,
+    pub memory_adaptive: Option<bool>,
+    pub total_ram: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1122,6 +1128,8 @@ impl VfsConfigRaw {
             qos_commit_slots,
             qos_fetch_slots,
             foreground_read_speedometer_shards,
+            memory_adaptive,
+            total_ram,
         );
 
         cfg
@@ -1303,6 +1311,8 @@ impl From<VfsConfig> for VfsConfigRaw {
             qos_commit_slots: Some(cfg.qos_commit_slots),
             qos_fetch_slots: Some(cfg.qos_fetch_slots),
             foreground_read_speedometer_shards: Some(cfg.foreground_read_speedometer_shards),
+            memory_adaptive: Some(cfg.memory_adaptive),
+            total_ram: Some(cfg.total_ram),
         }
     }
 }
@@ -1398,6 +1408,8 @@ impl Default for VfsConfig {
             qos_commit_slots: DEFAULT_QOS_COMMIT_SLOTS,
             qos_fetch_slots: DEFAULT_QOS_FETCH_SLOTS,
             foreground_read_speedometer_shards: FOREGROUND_READ_SPEEDOMETER_SHARDS,
+            memory_adaptive: true,
+            total_ram: 0,
         }
     }
 }
@@ -3599,15 +3611,20 @@ struct StartupState {
     lifecycle_notify: Condvar,
     metadata_invalidation_sync_interval: Duration,
     background_slab_flush_enabled: bool,
+    memory_adaptive: bool,
+    total_ram: u64,
 }
 
 impl StartupState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
         dirty_flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
         metadata_invalidation_sync_interval: Duration,
         background_slab_flush_enabled: bool,
+        memory_adaptive: bool,
+        total_ram: u64,
     ) -> Self {
         Self {
             lifecycle: Mutex::new(StartupLifecycle {
@@ -3621,6 +3638,8 @@ impl StartupState {
             lifecycle_notify: Condvar::new(),
             metadata_invalidation_sync_interval,
             background_slab_flush_enabled,
+            memory_adaptive,
+            total_ram,
         }
     }
 }
@@ -3701,7 +3720,8 @@ pub struct StudioVfs {
     startup: StartupState,
     /// Maximum total bytes allowed in the dirty-write memory buffer before
     /// `flush()` / `write()` apply backpressure.
-    max_dirty_bytes: usize,
+    /// Runtime-adjustable by the adaptive memory controller.
+    max_dirty_bytes: AtomicUsize,
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
     /// Maximum total bytes allowed in local NVMe spill before foreground
@@ -3730,6 +3750,9 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: std::sync::RwLock<Option<Arc<dyn KernelInvalidator>>>,
+    /// Adaptive memory budget controller (SFS-130). Empty when `VfsConfigRaw.memory_adaptive`
+    /// (config/env) is disabled.
+    memory_envelope: std::sync::OnceLock<Arc<crate::memory_envelope::MemoryEnvelope>>,
 }
 
 struct ForegroundReadScope<'a> {
@@ -4762,8 +4785,10 @@ impl StudioVfs {
                     upload_rx,
                     metadata_invalidation_sync_interval,
                     background_slab_flush_enabled,
+                    config.memory_adaptive,
+                    config.total_ram,
                 ),
-                max_dirty_bytes,
+                max_dirty_bytes: AtomicUsize::new(max_dirty_bytes),
                 max_xattr_bytes,
                 max_spill_bytes,
                 ingress_wal,
@@ -4783,6 +4808,7 @@ impl StudioVfs {
                 fetch_scheduler: fetch_scheduler.clone(),
                 distributed_flock,
                 kernel_invalidator: std::sync::RwLock::new(None),
+                memory_envelope: std::sync::OnceLock::new(),
             });
 
             vfs.restore_live_extents_from_pending_uploads();
@@ -5035,6 +5061,11 @@ impl StudioVfs {
                     }));
                 }
 
+                // Spawn adaptive MemoryEnvelope controller (SFS-130).
+                if self.startup.memory_adaptive {
+                    self.init_memory_envelope();
+                }
+
                 Ok(())
             })) {
                 Ok(result) => result,
@@ -5065,6 +5096,47 @@ impl StudioVfs {
         self.startup.lifecycle_notify.notify_all();
         drop(lifecycle);
         start_result
+    }
+
+    /// Initialise and spawn the adaptive MemoryEnvelope background task.
+    fn init_memory_envelope(self: &Arc<Self>) {
+        use crate::memory_envelope::MemoryEnvelope;
+
+        /// Default soft target: 8 GiB.  L1 alone gets ~5 GiB under ReadHeavy
+        /// (65% of 8 GiB − overhead).  Actual RSS when idle is much lower
+        /// because L1 evicts unused blocks — the grant is only a ceiling.
+        const DEFAULT_SOFT_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        /// Hard ceiling: 50% of total RAM.
+        const DEFAULT_CEILING_PCT: f64 = 0.50;
+
+        let total_ram = if self.startup.total_ram > 0 {
+            self.startup.total_ram
+        } else {
+            use sysinfo::System;
+            let mut sys = System::new();
+            sys.refresh_memory();
+            sys.total_memory()
+        };
+
+        let envelope = Arc::new(MemoryEnvelope::new(
+            total_ram,
+            DEFAULT_SOFT_TARGET_BYTES,
+            DEFAULT_CEILING_PCT,
+            self.block_size as u64,
+            self.upload_worker_count,
+            self.block_cache.clone(),
+            self.transit_memory_budget.clone(),
+            self.fetch_scheduler.clone(),
+        ));
+
+        // Store the envelope on self so `snapshot()` can be called for status output.
+        let _ = self.memory_envelope.set(envelope.clone());
+
+        let cancel = self.state.shutdown.uploader_shutdown_token.child_token();
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            envelope.run(vfs, cancel).await;
+        }));
     }
 
     fn track_background_task(&self, handle: JoinHandle<()>) {
@@ -5714,6 +5786,23 @@ impl StudioVfs {
                 desired_bytes =
                     desired_bytes.max(stage.target_bytes().saturating_add(dispatch_bytes));
             }
+            stage.retarget(desired_bytes)
+        };
+        if evicted > 0 {
+            self.state
+                .upload
+                .staged_payload_evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Resize the staged upload payload budget to the given byte target.
+    ///
+    /// Used by the adaptive memory controller to redistribute memory across
+    /// subsystems.  Evicts excess payloads synchronously.
+    pub fn retarget_staged_upload(&self, desired_bytes: usize) {
+        let evicted = {
+            let mut stage = self.state.upload.staged_payloads.lock();
             stage.retarget(desired_bytes)
         };
         if evicted > 0 {
@@ -7359,7 +7448,9 @@ impl StudioVfs {
             let fast_overcommit_head = !self.durable_cache_safety_mode()
                 && dirty_bytes == 0
                 && self.state.dirty_buffer.dirty_mem.lock().is_empty();
-            if dirty_bytes.saturating_add(total) <= self.max_dirty_bytes || fast_overcommit_head {
+            if dirty_bytes.saturating_add(total) <= self.max_dirty_bytes.load(Ordering::Acquire)
+                || fast_overcommit_head
+            {
                 if self.durable_cache_safety_mode() {
                     for (block_index, data) in &blocks {
                         self.spill_block_async((ino, *block_index), data.clone())
@@ -7924,6 +8015,44 @@ impl StudioVfs {
         self.block_size
     }
 
+    /// Current dirty-buffer memory limit.
+    pub fn max_dirty_bytes(&self) -> usize {
+        self.max_dirty_bytes.load(Ordering::Acquire)
+    }
+
+    /// Update the dirty-buffer memory limit at runtime.
+    pub fn set_max_dirty_bytes(&self, value: usize) {
+        self.max_dirty_bytes.store(value, Ordering::Release);
+    }
+
+    /// Number of foreground reads currently in-flight.
+    pub fn foreground_reads_inflight(&self) -> usize {
+        self.state
+            .read
+            .foreground_reads_inflight
+            .load(Ordering::Relaxed)
+    }
+
+    /// Shared reference to the block cache.
+    pub fn block_cache(&self) -> &Arc<BlockCache> {
+        &self.block_cache
+    }
+
+    /// Shared reference to the fetch scheduler.
+    pub fn fetch_scheduler(&self) -> &Arc<crate::fetch::FetchScheduler> {
+        &self.fetch_scheduler
+    }
+
+    /// Shared reference to the transit memory budget.
+    pub fn transit_memory_budget(&self) -> &Arc<crate::qos::TransitMemoryBudget> {
+        &self.transit_memory_budget
+    }
+
+    /// Snapshot of the adaptive memory envelope (if enabled).
+    pub fn memory_envelope_snapshot(&self) -> Option<crate::memory_envelope::EnvelopeSnapshot> {
+        self.memory_envelope.get().map(|e| e.snapshot())
+    }
+
     /// Wait until all pending S3 uploads complete or `timeout` elapses.
     ///
     /// Returns `true` if the upload queue drained within the timeout.
@@ -8114,7 +8243,8 @@ impl StudioVfs {
             .load(Ordering::Relaxed);
         let durable_mode = self.durable_cache_safety_mode();
         let lane = if !durable_mode {
-            let dirty_fits = dirty_mem_bytes.saturating_add(next_bytes) <= self.max_dirty_bytes;
+            let dirty_fits = dirty_mem_bytes.saturating_add(next_bytes)
+                <= self.max_dirty_bytes.load(Ordering::Acquire);
             if dirty_fits || dirty_mem_bytes == 0 {
                 VfsIngressLane::DirtyMem
             } else {
@@ -8124,7 +8254,8 @@ impl StudioVfs {
             // Prefer spill once spill accounting is already in use, even for tiny writes,
             // so we do not oscillate between spill and DirtyMem after RAM capacity was
             // exhausted once in the current process lifetime.
-            let dirty_fits = dirty_mem_bytes.saturating_add(next_bytes) <= self.max_dirty_bytes;
+            let dirty_fits = dirty_mem_bytes.saturating_add(next_bytes)
+                <= self.max_dirty_bytes.load(Ordering::Acquire);
             let prefer_dirty_mem = dirty_fits && spill_bytes == 0;
             if prefer_dirty_mem {
                 VfsIngressLane::DirtyMem
@@ -8138,7 +8269,7 @@ impl StudioVfs {
         VfsIngressPressure {
             next_bytes,
             dirty_mem_bytes,
-            dirty_mem_limit: self.max_dirty_bytes,
+            dirty_mem_limit: self.max_dirty_bytes.load(Ordering::Acquire),
             spill_bytes,
             spill_limit: self.max_spill_bytes,
             lane,
@@ -11847,6 +11978,19 @@ impl StudioVfs {
                     transit_memory_waiting_foreground = transit_memory.waiting_foreground,
                     transit_memory_waiting_background = transit_memory.waiting_background,
                     "upload pipeline transit memory"
+                );
+                debug!(
+                    l1_evictions = self.block_cache.l1_eviction_count(),
+                    l1_hits = self.block_cache.l1_hit_count(),
+                    l2_hits = self.block_cache.l2_hit_count(),
+                    l1_bytes = self.block_cache.l1_bytes(),
+                    l1_max_bytes = self.block_cache.l1_max_bytes(),
+                    prefetch_skips = self
+                        .fetch_scheduler
+                        .metrics
+                        .prefetch_skips
+                        .load(Ordering::Relaxed),
+                    "adaptive memory counters"
                 );
                 debug!(
                     upload_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,

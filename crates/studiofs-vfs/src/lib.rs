@@ -8,6 +8,7 @@ pub mod fetch;
 pub mod incarnation;
 pub(crate) mod ingress_wal;
 pub mod lock_order;
+pub mod memory_envelope;
 pub mod qos;
 pub mod readahead;
 mod runtime;
@@ -21,6 +22,7 @@ pub use incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
 pub use lock_order::{LockOrderGuard, LockTier, debug_lock_stack, is_validation_enabled};
+pub use memory_envelope::MemoryEnvelope;
 pub use qos::QosController;
 pub use readahead::{DirAccessTracker, ReadAheadTracker};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};

@@ -175,6 +175,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     // Keep existing integration tests on durable semantics unless overridden.
     let mut config = VfsConfigRaw {
         cache_safety_mode: Some(CacheSafetyMode::Durable),
+        memory_adaptive: Some(false),
         ..VfsConfigRaw::default()
     };
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
@@ -2230,6 +2231,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(true),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -2281,6 +2283,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(false),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3387,6 +3390,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(true),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3444,6 +3448,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(false),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3482,6 +3487,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(false),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -6338,6 +6344,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
             max_dirty_bytes: Some(32 * 1024 * 1024),
             max_spill_bytes: Some(64 * 1024 * 1024),
             background_slab_flush_enabled: Some(true),
+            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -6572,6 +6579,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             cache_safety_mode: Some(CacheSafetyMode::Durable),
             slab_flush_interval_ms: Some(5000),
             background_slab_flush_enabled: Some(false),
+            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -6665,6 +6673,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
                 background_slab_flush_enabled: Some(false),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -6771,6 +6780,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 max_dirty_bytes: Some(1),
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -6820,6 +6830,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 max_dirty_bytes: Some(1),
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
+                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(

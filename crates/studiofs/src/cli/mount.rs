@@ -11,10 +11,24 @@ use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
 
-const DYNAMIC_L1_LIMIT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const USB_L2_COMMIT_WORKERS: usize = 4;
 const USB_L2_COMMIT_QUEUE_CAPACITY: usize = 256;
 const USB_L2_IO_TIMEOUT_MS: u64 = 10_000;
+
+/// Initial L1 RAM budget before the adaptive envelope takes over.
+/// Capped at 25 % of total RAM so low-memory machines don't overshoot.
+fn initial_l1_bytes() -> u64 {
+    const DEFAULT_L1: u64 = 4 * 1024 * 1024 * 1024;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let total_ram = sys.total_memory();
+    if total_ram == 0 {
+        // Fall back to a sane default if sysinfo fails to report total memory.
+        return DEFAULT_L1;
+    }
+    let quarter_ram = total_ram / 4;
+    quarter_ram.min(DEFAULT_L1)
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
 pub enum L2Profile {
@@ -27,49 +41,6 @@ fn parse_positive_size_arg(raw: &str) -> anyhow::Result<u64> {
     parse_size_bytes(raw)
         .filter(|&bytes| bytes > 0)
         .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", raw))
-}
-
-fn calculate_dynamic_l1_limit(total_memory_bytes: u64) -> anyhow::Result<u64> {
-    anyhow::ensure!(
-        total_memory_bytes > 0,
-        "failed to detect total system memory; pass --memory-limit explicitly"
-    );
-    Ok((total_memory_bytes / 4).clamp(1, DYNAMIC_L1_LIMIT_CAP_BYTES))
-}
-
-fn detect_dynamic_l1_limit() -> anyhow::Result<u64> {
-    let mut system = System::new();
-    system.refresh_memory();
-    let total_memory_bytes = system.total_memory();
-    let dynamic_limit_bytes = calculate_dynamic_l1_limit(total_memory_bytes)?;
-    let dynamic_limit_gib = dynamic_limit_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    info!(
-        total_memory_bytes,
-        dynamic_limit_bytes,
-        dynamic_limit_gib,
-        cap_bytes = DYNAMIC_L1_LIMIT_CAP_BYTES,
-        "Utilizing 25% of total RAM for L1 cache limit (capped at 4GiB)"
-    );
-    Ok(dynamic_limit_bytes)
-}
-
-fn format_binary_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    const TIB: u64 = GIB * 1024;
-
-    if bytes >= TIB {
-        format!("{:.2}TiB", bytes as f64 / TIB as f64)
-    } else if bytes >= GIB {
-        format!("{:.2}GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.2}MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.2}KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes}B")
-    }
 }
 
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
@@ -385,6 +356,7 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     } else if let Some(max_spawned) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
         config.upload_worker_count = Some(max_spawned);
     }
+
     config
 }
 
@@ -395,7 +367,6 @@ pub fn run(
     meta_dir: &Path,
     cache_dir: Option<&Path>,
     cache_size: Option<&str>,
-    memory_limit: Option<&str>,
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
@@ -404,13 +375,8 @@ pub fn run(
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (mount_point, resolved_cache_dir, memory_limit, cache_size) =
-        super::settings::resolve_studiofs_config_for_mount(
-            mount_point,
-            cache_dir,
-            memory_limit,
-            cache_size,
-        )?;
+    let (mount_point, resolved_cache_dir, cache_size) =
+        super::settings::resolve_studiofs_config_for_mount(mount_point, cache_dir, cache_size)?;
 
     let cache_dir = resolved_cache_dir;
     let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
@@ -419,6 +385,14 @@ pub fn run(
     if let Some(principal) = principal {
         vfs_config_raw.principal = Some(principal.to_string());
     }
+
+    // Detect total RAM and pass it to VfsConfig for the MemoryEnvelope.
+    {
+        let mut system = System::new();
+        system.refresh_memory();
+        vfs_config_raw.total_ram = Some(system.total_memory());
+    }
+
     let vfs_config = vfs_config_raw
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
@@ -643,19 +617,7 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let (mem_limit, memory_limit_display) = if let Some(memory_limit) = memory_limit.as_deref() {
-        let parsed = parse_positive_size_arg(memory_limit)?;
-        (parsed, format_binary_size(parsed))
-    } else {
-        let dynamic_limit = detect_dynamic_l1_limit()?;
-        (
-            dynamic_limit,
-            format!(
-                "{} (dynamic: 25% of total RAM, capped at 4GiB)",
-                format_binary_size(dynamic_limit)
-            ),
-        )
-    };
+    let mem_limit = initial_l1_bytes();
     let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
@@ -709,7 +671,6 @@ pub fn run(
         "✓ Volume '{}' ready to mount at '{}'",
         name, actual_mount_path
     );
-    println!("  Memory limit: {}", memory_limit_display);
     println!("  Cache size:   {}", cache_size);
     println!("  Cache path:   {}", cache_path_str);
     println!(
@@ -884,34 +845,6 @@ mod tests {
         );
         assert_eq!(parse_positive_size_arg("1.5GB").unwrap(), 1_610_612_736);
         assert!(parse_positive_size_arg("0").is_err());
-    }
-
-    #[test]
-    fn test_calculate_dynamic_l1_limit_uses_quarter_of_total_memory() {
-        let total = 8 * 1024 * 1024 * 1024u64;
-        assert_eq!(calculate_dynamic_l1_limit(total).unwrap(), total / 4);
-    }
-
-    #[test]
-    fn test_calculate_dynamic_l1_limit_caps_at_4_gib() {
-        let total = 64 * 1024 * 1024 * 1024u64;
-        assert_eq!(
-            calculate_dynamic_l1_limit(total).unwrap(),
-            DYNAMIC_L1_LIMIT_CAP_BYTES
-        );
-    }
-
-    #[test]
-    fn test_calculate_dynamic_l1_limit_rejects_zero_total_memory() {
-        assert!(calculate_dynamic_l1_limit(0).is_err());
-    }
-
-    #[test]
-    fn test_format_binary_size() {
-        assert_eq!(format_binary_size(1023), "1023B");
-        assert_eq!(format_binary_size(1024), "1.00KiB");
-        assert_eq!(format_binary_size(1024 * 1024), "1.00MiB");
-        assert_eq!(format_binary_size(16 * 1024 * 1024 * 1024), "16.00GiB");
     }
 
     #[test]
