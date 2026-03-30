@@ -1090,7 +1090,18 @@ async fn put_fragmented_object(
     Ok(())
 }
 
-async fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
+async fn wait_until<F>(timeout: Duration, predicate: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    wait_until_with_interval(timeout, Duration::from_millis(100), predicate).await
+}
+
+async fn wait_until_with_interval<F>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut predicate: F,
+) -> bool
 where
     F: FnMut() -> bool,
 {
@@ -1102,7 +1113,7 @@ where
         if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -9541,6 +9552,82 @@ fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
     rt.shutdown_background();
 }
 
+#[test]
+fn sfs125_handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = setup_offline_sfs121_env();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (format_info, vfs) = make_offline_vfs_sfs121(&tmp, "sfs125-streams", Some(128 * 1024));
+        let block_size = format_info.block_size as usize;
+        let full_size = block_size * 8;
+        let payload: Vec<u8> = (0..full_size)
+            .map(|idx| ((idx as u64).wrapping_mul(1_103_515_245) >> 24) as u8)
+            .collect();
+
+        let attr = vfs
+            .create(1, b"sfs125-handle-aware.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let fh_seq = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+        let fh_rand = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+
+        let mut seq_buf = vec![0u8; block_size];
+        for step in 0..6u64 {
+            let offset = step * block_size as u64;
+            let read = vfs
+                .read_into_fh(fh_seq, attr.ino, offset, &mut seq_buf)
+                .await
+                .unwrap();
+            assert_eq!(read as usize, block_size);
+            let start = offset as usize;
+            assert_eq!(&seq_buf[..block_size], &payload[start..start + block_size]);
+        }
+
+        let mut rand_buf = vec![0u8; block_size / 2];
+        for offset in [0u64, (block_size * 6) as u64, (block_size * 2) as u64] {
+            let read = vfs
+                .read_into_fh(fh_rand, attr.ino, offset, &mut rand_buf)
+                .await
+                .unwrap();
+            let start = offset as usize;
+            let end = start + read as usize;
+            assert_eq!(&rand_buf[..read as usize], &payload[start..end]);
+        }
+
+        let seq_open = vfs.get_open_file(fh_seq).unwrap();
+        let rand_open = vfs.get_open_file(fh_rand).unwrap();
+        assert_eq!(seq_open.access_class_name(), "sequential_media_read");
+        assert_eq!(rand_open.access_class_name(), "random_interactive_read");
+
+        let stats = vfs.foreground_read_protection_stats();
+        assert_eq!(
+            stats.dominant_access_class.as_deref(),
+            Some("sequential_media_read")
+        );
+        assert!(stats.dominant_prefetch_enabled);
+        assert!(!stats.dominant_cache_promotion_on_read);
+        assert!(stats.dominant_readahead_max_width >= stats.dominant_readahead_base_width);
+        assert_eq!(stats.active_sequential_media_reads, 1);
+        assert_eq!(stats.active_random_interactive_reads, 1);
+
+        vfs.release_fh(fh_seq).await.unwrap();
+        vfs.release_fh(fh_rand).await.unwrap();
+
+        let closed_stats = vfs.foreground_read_protection_stats();
+        assert_eq!(closed_stats.active_sequential_media_reads, 0);
+        assert_eq!(closed_stats.active_random_interactive_reads, 0);
+    });
+    rt.shutdown_background();
+}
+
 /// Verify that per-file flush ordering is deterministic: a flush followed by
 /// a read must always observe the last flushed state, and interleaved writes
 /// to different inodes must not cross-contaminate.
@@ -10511,7 +10598,7 @@ fn local_reads_through_upload_with_partial_tail_block() {
         vfs.flush(attr.ino).await.unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(10), || {
+            wait_until_with_interval(Duration::from_secs(10), Duration::from_millis(5), || {
                 !vfs.pending_uploads_for_inode(attr.ino).is_empty()
             })
             .await,
@@ -10636,7 +10723,7 @@ fn concurrent_reads_through_upload_finalization() {
         vfs.flush(attr.ino).await.unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(10), || {
+            wait_until_with_interval(Duration::from_secs(10), Duration::from_millis(5), || {
                 !vfs.pending_uploads_for_inode(attr.ino).is_empty()
             })
             .await,

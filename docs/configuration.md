@@ -108,6 +108,7 @@ Notes:
 - `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--memory-limit` and `--cache-size` use the shared size parser and accept fractional values (for example `1.5GB`); both values must be greater than `0`.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
+- Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
 - `--profile=off` disables profiling explicitly, even if `STUDIOFS_PROFILE` is set.
@@ -483,6 +484,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - staged upload payload metrics (`upload_staged_payload_hits`, `upload_staged_payload_misses`, `upload_staged_payload_evictions`, `upload_staged_payload_target_bytes`, `upload_staged_payload_min_bytes`, `upload_staged_payload_max_bytes`)
 - upload fallback reread metrics (`upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
+- foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
 
@@ -497,6 +499,7 @@ Upload local-I/O tuning notes:
 - fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
 - if a single fetch request exceeds `STUDIOFS_TRANSIT_MEMORY_BUDGET`, StudioFS returns a fetch error instead of silently clamping the credit request.
 - speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.
+- upload throttling uses the same foreground-read speedometer plus the dominant access policy's `upload_pressure_boost`, so sequential media reads raise upload penalty faster than random interactive probes without adding a separate scheduler loop.
 
 Configuration validation notes:
 - StudioFS resolves user input through a raw/validated configuration pipeline before creating `StudioVfs`.

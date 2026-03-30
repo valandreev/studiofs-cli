@@ -1,0 +1,16 @@
+{
+  "chat.commandCenter.enabled": true,
+  "chat.useClaudeHooks": true,
+  "[rust]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  },
+  "python.analysis.extraPaths": [],
+  "search.exclude": {
+    "**/target": true,
+    "**/node_modules": true
+  }
+}

@@ -363,11 +363,14 @@ Notes:
 
 Handle-aware read path:
 - `read_into_fh(fh, ino, ...)` uses the same buffered-first read pipeline for every handle.
+- Each open handle maintains its own access classifier in core VFS, so one random reader no longer suppresses sequential-media prefetch on a different handle for the same inode.
+- Handle-less `read()` calls fall back to per-inode classifier state, which preserves the buffered path without requiring bridge-specific policy code.
 - Best-effort prefetch and the normal L1/L2 lookup path stay enabled for committed blocks regardless of platform or caller open style.
 - VFS also provides a synchronous cache-only fast path (`read_into_fh_sync_cached`):
   - probes all requested blocks first,
   - serves synchronously only when the full request can be satisfied locally,
   - reads L2 hits directly into caller-provided output slices,
+  - promotes L2 hits back into L1 only for access classes that opt into read promotion,
   - returns fallback (`None`) on miss so S3/object-store fetch remains async.
 - WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
 - FUSE bridge uses `can_read_fh_sync_cached(...)` as a cheap probe to avoid
@@ -440,17 +443,30 @@ Warmup runs in a background task scheduled by `StudioVfs::start()` and does not 
 
 ## ReadAhead (`readahead.rs`)
 
-Per-inode sequential read detection with adaptive prefetch depth.
+Per-stream sequential read detection with adaptive prefetch depth.
+
+The buffered read path classifies active streams into:
+- `sequential_media_read`
+- `random_interactive_read`
+- `sequential_writer`
+- `random_writer`
+
+These classes stay in core VFS and drive:
+- readahead width and minimum prefetch depth
+- whether read hints are eligible for best-effort prefetch
+- whether synchronous L2 hits are promoted back into L1
+- how aggressively foreground-read telemetry boosts upload backpressure
 
 ### Algorithm
 
-- **Score** per inode: 0–255, starts at 0
+- **Score** per stream: 0–255, starts at 0
 - Sequential read: score increases (default `+4` per sequential block span)
 - Random read: score -2
 - Dynamic width:
   - baseline width = `STUDIOFS_READAHEAD_WIDTH` (default `128`)
   - max width is derived from read buffer budget (`STUDIOFS_READ_BUFFER_MB`) and block size
   - sustained sequential reads ramp width up by doubling; random seeks reset width to baseline
+- Stream keys are `(ino, stream_id)` for handle-aware reads; in-flight prefetch dedup remains per `(ino, block)` so multiple handles still collapse duplicate background work.
 - Sequential velocity is tracked via EWMA (blocks/sec) over microsecond sampling windows:
   - sub-millisecond reads are accumulated into a sample window (anti-dither),
   - stale velocity state is reset after long idle gaps.
@@ -472,8 +488,8 @@ Runtime tuning knobs:
 - `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
 On each buffered `read()`:
-1. Hot path enqueues a compact prefetch hint (`ino`, `first_block`, `last_block`) and returns to user work.
-2. Background worker updates read-ahead state (`record_read`) and directory access state (`on_child_read`) regardless of transient prefetch budget limits.
+1. Hot path updates the handle or fallback classifier, then enqueues a compact prefetch hint (`ino`, `stream_id`, `first_block`, `last_block`, `policy`) and returns to user work.
+2. Background worker updates read-ahead state (`record_read_for_stream`) and directory access state (`on_child_read`) regardless of transient prefetch budget limits.
 3. Worker applies prefetch budget/headroom limits, deduplicates pending/in-flight blocks, and runs `read_block_for_prefetch()` tasks.
 4. `start_prefetch` / `finish_prefetch` continue to guard in-flight deduplication.
 

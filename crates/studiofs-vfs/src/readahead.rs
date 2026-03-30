@@ -34,11 +34,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use studiofs_meta::types::Ino;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReadStreamKey {
+    pub ino: Ino,
+    pub stream_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReadAheadPolicy {
+    pub base_width: u32,
+    pub max_width: u32,
+    pub min_prefetch_on_seq: u32,
+    pub prefetch_enabled: bool,
+}
+
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
 const MAX_SCORE: u8 = 255;
 const VELOCITY_SAMPLE_ALPHA: f64 = 0.25;
 const VELOCITY_SAMPLE_MIN_AGE_US: u64 = 1_000;
 const VELOCITY_SAMPLE_MAX_AGE_US: u64 = 2_000_000;
+/// Idle gap beyond which velocity and score begin soft-decaying instead of
+/// hard-resetting.  Media players frequently pause for 2–5 seconds during
+/// user interaction, scrubbing, or re-buffering; a hard reset at 2 s forces
+/// the prefetch window to restart from scratch.  The soft-decay range
+/// [VELOCITY_SAMPLE_MAX_AGE_US .. VELOCITY_SOFT_DECAY_LIMIT_US] halves the
+/// EMA velocity, cuts score by 75 %, and collapses the width, preserving
+/// enough state so the next sequential read can recover quickly.
+const VELOCITY_SOFT_DECAY_LIMIT_US: u64 = 10_000_000; // 10 s
 const LARGE_SEEK_RESET_BLOCK_DELTA: u32 = 256;
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
@@ -72,7 +94,7 @@ struct ReadState {
 /// Tracks per-inode sequential read patterns and manages in-flight prefetch state.
 pub struct ReadAheadTracker {
     /// Per-inode state.
-    states: DashMap<Ino, ReadState>,
+    states: DashMap<ReadStreamKey, ReadState>,
     /// Blocks that are already being prefetched — avoids duplicate work.
     inflight: DashMap<(Ino, u32), ()>,
     /// Maximum blocks ahead to fetch when fully ramped-up.
@@ -93,6 +115,15 @@ pub struct ReadAheadTracker {
 }
 
 impl ReadAheadTracker {
+    fn default_policy(&self) -> ReadAheadPolicy {
+        ReadAheadPolicy {
+            base_width: self.base_width,
+            max_width: self.width,
+            min_prefetch_on_seq: self.min_prefetch_on_seq,
+            prefetch_enabled: true,
+        }
+    }
+
     fn monotonic_now_micros() -> u64 {
         static START: OnceLock<Instant> = OnceLock::new();
         START
@@ -102,9 +133,9 @@ impl ReadAheadTracker {
             .min(u64::MAX as u128) as u64
     }
 
-    fn velocity_width_target(&self, blocks_per_sec: f64) -> u32 {
+    fn velocity_width_target(&self, blocks_per_sec: f64, base_width: u32, max_width: u32) -> u32 {
         if !blocks_per_sec.is_finite() || blocks_per_sec <= 0.0 {
-            return self.base_width;
+            return base_width;
         }
         let multiplier: u32 = if blocks_per_sec >= 512.0 {
             8
@@ -119,24 +150,28 @@ impl ReadAheadTracker {
         } else {
             1
         };
-        self.base_width
+        base_width
             .saturating_mul(multiplier)
-            .clamp(self.base_width, self.width)
+            .clamp(base_width, max_width)
     }
 
     fn record_read_with_stamp(
         &self,
-        ino: Ino,
+        key: ReadStreamKey,
         first_block: u32,
         last_block: u32,
+        policy: ReadAheadPolicy,
         now_micros: u64,
     ) -> Vec<u32> {
         let now_micros = now_micros.max(1);
-        let mut state = self.states.entry(ino).or_insert(ReadState {
+        let base_width = policy.base_width.max(1);
+        let max_width = policy.max_width.max(base_width);
+        let min_prefetch_on_seq = policy.min_prefetch_on_seq.max(1).min(max_width);
+        let mut state = self.states.entry(key).or_insert(ReadState {
             last_block: u32::MAX,
             score: 0,
             sequential_streak: 0,
-            current_width: self.base_width,
+            current_width: base_width,
             last_read_at_micros: 0,
             velocity_blocks_per_sec_ema: 0.0,
             velocity_sample_anchor_micros: 0,
@@ -146,11 +181,22 @@ impl ReadAheadTracker {
         if state.last_read_at_micros > 0
             && now_micros.saturating_sub(state.last_read_at_micros) > VELOCITY_SAMPLE_MAX_AGE_US
         {
-            // Previous throughput signal is stale after long idle periods.
-            state.score = 0;
-            state.sequential_streak = 0;
-            state.current_width = self.base_width;
-            state.velocity_blocks_per_sec_ema = 0.0;
+            let idle_us = now_micros.saturating_sub(state.last_read_at_micros);
+            if idle_us > VELOCITY_SOFT_DECAY_LIMIT_US {
+                // Hard reset: idle exceeded the soft-decay window.
+                state.score = 0;
+                state.sequential_streak = 0;
+                state.current_width = base_width;
+                state.velocity_blocks_per_sec_ema = 0.0;
+            } else {
+                // Soft decay: preserve partial state so resumed sequential
+                // reads recover quickly after short media-player pauses.
+                state.score /= 4;
+                state.sequential_streak /= 2;
+                state.current_width = state.current_width.max(base_width) / 2;
+                state.current_width = state.current_width.max(base_width);
+                state.velocity_blocks_per_sec_ema *= 0.5;
+            }
             // Re-seed anchor with "now" so resumed sequential reads can build
             // fresh velocity samples immediately after idle reset.
             state.velocity_sample_anchor_micros = now_micros;
@@ -197,7 +243,7 @@ impl ReadAheadTracker {
                 for _ in 0..ramp_steps {
                     next_width = next_width.saturating_mul(2);
                 }
-                state.current_width = next_width.clamp(self.base_width, self.width);
+                state.current_width = next_width.clamp(base_width, max_width);
             }
             if state.last_read_at_micros > 0 {
                 if state.velocity_sample_anchor_micros == 0 {
@@ -222,12 +268,15 @@ impl ReadAheadTracker {
                             };
                         state.velocity_sample_anchor_micros = now_micros;
                         state.velocity_sample_blocks = 0;
-                        let velocity_width =
-                            self.velocity_width_target(state.velocity_blocks_per_sec_ema);
+                        let velocity_width = self.velocity_width_target(
+                            state.velocity_blocks_per_sec_ema,
+                            base_width,
+                            max_width,
+                        );
                         state.current_width = state
                             .current_width
                             .max(velocity_width)
-                            .clamp(self.base_width, self.width);
+                            .clamp(base_width, max_width);
                     }
                 }
             }
@@ -244,7 +293,7 @@ impl ReadAheadTracker {
                 state.velocity_blocks_per_sec_ema *= 0.5;
             }
             state.sequential_streak = 0;
-            state.current_width = self.base_width;
+            state.current_width = base_width;
             state.velocity_sample_anchor_micros = 0;
             state.velocity_sample_blocks = 0;
         }
@@ -252,10 +301,10 @@ impl ReadAheadTracker {
         state.last_block = last_block;
         state.last_read_at_micros = now_micros;
         let score = state.score;
-        let current_width = state.current_width.clamp(self.base_width, self.width);
+        let current_width = state.current_width.clamp(base_width, max_width);
         drop(state);
 
-        if score == 0 {
+        if score == 0 || !policy.prefetch_enabled {
             return Vec::new();
         }
 
@@ -264,12 +313,12 @@ impl ReadAheadTracker {
         if (is_sequential || is_same_block) && score > 0 {
             // For small sequential reads over high-latency links, keep a
             // minimum look-ahead window to avoid throughput oscillation.
-            prefetch_count = prefetch_count.max(self.min_prefetch_on_seq.min(current_width));
+            prefetch_count = prefetch_count.max(min_prefetch_on_seq.min(current_width));
         }
         (1..=prefetch_count)
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
-                if self.inflight.contains_key(&(ino, block)) {
+                if self.inflight.contains_key(&(key.ino, block)) {
                     None // Already in-flight
                 } else {
                     Some(block)
@@ -336,7 +385,28 @@ impl ReadAheadTracker {
     /// Returns the list of *upcoming* block indices that the caller should
     /// schedule for prefetch.  Only blocks not already in-flight are returned.
     pub fn record_read(&self, ino: Ino, first_block: u32, last_block: u32) -> Vec<u32> {
-        self.record_read_with_stamp(ino, first_block, last_block, Self::monotonic_now_micros())
+        self.record_read_for_stream(
+            ReadStreamKey { ino, stream_id: 0 },
+            first_block,
+            last_block,
+            self.default_policy(),
+        )
+    }
+
+    pub fn record_read_for_stream(
+        &self,
+        key: ReadStreamKey,
+        first_block: u32,
+        last_block: u32,
+        policy: ReadAheadPolicy,
+    ) -> Vec<u32> {
+        self.record_read_with_stamp(
+            key,
+            first_block,
+            last_block,
+            policy,
+            Self::monotonic_now_micros(),
+        )
     }
 
     /// Mark a block as in-flight for prefetch.
@@ -361,23 +431,53 @@ impl ReadAheadTracker {
     /// can still be in flight. Dropping those stale tasks improves seek
     /// responsiveness for interactive video playback.
     pub fn is_prefetch_relevant(&self, ino: Ino, block: u32) -> bool {
-        let Some(state) = self.states.get(&ino) else {
+        let mut found_stream = false;
+        for state in self.states.iter() {
+            if state.key().ino != ino {
+                continue;
+            }
+            found_stream = true;
+            if Self::state_considers_block_relevant(&state, self.width.max(1), block) {
+                return true;
+            }
+        }
+        !found_stream
+    }
+
+    pub fn is_prefetch_relevant_for_stream(&self, key: ReadStreamKey, block: u32) -> bool {
+        let Some(state) = self.states.get(&key) else {
             return true;
         };
-        let head = state.last_block;
-        let tail_slack = self.width.max(1);
-        let min_valid = head.saturating_sub(tail_slack);
-        block >= min_valid
+        Self::state_considers_block_relevant(&state, self.width.max(1), block)
+    }
+
+    pub fn evict_stream(&self, key: ReadStreamKey) {
+        self.states.remove(&key);
     }
 
     /// Remove all state for an inode (e.g. on file close or delete).
     pub fn evict(&self, ino: Ino) {
-        self.states.remove(&ino);
+        self.states.retain(|candidate, _| candidate.ino != ino);
+        self.inflight
+            .retain(|(candidate_ino, _), _| *candidate_ino != ino);
+    }
+
+    fn state_considers_block_relevant(state: &ReadState, tail_slack: u32, block: u32) -> bool {
+        let head = state.last_block;
+        let min_valid = head.saturating_sub(tail_slack);
+        block >= min_valid
     }
 
     #[cfg(test)]
     fn debug_width(&self, ino: Ino) -> Option<u32> {
-        self.states.get(&ino).map(|s| s.current_width)
+        self.states
+            .get(&ReadStreamKey { ino, stream_id: 0 })
+            .map(|s| s.current_width)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_has_stream(&self, key: ReadStreamKey) -> bool {
+        self.states.contains_key(&key)
     }
 
     #[cfg(test)]
@@ -388,7 +488,13 @@ impl ReadAheadTracker {
         last_block: u32,
         at_micros: u64,
     ) -> Vec<u32> {
-        self.record_read_with_stamp(ino, first_block, last_block, at_micros)
+        self.record_read_with_stamp(
+            ReadStreamKey { ino, stream_id: 0 },
+            first_block,
+            last_block,
+            self.default_policy(),
+            at_micros,
+        )
     }
 }
 
@@ -558,6 +664,51 @@ mod tests {
             tracker.start_prefetch(1, 5),
             "after finish, should return true again"
         );
+    }
+
+    #[test]
+    fn test_inode_relevance_accepts_any_live_stream() {
+        let tracker = ReadAheadTracker::new(8);
+        let policy = tracker.default_policy();
+        let stale = ReadStreamKey {
+            ino: 99,
+            stream_id: 1,
+        };
+        let live = ReadStreamKey {
+            ino: 99,
+            stream_id: 2,
+        };
+
+        let _ = tracker.record_read_for_stream(stale, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(stale, 1, 1, policy);
+        let _ = tracker.record_read_for_stream(live, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(live, 1, 1, policy);
+        let _ = tracker.record_read_for_stream(stale, 1024, 1024, policy);
+
+        assert!(!tracker.is_prefetch_relevant_for_stream(stale, 2));
+        assert!(tracker.is_prefetch_relevant_for_stream(live, 2));
+        assert!(tracker.is_prefetch_relevant(99, 2));
+    }
+
+    #[test]
+    fn test_evict_stream_removes_only_target_stream() {
+        let tracker = ReadAheadTracker::new(8);
+        let policy = tracker.default_policy();
+        let keep = ReadStreamKey {
+            ino: 77,
+            stream_id: 1,
+        };
+        let drop_key = ReadStreamKey {
+            ino: 77,
+            stream_id: 2,
+        };
+
+        let _ = tracker.record_read_for_stream(keep, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(drop_key, 0, 0, policy);
+        tracker.evict_stream(drop_key);
+
+        assert!(tracker.debug_has_stream(keep));
+        assert!(!tracker.debug_has_stream(drop_key));
     }
 
     #[test]
@@ -759,6 +910,34 @@ mod tests {
         assert!(
             tracker.debug_width(1).unwrap_or(16) > 16,
             "velocity-based widening should recover after pause/resume"
+        );
+    }
+
+    #[test]
+    fn test_soft_decay_preserves_partial_state_for_media_player_pause() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let mut t = 1_000_000u64;
+        let _ = tracker.record_read_at_micros(1, 0, 0, t);
+
+        // Build up sequential score and velocity.
+        for block in 1..=32u32 {
+            t = t.saturating_add(1_000);
+            let _ = tracker.record_read_at_micros(1, block, block, t);
+        }
+        let pre_width = tracker.debug_width(1).unwrap_or(16);
+        assert!(pre_width > 16, "should have ramped up before pause");
+
+        // Simulate a media-player pause: idle for 5 seconds (within soft-decay
+        // range: 2s < 5s < 10s).
+        t = t.saturating_add(5_000_000);
+        let p = tracker.record_read_at_micros(1, 33, 33, t);
+
+        // Soft decay should preserve *some* score so sequential continues.
+        // With the soft path the score is reduced to score/4 (still > 0 for
+        // high prior scores), so prefetch should still produce blocks.
+        assert!(
+            !p.is_empty(),
+            "soft-decayed state should still produce prefetch suggestions after short pause"
         );
     }
 }

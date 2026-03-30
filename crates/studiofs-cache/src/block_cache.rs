@@ -357,7 +357,7 @@ impl BlockCache {
     ///
     /// Lookup: L1 (RAM) → L2 (NVMe file) → None.
     pub async fn get(&self, object_id: ObjectId) -> Option<Bytes> {
-        self.get_with_qos(object_id, L2IoPriority::Foreground)
+        self.get_with_qos(object_id, L2IoPriority::Foreground, true)
             .await
             .0
     }
@@ -386,7 +386,20 @@ impl BlockCache {
         object_id: ObjectId,
         priority: L2IoPriority,
     ) -> (Option<Bytes>, CacheReadTrace) {
-        self.get_with_qos(object_id, priority).await
+        self.get_with_qos(object_id, priority, true).await
+    }
+
+    /// Read a block with an explicit L2 QoS priority and optional L2→L1
+    /// promotion on cache hits.
+    pub async fn get_with_priority_and_promotion(
+        &self,
+        object_id: ObjectId,
+        priority: L2IoPriority,
+        promote_on_l2_hit: bool,
+    ) -> Option<Bytes> {
+        self.get_with_qos(object_id, priority, promote_on_l2_hit)
+            .await
+            .0
     }
 
     /// Read a block from L2 only and return lookup trace for observability.
@@ -398,7 +411,7 @@ impl BlockCache {
         object_id: ObjectId,
         priority: L2IoPriority,
     ) -> (Option<Bytes>, CacheReadTrace) {
-        self.get_from_l2_with_trace(object_id, priority, Duration::from_secs(0))
+        self.get_from_l2_with_trace(object_id, priority, Duration::from_secs(0), false)
             .await
     }
 
@@ -406,6 +419,7 @@ impl BlockCache {
         &self,
         object_id: ObjectId,
         priority: L2IoPriority,
+        promote_on_l2_hit: bool,
     ) -> (Option<Bytes>, CacheReadTrace) {
         let l1_started = Instant::now();
         if let Some(data) = self.l1.get(object_id) {
@@ -419,7 +433,7 @@ impl BlockCache {
         }
         let l1_lookup_latency = l1_started.elapsed();
 
-        self.get_from_l2_with_trace(object_id, priority, l1_lookup_latency)
+        self.get_from_l2_with_trace(object_id, priority, l1_lookup_latency, promote_on_l2_hit)
             .await
     }
 
@@ -428,6 +442,7 @@ impl BlockCache {
         object_id: ObjectId,
         priority: L2IoPriority,
         l1_lookup_latency: Duration,
+        promote_on_l2_hit: bool,
     ) -> (Option<Bytes>, CacheReadTrace) {
         let l2_started = Instant::now();
         if self.is_l2_read_breaker_open() {
@@ -479,7 +494,9 @@ impl BlockCache {
             .record(data.len() as u64, l2_lookup_latency);
 
         // Promote to L1 if budget allows (or near budget).
-        self.promote_to_l1(object_id, data.clone());
+        if promote_on_l2_hit {
+            self.promote_to_l1(object_id, data.clone());
+        }
         self.lru.touch(object_id);
 
         (
@@ -555,7 +572,7 @@ impl BlockCache {
         object_id: ObjectId,
         priority: L2IoPriority,
     ) -> Option<Bytes> {
-        self.get_with_qos(object_id, priority).await.0
+        self.get_with_qos(object_id, priority, true).await.0
     }
 
     /// Read from an L2 block synchronously into a provided output slice.
@@ -567,6 +584,18 @@ impl BlockCache {
         offset: u64,
         out: &mut [u8],
     ) -> Option<usize> {
+        self.get_sync_l2_into_with_promotion(object_id, offset, out, true)
+    }
+
+    /// Read from an L2 block synchronously into a provided output slice with
+    /// optional L2 to L1 promotion.
+    pub fn get_sync_l2_into_with_promotion(
+        &self,
+        object_id: ObjectId,
+        offset: u64,
+        out: &mut [u8],
+        promote_on_l2_hit: bool,
+    ) -> Option<usize> {
         if self.is_l2_read_breaker_open() {
             return None;
         }
@@ -575,6 +604,11 @@ impl BlockCache {
             Ok(Some(read)) => {
                 self.record_l2_read_completion();
                 self.metrics.l2_read.record(read as u64, started.elapsed());
+                // Only promote when we have a full-object read starting at offset 0.
+                if promote_on_l2_hit && offset == 0 && read == out.len() && read > 0 {
+                    let promoted = Bytes::copy_from_slice(&out[..read]);
+                    self.promote_to_l1(object_id, promoted);
+                }
                 self.lru.touch(object_id);
                 Some(read)
             }

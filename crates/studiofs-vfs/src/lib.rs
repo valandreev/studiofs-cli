@@ -3,6 +3,7 @@
 //! Platform-agnostic virtual filesystem operations. Bridges metadata, data, and cache layers.
 
 pub mod aimd;
+pub mod access;
 pub mod fetch;
 pub mod incarnation;
 pub(crate) mod ingress_wal;
