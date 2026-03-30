@@ -630,11 +630,6 @@ impl PgMetaEngine {
         &self.postgres_url
     }
 
-    #[allow(dead_code)]
-    fn volume_id(&self) -> i64 {
-        self.volume_id
-    }
-
     fn fetch_remote_uuid(&self, volume_id: i64) -> MetaResult<String> {
         let postgres_url = self.postgres_url.clone();
         let connect_timeout = self.connect_timeout;

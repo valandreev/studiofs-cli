@@ -215,18 +215,19 @@ unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
 ## ПРИОРИТЕТЫ ИСПРАВЛЕНИЙ
 
 Приоритет 1 (тривиально, высокий импакт):
-  2. Добавить cargo audit в CI - done
-  3. Добавить #![forbid(unsafe_code)] в крейты без unsafe - done
-  4. Сузить фичи tokio - done
+  7. Добавить cargo audit в CI - done
+  5. Добавить #![forbid(unsafe_code)] в крейты без unsafe - done
+  6. Сузить фичи tokio - done
+  12. `#[allow(dead_code)]` в production-коде - done
 
 Приоритет 2 (средняя сложность):
-  5. Заменить .lock().unwrap() на обработку poisoning (11 мест)
-  6. Заменить std::sync::Mutex → Atomic/tokio::sync в async-коде (2 поля)
-  7. Добавить SAFETY-комментарий к unsafe fn as_mut_slice
+  3. Заменить .lock().unwrap() на обработку poisoning (11 мест)
+  4. Заменить std::sync::Mutex → Atomic/tokio::sync в async-коде (2 поля)
+  13. Добавить SAFETY-комментарий к unsafe fn as_mut_slice
   8. Добавить CI matrix для Windows/macOS
 
 Приоритет 3 (большой объём работы):
-  9. Постепенно заменять .unwrap()/.expect() в redb_engine (508) и pg_engine (578)
-  10. Добавить документацию к публичным API
-  11. Рефакторинг клонирования в горячих путях кэша
-  12. Добавить doc-тесты к публичным типам и функциям
+  2. Постепенно заменять .unwrap()/.expect() в redb_engine (508) и pg_engine (578)
+  9. Добавить документацию к публичным API
+  10. Рефакторинг клонирования в горячих путях кэша
+  14. Добавить doc-тесты к публичным типам и функциям
