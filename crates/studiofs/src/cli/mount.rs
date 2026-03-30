@@ -16,7 +16,14 @@ const USB_L2_COMMIT_QUEUE_CAPACITY: usize = 256;
 const USB_L2_IO_TIMEOUT_MS: u64 = 10_000;
 
 /// Initial L1 RAM budget before the adaptive envelope takes over.
-const INITIAL_L1_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Capped at 25 % of total RAM so low-memory machines don't overshoot.
+fn initial_l1_bytes() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let quarter_ram = sys.total_memory() / 4;
+    const DEFAULT_L1: u64 = 4 * 1024 * 1024 * 1024;
+    quarter_ram.min(DEFAULT_L1)
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
 pub enum L2Profile {
@@ -609,7 +616,7 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let mem_limit = INITIAL_L1_BYTES;
+    let mem_limit = initial_l1_bytes();
     let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;

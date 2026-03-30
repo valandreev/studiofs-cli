@@ -62,7 +62,7 @@ impl WorkloadPhase {
     /// Budget ratios: (l1, transit, dirty, staged).  Fractions must sum to 1.0.
     fn ratios(self) -> (f64, f64, f64, f64) {
         match self {
-            Self::ReadHeavy => (0.65, 0.25, 0.05, 0.05),
+            Self::ReadHeavy => (0.60, 0.25, 0.10, 0.05),
             Self::WriteHeavy => (0.35, 0.15, 0.40, 0.10),
             Self::Mixed => (0.55, 0.25, 0.15, 0.05),
             Self::Idle => (0.50, 0.20, 0.20, 0.10),
@@ -164,6 +164,10 @@ pub struct MemoryEnvelope {
 
     // ── controller state (interior, updated each tick) ───────
     phase: parking_lot::Mutex<PhaseState>,
+
+    /// Cached `sysinfo::System` instance — reused across ticks so we only call
+    /// `refresh_memory()` instead of re-scanning processes/CPUs every second.
+    sys: parking_lot::Mutex<sysinfo::System>,
 }
 
 /// Mutable state guarded by a single mutex, updated once per tick.
@@ -265,6 +269,11 @@ impl MemoryEnvelope {
             "MemoryEnvelope initialised"
         );
 
+        // Pre-create the sysinfo::System with memory info so the first tick
+        // only needs a cheap `refresh_memory()` call.
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+
         Self {
             total_ram,
             soft_target,
@@ -276,6 +285,7 @@ impl MemoryEnvelope {
             transit_budget,
             fetch_scheduler,
             phase: parking_lot::Mutex::new(PhaseState::new()),
+            sys: parking_lot::Mutex::new(sys),
         }
     }
 
@@ -507,7 +517,7 @@ impl MemoryEnvelope {
         let retreat_ok = fg_p90_ms < 20
             && write_bp_delta == 0
             && signals.transit_fg_waiting == 0
-            && l1_utilization < 0.70;
+            && l1_utilization < 0.85;
 
         if should_burst {
             ps.retreat_ticks = 0;
@@ -624,7 +634,7 @@ impl MemoryEnvelope {
         // Aggressive prefetch cutoff.
         self.fetch_scheduler.set_prefetch_acquire_wait_ms(0);
 
-        debug!(
+        warn!(
             grant_mb = grant / (1024 * 1024),
             l1_floor_mb = self.floors.l1 / (1024 * 1024),
             transit_floor_mb = self.floors.transit / (1024 * 1024),
@@ -638,25 +648,23 @@ impl MemoryEnvelope {
 
     /// Check if OS available physical memory is below the emergency threshold.
     ///
-    /// Uses `sysinfo` crate.  Relatively cheap on Windows/Linux (reads /proc or
-    /// GlobalMemoryStatusEx), but we still guard it behind the tick interval.
+    /// Reuses the cached `sysinfo::System` — only `refresh_memory()` is called,
+    /// which is ~10-20× cheaper than `System::new()` on Windows.
     fn check_os_memory_pressure(&self) -> bool {
-        use sysinfo::System;
-        let mut sys = System::new();
+        let mut sys = self.sys.lock();
         sys.refresh_memory();
         let available = sys.available_memory(); // bytes
-        // Use EMERGENCY_ENTER_FRACTION to detect pressure, callers use
-        // EMERGENCY_EXIT_FRACTION for hysteresis on recovery.
+        drop(sys);
         let threshold = (self.total_ram as f64 * EMERGENCY_ENTER_FRACTION) as u64;
         available < threshold
     }
 
     /// Check if OS memory has recovered above the exit threshold.
     fn check_os_memory_recovered(&self) -> bool {
-        use sysinfo::System;
-        let mut sys = System::new();
+        let mut sys = self.sys.lock();
         sys.refresh_memory();
         let available = sys.available_memory();
+        drop(sys);
         let threshold = (self.total_ram as f64 * EMERGENCY_EXIT_FRACTION) as u64;
         available >= threshold
     }
