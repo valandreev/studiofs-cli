@@ -2,9 +2,9 @@ target/
 *.db
 *.db-shm
 *.db-wal
-Cargo.lock
+# Cargo.lock
 /docs/done
-/docs/ideas
+# /docs/ideas
 docs/logs/*.*
 *.exe
 .env
