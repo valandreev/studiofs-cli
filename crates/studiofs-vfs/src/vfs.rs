@@ -3750,7 +3750,8 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: std::sync::RwLock<Option<Arc<dyn KernelInvalidator>>>,
-    /// Adaptive memory budget controller (SFS-130).  Empty when `--memory-adaptive off`.
+    /// Adaptive memory budget controller (SFS-130). Empty when `VfsConfigRaw.memory_adaptive`
+    /// (config/env) is disabled.
     memory_envelope: std::sync::OnceLock<Arc<crate::memory_envelope::MemoryEnvelope>>,
 }
 
