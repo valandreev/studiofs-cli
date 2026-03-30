@@ -25,8 +25,8 @@ pub struct L1MemCache {
     shards: Vec<Mutex<HashMap<u64, Bytes>>>,
     /// Current total bytes stored.
     total_bytes: AtomicU64,
-    /// Budget in bytes.
-    max_bytes: u64,
+    /// Budget in bytes (runtime-adjustable by the adaptive memory controller).
+    max_bytes: AtomicU64,
 }
 
 impl L1MemCache {
@@ -39,7 +39,7 @@ impl L1MemCache {
         Self {
             shards,
             total_bytes: AtomicU64::new(0),
-            max_bytes,
+            max_bytes: AtomicU64::new(max_bytes),
         }
     }
 
@@ -94,12 +94,20 @@ impl L1MemCache {
 
     /// Byte budget.
     pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
+        self.max_bytes.load(Ordering::Acquire)
+    }
+
+    /// Update the byte budget at runtime.
+    ///
+    /// The caller should signal the evictor if the new limit is lower than
+    /// `total_bytes()` so excess entries are demoted promptly.
+    pub fn set_max_bytes(&self, value: u64) {
+        self.max_bytes.store(value, Ordering::Release);
     }
 
     /// Whether the cache is over budget.
     pub fn over_budget(&self) -> bool {
-        self.total_bytes() > self.max_bytes
+        self.total_bytes() > self.max_bytes()
     }
 
     /// Total number of entries across all shards.

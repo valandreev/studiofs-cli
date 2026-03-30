@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -98,7 +99,7 @@ pub struct TransitMemorySnapshot {
 
 #[derive(Debug)]
 pub struct TransitMemoryBudget {
-    budget_bytes: usize,
+    budget_bytes: AtomicUsize,
     state: Mutex<TransitMemoryBudgetState>,
     notify: Notify,
 }
@@ -120,22 +121,34 @@ pub struct TransitMemoryGuard {
 impl TransitMemoryBudget {
     pub fn new(budget_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
-            budget_bytes: budget_bytes.max(1),
+            budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
             state: Mutex::new(TransitMemoryBudgetState::default()),
             notify: Notify::new(),
         })
     }
 
     pub fn budget_bytes(&self) -> usize {
-        self.budget_bytes
+        self.budget_bytes.load(Ordering::Acquire)
+    }
+
+    /// Update the transit memory budget at runtime.
+    ///
+    /// Wakes any blocked allocators so they can re-evaluate against the new
+    /// limit.  A shrink while transit is fully used will not abort in-flight
+    /// guards — it simply delays new acquires until existing guards are
+    /// dropped.
+    pub fn set_budget_bytes(&self, value: usize) {
+        self.budget_bytes.store(value.max(1), Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     pub fn snapshot(&self) -> TransitMemorySnapshot {
+        let budget = self.budget_bytes();
         let state = self.state.lock();
         TransitMemorySnapshot {
-            budget_bytes: self.budget_bytes,
+            budget_bytes: budget,
             used_bytes: state.used_bytes,
-            available_bytes: self.budget_bytes.saturating_sub(state.used_bytes),
+            available_bytes: budget.saturating_sub(state.used_bytes),
             waiting_foreground: state.waiting_foreground,
             waiting_background: state.waiting_background,
         }
@@ -154,14 +167,16 @@ impl TransitMemoryBudget {
         priority: TransitPriority,
         requested_bytes: usize,
     ) -> TransitMemoryGuard {
-        let requested_bytes = requested_bytes.max(1).min(self.budget_bytes);
+        let budget = self.budget_bytes();
+        let requested_bytes = requested_bytes.max(1).min(budget);
         let mut waiter = TransitWaiter::new(self, priority);
 
         loop {
             let notified = self.notify.notified();
             {
+                let current_budget = self.budget_bytes();
                 let mut state = self.state.lock();
-                if can_allocate(&state, self.budget_bytes, requested_bytes, priority) {
+                if can_allocate(&state, current_budget, requested_bytes, priority) {
                     waiter.disarm(&mut state);
                     state.used_bytes = state.used_bytes.saturating_add(requested_bytes);
                     return TransitMemoryGuard {

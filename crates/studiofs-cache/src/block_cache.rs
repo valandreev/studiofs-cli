@@ -18,7 +18,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -225,6 +225,12 @@ pub struct BlockCache {
     l2_read_breaker_open_until: std::sync::Mutex<Option<Instant>>,
     /// Number of consecutive L2 read timeout events.
     l2_read_timeout_streak: AtomicU32,
+    /// Cumulative count of L1 blocks evicted (demoted to disk-only).
+    l1_eviction_count: AtomicU64,
+    /// Cumulative count of cache reads served from L1 (RAM).
+    l1_hits: AtomicU64,
+    /// Cumulative count of cache reads served from L2 (NVMe).
+    l2_hits: AtomicU64,
 }
 
 impl BlockCache {
@@ -316,6 +322,9 @@ impl BlockCache {
             last_checkpoint_signature: std::sync::Mutex::new(initial_checkpoint_signature),
             l2_read_breaker_open_until: std::sync::Mutex::new(None),
             l2_read_timeout_streak: AtomicU32::new(0),
+            l1_eviction_count: AtomicU64::new(0),
+            l1_hits: AtomicU64::new(0),
+            l2_hits: AtomicU64::new(0),
         });
 
         Ok((cache, upload_rx))
@@ -429,6 +438,7 @@ impl BlockCache {
                 l2_lookup_latency: None,
             };
             self.lru.touch(object_id);
+            self.l1_hits.fetch_add(1, Ordering::Relaxed);
             return (Some(data), trace);
         }
         let l1_lookup_latency = l1_started.elapsed();
@@ -499,6 +509,7 @@ impl BlockCache {
         }
         self.lru.touch(object_id);
 
+        self.l2_hits.fetch_add(1, Ordering::Relaxed);
         (
             Some(data),
             CacheReadTrace {
@@ -927,6 +938,35 @@ impl BlockCache {
         self.l1.total_bytes()
     }
 
+    /// Current L1 byte budget.
+    pub fn l1_max_bytes(&self) -> u64 {
+        self.l1.max_bytes()
+    }
+
+    /// Update L1 byte budget at runtime.  Signals the evictor if the new
+    /// limit is lower than current usage.
+    pub fn set_l1_max_bytes(&self, value: u64) {
+        self.l1.set_max_bytes(value);
+        if self.l1.over_budget() {
+            self.evict_notify.notify_one();
+        }
+    }
+
+    /// Cumulative L1 eviction count (blocks demoted from RAM to disk-only).
+    pub fn l1_eviction_count(&self) -> u64 {
+        self.l1_eviction_count.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of cache reads served from L1 (RAM).
+    pub fn l1_hit_count(&self) -> u64 {
+        self.l1_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of cache reads served from L2 (NVMe).
+    pub fn l2_hit_count(&self) -> u64 {
+        self.l2_hits.load(Ordering::Relaxed)
+    }
+
     /// Total bytes in L2 (NVMe).
     pub fn l2_bytes(&self) -> u64 {
         self.l2.total_bytes()
@@ -1002,16 +1042,21 @@ impl BlockCache {
 
     /// Run L1 eviction: demote oldest entries from RAM to disk-only.
     fn evict_l1_bytes(&self, mut to_free: u64) {
+        let mut evicted = 0u64;
         while to_free > 0 {
             let Some((id, size)) = self.lru.evict_l1() else {
                 break;
             };
             // Remove from L1 RAM (data stays on L2 disk).
             self.l1.remove(id);
+            evicted += 1;
             if size as u64 >= to_free {
                 break;
             }
             to_free -= size as u64;
+        }
+        if evicted > 0 {
+            self.l1_eviction_count.fetch_add(evicted, Ordering::Relaxed);
         }
     }
 
