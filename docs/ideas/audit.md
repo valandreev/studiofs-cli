@@ -84,40 +84,7 @@ l2_read_breaker_open_until: std::sync::Mutex<Option<Instant>>,
 Если задача заблокируется на этом мьютексе, она заблокирует весь
 executor-тред Tokio. Нужно tokio::sync::Mutex или Atomic.
 
-### 5. 🟠 Нет `#![forbid(unsafe_code)]` ни в одном крейте
-
-Ни один крейт (даже чисто-логические studiofs-meta, studiofs-data,
-studiofs-cache) не запрещает unsafe. По best practices, крейты без
-необходимости в unsafe должны иметь #![forbid(unsafe_code)].
-
-Рекомендация: добавить в lib.rs следующих крейтов:
-- studiofs-meta
-- studiofs-data
-- studiofs-cache
-- studiofs-vfs
-
-### 6. 🟠 `tokio = { features = ["full"] }` — избыточно
-
-Workspace Cargo.toml:
-```toml
-tokio = { version = "1", features = ["full"] }
-```
-
-Фактически используются: rt-multi-thread, time, sync, macros, fs, io-util.
-НЕ используются: signal, process, net.
-
-Замена на точечные фичи ускорит компиляцию на ~15-20%:
-```toml
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util"] }
-```
-
-### 7. 🟠 Нет `cargo audit` в CI
-
-Workflow .github/workflows/rust.yml запускает fmt, clippy, test, doc —
-но НЕ проверяет зависимости на уязвимости (cargo audit / cargo deny).
-Это рекомендуемая best practice для production-проектов.
-
-### 8. 🟠 CI только на Ubuntu
+### 5. 🟠 CI только на Ubuntu
 
 CI запускается только на ubuntu-latest, хотя проект поддерживает:
 - Windows (крейт studiofs-winfsp)
@@ -130,7 +97,18 @@ Windows-специфичный код (winfsp) никогда не тестир�
 
 ## УМЕРЕННЫЕ ПРОБЛЕМЫ
 
-### 9. 🟡 Массовое отсутствие документации
+### 6. 🟡 unsafe без SAFETY-комментария
+
+studiofs-winfsp/src/context.rs:88-90:
+```rust
+unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+}
+```
+Нет SAFETY-комментария с описанием инвариантов (ptr валиден, выровнен,
+эксклюзивно владеется на время 'a).
+
+### 7. 🟡 Массовое отсутствие документации
 
 30+ публичных функций без /// doc-комментариев (практически весь CLI-модуль):
 - cli/destroy.rs:8       — pub fn run
@@ -159,7 +137,7 @@ Windows-специфичный код (winfsp) никогда не тестир�
 
 Doc-тесты: только 2 примера на весь проект (aimd.rs и object.rs).
 
-### 10. 🟡 Клонирование данных в горячих путях кэша
+### 8. 🟡 Клонирование данных в горячих путях кэша
 
 studiofs-cache/src/block_cache.rs — data.clone() клонирует потенциально
 большие блоки данных (Vec<u8> / Bytes):
@@ -170,27 +148,10 @@ studiofs-cache/src/block_cache.rs — data.clone() клонирует потен
 
 Рекомендация: использовать Arc<[u8]> или Bytes для zero-copy sharing.
 
-### 11. 🟡 Нет rustfmt.toml / clippy.toml
+### 9. 🟡 Нет rustfmt.toml / clippy.toml
 
 Проект использует дефолтные настройки форматирования и линтинга.
 Рекомендуется зафиксировать конфигурацию явно для командной работы.
-
-### 12. 🟡 `#[allow(dead_code)]` в production-коде
-
-- studiofs-fuse/src/lib.rs:42        — #[allow(unused_variables)] foreground
-- studiofs-meta/src/pg_engine.rs:633 — #[allow(dead_code)]
-  (13 остальных — в тестовом коде vfs_test.rs, допустимо)
-
-### 13. 🟡 unsafe без SAFETY-комментария
-
-studiofs-winfsp/src/context.rs:88-90:
-```rust
-unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-}
-```
-Нет SAFETY-комментария с описанием инвариантов (ptr валиден, выровнен,
-эксклюзивно владеется на время 'a).
 
 --------------------------------------------------------------------------------
 
@@ -214,20 +175,13 @@ unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
 
 ## ПРИОРИТЕТЫ ИСПРАВЛЕНИЙ
 
-Приоритет 1 (тривиально, высокий импакт):
-  7. Добавить cargo audit в CI - done
-  5. Добавить #![forbid(unsafe_code)] в крейты без unsafe - done
-  6. Сузить фичи tokio - done
-  12. `#[allow(dead_code)]` в production-коде - done
-
-Приоритет 2 (средняя сложность):
+Приоритет 1 (средняя сложность):
   3. Заменить .lock().unwrap() на обработку poisoning (11 мест)
   4. Заменить std::sync::Mutex → Atomic/tokio::sync в async-коде (2 поля)
-  13. Добавить SAFETY-комментарий к unsafe fn as_mut_slice
-  8. Добавить CI matrix для Windows/macOS
+  6. Добавить SAFETY-комментарий к unsafe fn as_mut_slice
+  5. Добавить CI matrix для Windows/macOS
 
-Приоритет 3 (большой объём работы):
+Приоритет 2 (большой объём работы, требует итеративного подхода):
   2. Постепенно заменять .unwrap()/.expect() в redb_engine (508) и pg_engine (578)
-  9. Добавить документацию к публичным API
-  10. Рефакторинг клонирования в горячих путях кэша
-  14. Добавить doc-тесты к публичным типам и функциям
+  7. Добавить документацию к публичным API
+  8. Рефакторинг клонирования в горячих путях кэша (block_cache.rs)
