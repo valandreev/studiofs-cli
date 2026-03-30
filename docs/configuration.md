@@ -106,7 +106,7 @@ Notes:
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
-- Memory management is fully automatic via the adaptive MemoryEnvelope controller (SFS-130): soft target 8 GiB, hard ceiling 50% of total RAM. The controller grows budgets under I/O pressure and retreats when idle.
+- Memory management is fully automatic via the adaptive MemoryEnvelope controller (SFS-130): soft target 8 GiB, hard ceiling 50% of total RAM. The controller grows budgets under I/O pressure and retreats when idle. The initial L1 cache is capped at `min(4 GiB, 25% RAM)` so low-memory machines don't overshoot before the envelope takes over.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
 - Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.

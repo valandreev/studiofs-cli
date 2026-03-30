@@ -61,7 +61,7 @@ the capacity limit is reached.
 | `meta_path` | — | Path to redb database |
 | `cache_dir` | — | Root for block cache + journals |
 | `cache_size` | 100 GiB | L2 disk cache budget |
-| `memory_adaptive` | `true` | Adaptive memory controller (SFS-130): soft target 8 GiB, ceiling 50% RAM |
+| `memory_adaptive` | `true` | Adaptive memory controller (SFS-130): soft target 8 GiB, ceiling 50% RAM. Initial L1 = min(4 GiB, 25% RAM). ReadHeavy dirty budget 10%. Retreat threshold 85% L1. Emergency transitions logged at `warn`. |
 | `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |

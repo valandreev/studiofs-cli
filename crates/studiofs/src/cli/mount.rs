@@ -371,11 +371,7 @@ pub fn run(
     endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mount_point, resolved_cache_dir, cache_size) =
-        super::settings::resolve_studiofs_config_for_mount(
-            mount_point,
-            cache_dir,
-            cache_size,
-        )?;
+        super::settings::resolve_studiofs_config_for_mount(mount_point, cache_dir, cache_size)?;
 
     let cache_dir = resolved_cache_dir;
     let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;

@@ -10,8 +10,8 @@
 //!
 //! See `docs/ideas/adaptive-memory-budget.md` for the full design spec.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use studiofs_cache::BlockCache;
@@ -125,10 +125,10 @@ impl SubsystemFloors {
     /// Compute floors from the block size.
     pub fn from_block_size(block_size: u64) -> Self {
         Self {
-            l1: 32 * block_size,        // ~512 MB at 16 MB blocks
+            l1: 32 * block_size,                         // ~512 MB at 16 MB blocks
             transit: 4 * (block_size + 8 * 1024 * 1024), // ~128 MB (+ headroom)
-            dirty: block_size,          // 16 MB
-            staged: 2 * block_size,     // 32 MB
+            dirty: block_size,                           // 16 MB
+            staged: 2 * block_size,                      // 32 MB
         }
     }
 
@@ -313,11 +313,7 @@ impl MemoryEnvelope {
     // ── Tick loop ──────────────────────────────────────────────
 
     /// Run the control loop.  Spawned as a background tokio task.
-    pub async fn run(
-        self: &Arc<Self>,
-        vfs: Arc<StudioVfs>,
-        cancel: CancellationToken,
-    ) {
+    pub async fn run(self: &Arc<Self>, vfs: Arc<StudioVfs>, cancel: CancellationToken) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -416,7 +412,13 @@ impl MemoryEnvelope {
         // ── Grant sizing (burst / retreat) ──
 
         let current_grant = self.grant();
-        let new_grant = self.compute_grant(current_grant, &signals, write_bp_delta, eviction_delta, &mut ps);
+        let new_grant = self.compute_grant(
+            current_grant,
+            &signals,
+            write_bp_delta,
+            eviction_delta,
+            &mut ps,
+        );
         if new_grant != current_grant {
             self.current_grant.store(new_grant, Ordering::Release);
         }
@@ -460,7 +462,11 @@ impl MemoryEnvelope {
             l1_eviction_count: vfs.block_cache().l1_eviction_count(),
             l1_hits: vfs.block_cache().l1_hit_count(),
             l2_hits: vfs.block_cache().l2_hit_count(),
-            prefetch_skips: vfs.fetch_scheduler().metrics.prefetch_skips.load(Ordering::Relaxed),
+            prefetch_skips: vfs
+                .fetch_scheduler()
+                .metrics
+                .prefetch_skips
+                .load(Ordering::Relaxed),
             drained_mem_bytes: ingress.drained_mem_bytes,
             drained_spill_bytes: ingress.drained_spill_bytes,
             overlay_miss_exhaustions: ingress.local_overlay_cache_miss_retry_exhaustions,
@@ -616,7 +622,8 @@ impl MemoryEnvelope {
             0
         };
 
-        self.fetch_scheduler.set_prefetch_acquire_wait_ms(timeout_ms);
+        self.fetch_scheduler
+            .set_prefetch_acquire_wait_ms(timeout_ms);
     }
 
     // ── Emergency mode ─────────────────────────────────────────
@@ -627,7 +634,8 @@ impl MemoryEnvelope {
 
         // All subsystems to floor.
         self.block_cache.set_l1_max_bytes(self.floors.l1);
-        self.transit_budget.set_budget_bytes(self.floors.transit as usize);
+        self.transit_budget
+            .set_budget_bytes(self.floors.transit as usize);
         vfs.set_max_dirty_bytes(self.floors.dirty as usize);
         vfs.retarget_staged_upload(self.floors.staged as usize);
 
