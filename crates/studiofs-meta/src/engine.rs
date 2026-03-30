@@ -84,6 +84,23 @@ pub enum MetaError {
 
 pub type MetaResult<T> = Result<T, MetaError>;
 
+impl MetaError {
+    /// Returns `true` when the error indicates that the redb database file
+    /// requires repair (e.g. after an unclean shutdown) and the read-only
+    /// probe could not service the open.  Callers can retry with a writable
+    /// `Database::create()` which auto-recovers.
+    pub fn is_redb_repair_needed(&self) -> bool {
+        if let MetaError::Storage(msg) = self {
+            // redb 3.x: `DatabaseError::RepairAborted` stringifies as
+            // "Database repair aborted" which our read_format_info_readonly
+            // wraps in "failed to open redb read-only: …".
+            msg.contains("repair") || msg.contains("RepairAborted")
+        } else {
+            false
+        }
+    }
+}
+
 /// `setxattr` flag: create attribute, fail if key already exists.
 pub const XATTR_CREATE_FLAG: u32 = 1;
 /// `setxattr` flag: replace attribute, fail if key does not exist.
@@ -539,6 +556,11 @@ pub trait MetaReplication: Send + Sync {
 
     /// Return the estimated size of remote metadata in bytes, if applicable.
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
+
+    /// Prepare the engine for close: stop background threads and release
+    /// resources so that `Database::drop()` can run cleanly before process
+    /// exit.  Default is a no-op (standalone redb needs no preparation).
+    fn prepare_for_close(&self) {}
 }
 
 /// Public aggregate contract for consumers.

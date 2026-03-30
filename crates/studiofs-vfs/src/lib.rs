@@ -2,8 +2,8 @@
 //!
 //! Platform-agnostic virtual filesystem operations. Bridges metadata, data, and cache layers.
 
-pub mod aimd;
 pub mod access;
+pub mod aimd;
 pub mod fetch;
 pub mod incarnation;
 pub(crate) mod ingress_wal;
@@ -29,6 +29,6 @@ pub use utils::parse_size_bytes;
 pub use vfs::{
     CacheSafetyMode, KernelInvalidator, LockKind, NamespaceParent, NamespacePathStyle,
     NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsConfigRaw,
-    VfsConfigValidated, VfsError, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsForegroundReadProtectionStats, VfsReadFastPathStats, VfsResult, VfsUploadStats,
+    VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
+    VfsIngressPressure, VfsIngressStats, VfsReadFastPathStats, VfsResult, VfsUploadStats,
 };

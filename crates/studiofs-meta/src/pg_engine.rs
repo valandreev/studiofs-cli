@@ -10,7 +10,7 @@ use crate::types::*;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::RuntimeFlavor;
@@ -54,6 +54,11 @@ pub struct PgMetaEngine {
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
+    /// Signals the background poll thread to exit.
+    poll_shutdown: Arc<AtomicBool>,
+    /// Handle to the background poll thread, used by `prepare_for_close()`
+    /// to join the thread so `Database::drop()` runs before process exit.
+    poll_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +584,7 @@ impl PgMetaEngine {
             } else {
                 restored_flushed_event_seq
             };
+        let poll_shutdown = Arc::new(AtomicBool::new(false));
         let engine = Arc::new(Self {
             local,
             postgres_url: pg.url,
@@ -597,6 +603,8 @@ impl PgMetaEngine {
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             janitor_lock: Mutex::new(None),
+            poll_shutdown: poll_shutdown.clone(),
+            poll_handle: Mutex::new(None),
         });
 
         // Bootstrap from the last checkpoint if present, then catch up from
@@ -608,7 +616,12 @@ impl PgMetaEngine {
         let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
         if options.background_poll {
-            Self::start_background_poll(Arc::downgrade(&engine), engine.poll_interval);
+            let handle = Self::start_background_poll(
+                Arc::downgrade(&engine),
+                engine.poll_interval,
+                poll_shutdown,
+            );
+            *engine.poll_handle.lock().unwrap() = Some(handle);
         }
         Ok(engine)
     }
@@ -659,17 +672,38 @@ impl PgMetaEngine {
             .unwrap_or(0)
     }
 
-    fn start_background_poll(engine: std::sync::Weak<Self>, interval: Duration) {
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(interval);
-                let Some(engine) = engine.upgrade() else {
-                    break;
-                };
-                let _ = engine.flush_due_pending();
-                let _ = engine.sync_metadata();
-            }
-        });
+    fn start_background_poll(
+        engine: std::sync::Weak<Self>,
+        interval: Duration,
+        shutdown: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("pg-meta-poll".into())
+            .spawn(move || {
+                loop {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Sleep in short increments so we notice the shutdown flag
+                    // promptly instead of blocking for the full poll interval.
+                    let step = Duration::from_millis(250);
+                    let mut remaining = interval;
+                    while remaining > Duration::ZERO {
+                        let nap = remaining.min(step);
+                        std::thread::sleep(nap);
+                        remaining = remaining.saturating_sub(nap);
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                    }
+                    let Some(engine) = engine.upgrade() else {
+                        break;
+                    };
+                    let _ = engine.flush_due_pending();
+                    let _ = engine.sync_metadata();
+                }
+            })
+            .expect("spawn pg-meta-poll thread")
     }
 
     fn run_async<T, F>(&self, fut: F) -> MetaResult<T>
@@ -2220,6 +2254,20 @@ impl MetaReplication for PgMetaEngine {
         })?;
         Ok(Some(size))
     }
+
+    fn prepare_for_close(&self) {
+        // Signal the background poll thread to exit and wait for it.
+        // This ensures the thread's `Arc<PgMetaEngine>` (from Weak::upgrade)
+        // is dropped before the caller proceeds with process exit, so that
+        // `RedbMetaEngine` / `redb::Database` can run their Drop impls
+        // cleanly — preventing "Database repair aborted" on next mount.
+        self.poll_shutdown.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.poll_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
+    }
 }
 impl crate::engine::MetaEngine for PgMetaEngine {}
 
@@ -2451,6 +2499,8 @@ mod tests {
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             janitor_lock: Mutex::new(None),
+            poll_shutdown: Arc::new(AtomicBool::new(false)),
+            poll_handle: Mutex::new(None),
         };
 
         (dir, engine)

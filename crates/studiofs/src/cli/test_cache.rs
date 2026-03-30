@@ -1404,7 +1404,9 @@ async fn run_mounted_read_phase(
 }
 
 fn phase_telemetry_to_report(telemetry: &PhaseTelemetry, wall_elapsed: Duration) -> OpReport {
-    telemetry.overall.to_report(wall_elapsed.as_secs_f64() * 1000.0)
+    telemetry
+        .overall
+        .to_report(wall_elapsed.as_secs_f64() * 1000.0)
 }
 
 async fn run_l2_writes(
@@ -3640,8 +3642,14 @@ pub fn run(
                 work_root,
                 cache_path,
             } => {
-                run_mounted_end_to_end(&params, volume, mount_point, work_root, cache_path.as_deref())
-                    .await
+                run_mounted_end_to_end(
+                    &params,
+                    volume,
+                    mount_point,
+                    work_root,
+                    cache_path.as_deref(),
+                )
+                .await
             }
         }
     })?;

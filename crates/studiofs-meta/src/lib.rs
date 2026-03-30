@@ -97,6 +97,36 @@ pub fn open_meta_engine_with_options(
             let redb = RedbMetaEngine::open(path)?;
             Ok(Arc::new(redb))
         }
+        Err(ref err) if err.is_redb_repair_needed() => {
+            // ReadOnlyDatabase cannot repair an unclean shutdown.  Fall through
+            // to Database::create() which automatically recovers from crashes,
+            // power loss, and other unclean shutdowns (redb 3.x).
+            tracing::warn!(
+                "redb needs repair (read-only probe failed: {err}); \
+                 attempting writable open for auto-recovery"
+            );
+            // Open writable to trigger redb auto-repair, read format info,
+            // then drop before re-opening through the proper engine path.
+            let info = {
+                let redb = RedbMetaEngine::open(path)?;
+                let info = redb.get_format_info()?;
+                ensure_supported_format_version(&info)?;
+                info
+                // redb dropped here — releases file lock
+            };
+            if info.metadata.backend == MetadataBackend::Postgres {
+                let pg = PgMetaEngine::open_with_options(
+                    path,
+                    PgOpenOptions {
+                        background_poll: options.background_poll,
+                    },
+                )?;
+                Ok(pg)
+            } else {
+                let redb = RedbMetaEngine::open(path)?;
+                Ok(Arc::new(redb))
+            }
+        }
         Err(err) => Err(err),
     }
 }

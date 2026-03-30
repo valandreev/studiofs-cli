@@ -2907,17 +2907,39 @@ fn run_sync_with_timeout<T: Send + 'static>(
     operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
 ) -> VfsResult<Option<T>> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let result = operation();
         let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
-        Ok(result) => result.map(Some),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(VfsError::Other(
-            "timed operation thread disconnected".to_string(),
-        )),
+        Ok(result) => {
+            // Result received — thread has (almost certainly) finished; join to
+            // guarantee its captured `Arc`s are fully dropped before we return.
+            let _ = handle.join();
+            result.map(Some)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // The operation is still running.  We must NOT abandon the thread
+            // because it holds `Arc<dyn MetaEngine>` (and transitively
+            // `Arc<redb::Database>`).  If the process exits before that Arc
+            // drops, `Database::drop()` never runs and redb is left in an
+            // unclean state.  Wait with a generous secondary cap so the
+            // database is properly closed even when PG network I/O is slow.
+            warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                "run_sync_with_timeout: primary timeout reached, \
+                 waiting for thread to finish so redb closes cleanly"
+            );
+            let _ = handle.join();
+            Ok(None)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            Err(VfsError::Other(
+                "timed operation thread disconnected".to_string(),
+            ))
+        }
     }
 }
 
@@ -12509,6 +12531,10 @@ impl StudioVfs {
                 warn!("VFS shutdown: metadata flush failed: {}", e);
             }
         }
+        // Stop any background metadata threads (e.g. PgMetaEngine poll) so
+        // their Arc references are released before process exit, allowing
+        // redb::Database::drop() to run cleanly.
+        self.sync_meta().prepare_for_close();
         self.persist_cache().await;
         self.state
             .shutdown
@@ -12925,6 +12951,7 @@ mod tests {
     fn test_run_sync_with_timeout_returns_none_on_timeout() {
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = finished.clone();
+        let t0 = std::time::Instant::now();
         let result = run_sync_with_timeout(Duration::from_millis(10), move || {
             std::thread::sleep(Duration::from_millis(100));
             finished_clone.store(true, AtomicOrdering::Release);
@@ -12932,10 +12959,17 @@ mod tests {
         })
         .expect("timeout helper should not fail");
 
+        // The primary timeout should report None (timed out).
         assert_eq!(result, None);
+        // The thread is joined to ensure clean Arc release, so the operation
+        // finishes by the time we return.
         assert!(
-            !finished.load(AtomicOrdering::Acquire),
-            "timed-out helper should return before the slow operation finishes"
+            finished.load(AtomicOrdering::Acquire),
+            "thread should have been joined after timeout"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(100),
+            "run_sync_with_timeout should wait for thread join"
         );
     }
 
