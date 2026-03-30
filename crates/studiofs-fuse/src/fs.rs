@@ -691,9 +691,22 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let clamped_size = match self.vfs.getattr(ino) {
+            Ok(attr) => attr.size.saturating_sub(offset as u64).min(u64::from(size)) as u32,
+            Err(e) => {
+                error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
+                reply.error(vfs_err_to_errno(&e));
+                return;
+            }
+        };
+        if clamped_size == 0 {
+            reply.data(&[]);
+            return;
+        }
+
         let can_sync = match self
             .vfs
-            .can_read_fh_sync_cached(fh, ino, offset as u64, size)
+            .can_read_fh_sync_cached(fh, ino, offset as u64, clamped_size)
         {
             Ok(can_sync) => can_sync,
             Err(e) => {
@@ -704,7 +717,7 @@ impl Filesystem for StudioFuseFs {
         };
 
         if can_sync {
-            let mut out = vec![0u8; size as usize];
+            let mut out = vec![0u8; clamped_size as usize];
             match self
                 .vfs
                 .read_into_fh_sync_cached(fh, ino, offset as u64, &mut out)
@@ -722,7 +735,7 @@ impl Filesystem for StudioFuseFs {
             }
         }
 
-        let mut out = vec![0u8; size as usize];
+        let mut out = vec![0u8; clamped_size as usize];
         match self
             .rt
             .block_on(self.vfs.read_into_fh(fh, ino, offset as u64, &mut out))

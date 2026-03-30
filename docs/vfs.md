@@ -450,7 +450,6 @@ The buffered read path classifies active streams into:
 - `random_interactive_read`
 - `sequential_writer`
 - `random_writer`
-- `background_uploader`
 
 These classes stay in core VFS and drive:
 - readahead width and minimum prefetch depth

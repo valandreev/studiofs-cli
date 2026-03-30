@@ -9570,7 +9570,9 @@ fn sfs125_handle_aware_read_policy_keeps_sequential_and_random_streams_separate(
             .map(|idx| ((idx as u64).wrapping_mul(1_103_515_245) >> 24) as u8)
             .collect();
 
-        let attr = vfs.create(1, b"sfs125-handle-aware.bin", 0, 0, 0o644).unwrap();
+        let attr = vfs
+            .create(1, b"sfs125-handle-aware.bin", 0, 0, 0o644)
+            .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
@@ -9611,7 +9613,7 @@ fn sfs125_handle_aware_read_policy_keeps_sequential_and_random_streams_separate(
             Some("sequential_media_read")
         );
         assert!(stats.dominant_prefetch_enabled);
-        assert!(stats.dominant_cache_promotion_on_read);
+        assert!(!stats.dominant_cache_promotion_on_read);
         assert!(stats.dominant_readahead_max_width >= stats.dominant_readahead_base_width);
         assert_eq!(stats.active_sequential_media_reads, 1);
         assert_eq!(stats.active_random_interactive_reads, 1);

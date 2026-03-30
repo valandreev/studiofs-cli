@@ -431,17 +431,28 @@ impl ReadAheadTracker {
     /// can still be in flight. Dropping those stale tasks improves seek
     /// responsiveness for interactive video playback.
     pub fn is_prefetch_relevant(&self, ino: Ino, block: u32) -> bool {
-        self.is_prefetch_relevant_for_stream(ReadStreamKey { ino, stream_id: 0 }, block)
+        let mut found_stream = false;
+        for state in self.states.iter() {
+            if state.key().ino != ino {
+                continue;
+            }
+            found_stream = true;
+            if Self::state_considers_block_relevant(&state, self.width.max(1), block) {
+                return true;
+            }
+        }
+        !found_stream
     }
 
     pub fn is_prefetch_relevant_for_stream(&self, key: ReadStreamKey, block: u32) -> bool {
         let Some(state) = self.states.get(&key) else {
             return true;
         };
-        let head = state.last_block;
-        let tail_slack = self.width.max(1);
-        let min_valid = head.saturating_sub(tail_slack);
-        block >= min_valid
+        Self::state_considers_block_relevant(&state, self.width.max(1), block)
+    }
+
+    pub fn evict_stream(&self, key: ReadStreamKey) {
+        self.states.remove(&key);
     }
 
     /// Remove all state for an inode (e.g. on file close or delete).
@@ -451,11 +462,22 @@ impl ReadAheadTracker {
             .retain(|(candidate_ino, _), _| *candidate_ino != ino);
     }
 
+    fn state_considers_block_relevant(state: &ReadState, tail_slack: u32, block: u32) -> bool {
+        let head = state.last_block;
+        let min_valid = head.saturating_sub(tail_slack);
+        block >= min_valid
+    }
+
     #[cfg(test)]
     fn debug_width(&self, ino: Ino) -> Option<u32> {
         self.states
             .get(&ReadStreamKey { ino, stream_id: 0 })
             .map(|s| s.current_width)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_has_stream(&self, key: ReadStreamKey) -> bool {
+        self.states.contains_key(&key)
     }
 
     #[cfg(test)]
@@ -642,6 +664,51 @@ mod tests {
             tracker.start_prefetch(1, 5),
             "after finish, should return true again"
         );
+    }
+
+    #[test]
+    fn test_inode_relevance_accepts_any_live_stream() {
+        let tracker = ReadAheadTracker::new(8);
+        let policy = tracker.default_policy();
+        let stale = ReadStreamKey {
+            ino: 99,
+            stream_id: 1,
+        };
+        let live = ReadStreamKey {
+            ino: 99,
+            stream_id: 2,
+        };
+
+        let _ = tracker.record_read_for_stream(stale, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(stale, 1, 1, policy);
+        let _ = tracker.record_read_for_stream(live, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(live, 1, 1, policy);
+        let _ = tracker.record_read_for_stream(stale, 1024, 1024, policy);
+
+        assert!(!tracker.is_prefetch_relevant_for_stream(stale, 2));
+        assert!(tracker.is_prefetch_relevant_for_stream(live, 2));
+        assert!(tracker.is_prefetch_relevant(99, 2));
+    }
+
+    #[test]
+    fn test_evict_stream_removes_only_target_stream() {
+        let tracker = ReadAheadTracker::new(8);
+        let policy = tracker.default_policy();
+        let keep = ReadStreamKey {
+            ino: 77,
+            stream_id: 1,
+        };
+        let drop_key = ReadStreamKey {
+            ino: 77,
+            stream_id: 2,
+        };
+
+        let _ = tracker.record_read_for_stream(keep, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(drop_key, 0, 0, policy);
+        tracker.evict_stream(drop_key);
+
+        assert!(tracker.debug_has_stream(keep));
+        assert!(!tracker.debug_has_stream(drop_key));
     }
 
     #[test]

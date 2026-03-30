@@ -3549,7 +3549,6 @@ enum PrefetchWorkItem {
     },
     Block {
         ino: Ino,
-        stream_id: u64,
         block_idx: u32,
     },
 }
@@ -4839,18 +4838,21 @@ impl StudioVfs {
                 self.track_background_task(tokio::spawn(async move {
                     let worker = async {
                         let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
-                        let mut pending_queue: VecDeque<(Ino, u64, u32)> = VecDeque::new();
-                        let mut pending_set: HashSet<(Ino, u64, u32)> = HashSet::new();
+                        let mut pending_queue: VecDeque<(Ino, u32)> = VecDeque::new();
+                        let mut pending_set: HashSet<(Ino, u32)> = HashSet::new();
                         let mut inflight = JoinSet::new();
                         loop {
                             // Launch as many queued prefetches as permits allow without
                             // blocking the worker event loop.
-                            while let Some((ino, stream_id, block_idx)) =
-                                pending_queue.front().copied()
-                            {
+                            while let Some((ino, block_idx)) = pending_queue.front().copied() {
                                 if vfs_for_prefetch.shutdown_requested() {
                                     pending_queue.clear();
                                     pending_set.clear();
+                                    vfs_for_prefetch
+                                        .state
+                                        .metrics
+                                        .prefetch_queue_depth
+                                        .store(0, Ordering::Relaxed);
                                     break;
                                 }
                                 let permit = match prefetch_sem.clone().try_acquire_owned() {
@@ -4858,20 +4860,31 @@ impl StudioVfs {
                                     Err(_) => break,
                                 };
                                 let _ = pending_queue.pop_front();
-                                pending_set.remove(&(ino, stream_id, block_idx));
+                                pending_set.remove(&(ino, block_idx));
+                                vfs_for_prefetch
+                                    .state
+                                    .metrics
+                                    .prefetch_queue_depth
+                                    .store(pending_queue.len() as u64, Ordering::Relaxed);
                                 if !vfs_for_prefetch.readahead.start_prefetch(ino, block_idx) {
                                     continue;
                                 }
                                 let v = vfs_for_prefetch.clone();
                                 inflight.spawn(async move {
                                     let _permit = permit;
-                                    let _ =
-                                        v.read_block_for_prefetch(ino, stream_id, block_idx).await;
+                                    let _ = v.read_block_for_prefetch(ino, block_idx).await;
                                 });
                             }
 
                             tokio::select! {
                                 _ = vfs_for_prefetch.state.shutdown.shutdown_notify.notified() => {
+                                    pending_queue.clear();
+                                    pending_set.clear();
+                                    vfs_for_prefetch
+                                        .state
+                                        .metrics
+                                        .prefetch_queue_depth
+                                        .store(0, Ordering::Relaxed);
                                     inflight.abort_all();
                                     while inflight.join_next().await.is_some() {}
                                     break;
@@ -4880,7 +4893,7 @@ impl StudioVfs {
                                     if vfs_for_prefetch.shutdown_requested() {
                                         continue;
                                     }
-                                    let planned: Vec<(Ino, u64, u32)> = match work_item {
+                                    let planned: Vec<(Ino, u32)> = match work_item {
                                         PrefetchWorkItem::ReadHint {
                                             ino,
                                             stream_id,
@@ -4896,13 +4909,12 @@ impl StudioVfs {
                                         ),
                                         PrefetchWorkItem::Block {
                                             ino,
-                                            stream_id,
                                             block_idx,
-                                        } => vec![(ino, stream_id, block_idx)]
+                                        } => vec![(ino, block_idx)]
                                     };
-                                    for (ino, stream_id, block_idx) in planned {
-                                        if pending_set.insert((ino, stream_id, block_idx)) {
-                                            pending_queue.push_back((ino, stream_id, block_idx));
+                                    for (ino, block_idx) in planned {
+                                        if pending_set.insert((ino, block_idx)) {
+                                            pending_queue.push_back((ino, block_idx));
                                         }
                                     }
                                     vfs_for_prefetch.state.metrics.prefetch_queue_depth
@@ -6816,6 +6828,16 @@ impl StudioVfs {
         self.state.read.write_access_fallback.lock().remove(&ino);
     }
 
+    fn clear_access_tracking_for_stream(&self, ino: Ino, stream_id: u64) {
+        self.state
+            .read
+            .prefetch_last_hint
+            .lock()
+            .remove(&(ino, stream_id));
+        self.readahead
+            .evict_stream(ReadStreamKey { ino, stream_id });
+    }
+
     pub(crate) fn note_file_session_background_transition(
         &self,
         ino: Ino,
@@ -8667,11 +8689,9 @@ impl StudioVfs {
             && attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
         {
-            let _ = self.prefetch_tx.send(PrefetchWorkItem::Block {
-                ino,
-                stream_id: open_file.stream_id(),
-                block_idx: 0,
-            });
+            let _ = self
+                .prefetch_tx
+                .send(PrefetchWorkItem::Block { ino, block_idx: 0 });
         }
 
         Ok(fh)
@@ -8687,9 +8707,11 @@ impl StudioVfs {
             return Ok(());
         };
         let ino = open_file.ino;
+        let stream_id = open_file.stream_id();
         self.decrement_active_access_class(open_file.current_access_class());
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
         self.note_file_session_close_handle(ino, remaining);
+        self.clear_access_tracking_for_stream(ino, stream_id);
         if remaining > 0 {
             self.maybe_gc_file_session(ino);
             return Ok(());
@@ -10068,7 +10090,7 @@ impl StudioVfs {
         first_block: u32,
         last_block: u32,
         policy: AccessPolicy,
-    ) -> Vec<(Ino, u64, u32)> {
+    ) -> Vec<(Ino, u32)> {
         if self.shutdown_requested() || !policy.prefetch_enabled || self.readahead.width == 0 {
             return Vec::new();
         }
@@ -10100,8 +10122,6 @@ impl StudioVfs {
         );
         // Keep directory-level access state in sync regardless of budget.
         let siblings = self.dir_prefetch.on_child_read(ino);
-
-        // After transient transport failures, pause best-effort prefetch briefly
         // so foreground demand reads can recover the pipeline first.
         if self
             .fetch_scheduler
@@ -10122,7 +10142,7 @@ impl StudioVfs {
             return Vec::new();
         }
 
-        let mut planned: Vec<(Ino, u64, u32)> = Vec::new();
+        let mut planned: Vec<(Ino, u32)> = Vec::new();
         for block_idx in to_prefetch {
             if budget == 0 {
                 break;
@@ -10132,7 +10152,7 @@ impl StudioVfs {
             {
                 continue;
             }
-            planned.push((ino, stream_id, block_idx));
+            planned.push((ino, block_idx));
             budget = budget.saturating_sub(1);
         }
 
@@ -10142,7 +10162,7 @@ impl StudioVfs {
             if budget == 0 {
                 break;
             }
-            planned.push((sibling_ino, 0, 0));
+            planned.push((sibling_ino, 0));
             budget = budget.saturating_sub(1);
         }
         planned
@@ -10350,15 +10370,12 @@ impl StudioVfs {
     ///
     /// Like `read_block()` but silently ignores errors and always marks the
     /// readahead inflight state as done when finished.
-    async fn read_block_for_prefetch(&self, ino: Ino, stream_id: u64, block_index: u32) {
+    async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
         if self.shutdown_requested() {
             self.readahead.finish_prefetch(ino, block_index);
             return;
         }
-        if !self
-            .readahead
-            .is_prefetch_relevant_for_stream(ReadStreamKey { ino, stream_id }, block_index)
-        {
+        if !self.readahead.is_prefetch_relevant(ino, block_index) {
             self.readahead.finish_prefetch(ino, block_index);
             return;
         }
@@ -12767,6 +12784,51 @@ mod tests {
             .map(|sample| (sample.timestamp_ms, sample.latency_ns, sample.bytes_read))
             .collect();
         assert_eq!(kept, vec![(350, 30, 4_096)]);
+    }
+
+    #[test]
+    fn release_fh_clears_per_stream_read_tracking() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-clears-stream-state");
+        let _guard = rt.enter();
+
+        rt.block_on(async {
+            let attr = vfs.create(1, b"stream-state.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+            let stream_id = vfs.get_open_file(fh).unwrap().stream_id();
+            let key = ReadStreamKey { ino, stream_id };
+            let policy =
+                AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier)
+                    .readahead_policy();
+
+            let _ = vfs.readahead.record_read_for_stream(key, 0, 0, policy);
+            vfs.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .insert((ino, stream_id), (0, 1));
+
+            assert!(vfs.readahead.debug_has_stream(key));
+            assert!(
+                vfs.state
+                    .read
+                    .prefetch_last_hint
+                    .lock()
+                    .contains_key(&(ino, stream_id))
+            );
+
+            vfs.release_fh(fh).await.unwrap();
+
+            assert!(!vfs.readahead.debug_has_stream(key));
+            assert!(
+                !vfs.state
+                    .read
+                    .prefetch_last_hint
+                    .lock()
+                    .contains_key(&(ino, stream_id))
+            );
+        });
     }
 
     #[test]

@@ -21,11 +21,10 @@ pub(crate) enum AccessClass {
     RandomInteractiveRead,
     SequentialWriter,
     RandomWriter,
-    BackgroundUploader,
 }
 
 impl AccessClass {
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 4;
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -33,7 +32,6 @@ impl AccessClass {
             Self::RandomInteractiveRead => "random_interactive_read",
             Self::SequentialWriter => "sequential_writer",
             Self::RandomWriter => "random_writer",
-            Self::BackgroundUploader => "background_uploader",
         }
     }
 
@@ -43,7 +41,6 @@ impl AccessClass {
             Self::RandomInteractiveRead => 1,
             Self::SequentialWriter => 2,
             Self::RandomWriter => 3,
-            Self::BackgroundUploader => 4,
         }
     }
 
@@ -53,7 +50,6 @@ impl AccessClass {
             1 => Some(Self::RandomInteractiveRead),
             2 => Some(Self::SequentialWriter),
             3 => Some(Self::RandomWriter),
-            4 => Some(Self::BackgroundUploader),
             _ => None,
         }
     }
@@ -89,7 +85,7 @@ impl Default for AccessPolicy {
         Self {
             class: AccessClass::RandomInteractiveRead,
             prefetch_enabled: false,
-            cache_promotion_on_read: false,
+            cache_promotion_on_read: true,
             readahead_base_width: 1,
             readahead_max_width: 1,
             readahead_min_prefetch: 1,
@@ -107,7 +103,7 @@ impl AccessPolicy {
             AccessClass::SequentialMediaRead => Self {
                 class,
                 prefetch_enabled: true,
-                cache_promotion_on_read: true,
+                cache_promotion_on_read: false,
                 readahead_base_width: base_width,
                 readahead_max_width: max_width,
                 readahead_min_prefetch: min_prefetch,
@@ -116,7 +112,7 @@ impl AccessPolicy {
             AccessClass::RandomInteractiveRead => Self {
                 class,
                 prefetch_enabled: false,
-                cache_promotion_on_read: false,
+                cache_promotion_on_read: true,
                 readahead_base_width: 1,
                 readahead_max_width: base_width.clamp(1, 4),
                 readahead_min_prefetch: 1,
@@ -139,15 +135,6 @@ impl AccessPolicy {
                 readahead_max_width: 1,
                 readahead_min_prefetch: 1,
                 upload_pressure_boost: 1,
-            },
-            AccessClass::BackgroundUploader => Self {
-                class,
-                prefetch_enabled: false,
-                cache_promotion_on_read: false,
-                readahead_base_width: 1,
-                readahead_max_width: 1,
-                readahead_min_prefetch: 1,
-                upload_pressure_boost: 0,
             },
         }
     }
@@ -393,7 +380,7 @@ mod tests {
         assert_eq!(second.class, AccessClass::RandomInteractiveRead);
         assert_eq!(third.class, AccessClass::SequentialMediaRead);
         assert!(third.policy.prefetch_enabled);
-        assert!(third.policy.cache_promotion_on_read);
+        assert!(!third.policy.cache_promotion_on_read);
     }
 
     #[test]
@@ -405,7 +392,7 @@ mod tests {
         let random = state.observe_read(64 * 1024, 1024, cfg);
         assert_eq!(random.class, AccessClass::RandomInteractiveRead);
         assert!(!random.policy.prefetch_enabled);
-        assert!(!random.policy.cache_promotion_on_read);
+        assert!(random.policy.cache_promotion_on_read);
     }
 
     #[test]
