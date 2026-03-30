@@ -10122,6 +10122,7 @@ impl StudioVfs {
         );
         // Keep directory-level access state in sync regardless of budget.
         let siblings = self.dir_prefetch.on_child_read(ino);
+        // After transient transport failures, pause best-effort prefetch briefly
         // so foreground demand reads can recover the pipeline first.
         if self
             .fetch_scheduler
