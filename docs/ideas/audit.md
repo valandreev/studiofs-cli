@@ -216,8 +216,8 @@ unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
 
 Приоритет 1 (тривиально, высокий импакт):
   2. Добавить cargo audit в CI - done
-  3. Добавить #![forbid(unsafe_code)] в крейты без unsafe
-  4. Сузить фичи tokio
+  3. Добавить #![forbid(unsafe_code)] в крейты без unsafe - done
+  4. Сузить фичи tokio - done
 
 Приоритет 2 (средняя сложность):
   5. Заменить .lock().unwrap() на обработку poisoning (11 мест)
