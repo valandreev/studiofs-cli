@@ -48,3 +48,8 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-Dwarnings"
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

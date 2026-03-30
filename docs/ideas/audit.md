@@ -215,7 +215,6 @@ unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
 ## ПРИОРИТЕТЫ ИСПРАВЛЕНИЙ
 
 Приоритет 1 (тривиально, высокий импакт):
-  1. Закоммитить Cargo.lock (убрать из .gitignore)
   2. Добавить cargo audit в CI
   3. Добавить #![forbid(unsafe_code)] в крейты без unsafe
   4. Сузить фичи tokio
