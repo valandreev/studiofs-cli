@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! StudioFS Data Layer
 //!
 //! Handles reading/writing data blocks to S3-compatible storage via OpenDAL.

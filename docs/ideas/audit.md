@@ -215,7 +215,7 @@ unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
 ## ПРИОРИТЕТЫ ИСПРАВЛЕНИЙ
 
 Приоритет 1 (тривиально, высокий импакт):
-  2. Добавить cargo audit в CI
+  2. Добавить cargo audit в CI - done
   3. Добавить #![forbid(unsafe_code)] в крейты без unsafe
   4. Сузить фичи tokio
 
