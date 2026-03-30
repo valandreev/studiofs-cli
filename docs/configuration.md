@@ -463,7 +463,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
 | `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
-| `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `80% of memory limit` | Global transit-memory credit budget for active in-flight fetch/upload buffers (managed by adaptive envelope) |
+| `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from initial L1 cache budget; dynamically resized by MemoryEnvelope` | Global transit-memory credit budget for active in-flight fetch/upload buffers (managed by adaptive envelope) |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `35` | Foreground-read P90 latency target for upload throttling |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `1500` | Foreground-read speedometer window |
