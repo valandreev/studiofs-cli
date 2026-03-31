@@ -341,6 +341,7 @@ impl Materializer {
         results: Vec<BatchFlushResult>,
         manifests: Vec<PendingManifestSummary>,
     ) -> usize {
+        let mut legacy_l2_fallback_work: Vec<(u64, Bytes)> = Vec::new();
         let mut upload_ops: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(extents.len());
         let mut freed_bytes = 0usize;
         let mut drained_mem_blocks = 0u64;
@@ -361,8 +362,9 @@ impl Materializer {
                     block_index = extent.block_index,
                     object_id = extent.object_id,
                     error = %error,
-                    "materializer: BlockStore put failed; keeping legacy cache fallback for local reads"
+                    "materializer: BlockStore put failed; queueing legacy L2 fallback for uploader/read recovery"
                 );
+                legacy_l2_fallback_work.push((extent.object_id, data.clone()));
             } else {
                 vfs.block_store.mark_uploading(extent.object_id);
             }
@@ -473,6 +475,18 @@ impl Materializer {
             .metrics
             .drained_spill_bytes
             .fetch_add(drained_spill_bytes, Ordering::Relaxed);
+
+        if !legacy_l2_fallback_work.is_empty()
+            && let Err(error) = vfs
+                .block_cache
+                .commit_l2_batch(legacy_l2_fallback_work)
+                .await
+        {
+            warn!(
+                error = %error,
+                "materializer: failed to persist legacy L2 fallback blocks after BlockStore write errors"
+            );
+        }
 
         vfs.state.dirty_buffer.dirty_drained_notify.notify_waiters();
 

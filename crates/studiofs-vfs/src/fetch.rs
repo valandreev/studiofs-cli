@@ -162,7 +162,7 @@ impl FetchScheduler {
     ///
     /// # Arguments
     /// - `data_store`: read-optimised `DataStore` (no `ConcurrentLimitLayer` — AIMD manages concurrency).
-    /// - `cache`: shared block cache.
+    /// - `block_store`: shared BlockStore used by the committed read path.
     /// - `aimd_config`: AIMD parameters (use [`AimdConfig::fetch_default()`] for sane defaults).
     pub fn new(
         data_store: Arc<DataStore>,

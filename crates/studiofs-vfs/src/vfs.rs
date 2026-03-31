@@ -7108,6 +7108,15 @@ impl StudioVfs {
         .await
     }
 
+    async fn block_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || {
+            block_store.remove_batch(&object_ids);
+            Ok(())
+        })
+        .await
+    }
+
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
             pending_uploads: self.block_cache.pending_upload_count(),
@@ -9777,7 +9786,14 @@ impl StudioVfs {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
-            self.block_store.remove_batch(&evicted);
+            if let Err(error) = self.block_store_remove_batch_async(evicted.clone()).await {
+                warn!(
+                    ino,
+                    error = %error,
+                    evicted_blocks = evicted.len(),
+                    "evict_inode: BlockStore batch removal failed"
+                );
+            }
         }
         if !evicted.is_empty() || !deferred_pinned.is_empty() {
             debug!(
@@ -9821,7 +9837,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
-            self.block_store.remove_batch(&evicted);
+            self.block_store_remove_batch_async(evicted.clone()).await?;
         }
         if !evicted.is_empty() || deferred_pinned > 0 {
             info!(
@@ -11302,7 +11318,14 @@ impl StudioVfs {
                 Some(payload)
             } else {
                 let read_started = Instant::now();
-                let read_result = self.block_store_get_async(op.object_id).await?;
+                let read_result = match self.block_store_get_async(op.object_id).await? {
+                    Some(payload) => Some(payload),
+                    None => {
+                        self.block_cache
+                            .get_with_priority(op.object_id, L2IoPriority::Background)
+                            .await
+                    }
+                };
                 let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
                 drop(upload_io_permit);
                 self.state
