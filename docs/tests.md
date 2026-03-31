@@ -1,5 +1,16 @@
 # Tests Guide
 
+## Verification Matrix
+
+StudioFS runs four CI jobs on every push and PR. All four are intended as
+required gates (enforced via GitHub Branch Protection Rules).
+
+The authoritative matrix — what each job checks, what is not covered
+automatically, and the compile/unit/smoke distinctions — lives in
+[docs/contributing.md](contributing.md#verification-matrix).
+
+---
+
 ## Test Layers
 
 1. Fast local/unit tests (default).

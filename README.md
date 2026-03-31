@@ -165,9 +165,11 @@ cargo test --workspace --all-targets -- --nocapture
 ```
 
 CI runs four jobs on every push and PR — see
-[`.github/workflows/rust.yml`](.github/workflows/rust.yml) and
-[`docs/development.md`](docs/development.md) for the full matrix (Quality
-Gates, Linux, macOS, Windows). Each platform job includes an explicit named
+[`.github/workflows/rust.yml`](.github/workflows/rust.yml),
+[`docs/development.md`](docs/development.md), and
+[`docs/contributing.md`](docs/contributing.md) for the full verification
+matrix (Quality Gates, Linux, macOS, Windows) and the contributor rules for
+platform-specific changes. Each platform job includes an explicit named
 step for its backend crate (`studiofs-fuse` on Linux/macOS,
 `studiofs-winfsp` on Windows) so regressions in platform-specific code are
 immediately attributable in the CI log.
@@ -214,6 +216,7 @@ Project docs live in [docs/](docs/):
 - [docs/architecture.md](docs/architecture.md) - current system design and data flow
 - [docs/configuration.md](docs/configuration.md) - CLI commands, flags, env vars
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow
+- [docs/contributing.md](docs/contributing.md) - verification matrix, CI ownership, platform-specific code rules
 - [docs/tests.md](docs/tests.md) - test matrix and infra expectations
 - [docs/metadata.md](docs/metadata.md) - local `redb` + PostgreSQL metadata model
 - [docs/cache.md](docs/cache.md) - cache, upload queue, and writeback behavior

@@ -22,6 +22,12 @@ env:
 #
 # Platform verification jobs depend on quality so a fmt / clippy / audit
 # failure short-circuits before consuming macOS / Windows runner minutes.
+#
+# All four jobs are intended as required PR gates. This must be enforced via
+# GitHub Branch Protection Rules (Settings → Branches → require status checks);
+# it is not a property of this YAML file. See docs/contributing.md for the
+# full verification matrix, CI ownership rules, and contributor guidance for
+# platform-specific code changes.
 
 jobs:
   # ─── Quality / Portable Checks ────────────────────────────────────
