@@ -58,6 +58,7 @@ fn make_test_vfs(
 }
 
 fn signal_named_event(name: &str) {
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
     use windows::core::HSTRING;
 
@@ -65,6 +66,7 @@ fn signal_named_event(name: &str) {
     let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &wide) };
     let Ok(event) = event else { return };
     let _ = unsafe { SetEvent(event) };
+    let _ = unsafe { CloseHandle(event) };
 }
 
 #[test]
