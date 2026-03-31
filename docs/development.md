@@ -62,9 +62,15 @@ The GitHub Actions workflow (`.github/workflows/rust.yml`) runs four jobs:
 | Job | Runner | Purpose |
 |-----|--------|---------|
 | **Quality Gates** | `ubuntu-latest` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
-| **Linux** | `ubuntu-latest` | Workspace tests, SFS-121 targeted VFS fast suite |
-| **macOS** | `macos-latest` | Clippy + tests — validates `cfg(target_os = "macos")` paths in `studiofs-fuse` |
-| **Windows** | `windows-latest` | Clippy + tests — validates `cfg(windows)` paths in `studiofs-winfsp` |
+| **Linux** | `ubuntu-latest` | Workspace tests, SFS-121 targeted VFS fast suite, explicit `studiofs-fuse` Linux unit step |
+| **macOS** | `macos-latest` | Clippy + tests — explicit `studiofs-fuse` macOS unit step (exercises `cfg(target_os="macos")` branches) |
+| **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
+
+Each platform job includes a named step for the backend-specific crate so
+regressions in `studiofs-fuse` (Linux or macOS paths) or `studiofs-winfsp`
+are immediately attributable in the CI job log rather than buried inside the
+broad workspace run. Failures that originate from platform-specific code
+should call out the backend step name directly.
 
 Platform jobs depend on Quality Gates to avoid wasting macOS/Windows runner
 minutes when portable checks fail.

@@ -230,7 +230,7 @@ mod tests {
         ));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn build_mount_options_foreground_not_added_on_linux() {
         // On Linux, fusermount3 does not accept 'foreground' as a mount option.

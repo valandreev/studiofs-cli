@@ -40,6 +40,66 @@ S3-compatible side unless a test explicitly checks another provider.
 | FUSE bridge unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
+## Platform-Gated Unit Tests
+
+`studiofs-fuse` and `studiofs-winfsp` contain unit tests that are only
+meaningful on the OS they target. These tests must be run on the correct
+host — cross-compilation or a Linux-only CI pass does not count.
+
+### Rules for writing platform-gated unit tests
+
+1. **Use the narrowest `cfg` guard that reflects the real constraint.**
+   - Tests that validate Linux-specific behavior (e.g., `fusermount3` semantics): `#[cfg(target_os = "linux")]`
+     Prefer this over `#[cfg(not(target_os = "macos"))]` — the latter would also fire on
+     FreeBSD and other Unix variants where `fusermount3` is not present and the
+     behavior would be undefined.
+   - Tests that validate macOS-specific mount options (`volname`, `local`,
+     `foreground`): `#[cfg(target_os = "macos")]`
+   - Tests that validate WinFSP behavior (drive letters, timeout parsing):
+     no extra `cfg` needed — the crate root already has `#![cfg(windows)]`
+
+2. **Do not use `#[ignore]` to skip platform unit tests.**
+   Platform-gated tests that would be useless on other OSes must use `cfg`
+   guards, not `#[ignore]`. CI command details per platform:
+   - Linux: `cargo test -p studiofs-fuse --lib` (unit tests only).
+   - macOS: `cargo test -p studiofs-fuse --lib --tests` (unit tests +
+     integration tests). The `--tests` flag is required so that
+     non-mount platform tests placed in `tests/` (e.g.
+     `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
+   - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
+   Only the relevant runner runs each step; the other platforms skip it entirely
+     `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
+   - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
+   Only the relevant runner runs each step; the other platforms skip it entirely
+   via `cfg` guards in the test code.
+
+3. **Non-mount platform tests may live in `tests/` or `src/`; mount-requiring
+   tests belong in ignored integration tests.**
+   Non-mount platform tests that are too heavy or too coupled to other crates
+   for a `src/` unit-test module are allowed in `tests/` — CI picks them up via
+   `--tests`. Tests that require `FUSE` or `WinFSP` kernel interaction must be
+   placed in dedicated smoke-test files (e.g. `mount_sanity.rs`) and marked
+   `#[ignore]` to keep them out of the standard `cargo test -p <crate>` run.
+
+4. **Environment-variable mutation in tests (WinFSP only).**
+   Tests inside `studiofs-winfsp` that call `std::env::set_var`/`remove_var`
+   must hold `ENV_LOCK` (defined in the `tests` module) for the duration of the
+   env mutation. In CI the crate is run with `--test-threads=1`, which
+   serialises the entire binary and makes isolation explicit. If you need to
+   add new env-mutating tests, ensure they acquire `ENV_LOCK` and consider
+   whether `temp_env` or `serial_test` would be cleaner than a manual mutex.
+
+### CI coverage per platform
+
+| Crate | CI step | Runner |
+|-------|---------|--------|
+| `studiofs-fuse` (Linux paths) | `cargo test (studiofs-fuse — Linux paths)` | `ubuntu-latest` |
+| `studiofs-fuse` (macOS paths) | `cargo test (studiofs-fuse — macOS paths)` | `macos-latest` |
+| `studiofs-winfsp` | `cargo test (studiofs-winfsp)` | `windows-latest` |
+
+Each step is separate from the workspace run so a failure directly identifies
+the failing backend in the CI job log.
+
 ## Important Current Regressions
 
 The current architecture relies on these focused regressions:
