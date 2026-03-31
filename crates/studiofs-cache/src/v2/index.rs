@@ -265,7 +265,10 @@ impl BlockIndex {
             .collect()
     }
 
-    /// Update the flags for `object_id` and adjust `dirty_count` accordingly.
+    /// Replace the flags for `object_id` wholesale and adjust `dirty_count`.
+    ///
+    /// Prefer [`modify_flags`] for callers that only know *which bits to
+    /// change*, not the full desired flag set.
     ///
     /// Returns `false` if the entry does not exist.
     pub fn update_flags(&mut self, object_id: u64, new_flags: BlockFlags) -> bool {
@@ -278,6 +281,35 @@ impl BlockIndex {
                 _ => {}
             }
             entry.flags = new_flags;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Atomically apply `(current & !clear) | set` to the flags for
+    /// `object_id`, adjusting `dirty_count` for any DIRTY transitions.
+    ///
+    /// Unlike [`update_flags`] the caller does not need to read the current
+    /// flags first: the operation is a single locked read-modify-write, so
+    /// concurrent flag mutations by other threads (e.g. a concurrent
+    /// `mark_uploading` call) cannot be silently clobbered.
+    ///
+    /// Returns `false` if the entry does not exist.
+    pub fn modify_flags(&mut self, object_id: u64, clear: BlockFlags, set: BlockFlags) -> bool {
+        if let Some(entry) = self.entries.get_mut(&object_id) {
+            let old_flags = entry.flags;
+            let new_flags = (old_flags & !clear) | set;
+            if old_flags != new_flags {
+                let old_dirty = old_flags.contains(BlockFlags::DIRTY);
+                let new_dirty = new_flags.contains(BlockFlags::DIRTY);
+                match (old_dirty, new_dirty) {
+                    (false, true) => self.dirty_count += 1,
+                    (true, false) => self.dirty_count = self.dirty_count.saturating_sub(1),
+                    _ => {}
+                }
+                entry.flags = new_flags;
+            }
             true
         } else {
             false

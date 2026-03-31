@@ -198,7 +198,11 @@ impl LruList {
     /// evictable node exists.
     ///
     /// Time complexity: O(k) where k is the number of non-evictable nodes
-    /// before the first evictable one.
+    /// before the first evictable one.  In typical operation k is small because
+    /// dirty blocks are a minority.  If future workloads create long runs of
+    /// non-evictable blocks at the LRU head (e.g., all blocks dirty or
+    /// uploading at once), consider maintaining a separate singly-linked
+    /// "clean list" that only contains evictable nodes, reducing this to O(1).
     ///
     /// # Safety
     ///

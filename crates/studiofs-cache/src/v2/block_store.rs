@@ -236,9 +236,7 @@ impl BlockStore {
 
         // Phase 2: pread outside the lock (concurrent-safe, no seek).
         let mut buf = vec![0u8; data_size as usize];
-        if let Err(e) =
-            platform::pread(&self.file, &mut buf, offset + BLOCK_HEADER_SIZE as u64)
-        {
+        if let Err(e) = platform::pread(&self.file, &mut buf, offset + BLOCK_HEADER_SIZE as u64) {
             warn!(object_id, offset, %e, "block pread failed");
             self.miss_count.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -345,26 +343,50 @@ impl BlockStore {
     /// to the on-disk block header so the crash-recovery scanner (SFS-137)
     /// sees the correct state.  On pwrite failure the block retains its current
     /// flags and a warning is logged.
+    ///
+    /// # Concurrency
+    ///
+    /// The entry metadata is read under the lock (to build the disk header),
+    /// then the lock is released while `pwrite` runs.  After `pwrite` the
+    /// flags are cleared with a single atomic [`BlockIndex::modify_flags`] call
+    /// rather than a read-then-write, so a concurrent `mark_uploading` that
+    /// sets `UPLOADING` between the two lock acquisitions will not be silently
+    /// clobbered.
     pub fn mark_evictable(&self, object_id: u64) {
-        // Read entry metadata outside the lock to avoid I/O while holding it.
-        let (offset, data_size, checksum, current_flags) = {
+        // Read entry metadata under the lock.  We need offset/size/checksum
+        // to build the disk header, and the current PINNED bit (PINNED is
+        // not modified by any public API, so it is stable across the lock gap).
+        let (offset, data_size, checksum, pinned) = {
             let idx = self.index.lock();
             match idx.get(object_id) {
-                Some(e) if e.flags.intersects(BlockFlags::DIRTY | BlockFlags::UPLOADING) => {
-                    (e.offset, e.data_size, e.checksum, e.flags)
+                Some(e)
+                    if e.flags
+                        .intersects(BlockFlags::DIRTY | BlockFlags::UPLOADING) =>
+                {
+                    (
+                        e.offset,
+                        e.data_size,
+                        e.checksum,
+                        e.flags.contains(BlockFlags::PINNED),
+                    )
                 }
                 _ => return, // already evictable or not present
             }
         };
 
-        let new_flags = current_flags & !(BlockFlags::DIRTY | BlockFlags::UPLOADING);
-        // Only DIRTY and PINNED go on disk; UPLOADING is transient.
-        let disk_flags = new_flags.bits() & (format::FLAG_DIRTY | format::FLAG_PINNED);
+        // Write the on-disk header with DIRTY cleared; preserve PINNED.
+        let disk_flags = if pinned { format::FLAG_PINNED } else { 0 };
         let header = BlockHeader::new(object_id, data_size, checksum, disk_flags);
 
         match platform::pwrite(&self.file, &header.to_bytes(), offset) {
             Ok(()) => {
-                self.index.lock().update_flags(object_id, new_flags);
+                // Atomic read-modify-write: clear DIRTY and UPLOADING without
+                // touching any other flags a concurrent thread may have set.
+                self.index.lock().modify_flags(
+                    object_id,
+                    BlockFlags::DIRTY | BlockFlags::UPLOADING,
+                    BlockFlags::empty(),
+                );
             }
             Err(e) => {
                 warn!(
@@ -383,11 +405,9 @@ impl BlockStore {
     /// while the transfer is in flight.  No-op if the block does not exist.
     /// The `UPLOADING` flag is transient and never persisted to disk.
     pub fn mark_uploading(&self, object_id: u64) {
-        let mut idx = self.index.lock();
-        if let Some(entry) = idx.get(object_id) {
-            let new_flags = entry.flags | BlockFlags::UPLOADING;
-            idx.update_flags(object_id, new_flags);
-        }
+        self.index
+            .lock()
+            .modify_flags(object_id, BlockFlags::empty(), BlockFlags::UPLOADING);
     }
 
     /// Mark that an S3 upload has failed, clearing the `UPLOADING` flag so
@@ -395,11 +415,9 @@ impl BlockStore {
     ///
     /// No-op if the block does not exist.
     pub fn mark_upload_failed(&self, object_id: u64) {
-        let mut idx = self.index.lock();
-        if let Some(entry) = idx.get(object_id) {
-            let new_flags = entry.flags & !BlockFlags::UPLOADING;
-            idx.update_flags(object_id, new_flags);
-        }
+        self.index
+            .lock()
+            .modify_flags(object_id, BlockFlags::UPLOADING, BlockFlags::empty());
     }
 
     /// Remove a single block from the cache.
@@ -407,7 +425,9 @@ impl BlockStore {
     /// No-op if the block does not exist.
     pub fn remove(&self, object_id: u64) {
         if let Some(removed) = self.index.lock().remove(object_id) {
-            self.allocator.lock().free(removed.offset, removed.alloc_size);
+            self.allocator
+                .lock()
+                .free(removed.offset, removed.alloc_size);
         }
     }
 
@@ -904,7 +924,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = BlockStore::open(test_config(&dir)).unwrap();
 
-        let sizes: &[usize] = &[100, 4_000, 8_000, 500, 16_000, 200, 6_000, 1_000, 12_000, 50];
+        let sizes: &[usize] = &[
+            100, 4_000, 8_000, 500, 16_000, 200, 6_000, 1_000, 12_000, 50,
+        ];
         for (i, &sz) in sizes.iter().enumerate() {
             let data = vec![(i & 0xFF) as u8; sz];
             store.put(i as u64, &data, true).unwrap();
