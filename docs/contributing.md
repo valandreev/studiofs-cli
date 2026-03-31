@@ -15,12 +15,12 @@ sufficient.
 ### What is verified automatically on each push / PR
 
 | Check | Linux (`ubuntu-latest`) | macOS (`macos-latest`) | Windows (`windows-latest`) |
-|-------|------------------------|----------------------|--------------------------|
+|-------|------------------------|----------------------|----------------------------|
 | `cargo fmt` | ✅ (Quality Gates job) | — | — |
 | `cargo clippy` (workspace) | ✅ (Quality Gates job) | ✅ | ✅ |
 | `cargo clippy` (all features) | ✅ (Quality Gates job) | ✅ | ✅ |
 | `cargo doc` | ✅ (Quality Gates job) | — | — |
-| `cargo audit` | ✅ (Quality Gates job) | — | — |
+| `cargo audit` ¹ | ✅ (Quality Gates job) | — | — |
 | Workspace unit + compile tests | ✅ | ✅ | ✅ |
 | SFS-121 offline VFS fast suite | ✅ | — | — |
 | `studiofs-fuse` Linux unit tests | ✅ | — | — |
@@ -34,6 +34,13 @@ sufficient.
 | Platform bridge smoke tests (FUSE mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]` |
 | S3 / PostgreSQL integration tests | Require live RustFS + PostgreSQL; all marked `#[ignore]` |
 | Cross-client convergence tests | Require multi-process infra setup; all marked `#[ignore]` |
+
+<a name="footnote-audit"></a>
+¹ `cargo audit` reads the single workspace `Cargo.lock` and reports
+vulnerabilities regardless of target platform. Running it once on Linux covers
+the full dependency graph, including platform-specific crates such as
+`studiofs-winfsp`. Platform-conditional vulnerabilities (e.g. a Windows-only
+advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 **Compile/unit/smoke distinctions:**
 
@@ -49,7 +56,11 @@ sufficient.
 
 ### Required PR gates
 
-All four jobs are required for a PR to merge. The dependency graph is:
+All four jobs are intended to be required for a PR to merge. This is enforced
+via **GitHub Branch Protection Rules** (Settings → Branches → require status
+checks) — it is not a property of the workflow YAML itself. If you administer
+the repository, verify that all four checks are listed as required. The
+dependency graph is:
 
 ```
 quality  →  linux
@@ -129,10 +140,22 @@ fn set_volname() { ... }
 #[cfg(windows)]
 fn drive_letter_from_path() { ... }
 
-// ❌ avoid — too broad, fires on FreeBSD, OpenBSD, etc. where behavior differs
+// ✅ acceptable — generic POSIX interface shared by Linux and macOS
+// Use this when the behavior is identical on both platforms.
 #[cfg(unix)]
-fn unmount_via_fusermount() { ... }
+fn close_fd(fd: RawFd) { ... }
+
+// ❌ avoid when the behavior is OS-specific — use target_os instead
+// cfg(unix) also fires on FreeBSD, OpenBSD, and other platforms where
+// the behavior may differ or the crate does not target them.
+#[cfg(unix)]
+fn unmount_via_fusermount() { ... }  // fusermount3 is Linux-only
 ```
+
+Rule of thumb: use `#[cfg(unix)]` for standard POSIX APIs that behave the same
+on both Linux and macOS (file descriptors, signals, `libc` calls). Use
+`#[cfg(target_os = "linux")]` or `#[cfg(target_os = "macos")]` when the
+behavior, the system call, or the dependency is specific to one OS.
 
 For tests, the same rule applies. See [tests.md — Rules for writing platform-gated unit tests](tests.md#rules-for-writing-platform-gated-unit-tests) for the full guidance.
 
@@ -176,6 +199,19 @@ also need a kernel driver:
 #[test]
 #[ignore] // requires macfuse driver; run with STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1
 fn mount_sanity_macos() { ... }
+```
+
+For crates that only support specific platforms, use `compile_error!` in the
+crate root to make unsupported builds fail loudly rather than silently
+producing non-functional code:
+
+```rust
+// In studiofs-winfsp/src/lib.rs (already guarded by #![cfg(windows)])
+// — the cfg guard at the crate root is sufficient; compile_error! is only
+// needed if a portable crate gains non-portable code without a crate-root
+// guard.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("studiofs only supports Linux, macOS, and Windows");
 ```
 
 ---
