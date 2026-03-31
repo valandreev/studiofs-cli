@@ -227,6 +227,47 @@ impl LruList {
         }
         None
     }
+
+    /// Return the `object_id` of the oldest node that matches `predicate`
+    /// without unlinking it from the list.
+    ///
+    /// # Safety
+    ///
+    /// All nodes in the list must be backed by live `Box<IndexEntry>` values.
+    pub(super) unsafe fn find_front_matching(
+        &self,
+        predicate: impl Fn(u64) -> bool,
+    ) -> Option<u64> {
+        let mut cursor = self.head;
+        while let Some(node) = cursor {
+            let (object_id, next) = unsafe {
+                let node_ref = node.as_ref();
+                (node_ref.object_id, node_ref.next)
+            };
+            if predicate(object_id) {
+                return Some(object_id);
+            }
+            cursor = next;
+        }
+        None
+    }
+
+    /// Visit nodes from the LRU head (oldest) to tail (MRU).
+    ///
+    /// # Safety
+    ///
+    /// All nodes in the list must be backed by live `Box<IndexEntry>` values.
+    pub(super) unsafe fn for_each_oldest_first(&self, mut visit: impl FnMut(u64)) {
+        let mut cursor = self.head;
+        while let Some(node) = cursor {
+            let (object_id, next) = unsafe {
+                let node_ref = node.as_ref();
+                (node_ref.object_id, node_ref.next)
+            };
+            visit(object_id);
+            cursor = next;
+        }
+    }
 }
 
 impl Drop for LruList {

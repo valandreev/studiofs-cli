@@ -9,12 +9,14 @@
 //! | State | Lock |
 //! |-------|------|
 //! | [`BlockIndex`] (map + LRU + counters) | `Mutex<BlockIndex>` |
+//! | Metadata WAL appender | `Mutex<WalAppender>` |
 //! | [`FreeList`] (allocator) | `Mutex<FreeList>` |
 //! | Hit / miss counters | `AtomicU64` |
 //!
-//! Locks are **never held simultaneously** — the index lock is always
-//! released before the allocator lock is acquired, and vice-versa.  This
-//! strict ordering prevents deadlocks.
+//! The allocator lock is never held at the same time as the index lock.
+//! Some metadata mutations briefly hold the index and WAL locks together,
+//! but there is no reverse `wal -> index -> allocator` path.  That lock
+//! ordering prevents deadlocks while keeping WAL appends serialized.
 //!
 //! ## Eviction
 //!
@@ -37,7 +39,8 @@ use crate::v2::format::{
     self, BLOCK_HEADER_SIZE, BlockHeader, FORMAT_VERSION, SUPERBLOCK_SIZE, Superblock,
     alloc_size_for,
 };
-use crate::v2::index::{BlockFlags, BlockIndex};
+use crate::v2::index::{BlockFlags, BlockIndex, PersistedIndexEntry, RemovedEntry};
+use crate::v2::persistence::{self, WalAppender};
 use crate::v2::platform;
 
 // ===========================================================================
@@ -102,6 +105,8 @@ pub struct BlockStore {
     config: BlockStoreConfig,
     /// Combined block map + LRU list + dirty/block counters.
     index: Mutex<BlockIndex>,
+    /// Append-only metadata journal for mutations since the last snapshot.
+    wal: Mutex<WalAppender>,
     /// Best-fit free-space allocator for `blocks.data`.
     allocator: Mutex<FreeList>,
     /// Total cache hits since open.
@@ -156,9 +161,9 @@ impl BlockStore {
     ///
     /// * **New file** — writes a fresh superblock, starts empty.
     /// * **Existing file** — validates the superblock (magic, version, UUID).
-    ///   Index persistence is implemented in SFS-137; until then the in-memory
-    ///   index starts empty and all pre-existing data-region bytes are treated
-    ///   as reclaimable free space.
+    /// * **Metadata fast path** — loads `blocks.idx` and replays `blocks.wal`.
+    /// * **Fallback** — scans `blocks.data` block headers when metadata is
+    ///   missing or corrupt.
     pub fn open(config: BlockStoreConfig) -> Result<Self, BlockStoreError> {
         std::fs::create_dir_all(&config.cache_dir)?;
         let data_path = config.cache_dir.join("blocks.data");
@@ -225,25 +230,47 @@ impl BlockStore {
             (file, SUPERBLOCK_SIZE)
         };
 
-        // No index persistence yet — treat all data-region bytes as free
-        // (index persistence is implemented in SFS-137).
         let file_end = std::cmp::max(file_len, SUPERBLOCK_SIZE);
-        let allocator = if file_end > SUPERBLOCK_SIZE {
-            warn!(
-                data_bytes = file_end - SUPERBLOCK_SIZE,
-                "opening non-empty blocks.data without index persistence; \
-                 all existing data regions will be treated as free space \
-                 (snapshot+WAL persistence coming in SFS-137)",
-            );
-            FreeList::recover(config.max_size, file_end, &[])
-        } else {
-            FreeList::new(config.max_size)
+        let (recovered_entries, reset_wal) = match persistence::load_entries(
+            &config.cache_dir,
+            &file,
+        ) {
+            Ok(Some(entries)) => (entries, false),
+            Ok(None) => {
+                if file_end > SUPERBLOCK_SIZE {
+                    warn!(
+                        data_bytes = file_end - SUPERBLOCK_SIZE,
+                        "cache metadata missing; rebuilding BlockStore index by scanning blocks.data",
+                    );
+                }
+                (persistence::scan_data_file(&file)?, true)
+            }
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    "cache metadata load failed; rebuilding BlockStore index by scanning blocks.data",
+                );
+                (persistence::scan_data_file(&file)?, true)
+            }
         };
+
+        let occupied: Vec<(u64, u64)> = recovered_entries
+            .iter()
+            .map(|entry| (entry.offset, entry.alloc_size))
+            .collect();
+        let allocator = if occupied.is_empty() && file_end == SUPERBLOCK_SIZE {
+            FreeList::new(config.max_size)
+        } else {
+            FreeList::recover(config.max_size, file_end, &occupied)
+        };
+
+        let cache_dir = config.cache_dir.clone();
 
         Ok(Self {
             file,
             config,
-            index: Mutex::new(BlockIndex::new()),
+            index: Mutex::new(BlockIndex::from_persisted_entries(&recovered_entries)),
+            wal: Mutex::new(WalAppender::open(&cache_dir, reset_wal)?),
             allocator: Mutex::new(allocator),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
@@ -367,9 +394,10 @@ impl BlockStore {
         let alloc = alloc_size_for(data_size);
 
         // Remove any existing entry for this object_id and free its space so
-        // the allocator can reuse it.  This is done before the new allocation
-        // so the freed bytes count toward capacity for the incoming block.
-        if let Some(old) = self.index.lock().remove(object_id) {
+        // the allocator can reuse it. The old header is invalidated before the
+        // lock is released so full data-file scans never see both versions as
+        // live at once.
+        if let Some(old) = self.remove_entry_for_overwrite(object_id)? {
             self.allocator.lock().free(old.offset, old.alloc_size);
         }
 
@@ -411,10 +439,33 @@ impl BlockStore {
         // concurrent put inserted the same object_id after our initial remove,
         // `insert` returns the replaced allocation and we free it afterwards
         // without holding the index and allocator locks simultaneously.
-        let replaced = self
-            .index
-            .lock()
-            .insert(object_id, offset, data_size, alloc, checksum, flags);
+        let persisted_entry = PersistedIndexEntry {
+            object_id,
+            offset,
+            data_size,
+            alloc_size: alloc,
+            checksum,
+            flags,
+        };
+        let replaced = {
+            let mut idx = self.index.lock();
+            self.wal
+                .lock()
+                .append_put(persisted_entry)
+                .map_err(BlockStoreError::Io)?;
+            let replaced = idx.insert(object_id, offset, data_size, alloc, checksum, flags);
+            if let Some(ref old) = replaced
+                && let Err(error) = self.invalidate_block_header(old.offset)
+            {
+                warn!(
+                    error = ?error,
+                    object_id = old.object_id,
+                    offset = old.offset,
+                    "put: failed to invalidate superseded block header",
+                );
+            }
+            replaced
+        };
         pending_allocation.commit();
 
         if let Some(old) = replaced {
@@ -473,7 +524,12 @@ impl BlockStore {
         };
 
         // Write the on-disk header with DIRTY cleared; preserve PINNED.
-        let disk_flags = if pinned { format::FLAG_PINNED } else { 0 };
+        let new_flags = if pinned {
+            BlockFlags::PINNED
+        } else {
+            BlockFlags::empty()
+        };
+        let disk_flags = persistence::persisted_flag_bits(new_flags);
         let header = BlockHeader::new(object_id, data_size, checksum, disk_flags);
 
         match platform::pwrite(&self.file, &header.to_bytes(), offset) {
@@ -483,6 +539,13 @@ impl BlockStore {
                     BlockFlags::DIRTY | BlockFlags::UPLOADING,
                     BlockFlags::empty(),
                 );
+                if let Err(error) = self.wal.lock().append_update_flags(object_id, new_flags) {
+                    warn!(
+                        error = ?error,
+                        object_id,
+                        "mark_evictable: failed to append WAL update",
+                    );
+                }
             }
             Err(e) => {
                 warn!(
@@ -520,7 +583,31 @@ impl BlockStore {
     ///
     /// No-op if the block does not exist.
     pub fn remove(&self, object_id: u64) {
-        if let Some(removed) = self.index.lock().remove(object_id) {
+        let removed = {
+            let mut idx = self.index.lock();
+            let mut wal = self.wal.lock();
+            let removed = idx.remove(object_id);
+            if let Some(ref entry) = removed {
+                if let Err(error) = self.invalidate_block_header(entry.offset) {
+                    warn!(
+                        error = ?error,
+                        object_id = entry.object_id,
+                        offset = entry.offset,
+                        "remove: failed to invalidate block header",
+                    );
+                }
+                if let Err(error) = wal.append_remove(entry.object_id) {
+                    warn!(
+                        error = ?error,
+                        object_id = entry.object_id,
+                        "remove: failed to append WAL remove",
+                    );
+                }
+            }
+            removed
+        };
+
+        if let Some(removed) = removed {
             self.allocator
                 .lock()
                 .free(removed.offset, removed.alloc_size);
@@ -532,7 +619,29 @@ impl BlockStore {
     /// Unknown IDs are silently skipped.  More efficient than calling
     /// [`remove`] in a loop because the allocator lock is acquired only once.
     pub fn remove_batch(&self, object_ids: &[u64]) {
-        let removed = self.index.lock().remove_batch(object_ids);
+        let removed = {
+            let mut idx = self.index.lock();
+            let mut wal = self.wal.lock();
+            let removed = idx.remove_batch(object_ids);
+            for entry in &removed {
+                if let Err(error) = self.invalidate_block_header(entry.offset) {
+                    warn!(
+                        error = ?error,
+                        object_id = entry.object_id,
+                        offset = entry.offset,
+                        "remove_batch: failed to invalidate block header",
+                    );
+                }
+                if let Err(error) = wal.append_remove(entry.object_id) {
+                    warn!(
+                        error = ?error,
+                        object_id = entry.object_id,
+                        "remove_batch: failed to append WAL remove",
+                    );
+                }
+            }
+            removed
+        };
         if removed.is_empty() {
             return;
         }
@@ -557,6 +666,7 @@ impl BlockStore {
     /// Prefer explicit `close()` over relying on [`Drop`].
     pub fn close(self) -> Result<(), BlockStoreError> {
         platform::fdatasync(&self.file)?;
+        self.write_snapshot_and_clear_wal()?;
         self.synced.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -615,7 +725,7 @@ impl BlockStore {
 
         // Eviction loop: free one block at a time until the allocation fits.
         loop {
-            let evicted = self.index.lock().evict_one();
+            let evicted = self.evict_one_for_allocation()?;
             match evicted {
                 Some(entry) => {
                     self.allocator.lock().free(entry.offset, entry.alloc_size);
@@ -661,6 +771,60 @@ impl BlockStore {
         }
         Ok(Some(offset))
     }
+
+    fn remove_entry_for_overwrite(
+        &self,
+        object_id: u64,
+    ) -> Result<Option<RemovedEntry>, BlockStoreError> {
+        let mut idx = self.index.lock();
+        let Some(offset) = idx.get(object_id).map(|entry| entry.offset) else {
+            return Ok(None);
+        };
+
+        // Keep the index lock held across tombstoning + removal so a
+        // concurrent get() cannot observe a still-indexed block whose header
+        // has already been invalidated on disk.
+        self.invalidate_block_header(offset)?;
+        Ok(idx.remove(object_id))
+    }
+
+    fn evict_one_for_allocation(&self) -> Result<Option<RemovedEntry>, BlockStoreError> {
+        let mut idx = self.index.lock();
+        let Some((object_id, offset)) = idx.peek_oldest_evictable() else {
+            return Ok(None);
+        };
+
+        // Same rationale as overwrite removal: tombstone publication must stay
+        // ordered with index removal to avoid readers racing with a half-
+        // published eviction.
+        self.invalidate_block_header(offset)?;
+        let removed = idx
+            .remove(object_id)
+            .expect("peeked eviction candidate must still exist while index lock is held");
+
+        if let Err(error) = self.wal.lock().append_remove(removed.object_id) {
+            warn!(
+                error = ?error,
+                object_id = removed.object_id,
+                offset = removed.offset,
+                "evict_one_for_allocation: failed to append WAL remove",
+            );
+        }
+
+        Ok(Some(removed))
+    }
+
+    fn invalidate_block_header(&self, offset: u64) -> io::Result<()> {
+        let tombstone = [0u8; BLOCK_HEADER_SIZE as usize];
+        platform::pwrite(&self.file, &tombstone, offset)
+    }
+
+    fn write_snapshot_and_clear_wal(&self) -> Result<(), BlockStoreError> {
+        let entries = self.index.lock().snapshot_for_persistence();
+        persistence::write_snapshot(&self.config.cache_dir, &entries)?;
+        self.wal.lock().clear()?;
+        Ok(())
+    }
 }
 
 impl Drop for BlockStore {
@@ -680,10 +844,12 @@ impl Drop for BlockStore {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
     use std::sync::Arc;
     use std::thread;
 
     use super::*;
+    use crate::v2::persistence::{WAL_HEADER_SIZE, WAL_RECORD_SIZE};
     use tempfile::TempDir;
 
     fn test_config(dir: &TempDir) -> BlockStoreConfig {
@@ -1082,18 +1248,123 @@ mod tests {
     }
 
     #[test]
-    fn close_and_reopen_empty_index() {
+    fn close_and_reopen_restores_blocks_and_flags() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0x44; 16],
+        };
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"dirty", false).unwrap();
+        store.put(2, b"clean", true).unwrap();
+        store.close().unwrap();
+
+        let store2 = BlockStore::open(config).unwrap();
+        assert_eq!(store2.block_count(), 2);
+        assert_eq!(store2.dirty_count(), 1);
+        assert_eq!(&store2.get(1).unwrap()[..], b"dirty");
+        assert_eq!(&store2.get(2).unwrap()[..], b"clean");
+
+        store2.put(3, b"new-clean", true).unwrap();
+        store2.put(4, b"evict", true).unwrap();
+        assert!(
+            store2.contains(1),
+            "dirty block should remain non-evictable after reopen"
+        );
+        assert!(
+            !store2.contains(2),
+            "oldest clean block should be evicted after reopen"
+        );
+    }
+
+    #[test]
+    fn clean_shutdown_overwrites_existing_snapshot() {
         let dir = TempDir::new().unwrap();
         let config = test_config(&dir);
 
         let store = BlockStore::open(config.clone()).unwrap();
-        store.put(1, b"persist?", true).unwrap();
+        store.put(1, b"first", true).unwrap();
         store.close().unwrap();
 
-        // Index persistence is SFS-137; the cache starts empty on reopen.
-        let store2 = BlockStore::open(config).unwrap();
-        assert_eq!(store2.block_count(), 0);
-        assert!(store2.get(1).is_none());
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(2, b"second", true).unwrap();
+        store.close().unwrap();
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert_eq!(reopened.block_count(), 2);
+        assert_eq!(&reopened.get(1).unwrap()[..], b"first");
+        assert_eq!(&reopened.get(2).unwrap()[..], b"second");
+    }
+
+    #[test]
+    fn reopen_after_abrupt_drop_replays_snapshot_and_wal() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"snap", true).unwrap();
+        store.close().unwrap();
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(2, b"wal-clean", true).unwrap();
+        store.put(3, b"wal-dirty", false).unwrap();
+        drop(store);
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert_eq!(reopened.block_count(), 3);
+        assert_eq!(reopened.dirty_count(), 1);
+        assert_eq!(&reopened.get(1).unwrap()[..], b"snap");
+        assert_eq!(&reopened.get(2).unwrap()[..], b"wal-clean");
+        assert_eq!(&reopened.get(3).unwrap()[..], b"wal-dirty");
+    }
+
+    #[test]
+    fn reopen_ignores_partial_wal_tail() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"snap", true).unwrap();
+        store.close().unwrap();
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(2, b"keep", true).unwrap();
+        store.put(3, b"drop", true).unwrap();
+        drop(store);
+
+        let wal_path = dir.path().join("blocks.wal");
+        let wal_file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        wal_file
+            .set_len(WAL_HEADER_SIZE + WAL_RECORD_SIZE + WAL_RECORD_SIZE / 2)
+            .unwrap();
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert!(reopened.contains(1));
+        assert!(reopened.contains(2));
+        assert!(!reopened.contains(3));
+    }
+
+    #[test]
+    fn corrupt_snapshot_falls_back_to_data_scan() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"alpha", true).unwrap();
+        store.put(2, b"beta", false).unwrap();
+        store.close().unwrap();
+
+        let snapshot_path = dir.path().join("blocks.idx");
+        let snapshot_file = OpenOptions::new().write(true).open(&snapshot_path).unwrap();
+        platform::pwrite(&snapshot_file, b"BROKEN!!", 0).unwrap();
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert_eq!(reopened.block_count(), 2);
+        assert_eq!(reopened.dirty_count(), 1);
+        assert_eq!(&reopened.get(1).unwrap()[..], b"alpha");
+        assert_eq!(&reopened.get(2).unwrap()[..], b"beta");
     }
 
     #[test]

@@ -99,11 +99,24 @@ pub struct IndexEntry {
 /// and update external counters.
 #[derive(Debug)]
 pub struct RemovedEntry {
+    /// Logical object identifier.
+    pub object_id: u64,
     /// Byte offset of the block in `blocks.data`.
     pub offset: u64,
     /// Page-aligned on-disk allocation size.
     pub alloc_size: u64,
     /// Flags at the time of removal (used by eviction to skip dirty accounting).
+    pub flags: BlockFlags,
+}
+
+/// Snapshot-friendly representation of a live cache block.
+#[derive(Debug, Clone, Copy)]
+pub struct PersistedIndexEntry {
+    pub object_id: u64,
+    pub offset: u64,
+    pub data_size: u32,
+    pub alloc_size: u64,
+    pub checksum: u32,
     pub flags: BlockFlags,
 }
 
@@ -149,6 +162,22 @@ impl BlockIndex {
         }
     }
 
+    /// Build an index from oldest-first persisted entries.
+    pub fn from_persisted_entries(entries: &[PersistedIndexEntry]) -> Self {
+        let mut index = Self::with_capacity(entries.len());
+        for entry in entries {
+            index.insert(
+                entry.object_id,
+                entry.offset,
+                entry.data_size,
+                entry.alloc_size,
+                entry.checksum,
+                entry.flags,
+            );
+        }
+        index
+    }
+
     // -----------------------------------------------------------------------
     // Read-only accessors
     // -----------------------------------------------------------------------
@@ -187,6 +216,40 @@ impl BlockIndex {
     #[inline]
     pub fn lru_len(&self) -> usize {
         self.lru.len()
+    }
+
+    /// Snapshot all entries in deterministic oldest-first order.
+    pub fn snapshot_for_persistence(&self) -> Vec<PersistedIndexEntry> {
+        let mut snapshot = Vec::with_capacity(self.entries.len());
+        unsafe {
+            self.lru.for_each_oldest_first(|object_id| {
+                if let Some(entry) = self.entries.get(&object_id) {
+                    snapshot.push(PersistedIndexEntry {
+                        object_id,
+                        offset: entry.offset,
+                        data_size: entry.data_size,
+                        alloc_size: entry.alloc_size,
+                        checksum: entry.checksum,
+                        flags: entry.flags,
+                    });
+                }
+            });
+        }
+        snapshot
+    }
+
+    /// Return the oldest evictable block without removing it.
+    pub fn peek_oldest_evictable(&self) -> Option<(u64, u64)> {
+        let object_id = unsafe {
+            self.lru.find_front_matching(|object_id| {
+                self.entries
+                    .get(&object_id)
+                    .map(|entry| entry.flags.is_evictable())
+                    .unwrap_or(false)
+            })
+        }?;
+        let entry = self.entries.get(&object_id)?;
+        Some((object_id, entry.offset))
     }
 
     // -----------------------------------------------------------------------
@@ -349,6 +412,7 @@ impl BlockIndex {
         self.block_count = self.block_count.saturating_sub(1);
 
         Some(RemovedEntry {
+            object_id: oid,
             offset: boxed.offset,
             alloc_size: boxed.alloc_size,
             flags: boxed.flags,
@@ -377,6 +441,7 @@ impl BlockIndex {
         self.block_count = self.block_count.saturating_sub(1);
 
         Some(RemovedEntry {
+            object_id,
             offset: boxed.offset,
             alloc_size: boxed.alloc_size,
             flags: boxed.flags,
