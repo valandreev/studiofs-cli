@@ -164,6 +164,11 @@ Fast test suite:
 cargo test --workspace --all-targets -- --nocapture
 ```
 
+CI runs four jobs on every push and PR — see
+[`.github/workflows/rust.yml`](.github/workflows/rust.yml) and
+[`docs/development.md`](docs/development.md) for the full matrix (Quality
+Gates, Linux, macOS, Windows).
+
 Infra-heavy ignored suite:
 
 ```bash
