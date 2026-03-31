@@ -3678,6 +3678,7 @@ dependencies = [
 name = "studiofs-cache"
 version = "0.1.1"
 dependencies = [
+ "bitflags 2.11.0",
  "bytes",
  "crc32fast",
  "dashmap",

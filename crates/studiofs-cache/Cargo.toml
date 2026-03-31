@@ -18,6 +18,7 @@ libc.workspace = true
 uuid.workspace = true
 memmap2 = "0.9"
 crc32fast = "1"
+bitflags = "2.4"
 
 [dev-dependencies]
 tempfile = "3"

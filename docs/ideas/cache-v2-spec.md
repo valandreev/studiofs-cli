@@ -421,7 +421,8 @@ pub struct BlockStore { ... }
 
 impl BlockStore {
     /// Создать или открыть кеш.
-    /// Загружает индекс (snapshot + WAL replay).
+    /// Сейчас валидирует superblock и стартует с пустым in-memory индексом.
+    /// Snapshot + WAL replay — следующая фаза.
     pub fn open(config: BlockStoreConfig) -> Result<Self>;
     
     /// Прочитать блок из кеша.
@@ -440,7 +441,14 @@ impl BlockStore {
     pub fn put(&self, object_id: u64, data: &[u8], evictable: bool) -> Result<()>;
     
     /// Пометить блок как evictable (после успешной загрузки в S3).
+    /// Очищает DIRTY и transient UPLOADING.
     pub fn mark_evictable(&self, object_id: u64);
+
+    /// Пометить блок как uploading, исключив его из eviction.
+    pub fn mark_uploading(&self, object_id: u64);
+
+    /// Сбросить transient UPLOADING после неудачной загрузки, сохранив DIRTY.
+    pub fn mark_upload_failed(&self, object_id: u64);
     
     /// Удалить блок явно (файл удалён из VFS).
     pub fn remove(&self, object_id: u64);
@@ -1065,55 +1073,53 @@ Snapshot файл включает xxhash32 всех записей. Если ch
 
 ```
 BlockStore
-├── index: RwLock<BlockIndex>         ← HashMap + LRU
-│   ├── Read lock: get(), contains()  ← параллельные чтения
-│   └── Write lock: put(), remove(), evict()
+├── index: Mutex<BlockIndex>          ← HashMap + intrusive LRU + counters
+│   ├── get(): lookup + later touch   ← короткие critical sections
+│   ├── put/remove/evict(): mutate
+│   └── mark_evictable(): держит lock на время маленького header pwrite
 │
-├── mmap_reader: MmapReader           ← lock-free (ArcSwap)
-│   └── get(): load Arc, read slice   ← параллельные чтения, zero lock
+├── allocator: Mutex<FreeList>        ← только при allocate/free/set_len
+│   └── Short critical section (~μs–ms при росте файла)
 │
-├── allocator: Mutex<FreeList>        ← только при allocate/free
-│   └── Short critical section (~μs)
+├── data file: File                   ← pread/pwrite thread-safe
+│   └── Concurrent pwrite to different offsets: safe
 │
-├── data_fd: RawFd                    ← pwrite() thread-safe
-│   └── Concurrent pwrite to different offsets: safe (POSIX guarantee)
-│
-├── wal_fd: Mutex<File>               ← append-only, serialized
-│   └── Short critical section (write ~28 bytes)
-│
-└── evictor: background thread        ← takes write lock on index
+└── evictor: background thread        ← future
 ```
 
 ### 14.2 Типичный concurrency flow
 
 **N параллельных чтений (FUSE threads):**
 ```
-Thread 1: index.read() → mmap.load() → return Bytes     ← no locks held during I/O
-Thread 2: index.read() → mmap.load() → return Bytes
-Thread N: index.read() → mmap.load() → return Bytes
+Thread 1: index.lock() → copy metadata → unlock → pread → index.lock() → touch
+Thread 2: index.lock() → copy metadata → unlock → pread → index.lock() → touch
+Thread N: index.lock() → copy metadata → unlock → pread → index.lock() → touch
 ```
 
-Read lock на index удерживается ~50нс (только HashMap lookup + LRU touch). mmap read — lock-free.
+I/O выполняется без удержания index lock. Исключение: `mark_evictable()`
+держит lock во время маленького header `pwrite`, чтобы исключить ABA по
+disk offset при remove + reuse слота.
 
 **Запись + параллельные чтения:**
 ```
-Write thread: index.write() → allocator.lock() → pwrite() → wal.lock()
-Read thread:  index.read()  → mmap.load() → return        ← не блокируется pwrite
+Write thread: index.lock() remove-old → unlock → allocator.lock() → pwrite() → index.lock() insert
+Read thread:  index.lock() lookup      → unlock → pread             → index.lock() touch
 ```
 
-Write lock на index удерживается только для insert (~100нс). pwrite выполняется без lock-а index. Читатели не блокируются записью.
+`put()` не держит одновременно `index` и `allocator`; незакоммиченная
+allocation защищена RAII guard, чтобы post-write panic/ошибка не оставили
+allocator впереди индекса.
 
 ### 14.3 Deadlock prevention
 
 Строгий порядок захвата lock-ов:
 
 ```
-1. index (RwLock)
+1. index (Mutex<BlockIndex>)
 2. allocator (Mutex)  
-3. wal (Mutex)
 ```
 
-Никогда не захватываем allocator перед index, или wal перед allocator.
+Никогда не захватываем allocator перед index.
 
 ---
 
@@ -1168,27 +1174,27 @@ platform_direct_io.rs → Уходит (не нужен: не используе
 lib.rs            → Re-export
 block_store.rs    → BlockStore struct + impl
 allocator.rs      → FreeList
-index.rs          → BlockIndex + BlockEntry + persistence (snapshot/WAL)
+index.rs          → BlockIndex + BlockEntry (in-memory only)
 lru.rs            → LruList + LruNode
-mmap_reader.rs    → MmapReader (ArcSwap + Mmap)
-platform.rs       → PlatformOps trait + conditional impls
-write_buffer.rs   → WriteBuffer (может жить в VFS или cache)
-evictor.rs        → Background eviction thread
+platform.rs       → Platform helpers + conditional impls
+evictor.rs        → Background eviction thread (future)
 metrics.rs        → Counters, histograms
+mmap_reader.rs    → Future (Phase 2)
+write_buffer.rs   → Может жить в VFS или cache (future)
 ```
 
 ---
 
 ## 16. Фазы реализации
 
-### Phase 1: Core BlockStore (foundation)
+### Phase 1: Core BlockStore (implemented)
 
 **Scope:**
 - `BlockStore::open()` / `close()`
 - `put()` / `get()` / `remove()` — с pread/pwrite (без mmap)
 - FreeList allocator
-- BlockIndex (HashMap, in-memory only, без persistence)
-- LRU eviction (basic)
+- BlockIndex (HashMap + intrusive LRU, in-memory only, без persistence)
+- LRU eviction (DIRTY/PINNED/UPLOADING-aware)
 - Файл данных с superblock + block headers
 - Unit tests
 
