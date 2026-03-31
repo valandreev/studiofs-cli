@@ -55,6 +55,20 @@ cargo clippy --workspace --all-targets
 cargo check --workspace
 ```
 
+## CI Matrix
+
+The GitHub Actions workflow (`.github/workflows/rust.yml`) runs four jobs:
+
+| Job | Runner | Purpose |
+|-----|--------|---------|
+| **Quality Gates** | `ubuntu-latest` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
+| **Linux** | `ubuntu-latest` | Workspace tests, SFS-121 targeted VFS fast suite |
+| **macOS** | `macos-latest` | Clippy + tests — validates `cfg(target_os = "macos")` paths in `studiofs-fuse` |
+| **Windows** | `windows-latest` | Clippy + tests — validates `cfg(windows)` paths in `studiofs-winfsp` |
+
+Platform jobs depend on Quality Gates to avoid wasting macOS/Windows runner
+minutes when portable checks fail.
+
 ## Tests
 
 Fast suite:
