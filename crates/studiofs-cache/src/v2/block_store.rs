@@ -112,6 +112,45 @@ pub struct BlockStore {
     synced: AtomicBool,
 }
 
+/// Frees an allocated region unless the caller explicitly commits it.
+///
+/// `BlockStore::put` allocates space before writing block bytes and before the
+/// in-memory index entry is published. This guard closes that gap so an I/O
+/// error or panic cannot leave allocator state permanently ahead of the index.
+struct PendingAllocation<'a> {
+    store: &'a BlockStore,
+    offset: u64,
+    alloc_size: u64,
+    committed: bool,
+}
+
+impl<'a> PendingAllocation<'a> {
+    fn new(store: &'a BlockStore, offset: u64, alloc_size: u64) -> Self {
+        Self {
+            store,
+            offset,
+            alloc_size,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingAllocation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.store
+            .allocator
+            .lock()
+            .free(self.offset, self.alloc_size);
+    }
+}
+
 impl BlockStore {
     /// Create or open a block store in `config.cache_dir`.
     ///
@@ -283,6 +322,19 @@ impl BlockStore {
     ///   to make room.  Returns [`BlockStoreError::CacheFull`] only when all
     ///   remaining blocks are non-evictable.
     pub fn put(&self, object_id: u64, data: &[u8], evictable: bool) -> Result<(), BlockStoreError> {
+        self.put_inner(object_id, data, evictable, || {})
+    }
+
+    fn put_inner<F>(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+        after_write: F,
+    ) -> Result<(), BlockStoreError>
+    where
+        F: FnOnce(),
+    {
         let data_size = u32::try_from(data.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -300,9 +352,12 @@ impl BlockStore {
 
         // Allocate space, evicting LRU blocks when needed.
         let offset = self.allocate_with_eviction(alloc)?;
+        let mut pending_allocation = PendingAllocation::new(self, offset, alloc);
 
         // Write header + payload via pwrite.  On I/O failure the allocated
-        // region is freed immediately so the allocator does not leak space.
+        // region is released by `pending_allocation` so the allocator does not
+        // leak space even if we return early or unwind before publishing the
+        // new index entry.
         let checksum = crc32fast::hash(data);
         let flags = if evictable {
             BlockFlags::empty()
@@ -324,16 +379,32 @@ impl BlockStore {
             });
 
         if let Err(e) = write_result {
-            self.allocator.lock().free(offset, alloc);
             return Err(BlockStoreError::Io(e));
         }
+
+        after_write();
 
         // Register the block in the index (push to LRU tail).
         self.index
             .lock()
             .insert(object_id, offset, data_size, alloc, checksum, flags);
+        pending_allocation.commit();
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn put_with_after_write_hook<F>(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+        after_write: F,
+    ) -> Result<(), BlockStoreError>
+    where
+        F: FnOnce(),
+    {
+        self.put_inner(object_id, data, evictable, after_write)
     }
 
     /// Mark a dirty block as evictable — typically called after a successful
@@ -917,6 +988,26 @@ mod tests {
         assert_eq!(store.allocated_bytes(), 0);
         store.put(2, b"second", true).unwrap();
         assert_eq!(store.allocated_bytes(), alloc_before);
+    }
+
+    #[test]
+    fn panic_after_write_releases_pending_allocation() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.put_with_after_write_hook(1, b"first", true, || {
+                panic!("simulated panic after write");
+            });
+        }));
+
+        assert!(panic_result.is_err());
+        assert_eq!(store.block_count(), 0);
+        assert_eq!(store.allocated_bytes(), 0);
+        assert!(!store.contains(1));
+
+        store.put(2, b"second", true).unwrap();
+        assert_eq!(&store.get(2).unwrap()[..], b"second");
     }
 
     #[test]

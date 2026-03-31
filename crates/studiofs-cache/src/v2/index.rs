@@ -387,11 +387,17 @@ impl BlockIndex {
 impl Drop for BlockIndex {
     fn drop(&mut self) {
         // Unlink every node before the Boxes (and their embedded LruNodes) are
-        // freed, so LruList::drop's debug_assert passes.
-        let ids: Vec<u64> = self.entries.keys().copied().collect();
-        for id in ids {
-            let _ = self.remove_unlinked(id);
+        // freed, so LruList::drop's debug_assert passes. Drain the map instead
+        // of collecting keys and doing N extra HashMap lookups.
+        let lru = &mut self.lru;
+        for (_, mut boxed) in self.entries.drain() {
+            let node_ptr = NonNull::from(&mut boxed.lru_node);
+            // SAFETY: every drained entry was linked at insert time and the
+            // Box remains alive for the duration of the unlink.
+            unsafe { lru.remove(node_ptr) };
         }
+        self.dirty_count = 0;
+        self.block_count = 0;
     }
 }
 
