@@ -296,8 +296,30 @@ impl BlockStore {
             return None;
         }
 
-        // Phase 3: touch LRU under the index lock (O(1) promotion).
-        self.index.lock().touch(object_id);
+        // Phase 3: revalidate metadata and touch LRU under the index lock.
+        //
+        // This closes an ABA window where the on-disk region at `offset` could
+        // have been freed and reallocated to a different object between the
+        // initial metadata read and the `pread` above. If the current index
+        // entry no longer matches the metadata used for the read, treat this
+        // as a miss and discard the payload.
+        {
+            let mut idx = self.index.lock();
+            let metadata_matches = matches!(
+                idx.get(object_id),
+                Some(e)
+                    if e.offset == offset
+                        && e.data_size == data_size
+                        && e.checksum == checksum
+            );
+
+            if !metadata_matches {
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+
+            idx.touch(object_id);
+        }
 
         self.hit_count.fetch_add(1, Ordering::Relaxed);
         Some(Bytes::from(buf))
@@ -318,7 +340,7 @@ impl BlockStore {
     /// * `evictable = false` marks the block as *dirty* (sets the `DIRTY`
     ///   flag); the block will not be chosen for LRU eviction until
     ///   [`mark_evictable`] is called.
-    /// * If the block already exists it is atomically replaced.
+    /// * If the block already exists it is replaced in the cache.
     /// * When the cache is full, eligible LRU blocks are evicted automatically
     ///   to make room.  Returns [`BlockStoreError::CacheFull`] only when all
     ///   remaining blocks are non-evictable.
@@ -385,11 +407,19 @@ impl BlockStore {
 
         after_write();
 
-        // Register the block in the index (push to LRU tail).
-        self.index
+        // Register the block in the index (push to LRU tail). If another
+        // concurrent put inserted the same object_id after our initial remove,
+        // `insert` returns the replaced allocation and we free it afterwards
+        // without holding the index and allocator locks simultaneously.
+        let replaced = self
+            .index
             .lock()
             .insert(object_id, offset, data_size, alloc, checksum, flags);
         pending_allocation.commit();
+
+        if let Some(old) = replaced {
+            self.allocator.lock().free(old.offset, old.alloc_size);
+        }
 
         Ok(())
     }
@@ -834,8 +864,9 @@ mod tests {
         assert_eq!(store.dirty_count(), 1);
         // Block should still be non-evictable (DIRTY set):
         // fill cache with clean blocks and verify block 1 survives.
+        let second_dir = TempDir::new().unwrap();
         let small_cfg = BlockStoreConfig {
-            cache_dir: TempDir::new().unwrap().keep(),
+            cache_dir: second_dir.path().to_path_buf(),
             max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
             volume_uuid: [0xBB; 16],
         };
