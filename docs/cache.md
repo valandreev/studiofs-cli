@@ -8,7 +8,7 @@ There are two generations of the cache implementation:
 | Generation | Module | Status |
 |------------|--------|--------|
 | **v3 (current)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active — used by VFS |
-| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Core store implemented; not yet wired to VFS |
+| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Foreground VFS reads and committed local extents now use BlockStore; async VFS paths route blocking BlockStore mutations through Tokio's blocking pool while legacy cache helpers still back staged upload compatibility |
 
 ---
 
@@ -17,6 +17,9 @@ There are two generations of the cache implementation:
 > **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
 > dirty/uploading eviction gating, auto-eviction, mmap reads with generation
 > remapping, snapshot/WAL persistence, and startup recovery are implemented.
+> The VFS committed read path now uses BlockStore as its primary cache, and
+> async VFS workers offload blocking BlockStore read/write/remove transitions
+> onto Tokio's blocking pool instead of running them on executor threads.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.

@@ -210,7 +210,8 @@ PendingUpload received
   ├─ Stage lookup: try transient staged upload payload seeded by materializer
   │    └─ retains payload until success/cancel so upload retries can reuse RAM copy
   ├─ Fallback local I/O phase: on staging miss, acquire upload local-cache I/O slots,
-  │  read block from cache (L1 or L2), release slots immediately
+  │  reread the committed payload from BlockStore/L1, release slots immediately,
+  │  and run any blocking BlockStore I/O on Tokio's blocking pool
   ├─ Reject stale op if inode/incarnation no longer match
   ├─ Split logical block into 4 cloud fragments (up to 4 MiB each)
   ├─ Network phase: upload fragments to S3 (no local-cache I/O slot held)
@@ -218,6 +219,9 @@ PendingUpload received
   ├─ PUT fragment objects to S3 in parallel via UploadScheduler (AIMD + retry/timeout policy)
   ├─ Mark extent record as uploaded only after upload success
   ├─ cache.complete_upload(pending) — unpin LRU entry
+  ├─ post-upload cache cleanup (`mark_evictable` / deferred remove) runs via
+  │  blocking-pool wrappers so the async uploader never performs direct local
+  │  cache file I/O on executor threads
   │
   └─ On failure: requeue with backoff
 ```

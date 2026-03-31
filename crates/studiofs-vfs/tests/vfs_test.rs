@@ -1145,33 +1145,8 @@ async fn measure_foreground_read_phase(
     (sweep_elapsed, throughput_mib_s, protection_stats)
 }
 
-fn l2_cache_block_bytes(cache_dir: &std::path::Path) -> u64 {
-    let blocks_dir = cache_dir.join("blocks");
-    let mut total = 0;
-    let Ok(shards) = std::fs::read_dir(blocks_dir) else {
-        return 0;
-    };
-    for shard in shards.flatten() {
-        let Ok(file_type) = shard.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(shard.path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("block") {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
+fn committed_cache_block_bytes(vfs: &Arc<StudioVfs>) -> u64 {
+    vfs.block_store().allocated_bytes()
 }
 
 async fn seed_committed_file(
@@ -4767,29 +4742,33 @@ async fn rename_into_trashes_evicts_local_cache_blocks() {
             object_ids
                 .iter()
                 .all(|object_id| vfs.read_cached_block(*object_id).is_some())
-                && l2_cache_block_bytes(&cache_dir) > 0
+                && committed_cache_block_bytes(&vfs) > 0
         })
         .await,
         "seeded file should be present in the local cache before trash rename"
     );
 
-    let l2_before = l2_cache_block_bytes(&cache_dir);
+    let committed_before = committed_cache_block_bytes(&vfs);
     assert!(
-        l2_before > 0,
-        "cache should contain block files before rename"
+        committed_before > 0,
+        "committed cache should contain block bytes before trash rename"
     );
 
     vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin")
         .unwrap();
 
     assert!(
-        wait_until(Duration::from_secs(10), || l2_cache_block_bytes(&cache_dir)
-            < l2_before)
+        wait_until(Duration::from_secs(10), || {
+            object_ids
+                .iter()
+                .all(|object_id| vfs.read_cached_block(*object_id).is_none())
+                && committed_cache_block_bytes(&vfs) < committed_before
+        })
         .await,
-        "moving into .Trashes should shrink the L2 cache promptly"
+        "moving into .Trashes should evict committed cache entries promptly"
     );
     assert_eq!(
-        l2_cache_block_bytes(&cache_dir),
+        committed_cache_block_bytes(&vfs),
         0,
         "all cached blocks for the trashed file should be removed from local cache"
     );
@@ -9228,8 +9207,8 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
             "post-upload throughput too low: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
         );
         assert!(
-            post_throughput_mib_s >= during_throughput_mib_s * 0.8,
-            "post-upload throughput failed to recover after upload drained: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
+            post_throughput_mib_s >= baseline_throughput_mib_s * 0.8,
+            "post-upload throughput failed to recover toward baseline after upload drained: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
         );
     });
     rt.shutdown_background();

@@ -19,7 +19,7 @@ use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::block_cache::BlockCache;
+use studiofs_cache::v2::BlockStore;
 use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
@@ -51,8 +51,8 @@ pub enum FetchError {
     #[error("object decode error: {0}")]
     Decode(#[from] studiofs_data::object::ObjectError),
 
-    #[error("cache write error: {0}")]
-    CacheWrite(std::io::Error),
+    #[error("cache access error: {0}")]
+    CacheAccess(String),
 
     #[error("prefetch skipped: no foreground headroom")]
     PrefetchSkipped,
@@ -130,8 +130,8 @@ pub struct FetchScheduler {
     inflight: DashMap<u64, broadcast::Sender<BroadcastResult>>,
     /// S3 data store (read-optimised operator).
     data_store: Arc<DataStore>,
-    /// Unified block cache (L1 RAM + L2 NVMe).
-    cache: Arc<BlockCache>,
+    /// Cache v2 block store used by the foreground read path.
+    block_store: Arc<BlockStore>,
     /// Maximum attempts per fetch operation.
     max_fetch_attempts: u32,
     /// Maximum attempts for best-effort prefetch fetches.
@@ -162,11 +162,11 @@ impl FetchScheduler {
     ///
     /// # Arguments
     /// - `data_store`: read-optimised `DataStore` (no `ConcurrentLimitLayer` — AIMD manages concurrency).
-    /// - `cache`: shared block cache.
+    /// - `block_store`: shared BlockStore used by the committed read path.
     /// - `aimd_config`: AIMD parameters (use [`AimdConfig::fetch_default()`] for sane defaults).
     pub fn new(
         data_store: Arc<DataStore>,
-        cache: Arc<BlockCache>,
+        block_store: Arc<BlockStore>,
         aimd_config: AimdConfig,
         default_prefetch_reserve_slots: usize,
         qos: Arc<QosController>,
@@ -201,7 +201,7 @@ impl FetchScheduler {
             aimd: AimdController::new(aimd_config),
             inflight: DashMap::new(),
             data_store,
-            cache,
+            block_store,
             max_fetch_attempts,
             prefetch_max_fetch_attempts,
             request_timeout: Duration::from_secs(request_timeout_s),
@@ -251,7 +251,7 @@ impl FetchScheduler {
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
-        if let Some(cached) = self.cache.get(object_id).await {
+        if let Some(cached) = self.block_store_get_async(object_id).await? {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
@@ -295,7 +295,7 @@ impl FetchScheduler {
                     match recv {
                         // Fetcher succeeded — grab from cache.
                         Ok(Ok(true)) => {
-                            if let Some(cached) = self.cache.get(object_id).await {
+                            if let Some(cached) = self.block_store_get_async(object_id).await? {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(cached);
                             }
@@ -497,9 +497,10 @@ impl FetchScheduler {
             let start = fragment_index.saturating_mul(CLOUD_FRAGMENT_SIZE);
             let end = start.saturating_add(part.len());
             if end > assembled.len() {
-                return Err(FetchError::CacheWrite(std::io::Error::other(
-                    "fragment bounds exceed assembled payload buffer",
-                )));
+                return Err(FetchError::CorruptFragment {
+                    object_id,
+                    reason: "fragment bounds exceed assembled payload buffer".to_string(),
+                });
             }
             assembled[start..end].copy_from_slice(&part);
             lengths[fragment_index] = part.len();
@@ -514,12 +515,34 @@ impl FetchScheduler {
         let payload = Bytes::from(assembled);
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
-        self.cache
-            .put(object_id, payload.clone())
-            .await
-            .map_err(FetchError::CacheWrite)?;
+        self.block_store_put_async(object_id, payload.clone(), true)
+            .await?;
 
         Ok(payload)
+    }
+
+    async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
+        let block_store = self.block_store.clone();
+        tokio::task::spawn_blocking(move || block_store.get(object_id))
+            .await
+            .map_err(|error| {
+                FetchError::CacheAccess(format!("block store get task failed: {error}"))
+            })
+    }
+
+    async fn block_store_put_async(
+        &self,
+        object_id: u64,
+        payload: Bytes,
+        evictable: bool,
+    ) -> Result<(), FetchError> {
+        let block_store = self.block_store.clone();
+        tokio::task::spawn_blocking(move || block_store.put(object_id, payload.as_ref(), evictable))
+            .await
+            .map_err(|error| {
+                FetchError::CacheAccess(format!("block store put task failed: {error}"))
+            })?
+            .map_err(|error| FetchError::CacheAccess(error.to_string()))
     }
 
     /// Perform S3 GET for one fragment with retries + AIMD.
@@ -566,11 +589,10 @@ impl FetchScheduler {
                     }
                 }
             };
-            let _fetch_qos = self.qos.acquire_fetch().await.map_err(|e| {
-                FetchError::CacheWrite(std::io::Error::other(format!(
-                    "fetch qos permit failed: {e}"
-                )))
-            })?;
+            let _fetch_qos =
+                self.qos.acquire_fetch().await.map_err(|e| {
+                    FetchError::CacheAccess(format!("fetch qos permit failed: {e}"))
+                })?;
             let wait_ms = wait_start.elapsed().as_millis();
             if wait_ms > 100 {
                 debug!(
