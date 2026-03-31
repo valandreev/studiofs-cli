@@ -66,7 +66,7 @@ host — cross-compilation or a Linux-only CI pass does not count.
      integration tests). The `--tests` flag is required so that
      non-mount platform tests placed in `tests/` (e.g.
      `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
-     integration tests). On macOS the `--tests` flag is required so that
+   - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
      non-mount platform tests placed in `tests/` (e.g.
      `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
