@@ -140,12 +140,20 @@ fn is_benign_best_effort_error(error: &io::Error) -> bool {
 }
 
 #[cfg(windows)]
-fn is_benign_best_effort_error(_error: &io::Error) -> bool {
-    // Windows-specific best-effort advisory primitives are still implemented as
-    // safe no-ops. If future implementations start returning native errors,
-    // keep the best-effort contract by treating unsupported advisory requests
-    // (for example ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED) as benign.
-    false
+fn is_benign_best_effort_error(error: &io::Error) -> bool {
+    // Keep advisory/storage hints best-effort on Windows too. Filesystems and
+    // runtimes commonly report unsupported or denied advisory requests via
+    // Win32 errors that should not fail the cache fast path.
+    matches!(
+        error.raw_os_error(),
+        Some(
+            1   // ERROR_INVALID_FUNCTION
+                | 5   // ERROR_ACCESS_DENIED
+                | 50  // ERROR_NOT_SUPPORTED
+                | 87  // ERROR_INVALID_PARAMETER
+                | 120 // ERROR_CALL_NOT_IMPLEMENTED
+        )
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -256,4 +264,23 @@ fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
             "offset exceeds platform off_t range",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_best_effort_error_list_covers_common_advisory_failures() {
+        for code in [1, 5, 50, 87, 120] {
+            assert!(is_benign_best_effort_error(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+
+        assert!(!is_benign_best_effort_error(&io::Error::from_raw_os_error(
+            32
+        )));
+    }
 }

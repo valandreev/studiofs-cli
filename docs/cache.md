@@ -116,6 +116,9 @@ Implementation notes:
   so fallback recovery scans only pick up live blocks.
 - free paths issue best-effort hole-punch and `dont-need` hints, while file
   growth issues best-effort preallocation before `set_len()`.
+- Windows keeps the same best-effort contract for advisory/storage hints by
+  treating common unsupported or denied Win32 responses as benign rather than
+  surfacing them as cache read/write failures.
 
 Error variants include `CacheFull { needed, max_size, allocated, free }` for
 fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
