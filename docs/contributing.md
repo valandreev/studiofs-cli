@@ -44,7 +44,7 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 **Compile/unit/smoke distinctions:**
 
-- **Portable compile + clippy** — checked by Quality Gates on Linux, then again by each platform job. Catches API breakage on all supported targets.
+- **Portable compile + clippy** — `cargo clippy` runs in Quality Gates (Linux), macOS, and Windows jobs. The Linux job does not repeat clippy; compile coverage on Linux comes from the workspace `cargo test` run. Together the three jobs catch API and cfg-gated breakage on all supported targets.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
 - **Platform unit tests** — the named backend step in each platform job (`studiofs-fuse` on Linux and macOS, `studiofs-winfsp` on Windows). This is the primary signal for platform-specific code paths.
 - **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. Run manually or on self-hosted runners with the full kernel driver available. Not a PR gate.
@@ -117,7 +117,7 @@ any other host-OS conditional that routes to platform-specific behavior.
 A PR that adds or meaningfully changes a `cfg`-guarded branch **must** include
 one of the following in the PR description:
 
-- "CI covers this — the macOS job runs `studiofs-fuse --lib --tests` which exercises this path."
+- "CI covers this — the macOS job runs `cargo test -p studiofs-fuse --lib --tests` which exercises this path."
 - "This path requires a live FUSE mount. I validated locally with `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored`."
 - "This path is Windows-only. CI covers it via the `studiofs-winfsp` unit step on `windows-latest`."
 
