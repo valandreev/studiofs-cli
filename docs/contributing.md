@@ -31,7 +31,7 @@ sufficient.
 
 | Check | Notes |
 |-------|-------|
-| Platform bridge smoke tests (FUSE mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]`. See [smoke workflow](#smoke-test-workflow) |
+| Platform bridge smoke tests (mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]`. See [smoke workflow](#smoke-test-workflow) |
 | S3 / PostgreSQL integration tests | Require live RustFS + PostgreSQL; all marked `#[ignore]` |
 | Cross-client convergence tests | Require multi-process infra setup; all marked `#[ignore]` |
 

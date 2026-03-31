@@ -142,6 +142,14 @@ fn fuse_mount_write_read_unmount_smoke() {
     ];
 
     let mount_path = mount_dir.path().to_path_buf();
+
+    // Capture the device ID before FUSE mounts over the directory.
+    // When FUSE is active the kernel overlays a new device, so dev() changes.
+    use std::os::unix::fs::MetadataExt;
+    let pre_dev = std::fs::metadata(&mount_path)
+        .expect("mount dir should exist before session creation")
+        .dev();
+
     let mut session = fuser::Session::new(fs, &mount_path, &options).expect("create FUSE session");
     let mut unmount = session.unmount_callable();
 
@@ -152,12 +160,14 @@ fn fuse_mount_write_read_unmount_smoke() {
         }
     });
 
-    // Poll until the mount becomes available (up to 10 s).
-    // On slow CI runners a fixed sleep(2 s) is insufficient.
+    // Poll until the FUSE filesystem is overlaid (device ID diverges from pre-mount value).
+    // A plain is_ok() check would pass immediately because the temp dir already exists.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if std::fs::metadata(&mount_path).is_ok() {
-            // The mount root is stat-able — FUSE is up.
+        if std::fs::metadata(&mount_path)
+            .map(|m| m.dev() != pre_dev)
+            .unwrap_or(false)
+        {
             break;
         }
         assert!(
@@ -183,7 +193,7 @@ fn fuse_mount_write_read_unmount_smoke() {
         .map(|e| e.file_name())
         .collect();
     assert!(
-        entries.iter().any(|n| n == "smoke.txt"),
+        entries.iter().any(|n| n == std::ffi::OsStr::new("smoke.txt")),
         "directory listing must contain the created file, got: {entries:?}"
     );
 
@@ -191,7 +201,7 @@ fn fuse_mount_write_read_unmount_smoke() {
     std::fs::remove_file(&test_file).expect("delete through FUSE mount");
 
     // ── Clean unmount ───────────────────────────────────────────────
-    let _ = unmount.unmount();
+    unmount.unmount().expect("FUSE unmount should succeed");
     session_handle
         .join()
         .expect("FUSE session thread should exit cleanly");

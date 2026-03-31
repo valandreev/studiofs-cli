@@ -174,8 +174,6 @@ fn winfsp_mount_write_read_unmount_smoke() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    // drive_root already computed above.
-
     // ── Smoke: create + write ───────────────────────────────────────
     let test_file = std::path::PathBuf::from(&drive_root).join("smoke.txt");
     let payload = b"StudioFS WinFSP smoke-test payload";
@@ -192,7 +190,7 @@ fn winfsp_mount_write_read_unmount_smoke() {
         .map(|e| e.file_name())
         .collect();
     assert!(
-        entries.iter().any(|n| n == "smoke.txt"),
+        entries.iter().any(|n| n == std::ffi::OsStr::new("smoke.txt")),
         "directory listing must contain the created file, got: {entries:?}"
     );
 
