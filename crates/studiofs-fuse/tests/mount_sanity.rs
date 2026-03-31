@@ -193,7 +193,9 @@ fn fuse_mount_write_read_unmount_smoke() {
         .map(|e| e.file_name())
         .collect();
     assert!(
-        entries.iter().any(|n| n == std::ffi::OsStr::new("smoke.txt")),
+        entries
+            .iter()
+            .any(|n| n == std::ffi::OsStr::new("smoke.txt")),
         "directory listing must contain the created file, got: {entries:?}"
     );
 
