@@ -9718,7 +9718,7 @@ impl StudioVfs {
 
         self.remove_live_extents_for_inode(ino);
 
-        // L1 + L2 — unified block cache: remove each object.
+        // Committed cache + L1/L2 upload cache: remove each object.
         // Blocks with a pending upload are pinned — schedule deferred eviction
         // so they are cleaned up once the upload completes (or is cancelled by
         // the uploader when it detects the inode is deleted).
@@ -9742,6 +9742,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
+            self.block_store.remove_batch(&evicted);
         }
         if !evicted.is_empty() || !deferred_pinned.is_empty() {
             debug!(
@@ -9785,6 +9786,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
+            self.block_store.remove_batch(&evicted);
         }
         if !evicted.is_empty() || deferred_pinned > 0 {
             info!(
@@ -9882,7 +9884,7 @@ impl StudioVfs {
         }
         let _ = self.remove_spill_entry((ino, block_index));
 
-        // L1 + L2 — unified block cache (defer if pinned for pending upload).
+        // Committed cache + L1/L2 upload cache (defer if pinned for pending upload).
         if self.block_cache.is_pinned(object_id) {
             self.state.upload.pending_evictions.lock().insert(object_id);
             debug!(
@@ -9891,6 +9893,7 @@ impl StudioVfs {
             );
         } else {
             self.block_cache.remove_sync(object_id);
+            self.block_store.remove(object_id);
         }
     }
 
