@@ -58,26 +58,13 @@ fn make_test_vfs(
 }
 
 fn signal_named_event(name: &str) {
-    unsafe extern "system" {
-        fn OpenEventW(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            lpName: *const u16,
-        ) -> *mut core::ffi::c_void;
-        fn SetEvent(hEvent: *mut core::ffi::c_void) -> i32;
-        fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
-    }
+    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    use windows::core::HSTRING;
 
-    const EVENT_MODIFY_STATE: u32 = 0x0002;
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
-    if event.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = SetEvent(event);
-        let _ = CloseHandle(event);
-    }
+    let wide = HSTRING::from(name);
+    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &wide) };
+    let Ok(event) = event else { return };
+    let _ = unsafe { SetEvent(event) };
 }
 
 #[test]
@@ -166,15 +153,26 @@ fn winfsp_mount_write_read_unmount_smoke() {
         .map_err(|e| e.to_string())
     });
 
-    // Allow time for WinFSP mount to become available.
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Ensure the drive root path ends with a backslash.
+    // Poll until the drive root becomes available (up to 10 s).
+    // On slow CI runners a fixed sleep(2 s) is insufficient.
     let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
         mount_point.clone()
     } else {
         format!("{mount_point}\\")
     };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // drive_root already computed above.
 
     // ── Smoke: create + write ───────────────────────────────────────
     let test_file = std::path::PathBuf::from(&drive_root).join("smoke.txt");

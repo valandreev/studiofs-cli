@@ -152,8 +152,20 @@ fn fuse_mount_write_read_unmount_smoke() {
         }
     });
 
-    // Allow time for the mount to become available.
-    std::thread::sleep(Duration::from_secs(2));
+    // Poll until the mount becomes available (up to 10 s).
+    // On slow CI runners a fixed sleep(2 s) is insufficient.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&mount_path).is_ok() {
+            // The mount root is stat-able — FUSE is up.
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "FUSE mount did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // ── Smoke: create + write ───────────────────────────────────────
     let test_file = mount_path.join("smoke.txt");
