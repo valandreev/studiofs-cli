@@ -12,5 +12,10 @@
   "search.exclude": {
     "**/target": true,
     "**/node_modules": true
+  },
+  "chat.tools.terminal.autoApprove": {
+    "cargo clippy": true,
+    "cargo test": true,
+    "git commit": true
   }
 }
