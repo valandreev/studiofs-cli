@@ -47,14 +47,29 @@ pub struct BlockStoreConfig {
 pub enum BlockStoreError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("cache full: need {needed} bytes, limit {max_size}")]
-    CacheFull { needed: u64, max_size: u64 },
+    #[error(
+        "cache full: need {needed} bytes, limit {max_size} \
+         (allocated {allocated}, free {free})"
+    )]
+    CacheFull {
+        needed: u64,
+        max_size: u64,
+        allocated: u64,
+        free: u64,
+    },
     #[error("corrupt superblock: {0}")]
     CorruptSuperblock(String),
     #[error("format version mismatch: expected {expected}, found {found}")]
     VersionMismatch { expected: u32, found: u32 },
     #[error("volume UUID mismatch")]
     VolumeUuidMismatch,
+    #[error(
+        "max_size shrunk: superblock records {superblock_max} but config specifies {config_max}"
+    )]
+    MaxSizeShrunk {
+        superblock_max: u64,
+        config_max: u64,
+    },
 }
 
 // ===========================================================================
@@ -131,6 +146,12 @@ impl BlockStore {
             if sb.volume_uuid != config.volume_uuid {
                 return Err(BlockStoreError::VolumeUuidMismatch);
             }
+            if config.max_size < sb.max_size {
+                return Err(BlockStoreError::MaxSizeShrunk {
+                    superblock_max: sb.max_size,
+                    config_max: config.max_size,
+                });
+            }
 
             (file, len)
         } else {
@@ -152,6 +173,12 @@ impl BlockStore {
         // No index persistence yet — treat all data-region bytes as free.
         let file_end = std::cmp::max(file_len, SUPERBLOCK_SIZE);
         let allocator = if file_end > SUPERBLOCK_SIZE {
+            warn!(
+                data_bytes = file_end - SUPERBLOCK_SIZE,
+                "opening non-empty blocks.data without index persistence; \
+                 all existing data regions will be treated as free space \
+                 (index persistence coming in SFS-136)",
+            );
             FreeList::recover(config.max_size, file_end, &[])
         } else {
             FreeList::new(config.max_size)
@@ -224,18 +251,25 @@ impl BlockStore {
         let data_size = data.len() as u32;
         let alloc = alloc_size_for(data_size);
 
-        // Replace if already present.
-        if self.contains(object_id) {
-            self.remove(object_id);
-        }
+        // Remove if already present (remove is a no-op for missing keys,
+        // saving one RwLock read compared to contains()+remove()).
+        self.remove(object_id);
 
         // Allocate space + ensure the file is large enough (under lock).
         let offset = {
             let mut alloc_guard = self.allocator.lock();
             let offset = alloc_guard.allocate(alloc).map_err(|e| match e {
-                AllocError::CacheFull { needed, max_size } => {
-                    BlockStoreError::CacheFull { needed, max_size }
-                }
+                AllocError::CacheFull {
+                    needed,
+                    max_size,
+                    allocated,
+                    free,
+                } => BlockStoreError::CacheFull {
+                    needed,
+                    max_size,
+                    allocated,
+                    free,
+                },
             })?;
             let needed_len = alloc_guard.file_end();
             drop(alloc_guard);
@@ -686,5 +720,139 @@ mod tests {
         for i in (0u64..100).step_by(2) {
             assert!(store.contains(i));
         }
+    }
+
+    #[test]
+    fn fragmentation_and_coalesce() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        // Insert blocks of varying sizes: 100B, 4000B, 8000B, 500B, 16000B
+        let sizes: &[usize] = &[
+            100, 4_000, 8_000, 500, 16_000, 200, 6_000, 1_000, 12_000, 50,
+        ];
+        for (i, &sz) in sizes.iter().enumerate() {
+            let data = vec![(i & 0xFF) as u8; sz];
+            store.put(i as u64, &data, true).unwrap();
+        }
+        assert_eq!(store.block_count(), sizes.len() as u64);
+        let alloc_before = store.allocated_bytes();
+
+        // Remove every other block to create fragmentation.
+        for i in (0..sizes.len()).step_by(2) {
+            store.remove(i as u64);
+        }
+        assert_eq!(store.block_count(), 5);
+
+        // Remaining blocks should still be readable.
+        for i in (1..sizes.len()).step_by(2) {
+            let expected = vec![(i & 0xFF) as u8; sizes[i]];
+            let got = store.get(i as u64).unwrap();
+            assert_eq!(&got[..], &expected[..]);
+        }
+
+        // Re-insert into the holes — allocator should reuse free space.
+        for i in (0..sizes.len()).step_by(2) {
+            let data = vec![0xFFu8; sizes[i]];
+            store.put(i as u64, &data, true).unwrap();
+        }
+        assert_eq!(store.block_count(), sizes.len() as u64);
+
+        // Total allocation should be the same (space was reused, not grown).
+        assert_eq!(store.allocated_bytes(), alloc_before);
+    }
+
+    #[test]
+    fn concurrent_put_get() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlockStore::open(test_config(&dir)).unwrap());
+
+        // Phase 1: concurrent puts from 4 threads, 50 blocks each (disjoint ID ranges).
+        let mut handles = Vec::new();
+        for t in 0u64..4 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                let base = t * 50;
+                for i in 0..50 {
+                    let id = base + i;
+                    let data = format!("t{t}-block-{i}");
+                    s.put(id, data.as_bytes(), true).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.block_count(), 200);
+
+        // Phase 2: concurrent reads from 4 threads.
+        let mut handles = Vec::new();
+        for t in 0u64..4 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                let base = t * 50;
+                for i in 0..50 {
+                    let id = base + i;
+                    let expected = format!("t{t}-block-{i}");
+                    let got = s.get(id).expect("should hit");
+                    assert_eq!(&got[..], expected.as_bytes());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.hit_count(), 200);
+
+        // Phase 3: concurrent mixed put + remove.
+        let mut handles = Vec::new();
+        // Thread removing odd IDs
+        {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for id in (1..200u64).step_by(2) {
+                    s.remove(id);
+                }
+            }));
+        }
+        // Thread putting new blocks into a higher ID range
+        {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for id in 200..300u64 {
+                    s.put(id, b"new-block", true).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Even IDs from original range should still be present.
+        for id in (0..200u64).step_by(2) {
+            assert!(store.contains(id), "even id {id} should survive");
+        }
+    }
+
+    #[test]
+    fn reopen_rejects_shrunk_max_size() {
+        let dir = TempDir::new().unwrap();
+        let config1 = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 128 * 1024 * 1024,
+            volume_uuid: [0x11; 16],
+        };
+        BlockStore::open(config1).unwrap().close().unwrap();
+
+        let config2 = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 64 * 1024 * 1024, // smaller than superblock
+            volume_uuid: [0x11; 16],
+        };
+        let res = BlockStore::open(config2);
+        assert!(matches!(res, Err(BlockStoreError::MaxSizeShrunk { .. })));
     }
 }

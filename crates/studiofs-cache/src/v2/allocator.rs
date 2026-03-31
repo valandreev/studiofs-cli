@@ -10,8 +10,16 @@ use crate::v2::format::{GROWTH_CHUNK, PAGE_SIZE, SUPERBLOCK_SIZE};
 /// Allocation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AllocError {
-    #[error("cache full: need {needed} bytes, limit {max_size}")]
-    CacheFull { needed: u64, max_size: u64 },
+    #[error(
+        "cache full: need {needed} bytes, limit {max_size} \
+         (allocated {allocated}, free {free})"
+    )]
+    CacheFull {
+        needed: u64,
+        max_size: u64,
+        allocated: u64,
+        free: u64,
+    },
 }
 
 /// Free-space allocator tracking unused byte ranges in the data file.
@@ -131,6 +139,8 @@ impl FreeList {
         Err(AllocError::CacheFull {
             needed: size,
             max_size: self.max_size,
+            allocated: self.allocated_bytes,
+            free: self.free_bytes(),
         })
     }
 
