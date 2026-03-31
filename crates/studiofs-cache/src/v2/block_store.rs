@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tracing::warn;
 
 use crate::v2::allocator::{AllocError, FreeList};
@@ -84,7 +84,7 @@ struct BlockEntry {
     /// Actual payload size (bytes).
     data_size: u32,
     /// Total allocated size on disk (page-aligned, includes header + padding).
-    alloc_size: u32,
+    alloc_size: u64,
     /// CRC-32 of the payload (for read-time verification).
     checksum: u32,
     /// Flags stored in the on-disk header (DIRTY, PINNED, …).
@@ -107,6 +107,9 @@ pub struct BlockStore {
     block_count: AtomicU64,
     hit_count: AtomicU64,
     miss_count: AtomicU64,
+    /// Set by `close()` so that [`Drop`] skips the redundant fdatasync on the
+    /// normal shutdown path.
+    synced: AtomicBool,
 }
 
 impl BlockStore {
@@ -137,6 +140,13 @@ impl BlockStore {
             let sb = Superblock::from_bytes(&sb_buf)
                 .map_err(|e| BlockStoreError::CorruptSuperblock(e.to_string()))?;
 
+            if sb.page_size != format::PAGE_SIZE as u32 {
+                return Err(BlockStoreError::CorruptSuperblock(format!(
+                    "page_size mismatch: expected {}, found {}",
+                    format::PAGE_SIZE,
+                    sb.page_size,
+                )));
+            }
             if sb.version != FORMAT_VERSION {
                 return Err(BlockStoreError::VersionMismatch {
                     expected: FORMAT_VERSION,
@@ -151,6 +161,12 @@ impl BlockStore {
                     superblock_max: sb.max_size,
                     config_max: config.max_size,
                 });
+            }
+            if config.max_size > sb.max_size {
+                // Persist the larger limit so a future reopen reflects the
+                // current upper bound rather than the original smaller value.
+                let updated_sb = Superblock::new(config.max_size, config.volume_uuid);
+                platform::pwrite(&file, &updated_sb.to_bytes(), 0)?;
             }
 
             (file, len)
@@ -193,6 +209,7 @@ impl BlockStore {
             block_count: AtomicU64::new(0),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
+            synced: AtomicBool::new(false),
         })
     }
 
@@ -203,7 +220,13 @@ impl BlockStore {
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
         let entry = {
             let entries = self.entries.read();
-            *entries.get(&object_id)?
+            match entries.get(&object_id) {
+                Some(e) => *e,
+                None => {
+                    self.miss_count.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
         };
 
         let mut buf = vec![0u8; entry.data_size as usize];
@@ -248,7 +271,12 @@ impl BlockStore {
     /// * Returns [`BlockStoreError::CacheFull`] when there is no room and
     ///   nothing can be reclaimed.
     pub fn put(&self, object_id: u64, data: &[u8], evictable: bool) -> Result<(), BlockStoreError> {
-        let data_size = data.len() as u32;
+        let data_size = u32::try_from(data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block too large for cache format (size exceeds u32::MAX)",
+            )
+        })?;
         let alloc = alloc_size_for(data_size);
 
         // Remove if already present (remove is a no-op for missing keys,
@@ -286,12 +314,20 @@ impl BlockStore {
         };
 
         // Write header + payload via pwrite (concurrent-safe, no seek).
+        // On any I/O failure the allocated region is freed before returning so
+        // the allocator does not leak space.
         let checksum = crc32fast::hash(data);
         let flags = if evictable { 0 } else { format::FLAG_DIRTY };
         let header = BlockHeader::new(object_id, data_size, checksum, flags);
-        platform::pwrite(&self.file, &header.to_bytes(), offset)?;
-        if !data.is_empty() {
-            platform::pwrite(&self.file, data, offset + BLOCK_HEADER_SIZE as u64)?;
+        if let Err(e) = platform::pwrite(&self.file, &header.to_bytes(), offset).and_then(|()| {
+            if !data.is_empty() {
+                platform::pwrite(&self.file, data, offset + BLOCK_HEADER_SIZE as u64)
+            } else {
+                Ok(())
+            }
+        }) {
+            self.allocator.lock().free(offset, alloc);
+            return Err(BlockStoreError::Io(e));
         }
 
         // Record in-memory entry.
@@ -302,7 +338,7 @@ impl BlockStore {
                 BlockEntry {
                     offset,
                     data_size,
-                    alloc_size: alloc as u32,
+                    alloc_size: alloc,
                     checksum,
                     flags,
                 },
@@ -317,12 +353,31 @@ impl BlockStore {
     }
 
     /// Mark a dirty block as evictable (e.g. after a successful S3 upload).
+    ///
+    /// Persists the cleared DIRTY flag to the on-disk block header so that
+    /// the SFS-136 crash-recovery scanner sees the correct state.  On
+    /// pwrite failure the block remains dirty and a warning is logged.
     pub fn mark_evictable(&self, object_id: u64) {
         let mut entries = self.entries.write();
         if let Some(entry) = entries.get_mut(&object_id) {
             if entry.flags & format::FLAG_DIRTY != 0 {
-                entry.flags &= !format::FLAG_DIRTY;
-                self.dirty_count.fetch_sub(1, Ordering::Relaxed);
+                let new_flags = entry.flags & !format::FLAG_DIRTY;
+                let header =
+                    BlockHeader::new(object_id, entry.data_size, entry.checksum, new_flags);
+                match platform::pwrite(&self.file, &header.to_bytes(), entry.offset) {
+                    Ok(()) => {
+                        entry.flags = new_flags;
+                        self.dirty_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = ?e,
+                            object_id,
+                            offset = entry.offset,
+                            "mark_evictable: pwrite failed; block remains dirty",
+                        );
+                    }
+                }
             }
         }
     }
@@ -336,7 +391,7 @@ impl BlockStore {
         if let Some(entry) = entry {
             self.allocator
                 .lock()
-                .free(entry.offset, entry.alloc_size as u64);
+                .free(entry.offset, entry.alloc_size);
             self.block_count.fetch_sub(1, Ordering::Relaxed);
             if entry.flags & format::FLAG_DIRTY != 0 {
                 self.dirty_count.fetch_sub(1, Ordering::Relaxed);
@@ -360,7 +415,7 @@ impl BlockStore {
         let mut alloc = self.allocator.lock();
         let mut dirty_removed = 0u32;
         for entry in &removed {
-            alloc.free(entry.offset, entry.alloc_size as u64);
+            alloc.free(entry.offset, entry.alloc_size);
             if entry.flags & format::FLAG_DIRTY != 0 {
                 dirty_removed += 1;
             }
@@ -385,12 +440,18 @@ impl BlockStore {
     /// Prefer calling `close()` explicitly over relying on [`Drop`].
     pub fn close(self) -> Result<(), BlockStoreError> {
         platform::fdatasync(&self.file)?;
+        self.synced.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
 
 impl Drop for BlockStore {
     fn drop(&mut self) {
+        // Skip if `close()` already synced to avoid a redundant syscall on
+        // the normal shutdown path.
+        if self.synced.load(Ordering::Relaxed) {
+            return;
+        }
         // Best-effort sync so data reaches stable storage even when the
         // caller forgets to call `close()`.  Errors are logged but not
         // propagated (Drop cannot fail).
@@ -482,7 +543,7 @@ mod tests {
         let store = BlockStore::open(test_config(&dir)).unwrap();
 
         assert!(store.get(999).is_none());
-        assert_eq!(store.miss_count(), 0); // miss counter only bumps on pread/checksum failures
+        assert_eq!(store.miss_count(), 1); // index miss increments counter
     }
 
     #[test]
