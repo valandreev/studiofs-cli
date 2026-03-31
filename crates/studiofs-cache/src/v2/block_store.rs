@@ -271,13 +271,17 @@ impl BlockStore {
                     free,
                 },
             })?;
-            let needed_len = alloc_guard.file_end();
-            drop(alloc_guard);
 
+            // Extend the physical file while still holding the allocator lock
+            // so that a concurrent `free()` + `allocate()` in another thread
+            // cannot observe a smaller `file_end` and race with `set_len`.
+            let needed_len = alloc_guard.file_end();
             let current_len = self.file.metadata()?.len();
             if needed_len > current_len {
                 self.file.set_len(needed_len)?;
             }
+            drop(alloc_guard);
+
             offset
         };
 
@@ -377,11 +381,26 @@ impl BlockStore {
     }
 
     /// Graceful shutdown: sync data and drop the file handle.
+    ///
+    /// Prefer calling `close()` explicitly over relying on [`Drop`].
     pub fn close(self) -> Result<(), BlockStoreError> {
         platform::fdatasync(&self.file)?;
         Ok(())
     }
+}
 
+impl Drop for BlockStore {
+    fn drop(&mut self) {
+        // Best-effort sync so data reaches stable storage even when the
+        // caller forgets to call `close()`.  Errors are logged but not
+        // propagated (Drop cannot fail).
+        if let Err(e) = platform::fdatasync(&self.file) {
+            warn!(%e, "BlockStore drop: fdatasync failed");
+        }
+    }
+}
+
+impl BlockStore {
     // -- Metrics --
 
     /// Bytes currently allocated to live blocks (including headers + padding).

@@ -1,6 +1,123 @@
 # Cache System
 
-The cache subsystem (`studiofs-cache`) implements a two-level block cache designed for high-throughput NVMe-backed storage with crash-safe writeback to S3.
+The cache subsystem (`studiofs-cache`) implements block caching for high-throughput
+NVMe-backed storage with crash-safe writeback to S3.
+
+There are two generations of the cache implementation:
+
+| Generation | Module | Status |
+|------------|--------|--------|
+| **v3 (current)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active — used by VFS |
+| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format` | Foundation laid (SFS-135); index + eviction in SFS-136 |
+
+---
+
+## Cache v2 — Single-file BlockStore
+
+> **Status:** Foundation implemented in SFS-135. Not yet wired to VFS.
+
+Replaces the L1/L2 split with a single `blocks.data` file managed by a native
+free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
+
+### Cache directory layout
+
+```
+{cache_dir}/
+├── blocks.data     # single data file (all blocks)
+├── blocks.idx      # index snapshot — binary (SFS-136)
+├── blocks.wal      # index WAL — append-only (SFS-136)
+└── pins.json       # pin config — future
+```
+
+### `blocks.data` format
+
+**Superblock** (first 4 096 bytes, offset 0):
+
+| Offset | Size | Field        | Description                      |
+|--------|------|--------------|----------------------------------|
+| 0      | 8    | `magic`      | `b"STFSCA\x01\x00"`              |
+| 8      | 4    | `version`    | `1u32` (little-endian)           |
+| 12     | 4    | `page_size`  | `4096u32`                        |
+| 16     | 8    | `max_size`   | user-configured limit (bytes)    |
+| 24     | 8    | `created_at` | Unix timestamp                   |
+| 32     | 16   | `volume_uuid`| ties cache to a specific volume  |
+| 48     | 4048 | `_reserved`  | zero-filled                      |
+
+**Block record** (offset 4096+, each 4 KiB-aligned):
+
+```
+┌──────────────────────────────────────────────┐
+│ Block Header (32 bytes)                       │
+│  magic: [u8; 4]    = b"SBLK"                │
+│  flags: u8          (DIRTY=0x01, PINNED=0x02)│
+│  _reserved: [u8; 3]                          │
+│  object_id: u64                              │
+│  data_size: u32    (actual payload bytes)    │
+│  checksum: u32     (crc32fast of payload)    │
+│  _padding: [u8; 8]                           │
+├──────────────────────────────────────────────┤
+│ Payload  (data_size bytes)                    │
+├──────────────────────────────────────────────┤
+│ Padding  (to next 4 KiB boundary)            │
+└──────────────────────────────────────────────┘
+```
+
+Allocation size = `ceil((32 + data_size) / 4096) * 4096`.
+
+### FreeList allocator
+
+`v2::allocator::FreeList` — best-fit with dual BTreeMap indexes:
+
+- `by_offset: BTreeMap<u64, u64>` — O(log n) neighbour lookup for coalescing
+- `by_size: BTreeMap<(u64, u64), ()>` — O(log n) best-fit search
+
+Key behaviours:
+
+| Operation | Description |
+|-----------|-------------|
+| `allocate(size)` | Best-fit from free list; grows file by `max(size, 256 MiB)` if no fit |
+| `free(offset, size)` | Returns region, coalesces left+right neighbours, truncates tail |
+| `recover(max_size, file_end, occupied)` | Rebuilds free list from live block offsets (used by SFS-136 index recovery) |
+
+File extension (`set_len`) happens **inside the allocator lock** to prevent
+concurrent threads from observing an inconsistent file end.
+
+### `BlockStore` API
+
+```rust
+BlockStore::open(config)            // create or open (validates magic, version, UUID, max_size)
+BlockStore::put(id, data, evictable)// allocate + pwrite header + payload; replace if exists
+BlockStore::get(id)                 // pread + crc32 verify → Option<Bytes>
+BlockStore::contains(id)            // index lookup only
+BlockStore::remove(id)              // free allocation, update index
+BlockStore::remove_batch(ids)       // batched remove under single allocator lock
+BlockStore::mark_evictable(id)      // clear DIRTY flag after S3 upload
+BlockStore::sync_data()             // fdatasync
+BlockStore::close(self)             // fdatasync + drop
+// Drop impl: best-effort fdatasync on implicit drop
+```
+
+Error variants include `CacheFull { needed, max_size, allocated, free }` for
+fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
+limit on an existing file.
+
+### Index persistence (SFS-136)
+
+Not yet implemented.  On open, all data-region bytes are treated as free space
+(index is empty).  A WARN log is emitted when a non-empty `blocks.data` is
+opened without index persistence.
+
+When SFS-136 lands:
+1. **Fast path** — load `blocks.idx` snapshot + replay `blocks.wal`
+2. **Crash fallback** — scan `blocks.data` block headers (`SBLK` magic + checksum)
+
+Block headers are written today precisely to support fallback recovery.
+
+---
+
+## Cache v3 (current) — L1 + L2
+
+> **Status:** Active.  Used by VFS.  Will be replaced by v2 once SFS-136 lands.
 
 ## Architecture
 
