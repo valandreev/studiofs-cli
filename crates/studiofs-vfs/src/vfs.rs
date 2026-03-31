@@ -9,17 +9,16 @@
 //!
 //! Write Path:
 //! 1. Split data into blocks
-//! 2. Package block into STFS object format
-//! 3. Allocate sequential block ID
-//! 4. Store in cache with journal
-//! 5. Queue for async upload
-//! 6. Update metadata with BlockRef
+//! 2. Merge dirty bytes into the per-file `WriteBuffer`
+//! 3. Persist full dirty blocks locally via `BlockStore::put(...)`
+//! 4. `sync_data()` and persist extent metadata / attrs
+//! 5. Queue committed extents for async upload + remote publish
 //!
 //! Read Path:
-//! 1. Look up block references from metadata
-//! 2. Fetch from cache/S3
-//! 3. Validate object payload + checksum
-//! 4. Assemble response
+//! 1. Check the `WriteBuffer` overlay for newer local bytes
+//! 2. Resolve local metadata refs to committed local extents in `BlockStore`
+//! 3. Fall back to compatibility cache helpers / S3 fetch
+//! 4. Validate object payload + checksum and assemble response
 
 #[path = "commit.rs"]
 mod commit;
@@ -146,17 +145,21 @@ pub struct StatFs {
     pub frsize: u32,
 }
 
-/// Snapshot of local accepted-ingress state used for observability and
-/// backpressure diagnostics.
+/// Snapshot of local write-buffer / legacy-ingress state used for observability
+/// and backpressure diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct VfsIngressStats {
-    /// Accepted bytes currently buffered in RAM (`dirty_mem`).
+    /// Accepted bytes currently buffered in RAM by the active `WriteBuffer`
+    /// path (legacy field name retained for compatibility).
     pub dirty_mem_bytes: usize,
-    /// Accepted block count currently buffered in RAM (`dirty_mem`).
+    /// Accepted block count currently buffered in RAM by the active
+    /// `WriteBuffer` path (legacy field name retained for compatibility).
     pub dirty_mem_blocks: usize,
-    /// Accepted bytes currently spilled to local NVMe (`ingress_spill`).
+    /// Legacy ingress spill bytes currently present on local NVMe.
+    /// Expected to remain zero on the Cache v2 foreground path.
     pub spill_bytes: usize,
-    /// Accepted spill records currently present in `ingress_spill`.
+    /// Legacy ingress spill records currently present on disk.
+    /// Expected to remain zero on the Cache v2 foreground path.
     pub spill_records: usize,
     /// Age of the oldest spill record in milliseconds.
     pub oldest_spill_age_ms: u64,
@@ -171,16 +174,21 @@ pub struct VfsIngressStats {
     pub fast_backpressure_events: u64,
     /// Maximum single fast-mode backpressure stall observed since startup.
     pub fast_backpressure_stall_max_ms: u64,
-    /// Number of blocks that were forced to spill because RAM acceptance was
-    /// over budget.
+    /// Legacy counter for blocks that were forced to spill because RAM
+    /// acceptance was over budget. Expected to remain zero on the Cache v2
+    /// foreground path.
     pub forced_spill_blocks: u64,
-    /// Total blocks drained from RAM accepted state into metadata/cache.
+    /// Total blocks drained from RAM accepted state into committed local
+    /// metadata / cache state.
     pub drained_mem_blocks: u64,
-    /// Total bytes drained from RAM accepted state into metadata/cache.
+    /// Total bytes drained from RAM accepted state into committed local
+    /// metadata / cache state.
     pub drained_mem_bytes: u64,
-    /// Total blocks drained from spill accepted state into metadata/cache.
+    /// Total blocks drained from legacy spill accepted state into committed
+    /// local metadata / cache state.
     pub drained_spill_blocks: u64,
-    /// Total bytes drained from spill accepted state into metadata/cache.
+    /// Total bytes drained from legacy spill accepted state into committed
+    /// local metadata / cache state.
     pub drained_spill_bytes: u64,
     /// Retry attempts made when a locally-accepted block was found in
     /// `live_extent_records` but was transiently absent from the block cache
@@ -212,7 +220,9 @@ pub struct VfsIngressStats {
     pub checkpoint_live_segments: u64,
 }
 
-/// Immediate local-ingress acceptance decision for a prospective write batch.
+/// Compatibility-shaped acceptance decision for a prospective write batch.
+/// The active Cache v2 foreground path uses `DirtyMem` and `Backpressure`;
+/// `Spill` is retained for legacy observability compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsIngressLane {
     DirtyMem,

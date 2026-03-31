@@ -19,14 +19,14 @@ file when `studiofs mount` starts.
 
 The `[vfs]` section currently covers:
 
-- dirty/spill budgets and ingress segment sizing
+- write-buffer budgets and legacy ingress-artifact compatibility sizing
 - janitor cadence and lease settings
 - read-ahead, prefetch, and directory hydration tuning
 - xattr limits and cache capacities
 - upload/fetch retry and timeout tuning
 - QoS semaphore slot counts
-- slab flush behavior and shutdown flush timeout
-- materializer drain batch sizing
+- local write-buffer drain behavior and shutdown flush timeout
+- write-buffer persist batch sizing
 - publish visibility timeout before manifest commit
 
 Priority for each setting:
@@ -174,7 +174,7 @@ Notes:
 - `studiofs settings --disable-bg-slab-flush` disables the background slab flusher in the `[vfs]` section.
 - `studiofs settings --enable-bg-slab-flush` re-enables the background slab flusher in the `[vfs]` section.
 - `studiofs settings --slab-flush-interval 0` disables the background slab flusher (for environments where zero is a preferred explicit override).
-- The `[vfs]` section also stores advanced runtime knobs such as upload/fetch retry windows, QoS slot counts, materializer drain batch size, and publish visibility timeout.
+- The `[vfs]` section also stores advanced runtime knobs such as upload/fetch retry windows, QoS slot counts, write-buffer persist batch size, and publish visibility timeout.
 
 ### `umount`
 
@@ -400,7 +400,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
 | `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
-| `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | NVMe spill budget for accepted dirty blocks |
+| `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | Legacy ingress-artifact budget retained for startup compatibility; new foreground writes do not spill into ingress |
 | `STUDIOFS_XATTR_MAX_BYTES` | `4MB` | Maximum bytes per xattr value when writing metadata (enforced in VFS before metadata persistence) |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
 | `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
@@ -411,7 +411,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY` | `65536` | Max number of cached effective ACL entries before ACL cache reset |
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
-| `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max staged blocks drained per flusher cycle |
+| `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max dirty `WriteBuffer` blocks persisted per local drain cycle |
 | `STUDIOFS_L2_COMMIT_WORKERS` | `32` | Number of bounded L2 commit scheduler workers |
 | `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `4096` | L2 commit queue capacity before enqueue backpressure |
 | `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
@@ -422,13 +422,13 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
-| `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Local cache durability policy: `fast` (single local payload write, best-effort startup self-heal) or `durable` (WAL-backed local accept + checkpoint recovery) |
-| `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Max size of active append-only ingress segment before rotation |
-| `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Periodic ingress checkpoint cadence |
-| `STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES` | `64MB` | Immediate checkpoint trigger on uncheckpointed ingress bytes |
-| `STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS` | `128` | Immediate checkpoint trigger on ingress record mutations |
-| `STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG` | `2` | Checkpoint trigger when active segment runs too far ahead |
-| `STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS` | `4` | Checkpoint trigger when live ingress index spans too many segments |
+| `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Startup recovery policy for legacy ingress artifacts: `fast` discards them during self-heal, `durable` preserves checkpoint/state metadata. Foreground writes use the same `WriteBuffer -> BlockStore -> sync_data() -> metadata` path in both modes |
+| `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Legacy durable-ingress segment rotation size retained for startup recovery compatibility |
+| `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Legacy durable-ingress checkpoint cadence retained for startup recovery compatibility |
+| `STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES` | `64MB` | Legacy durable-ingress checkpoint trigger on uncheckpointed append churn |
+| `STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS` | `128` | Legacy durable-ingress checkpoint trigger on mutation count |
+| `STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG` | `2` | Legacy durable-ingress checkpoint trigger when the active head outruns the last checkpoint |
+| `STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS` | `4` | Legacy durable-ingress checkpoint trigger when retained live refs span too many segments |
 | `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Max attempts for upload retries |
 | `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-upload request timeout |
 | `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base delay |
@@ -460,8 +460,8 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
-| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background slab flusher wake interval (`0` disables background flusher) |
-| `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background slab flusher |
+| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` disables background drain) |
+| `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background local write-buffer drain |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
 | `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from initial L1 cache budget; dynamically resized by MemoryEnvelope` | Global transit-memory credit budget for active in-flight fetch/upload buffers (managed by adaptive envelope) |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
@@ -474,8 +474,8 @@ multipliers (`1KB = 1024B`).
 Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
-- ingress append throughput (`ops`, `bytes`) and latency histogram
-- materialize batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
+- legacy ingress artifact counters/checkpoint stats (expected to remain at zero on the Cache v2 foreground path unless recovering older artifacts)
+- local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache L2 read/write throughput and latency histograms
 - L2 commit scheduler counters (`cache_l2_commit_queue_depth`, `cache_l2_commit_queue_depth_peak`, `cache_l2_commit_workers_active`, `cache_l2_commit_workers_active_peak`, `cache_l2_commit_backpressure_events`)
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
@@ -489,7 +489,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
 
 Upload local-I/O tuning notes:
-- upload workers first try a transient staged payload seeded by the materializer; local-cache I/O slots are only used on staging miss and are released immediately after the cache read.
+- upload workers first try a transient staged payload seeded by the local persist path; local-cache I/O slots are only used on staging miss and are released immediately after the cache read.
 - queue-head staged payloads are preserved under backlog by evicting the newest staged entries first; the bounded transient stage is expanded more aggressively against the dirty-memory budget before falling back to L2.
 - upload workers check L1 before consuming upload local-I/O slots, and actual L2 fallback rereads are deferred while foreground reads are still active.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.

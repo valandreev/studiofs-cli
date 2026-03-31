@@ -201,21 +201,21 @@ ENV TUNING:
   STUDIOFS_UPLOAD_REQUEUE_BASE_MS   Base backoff for exhausted upload requeue (default: 5000).
   STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
   STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
-  STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background slab flusher wake interval (default: 10).
-  STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background slab flushing (default: 0).
+  STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background local write-buffer drain wake interval (default: 10).
+  STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background local write-buffer drain (default: 0).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
-  STUDIOFS_MAX_DRAIN_BATCH          Max staged blocks drained per flusher cycle (default: 1024).
+  STUDIOFS_MAX_DRAIN_BATCH          Max dirty WriteBuffer blocks persisted per drain cycle (default: 1024).
   STUDIOFS_L2_COMMIT_WORKERS        L2 commit scheduler workers (default: 32).
   STUDIOFS_L2_COMMIT_QUEUE_CAPACITY L2 commit scheduler queue depth before backpressure (default: 4096).
   STUDIOFS_L2_READ_TIMEOUT_MS       L2 local-read timeout before cache-miss fallback (default: 5000).
   STUDIOFS_L2_WRITE_TIMEOUT_MS      L2 local-write timeout per attempt (default: 5000).
-  STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Rotate append-only ingress segments after this size (default: 256MiB).
-  STUDIOFS_CACHE_SAFETY_MODE         Local cache durability policy: fast|durable (default: fast).
-  STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Periodic ingress checkpoint interval (default: 30).
-  STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES  Wake checkpointing after this much uncheckpointed append churn (default: 64MiB).
-  STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS  Wake checkpointing after this many uncheckpointed ingress mutations (default: 128).
-  STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG  Wake checkpointing when active head is this many segments ahead of the last checkpoint (default: 2).
-  STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS  Wake checkpointing when live ingress refs span this many segments (default: 4).
+  STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Legacy durable-ingress segment rotation size (default: 256MiB).
+  STUDIOFS_CACHE_SAFETY_MODE         Startup recovery policy for legacy ingress artifacts: fast|durable (default: fast).
+  STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Legacy durable-ingress checkpoint interval (default: 30).
+  STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES  Legacy durable-ingress checkpoint trigger on append churn (default: 64MiB).
+  STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS  Legacy durable-ingress checkpoint trigger on mutation count (default: 128).
+  STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG  Legacy durable-ingress checkpoint trigger on segment lag (default: 2).
+  STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS  Legacy durable-ingress checkpoint trigger on live-segment span (default: 4).
   STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS  Max time to wait for uploaded objects to become visible before publishing manifests (default: 30).
   STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
   STUDIOFS_TRANSIT_MEMORY_BUDGET    Max active read/upload transit buffers (default: 80% of --memory-limit).

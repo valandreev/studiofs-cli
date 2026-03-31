@@ -2161,15 +2161,6 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
     // values here avoids inheriting a stale offline endpoint.
     apply_test_online_s3_env();
 
-    fn segment_file_count(dir: &std::path::Path) -> usize {
-        let dir = dir.join("segments");
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
-            .count()
-    }
-
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2180,7 +2171,6 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let spill_dir = cache_dir.join("ingress_spill");
 
     let volume_suffix = format!("spill-crash-{}", std::process::id());
     let format_info = make_format_info(&volume_suffix);
@@ -2202,7 +2192,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             .unwrap();
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
-                max_dirty_bytes: Some(1),
+                max_dirty_bytes: Some(8 * 1024 * 1024),
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(true),
@@ -2253,8 +2243,12 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let offline_info =
+                make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+            meta.set_format_info(&offline_info).unwrap();
+            let data_config_offline = DataStoreConfig::from(&offline_info);
             let vfs_config = VfsConfigRaw {
-                max_dirty_bytes: Some(1),
+                max_dirty_bytes: Some(8 * 1024 * 1024),
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(false),
@@ -2263,7 +2257,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             };
             let vfs = StudioVfs::new(
                 meta.clone(),
-                &data_config,
+                &data_config_offline,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
@@ -2291,25 +2285,25 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
 
             let after = meta.get_file_blocks(ino).unwrap();
             assert_eq!(
+                after.len(),
+                1,
+                "overwrite should still leave one committed block ref"
+            );
+            assert_ne!(
                 after[0].1.object_id, baseline_object_id,
-                "spill-backed overwrite must not advance metadata before simulated crash"
+                "local flush should advance metadata to the newly committed cache-v2 object"
             );
             assert!(
-                segment_file_count(&spill_dir) > 0,
-                "flush should leave at least one ingress segment on disk before crash"
+                vfs.pending_uploads_for_inode(ino).len() == 1,
+                "offline overwrite should queue exactly one pending upload"
             );
         });
         rt.shutdown_background();
     }
-
-    assert!(
-        segment_file_count(&spill_dir) > 0,
-        "simulated crash should leave ingress segments for restart recovery"
-    );
     let blocks_after_crash = meta.get_file_blocks(ino).unwrap();
-    assert_eq!(
+    assert_ne!(
         blocks_after_crash[0].1.object_id, baseline_object_id,
-        "metadata should still point at baseline block after crash"
+        "metadata should still point at the locally committed replacement after crash"
     );
 
     {
@@ -2318,9 +2312,13 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             .build()
             .unwrap();
         rt.block_on(async {
+            let offline_info =
+                make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+            meta.set_format_info(&offline_info).unwrap();
+            let data_config_offline = DataStoreConfig::from(&offline_info);
             let vfs = StudioVfs::new(
                 meta.clone(),
-                &data_config,
+                &data_config_offline,
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
@@ -2331,10 +2329,8 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
                 .expect("failed to start StudioVfs background workers");
 
             let blocks = meta.get_file_blocks(ino).unwrap();
-            assert_eq!(
-                blocks[0].1.object_id, baseline_object_id,
-                "restart should not require metadata flush before serving recovered spill"
-            );
+            assert_eq!(blocks.len(), 1);
+            assert_ne!(blocks[0].1.object_id, baseline_object_id);
 
             let data = vfs
                 .read(ino, 0, replacement_payload.len() as u32)
@@ -2343,7 +2339,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             assert_eq!(
                 data.as_ref(),
                 replacement_payload.as_slice(),
-                "read-after-restart should serve bytes from recovered spill overlay"
+                "read-after-restart should serve bytes from the locally committed block-store state"
             );
         });
         rt.shutdown_background();
@@ -2360,8 +2356,9 @@ fn writer_reads_full_file_before_any_remote_commit() {
     let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
 
     unsafe {
-        // Keep writes local-only: acceptance into cache + WAL, no slab drain.
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        // Keep uploads remote-offline; local flush should still commit through
+        // BlockStore + metadata immediately.
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -2404,8 +2401,8 @@ fn writer_reads_full_file_before_any_remote_commit() {
 
         let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
         assert!(
-            blocks.is_empty(),
-            "metadata should remain empty while background slab flusher is disabled"
+            !blocks.is_empty(),
+            "local flush should commit metadata even before any remote upload succeeds"
         );
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
@@ -3318,15 +3315,6 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
 
 #[test]
 fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
-    fn segment_file_count(dir: &std::path::Path) -> usize {
-        let dir = dir.join("segments");
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
-            .count()
-    }
-
     let _env = ScopedTestEnv::new();
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
@@ -3340,12 +3328,12 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let spill_dir = cache_dir.join("ingress_spill");
     let volume_suffix = format!("crash-remote-fetch-{}", std::process::id());
     let baseline_payload = vec![0xC1u8; 512 * 1024];
     let replacement_payload = vec![0xC2u8; 512 * 1024];
     let mut ino = 0u64;
     let mut baseline_object_id = 0u64;
+    let mut replacement_object_id = 0u64;
     let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
     let online_endpoint = test_env_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
     let mut format_info = make_format_info_with_endpoint(&volume_suffix, &online_endpoint);
@@ -3419,7 +3407,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .unwrap();
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
-                max_dirty_bytes: Some(1),
+                max_dirty_bytes: Some(8 * 1024 * 1024),
                 max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 background_slab_flush_enabled: Some(false),
@@ -3441,9 +3429,20 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                 .expect("failed to start StudioVfs background workers");
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
+            let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+            assert_eq!(blocks.len(), 1);
+            replacement_object_id = blocks[0].1.object_id;
+            assert_ne!(replacement_object_id, baseline_object_id);
+            let ds = DataStore::new(&data_config_online).unwrap();
             assert!(
-                segment_file_count(&spill_dir) > 0,
-                "replacement should be present in ingress spill before restart"
+                wait_until_object_absent(
+                    &ds,
+                    &make_format_info_with_endpoint(&volume_suffix, &online_endpoint).data_prefix,
+                    replacement_object_id,
+                    Duration::from_secs(2),
+                )
+                .await,
+                "replacement should remain local-only before restart while the endpoint is offline"
             );
         });
         rt.shutdown_background();
@@ -3476,23 +3475,20 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             .unwrap();
             vfs.start().expect("failed to start StudioVfs background workers");
             let blocks = vfs.meta().get_file_blocks(ino).unwrap();
-            assert_eq!(
-                blocks[0].1.object_id, baseline_object_id,
-                "metadata should still point to baseline block"
-            );
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].1.object_id, replacement_object_id);
             let read = tokio::time::timeout(
                 Duration::from_secs(10),
                 vfs.read(ino, 0, replacement_payload.len() as u32),
             )
             .await
-            .expect("read should complete from local ingress without remote fetch")
+            .expect("read should complete from committed local cache state without remote fetch")
             .unwrap();
             assert_eq!(
                 read.as_ref(),
                 replacement_payload.as_slice(),
-                "read after restart with offline endpoint should use recovered spill overlay; ingress={:?} segments={} meta_blocks={:?}",
+                "read after restart with offline endpoint should use committed block-store state; ingress={:?} meta_blocks={:?}",
                 vfs.ingress_stats(),
-                segment_file_count(&spill_dir),
                 vfs.meta().get_file_blocks(ino).ok(),
             );
         });
@@ -5531,7 +5527,7 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
     unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "128MB");
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
@@ -6161,34 +6157,21 @@ fn test_ingress_prefers_spill_before_backpressure() {
 
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::Spill,
-            "with RAM budget exhausted by config and spill budget available, acceptance should prefer spill"
+            VfsIngressLane::DirtyMem,
+            "the first payload enters the write buffer and is then locally committed"
         );
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
         let stats = vfs.ingress_stats();
-        assert!(
-            stats.spill_records > 0,
-            "flush should materialize at least one accepted spill record"
-        );
-        assert!(
-            stats.spill_bytes >= payload.len(),
-            "spill bytes should include the flushed payload"
-        );
-        assert!(
-            stats.forced_spill_blocks > 0,
-            "forced spill counter should advance when RAM budget is too small"
-        );
-        assert_eq!(
-            stats.write_backpressure_wait_ms, 0,
-            "foreground should not accumulate backpressure wait while spill still has headroom"
-        );
+        assert_eq!(stats.spill_records, 0);
+        assert_eq!(stats.spill_bytes, 0);
+        assert_eq!(stats.forced_spill_blocks, 0);
         assert_eq!(
             vfs.ingress_pressure_for(1).lane,
-            VfsIngressLane::Spill,
-            "small follow-up payloads should still prefer spill before entering backpressure"
+            VfsIngressLane::DirtyMem,
+            "after flush drains the write buffer, follow-up writes start from an empty local budget again"
         );
     });
     rt.shutdown_background();
@@ -6253,7 +6236,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
             .unwrap();
         assert_eq!(
             durable_vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::Spill
+            VfsIngressLane::DirtyMem
         );
         durable_vfs
             .write(durable_attr.ino, 0, &payload)
@@ -6261,9 +6244,15 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
             .unwrap();
         durable_vfs.flush(durable_attr.ino).await.unwrap();
         let durable_stats = durable_vfs.ingress_stats();
-        assert!(
-            durable_stats.spill_bytes >= payload.len(),
-            "durable mode should persist accepted payload in ingress spill"
+        assert_eq!(durable_stats.spill_bytes, 0);
+        assert_eq!(durable_stats.spill_records, 0);
+        assert_eq!(
+            durable_vfs
+                .meta()
+                .get_file_blocks(durable_attr.ino)
+                .unwrap()
+                .len(),
+            1
         );
 
         let fast_tmp = tempfile::tempdir().unwrap();
@@ -6280,9 +6269,15 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         fast_vfs.write(fast_attr.ino, 0, &payload).await.unwrap();
         fast_vfs.flush(fast_attr.ino).await.unwrap();
         let fast_stats = fast_vfs.ingress_stats();
+        assert_eq!(fast_stats.spill_bytes, 0);
+        assert_eq!(fast_stats.spill_records, 0);
         assert_eq!(
-            fast_stats.spill_bytes, 0,
-            "fast mode should avoid duplicate ingress payload writes"
+            fast_vfs
+                .meta()
+                .get_file_blocks(fast_attr.ino)
+                .unwrap()
+                .len(),
+            1
         );
     });
     rt.shutdown_background();
@@ -6402,7 +6397,7 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
     let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
     let _restore_assist = EnvRestore::capture("STUDIOFS_FOREGROUND_DRAIN_ASSIST");
     unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
         std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
         std::env::set_var("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
@@ -6442,22 +6437,22 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
 
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::Spill,
-            "before spill is populated, the next payload should still fit into spill"
+            VfsIngressLane::DirtyMem,
+            "an empty write buffer accepts the first partial payload"
         );
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
-        vfs.flush(attr.ino).await.unwrap();
 
         let stats = vfs.ingress_stats();
         assert!(
-            stats.spill_bytes >= payload.len(),
-            "first payload should consume the configured spill budget"
+            stats.dirty_mem_bytes >= payload.len(),
+            "the first partial payload should stay resident in the write buffer"
         );
+        assert_eq!(stats.spill_bytes, 0);
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
             VfsIngressLane::Backpressure,
-            "once spill is full and RAM is over budget, the next payload should report backpressure"
+            "once the write buffer is full, the next payload should report local backpressure"
         );
     });
     rt.shutdown_background();
@@ -6466,10 +6461,13 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
 #[test]
 fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
     let _env = ScopedTestEnv::new();
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_flush_interval = ScopedEnvVar::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
-        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
         std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "250");
     }
@@ -6505,20 +6503,24 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 
         let payload = vec![0x55u8; 512 * 1024];
 
-        let first = vfs.create(1, b"spill-full.bin", 0, 0, 0o644).unwrap();
+        let first = vfs.create(1, b"write-buffer-full.bin", 0, 0, 0o644).unwrap();
         vfs.write(first.ino, 0, &payload).await.unwrap();
-        vfs.flush(first.ino).await.unwrap();
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
             VfsIngressLane::Backpressure,
-            "after the first spill-backed flush, the same payload should hit backpressure"
+            "once the write buffer is full, the same payload should hit local backpressure"
         );
 
         let blocked_vfs = vfs.clone();
+        let blocked_payload = payload.clone();
         let blocked = tokio::spawn(async move {
-            let second = blocked_vfs.create(1, b"blocked.bin", 0, 0, 0o644).unwrap();
-            blocked_vfs.write(second.ino, 0, &payload).await.unwrap();
-            match tokio::time::timeout(Duration::from_secs(30), blocked_vfs.flush(second.ino)).await {
+            let second = blocked_vfs.create(1, b"drained.bin", 0, 0, 0o644).unwrap();
+            blocked_vfs
+                .write(second.ino, 0, &blocked_payload)
+                .await
+                .unwrap();
+            match tokio::time::timeout(Duration::from_secs(30), blocked_vfs.flush(second.ino)).await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => panic!("flush failed: {e}"),
                 Err(_) => {
@@ -6534,9 +6536,10 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 
         let stats = vfs.ingress_stats();
         assert!(
-            stats.write_backpressure_wait_ms > 0 || stats.drained_spill_blocks > 0,
-            "foreground backpressure should either accumulate measurable wait time or observe spill drain progress"
+            stats.dirty_mem_bytes <= payload.len(),
+            "backpressure should drain at least the newly written inode back out of the write buffer"
         );
+        assert_eq!(stats.spill_bytes, 0);
     });
     rt.shutdown_background();
 }
@@ -6560,12 +6563,12 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         .build()
         .unwrap();
     rt.block_on(async {
-        ensure_bucket().await;
-        let vfs_config = VfsConfigRaw {
-            max_dirty_bytes: Some(1),
-            max_spill_bytes: Some(4 * 1024 * 1024),
-            cache_safety_mode: Some(CacheSafetyMode::Durable),
-            slab_flush_interval_ms: Some(5000),
+            ensure_bucket().await;
+            let vfs_config = VfsConfigRaw {
+                max_dirty_bytes: Some(4 * 256 * 1024),
+                max_spill_bytes: Some(4 * 1024 * 1024),
+                cache_safety_mode: Some(CacheSafetyMode::Durable),
+                slab_flush_interval_ms: Some(5000),
             background_slab_flush_enabled: Some(false),
             memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
@@ -6600,22 +6603,17 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         }
 
         let stats = vfs.ingress_stats();
-        assert!(
-            stats.spill_records >= writer_count,
-            "concurrent writers should leave accepted spill-backed state while background drain is disabled"
-        );
-        assert!(
-            stats.forced_spill_blocks >= writer_count as u64,
-            "each writer should contribute to forced spill accounting under RAM pressure"
-        );
+        assert_eq!(stats.spill_records, 0);
+        assert_eq!(stats.spill_bytes, 0);
+        assert_eq!(stats.forced_spill_blocks, 0);
         assert_eq!(
             stats.write_backpressure_wait_ms, 0,
-            "foreground writers should not block while spill still has available capacity"
+            "with sufficient local budget, concurrent foreground writers should not block"
         );
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::Spill,
-            "after concurrent accepted writes, spill should still be preferred until its budget is exhausted"
+            VfsIngressLane::DirtyMem,
+            "once flush drains the write buffer, new writes should start from the empty local budget again"
         );
     });
     rt.shutdown_background();
@@ -6623,22 +6621,12 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
 
 #[test]
 fn test_ingress_multi_writer_spill_recovers_after_crash() {
-    fn segment_file_count(dir: &std::path::Path) -> usize {
-        let dir = dir.join("segments");
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
-            .count()
-    }
-
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let spill_dir = cache_dir.join("ingress_spill");
     let volume_suffix = format!("spill-multi-crash-{}", std::process::id());
-    let format_info = make_format_info(&volume_suffix);
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
     let data_config = DataStoreConfig::from(&format_info);
     let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
     meta.init_root(0, 0).unwrap();
@@ -6654,9 +6642,8 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             .build()
             .unwrap();
         rt.block_on(async {
-            ensure_bucket().await;
             let vfs_config = VfsConfigRaw {
-                max_dirty_bytes: Some(1),
+                max_dirty_bytes: Some(8 * 1024 * 1024),
                 max_spill_bytes: Some(8 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
@@ -6694,26 +6681,15 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
             for task in tasks {
                 files.push(task.await.unwrap());
             }
-
-            assert!(
-                segment_file_count(&spill_dir) > 0,
-                "segment directory should contain accepted ingress records before crash"
-            );
         });
         rt.shutdown_background();
     }
-
-    assert!(
-        segment_file_count(&spill_dir) > 0,
-        "simulated crash should leave ingress segments for accepted writers"
-    );
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            ensure_bucket().await;
             let vfs = StudioVfs::new(
                 meta.clone(),
                 &data_config,
@@ -6731,7 +6707,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 assert_eq!(
                     data.as_ref(),
                     payload.as_slice(),
-                    "read-after-restart should return recovered spill-backed bytes for every file"
+                    "read-after-restart should return locally committed bytes for every file"
                 );
             }
         });

@@ -6,12 +6,12 @@ StudioFS mounts S3-compatible object storage as a local filesystem with a
 local-first metadata path and eventual multi-client convergence.
 
 Core principles:
-- Foreground filesystem operations read and write local `redb` only.
+- Foreground metadata operations read and write local `redb`; foreground payload durability flows through the local `BlockStore`.
 - PostgreSQL is the shared replication bus and checkpoint store, not the hot read path.
 - File payloads live in immutable S3 objects; each 16 MiB logical block is stored as four 4 MiB cloud fragments.
 - Runtime file visibility is split into local accepted state and remote-visible
   committed state.
-- RAM + NVMe cache tiers hide most object-store latency.
+- Local `BlockStore` plus compatibility cache helpers hide most object-store latency.
 
 - `flush()` and `close()` must make accepted data readable locally without waiting for S3/upload/metadata.
 - Remote readers observe only coarse states: `uploading`, `updating`, `ready`.
@@ -54,12 +54,9 @@ Core invariants:
 
 1. App calls a VFS mutation.
 2. StudioFS updates local metadata in `redb`.
-3. File payload enters local write staging (`pending_blocks`, `dirty_mem`, ingress live index backed by `ingress_spill/segments/`, cache).
-4. `flush(ino)`/`close(ino)` applies the configured cache safety policy:
-   - `durable`: appends accepted records to ingress (durable local accept path),
-   - `fast`: skips ingress payload persistence and relies on best-effort self-heal on restart.
-   - ingress implementation details live in `crates/studiofs-vfs/src/ingress_wal.rs`.
-5. Background workers materialize accepted records and upload each logical block as four independent cloud fragments.
+3. File payload lands in the per-file `WriteBuffer`; full aligned blocks may be eagerly persisted to local `BlockStore` and extent metadata.
+4. `flush(ino)` / `fsync(ino)` / `close(ino)` drain dirty `WriteBuffer` blocks through `BlockStore::put(...) -> sync_data() -> metadata`, then enqueue uploads.
+5. Background workers upload each committed logical block as four independent cloud fragments.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
 8. Other clients pull only newer foreign batches and apply remote-visible namespace/attrs/symlinks/xattrs to local `base_*`.
@@ -68,13 +65,10 @@ Core invariants:
 ## Write Path
 
 1. Split incoming data into blocks.
-2. Stage bytes locally in memory and, if needed, NVMe spill.
-3. Track staged data in pending incarnation state.
-4. On `flush()` / `close()`, ingress behavior depends on `cache_safety_mode`:
-   - `durable` appends accepted records,
-   - `fast` avoids duplicate ingress payload writes.
-5. Background materialization builds and updates pending manifests as needed.
-6. On publish, update remote committed incarnation and `committed_size`.
+2. Merge bytes into the per-file `WriteBuffer`.
+3. Full aligned blocks may be eagerly committed locally through `BlockStore` + metadata, while partial tails stay in RAM.
+4. `flush()` / `fsync()` / `close()` transactionally persist remaining dirty blocks and attrs via `BlockStore::put(...) -> sync_data() -> metadata -> upload queue`.
+5. On publish, update the remote committed incarnation and `committed_size`.
 
 This lets the local client read accepted data immediately, while remote clients
 still observe committed incarnations as they become published.
@@ -82,16 +76,15 @@ still observe committed incarnations as they become published.
 ## Read Path
 
 Reads prefer local state in this order:
-1. `pending_blocks`
-2. `dirty_mem`
-3. ingress live index (`ingress_spill/segments/`, `durable` mode)
-4. cache (L1/L2)
-5. S3 fetch
+1. `WriteBuffer`
+2. committed local extents / committed file blocks backed by `BlockStore`
+3. compatibility cache helpers
+4. S3 fetch
 
-Ingress WAL metadata format:
-- Checkpoint/state metadata is persisted in binary `postcard` format with file-level
-  magic headers (`IWC1` / `IWS1`).
-- Recovery accepts legacy JSON metadata files for backward compatibility.
+Legacy ingress artifacts note:
+- `cache_safety_mode=durable` still preserves ingress checkpoint/state metadata
+  for startup recovery of pre-Cache-v2 artifacts.
+- `cache_safety_mode=fast` discards those artifacts during startup self-heal.
 
 Metadata lookups are served from local `redb`, where local staged blocks
 override committed blocks, and local overlay attrs/dentries/symlinks/xattrs override the remote-visible base view.

@@ -7,8 +7,8 @@ There are two generations of the cache implementation:
 
 | Generation | Module | Status |
 |------------|--------|--------|
-| **v3 (current)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active — used by VFS |
-| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Foreground VFS reads and committed local extents now use BlockStore; async VFS paths route blocking BlockStore mutations through Tokio's blocking pool while legacy cache helpers still back staged upload compatibility |
+| **v3 (compatibility path)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active for upload-queue compatibility, cache promotion, and fallback rereads while VFS foreground hot paths migrate |
+| **v2 (active foreground path)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Foreground VFS reads and local write durability now use BlockStore; async VFS paths route blocking BlockStore mutations through Tokio's blocking pool while some legacy cache helpers still back upload compatibility |
 
 ---
 
@@ -17,9 +17,10 @@ There are two generations of the cache implementation:
 > **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
 > dirty/uploading eviction gating, auto-eviction, mmap reads with generation
 > remapping, snapshot/WAL persistence, and startup recovery are implemented.
-> The VFS committed read path now uses BlockStore as its primary cache, and
-> async VFS workers offload blocking BlockStore read/write/remove transitions
-> onto Tokio's blocking pool instead of running them on executor threads.
+> The VFS foreground read path and local write-durability path now use
+> BlockStore as the primary local data store, and async VFS workers offload
+> blocking BlockStore read/write/remove transitions onto Tokio's blocking pool
+> instead of running them on executor threads.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
@@ -149,10 +150,10 @@ as acceptable best-effort metadata loss and repairs it via snapshot replay or
 
 ---
 
-## Cache v3 (current) — L1 + L2
+## Cache v3 (compatibility path) — L1 + L2
 
-> **Status:** Active.  Used by VFS.  Will be replaced by v2 after persistence
-> and VFS integration land.
+> **Status:** Still active for compatibility helpers, upload-queue plumbing, and
+> fallback rereads while the foreground VFS path continues moving to v2.
 
 ## Architecture
 
@@ -304,7 +305,7 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 
 ### L2 Commit Scheduler (`block_cache.rs`)
 
-Bounded scheduler for asynchronous L2 commits from the materializer path.
+Bounded scheduler for asynchronous L2 commits from compatibility upload/persist paths.
 
 | Property | Value |
 |----------|-------|

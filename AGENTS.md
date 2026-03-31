@@ -234,7 +234,7 @@ test: add destroy tests fixes
 
 ### Data Flow
 
-1. **Write Path**: Application → VFS → Block staging → Ingress journal → S3 upload → Background epoch finalizer publish
+1. **Write Path**: Application → per-file `WriteBuffer` → `BlockStore::put` → `sync_data()` → local extent metadata → upload queue
 2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
 3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
 
@@ -251,7 +251,7 @@ test: add destroy tests fixes
 Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 
 - `STUDIOFS_MAX_DIRTY_BYTES`: Memory budget for dirty blocks
-- `STUDIOFS_MAX_SPILL_BYTES`: Disk budget for spill-backed writes
+- `STUDIOFS_MAX_SPILL_BYTES`: Legacy ingress-artifact budget retained for startup compatibility; foreground writes no longer spill into ingress
 - `STUDIOFS_S3_ENDPOINT`: S3 endpoint URL
 - `STUDIOFS_S3_BUCKET`: S3 bucket name
 - `STUDIOFS_PRINCIPAL`: ACL principal for access control
@@ -294,24 +294,28 @@ Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 
 ### Overview
 
-The monolithic `VfsState` struct (68 fields) was decomposed into 11 cohesive, independently lockable subsystems to improve maintainability, reduce lock contention, and clarify ownership boundaries.
+The monolithic `VfsState` struct (68 fields) was decomposed into 11 cohesive subsystems to improve maintainability, reduce lock contention, and clarify ownership boundaries.
 
 ### Subsystems
 
 ```
 VfsState (composed of 11 subsystems)
-├── ingress: IngressState          # Ingress WAL, spill tracking, segment management
-├── dirty_buffer: DirtyBufferState # Dirty memory buffer, spill state, drain coordination
-├── upload: UploadState            # Upload queue, cancellation, pending evictions
-├── namespace: NamespaceState       # Dentry cache, path shortcuts, attr cache
-├── acl: AclState                  # ACL state (minimal, placeholder)
-├── incarnation: IncarnationState  # Inode incarnation tracking
-├── write_buffer: WriteBufferState # Pending blocks for writes
-├── read: ReadState                # Foreground read tracking, P90 latency, prefetch hints
-├── file_lock: FileLockState       # File locking state
-├── shutdown: ShutdownState        # Shutdown flags, tokens, task handles
-└── metrics: MetricsState          # Runtime metrics and counters
+├── ingress: IngressState             # Legacy ingress checkpoint/artifact state + observability
+├── upload: UploadState               # Upload queue, cancellation, pending evictions
+├── file_session: FileSessionState    # Per-inode operation ordering and handle tracking
+├── namespace: NamespaceState         # Dentry cache, path shortcuts, attr cache
+├── acl: AclState                     # ACL state (minimal, placeholder)
+├── incarnation: IncarnationState     # Inode incarnation tracking
+├── write_buffer: WriteBufferState    # Pending per-file blocks for writes
+├── read: ReadState                   # Foreground read tracking, P90 latency, prefetch hints
+├── file_lock: FileLockState          # File locking state
+├── shutdown: ShutdownState           # Shutdown flags, tokens, task handles
+└── metrics: MetricsState             # Runtime metrics and counters
 ```
+
+`DirtyBufferState` is no longer part of active `VfsState`; the legacy tier is
+kept only in the lock-order validator so older ordering assumptions still have a
+stable placeholder.
 
 ### Lock Ordering Policy
 
@@ -319,8 +323,8 @@ To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest prior
 
 1. **Tier 1**: `ShutdownState` — shutdown flags are checked before any other operation
 2. **Tier 2**: `WriteBufferState` — pending write blocks
-3. **Tier 3**: `DirtyBufferState` — dirty memory buffer and spill state
-4. **Tier 4**: `IngressState` — ingress WAL and spill entries
+3. **Tier 3**: reserved legacy `DirtyBufferState` slot — no active subsystem
+4. **Tier 4**: `IngressState` — legacy ingress checkpoint / artifact state
 5. **Tier 5**: `NamespaceState` — dentry/attr caches
 6. **Tier 6**: `IncarnationState` — inode incarnation tracking
 7. **Tier 7**: `UploadState` — upload queue and cancellations
@@ -328,17 +332,17 @@ To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest prior
 9. **Tier 9**: `FileLockState` — file locks
 10. **Tier 10**: `MetricsState` — metrics (rarely needs locking)
 
+`FileSessionState` is coordinated through per-inode async permits and is not
+part of the shared-mutex tier list above.
+
 ### VfsState::new Pattern
 
 The `VfsState::new()` constructor accepts `&VfsConfig` for cache/limit parameters rather than individual arguments:
 
 ```rust
 fn new(
-    recovered_spill: RecoveredSpillMap,
-    recovered_spill_bytes: usize,
-    active_segment_id: u64,
-    recovered_spill_seq: u64,
     initial_checkpoint_meta: Option<(u64, u64, u64)>,
+    block_size: u32,
     cfg: &VfsConfig,
 ) -> Self
 ```
@@ -346,7 +350,7 @@ fn new(
 ### Key Patterns
 
 1. **State access**: Use `self.state.subsystem.field` instead of direct fields on `VfsState`
-2. **Lock release before IO**: Always release mutex locks before performing IO operations (file deletions, WAL appends)
-3. **Batch operations**: Use batch methods like `remove_spill_entries_batch()` for efficiency
+2. **Lock release before IO**: Always release mutex locks before performing BlockStore writes, metadata flushes, file deletions, or ingress artifact cleanup
+3. **Batch operations**: Prefer batch BlockStore / metadata operations when draining `WriteBuffer`; avoid per-block IO while holding hot locks
 4. **Atomic ordering**: Use `Release`/`Acquire` for critical data (throttling metrics), `Relaxed` for non-critical counters
 5. **notify_waiters outside lock**: Always call `notify_waiters()` after releasing the mutex to avoid lock contention
