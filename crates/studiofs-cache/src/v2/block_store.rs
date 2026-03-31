@@ -315,14 +315,6 @@ impl BlockStore {
             }
         };
 
-        if let Err(error) = platform::advise_will_need(
-            &self.file,
-            offset + BLOCK_HEADER_SIZE as u64,
-            u64::from(data_size),
-        ) {
-            warn!(object_id, offset, error = ?error, "read-ahead hint failed");
-        }
-
         // Verify checksum.
         let actual_crc = crc32fast::hash(&data);
         if actual_crc != checksum {
@@ -864,50 +856,48 @@ impl BlockStore {
     }
 
     fn release_allocation(&self, offset: u64, alloc_size: u64) {
+        self.issue_allocation_release_hints(offset, alloc_size, None);
         self.allocator.lock().free(offset, alloc_size);
+    }
 
+    fn release_allocations_batch(&self, removed: &[RemovedEntry]) {
+        for entry in removed {
+            self.issue_allocation_release_hints(
+                entry.offset,
+                entry.alloc_size,
+                Some(entry.object_id),
+            );
+        }
+
+        let mut allocator = self.allocator.lock();
+        for entry in removed {
+            allocator.free(entry.offset, entry.alloc_size);
+        }
+    }
+
+    fn issue_allocation_release_hints(
+        &self,
+        offset: u64,
+        alloc_size: u64,
+        object_id: Option<u64>,
+    ) {
         if let Err(error) = platform::punch_hole(&self.file, offset, alloc_size) {
-            warn!(offset, alloc_size, error = ?error, "hole punch failed for freed cache region");
+            warn!(
+                object_id,
+                offset,
+                alloc_size,
+                error = ?error,
+                "hole punch failed for freed cache region",
+            );
         }
         if let Err(error) = platform::advise_dont_need(&self.file, offset, alloc_size) {
             warn!(
+                object_id,
                 offset,
                 alloc_size,
                 error = ?error,
                 "dont-need hint failed for freed cache region",
             );
-        }
-    }
-
-    fn release_allocations_batch(&self, removed: &[RemovedEntry]) {
-        {
-            let mut allocator = self.allocator.lock();
-            for entry in removed {
-                allocator.free(entry.offset, entry.alloc_size);
-            }
-        }
-
-        for entry in removed {
-            if let Err(error) = platform::punch_hole(&self.file, entry.offset, entry.alloc_size) {
-                warn!(
-                    object_id = entry.object_id,
-                    offset = entry.offset,
-                    alloc_size = entry.alloc_size,
-                    error = ?error,
-                    "hole punch failed for freed cache region",
-                );
-            }
-            if let Err(error) =
-                platform::advise_dont_need(&self.file, entry.offset, entry.alloc_size)
-            {
-                warn!(
-                    object_id = entry.object_id,
-                    offset = entry.offset,
-                    alloc_size = entry.alloc_size,
-                    error = ?error,
-                    "dont-need hint failed for freed cache region",
-                );
-            }
         }
     }
 
