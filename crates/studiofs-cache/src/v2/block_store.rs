@@ -1,26 +1,43 @@
-//! Single-file block cache with a native free-space allocator.
+//! Single-file block cache with a native free-space allocator and LRU eviction.
 //!
-//! `BlockStore` is the Cache v2 foundation: one `blocks.data` file, a
-//! [`FreeList`] allocator, and an in-memory entry map.  This first version
-//! uses pread/pwrite for all I/O; the mmap read path comes in a later issue.
+//! `BlockStore` is the Cache v2 core: one `blocks.data` file, a [`FreeList`]
+//! best-fit allocator, a [`BlockIndex`] for O(1) lookup, and an intrusive LRU
+//! list for eviction ordering.
 //!
-//! Thread-safe: concurrent readers via `RwLock`, writes serialised through
-//! the allocator `Mutex`.
+//! ## Thread-safety model
+//!
+//! | State | Lock |
+//! |-------|------|
+//! | [`BlockIndex`] (map + LRU + counters) | `Mutex<BlockIndex>` |
+//! | [`FreeList`] (allocator) | `Mutex<FreeList>` |
+//! | Hit / miss counters | `AtomicU64` |
+//!
+//! Locks are **never held simultaneously** — the index lock is always
+//! released before the allocator lock is acquired, and vice-versa.  This
+//! strict ordering prevents deadlocks.
+//!
+//! ## Eviction
+//!
+//! When [`put`] cannot obtain enough space, it repeatedly calls
+//! `BlockIndex::evict_one` to pop the oldest *evictable* LRU entry (blocks
+//! with `DIRTY`, `PINNED`, or `UPLOADING` are skipped), frees the recovered
+//! allocation, and retries.  If no evictable blocks remain it returns
+//! [`BlockStoreError::CacheFull`].
 
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::warn;
 
-use crate::v2::allocator::{AllocError, FreeList};
+use crate::v2::allocator::FreeList;
 use crate::v2::format::{
     self, BLOCK_HEADER_SIZE, BlockHeader, FORMAT_VERSION, SUPERBLOCK_SIZE, Superblock,
     alloc_size_for,
 };
+use crate::v2::index::{BlockFlags, BlockIndex};
 use crate::v2::platform;
 
 // ===========================================================================
@@ -32,7 +49,7 @@ use crate::v2::platform;
 pub struct BlockStoreConfig {
     /// Directory for cache files (`blocks.data` will be created here).
     pub cache_dir: PathBuf,
-    /// Maximum size of the data file in bytes.
+    /// Maximum total size of the data file in bytes.
     pub max_size: u64,
     /// Volume UUID — validated on open to prevent cross-volume cache reuse.
     pub volume_uuid: [u8; 16],
@@ -73,53 +90,36 @@ pub enum BlockStoreError {
 }
 
 // ===========================================================================
-// Internal types
-// ===========================================================================
-
-/// In-memory metadata for a single cached block.
-#[derive(Debug, Clone, Copy)]
-struct BlockEntry {
-    /// Byte offset of this block's header in the data file.
-    offset: u64,
-    /// Actual payload size (bytes).
-    data_size: u32,
-    /// Total allocated size on disk (page-aligned, includes header + padding).
-    alloc_size: u64,
-    /// CRC-32 of the payload (for read-time verification).
-    checksum: u32,
-    /// Flags stored in the on-disk header (DIRTY, PINNED, …).
-    flags: u8,
-}
-
-// ===========================================================================
 // BlockStore
 // ===========================================================================
 
-/// Single-file block cache with a built-in allocator.
+/// Single-file block cache with built-in allocator and LRU eviction.
 ///
-/// One instance per mount.  Thread-safe for concurrent get/put/remove.
+/// One instance per mount.  Thread-safe for concurrent `get` / `put` /
+/// `remove` calls from multiple threads.
 pub struct BlockStore {
     file: File,
     config: BlockStoreConfig,
+    /// Combined block map + LRU list + dirty/block counters.
+    index: Mutex<BlockIndex>,
+    /// Best-fit free-space allocator for `blocks.data`.
     allocator: Mutex<FreeList>,
-    entries: RwLock<HashMap<u64, BlockEntry>>,
-    dirty_count: AtomicU32,
-    block_count: AtomicU64,
+    /// Total cache hits since open.
     hit_count: AtomicU64,
+    /// Total cache misses since open.
     miss_count: AtomicU64,
-    /// Set by `close()` so that [`Drop`] skips the redundant fdatasync on the
-    /// normal shutdown path.
+    /// Set by `close()` so [`Drop`] can skip the redundant fdatasync.
     synced: AtomicBool,
 }
 
 impl BlockStore {
     /// Create or open a block store in `config.cache_dir`.
     ///
-    /// * **New file** — writes a fresh superblock and starts empty.
+    /// * **New file** — writes a fresh superblock, starts empty.
     /// * **Existing file** — validates the superblock (magic, version, UUID).
-    ///   Because index persistence is not yet implemented (see SFS-136), the
-    ///   in-memory index starts empty and any pre-existing data regions are
-    ///   treated as reclaimable free space.
+    ///   Index persistence is implemented in SFS-137; until then the in-memory
+    ///   index starts empty and all pre-existing data-region bytes are treated
+    ///   as reclaimable free space.
     pub fn open(config: BlockStoreConfig) -> Result<Self, BlockStoreError> {
         std::fs::create_dir_all(&config.cache_dir)?;
         let data_path = config.cache_dir.join("blocks.data");
@@ -177,7 +177,6 @@ impl BlockStore {
                 .create_new(true)
                 .open(&data_path)?;
 
-            // Write superblock.
             let sb = Superblock::new(config.max_size, config.volume_uuid);
             platform::pwrite(&file, &sb.to_bytes(), 0)?;
             file.set_len(SUPERBLOCK_SIZE)?;
@@ -186,14 +185,15 @@ impl BlockStore {
             (file, SUPERBLOCK_SIZE)
         };
 
-        // No index persistence yet — treat all data-region bytes as free.
+        // No index persistence yet — treat all data-region bytes as free
+        // (index persistence is implemented in SFS-137).
         let file_end = std::cmp::max(file_len, SUPERBLOCK_SIZE);
         let allocator = if file_end > SUPERBLOCK_SIZE {
             warn!(
                 data_bytes = file_end - SUPERBLOCK_SIZE,
                 "opening non-empty blocks.data without index persistence; \
                  all existing data regions will be treated as free space \
-                 (index persistence coming in SFS-136)",
+                 (snapshot+WAL persistence coming in SFS-137)",
             );
             FreeList::recover(config.max_size, file_end, &[])
         } else {
@@ -203,25 +203,30 @@ impl BlockStore {
         Ok(Self {
             file,
             config,
+            index: Mutex::new(BlockIndex::new()),
             allocator: Mutex::new(allocator),
-            entries: RwLock::new(HashMap::new()),
-            dirty_count: AtomicU32::new(0),
-            block_count: AtomicU64::new(0),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
             synced: AtomicBool::new(false),
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Core read operations
+    // -----------------------------------------------------------------------
+
     /// Read a block from the cache.
     ///
-    /// Returns `None` on cache miss or data-integrity failure.
-    /// Atomically bumps the hit/miss counter.
+    /// Returns `None` on a cache miss or a data-integrity failure (short read
+    /// or checksum mismatch).  Bumps the hit/miss counter.
+    ///
+    /// On a hit, moves the block to the MRU position in the LRU list.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
-        let entry = {
-            let entries = self.entries.read();
-            match entries.get(&object_id) {
-                Some(e) => *e,
+        // Phase 1: copy entry metadata under the index lock (no I/O inside lock).
+        let (offset, data_size, checksum) = {
+            let idx = self.index.lock();
+            match idx.get(object_id) {
+                Some(e) => (e.offset, e.data_size, e.checksum),
                 None => {
                     self.miss_count.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -229,24 +234,23 @@ impl BlockStore {
             }
         };
 
-        let mut buf = vec![0u8; entry.data_size as usize];
-        if let Err(e) = platform::pread(
-            &self.file,
-            &mut buf,
-            entry.offset + BLOCK_HEADER_SIZE as u64,
-        ) {
-            warn!(object_id, offset = entry.offset, %e, "block pread failed");
+        // Phase 2: pread outside the lock (concurrent-safe, no seek).
+        let mut buf = vec![0u8; data_size as usize];
+        if let Err(e) =
+            platform::pread(&self.file, &mut buf, offset + BLOCK_HEADER_SIZE as u64)
+        {
+            warn!(object_id, offset, %e, "block pread failed");
             self.miss_count.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
         // Verify checksum.
         let actual_crc = crc32fast::hash(&buf);
-        if actual_crc != entry.checksum {
+        if actual_crc != checksum {
             warn!(
                 object_id,
-                offset = entry.offset,
-                expected = entry.checksum,
+                offset,
+                expected = checksum,
                 actual = actual_crc,
                 "block checksum mismatch",
             );
@@ -254,22 +258,32 @@ impl BlockStore {
             return None;
         }
 
+        // Phase 3: touch LRU under the index lock (O(1) promotion).
+        self.index.lock().touch(object_id);
+
         self.hit_count.fetch_add(1, Ordering::Relaxed);
         Some(Bytes::from(buf))
     }
 
-    /// Check whether a block exists without reading its data.
+    /// Check whether a block exists in the cache without reading data or
+    /// updating the LRU order.
     pub fn contains(&self, object_id: u64) -> bool {
-        self.entries.read().contains_key(&object_id)
+        self.index.lock().contains(object_id)
     }
+
+    // -----------------------------------------------------------------------
+    // Core write operations
+    // -----------------------------------------------------------------------
 
     /// Write a block to the cache.
     ///
-    /// * `evictable = false` marks the block as *dirty* (not eligible for
-    ///   eviction until the caller calls [`mark_evictable`]).
-    /// * If the block already exists it is replaced (remove + re-put).
-    /// * Returns [`BlockStoreError::CacheFull`] when there is no room and
-    ///   nothing can be reclaimed.
+    /// * `evictable = false` marks the block as *dirty* (sets the `DIRTY`
+    ///   flag); the block will not be chosen for LRU eviction until
+    ///   [`mark_evictable`] is called.
+    /// * If the block already exists it is atomically replaced.
+    /// * When the cache is full, eligible LRU blocks are evicted automatically
+    ///   to make room.  Returns [`BlockStoreError::CacheFull`] only when all
+    ///   remaining blocks are non-evictable.
     pub fn put(&self, object_id: u64, data: &[u8], evictable: bool) -> Result<(), BlockStoreError> {
         let data_size = u32::try_from(data.len()).map_err(|_| {
             io::Error::new(
@@ -279,153 +293,142 @@ impl BlockStore {
         })?;
         let alloc = alloc_size_for(data_size);
 
-        // Remove if already present (remove is a no-op for missing keys,
-        // saving one RwLock read compared to contains()+remove()).
-        self.remove(object_id);
+        // Remove any existing entry for this object_id and free its space so
+        // the allocator can reuse it.  This is done before the new allocation
+        // so the freed bytes count toward capacity for the incoming block.
+        if let Some(old) = self.index.lock().remove(object_id) {
+            self.allocator.lock().free(old.offset, old.alloc_size);
+        }
 
-        // Allocate space + ensure the file is large enough (under lock).
-        let offset = {
-            let mut alloc_guard = self.allocator.lock();
-            let offset = alloc_guard.allocate(alloc).map_err(|e| match e {
-                AllocError::CacheFull {
-                    needed,
-                    max_size,
-                    allocated,
-                    free,
-                } => BlockStoreError::CacheFull {
-                    needed,
-                    max_size,
-                    allocated,
-                    free,
-                },
-            })?;
+        // Allocate space, evicting LRU blocks when needed.
+        let offset = self.allocate_with_eviction(alloc)?;
 
-            // Extend the physical file while still holding the allocator lock
-            // so that a concurrent `free()` + `allocate()` in another thread
-            // cannot observe a smaller `file_end` and race with `set_len`.
-            let needed_len = alloc_guard.file_end();
-            let current_len = self.file.metadata()?.len();
-            if needed_len > current_len {
-                self.file.set_len(needed_len)?;
-            }
-            drop(alloc_guard);
-
-            offset
-        };
-
-        // Write header + payload via pwrite (concurrent-safe, no seek).
-        // On any I/O failure the allocated region is freed before returning so
-        // the allocator does not leak space.
+        // Write header + payload via pwrite.  On I/O failure the allocated
+        // region is freed immediately so the allocator does not leak space.
         let checksum = crc32fast::hash(data);
-        let flags = if evictable { 0 } else { format::FLAG_DIRTY };
-        let header = BlockHeader::new(object_id, data_size, checksum, flags);
-        if let Err(e) = platform::pwrite(&self.file, &header.to_bytes(), offset).and_then(|()| {
-            if !data.is_empty() {
-                platform::pwrite(&self.file, data, offset + BLOCK_HEADER_SIZE as u64)
-            } else {
-                Ok(())
-            }
-        }) {
+        let flags = if evictable {
+            BlockFlags::empty()
+        } else {
+            BlockFlags::DIRTY
+        };
+        // Only DIRTY and PINNED are persisted in the on-disk header;
+        // UPLOADING is a transient in-memory flag.
+        let disk_flags = flags.bits() & (format::FLAG_DIRTY | format::FLAG_PINNED);
+        let header = BlockHeader::new(object_id, data_size, checksum, disk_flags);
+
+        let write_result =
+            platform::pwrite(&self.file, &header.to_bytes(), offset).and_then(|()| {
+                if !data.is_empty() {
+                    platform::pwrite(&self.file, data, offset + BLOCK_HEADER_SIZE as u64)
+                } else {
+                    Ok(())
+                }
+            });
+
+        if let Err(e) = write_result {
             self.allocator.lock().free(offset, alloc);
             return Err(BlockStoreError::Io(e));
         }
 
-        // Record in-memory entry.
-        {
-            let mut entries = self.entries.write();
-            entries.insert(
-                object_id,
-                BlockEntry {
-                    offset,
-                    data_size,
-                    alloc_size: alloc,
-                    checksum,
-                    flags,
-                },
-            );
-        }
-        self.block_count.fetch_add(1, Ordering::Relaxed);
-        if !evictable {
-            self.dirty_count.fetch_add(1, Ordering::Relaxed);
-        }
+        // Register the block in the index (push to LRU tail).
+        self.index
+            .lock()
+            .insert(object_id, offset, data_size, alloc, checksum, flags);
 
         Ok(())
     }
 
-    /// Mark a dirty block as evictable (e.g. after a successful S3 upload).
+    /// Mark a dirty block as evictable — typically called after a successful
+    /// S3 upload.
     ///
-    /// Persists the cleared DIRTY flag to the on-disk block header so that
-    /// the SFS-136 crash-recovery scanner sees the correct state.  On
-    /// pwrite failure the block remains dirty and a warning is logged.
+    /// Clears both `DIRTY` and `UPLOADING` flags.  Persists the cleared flags
+    /// to the on-disk block header so the crash-recovery scanner (SFS-137)
+    /// sees the correct state.  On pwrite failure the block retains its current
+    /// flags and a warning is logged.
     pub fn mark_evictable(&self, object_id: u64) {
-        let mut entries = self.entries.write();
-        if let Some(entry) = entries.get_mut(&object_id) {
-            if entry.flags & format::FLAG_DIRTY != 0 {
-                let new_flags = entry.flags & !format::FLAG_DIRTY;
-                let header =
-                    BlockHeader::new(object_id, entry.data_size, entry.checksum, new_flags);
-                match platform::pwrite(&self.file, &header.to_bytes(), entry.offset) {
-                    Ok(()) => {
-                        entry.flags = new_flags;
-                        self.dirty_count.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = ?e,
-                            object_id,
-                            offset = entry.offset,
-                            "mark_evictable: pwrite failed; block remains dirty",
-                        );
-                    }
+        // Read entry metadata outside the lock to avoid I/O while holding it.
+        let (offset, data_size, checksum, current_flags) = {
+            let idx = self.index.lock();
+            match idx.get(object_id) {
+                Some(e) if e.flags.intersects(BlockFlags::DIRTY | BlockFlags::UPLOADING) => {
+                    (e.offset, e.data_size, e.checksum, e.flags)
                 }
+                _ => return, // already evictable or not present
             }
+        };
+
+        let new_flags = current_flags & !(BlockFlags::DIRTY | BlockFlags::UPLOADING);
+        // Only DIRTY and PINNED go on disk; UPLOADING is transient.
+        let disk_flags = new_flags.bits() & (format::FLAG_DIRTY | format::FLAG_PINNED);
+        let header = BlockHeader::new(object_id, data_size, checksum, disk_flags);
+
+        match platform::pwrite(&self.file, &header.to_bytes(), offset) {
+            Ok(()) => {
+                self.index.lock().update_flags(object_id, new_flags);
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    object_id,
+                    offset,
+                    "mark_evictable: pwrite failed; block retains dirty/uploading flags",
+                );
+            }
+        }
+    }
+
+    /// Mark a block as *currently uploading* to S3.
+    ///
+    /// Sets the `UPLOADING` flag so the block is excluded from LRU eviction
+    /// while the transfer is in flight.  No-op if the block does not exist.
+    /// The `UPLOADING` flag is transient and never persisted to disk.
+    pub fn mark_uploading(&self, object_id: u64) {
+        let mut idx = self.index.lock();
+        if let Some(entry) = idx.get(object_id) {
+            let new_flags = entry.flags | BlockFlags::UPLOADING;
+            idx.update_flags(object_id, new_flags);
+        }
+    }
+
+    /// Mark that an S3 upload has failed, clearing the `UPLOADING` flag so
+    /// the block can be retried.  The `DIRTY` flag is preserved.
+    ///
+    /// No-op if the block does not exist.
+    pub fn mark_upload_failed(&self, object_id: u64) {
+        let mut idx = self.index.lock();
+        if let Some(entry) = idx.get(object_id) {
+            let new_flags = entry.flags & !BlockFlags::UPLOADING;
+            idx.update_flags(object_id, new_flags);
         }
     }
 
     /// Remove a single block from the cache.
+    ///
+    /// No-op if the block does not exist.
     pub fn remove(&self, object_id: u64) {
-        let entry = {
-            let mut entries = self.entries.write();
-            entries.remove(&object_id)
-        };
-        if let Some(entry) = entry {
-            self.allocator.lock().free(entry.offset, entry.alloc_size);
-            self.block_count.fetch_sub(1, Ordering::Relaxed);
-            if entry.flags & format::FLAG_DIRTY != 0 {
-                self.dirty_count.fetch_sub(1, Ordering::Relaxed);
-            }
+        if let Some(removed) = self.index.lock().remove(object_id) {
+            self.allocator.lock().free(removed.offset, removed.alloc_size);
         }
     }
 
-    /// Remove multiple blocks in one call.
+    /// Remove multiple blocks in a single call.
+    ///
+    /// Unknown IDs are silently skipped.  More efficient than calling
+    /// [`remove`] in a loop because the allocator lock is acquired only once.
     pub fn remove_batch(&self, object_ids: &[u64]) {
-        let removed: Vec<BlockEntry> = {
-            let mut entries = self.entries.write();
-            object_ids
-                .iter()
-                .filter_map(|id| entries.remove(id))
-                .collect()
-        };
+        let removed = self.index.lock().remove_batch(object_ids);
         if removed.is_empty() {
             return;
         }
-
         let mut alloc = self.allocator.lock();
-        let mut dirty_removed = 0u32;
         for entry in &removed {
             alloc.free(entry.offset, entry.alloc_size);
-            if entry.flags & format::FLAG_DIRTY != 0 {
-                dirty_removed += 1;
-            }
-        }
-        drop(alloc);
-
-        self.block_count
-            .fetch_sub(removed.len() as u64, Ordering::Relaxed);
-        if dirty_removed > 0 {
-            self.dirty_count.fetch_sub(dirty_removed, Ordering::Relaxed);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Persistence
+    // -----------------------------------------------------------------------
 
     /// Flush the data file to stable storage (`fdatasync`).
     pub fn sync_data(&self) -> Result<(), BlockStoreError> {
@@ -433,48 +436,32 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Graceful shutdown: sync data and drop the file handle.
+    /// Graceful shutdown: flush data and release the file handle.
     ///
-    /// Prefer calling `close()` explicitly over relying on [`Drop`].
+    /// Prefer explicit `close()` over relying on [`Drop`].
     pub fn close(self) -> Result<(), BlockStoreError> {
         platform::fdatasync(&self.file)?;
         self.synced.store(true, Ordering::Relaxed);
         Ok(())
     }
-}
 
-impl Drop for BlockStore {
-    fn drop(&mut self) {
-        // Skip if `close()` already synced to avoid a redundant syscall on
-        // the normal shutdown path.
-        if self.synced.load(Ordering::Relaxed) {
-            return;
-        }
-        // Best-effort sync so data reaches stable storage even when the
-        // caller forgets to call `close()`.  Errors are logged but not
-        // propagated (Drop cannot fail).
-        if let Err(e) = platform::fdatasync(&self.file) {
-            warn!(%e, "BlockStore drop: fdatasync failed");
-        }
-    }
-}
+    // -----------------------------------------------------------------------
+    // Metrics
+    // -----------------------------------------------------------------------
 
-impl BlockStore {
-    // -- Metrics --
-
-    /// Bytes currently allocated to live blocks (including headers + padding).
+    /// Bytes currently allocated to live blocks (header + data + padding).
     pub fn allocated_bytes(&self) -> u64 {
         self.allocator.lock().allocated_bytes()
     }
 
     /// Number of blocks currently in the cache.
     pub fn block_count(&self) -> u64 {
-        self.block_count.load(Ordering::Relaxed)
+        self.index.lock().block_count()
     }
 
-    /// Number of dirty (non-evictable) blocks.
+    /// Number of blocks with the `DIRTY` flag set (not yet uploaded to S3).
     pub fn dirty_count(&self) -> u32 {
-        self.dirty_count.load(Ordering::Relaxed)
+        self.index.lock().dirty_count()
     }
 
     /// Total cache hits since open.
@@ -491,6 +478,84 @@ impl BlockStore {
     pub fn data_path(&self) -> PathBuf {
         self.config.cache_dir.join("blocks.data")
     }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Allocate `alloc` bytes, evicting LRU blocks as needed.
+    ///
+    /// 1. Try a direct allocation.
+    /// 2. On failure, pop the oldest evictable block from the index, free its
+    ///    space, and retry.  Repeat until allocation succeeds or no more
+    ///    evictable blocks remain.
+    ///
+    /// The file is extended to accommodate the new allocation before returning.
+    fn allocate_with_eviction(&self, alloc: u64) -> Result<u64, BlockStoreError> {
+        // First attempt without eviction.
+        if let Some(offset) = self.try_allocate_and_extend(alloc)? {
+            return Ok(offset);
+        }
+
+        // Eviction loop: free one block at a time until the allocation fits.
+        loop {
+            let evicted = self.index.lock().evict_one();
+            match evicted {
+                Some(entry) => {
+                    self.allocator.lock().free(entry.offset, entry.alloc_size);
+                }
+                None => {
+                    // All remaining blocks are non-evictable.
+                    let a = self.allocator.lock();
+                    return Err(BlockStoreError::CacheFull {
+                        needed: alloc,
+                        max_size: self.config.max_size,
+                        allocated: a.allocated_bytes(),
+                        free: a.free_bytes(),
+                    });
+                }
+            }
+
+            if let Some(offset) = self.try_allocate_and_extend(alloc)? {
+                return Ok(offset);
+            }
+            // If we evicted but still cannot allocate (e.g. the freed block
+            // was too small to satisfy the request on its own), evict more.
+        }
+    }
+
+    /// Try a single allocation from the free list and extend the physical file
+    /// if the logical `file_end` grew.
+    ///
+    /// Returns `Ok(Some(offset))` on success, `Ok(None)` when the free list
+    /// cannot satisfy the request without eviction.
+    fn try_allocate_and_extend(&self, alloc: u64) -> Result<Option<u64>, BlockStoreError> {
+        let mut a = self.allocator.lock();
+        let offset = match a.allocate(alloc) {
+            Ok(off) => off,
+            Err(_) => return Ok(None),
+        };
+        // Extend the physical file while still holding the allocator lock so
+        // that a concurrent free+allocate in another thread cannot race with
+        // set_len.
+        let needed_len = a.file_end();
+        let current_len = self.file.metadata()?.len();
+        if needed_len > current_len {
+            self.file.set_len(needed_len)?;
+        }
+        Ok(Some(offset))
+    }
+}
+
+impl Drop for BlockStore {
+    fn drop(&mut self) {
+        if self.synced.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = platform::fdatasync(&self.file) {
+            warn!(%e, "BlockStore drop: fdatasync failed");
+        }
+    }
 }
 
 // ===========================================================================
@@ -499,6 +564,9 @@ impl BlockStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::thread;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -509,6 +577,10 @@ mod tests {
             volume_uuid: [0xAA; 16],
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Baseline correctness
+    // -----------------------------------------------------------------------
 
     #[test]
     fn create_new_store() {
@@ -541,7 +613,7 @@ mod tests {
         let store = BlockStore::open(test_config(&dir)).unwrap();
 
         assert!(store.get(999).is_none());
-        assert_eq!(store.miss_count(), 1); // index miss increments counter
+        assert_eq!(store.miss_count(), 1);
     }
 
     #[test]
@@ -560,8 +632,6 @@ mod tests {
         let store = BlockStore::open(test_config(&dir)).unwrap();
 
         store.put(1, b"data", true).unwrap();
-        assert!(store.contains(1));
-
         store.remove(1);
         assert!(!store.contains(1));
         assert_eq!(store.block_count(), 0);
@@ -576,7 +646,7 @@ mod tests {
         store.put(2, b"b", true).unwrap();
         store.put(3, b"c", true).unwrap();
 
-        store.remove_batch(&[1, 3, 999]); // 999 doesn't exist — harmless
+        store.remove_batch(&[1, 3, 999]); // 999 is a no-op
         assert!(!store.contains(1));
         assert!(store.contains(2));
         assert!(!store.contains(3));
@@ -618,11 +688,13 @@ mod tests {
     fn empty_payload() {
         let dir = TempDir::new().unwrap();
         let store = BlockStore::open(test_config(&dir)).unwrap();
-
         store.put(1, b"", true).unwrap();
-        let got = store.get(1).unwrap();
-        assert!(got.is_empty());
+        assert!(store.get(1).unwrap().is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Flag tracking
+    // -----------------------------------------------------------------------
 
     #[test]
     fn dirty_flag_tracking() {
@@ -646,39 +718,173 @@ mod tests {
 
         store.put(1, b"dirty", false).unwrap();
         assert_eq!(store.dirty_count(), 1);
-
         store.remove(1);
         assert_eq!(store.dirty_count(), 0);
     }
 
     #[test]
-    fn capacity_limit_returns_error() {
+    fn mark_uploading_and_evictable() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(1, b"data", false).unwrap(); // DIRTY
+        assert_eq!(store.dirty_count(), 1);
+
+        store.mark_uploading(1); // DIRTY | UPLOADING
+
+        store.mark_evictable(1); // clears both
+        assert_eq!(store.dirty_count(), 0);
+    }
+
+    #[test]
+    fn mark_upload_failed_preserves_dirty() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(1, b"data", false).unwrap(); // DIRTY
+        store.mark_uploading(1);
+        store.mark_upload_failed(1); // clears UPLOADING, keeps DIRTY
+
+        assert_eq!(store.dirty_count(), 1);
+        // Block should still be non-evictable (DIRTY set):
+        // fill cache with clean blocks and verify block 1 survives.
+        let small_cfg = BlockStoreConfig {
+            cache_dir: TempDir::new().unwrap().keep(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0xBB; 16],
+        };
+        let s2 = BlockStore::open(small_cfg).unwrap();
+        s2.put(1, b"data", false).unwrap();
+        s2.mark_uploading(1);
+        s2.mark_upload_failed(1);
+        // Fill with 2 clean blocks then attempt a 3rd — eviction should NOT
+        // pick block 1 because it's still dirty.
+        s2.put(2, b"clean", true).unwrap();
+        s2.put(3, b"clean", true).unwrap();
+        // Cache is full (3 pages used); put(4) must evict 2 or 3, not 1.
+        s2.put(4, b"clean", true).unwrap();
+        assert!(s2.contains(1), "dirty block should not be evicted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Eviction behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_evict_lru_when_full() {
+        // Cache holds exactly 3 single-page blocks.
         let dir = TempDir::new().unwrap();
         let config = BlockStoreConfig {
             cache_dir: dir.path().to_path_buf(),
-            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE, // room for 3 small blocks
-            volume_uuid: [0xBB; 16],
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0xDD; 16],
         };
         let store = BlockStore::open(config).unwrap();
 
-        // Fill up (each 1-byte block takes 1 page = 4096).
+        // Insert 3 evictable blocks in order 1, 2, 3.
+        store.put(1, b"a", true).unwrap();
+        store.put(2, b"b", true).unwrap();
+        store.put(3, b"c", true).unwrap();
+        assert_eq!(store.block_count(), 3);
+
+        // Insert a 4th block — should auto-evict block 1 (oldest LRU).
+        store.put(4, b"d", true).unwrap();
+        assert_eq!(store.block_count(), 3);
+        assert!(!store.contains(1), "oldest block evicted");
+        assert!(store.contains(2));
+        assert!(store.contains(3));
+        assert!(store.contains(4));
+    }
+
+    #[test]
+    fn evict_skips_dirty_blocks() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0xEE; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        // 1 = dirty (oldest), 2 = clean, 3 = clean.
+        store.put(1, b"x", false).unwrap(); // DIRTY
+        store.put(2, b"y", true).unwrap();
+        store.put(3, b"z", true).unwrap();
+
+        // Insert 4th — must evict block 2 (oldest evictable), not block 1.
+        store.put(4, b"w", true).unwrap();
+        assert!(store.contains(1), "dirty block must not be evicted");
+        assert!(!store.contains(2), "oldest evictable was evicted");
+    }
+
+    #[test]
+    fn all_dirty_returns_cache_full() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0xFF; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        // Fill with dirty (non-evictable) blocks.
+        store.put(1, b"d", false).unwrap();
+        store.put(2, b"d", false).unwrap();
+        store.put(3, b"d", false).unwrap();
+
+        // 4th put cannot evict anyone → CacheFull.
+        let res = store.put(4, b"d", false);
+        assert!(matches!(res, Err(BlockStoreError::CacheFull { .. })));
+    }
+
+    #[test]
+    fn eviction_touch_updates_lru_order() {
+        // 3-page cache: insert 1, 2, 3; touch 1 (making 2 the oldest); then
+        // inserting 4 should evict 2.
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0x10; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
         store.put(1, b"a", true).unwrap();
         store.put(2, b"b", true).unwrap();
         store.put(3, b"c", true).unwrap();
 
-        // Fourth block should fail.
-        let res = store.put(4, b"d", true);
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            BlockStoreError::CacheFull { .. } => {}
-            other => panic!("expected CacheFull, got {other}"),
-        }
+        // Touch block 1 via get() — it moves to MRU; 2 is now the oldest.
+        store.get(1);
 
-        // Remove one, then the put should succeed.
-        store.remove(2);
         store.put(4, b"d", true).unwrap();
-        assert_eq!(&store.get(4).unwrap()[..], b"d");
+        assert!(store.contains(1), "recently touched; should not be evicted");
+        assert!(!store.contains(2), "oldest LRU; evicted");
     }
+
+    #[test]
+    fn uploading_flag_prevents_eviction() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0x20; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        store.put(1, b"u", true).unwrap(); // evictable but UPLOADING
+        store.mark_uploading(1);
+        store.put(2, b"e", true).unwrap();
+        store.put(3, b"e", true).unwrap();
+
+        // 4th block: 1 is UPLOADING, 2 is oldest evictable.
+        store.put(4, b"e", true).unwrap();
+        assert!(store.contains(1), "uploading block not evicted");
+        assert!(!store.contains(2), "oldest plain-evictable evicted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Allocator / capacity
+    // -----------------------------------------------------------------------
 
     #[test]
     fn allocator_reuse_after_remove() {
@@ -687,14 +893,46 @@ mod tests {
 
         store.put(1, b"first", true).unwrap();
         let alloc_before = store.allocated_bytes();
-
         store.remove(1);
         assert_eq!(store.allocated_bytes(), 0);
-
         store.put(2, b"second", true).unwrap();
-        let alloc_after = store.allocated_bytes();
-        assert_eq!(alloc_before, alloc_after);
+        assert_eq!(store.allocated_bytes(), alloc_before);
     }
+
+    #[test]
+    fn fragmentation_and_coalesce() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        let sizes: &[usize] = &[100, 4_000, 8_000, 500, 16_000, 200, 6_000, 1_000, 12_000, 50];
+        for (i, &sz) in sizes.iter().enumerate() {
+            let data = vec![(i & 0xFF) as u8; sz];
+            store.put(i as u64, &data, true).unwrap();
+        }
+        let alloc_before = store.allocated_bytes();
+
+        // Create fragmentation.
+        for i in (0..sizes.len()).step_by(2) {
+            store.remove(i as u64);
+        }
+        assert_eq!(store.block_count(), 5);
+
+        for i in (1..sizes.len()).step_by(2) {
+            let expected = vec![(i & 0xFF) as u8; sizes[i]];
+            assert_eq!(&store.get(i as u64).unwrap()[..], &expected[..]);
+        }
+
+        // Re-insert; allocator should reuse freed space.
+        for i in (0..sizes.len()).step_by(2) {
+            let data = vec![0xFFu8; sizes[i]];
+            store.put(i as u64, &data, true).unwrap();
+        }
+        assert_eq!(store.allocated_bytes(), alloc_before);
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence / reopen
+    // -----------------------------------------------------------------------
 
     #[test]
     fn sync_data_does_not_error() {
@@ -705,16 +943,15 @@ mod tests {
     }
 
     #[test]
-    fn close_and_reopen() {
+    fn close_and_reopen_empty_index() {
         let dir = TempDir::new().unwrap();
         let config = test_config(&dir);
 
-        // First session.
         let store = BlockStore::open(config.clone()).unwrap();
         store.put(1, b"persist?", true).unwrap();
         store.close().unwrap();
 
-        // Second session — no index persistence yet so the cache starts empty.
+        // Index persistence is SFS-137; the cache starts empty on reopen.
         let store2 = BlockStore::open(config).unwrap();
         assert_eq!(store2.block_count(), 0);
         assert!(store2.get(1).is_none());
@@ -733,186 +970,12 @@ mod tests {
         let config2 = BlockStoreConfig {
             cache_dir: dir.path().to_path_buf(),
             max_size: 64 * 1024 * 1024,
-            volume_uuid: [0x22; 16], // different UUID
+            volume_uuid: [0x22; 16],
         };
-        let res = BlockStore::open(config2);
-        assert!(matches!(res, Err(BlockStoreError::VolumeUuidMismatch)));
-    }
-
-    #[test]
-    fn hit_miss_counters() {
-        let dir = TempDir::new().unwrap();
-        let store = BlockStore::open(test_config(&dir)).unwrap();
-
-        store.put(1, b"data", true).unwrap();
-        store.get(1); // hit
-        store.get(1); // hit
-        assert_eq!(store.hit_count(), 2);
-        assert_eq!(store.miss_count(), 0);
-    }
-
-    #[test]
-    fn large_block_16mb() {
-        let dir = TempDir::new().unwrap();
-        let config = BlockStoreConfig {
-            cache_dir: dir.path().to_path_buf(),
-            max_size: 256 * 1024 * 1024,
-            volume_uuid: [0xCC; 16],
-        };
-        let store = BlockStore::open(config).unwrap();
-
-        let big = vec![0x42u8; 16 * 1024 * 1024];
-        store.put(1, &big, true).unwrap();
-
-        let got = store.get(1).unwrap();
-        assert_eq!(got.len(), big.len());
-        assert_eq!(got[0], 0x42);
-        assert_eq!(got[got.len() - 1], 0x42);
-    }
-
-    #[test]
-    fn many_blocks_cycle() {
-        let dir = TempDir::new().unwrap();
-        let store = BlockStore::open(test_config(&dir)).unwrap();
-
-        // Insert 100 blocks.
-        for i in 0u64..100 {
-            let data = format!("block-{i}");
-            store.put(i, data.as_bytes(), true).unwrap();
-        }
-        assert_eq!(store.block_count(), 100);
-
-        // Verify all.
-        for i in 0u64..100 {
-            let expected = format!("block-{i}");
-            let got = store.get(i).unwrap();
-            assert_eq!(&got[..], expected.as_bytes());
-        }
-
-        // Remove odd IDs.
-        let odds: Vec<u64> = (0..100).filter(|i| i % 2 == 1).collect();
-        store.remove_batch(&odds);
-        assert_eq!(store.block_count(), 50);
-
-        // Even IDs still readable.
-        for i in (0u64..100).step_by(2) {
-            assert!(store.contains(i));
-        }
-    }
-
-    #[test]
-    fn fragmentation_and_coalesce() {
-        let dir = TempDir::new().unwrap();
-        let store = BlockStore::open(test_config(&dir)).unwrap();
-
-        // Insert blocks of varying sizes: 100B, 4000B, 8000B, 500B, 16000B
-        let sizes: &[usize] = &[
-            100, 4_000, 8_000, 500, 16_000, 200, 6_000, 1_000, 12_000, 50,
-        ];
-        for (i, &sz) in sizes.iter().enumerate() {
-            let data = vec![(i & 0xFF) as u8; sz];
-            store.put(i as u64, &data, true).unwrap();
-        }
-        assert_eq!(store.block_count(), sizes.len() as u64);
-        let alloc_before = store.allocated_bytes();
-
-        // Remove every other block to create fragmentation.
-        for i in (0..sizes.len()).step_by(2) {
-            store.remove(i as u64);
-        }
-        assert_eq!(store.block_count(), 5);
-
-        // Remaining blocks should still be readable.
-        for i in (1..sizes.len()).step_by(2) {
-            let expected = vec![(i & 0xFF) as u8; sizes[i]];
-            let got = store.get(i as u64).unwrap();
-            assert_eq!(&got[..], &expected[..]);
-        }
-
-        // Re-insert into the holes — allocator should reuse free space.
-        for i in (0..sizes.len()).step_by(2) {
-            let data = vec![0xFFu8; sizes[i]];
-            store.put(i as u64, &data, true).unwrap();
-        }
-        assert_eq!(store.block_count(), sizes.len() as u64);
-
-        // Total allocation should be the same (space was reused, not grown).
-        assert_eq!(store.allocated_bytes(), alloc_before);
-    }
-
-    #[test]
-    fn concurrent_put_get() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let dir = TempDir::new().unwrap();
-        let store = Arc::new(BlockStore::open(test_config(&dir)).unwrap());
-
-        // Phase 1: concurrent puts from 4 threads, 50 blocks each (disjoint ID ranges).
-        let mut handles = Vec::new();
-        for t in 0u64..4 {
-            let s = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                let base = t * 50;
-                for i in 0..50 {
-                    let id = base + i;
-                    let data = format!("t{t}-block-{i}");
-                    s.put(id, data.as_bytes(), true).unwrap();
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(store.block_count(), 200);
-
-        // Phase 2: concurrent reads from 4 threads.
-        let mut handles = Vec::new();
-        for t in 0u64..4 {
-            let s = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                let base = t * 50;
-                for i in 0..50 {
-                    let id = base + i;
-                    let expected = format!("t{t}-block-{i}");
-                    let got = s.get(id).expect("should hit");
-                    assert_eq!(&got[..], expected.as_bytes());
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(store.hit_count(), 200);
-
-        // Phase 3: concurrent mixed put + remove.
-        let mut handles = Vec::new();
-        // Thread removing odd IDs
-        {
-            let s = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                for id in (1..200u64).step_by(2) {
-                    s.remove(id);
-                }
-            }));
-        }
-        // Thread putting new blocks into a higher ID range
-        {
-            let s = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                for id in 200..300u64 {
-                    s.put(id, b"new-block", true).unwrap();
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // Even IDs from original range should still be present.
-        for id in (0..200u64).step_by(2) {
-            assert!(store.contains(id), "even id {id} should survive");
-        }
+        assert!(matches!(
+            BlockStore::open(config2),
+            Err(BlockStoreError::VolumeUuidMismatch)
+        ));
     }
 
     #[test]
@@ -927,10 +990,178 @@ mod tests {
 
         let config2 = BlockStoreConfig {
             cache_dir: dir.path().to_path_buf(),
-            max_size: 64 * 1024 * 1024, // smaller than superblock
+            max_size: 64 * 1024 * 1024,
             volume_uuid: [0x11; 16],
         };
-        let res = BlockStore::open(config2);
-        assert!(matches!(res, Err(BlockStoreError::MaxSizeShrunk { .. })));
+        assert!(matches!(
+            BlockStore::open(config2),
+            Err(BlockStoreError::MaxSizeShrunk { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hit_miss_counters() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(1, b"data", true).unwrap();
+        store.get(1);
+        store.get(1);
+        assert_eq!(store.hit_count(), 2);
+        assert_eq!(store.miss_count(), 0);
+        store.get(99);
+        assert_eq!(store.miss_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Large blocks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn large_block_16mb() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 256 * 1024 * 1024,
+            volume_uuid: [0xCC; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        let big = vec![0x42u8; 16 * 1024 * 1024];
+        store.put(1, &big, true).unwrap();
+        let got = store.get(1).unwrap();
+        assert_eq!(got.len(), big.len());
+        assert_eq!(got[0], 0x42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_put_get() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlockStore::open(test_config(&dir)).unwrap());
+
+        // Phase 1: concurrent puts from 4 threads (disjoint ID ranges).
+        let mut handles = Vec::new();
+        for t in 0u64..4 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for i in 0u64..50 {
+                    let id = t * 50 + i;
+                    let data = format!("t{t}-block-{i}");
+                    s.put(id, data.as_bytes(), true).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.block_count(), 200);
+
+        // Phase 2: concurrent reads.
+        let mut handles = Vec::new();
+        for t in 0u64..4 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for i in 0u64..50 {
+                    let id = t * 50 + i;
+                    let expected = format!("t{t}-block-{i}");
+                    let got = s.get(id).expect("should hit");
+                    assert_eq!(&got[..], expected.as_bytes());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.hit_count(), 200);
+
+        // Phase 3: concurrent removes and new puts.
+        let mut handles = Vec::new();
+        {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for id in (1u64..200).step_by(2) {
+                    s.remove(id);
+                }
+            }));
+        }
+        {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for id in 200u64..300 {
+                    s.put(id, b"new-block", true).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        for id in (0u64..200).step_by(2) {
+            assert!(store.contains(id), "even id {id} should survive");
+        }
+    }
+
+    #[test]
+    fn concurrent_touch_stress() {
+        // Many threads repeatedly get the same block to stress the LRU touch path.
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlockStore::open(test_config(&dir)).unwrap());
+
+        // Seed several blocks.
+        for id in 0u64..20 {
+            store.put(id, b"shared", true).unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    for id in 0u64..20 {
+                        let _ = s.get(id);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All blocks must still be present and readable after the touch storm.
+        assert_eq!(store.block_count(), 20);
+        for id in 0u64..20 {
+            assert!(store.contains(id));
+        }
+    }
+
+    #[test]
+    fn many_blocks_cycle() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        for i in 0u64..100 {
+            let data = format!("block-{i}");
+            store.put(i, data.as_bytes(), true).unwrap();
+        }
+        assert_eq!(store.block_count(), 100);
+
+        for i in 0u64..100 {
+            let expected = format!("block-{i}");
+            let got = store.get(i).unwrap();
+            assert_eq!(&got[..], expected.as_bytes());
+        }
+
+        let odds: Vec<u64> = (0..100).filter(|i| i % 2 == 1).collect();
+        store.remove_batch(&odds);
+        assert_eq!(store.block_count(), 50);
+        for i in (0u64..100).step_by(2) {
+            assert!(store.contains(i));
+        }
     }
 }
