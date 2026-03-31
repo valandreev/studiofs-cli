@@ -3,8 +3,8 @@
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
 
-- `flush()`/`close()` and local WAL accept guarantee immediate read-after-write for
-  the same mounted client.
+- `flush()`/`fsync()` and the local `WriteBuffer -> BlockStore -> sync_data() -> metadata`
+  commit path guarantee immediate read-after-write for the same mounted client.
 - remote readers see only coarse `upload_state` (`uploading`, `updating`, `ready`).
 - remote visibility is file-version atomic via incarnation publish.
 
@@ -16,10 +16,11 @@ Holds all runtime state:
 |-------|------|---------|
 | `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
-| `block_cache` | `Arc<BlockCache>` | L1 + L2 block cache |
+| `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
+| `block_cache` | `Arc<BlockCache>` | Compatibility cache helpers, promotion, and upload-queue plumbing |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
-| `state` | `VfsState` | Open files, dirty buffers, backpressure |
+| `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |
 
 ### Lifecycle
 
@@ -59,13 +60,13 @@ the capacity limit is reached.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `meta_path` | — | Path to redb database |
-| `cache_dir` | — | Root for block cache + journals |
+| `cache_dir` | — | Root for `BlockStore`, compatibility cache data, and journals |
 | `cache_size` | 100 GiB | L2 disk cache budget |
 | `memory_adaptive` | `true` | Adaptive memory controller (SFS-130): soft target 8 GiB, ceiling 50% RAM. Initial L1 = min(4 GiB, 25% RAM). ReadHeavy dirty budget 10%. Retreat threshold 85% L1. Emergency transitions logged at `warn`. |
 | `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |
-| `max_dirty_bytes` | 12 GiB | Dirty memory limit before backpressure |
+| `max_dirty_bytes` | 12 GiB | Local `WriteBuffer` memory limit before backpressure |
 | `l2_commit_workers` | 32 | Bounded L2 commit scheduler workers |
 | `l2_commit_queue_capacity` | 4096 | Bounded L2 commit queue capacity |
 | `l2_read_timeout_ms` | 5000 | Max wait for local L2 read before cache-miss fallback |
@@ -104,49 +105,50 @@ Adaptive upload throttling overrides:
 data arrives
   │
   ├─ Split into block-aligned chunks
-  ├─ Store/merge in `pending_blocks`
+  ├─ Store/merge in the per-file `WriteBuffer`
   ├─ Update local inode size and pending incarnation overlay
-  └─ Full blocks can be moved immediately into dirty staging
+  └─ If a full aligned block becomes complete, VFS may eagerly persist it
+     through `BlockStore -> sync_data() -> metadata`
 ```
 
 Handle-aware write path:
 - `write_fh(fh, ino, offset, data)` buffers data identically to `write()`.
 - `flush_fh()` runs the normal ordered flush for the inode and then surfaces any sticky async-upload error for that inode.
-- Foreground `flush()` / `close()` keep local staging and error reporting deterministic without waiting for remote upload or manifest publication.
-- In `cache_safety_mode=durable`, ingress WAL appends are forced with local `sync_data()`, so this confirmation is resilient to process crash and OS-page-cache loss scenarios.
+- Foreground `flush()` / `close()` keep local persistence and error reporting deterministic without waiting for remote upload or manifest publication.
+- Full-block eager flush lets aligned blocks become locally durable before the tail partial block is ready.
+- Foreground backpressure is driven by local `WriteBuffer` pressure; upload backlog alone does not stall writes.
 - Asynchronous upload failures are tracked as sticky inode errors; `flush_fh` / `fsync` report `EIO` deterministically until the async pipeline recovers and clears the sticky state.
 - `flush_fh`/`fsync` report sticky upload errors only after finishing the current local sync step, so newly written data is still persisted locally before `EIO` is returned.
 
-### 2. `flush(ino)` / `close(ino)`
+### 2. `flush(ino)` / `fsync(ino)` / `close(ino)`
 
 ```
-pending_blocks for this inode
+dirty `WriteBuffer` blocks for this inode
   │
-  ├─ `cache_safety_mode=durable`: append accepted records to ingress segments
-  │   (durable local accept + startup replay)
-  │   - payload is passed as `Bytes` directly into the blocking spill writer
-  │     (no `to_vec()` deep-copy on the hot path)
-  ├─ `cache_safety_mode=fast`: keep accepted payloads in RAM only and avoid
-  │   duplicate ingress payload writes
-  ├─ Update live ingress index / pending incarnation state
-  └─ Notify background pipeline
+  ├─ Take a point-in-time snapshot of dirty blocks
+  ├─ Reserve/reuse per-block object IDs
+  ├─ `BlockStore::put(...)` committed payloads locally
+  ├─ `BlockStore::sync_data()`
+  ├─ Persist extent metadata + attrs in local metadata
+  ├─ Commit `WriteBuffer` state only for bytes that actually persisted
+  └─ Enqueue uploads for the committed extents
 ```
 
 `cache_safety_mode` is configurable via VFS config / `studiofs settings --cache-safety-mode`
 or environment variable `STUDIOFS_CACHE_SAFETY_MODE=fast|durable`.
 
-Crash semantics note:
-- `fast` mode does not keep WAL-backed accepted payloads. After abrupt termination
-  (`SIGKILL`/process crash), very recent accepted writes that were not yet
-  materialized can be lost (typically the last materializer window).
-- `durable` mode keeps WAL/checkpoint-backed restart recovery for accepted ingress.
+Local durability notes:
+- Dirty bytes stay in `WriteBuffer` until the `BlockStore -> sync_data() -> metadata` sequence succeeds; failed persists do not drain RAM ownership.
+- Reserved object IDs make retrying the same dirty block idempotent across metadata failures.
+- `cache_safety_mode` no longer changes the foreground persistence path. Both modes use the same local durability flow.
+- `fast` mode removes legacy ingress artifacts during startup self-heal; `durable` mode preserves checkpoint/state metadata for startup recovery compatibility.
 
 ### File Session Ordering Model
 
 - Active regular-file transitions are owned by a per-inode file-session gate in VFS core.
 - `read` operations use a shared session lock (parallel reads on the same inode are allowed).
 - `write`, `flush`, `fsync`, and `release` use an exclusive session lock (state-changing barriers).
-- Background stages (`materialize`, `upload`, `finalize`) publish explicit per-inode transition events through the same file-session state.
+- Background stages (`local persist`, `upload`, `finalize`) publish explicit per-inode transition events through the same file-session state.
 - Open-handle counts are mirrored into file-session state on `open_file` / `release_fh` so lifecycle state and operation ordering live in one authority.
 - Session registry is stored as `HashMap<Ino, Weak<FileSessionEntry>>`; active operations/handles keep strong `Arc` ownership.
 - Idle sessions are garbage-collected lazily by pruning dead `Weak` entries (no strong owners remain).
@@ -161,64 +163,28 @@ Crash semantics note:
 - Session observability counters are maintained incrementally via atomics, so
   `file_session_stats()` does not need a full-table scan of active sessions.
 
-Ingress WAL internals:
-- The WAL subsystem is implemented in [`crates/studiofs-vfs/src/ingress_wal.rs`].
-- `vfs.rs` interacts with it through `IngressWal`, `IngressLiveIndex`, and `SpillEntry`
-  instead of owning segment-format details.
-- WAL metadata files (`ingress_spill/state.json`, `ingress_spill/checkpoints/latest.json`)
-  are encoded as binary `postcard` payloads with magic prefixes (`IWS1` / `IWC1`).
-- Startup recovery remains backward-compatible with legacy JSON metadata files.
+Legacy ingress-artifact note:
+- The legacy artifact subsystem lives in [`crates/studiofs-vfs/src/ingress_wal.rs`].
+- `cache_safety_mode=durable` preserves checkpoint/state metadata there for startup recovery compatibility.
+- `cache_safety_mode=fast` self-heals by discarding those artifacts on startup.
 
-### 3. Background Materializer (`drain_dirty_mem` lineage)
-
-Runs every 10ms, processes continuously while data exists:
-
-```
-dirty_mem + ingress_spill
-  │
-  ├─ Take batch of up to 1024 blocks
-  │    ├─ build `dirty_mem` and `ingress_live` snapshots for selected keys
-  │    └─ avoid per-key mutex contention while collecting batch payloads
-  │
-  ├─ Phase 1: pending manifest state update + L1 stage
-  │    ├─ allocate object ids
-  │    ├─ cache.stage_l1(id, data)
-  │    ├─ stage upload payload in bounded transient RAM window for uploader reuse
-  │    └─ meta.flush_blocks_batch()   ← local pending refs only
-  │
-  ├─ Phase 2: L2 commit scheduling (bounded)
-  │    └─ cache.commit_l2_batch(blocks) — consumes owned `Vec<(ObjectId, Bytes)>`, bounded queue + fixed worker pool
-  │
-  ├─ Phase 3: Upload enqueue for accepted incarnation extents
-  │    └─ cache.submit_upload(..., content_epoch) for each
-  │
-  ├─ Decrement dirty_bytes
-  ├─ Remove spill entries by `spill_seq` match against live index
-  │    (avoids re-reading full spill payloads from disk for byte-compare)
-  ├─ Notify dirty_drained_notify (wake backpressured writers)
-  │
-  └─ If batch was full, loop immediately
-```
-
-### 4. Upload Worker
+### 3. Background Upload Worker
 
 Consumes from upload queue channel:
 
 ```
-PendingUpload received
+Persisted extent queued
   │
-  ├─ Stage lookup: try transient staged upload payload seeded by materializer
-  │    └─ retains payload until success/cancel so upload retries can reuse RAM copy
-  ├─ Fallback local I/O phase: on staging miss, acquire upload local-cache I/O slots,
-  │  reread the committed payload from BlockStore/L1, release slots immediately,
-  │  and run any blocking BlockStore I/O on Tokio's blocking pool
+  ├─ Acquire local-cache I/O permits only for the local reread phase
+  ├─ Reread the committed payload from `BlockStore` (with compatibility cache helpers as needed)
+  ├─ Run blocking local I/O on Tokio's blocking pool
   ├─ Reject stale op if inode/incarnation no longer match
   ├─ Split logical block into 4 cloud fragments (up to 4 MiB each)
   ├─ Network phase: upload fragments to S3 (no local-cache I/O slot held)
   ├─ Build fragment `Buffer`s (header + raw payload chunk), compute xxh64 checksums
   ├─ PUT fragment objects to S3 in parallel via UploadScheduler (AIMD + retry/timeout policy)
   ├─ Mark extent record as uploaded only after upload success
-  ├─ cache.complete_upload(pending) — unpin LRU entry
+  ├─ Release local cache bookkeeping / eviction gating
   ├─ post-upload cache cleanup (`mark_evictable` / deferred remove) runs via
   │  blocking-pool wrappers so the async uploader never performs direct local
   │  cache file I/O on executor threads
@@ -228,12 +194,13 @@ PendingUpload received
 
 Upload worker responsibility is intentionally narrow:
 - it is the data plane for block payloads only;
+- local durability has already been established before the upload is queued;
 - it does not publish file manifests or decide when an inode incarnation becomes
   remote-visible;
 - once an extent upload succeeds, later file-version publication is handled by a
   separate epoch finalizer.
 
-### 5. Background Epoch Finalizer
+### 4. Background Epoch Finalizer
 
 Runs independently from upload workers and is responsible for control-plane
 publication of file versions:
@@ -241,8 +208,7 @@ publication of file versions:
 ```
 queued (ino, content_epoch)
   │
-  ├─ Skip/requeue if the inode still has local overlay state
-  │  (`pending_blocks`, dirty memory, ingress/WAL data)
+  ├─ Skip/requeue if the inode still has dirty `WriteBuffer` state
   ├─ Read the current block list for that epoch from metadata
   ├─ Wait until every referenced object is remote-visible
   ├─ Publish the manifest only if metadata still matches the verified block list
@@ -260,12 +226,10 @@ Why this split exists:
   avoids the classic "1 pending block per file" tail behavior.
 
 Consistency rules:
-- finalization is blocked while any local overlay remains for the inode,
-  including live ingress/WAL state;
+- finalization is blocked while any dirty local `WriteBuffer` overlay remains for the inode;
 - remote visibility is checked before publication;
 - publication is conditional on the verified manifest still matching metadata,
-  so a newer materialization pass cannot race an older verified block list into
-  a stale manifest.
+  so a newer local persist pass cannot race an older verified block list into a stale manifest.
 
 Deleted-inode cancellation behavior:
 - VFS tracks unlinked inodes in an in-memory `deleted_inodes` set and cancels
@@ -305,17 +269,13 @@ through `committed_size`, not through the local foreground `size`.
 ### `read(ino, offset, size)`
 
 ```
-local metadata view ──┬─ pending incarnation extents
-                        └─ fallback `committed_file_blocks`
+local metadata view ──┬─ dirty `WriteBuffer`
+                      └─ committed local extents / `committed_file_blocks`
          │
          ▼
-  resolve block data ─── ┌─ pending_blocks
-  (first match wins)     ├─ dirty_mem
-                         ├─ open handle dirty state
-                         ├─ pending incarnation extents
-                         ├─ ingress_spill
-                         ├─ L1 memory cache
-                         ├─ L2 disk cache
+  resolve block data ─── ┌─ `WriteBuffer`
+  (first match wins)     ├─ committed local extents in `BlockStore`
+                         ├─ compatibility cache helpers
                          └─ FetchScheduler → S3 fragment fetch (parallel, per-fragment retry)
          │
          ▼
@@ -332,37 +292,22 @@ local metadata view ──┬─ pending incarnation extents
   assemble response bytes
 ```
 
-**Completion-aware local read semantics (SFS-123)**
+**Two-level local read semantics**
 
-StudioFS uses a four-stage local-data availability model to guarantee
-local-read correctness while background uploads and L2 commits complete.
-The stages are:
+StudioFS now uses a two-level local-data availability model for foreground reads:
 
-- Stage 1 — `pending_blocks`: unflushed per-handle write buffer (in-memory).
-- Stage 2 — `dirty_mem`: accepted in-RAM staging after `flush_ordered`.
-- Stage 3 — `live_extent_records` + block cache: materialized L1/L2 entries
-  created by the materializer (`stage_l1` + `record_live_extent`) and pinned
-  until `complete_upload`.
-- Stage 4 — ingress spill WAL: durable spill entries used in `durable` mode
-  or when materialization has not yet occurred.
-
-To cover the narrow window between `complete_upload` (L1 unpin) and the
-corresponding L2/NVMe commit finishing, the async read path applies a bounded
-retry when a live-extent exists but the block is absent from cache. The
-default retry budget is 5 attempts × 10 ms = ~50 ms total. The following
-observability counters were added to `VfsIngressStats`:
-
-- `local_overlay_cache_miss_retries` — total retry attempts performed
-- `local_overlay_cache_miss_retry_exhaustions` — number of times the retry
-  budget was exhausted without locating the block in cache
+- Level 1 — `WriteBuffer`: dirty bytes that have not yet been committed locally,
+  including newer writes that may have arrived after a point-in-time persist snapshot was taken.
+- Level 2 — committed local cache state: extents already written to `BlockStore`
+  and referenced by local metadata / pending incarnation state.
 
 Notes:
-- Synchronous cache-only probes intentionally accept an immediate cache miss
-  and fall back to the async read path; this preserves fast sync probes while
-  the async path provides bounded recovery for transient L1→L2 handover.
-- The retry budget is intentionally bounded and observable; operators can
-  monitor the exhaustion counter to detect when the fixed (build-time)
-  retry budget may be insufficient for their hardware profile.
+- Persist snapshots are intentionally point-in-time only. If a block changes again
+  before that snapshot commits, the newer bytes stay dirty in `WriteBuffer` and a
+  later flush persists them.
+- Upload progress and remote publication do not affect local read-after-write for
+  the mounted client.
+- Synchronous cache-only probes may still fall back to the async read path on miss.
 
 
 Handle-aware read path:
@@ -536,9 +481,9 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 When accepted local staging exceeds configured budget:
 
-1. StudioFS prefers spilling to NVMe ingress (`ingress_spill`)
-2. only after RAM + spill budget are exhausted do `write()` / `flush()` wait
-3. background flusher drains staged blocks and wakes waiters
+1. StudioFS first tries to persist full dirty `WriteBuffer` blocks into local `BlockStore`
+2. foreground `write()` / `flush()` can assist the local drain path when pressure remains
+3. only exhaustion of the local `WriteBuffer` budget stalls foreground writers; upload backlog alone does not trigger backpressure
 
 This prevents unbounded memory growth during sustained writes.
 
