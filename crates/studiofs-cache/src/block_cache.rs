@@ -220,9 +220,9 @@ pub struct BlockCache {
     metrics: CachePipelineMetrics,
     /// Last persisted checkpoint signature: `(entry_count, crc32(entries))`.
     /// Used to skip redundant tmp+rename cycles when metadata is unchanged.
-    last_checkpoint_signature: std::sync::Mutex<Option<(u32, u32)>>,
+    last_checkpoint_signature: parking_lot::Mutex<Option<(u32, u32)>>,
     /// Monotonic deadline until which L2 reads are bypassed.
-    l2_read_breaker_open_until: std::sync::Mutex<Option<Instant>>,
+    l2_read_breaker_open_until: parking_lot::Mutex<Option<Instant>>,
     /// Number of consecutive L2 read timeout events.
     l2_read_timeout_streak: AtomicU32,
     /// Cumulative count of L1 blocks evicted (demoted to disk-only).
@@ -319,8 +319,8 @@ impl BlockCache {
             l2_commit_scheduler,
             background_tasks_started: AtomicBool::new(false),
             metrics,
-            last_checkpoint_signature: std::sync::Mutex::new(initial_checkpoint_signature),
-            l2_read_breaker_open_until: std::sync::Mutex::new(None),
+            last_checkpoint_signature: parking_lot::Mutex::new(initial_checkpoint_signature),
+            l2_read_breaker_open_until: parking_lot::Mutex::new(None),
             l2_read_timeout_streak: AtomicU32::new(0),
             l1_eviction_count: AtomicU64::new(0),
             l1_hits: AtomicU64::new(0),
@@ -522,10 +522,7 @@ impl BlockCache {
 
     fn is_l2_read_breaker_open(&self) -> bool {
         let now = Instant::now();
-        let mut guard = match self.l2_read_breaker_open_until.lock() {
-            Ok(guard) => guard,
-            Err(_) => return false,
-        };
+        let mut guard = self.l2_read_breaker_open_until.lock();
         match *guard {
             Some(until) if now < until => true,
             Some(_) => {
@@ -553,9 +550,8 @@ impl BlockCache {
             .as_millis()
             .clamp(1, u64::MAX as u128) as u64;
         let open_until = Instant::now() + Duration::from_millis(cooldown_ms);
-        if let Ok(mut guard) = self.l2_read_breaker_open_until.lock() {
-            *guard = Some(open_until);
-        }
+        let mut guard = self.l2_read_breaker_open_until.lock();
+        *guard = Some(open_until);
         warn!(
             object_id,
             threshold, cooldown_ms, "L2 read circuit breaker opened after repeated read timeouts"
@@ -1291,10 +1287,7 @@ impl BlockCache {
     fn prepare_checkpoint_write(&self) -> io::Result<Option<CheckpointWrite>> {
         let (buf, signature) = self.build_checkpoint_payload();
         let should_skip = {
-            let guard = self
-                .last_checkpoint_signature
-                .lock()
-                .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
+            let guard = self.last_checkpoint_signature.lock();
             matches!(*guard, Some(last) if last == signature)
         };
         if should_skip {
@@ -1368,10 +1361,7 @@ impl BlockCache {
     }
 
     fn record_checkpoint_signature(&self, signature: CheckpointSignature) -> io::Result<()> {
-        let mut guard = self
-            .last_checkpoint_signature
-            .lock()
-            .map_err(|_| io::Error::other("checkpoint signature lock poisoned"))?;
+        let mut guard = self.last_checkpoint_signature.lock();
         *guard = Some(signature);
         Ok(())
     }
@@ -1592,12 +1582,7 @@ mod tests {
         }
 
         let (cache, _rx) = BlockCache::open(config).unwrap();
-        let signature = cache
-            .last_checkpoint_signature
-            .lock()
-            .unwrap()
-            .as_ref()
-            .copied();
+        let signature = cache.last_checkpoint_signature.lock().as_ref().copied();
         assert!(signature.is_some());
     }
 

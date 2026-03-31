@@ -85,6 +85,11 @@ impl SendMutBuffer {
         }
     }
 
+    /// # Safety
+    ///
+    /// `self.ptr` must be valid, properly aligned, and point to `self.len`
+    /// initialised bytes.  The caller must ensure exclusive access to the
+    /// backing memory for the entire lifetime `'a`.
     unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }

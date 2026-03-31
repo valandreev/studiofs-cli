@@ -40,7 +40,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures::{FutureExt, future::join_all};
 use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -3749,7 +3749,7 @@ pub struct StudioVfs {
     /// Optional serverless distributed lock manager for bimodal consistency.
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
-    kernel_invalidator: std::sync::RwLock<Option<Arc<dyn KernelInvalidator>>>,
+    kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
     /// Adaptive memory budget controller (SFS-130). Empty when `VfsConfigRaw.memory_adaptive`
     /// (config/env) is disabled.
     memory_envelope: std::sync::OnceLock<Arc<crate::memory_envelope::MemoryEnvelope>>,
@@ -4807,7 +4807,7 @@ impl StudioVfs {
                 prefetch_pause_on_neterr,
                 fetch_scheduler: fetch_scheduler.clone(),
                 distributed_flock,
-                kernel_invalidator: std::sync::RwLock::new(None),
+                kernel_invalidator: RwLock::new(None),
                 memory_envelope: std::sync::OnceLock::new(),
             });
 
@@ -5220,7 +5220,7 @@ impl StudioVfs {
     }
 
     fn kernel_invalidator(&self) -> Option<Arc<dyn KernelInvalidator>> {
-        self.kernel_invalidator.read().unwrap().clone()
+        self.kernel_invalidator.read().clone()
     }
 
     fn collect_metadata_inodes(engine: &dyn MetaEngine) -> MetaResult<HashSet<Ino>> {
@@ -7967,7 +7967,7 @@ impl StudioVfs {
     /// Register a kernel cache invalidator (called by the platform bridge
     /// after mount so metadata refreshes can invalidate kernel dentry/attribute cache).
     pub fn set_kernel_invalidator(&self, inv: Arc<dyn KernelInvalidator>) {
-        *self.kernel_invalidator.write().unwrap() = Some(inv);
+        *self.kernel_invalidator.write() = Some(inv);
     }
 
     /// Clear kernel cache invalidator registration.
@@ -7975,7 +7975,7 @@ impl StudioVfs {
     /// Used during unmount/shutdown so in-flight metadata watchers do not
     /// attempt to notify a torn-down filesystem channel.
     pub fn clear_kernel_invalidator(&self) {
-        *self.kernel_invalidator.write().unwrap() = None;
+        *self.kernel_invalidator.write() = None;
     }
 
     /// Obtain the synchronous metadata engine handle backing this VFS.

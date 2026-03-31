@@ -288,7 +288,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
         }
     }
 
-    *SHUTDOWN_TX.lock().unwrap() = Some(tx);
+    *SHUTDOWN_TX.lock() = Some(tx);
     unsafe {
         SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
@@ -308,13 +308,12 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     Ok(())
 }
 
-static SHUTDOWN_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
-    std::sync::Mutex::new(None);
+static SHUTDOWN_TX: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    parking_lot::Mutex::new(None);
 
 pub(crate) fn request_shutdown() {
-    if let Ok(guard) = SHUTDOWN_TX.lock()
-        && let Some(tx) = guard.as_ref()
-    {
+    let guard = SHUTDOWN_TX.lock();
+    if let Some(tx) = guard.as_ref() {
         let _ = tx.send(());
     }
 }

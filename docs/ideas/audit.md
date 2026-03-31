@@ -47,42 +47,9 @@ c) VFS-операции с коллекциями (vfs.rs):
    components.last().unwrap().as_bytes().to_vec();  // строка 449
    ```
 
-### 3. 🔴 Lock poisoning — 11 мест с `.lock().unwrap()`
-
-Если какой-либо поток запаникует, держа мьютекс, все последующие
-.lock().unwrap() тоже запаникуют каскадом:
-
-- studiofs-winfsp/src/lib.rs:291         — SHUTDOWN_TX.lock().unwrap()
-- studiofs-vfs/src/vfs.rs:5223          — kernel_invalidator.read().unwrap()
-- studiofs-vfs/src/vfs.rs:7970          — kernel_invalidator.write().unwrap()
-- studiofs-vfs/src/vfs.rs:7978          — kernel_invalidator.write().unwrap()
-- studiofs-meta/src/pg_engine.rs:624    — poll_handle.lock().unwrap()
-- studiofs/src/cli/umount.rs:170        — pid_state().lock().unwrap()
-- studiofs/src/cli/umount.rs:178        — pid_state().lock().unwrap()
-- studiofs/src/cli/umount.rs:206        — pid_state().lock().unwrap()
-- studiofs/src/cli/umount.rs:223        — pid_state().lock().unwrap()
-
-Рекомендация: заменить на
-```rust
-lock.lock().unwrap_or_else(|poisoned| {
-    tracing::warn!("lock poisoned, recovering");
-    poisoned.into_inner()
-})
-```
-
 --------------------------------------------------------------------------------
 
 ## СЕРЬЁЗНЫЕ ПРОБЛЕМЫ
-
-### 4. 🟠 `std::sync::Mutex` в async-контексте
-
-studiofs-cache/src/block_cache.rs:223,225:
-```rust
-last_checkpoint_signature: std::sync::Mutex<Option<(u32, u32)>>,
-l2_read_breaker_open_until: std::sync::Mutex<Option<Instant>>,
-```
-Если задача заблокируется на этом мьютексе, она заблокирует весь
-executor-тред Tokio. Нужно tokio::sync::Mutex или Atomic.
 
 ### 5. 🟠 CI только на Ubuntu
 
@@ -96,17 +63,6 @@ Windows-специфичный код (winfsp) никогда не тестир�
 --------------------------------------------------------------------------------
 
 ## УМЕРЕННЫЕ ПРОБЛЕМЫ
-
-### 6. 🟡 unsafe без SAFETY-комментария
-
-studiofs-winfsp/src/context.rs:88-90:
-```rust
-unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-}
-```
-Нет SAFETY-комментария с описанием инвариантов (ptr валиден, выровнен,
-эксклюзивно владеется на время 'a).
 
 ### 7. 🟡 Массовое отсутствие документации
 
@@ -148,11 +104,6 @@ studiofs-cache/src/block_cache.rs — data.clone() клонирует потен
 
 Рекомендация: использовать Arc<[u8]> или Bytes для zero-copy sharing.
 
-### 9. 🟡 Нет rustfmt.toml / clippy.toml
-
-Проект использует дефолтные настройки форматирования и линтинга.
-Рекомендуется зафиксировать конфигурацию явно для командной работы.
-
 --------------------------------------------------------------------------------
 
 ## ХОРОШИЕ ПРАКТИКИ ✅
@@ -176,9 +127,6 @@ studiofs-cache/src/block_cache.rs — data.clone() клонирует потен
 ## ПРИОРИТЕТЫ ИСПРАВЛЕНИЙ
 
 Приоритет 1 (средняя сложность):
-  3. Заменить .lock().unwrap() на обработку poisoning (11 мест)
-  4. Заменить std::sync::Mutex → Atomic/tokio::sync в async-коде (2 поля)
-  6. Добавить SAFETY-комментарий к unsafe fn as_mut_slice
   5. Добавить CI matrix для Windows/macOS
 
 Приоритет 2 (большой объём работы, требует итеративного подхода):

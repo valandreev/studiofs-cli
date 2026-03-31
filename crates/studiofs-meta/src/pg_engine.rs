@@ -621,7 +621,7 @@ impl PgMetaEngine {
                 engine.poll_interval,
                 poll_shutdown,
             );
-            *engine.poll_handle.lock().unwrap() = Some(handle);
+            *engine.poll_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
         }
         Ok(engine)
     }
