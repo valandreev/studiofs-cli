@@ -66,6 +66,9 @@ impl MmapReader {
                     "requested mmap read end exceeds addressable space",
                 )
             })?;
+            // Cache v2 intentionally stays at one-copy reads for this phase.
+            // A future zero-copy path can bind Bytes to the generation Arc if
+            // profiling shows the copy is material on large blocks.
             return Ok(Bytes::copy_from_slice(&generation.mmap[start..end]));
         }
 
@@ -113,6 +116,11 @@ impl MmapReader {
             )
         })?;
         let mmap = unsafe { MmapOptions::new().len(mapped_len_usize).map(file)? };
+        // The Cache v2 design currently prefers a sequential hint on the whole
+        // mapping, matching the original spec for OS page-cache driven reads.
+        // If benchmarks show this is counterproductive for random-heavy access
+        // patterns, revisit this advisory choice rather than changing reader
+        // semantics.
         let _ = platform::advise_sequential(mmap.as_ref());
         Ok(MmapGeneration {
             #[cfg(test)]

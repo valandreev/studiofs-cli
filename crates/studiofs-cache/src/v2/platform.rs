@@ -141,6 +141,10 @@ fn is_benign_best_effort_error(error: &io::Error) -> bool {
 
 #[cfg(windows)]
 fn is_benign_best_effort_error(_error: &io::Error) -> bool {
+    // Windows-specific best-effort advisory primitives are still implemented as
+    // safe no-ops. If future implementations start returning native errors,
+    // keep the best-effort contract by treating unsupported advisory requests
+    // (for example ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED) as benign.
     false
 }
 
