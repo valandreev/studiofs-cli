@@ -238,6 +238,20 @@ impl BlockIndex {
         snapshot
     }
 
+    /// Return the oldest evictable block without removing it.
+    pub fn peek_oldest_evictable(&self) -> Option<(u64, u64)> {
+        let object_id = unsafe {
+            self.lru.find_front_matching(|object_id| {
+                self.entries
+                    .get(&object_id)
+                    .map(|entry| entry.flags.is_evictable())
+                    .unwrap_or(false)
+            })
+        }?;
+        let entry = self.entries.get(&object_id)?;
+        Some((object_id, entry.offset))
+    }
+
     // -----------------------------------------------------------------------
     // Mutating operations
     // -----------------------------------------------------------------------

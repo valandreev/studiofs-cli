@@ -777,24 +777,41 @@ impl BlockStore {
         object_id: u64,
     ) -> Result<Option<RemovedEntry>, BlockStoreError> {
         let mut idx = self.index.lock();
-        let removed = idx.remove(object_id);
-        if let Some(ref entry) = removed {
-            self.invalidate_block_header(entry.offset)?;
-        }
-        Ok(removed)
+        let Some(offset) = idx.get(object_id).map(|entry| entry.offset) else {
+            return Ok(None);
+        };
+
+        // Keep the index lock held across tombstoning + removal so a
+        // concurrent get() cannot observe a still-indexed block whose header
+        // has already been invalidated on disk.
+        self.invalidate_block_header(offset)?;
+        Ok(idx.remove(object_id))
     }
 
     fn evict_one_for_allocation(&self) -> Result<Option<RemovedEntry>, BlockStoreError> {
         let mut idx = self.index.lock();
-        let removed = idx.evict_one();
-        if let Some(ref entry) = removed {
-            self.invalidate_block_header(entry.offset)?;
-            self.wal
-                .lock()
-                .append_remove(entry.object_id)
-                .map_err(BlockStoreError::Io)?;
+        let Some((object_id, offset)) = idx.peek_oldest_evictable() else {
+            return Ok(None);
+        };
+
+        // Same rationale as overwrite removal: tombstone publication must stay
+        // ordered with index removal to avoid readers racing with a half-
+        // published eviction.
+        self.invalidate_block_header(offset)?;
+        let removed = idx
+            .remove(object_id)
+            .expect("peeked eviction candidate must still exist while index lock is held");
+
+        if let Err(error) = self.wal.lock().append_remove(removed.object_id) {
+            warn!(
+                error = ?error,
+                object_id = removed.object_id,
+                offset = removed.offset,
+                "evict_one_for_allocation: failed to append WAL remove",
+            );
         }
-        Ok(removed)
+
+        Ok(Some(removed))
     }
 
     fn invalidate_block_header(&self, offset: u64) -> io::Result<()> {
