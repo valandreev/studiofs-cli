@@ -167,7 +167,10 @@ cargo test --workspace --all-targets -- --nocapture
 CI runs four jobs on every push and PR — see
 [`.github/workflows/rust.yml`](.github/workflows/rust.yml) and
 [`docs/development.md`](docs/development.md) for the full matrix (Quality
-Gates, Linux, macOS, Windows).
+Gates, Linux, macOS, Windows). Each platform job includes an explicit named
+step for its backend crate (`studiofs-fuse` on Linux/macOS,
+`studiofs-winfsp` on Windows) so regressions in platform-specific code are
+immediately attributable in the CI log.
 
 Infra-heavy ignored suite:
 

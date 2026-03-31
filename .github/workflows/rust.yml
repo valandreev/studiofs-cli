@@ -12,9 +12,13 @@ env:
 # ─── Jobs ──────────────────────────────────────────────────────────────
 #
 #  quality   — portable lint, fmt, doc, audit (runs once on Linux)
-#  linux     — workspace tests on Linux
-#  macos     — clippy + tests on macOS  (validates studiofs-fuse macOS paths)
-#  windows   — clippy + tests on Windows (validates studiofs-winfsp)
+#  linux     — workspace tests on Linux; explicit studiofs-fuse Linux unit step
+#  macos     — clippy + tests on macOS; explicit studiofs-fuse macOS unit step
+#  windows   — clippy + tests on Windows; explicit studiofs-winfsp unit step
+#
+# Each platform job has a named step for the backend-specific crate so that
+# regressions in studiofs-fuse (Linux/macOS paths) or studiofs-winfsp clearly
+# identify the failing backend in the CI job log.
 #
 # Platform verification jobs depend on quality so a fmt / clippy / audit
 # failure short-circuits before consuming macOS / Windows runner minutes.
@@ -75,13 +79,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo test
-        run: cargo test --workspace --all-targets -- --nocapture
+        # Exclude studiofs-fuse so the workspace run does not duplicate the
+        # work performed by the explicit named step below. The explicit step
+        # is the sole source of signal for this backend on Linux.
+        run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
 
       - name: cargo test (SFS-121 offline fast suite)
         # Explicit gate for the SFS-121 buffered-first offline tests.
         # These are already included in the workspace run above; this step
         # makes failures immediately attributable to the SFS-121 suite in CI.
         run: cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --nocapture
+
+      - name: cargo test (studiofs-fuse — Linux paths)
+        # Sole runner for studiofs-fuse on Linux. Runs lib + non-ignored
+        # integration tests. cfg(target_os="linux") tests are exercised here;
+        # cfg(target_os="macos") tests are skipped by the compiler-guard.
+        run: cargo test -p studiofs-fuse -- --nocapture
 
   # ─── macOS Verification ────────────────────────────────────────────
   macos:
@@ -110,7 +123,16 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets -- --nocapture
+        # Exclude studiofs-fuse so the workspace run does not duplicate the
+        # work performed by the explicit named step below. The explicit step
+        # is the sole source of signal for this backend on macOS.
+        run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
+
+      - name: cargo test (studiofs-fuse — macOS paths)
+        # Sole runner for studiofs-fuse on macOS. Runs lib + non-ignored
+        # integration tests. cfg(target_os="macos") tests (volname, local,
+        # foreground) are exercised here and nowhere else.
+        run: cargo test -p studiofs-fuse -- --nocapture
 
   # ─── Windows Verification ──────────────────────────────────────────
   windows:
@@ -139,4 +161,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets -- --nocapture
+        # Exclude studiofs-winfsp so the workspace run does not duplicate the
+        # work performed by the explicit named step below. The explicit step
+        # is the sole source of signal for this backend on Windows.
+        run: cargo test --workspace --all-targets --exclude studiofs-winfsp -- --nocapture
+
+      - name: cargo test (studiofs-winfsp)
+        # Sole runner for studiofs-winfsp. Runs lib + non-ignored integration
+        # tests. The crate is guarded by #![cfg(windows)] so these tests only
+        # compile and run here.
+        # --test-threads=1 serialises the env-var-manipulating unit tests
+        # within this binary (ENV_LOCK already handles intra-binary
+        # serialisation, but 1 thread makes the isolation explicit and avoids
+        # any dependency on the lock being held across OS thread switches).
+        run: cargo test -p studiofs-winfsp -- --nocapture --test-threads=1
