@@ -206,6 +206,10 @@ Recent notes:
 - Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md](docs/vfs.md).
   This documents the 4-stage local overlay model, the bounded async retry for
   the L1→L2 handover window, and the new observability counters.
+- Finalized the BlockStore-backed committed read path (SFS-139): foreground reads,
+  readahead, and upload cache rereads now use `studiofs-cache` v2 as the primary
+  committed cache, while async VFS workers route blocking local cache mutations
+  through Tokio's blocking pool.
 
 ## Documentation
 

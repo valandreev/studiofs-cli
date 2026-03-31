@@ -5410,29 +5410,30 @@ impl StudioVfs {
         }
     }
 
-    fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) {
+    async fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) -> VfsResult<()> {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
         self.discard_staged_upload_payload(op.object_id);
         self.block_cache.cancel_upload(op, !has_open_handles);
-        self.block_store.remove(op.object_id);
+        self.block_store_remove_async(op.object_id).await?;
         self.state
             .upload
             .pending_evictions
             .lock()
             .remove(&op.object_id);
+        Ok(())
     }
 
-    fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> bool {
+    async fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> VfsResult<bool> {
         if !self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-            return false;
+            return Ok(false);
         }
         self.state
             .upload
             .upload_canceled_deleted
             .fetch_add(1, Ordering::Relaxed);
-        self.cancel_upload_for_deleted_inode(op);
+        self.cancel_upload_for_deleted_inode(op).await?;
         self.maybe_clear_deleted_inode_marker(op.ino);
-        true
+        Ok(true)
     }
 
     fn maybe_clear_deleted_inode_marker(&self, ino: Ino) {
@@ -7085,6 +7086,24 @@ impl StudioVfs {
             block_store
                 .put(object_id, data.as_ref(), evictable)
                 .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
+        })
+        .await
+    }
+
+    async fn block_store_mark_evictable_async(&self, object_id: u64) -> VfsResult<()> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || {
+            block_store.mark_evictable(object_id);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn block_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || {
+            block_store.remove(object_id);
+            Ok(())
         })
         .await
     }
@@ -10834,7 +10853,16 @@ impl StudioVfs {
                                     "upload failed for deleted inode, cancelling: {}",
                                     e
                                 );
-                                vfs.cancel_upload_for_deleted_inode(&op);
+                                if let Err(cancel_error) =
+                                    vfs.cancel_upload_for_deleted_inode(&op).await
+                                {
+                                    warn!(
+                                        object_id = op.object_id,
+                                        ino = op.ino,
+                                        error = %cancel_error,
+                                        "upload cancel cleanup failed for deleted inode"
+                                    );
+                                }
                                 vfs.state.upload
                                     .upload_canceled_deleted
                                     .fetch_add(1, Ordering::Relaxed);
@@ -10989,7 +11017,7 @@ impl StudioVfs {
                 waited_upload_delay_ms = delay_ms - age_ms;
                 tokio::select! {
                     _ = upload_cancel_token.cancelled() => {
-                        if self.cancel_upload_if_inode_deleted(&op) {
+                        if self.cancel_upload_if_inode_deleted(&op).await? {
                             debug!(ino = op.ino, object_id = op.object_id, "process_upload cancelled during upload delay");
                         }
                         return Ok(());
@@ -11004,7 +11032,7 @@ impl StudioVfs {
 
         // Fast-path first: if inode is already deleted, avoid any penalty
         // computation/sleep and cancel upload immediately.
-        if self.cancel_upload_if_inode_deleted(&op) {
+        if self.cancel_upload_if_inode_deleted(&op).await? {
             debug!(
                 object_id = op.object_id,
                 ino = op.ino,
@@ -11023,7 +11051,7 @@ impl StudioVfs {
             tokio::select! {
                 _ = self.state.shutdown.uploader_shutdown_token.cancelled() => return Ok(()),
                 _ = upload_cancel_token.cancelled() => {
-                    if self.cancel_upload_if_inode_deleted(&op) {
+                    if self.cancel_upload_if_inode_deleted(&op).await? {
                         debug!(
                             ino = op.ino,
                             object_id = op.object_id,
@@ -11067,7 +11095,7 @@ impl StudioVfs {
                 ino = op.ino,
                 "upload cancelled: inode deleted or missing"
             );
-            self.cancel_upload_for_deleted_inode(&op);
+            self.cancel_upload_for_deleted_inode(&op).await?;
             self.maybe_clear_deleted_inode_marker(op.ino);
             debug!(
                 ino = op.ino,
@@ -11096,7 +11124,7 @@ impl StudioVfs {
                 "upload cancelled: stale content epoch"
             );
             self.block_cache.cancel_upload(&op, false);
-            self.block_store.remove(op.object_id);
+            self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
                 .pending_evictions
@@ -11131,7 +11159,7 @@ impl StudioVfs {
                 "upload cancelled: stale block superseded by newer object"
             );
             self.block_cache.cancel_upload(&op, false);
-            self.block_store.remove(op.object_id);
+            self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
                 .pending_evictions
@@ -11197,7 +11225,7 @@ impl StudioVfs {
                     // Shutdown cancellation: keep op pending in journal by exiting
                     // before any completion path.
                     TimeoutOrCancel::Cancelled => {
-                        self.cancel_upload_if_inode_deleted(&op);
+                        self.cancel_upload_if_inode_deleted(&op).await?;
                         return Ok(());
                     }
                 }
@@ -11345,7 +11373,7 @@ impl StudioVfs {
                             // Shutdown cancellation: exit quietly so worker
                             // loop does not requeue/log as transient failure.
                             TimeoutOrCancel::Cancelled => {
-                                self.cancel_upload_if_inode_deleted(&op);
+                                self.cancel_upload_if_inode_deleted(&op).await?;
                                 return Ok(());
                             }
                         }
@@ -11366,7 +11394,7 @@ impl StudioVfs {
                         // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                             self.block_cache.cancel_upload(&op, false);
-                            self.block_store.remove(op.object_id);
+                            self.block_store_remove_async(op.object_id).await?;
                             self.state
                                 .upload
                                 .pending_evictions
@@ -11384,7 +11412,7 @@ impl StudioVfs {
                     // through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                         self.block_cache.cancel_upload(&op, false);
-                        self.block_store.remove(op.object_id);
+                        self.block_store_remove_async(op.object_id).await?;
                         self.state
                             .upload
                             .pending_evictions
@@ -11488,7 +11516,7 @@ impl StudioVfs {
             // Because `complete_upload` is not called, the pending op remains
             // in the persistent journal for safe resume on next mount.
             if saw_cancel {
-                self.cancel_upload_if_inode_deleted(&op);
+                self.cancel_upload_if_inode_deleted(&op).await?;
                 return Ok(());
             }
             if let Some((fragment_index, key, e)) = first_error {
@@ -11526,7 +11554,7 @@ impl StudioVfs {
                     .unwrap_or(false) =>
             {
                 self.block_cache.complete_upload(&op);
-                self.block_store.mark_evictable(op.object_id);
+                self.block_store_mark_evictable_async(op.object_id).await?;
                 self.discard_staged_upload_payload(op.object_id);
                 debug!(
                     ino = op.ino,
@@ -11580,7 +11608,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_with_priority(op.object_id, L2IoPriority::Background)
                 .await;
-            self.block_store.remove(op.object_id);
+            self.block_store_remove_async(op.object_id).await?;
             debug!(
                 object_id = op.object_id,
                 "post-upload eviction: block removed (inode deleted)"
@@ -11595,9 +11623,9 @@ impl StudioVfs {
             self.block_cache
                 .remove_with_priority(op.object_id, L2IoPriority::Background)
                 .await;
-            self.block_store.remove(op.object_id);
+            self.block_store_remove_async(op.object_id).await?;
         } else {
-            self.block_store.mark_evictable(op.object_id);
+            self.block_store_mark_evictable_async(op.object_id).await?;
         }
 
         debug!(
