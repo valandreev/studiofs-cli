@@ -130,6 +130,12 @@ Snapshot and WAL records are versioned binary formats.  WAL replay ignores a
 partial trailing record so abrupt termination does not poison the whole log.
 Clean shutdown writes a fresh snapshot and truncates `blocks.wal`.
 
+WAL appends intentionally do not call `flush`/`sync_data()` on every mutation.
+That keeps `put()`/`remove()` on the sequential append fast path, but it also
+means an OS crash can lose the newest unsynced WAL tail.  Recovery treats that
+as acceptable best-effort metadata loss and repairs it via snapshot replay or
+`blocks.data` scan fallback.
+
 ---
 
 ## Cache v3 (current) — L1 + L2

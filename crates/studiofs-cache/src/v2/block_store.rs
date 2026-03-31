@@ -9,12 +9,14 @@
 //! | State | Lock |
 //! |-------|------|
 //! | [`BlockIndex`] (map + LRU + counters) | `Mutex<BlockIndex>` |
+//! | Metadata WAL appender | `Mutex<WalAppender>` |
 //! | [`FreeList`] (allocator) | `Mutex<FreeList>` |
 //! | Hit / miss counters | `AtomicU64` |
 //!
-//! Locks are **never held simultaneously** — the index lock is always
-//! released before the allocator lock is acquired, and vice-versa.  This
-//! strict ordering prevents deadlocks.
+//! The allocator lock is never held at the same time as the index lock.
+//! Some metadata mutations briefly hold the index and WAL locks together,
+//! but there is no reverse `wal -> index -> allocator` path.  That lock
+//! ordering prevents deadlocks while keeping WAL appends serialized.
 //!
 //! ## Eviction
 //!
@@ -1258,6 +1260,25 @@ mod tests {
             !store2.contains(2),
             "oldest clean block should be evicted after reopen"
         );
+    }
+
+    #[test]
+    fn clean_shutdown_overwrites_existing_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"first", true).unwrap();
+        store.close().unwrap();
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(2, b"second", true).unwrap();
+        store.close().unwrap();
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert_eq!(reopened.block_count(), 2);
+        assert_eq!(&reopened.get(1).unwrap()[..], b"first");
+        assert_eq!(&reopened.get(2).unwrap()[..], b"second");
     }
 
     #[test]

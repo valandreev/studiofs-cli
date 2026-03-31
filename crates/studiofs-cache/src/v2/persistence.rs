@@ -50,6 +50,14 @@ pub(super) struct WalAppender {
 }
 
 impl WalAppender {
+    /// Open the append-only metadata WAL.
+    ///
+    /// WAL appends deliberately avoid `flush` / `sync_data` on the hot path.
+    /// A process crash is recovered by replaying any records that reached the
+    /// kernel page cache, while an OS crash may lose the newest unsynced tail.
+    /// That trade-off is intentional: the index WAL is best-effort metadata,
+    /// and any lost tail is repaired by snapshot replay or `blocks.data` scan
+    /// fallback on the next open.
     pub(super) fn open(cache_dir: &Path, reset: bool) -> io::Result<Self> {
         let path = wal_path(cache_dir);
         let mut file = OpenOptions::new()
@@ -190,10 +198,6 @@ pub(super) fn write_snapshot(cache_dir: &Path, entries: &[PersistedIndexEntry]) 
     file.write_all(&header)?;
     file.write_all(&body)?;
     file.sync_all()?;
-
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
     std::fs::rename(tmp_path, path)?;
     Ok(())
 }
@@ -431,7 +435,7 @@ fn validate_recovered_entries(
     let mut header_buf = [0u8; BLOCK_HEADER_SIZE as usize];
 
     for entry in entries {
-        if entry.offset < SUPERBLOCK_SIZE || !entry.offset.is_multiple_of(PAGE_SIZE) {
+        if entry.offset < SUPERBLOCK_SIZE || entry.offset % PAGE_SIZE != 0 {
             continue;
         }
         if entry.offset + BLOCK_HEADER_SIZE as u64 > file_len {
