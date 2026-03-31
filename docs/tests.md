@@ -1,5 +1,31 @@
 # Tests Guide
 
+## Verification Matrix
+
+StudioFS runs four CI jobs on every push and PR. All four are required gates.
+For the full contributor rules and CI ownership details see
+[docs/contributing.md](contributing.md).
+
+### Automatic vs manual coverage
+
+| Check | Linux | macOS | Windows |
+|-------|-------|-------|---------|
+| `cargo fmt` | ✅ Quality | — | — |
+| `cargo clippy` | ✅ Quality | ✅ | ✅ |
+| `cargo doc` / `cargo audit` | ✅ Quality | — | — |
+| Workspace unit + compile tests | ✅ | ✅ | ✅ |
+| `studiofs-fuse` Linux unit tests | ✅ | — | — |
+| `studiofs-fuse` macOS unit + non-mount integration | — | ✅ | — |
+| `studiofs-winfsp` unit tests | — | — | ✅ |
+| Platform bridge smoke tests (mount/unmount) | manual | manual | manual |
+| S3 / PostgreSQL integration (`#[ignore]`) | manual | manual | manual |
+
+**Quality Gates** runs once on Linux and gates all three platform jobs;
+a fmt/clippy/audit failure short-circuits before spending macOS or Windows
+runner minutes.
+
+---
+
 ## Test Layers
 
 1. Fast local/unit tests (default).
