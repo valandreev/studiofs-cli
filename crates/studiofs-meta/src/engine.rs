@@ -579,4 +579,21 @@ pub trait MetaEngine:
     + MetaSnapshots
     + MetaReplication
 {
+    /// Flush block refs and, optionally, inode attrs in one logical
+    /// foreground persist step.
+    ///
+    /// Backends should override this to make the operation atomic. The default
+    /// implementation preserves behavior but is not crash-atomic across the
+    /// two metadata updates.
+    fn flush_blocks_batch_with_attr(
+        &self,
+        entries: &[BatchFlushEntry],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Vec<BatchFlushResult>> {
+        let results = self.flush_blocks_batch(entries)?;
+        if let Some(attr) = attr {
+            self.set_attr(attr)?;
+        }
+        Ok(results)
+    }
 }

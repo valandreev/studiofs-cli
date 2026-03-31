@@ -5223,147 +5223,7 @@ impl MetaBlocks for RedbMetaEngine {
     /// This replaces N individual transactions (each with its own fsync) with
     /// one transaction - reducing commit overhead by ~100-300x.
     fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        if entries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut results = Vec::with_capacity(entries.len());
-        let mut used_space_delta: i64 = 0;
-
-        {
-            let mut blocks_table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut counters_table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut touched_inodes = std::collections::BTreeSet::new();
-
-            for e in entries {
-                let key = encode_file_block_key(e.ino, e.block_index);
-                let block_ref = BlockRef {
-                    object_id: e.object_id,
-                    offset: 0,
-                    length: e.length,
-                    flags: e.flags,
-                };
-                let data = encode(&block_ref)?;
-
-                // Read old block ref (for GC).
-                let old_block = if let Some(entry) = blocks_table
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                {
-                    let old: BlockRef = decode(entry.value())?;
-                    Some(old)
-                } else {
-                    None
-                };
-
-                // Write new block ref.
-                blocks_table
-                    .insert(key.as_slice(), data.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-                if let Some(ref old) = old_block {
-                    used_space_delta -= old.length as i64;
-                }
-
-                used_space_delta += e.length as i64;
-                results.push(BatchFlushResult { old_block });
-                touched_inodes.insert(e.ino);
-            }
-
-            if !touched_inodes.is_empty() {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let mut inodes = txn
-                    .open_table(INODES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                for ino in touched_inodes {
-                    let attr_bytes = inodes
-                        .get(ino)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                        .map(|g| g.value().to_vec());
-                    if let Some(attr_bytes) = attr_bytes {
-                        let mut attr: InodeAttr = decode(&attr_bytes)?;
-                        let has_committed_manifest =
-                            !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
-                        Self::transition_upload_state_for_local_mutation(
-                            &mut attr,
-                            has_committed_manifest,
-                        );
-                        let encoded = encode(&attr)?;
-                        inodes
-                            .insert(ino, encoded.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                }
-            }
-
-            let current_used = match counters_table
-                .get(counters::USED_SPACE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            let new_used = if used_space_delta >= 0 {
-                current_used.saturating_add(used_space_delta as u64)
-            } else {
-                current_used.saturating_sub((-used_space_delta) as u64)
-            };
-            counters_table
-                .insert(counters::USED_SPACE, new_used)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let seq_id = match counters_table
-                .get("nextEventSeq")
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 1,
-            };
-            counters_table
-                .insert("nextEventSeq", seq_id + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let batch_blocks: Vec<(Ino, u32, BlockRef)> = entries
-                .iter()
-                .map(|e| {
-                    (
-                        e.ino,
-                        e.block_index,
-                        BlockRef {
-                            object_id: e.object_id,
-                            offset: 0,
-                            length: e.length,
-                            flags: e.flags,
-                        },
-                    )
-                })
-                .collect();
-            let event = crate::events::MetaEvent::SetFileBlocksBatch {
-                blocks: batch_blocks,
-            };
-            let event_data = encode(&event)?;
-            let mut events = txn
-                .open_table(EVENT_LOG_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            events
-                .insert(seq_id, event_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(results)
+        self.flush_blocks_batch_with_attr_txn(entries, None)
     }
 
     fn commit_uploaded_block(
@@ -5589,6 +5449,178 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(true)
     }
 }
+
+impl RedbMetaEngine {
+    fn flush_blocks_batch_with_attr_txn(
+        &self,
+        entries: &[BatchFlushEntry],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Vec<BatchFlushResult>> {
+        if entries.is_empty() && attr.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(entries.len());
+        let mut used_space_delta: i64 = 0;
+
+        let normalized_attr = if let Some(attr) = attr {
+            let committed = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut normalized = attr.clone();
+            if normalized.kind == FileType::RegularFile {
+                let has_committed_manifest =
+                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                Self::transition_upload_state_for_local_mutation(
+                    &mut normalized,
+                    has_committed_manifest,
+                );
+            }
+            Some(normalized)
+        } else {
+            None
+        };
+
+        {
+            let mut touched_inodes = std::collections::BTreeSet::new();
+            if !entries.is_empty() {
+                let mut blocks_table = txn
+                    .open_table(FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                for e in entries {
+                    let key = encode_file_block_key(e.ino, e.block_index);
+                    let block_ref = BlockRef {
+                        object_id: e.object_id,
+                        offset: 0,
+                        length: e.length,
+                        flags: e.flags,
+                    };
+                    let data = encode(&block_ref)?;
+
+                    let old_block = if let Some(entry) = blocks_table
+                        .get(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                    {
+                        let old: BlockRef = decode(entry.value())?;
+                        Some(old)
+                    } else {
+                        None
+                    };
+
+                    blocks_table
+                        .insert(key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                    if let Some(ref old) = old_block {
+                        used_space_delta -= old.length as i64;
+                    }
+
+                    used_space_delta += e.length as i64;
+                    results.push(BatchFlushResult { old_block });
+                    touched_inodes.insert(e.ino);
+                }
+            }
+
+            if !touched_inodes.is_empty() {
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for ino in touched_inodes {
+                    if normalized_attr.as_ref().is_some_and(|attr| attr.ino == ino) {
+                        continue;
+                    }
+                    let attr_bytes = inodes
+                        .get(ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|g| g.value().to_vec());
+                    if let Some(attr_bytes) = attr_bytes {
+                        let mut current_attr: InodeAttr = decode(&attr_bytes)?;
+                        let has_committed_manifest =
+                            !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                        Self::transition_upload_state_for_local_mutation(
+                            &mut current_attr,
+                            has_committed_manifest,
+                        );
+                        let encoded = encode(&current_attr)?;
+                        inodes
+                            .insert(ino, encoded.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+            }
+
+            if let Some(attr) = normalized_attr.as_ref() {
+                Self::set_inode_overlay_in_txn(&txn, attr)?;
+            }
+
+            if !entries.is_empty() {
+                {
+                    let mut counters_table = txn
+                        .open_table(COUNTERS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let current_used = match counters_table
+                        .get(counters::USED_SPACE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                    {
+                        Some(v) => v.value(),
+                        None => 0,
+                    };
+                    let new_used = if used_space_delta >= 0 {
+                        current_used.saturating_add(used_space_delta as u64)
+                    } else {
+                        current_used.saturating_sub((-used_space_delta) as u64)
+                    };
+                    counters_table
+                        .insert(counters::USED_SPACE, new_used)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+
+                let batch_blocks: Vec<(Ino, u32, BlockRef)> = entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.ino,
+                            e.block_index,
+                            BlockRef {
+                                object_id: e.object_id,
+                                offset: 0,
+                                length: e.length,
+                                flags: e.flags,
+                            },
+                        )
+                    })
+                    .collect();
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetFileBlocksBatch {
+                        blocks: batch_blocks,
+                    },
+                )?;
+            }
+
+            if let Some(attr) = normalized_attr.as_ref() {
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
+                )?;
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(results)
+    }
+}
+
 impl MetaGc for RedbMetaEngine {
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         let txn = self
@@ -6228,7 +6260,15 @@ impl MetaReplication for RedbMetaEngine {
         Ok(None)
     }
 }
-impl crate::engine::MetaEngine for RedbMetaEngine {}
+impl crate::engine::MetaEngine for RedbMetaEngine {
+    fn flush_blocks_batch_with_attr(
+        &self,
+        entries: &[BatchFlushEntry],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Vec<BatchFlushResult>> {
+        self.flush_blocks_batch_with_attr_txn(entries, attr)
+    }
+}
 
 #[cfg(test)]
 mod tests {

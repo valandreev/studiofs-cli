@@ -230,7 +230,6 @@ impl StudioVfs {
         blocks: Vec<(u32, Bytes)>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
-        flush_upload_journal: bool,
     ) -> VfsResult<Vec<PersistedWriteBlock>> {
         if blocks.is_empty() {
             if let Some(mut attr) = attr_to_persist {
@@ -286,6 +285,12 @@ impl StudioVfs {
         // returns after local bytes are durable. If any pre-metadata step fails,
         // remove the cache entries again: the canonical retry source remains the
         // WriteBuffer snapshot guarded by `reserved_object_id`.
+        let mut attr_for_meta = attr_to_persist.clone();
+        if let Some(attr) = attr_for_meta.as_mut() {
+            Self::transition_upload_state_for_local_mutation(attr);
+        }
+        let attr_after_commit = attr_for_meta.clone();
+
         let pre_metadata_result: VfsResult<()> = async {
             for block in &persisted_blocks {
                 self.block_store_put_async(block.object_id, block.data.clone(), false)
@@ -310,7 +315,9 @@ impl StudioVfs {
 
             run_meta(
                 self.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| engine.flush_blocks_batch(&entries),
+                move |engine: Arc<dyn MetaEngine>| {
+                    engine.flush_blocks_batch_with_attr(&entries, attr_for_meta.as_ref())
+                },
             )
             .await?;
             Ok(())
@@ -342,14 +349,7 @@ impl StudioVfs {
             self.block_store.mark_uploading(block.object_id);
         }
 
-        if let Some(mut attr) = attr_to_persist {
-            Self::transition_upload_state_for_local_mutation(&mut attr);
-            let meta = self.meta_async.clone();
-            let attr_for_meta = attr.clone();
-            run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.set_attr(&attr_for_meta)
-            })
-            .await?;
+        if let Some(attr) = attr_after_commit {
             self.state.namespace.attr_read_cache.lock().remove(ino);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
@@ -362,7 +362,7 @@ impl StudioVfs {
                 "queued",
             );
         }
-        if flush_upload_journal {
+        if !upload_ops.is_empty() {
             self.block_cache.flush_upload_journal().await;
         }
         Ok(persisted_blocks)
@@ -656,13 +656,7 @@ impl StudioVfs {
                 };
             let attr_to_clear = attr_to_persist.clone();
             let persisted_blocks = self
-                .persist_write_buffer_blocks(
-                    ino,
-                    full_blocks,
-                    content_epoch,
-                    attr_to_persist,
-                    false,
-                )
+                .persist_write_buffer_blocks(ino, full_blocks, content_epoch, attr_to_persist)
                 .await?;
             self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
             if let Some(attr) = attr_to_clear.as_ref() {
@@ -692,7 +686,7 @@ impl StudioVfs {
         };
         let attr_to_clear = dirty_attr.clone();
         let persisted_blocks = self
-            .persist_write_buffer_blocks(ino, blocks_to_buffer, content_epoch, dirty_attr, true)
+            .persist_write_buffer_blocks(ino, blocks_to_buffer, content_epoch, dirty_attr)
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {

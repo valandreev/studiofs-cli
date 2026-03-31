@@ -2264,7 +2264,15 @@ impl MetaReplication for PgMetaEngine {
         }
     }
 }
-impl crate::engine::MetaEngine for PgMetaEngine {}
+impl crate::engine::MetaEngine for PgMetaEngine {
+    fn flush_blocks_batch_with_attr(
+        &self,
+        entries: &[BatchFlushEntry],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Vec<BatchFlushResult>> {
+        self.mutate(|local| local.flush_blocks_batch_with_attr(entries, attr))
+    }
+}
 
 #[cfg(test)]
 mod tests {

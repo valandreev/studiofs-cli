@@ -2416,6 +2416,117 @@ fn writer_reads_full_file_before_any_remote_commit() {
 }
 
 #[test]
+fn eager_full_block_write_recovers_pending_upload_after_restart() {
+    type EnvRestore = ScopedEnvVar;
+
+    let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("eager-full-block-restart-{}", std::process::id());
+    let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&offline_info).unwrap();
+
+    let payload = vec![0xC3u8; offline_info.block_size as usize];
+    let mut inode = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            let attr = vfs.create(1, b"eager-full-block.bin", 0, 0, 0o644).unwrap();
+            inode = attr.ino;
+            vfs.write(inode, 0, &payload).await.unwrap();
+
+            let attr_after = vfs.getattr(inode).unwrap();
+            assert_eq!(
+                attr_after.size,
+                payload.len() as u64,
+                "eager full-block commit must advance inode size together with block refs"
+            );
+            assert_eq!(
+                vfs.meta().get_file_blocks(inode).unwrap().len(),
+                1,
+                "eager full-block write should commit one block ref without flush()"
+            );
+            assert_eq!(
+                vfs.pending_uploads_for_inode(inode).len(),
+                1,
+                "eager full-block write must persist a pending upload intent before restart"
+            );
+
+            let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(read.as_ref(), payload.as_slice());
+        });
+        rt.shutdown_background();
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            assert_eq!(
+                vfs.pending_uploads_for_inode(inode).len(),
+                1,
+                "restart should recover the eager-path upload journal entry"
+            );
+            let attr_after = vfs.getattr(inode).unwrap();
+            assert_eq!(attr_after.size, payload.len() as u64);
+            assert_eq!(vfs.meta().get_file_blocks(inode).unwrap().len(), 1);
+
+            let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(
+                read.as_ref(),
+                payload.as_slice(),
+                "restart should recover eager full-block bytes from committed local state"
+            );
+        });
+        rt.shutdown_background();
+    }
+}
+
+#[test]
 fn writer_recovers_local_file_after_restart_before_upload_complete() {
     type EnvRestore = ScopedEnvVar;
 
