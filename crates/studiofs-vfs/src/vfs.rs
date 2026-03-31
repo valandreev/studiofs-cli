@@ -23,8 +23,8 @@
 
 #[path = "commit.rs"]
 mod commit;
-#[path = "materialize.rs"]
-mod materialize;
+#[path = "write_buffer.rs"]
+mod write_buffer;
 
 use crate::access::{
     AccessClass, AccessClassifierConfig, AccessDecision, AccessPolicy, HandleAccessState,
@@ -36,6 +36,7 @@ use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
 use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
+use crate::vfs::write_buffer::WriteBufferState;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{FutureExt, future::join_all};
 use opendal::options::WriteOptions;
@@ -61,7 +62,7 @@ use studiofs_data::object::{
     parse_object_id_from_key,
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
-use studiofs_meta::engine::{BatchFlushEntry, BatchFlushResult};
+use studiofs_meta::engine::BatchFlushEntry;
 use studiofs_meta::schema::{DirEntry, ROOT_INO, SetattrArgs, UploadState as MetaUploadState};
 use studiofs_meta::types::{
     AccessLevel, BlockFlags, BlockRef, FileType, Ino, InodeAttr, block_index_from_offset,
@@ -76,11 +77,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::ingress_wal::{
-    AppendOutcome, INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressRecordKind, IngressWal,
-    RecoveredSpillMap, SpillEntry, latest_ingress_checkpoint_path,
-    load_latest_ingress_checkpoint_meta, read_ingress_entry_bytes, recover_spill_dir,
-    reset_ingress_artifacts_for_fast_mode, scan_ingress_artifacts, write_ingress_checkpoint,
-    write_ingress_state,
+    INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressWal, RecoveredSpillMap,
+    latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta, recover_spill_dir,
+    reset_ingress_artifacts_for_fast_mode, scan_ingress_artifacts,
 };
 
 // =============================================================================
@@ -2806,96 +2805,13 @@ impl HandleTable {
     }
 }
 
-// =============================================================================
-// Pending Block (Write Buffer)
-// =============================================================================
-
-/// A block that is being written but not yet flushed.
-#[derive(Debug, Clone)]
-struct PendingBlock {
-    /// Block data (uncompressed).
-    data: BytesMut,
-    /// Has this block been modified?
-    dirty: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PersistedWriteBlock {
-    block_index: u32,
-    object_id: u64,
-    data: Bytes,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ExtentRecordId {
     object_id: u64,
     content_epoch: u64,
 }
 
-#[derive(Debug, Default)]
-struct DirtyMemIndex {
-    entries: HashMap<(Ino, u32), Bytes>,
-    by_ino_counts: HashMap<Ino, usize>,
-}
-
-impl DirtyMemIndex {
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn values(&self) -> impl Iterator<Item = &Bytes> {
-        self.entries.values()
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
-        self.entries.keys()
-    }
-
-    fn get(&self, key: &(Ino, u32)) -> Option<&Bytes> {
-        self.entries.get(key)
-    }
-
-    fn insert(&mut self, key: (Ino, u32), value: Bytes) -> Option<Bytes> {
-        let old = self.entries.insert(key, value);
-        if old.is_none() {
-            *self.by_ino_counts.entry(key.0).or_insert(0) += 1;
-        }
-        old
-    }
-
-    fn remove(&mut self, key: &(Ino, u32)) -> Option<Bytes> {
-        let old = self.entries.remove(key);
-        if old.is_some() {
-            let ino = key.0;
-            let count = self.by_ino_counts.get(&ino).copied().unwrap_or(0);
-            if count <= 1 {
-                self.by_ino_counts.remove(&ino);
-            } else {
-                self.by_ino_counts.insert(ino, count - 1);
-            }
-        }
-        old
-    }
-
-    fn remove_inode(&mut self, ino: Ino) -> usize {
-        let mut removed_bytes = 0usize;
-        self.entries.retain(|(i, _), data| {
-            if *i == ino {
-                removed_bytes = removed_bytes.saturating_add(data.len());
-                false
-            } else {
-                true
-            }
-        });
-        self.by_ino_counts.remove(&ino);
-        removed_bytes
-    }
-}
-
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn ingress_checkpoint_due_with_policy(
     pending_bytes: u64,
@@ -3026,17 +2942,12 @@ fn init_ingress_recovery_state(
 
 struct IngressState {
     ingress_live: Mutex<IngressLiveIndex>,
-    ingress_segment_write_lock: Mutex<()>,
-    active_ingress_segment_id: AtomicU64,
-    spill_seq: AtomicU64,
     ingress_append_stats: IoStats,
     ingress_checkpoint_persists: AtomicU64,
     ingress_checkpoint_failures: AtomicU64,
     ingress_last_checkpoint_unix_ms: AtomicU64,
     ingress_last_checkpoint_segment_id: AtomicU64,
     ingress_last_checkpoint_offset: AtomicU64,
-    ingress_checkpoint_pending_bytes: AtomicU64,
-    ingress_checkpoint_pending_mutations: AtomicU64,
     ingress_checkpoint_notify: tokio::sync::Notify,
     ingress_checkpoint_stopped: std::sync::atomic::AtomicBool,
 }
@@ -3044,16 +2955,11 @@ struct IngressState {
 impl IngressState {
     fn new(
         recovered_spill: RecoveredSpillMap,
-        recovered_spill_bytes: usize,
-        active_segment_id: u64,
-        recovered_spill_seq: u64,
+        _recovered_spill_bytes: usize,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
     ) -> Self {
         Self {
             ingress_live: Mutex::new(IngressLiveIndex::from_entries(recovered_spill)),
-            ingress_segment_write_lock: Mutex::new(()),
-            active_ingress_segment_id: AtomicU64::new(active_segment_id),
-            spill_seq: AtomicU64::new(recovered_spill_seq),
             ingress_append_stats: IoStats::default(),
             ingress_checkpoint_persists: AtomicU64::new(0),
             ingress_checkpoint_failures: AtomicU64::new(0),
@@ -3072,32 +2978,8 @@ impl IngressState {
                     .map(|(_, _, offset)| offset)
                     .unwrap_or(0),
             ),
-            ingress_checkpoint_pending_bytes: AtomicU64::new(recovered_spill_bytes as u64),
-            ingress_checkpoint_pending_mutations: AtomicU64::new(0),
             ingress_checkpoint_notify: tokio::sync::Notify::new(),
             ingress_checkpoint_stopped: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-struct DirtyBufferState {
-    dirty_mem: Mutex<DirtyMemIndex>,
-    dirty_bytes: AtomicUsize,
-    dirty_spill_bytes: AtomicUsize,
-    forced_spill_blocks: AtomicU64,
-    dirty_drained_notify: tokio::sync::Notify,
-    dirty_drain_lock: tokio::sync::Mutex<()>,
-}
-
-impl DirtyBufferState {
-    fn new(recovered_spill_bytes: usize) -> Self {
-        Self {
-            dirty_mem: Mutex::new(DirtyMemIndex::default()),
-            dirty_bytes: AtomicUsize::new(0),
-            dirty_spill_bytes: AtomicUsize::new(recovered_spill_bytes),
-            forced_spill_blocks: AtomicU64::new(0),
-            dirty_drained_notify: tokio::sync::Notify::new(),
-            dirty_drain_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -3347,28 +3229,6 @@ impl IncarnationState {
     }
 }
 
-struct WriteBufferState {
-    pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
-    write_backpressure_wait_ms: AtomicU64,
-    write_backpressure_events: AtomicU64,
-    fast_backpressure_wait_ms: AtomicU64,
-    fast_backpressure_events: AtomicU64,
-    fast_backpressure_stall_max_ms: AtomicU64,
-}
-
-impl WriteBufferState {
-    fn new() -> Self {
-        Self {
-            pending_blocks: Mutex::new(std::collections::HashMap::new()),
-            write_backpressure_wait_ms: AtomicU64::new(0),
-            write_backpressure_events: AtomicU64::new(0),
-            fast_backpressure_wait_ms: AtomicU64::new(0),
-            fast_backpressure_events: AtomicU64::new(0),
-            fast_backpressure_stall_max_ms: AtomicU64::new(0),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ForegroundReadSample {
     timestamp_ms: u64,
@@ -3460,10 +3320,6 @@ impl ShutdownState {
 }
 
 struct MetricsState {
-    drained_mem_blocks: AtomicU64,
-    drained_mem_bytes: AtomicU64,
-    drained_spill_blocks: AtomicU64,
-    drained_spill_bytes: AtomicU64,
     materialize_batch_stats: MaterializeBatchStats,
     ignored_entries: Mutex<IgnoredEntryRegistry>,
     next_ignored_ino: AtomicU64,
@@ -3484,10 +3340,6 @@ struct MetricsState {
 impl MetricsState {
     fn new() -> Self {
         Self {
-            drained_mem_blocks: AtomicU64::new(0),
-            drained_mem_bytes: AtomicU64::new(0),
-            drained_spill_blocks: AtomicU64::new(0),
-            drained_spill_bytes: AtomicU64::new(0),
             materialize_batch_stats: MaterializeBatchStats::default(),
             ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
@@ -3506,8 +3358,8 @@ impl VfsState {
     fn new(
         recovered_spill: RecoveredSpillMap,
         recovered_spill_bytes: usize,
-        active_segment_id: u64,
-        recovered_spill_seq: u64,
+        _active_segment_id: u64,
+        _recovered_spill_seq: u64,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
         block_size: u32,
         cfg: &VfsConfig,
@@ -3516,11 +3368,8 @@ impl VfsState {
             ingress: IngressState::new(
                 recovered_spill,
                 recovered_spill_bytes,
-                active_segment_id,
-                recovered_spill_seq,
                 initial_checkpoint_meta,
             ),
-            dirty_buffer: DirtyBufferState::new(recovered_spill_bytes),
             upload: UploadState::new(
                 derive_upload_cache_io_foreground_cost_base(cfg.upload_cache_io_slots),
                 block_size,
@@ -3549,7 +3398,6 @@ impl VfsState {
 
 struct VfsState {
     ingress: IngressState,
-    dirty_buffer: DirtyBufferState,
     upload: UploadState,
     file_session: FileSessionState,
     namespace: NamespaceState,
@@ -3593,7 +3441,6 @@ enum PrefetchWorkItem {
 
 struct StartupChannels {
     prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
-    dirty_flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
 }
 
@@ -3614,7 +3461,6 @@ struct StartupState {
     lifecycle: Mutex<StartupLifecycle>,
     lifecycle_notify: Condvar,
     metadata_invalidation_sync_interval: Duration,
-    background_slab_flush_enabled: bool,
     memory_adaptive: bool,
     total_ram: u64,
 }
@@ -3623,10 +3469,8 @@ impl StartupState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
-        dirty_flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
         metadata_invalidation_sync_interval: Duration,
-        background_slab_flush_enabled: bool,
         memory_adaptive: bool,
         total_ram: u64,
     ) -> Self {
@@ -3635,13 +3479,11 @@ impl StartupState {
                 status: StartupStatus::Uninitialized,
                 channels: Some(StartupChannels {
                     prefetch_rx,
-                    dirty_flush_rx,
                     upload_rx,
                 }),
             }),
             lifecycle_notify: Condvar::new(),
             metadata_invalidation_sync_interval,
-            background_slab_flush_enabled,
             memory_adaptive,
             total_ram,
         }
@@ -3668,8 +3510,6 @@ pub struct StudioVfs {
     data_prefix: String,
     /// Internal state (mutable).
     state: Arc<VfsState>,
-    /// Local cache durability/safety mode.
-    cache_safety_mode: CacheSafetyMode,
     /// Principal used for ACL evaluation in this mounted VFS instance.
     acl_principal: String,
     /// Max number of entries in effective ACL cache.
@@ -3681,13 +3521,7 @@ pub struct StudioVfs {
     upload_requeue_base: Duration,
     upload_requeue_max: Duration,
     upload_stats_interval: Duration,
-    slab_flush_interval: Duration,
     shutdown_metadata_flush_timeout: Duration,
-    ingress_checkpoint_interval: Duration,
-    ingress_checkpoint_min_append_bytes: u64,
-    ingress_checkpoint_min_mutations: u64,
-    ingress_checkpoint_max_segment_lag: u64,
-    ingress_checkpoint_max_live_segments: u64,
     /// Shared local-I/O budget for upload path reads from cache.
     upload_cache_io_slots: Arc<Semaphore>,
     upload_cache_io_slots_max: u32,
@@ -3710,7 +3544,6 @@ pub struct StudioVfs {
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
     upload_worker_count: usize,
-    max_drain_batch: usize,
     publish_visibility_timeout: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
@@ -3719,9 +3552,6 @@ pub struct StudioVfs {
     /// Channel sender for background prefetch planning and execution.
     /// The receiver lives in a spawned task that has an Arc<Self>.
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
-    /// Signal sender to wake the background flusher when new dirty blocks
-    /// are buffered.
-    dirty_flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
     /// One-time startup state used by `start()` to spawn background workers.
     startup: StartupState,
     /// Maximum total bytes allowed in the dirty-write memory buffer before
@@ -3730,9 +3560,6 @@ pub struct StudioVfs {
     max_dirty_bytes: AtomicUsize,
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
-    /// Maximum total bytes allowed in local NVMe spill before foreground
-    /// writes block waiting for the pipeline to catch up.
-    max_spill_bytes: usize,
     ingress_wal: IngressWal,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
@@ -3822,11 +3649,6 @@ impl StudioVfs {
             .by_ino
             .get(&ino)
             .map(|ignored| ignored.attr.clone())
-    }
-
-    #[inline]
-    fn durable_cache_safety_mode(&self) -> bool {
-        matches!(self.cache_safety_mode, CacheSafetyMode::Durable)
     }
 
     fn ignored_dir_attr(&self, ino: Ino) -> Option<InodeAttr> {
@@ -4545,9 +4367,6 @@ impl StudioVfs {
             let (prefetch_tx, prefetch_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
 
-            // Dirty-write memory buffer + background flusher channel.
-            let (dirty_flush_tx, dirty_flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
             // Create a read-optimised DataStore with dedicated connection pool and
             // tighter timeouts so that background uploads can never starve reads.
             let data_read = Arc::new(
@@ -4673,10 +4492,8 @@ impl StudioVfs {
             let upload_requeue_base = Duration::from_millis(config.upload_requeue_base_ms);
             let upload_requeue_max = Duration::from_millis(config.upload_requeue_max_ms);
             let upload_stats_interval = Duration::from_secs(config.upload_stats_interval_secs);
-            let slab_flush_interval = Duration::from_millis(config.slab_flush_interval_ms);
             let shutdown_metadata_flush_timeout =
                 Duration::from_secs(config.shutdown_metadata_flush_timeout_secs);
-            let background_slab_flush_enabled = config.background_slab_flush_enabled;
             let ingress_checkpoint_interval =
                 Duration::from_secs(config.ingress_checkpoint_interval_secs);
             let ingress_checkpoint_min_append_bytes = config.ingress_checkpoint_min_append_bytes;
@@ -4696,7 +4513,6 @@ impl StudioVfs {
             let upload_fg_read_latency_sticky_window_ms = upload_fg_read_latency_window_ms
                 .saturating_mul(upload_fg_read_latency_sticky_windows);
             let upload_worker_count = config.upload_worker_count;
-            let max_drain_batch = config.max_drain_batch;
             let publish_visibility_timeout =
                 Duration::from_secs(config.publish_visibility_timeout_secs);
             debug!(
@@ -4705,7 +4521,6 @@ impl StudioVfs {
                 requeue_base_ms = upload_requeue_base.as_millis() as u64,
                 requeue_max_ms = upload_requeue_max.as_millis() as u64,
                 upload_stats_interval_secs = upload_stats_interval.as_secs(),
-                slab_flush_interval_ms = slab_flush_interval.as_millis() as u64,
                 ingress_checkpoint_interval_secs = ingress_checkpoint_interval.as_secs(),
                 ingress_checkpoint_min_append_bytes,
                 ingress_checkpoint_min_mutations,
@@ -4740,7 +4555,6 @@ impl StudioVfs {
                 block_cache,
                 block_size,
                 data_prefix,
-                cache_safety_mode,
                 acl_principal,
                 effective_acl_cache_capacity,
                 state: Arc::new(VfsState::new(
@@ -4757,13 +4571,7 @@ impl StudioVfs {
                 upload_requeue_base,
                 upload_requeue_max,
                 upload_stats_interval,
-                slab_flush_interval,
                 shutdown_metadata_flush_timeout,
-                ingress_checkpoint_interval,
-                ingress_checkpoint_min_append_bytes,
-                ingress_checkpoint_min_mutations,
-                ingress_checkpoint_max_segment_lag,
-                ingress_checkpoint_max_live_segments,
                 upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
                 // Safe cast: upload_cache_io_slots is validated earlier to fit in u32
                 upload_cache_io_slots_max: {
@@ -4789,24 +4597,19 @@ impl StudioVfs {
                 access_classifier,
                 upload_user_idle_grace,
                 upload_worker_count,
-                max_drain_batch,
                 publish_visibility_timeout,
                 readahead: readahead.clone(),
                 dir_prefetch,
                 prefetch_tx,
-                dirty_flush_tx,
                 startup: StartupState::new(
                     prefetch_rx,
-                    dirty_flush_rx,
                     upload_rx,
                     metadata_invalidation_sync_interval,
-                    background_slab_flush_enabled,
                     config.memory_adaptive,
                     config.total_ram,
                 ),
                 max_dirty_bytes: AtomicUsize::new(max_dirty_bytes),
                 max_xattr_bytes,
-                max_spill_bytes,
                 ingress_wal,
                 handle_table: HandleTable::new(),
                 janitor_lease,
@@ -4862,7 +4665,6 @@ impl StudioVfs {
 
         let StartupChannels {
             mut prefetch_rx,
-            dirty_flush_rx,
             upload_rx,
         } = {
             let mut lifecycle = self.startup.lifecycle.lock();
@@ -5059,11 +4861,6 @@ impl StudioVfs {
                 self.track_background_task(tokio::spawn(async move {
                     vfs_clone.background_janitor().await;
                 }));
-
-                // Cache v2 writes are drained inline through WriteBuffer ->
-                // BlockStore -> upload queue, so the legacy slab/materializer
-                // worker stays disabled.
-                drop(dirty_flush_rx);
 
                 // Spawn adaptive MemoryEnvelope controller (SFS-130).
                 if self.startup.memory_adaptive {
@@ -5563,18 +5360,6 @@ impl StudioVfs {
         (p95, max)
     }
 
-    fn spill_age_stats_ms(&self) -> (usize, u64) {
-        let ingress_live = self.state.ingress.ingress_live.lock();
-        let count = ingress_live.len();
-        let now_ms = Self::now_unix_millis();
-        let oldest_age_ms = ingress_live
-            .iter()
-            .map(|(_, entry)| now_ms.saturating_sub(entry.created_unix_ms))
-            .max()
-            .unwrap_or(0);
-        (count, oldest_age_ms)
-    }
-
     fn upload_pipeline_is_idle(&self, pending_uploads: usize, ingress: &VfsIngressStats) -> bool {
         crate::upload::upload_log_is_idle(pending_uploads, self.upload_scheduler.in_flight())
             && ingress.dirty_mem_blocks == 0
@@ -5608,138 +5393,6 @@ impl StudioVfs {
         } else {
             format!("{pending_upload_bytes}B")
         }
-    }
-
-    fn ingress_checkpoint_due(&self, timer_fired: bool) -> bool {
-        let pending_bytes = self
-            .state
-            .ingress
-            .ingress_checkpoint_pending_bytes
-            .load(Ordering::Relaxed);
-        let pending_mutations = self
-            .state
-            .ingress
-            .ingress_checkpoint_pending_mutations
-            .load(Ordering::Relaxed);
-        let active_segment_lag = self
-            .state
-            .ingress
-            .active_ingress_segment_id
-            .load(Ordering::Relaxed)
-            .saturating_sub(
-                self.state
-                    .ingress
-                    .ingress_last_checkpoint_segment_id
-                    .load(Ordering::Relaxed),
-            );
-        let live_segment_count = self.state.ingress.ingress_live.lock().live_segment_count();
-        ingress_checkpoint_due_with_policy(
-            pending_bytes,
-            pending_mutations,
-            self.ingress_checkpoint_min_append_bytes,
-            self.ingress_checkpoint_min_mutations,
-            active_segment_lag,
-            self.ingress_checkpoint_max_segment_lag,
-            live_segment_count,
-            self.ingress_checkpoint_max_live_segments,
-            timer_fired,
-        )
-    }
-
-    fn persist_ingress_recovery_state_owned(
-        state: Arc<VfsState>,
-        ingress_wal: IngressWal,
-    ) -> VfsResult<()> {
-        let _writer_guard = state.ingress.ingress_segment_write_lock.lock();
-        let ingress_live = state.ingress.ingress_live.lock();
-        let meta = write_ingress_checkpoint(
-            ingress_wal.checkpoint_dir(),
-            &ingress_live,
-            ingress_wal.segment_dir(),
-            state
-                .ingress
-                .active_ingress_segment_id
-                .load(Ordering::Relaxed),
-            state.ingress.spill_seq.load(Ordering::Relaxed),
-        )?;
-        state
-            .ingress
-            .ingress_checkpoint_persists
-            .fetch_add(1, Ordering::Relaxed);
-        state
-            .ingress
-            .ingress_last_checkpoint_unix_ms
-            .store(Self::now_unix_millis(), Ordering::Relaxed);
-        state
-            .ingress
-            .ingress_last_checkpoint_segment_id
-            .store(meta.covered_segment_id, Ordering::Relaxed);
-        state
-            .ingress
-            .ingress_last_checkpoint_offset
-            .store(meta.covered_offset, Ordering::Relaxed);
-        state
-            .ingress
-            .ingress_checkpoint_pending_bytes
-            .store(0, Ordering::Relaxed);
-        state
-            .ingress
-            .ingress_checkpoint_pending_mutations
-            .store(0, Ordering::Relaxed);
-        write_ingress_state(
-            ingress_wal.spill_dir(),
-            state
-                .ingress
-                .active_ingress_segment_id
-                .load(Ordering::Relaxed),
-            state.ingress.spill_seq.load(Ordering::Relaxed),
-        )
-    }
-
-    fn note_ingress_checkpoint_churn(&self, record_bytes: u64) {
-        let pending_bytes = self
-            .state
-            .ingress
-            .ingress_checkpoint_pending_bytes
-            .fetch_add(record_bytes, Ordering::Relaxed)
-            .saturating_add(record_bytes);
-        let pending_mutations = self
-            .state
-            .ingress
-            .ingress_checkpoint_pending_mutations
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        if pending_bytes >= self.ingress_checkpoint_min_append_bytes
-            || pending_mutations >= self.ingress_checkpoint_min_mutations
-        {
-            self.state.ingress.ingress_checkpoint_notify.notify_one();
-        }
-    }
-
-    fn append_ingress_record_live(
-        &self,
-        key: (Ino, u32),
-        seq: u64,
-        created_unix_ms: u64,
-        kind: IngressRecordKind,
-        payload: &[u8],
-    ) -> VfsResult<AppendOutcome> {
-        let started = Instant::now();
-        let _guard = self.state.ingress.ingress_segment_write_lock.lock();
-        let append = self.ingress_wal.append(
-            &self.state.ingress.active_ingress_segment_id,
-            key,
-            seq,
-            created_unix_ms,
-            kind,
-            payload,
-        )?;
-        self.note_ingress_checkpoint_churn(append.record_bytes);
-        self.state
-            .ingress
-            .ingress_append_stats
-            .record(append.record_bytes, started.elapsed());
-        Ok(append)
     }
 
     fn upload_requeue_delay(&self, op: &PendingUpload) -> Duration {
@@ -6080,153 +5733,6 @@ impl StudioVfs {
         };
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
-    }
-
-    fn remove_spill_entry(&self, key: (Ino, u32)) -> Option<SpillEntry> {
-        let removed = self.state.ingress.ingress_live.lock().remove(&key);
-        if let Some(ref entry) = removed {
-            let seq = self.state.ingress.spill_seq.fetch_add(1, Ordering::Relaxed);
-            let _ = self.append_ingress_record_live(
-                key,
-                seq,
-                Self::now_unix_millis(),
-                IngressRecordKind::Invalidate,
-                &[],
-            );
-            self.state
-                .dirty_buffer
-                .dirty_spill_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(entry.len))
-                })
-                .ok();
-            if entry.path.extension().is_some_and(|ext| ext == "spill") {
-                let _ = std::fs::remove_file(&entry.path);
-            }
-            self.state
-                .dirty_buffer
-                .dirty_drained_notify
-                .notify_waiters();
-        }
-        removed
-    }
-
-    /// Batch remove spill entries for a given inode.
-    /// Holds the lock once to extract all entries, then performs
-    /// IO operations (WAL writes, file deletions) after releasing the lock.
-    fn remove_spill_entries_batch(&self, ino: Ino) -> usize {
-        // Phase 1: Acquire lock, extract all entries for this inode, release lock.
-        let removed: Vec<((Ino, u32), SpillEntry)> = {
-            let mut ingress_live = self.state.ingress.ingress_live.lock();
-            let keys: Vec<(Ino, u32)> = ingress_live
-                .keys()
-                .filter(|(i, _)| *i == ino)
-                .cloned()
-                .collect();
-
-            let mut result = Vec::with_capacity(keys.len());
-            for key in keys {
-                if let Some(entry) = ingress_live.remove(&key) {
-                    result.push((key, entry));
-                }
-            }
-            result
-        };
-        // Lock released here.
-
-        if removed.is_empty() {
-            return 0;
-        }
-
-        // Phase 2: Process removed entries outside the lock.
-        let mut spill_files_to_delete = Vec::new();
-        let mut total_spill_bytes_freed = 0;
-        let now_ms = Self::now_unix_millis();
-
-        for (key, entry) in &removed {
-            let seq = self.state.ingress.spill_seq.fetch_add(1, Ordering::Relaxed);
-            let _ = self.append_ingress_record_live(
-                *key,
-                seq,
-                now_ms,
-                IngressRecordKind::Invalidate,
-                &[],
-            );
-            total_spill_bytes_freed += entry.len;
-
-            if entry.path.extension().is_some_and(|ext| ext == "spill") {
-                spill_files_to_delete.push(entry.path.clone());
-            }
-        }
-
-        if total_spill_bytes_freed > 0 {
-            self.state
-                .dirty_buffer
-                .dirty_spill_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(total_spill_bytes_freed))
-                })
-                .ok();
-            self.state
-                .dirty_buffer
-                .dirty_drained_notify
-                .notify_waiters();
-        }
-
-        // Phase 3: Delete spill files (IO operation) — done last, outside any lock.
-        for path in spill_files_to_delete {
-            let _ = std::fs::remove_file(&path);
-        }
-
-        removed.len()
-    }
-
-    fn load_spill_block(&self, key: (Ino, u32)) -> VfsResult<Option<Bytes>> {
-        let entry = self.state.ingress.ingress_live.lock().get_cloned(&key);
-        let Some(entry) = entry else {
-            return Ok(None);
-        };
-        Ok(Some(read_ingress_entry_bytes(&entry)?))
-    }
-
-    fn spill_block(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
-        let seq = self.state.ingress.spill_seq.fetch_add(1, Ordering::Relaxed);
-        let created_unix_ms = Self::now_unix_millis();
-        let append = self.append_ingress_record_live(
-            key,
-            seq,
-            created_unix_ms,
-            IngressRecordKind::Put,
-            &data,
-        )?;
-
-        if let Some(old) = self.state.ingress.ingress_live.lock().insert(
-            key,
-            SpillEntry {
-                seq,
-                segment_id: append.segment_id,
-                path: append.path,
-                offset: append.offset,
-                len: data.len(),
-                created_unix_ms,
-            },
-        ) {
-            self.state
-                .dirty_buffer
-                .dirty_spill_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(old.len))
-                })
-                .ok();
-            if old.path.extension().is_some_and(|ext| ext == "spill") {
-                let _ = std::fs::remove_file(old.path);
-            }
-        }
-        self.state
-            .dirty_buffer
-            .dirty_spill_bytes
-            .fetch_add(data.len(), Ordering::Relaxed);
-        Ok(())
     }
 
     async fn current_content_epoch_async(&self, ino: Ino) -> VfsResult<u64> {
@@ -7068,189 +6574,6 @@ impl StudioVfs {
         }
     }
 
-    fn total_pending_write_buffer_bytes(&self) -> usize {
-        self.state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .values()
-            .map(|block| block.data.len())
-            .sum()
-    }
-
-    fn has_pending_write_buffer_blocks_for_inode(&self, ino: Ino) -> bool {
-        self.state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
-    }
-
-    fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
-        if self.has_pending_write_buffer_blocks_for_inode(ino) {
-            return;
-        }
-        let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
-        if let Some(current) = dirty_attrs.get(&ino)
-            && current.content_epoch == attr.content_epoch
-            && current.size == attr.size
-            && current.mtime == attr.mtime
-            && current.ctime == attr.ctime
-        {
-            dirty_attrs.remove(&ino);
-        }
-    }
-
-    async fn persist_write_buffer_blocks(
-        &self,
-        ino: Ino,
-        blocks: Vec<(u32, Bytes)>,
-        attr_to_persist: Option<InodeAttr>,
-        flush_upload_journal: bool,
-    ) -> VfsResult<()> {
-        if blocks.is_empty() {
-            if let Some(mut attr) = attr_to_persist {
-                Self::transition_upload_state_for_local_mutation(&mut attr);
-                let meta = self.meta_async.clone();
-                let attr_for_meta = attr.clone();
-                run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                    engine.set_attr(&attr_for_meta)
-                })
-                .await?;
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-                self.clear_matching_dirty_attr_if_committed(ino, &attr);
-            }
-            return Ok(());
-        }
-
-        let block_count = blocks.len() as u32;
-        let object_ids = run_meta(
-            self.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.next_block_ids(block_count),
-        )
-        .await?;
-
-        let persisted_blocks: Vec<PersistedWriteBlock> = blocks
-            .into_iter()
-            .zip(object_ids.into_iter())
-            .map(|((block_index, data), object_id)| PersistedWriteBlock {
-                block_index,
-                object_id,
-                data,
-            })
-            .collect();
-
-        for block in &persisted_blocks {
-            self.block_store_put_async(block.object_id, block.data.clone(), false)
-                .await?;
-        }
-        self.block_store_sync_data_async().await?;
-
-        let entries: Vec<BatchFlushEntry> = persisted_blocks
-            .iter()
-            .map(|block| BatchFlushEntry {
-                ino,
-                block_index: block.block_index,
-                object_id: block.object_id,
-                length: block.data.len() as u32,
-                flags: if block.data.len() < self.block_size as usize {
-                    BlockFlags::PARTIAL_BLOCK
-                } else {
-                    BlockFlags::empty()
-                },
-            })
-            .collect();
-
-        run_meta(
-            self.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.flush_blocks_batch(&entries),
-        )
-        .await?;
-
-        let content_epoch = if let Some(attr) = attr_to_persist.as_ref() {
-            attr.content_epoch
-        } else {
-            self.current_content_epoch_async(ino).await?
-        };
-
-        let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
-            .iter()
-            .map(|block| {
-                (
-                    ino,
-                    (block.block_index as u64).saturating_mul(self.block_size as u64),
-                    block.object_id,
-                    content_epoch,
-                )
-            })
-            .collect();
-
-        for block in &persisted_blocks {
-            self.block_cache
-                .stage_l1(block.object_id, block.data.clone());
-            self.stage_upload_payload(block.object_id, block.data.clone());
-            self.record_live_extent(ino, block.block_index, block.object_id, content_epoch);
-            self.block_store.mark_uploading(block.object_id);
-        }
-
-        if let Some(mut attr) = attr_to_persist {
-            Self::transition_upload_state_for_local_mutation(&mut attr);
-            let meta = self.meta_async.clone();
-            let attr_for_meta = attr.clone();
-            run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.set_attr(&attr_for_meta)
-            })
-            .await?;
-            self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-            self.clear_matching_dirty_attr_if_committed(ino, &attr);
-        }
-
-        self.block_cache.submit_uploads_batch(&upload_ops);
-        for (upload_ino, _, _, _) in &upload_ops {
-            self.note_file_session_background_transition(
-                *upload_ino,
-                FileSessionOperation::Upload,
-                "queued",
-            );
-        }
-        if flush_upload_journal {
-            self.block_cache.flush_upload_journal().await;
-        }
-        Ok(())
-    }
-
-    async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
-        let started = Instant::now();
-        self.flush_ordered(ino).await?;
-        let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        if waited_ms > 0 {
-            self.state
-                .write_buffer
-                .write_backpressure_events
-                .fetch_add(1, Ordering::Relaxed);
-            self.state
-                .write_buffer
-                .write_backpressure_wait_ms
-                .fetch_add(waited_ms, Ordering::Relaxed);
-            self.state
-                .write_buffer
-                .fast_backpressure_events
-                .fetch_add(1, Ordering::Relaxed);
-            self.state
-                .write_buffer
-                .fast_backpressure_wait_ms
-                .fetch_add(waited_ms, Ordering::Relaxed);
-            self.state
-                .write_buffer
-                .fast_backpressure_stall_max_ms
-                .fetch_max(waited_ms, Ordering::Relaxed);
-        }
-        Ok(())
-    }
-
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
             pending_uploads: self.block_cache.pending_upload_count(),
@@ -7411,232 +6734,6 @@ impl StudioVfs {
         file_size
             .saturating_sub(block_start)
             .min(self.block_size as u64) as usize
-    }
-
-    fn clear_pending_block(&self, ino: Ino, block_index: u32) {
-        let _ = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .remove(&(ino, block_index));
-    }
-
-    fn trim_local_block_staging(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        new_len: usize,
-    ) -> VfsResult<bool> {
-        let mut changed = false;
-
-        {
-            let mut pending = self.state.write_buffer.pending_blocks.lock();
-            if let Some(block) = pending.get_mut(&(ino, block_index))
-                && block.data.len() > new_len
-            {
-                block.data.truncate(new_len);
-                block.dirty = true;
-                changed = true;
-            }
-        }
-
-        Ok(changed)
-    }
-
-    fn load_local_block_bytes_sync(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        object_id: u64,
-    ) -> VfsResult<Option<Bytes>> {
-        let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
-        if let Some(data) =
-            self.read_pending_overlay_block_sync(ino, block_index, pending_content_epoch)?
-        {
-            return Ok(Some(data));
-        }
-        Ok(self.block_store.get(object_id))
-    }
-
-    fn install_truncated_pending_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        data: Bytes,
-        new_len: usize,
-    ) {
-        self.clear_pending_block(ino, block_index);
-        let mut pending = self.state.write_buffer.pending_blocks.lock();
-        pending.insert(
-            (ino, block_index),
-            PendingBlock {
-                data: BytesMut::from(&data[..new_len]),
-                dirty: true,
-            },
-        );
-    }
-
-    async fn enqueue_dirty_blocks(&self, ino: Ino, blocks: Vec<(u32, Bytes)>) -> VfsResult<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let _accept_qos = self.qos.try_acquire_accept();
-        let total: usize = blocks.iter().map(|(_, d)| d.len()).sum();
-        let block_count = blocks.len() as u64;
-
-        loop {
-            // Register the waiter before capacity checks so a concurrent drain
-            // cannot free space and notify in the race window between "no room"
-            // and `notified().await`.
-            let notified = self.state.dirty_buffer.dirty_drained_notify.notified();
-            let dirty_bytes = self.state.dirty_buffer.dirty_bytes.load(Ordering::Relaxed);
-            let fast_overcommit_head = !self.durable_cache_safety_mode()
-                && dirty_bytes == 0
-                && self.state.dirty_buffer.dirty_mem.lock().is_empty();
-            if dirty_bytes.saturating_add(total) <= self.max_dirty_bytes.load(Ordering::Acquire)
-                || fast_overcommit_head
-            {
-                if self.durable_cache_safety_mode() {
-                    for (block_index, data) in &blocks {
-                        self.spill_block_async((ino, *block_index), data.clone())
-                            .await?;
-                    }
-                }
-                {
-                    let mut dirty = self.state.dirty_buffer.dirty_mem.lock();
-                    for (block_index, data) in &blocks {
-                        if let Some(old) = dirty.insert((ino, *block_index), data.clone()) {
-                            self.state
-                                .dirty_buffer
-                                .dirty_bytes
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                    Some(v.saturating_sub(old.len()))
-                                })
-                                .ok();
-                        }
-                    }
-                }
-                self.state
-                    .dirty_buffer
-                    .dirty_bytes
-                    .fetch_add(total, Ordering::Relaxed);
-                let _ = self.dirty_flush_tx.send(());
-                return Ok(());
-            }
-
-            if self.durable_cache_safety_mode() {
-                let spill_bytes = self
-                    .state
-                    .dirty_buffer
-                    .dirty_spill_bytes
-                    .load(Ordering::Relaxed);
-                if spill_bytes.saturating_add(total) <= self.max_spill_bytes {
-                    for (block_index, data) in blocks {
-                        {
-                            let mut dirty = self.state.dirty_buffer.dirty_mem.lock();
-                            if let Some(old) = dirty.remove(&(ino, block_index)) {
-                                self.state
-                                    .dirty_buffer
-                                    .dirty_bytes
-                                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                        Some(v.saturating_sub(old.len()))
-                                    })
-                                    .ok();
-                            }
-                        }
-                        self.spill_block_async((ino, block_index), data).await?;
-                    }
-                    self.state
-                        .dirty_buffer
-                        .forced_spill_blocks
-                        .fetch_add(block_count, Ordering::Relaxed);
-                    self.state
-                        .dirty_buffer
-                        .dirty_drained_notify
-                        .notify_waiters();
-                    let _ = self.dirty_flush_tx.send(());
-                    return Ok(());
-                }
-            }
-
-            let _ = self.dirty_flush_tx.send(());
-            let wait_started = Instant::now();
-            notified.await;
-            let waited_ms = std::cmp::max(1u64, wait_started.elapsed().as_millis() as u64);
-            self.state
-                .write_buffer
-                .write_backpressure_events
-                .fetch_add(1, Ordering::Relaxed);
-            self.state
-                .write_buffer
-                .write_backpressure_wait_ms
-                .fetch_add(waited_ms, Ordering::Relaxed);
-            if !self.durable_cache_safety_mode() {
-                self.state
-                    .write_buffer
-                    .fast_backpressure_events
-                    .fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .write_buffer
-                    .fast_backpressure_wait_ms
-                    .fetch_add(waited_ms, Ordering::Relaxed);
-                self.state
-                    .write_buffer
-                    .fast_backpressure_stall_max_ms
-                    .fetch_max(waited_ms, Ordering::Relaxed);
-            }
-        }
-    }
-
-    async fn spill_block_async(&self, key: (Ino, u32), data: Bytes) -> VfsResult<()> {
-        let state = self.state.clone();
-        let ingress_wal = self.ingress_wal.clone();
-        run_blocking(move || {
-            let (seq, created_unix_ms, append) = {
-                let _guard = state.ingress.ingress_segment_write_lock.lock();
-                let seq = state.ingress.spill_seq.fetch_add(1, Ordering::Relaxed);
-                let created_unix_ms = StudioVfs::now_unix_millis();
-                let append = ingress_wal.append(
-                    &state.ingress.active_ingress_segment_id,
-                    key,
-                    seq,
-                    created_unix_ms,
-                    IngressRecordKind::Put,
-                    &data,
-                )?;
-                (seq, created_unix_ms, append)
-            };
-
-            if let Some(old) = state.ingress.ingress_live.lock().insert(
-                key,
-                SpillEntry {
-                    seq,
-                    segment_id: append.segment_id,
-                    path: append.path,
-                    offset: append.offset,
-                    len: data.len(),
-                    created_unix_ms,
-                },
-            ) {
-                state
-                    .dirty_buffer
-                    .dirty_spill_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(old.len))
-                    })
-                    .ok();
-                if old.path.extension().is_some_and(|ext| ext == "spill") {
-                    let _ = std::fs::remove_file(old.path);
-                }
-            }
-            state
-                .dirty_buffer
-                .dirty_spill_bytes
-                .fetch_add(data.len(), Ordering::Relaxed);
-            Ok(())
-        })
-        .await
     }
 
     #[inline]
@@ -8150,7 +7247,7 @@ impl StudioVfs {
     pub fn ingress_stats(&self) -> VfsIngressStats {
         let pending = self.state.write_buffer.pending_blocks.lock();
         let dirty_mem_blocks = pending.len();
-        let dirty_mem_bytes = pending.values().map(|block| block.data.len()).sum();
+        let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
         drop(pending);
 
         let last_checkpoint_unix_ms = self
@@ -8292,11 +7389,7 @@ impl StudioVfs {
         let attr = match self.sync_meta().get_attr(ino) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
-                self.state
-                    .write_buffer
-                    .pending_blocks
-                    .lock()
-                    .retain(|(pending_ino, _), _| *pending_ino != ino);
+                self.clear_pending_blocks_for_inode(ino);
                 self.clear_inode_incarnation(ino);
                 self.state.namespace.dirty_attrs.lock().remove(&ino);
                 self.state.namespace.attr_read_cache.lock().remove(ino);
@@ -8341,11 +7434,7 @@ impl StudioVfs {
         {
             Ok(attr) => attr,
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.state
-                    .write_buffer
-                    .pending_blocks
-                    .lock()
-                    .retain(|(pending_ino, _), _| *pending_ino != ino);
+                self.clear_pending_blocks_for_inode(ino);
                 self.clear_inode_incarnation(ino);
                 self.state.namespace.dirty_attrs.lock().remove(&ino);
                 self.state.namespace.attr_read_cache.lock().remove(ino);
@@ -8579,11 +7668,7 @@ impl StudioVfs {
         }
 
         if let Some(ino) = ino_hint {
-            self.state
-                .write_buffer
-                .pending_blocks
-                .lock()
-                .retain(|(pending_ino, _), _| *pending_ino != ino);
+            self.clear_pending_blocks_for_inode(ino);
             self.clear_inode_incarnation(ino);
             self.state.namespace.dirty_attrs.lock().remove(&ino);
             self.state.namespace.attr_read_cache.lock().remove(ino);
@@ -8900,11 +7985,7 @@ impl StudioVfs {
             .await?;
 
             if !removed_ids.is_empty() {
-                self.state
-                    .write_buffer
-                    .pending_blocks
-                    .lock()
-                    .retain(|(i, _), _| *i != ino);
+                self.clear_pending_blocks_for_inode(ino);
                 self.evict_inode_from_caches(ino, &removed_ids).await;
             }
             debug!(
@@ -9521,11 +8602,7 @@ impl StudioVfs {
                 }
 
                 // Clear pending blocks buffer
-                self.state
-                    .write_buffer
-                    .pending_blocks
-                    .lock()
-                    .retain(|(ino, _), _| *ino != attr.ino);
+                self.clear_pending_blocks_for_inode(attr.ino);
 
                 // Immediately evict all cached blocks for this inode — no need to wait for GC.
                 self.evict_inode_from_caches(attr.ino, &removed_ids).await;
@@ -9686,11 +8763,7 @@ impl StudioVfs {
                 for &object_id in &removed_ids {
                     meta.add_pending_deletion(object_id, timestamp)?;
                 }
-                self.state
-                    .write_buffer
-                    .pending_blocks
-                    .lock()
-                    .retain(|(i, _), _| *i != ino);
+                self.clear_pending_blocks_for_inode(ino);
                 self.evict_inode_from_caches(ino, &removed_ids).await;
             }
 
@@ -9743,11 +8816,7 @@ impl StudioVfs {
     /// disk / RAM space without waiting for the next background GC run.
     async fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
-        self.state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .retain(|(candidate, _), _| *candidate != ino);
+        self.clear_pending_blocks_for_inode(ino);
 
         self.remove_live_extents_for_inode(ino);
 
@@ -10437,18 +9506,6 @@ impl StudioVfs {
             .map_err(VfsError::Meta)
     }
 
-    async fn load_spill_block_async(&self, key: (Ino, u32)) -> VfsResult<Option<Bytes>> {
-        let state = self.state.clone();
-        run_blocking(move || {
-            let entry = state.ingress.ingress_live.lock().get_cloned(&key);
-            let Some(entry) = entry else {
-                return Ok(None);
-            };
-            Ok(Some(read_ingress_entry_bytes(&entry)?))
-        })
-        .await
-    }
-
     /// Prefetch a block into cache (called from spawned prefetch tasks).
     ///
     /// Like `read_block()` but silently ignores errors and always marks the
@@ -10538,163 +9595,6 @@ impl StudioVfs {
         result
     }
 
-    async fn write_ordered(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        let _ = self.observe_write_access(None, ino, offset, data.len());
-        if self.ignored_entry_attr(ino).is_some() {
-            let size = offset.saturating_add(data.len() as u64);
-            let _ = self.update_ignored_entry(ino, |attr| {
-                if size > attr.size {
-                    attr.size = size;
-                    attr.committed_size = size;
-                }
-                attr.touch_mtime();
-            });
-            return Ok(data.len() as u32);
-        }
-
-        if data.is_empty() {
-            return Ok(0);
-        }
-
-        let initial_attr = self.getattr_async(ino).await?;
-        let current_size = initial_attr.size;
-        self.refresh_inode_incarnation_state_from_attr(ino, &initial_attr);
-        let mut written = 0u64;
-        let mut remaining = data.len();
-        let mut current_offset = offset;
-        let mut data_offset = 0;
-        let mut full_blocks: Vec<(u32, Bytes)> = Vec::new();
-
-        while remaining > 0 {
-            let block_index = block_index_from_offset(current_offset, self.block_size);
-            let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
-            let space_in_block = self.block_size as usize - offset_in_block;
-            let to_write = remaining.min(space_in_block);
-
-            // Load existing block data if needed (outside lock to avoid holding
-            // parking_lot::Mutex across .await)
-            let need_load = !self
-                .state
-                .write_buffer
-                .pending_blocks
-                .lock()
-                .contains_key(&(ino, block_index));
-            if need_load {
-                let existing_data = match self.read_block_if_exists(ino, block_index).await {
-                    Ok(Some(d)) => d,
-                    _ => Bytes::new(),
-                };
-                let logical_len = self.logical_block_len(current_size, block_index);
-                let existing_data = if existing_data.len() > logical_len {
-                    existing_data.slice(0..logical_len)
-                } else {
-                    existing_data
-                };
-                let mut pending = self.state.write_buffer.pending_blocks.lock();
-                // Double-check: another write call might have inserted while we loaded
-                pending
-                    .entry((ino, block_index))
-                    .or_insert_with(|| PendingBlock {
-                        data: BytesMut::from(existing_data.as_ref()),
-                        dirty: false,
-                    });
-            }
-
-            // Write data into the pending block (brief lock)
-            {
-                let mut pending = self.state.write_buffer.pending_blocks.lock();
-                let pending_block = pending.get_mut(&(ino, block_index)).unwrap();
-                self.remove_live_extent(ino, block_index);
-
-                // Ensure buffer is large enough
-                let end_pos = offset_in_block + to_write;
-                if pending_block.data.len() < end_pos {
-                    pending_block.data.resize(end_pos, 0);
-                }
-
-                // Copy data
-                pending_block.data[offset_in_block..end_pos]
-                    .copy_from_slice(&data[data_offset..data_offset + to_write]);
-                pending_block.dirty = true;
-
-                // If block is now full → extract for eager flush
-                if pending_block.data.len() >= self.block_size as usize {
-                    let pb = pending.remove(&(ino, block_index)).unwrap();
-                    full_blocks.push((block_index, pb.data.freeze()));
-                }
-            }
-
-            written += to_write as u64;
-            remaining -= to_write;
-            current_offset += to_write as u64;
-            data_offset += to_write;
-        }
-
-        // Enter or reuse a single pending incarnation for this inode and keep
-        // all subsequent writes in the same local version until upload/commit catches up.
-        let mut base_attr = self.getattr_async(ino).await?;
-        self.begin_pending_incarnation(ino, &mut base_attr);
-        {
-            let mut dirty = self.state.namespace.dirty_attrs.lock();
-            let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
-            attr.content_epoch = base_attr.content_epoch;
-            if current_offset > attr.size {
-                attr.size = current_offset;
-                attr.touch_mtime();
-            }
-            self.update_pending_incarnation_size(ino, attr.size);
-        }
-
-        if !full_blocks.is_empty() {
-            let attr_to_persist = if self.has_pending_write_buffer_blocks_for_inode(ino) {
-                None
-            } else {
-                let dirty = self.state.namespace.dirty_attrs.lock();
-                dirty.get(&ino).cloned()
-            };
-            self.persist_write_buffer_blocks(ino, full_blocks, attr_to_persist, false)
-                .await?;
-        }
-
-        if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
-            self.apply_write_buffer_backpressure(ino).await?;
-        }
-
-        Ok(written as u32)
-    }
-
-    /// Read a block if it exists, returns None if block not found.
-    async fn read_block_if_exists(&self, ino: Ino, block_index: u32) -> VfsResult<Option<Bytes>> {
-        let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
-        if let Some(data) = self
-            .read_pending_overlay_block_async(ino, block_index, pending_content_epoch)
-            .await?
-        {
-            return Ok(Some(data));
-        }
-
-        // Get block reference from metadata
-        let block_ref = match self.get_file_block_async(ino, block_index).await? {
-            Some(br) => br,
-            None => return Ok(None),
-        };
-
-        if let Some(cached) = self.block_store_get_async(block_ref.object_id).await? {
-            return Ok(Some(cached));
-        }
-
-        // Fetch from S3 via FetchScheduler (handles retry, AIMD, singleflight)
-        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
-        let data = self
-            .fetch_scheduler
-            .fetch_block(block_ref.object_id, &keys)
-            .await
-            .map_err(|e| VfsError::Other(e.to_string()))?;
-
-        Ok(Some(data))
-    }
-
     /// Flush all buffered blocks for a file.
     ///
     /// With eager flushing in `write()`, most full blocks are already flushed.
@@ -10708,50 +9608,6 @@ impl StudioVfs {
         drop(session);
         self.maybe_gc_file_session(ino);
         result
-    }
-
-    async fn flush_ordered(&self, ino: Ino) -> VfsResult<()> {
-        self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if self.ignored_entry_attr(ino).is_some() {
-            return Ok(());
-        }
-
-        let blocks_to_buffer: Vec<(u32, Bytes)> = {
-            let mut pending = self.state.write_buffer.pending_blocks.lock();
-            let keys: Vec<_> = pending.keys().filter(|(i, _)| *i == ino).cloned().collect();
-
-            let mut blocks = Vec::new();
-            for key in keys {
-                if let Some(pb) = pending.remove(&key)
-                    && pb.dirty
-                {
-                    blocks.push((key.1, pb.data.freeze()));
-                }
-            }
-            blocks
-        };
-        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
-        self.persist_write_buffer_blocks(ino, blocks_to_buffer, dirty_attr, true)
-            .await?;
-
-        Ok(())
-    }
-
-    // =========================================================================
-    // Background Slab Flusher
-    // =========================================================================
-
-    /// Woken by `dirty_flush_tx` signals and a periodic timer.
-    /// Drains accepted ingress records into cache, metadata, and upload intents.
-    async fn background_slab_flusher(
-        self: Arc<Self>,
-        rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-    ) {
-        materialize::Materializer::background_loop(self, rx).await;
-    }
-
-    async fn drain_dirty_mem(&self) {
-        materialize::Materializer::drain(self).await;
     }
 
     // =========================================================================
@@ -11924,45 +10780,6 @@ impl StudioVfs {
         }
     }
 
-    async fn background_ingress_checkpoint(self: Arc<Self>) {
-        loop {
-            let timer = tokio::time::sleep(self.ingress_checkpoint_interval);
-            tokio::pin!(timer);
-            let timer_fired = tokio::select! {
-                _ = self.state.shutdown.shutdown_notify.notified() => return,
-                _ = &mut timer => true,
-                _ = self.state.ingress.ingress_checkpoint_notify.notified() => false,
-            };
-            if self
-                .state
-                .ingress
-                .ingress_checkpoint_stopped
-                .load(Ordering::Acquire)
-                || self.shutdown_requested()
-            {
-                return;
-            }
-            if self.state.ingress.ingress_live.lock().is_empty() {
-                continue;
-            }
-            if !self.ingress_checkpoint_due(timer_fired) {
-                continue;
-            }
-            let state = self.state.clone();
-            let ingress_wal = self.ingress_wal.clone();
-            if let Err(e) =
-                run_blocking(move || Self::persist_ingress_recovery_state_owned(state, ingress_wal))
-                    .await
-            {
-                self.state
-                    .ingress
-                    .ingress_checkpoint_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!("background ingress checkpoint persist failed: {}", e);
-            }
-        }
-    }
-
     /// Background task for garbage collection.
     async fn background_gc(self: Arc<Self>) {
         info!("background GC started");
@@ -12394,30 +11211,6 @@ impl StudioVfs {
         tracing::info!("block cache checkpoint persisted");
     }
 
-    async fn flush_pending_blocks_for_shutdown(&self) {
-        let mut inos: BTreeSet<Ino> = {
-            let pending = self.state.write_buffer.pending_blocks.lock();
-            pending.keys().map(|(ino, _)| *ino).collect()
-        };
-        {
-            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
-            inos.extend(dirty_attrs.keys().copied());
-        }
-        if inos.is_empty() {
-            return;
-        }
-
-        info!(
-            inode_count = inos.len(),
-            "VFS shutdown: flushing buffered inodes"
-        );
-        for ino in inos {
-            if let Err(e) = self.flush(ino).await {
-                warn!(ino, error = %e, "VFS shutdown: flush inode failed");
-            }
-        }
-    }
-
     /// Best-effort graceful shutdown: drain dirty buffers, persist final
     /// checkpoint state, cancel uploader tasks, then persist cache checkpoint.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
@@ -12455,7 +11248,6 @@ impl StudioVfs {
             .ingress
             .ingress_checkpoint_notify
             .notify_waiters();
-        let _ = self.dirty_flush_tx.send(());
         self.join_background_tasks(background_join_timeout).await;
 
         // Reset the active-access-class telemetry counters for any handles that
@@ -12482,10 +11274,6 @@ impl StudioVfs {
         );
 
         *self.state.ingress.ingress_live.lock() = IngressLiveIndex::default();
-        self.state
-            .dirty_buffer
-            .dirty_spill_bytes
-            .store(0, Ordering::Relaxed);
         if let Err(e) = reset_ingress_artifacts_for_fast_mode(self.ingress_wal.spill_dir()) {
             warn!(
                 "VFS shutdown: failed to remove legacy ingress artifacts: {}",

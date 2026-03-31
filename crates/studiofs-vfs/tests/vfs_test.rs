@@ -8017,6 +8017,150 @@ async fn test_write_at_exact_block_boundary_transition() {
     assert_eq!(data[block_size], 0xFF);
 }
 
+#[test]
+fn flush_failure_keeps_pending_write_buffer_data() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("flush-failure-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            4096,
+            16 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs.create(1, b"flush-failure.bin", 0, 0, 0o644).unwrap();
+        let payload = vec![0xABu8; 1024];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        let err = vfs.flush(attr.ino).await.unwrap_err();
+        assert!(
+            err.to_string().contains("block store put failed"),
+            "expected block store persistence error, got: {err}"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "flush failure must leave data readable from the pending write buffer"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "failed flush must not publish committed live extents"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "failed flush must not enqueue uploads"
+        );
+        assert!(
+            vfs.ingress_stats().dirty_mem_bytes >= payload.len(),
+            "failed flush must keep bytes accounted in the write buffer"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-failure-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            &cache_dir_str,
+            4096,
+            16 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs.create(1, b"write-failure.bin", 0, 0, 0o644).unwrap();
+        let payload = vec![0xCDu8; block_size];
+
+        let err = vfs.write(attr.ino, 0, &payload).await.unwrap_err();
+        assert!(
+            err.to_string().contains("block store put failed"),
+            "expected block store persistence error, got: {err}"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "failed eager flush must keep data readable from the pending write buffer"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "failed eager flush must not publish committed live extents"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "failed eager flush must not enqueue uploads"
+        );
+        assert!(
+            vfs.ingress_stats().dirty_mem_bytes >= payload.len(),
+            "failed eager flush must keep bytes accounted in the write buffer"
+        );
+    });
+    rt.shutdown_background();
+}
+
 /// Truncate to zero, then write again. Verify old blocks are GC'd and new data is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
