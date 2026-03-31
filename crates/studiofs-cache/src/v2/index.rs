@@ -59,7 +59,7 @@ impl BlockFlags {
     /// meaning the block may be chosen as an eviction candidate.
     #[inline]
     pub fn is_evictable(self) -> bool {
-        self.is_empty()
+        !self.intersects(BlockFlags::DIRTY | BlockFlags::PINNED | BlockFlags::UPLOADING)
     }
 }
 

@@ -206,6 +206,7 @@ impl BlockStore {
                 // current upper bound rather than the original smaller value.
                 let updated_sb = Superblock::new(config.max_size, config.volume_uuid);
                 platform::pwrite(&file, &updated_sb.to_bytes(), 0)?;
+                platform::fdatasync(&file)?;
             }
 
             (file, len)
@@ -417,32 +418,28 @@ impl BlockStore {
     ///
     /// # Concurrency
     ///
-    /// The entry metadata is read under the lock (to build the disk header),
-    /// then the lock is released while `pwrite` runs.  After `pwrite` the
-    /// flags are cleared with a single atomic [`BlockIndex::modify_flags`] call
-    /// rather than a read-then-write, so a concurrent `mark_uploading` that
-    /// sets `UPLOADING` between the two lock acquisitions will not be silently
-    /// clobbered.
+    /// This method intentionally holds the index lock across the header
+    /// `pwrite`. The header write is small and fixed-size, while dropping the
+    /// lock would open an ABA window where the block could be removed, its
+    /// disk offset reused for another object, and then overwritten by the stale
+    /// header write.
     pub fn mark_evictable(&self, object_id: u64) {
-        // Read entry metadata under the lock.  We need offset/size/checksum
-        // to build the disk header, and the current PINNED bit (PINNED is
-        // not modified by any public API, so it is stable across the lock gap).
-        let (offset, data_size, checksum, pinned) = {
-            let idx = self.index.lock();
-            match idx.get(object_id) {
-                Some(e)
-                    if e.flags
-                        .intersects(BlockFlags::DIRTY | BlockFlags::UPLOADING) =>
-                {
-                    (
-                        e.offset,
-                        e.data_size,
-                        e.checksum,
-                        e.flags.contains(BlockFlags::PINNED),
-                    )
-                }
-                _ => return, // already evictable or not present
+        // Keep the index lock for the entire operation so the entry cannot be
+        // removed or replaced while we are writing its on-disk header.
+        let mut idx = self.index.lock();
+        let (offset, data_size, checksum, pinned) = match idx.get(object_id) {
+            Some(e)
+                if e.flags
+                    .intersects(BlockFlags::DIRTY | BlockFlags::UPLOADING) =>
+            {
+                (
+                    e.offset,
+                    e.data_size,
+                    e.checksum,
+                    e.flags.contains(BlockFlags::PINNED),
+                )
             }
+            _ => return, // already evictable or not present
         };
 
         // Write the on-disk header with DIRTY cleared; preserve PINNED.
@@ -451,9 +448,7 @@ impl BlockStore {
 
         match platform::pwrite(&self.file, &header.to_bytes(), offset) {
             Ok(()) => {
-                // Atomic read-modify-write: clear DIRTY and UPLOADING without
-                // touching any other flags a concurrent thread may have set.
-                self.index.lock().modify_flags(
+                idx.modify_flags(
                     object_id,
                     BlockFlags::DIRTY | BlockFlags::UPLOADING,
                     BlockFlags::empty(),
