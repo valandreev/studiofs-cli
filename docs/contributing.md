@@ -210,7 +210,7 @@ producing non-functional code:
 // — the cfg guard at the crate root is sufficient; compile_error! is only
 // needed if a portable crate gains non-portable code without a crate-root
 // guard.
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!("studiofs only supports Linux, macOS, and Windows");
 ```
 
