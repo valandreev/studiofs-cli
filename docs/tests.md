@@ -81,9 +81,9 @@ host — cross-compilation or a Linux-only CI pass does not count.
 
 | Crate | CI step | Runner |
 |-------|---------|--------|
-| `studiofs-fuse` (Linux paths) | `cargo test (studiofs-fuse unit — Linux paths)` | `ubuntu-latest` |
-| `studiofs-fuse` (macOS paths) | `cargo test (studiofs-fuse unit — macOS paths)` | `macos-latest` |
-| `studiofs-winfsp` | `cargo test (studiofs-winfsp unit tests)` | `windows-latest` |
+| `studiofs-fuse` (Linux paths) | `cargo test (studiofs-fuse — Linux paths)` | `ubuntu-latest` |
+| `studiofs-fuse` (macOS paths) | `cargo test (studiofs-fuse — macOS paths)` | `macos-latest` |
+| `studiofs-winfsp` | `cargo test (studiofs-winfsp)` | `windows-latest` |
 
 Each step is separate from the workspace run so a failure directly identifies
 the failing backend in the CI job log.
