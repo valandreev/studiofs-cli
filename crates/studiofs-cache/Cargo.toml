@@ -17,6 +17,7 @@ dashmap.workspace = true
 libc.workspace = true
 uuid.workspace = true
 memmap2 = "0.9"
+arc-swap = "1"
 crc32fast = "1"
 bitflags = "2.4"
 

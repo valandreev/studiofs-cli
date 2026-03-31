@@ -40,6 +40,7 @@ use crate::v2::format::{
     alloc_size_for,
 };
 use crate::v2::index::{BlockFlags, BlockIndex, PersistedIndexEntry, RemovedEntry};
+use crate::v2::mmap_reader::MmapReader;
 use crate::v2::persistence::{self, WalAppender};
 use crate::v2::platform;
 
@@ -103,6 +104,7 @@ pub enum BlockStoreError {
 pub struct BlockStore {
     file: File,
     config: BlockStoreConfig,
+    mmap_reader: MmapReader,
     /// Combined block map + LRU list + dirty/block counters.
     index: Mutex<BlockIndex>,
     /// Append-only metadata journal for mutations since the last snapshot.
@@ -149,10 +151,7 @@ impl Drop for PendingAllocation<'_> {
         if self.committed {
             return;
         }
-        self.store
-            .allocator
-            .lock()
-            .free(self.offset, self.alloc_size);
+        self.store.release_allocation(self.offset, self.alloc_size);
     }
 }
 
@@ -265,10 +264,12 @@ impl BlockStore {
         };
 
         let cache_dir = config.cache_dir.clone();
+        let mmap_reader = MmapReader::new(&file, file_end)?;
 
         Ok(Self {
             file,
             config,
+            mmap_reader,
             index: Mutex::new(BlockIndex::from_persisted_entries(&recovered_entries)),
             wal: Mutex::new(WalAppender::open(&cache_dir, reset_wal)?),
             allocator: Mutex::new(allocator),
@@ -301,16 +302,29 @@ impl BlockStore {
             }
         };
 
-        // Phase 2: pread outside the lock (concurrent-safe, no seek).
-        let mut buf = vec![0u8; data_size as usize];
-        if let Err(e) = platform::pread(&self.file, &mut buf, offset + BLOCK_HEADER_SIZE as u64) {
-            warn!(object_id, offset, %e, "block pread failed");
-            self.miss_count.fetch_add(1, Ordering::Relaxed);
-            return None;
+        // Phase 2: mmap fast path with pread fallback outside the lock.
+        let data = match self
+            .mmap_reader
+            .read(offset + BLOCK_HEADER_SIZE as u64, data_size as usize)
+        {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(object_id, offset, %e, "block read failed");
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        if let Err(error) = platform::advise_will_need(
+            &self.file,
+            offset + BLOCK_HEADER_SIZE as u64,
+            u64::from(data_size),
+        ) {
+            warn!(object_id, offset, error = ?error, "read-ahead hint failed");
         }
 
         // Verify checksum.
-        let actual_crc = crc32fast::hash(&buf);
+        let actual_crc = crc32fast::hash(&data);
         if actual_crc != checksum {
             warn!(
                 object_id,
@@ -349,13 +363,29 @@ impl BlockStore {
         }
 
         self.hit_count.fetch_add(1, Ordering::Relaxed);
-        Some(Bytes::from(buf))
+        Some(data)
     }
 
     /// Check whether a block exists in the cache without reading data or
     /// updating the LRU order.
     pub fn contains(&self, object_id: u64) -> bool {
         self.index.lock().contains(object_id)
+    }
+
+    /// Submit a best-effort read-ahead hint for a cached block.
+    pub fn advise_will_need(&self, object_id: u64) {
+        let (offset, data_size) = match {
+            let idx = self.index.lock();
+            idx.get(object_id)
+                .map(|entry| (entry.offset + BLOCK_HEADER_SIZE as u64, entry.data_size))
+        } {
+            Some(metadata) => metadata,
+            None => return,
+        };
+
+        if let Err(error) = platform::advise_will_need(&self.file, offset, u64::from(data_size)) {
+            warn!(object_id, offset, error = ?error, "explicit read-ahead hint failed");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -398,7 +428,7 @@ impl BlockStore {
         // lock is released so full data-file scans never see both versions as
         // live at once.
         if let Some(old) = self.remove_entry_for_overwrite(object_id)? {
-            self.allocator.lock().free(old.offset, old.alloc_size);
+            self.release_allocation(old.offset, old.alloc_size);
         }
 
         // Allocate space, evicting LRU blocks when needed.
@@ -469,7 +499,16 @@ impl BlockStore {
         pending_allocation.commit();
 
         if let Some(old) = replaced {
-            self.allocator.lock().free(old.offset, old.alloc_size);
+            self.release_allocation(old.offset, old.alloc_size);
+        }
+
+        if let Err(error) = self.mmap_reader.remap_if_needed(offset + alloc) {
+            warn!(
+                object_id,
+                offset,
+                error = ?error,
+                "mmap remap after growth failed; reads will use pread fallback until the next remap",
+            );
         }
 
         Ok(())
@@ -608,9 +647,7 @@ impl BlockStore {
         };
 
         if let Some(removed) = removed {
-            self.allocator
-                .lock()
-                .free(removed.offset, removed.alloc_size);
+            self.release_allocation(removed.offset, removed.alloc_size);
         }
     }
 
@@ -645,10 +682,7 @@ impl BlockStore {
         if removed.is_empty() {
             return;
         }
-        let mut alloc = self.allocator.lock();
-        for entry in &removed {
-            alloc.free(entry.offset, entry.alloc_size);
-        }
+        self.release_allocations_batch(&removed);
     }
 
     // -----------------------------------------------------------------------
@@ -728,7 +762,7 @@ impl BlockStore {
             let evicted = self.evict_one_for_allocation()?;
             match evicted {
                 Some(entry) => {
-                    self.allocator.lock().free(entry.offset, entry.alloc_size);
+                    self.release_allocation(entry.offset, entry.alloc_size);
                 }
                 None => {
                     // All remaining blocks are non-evictable.
@@ -767,6 +801,16 @@ impl BlockStore {
         let needed_len = a.file_end();
         let current_len = self.file.metadata()?.len();
         if needed_len > current_len {
+            if let Err(error) =
+                platform::preallocate(&self.file, current_len, needed_len - current_len)
+            {
+                warn!(
+                    current_len,
+                    needed_len,
+                    error = ?error,
+                    "best-effort data-file preallocation failed",
+                );
+            }
             self.file.set_len(needed_len)?;
         }
         Ok(Some(offset))
@@ -819,11 +863,71 @@ impl BlockStore {
         platform::pwrite(&self.file, &tombstone, offset)
     }
 
+    fn release_allocation(&self, offset: u64, alloc_size: u64) {
+        self.allocator.lock().free(offset, alloc_size);
+
+        if let Err(error) = platform::punch_hole(&self.file, offset, alloc_size) {
+            warn!(offset, alloc_size, error = ?error, "hole punch failed for freed cache region");
+        }
+        if let Err(error) = platform::advise_dont_need(&self.file, offset, alloc_size) {
+            warn!(
+                offset,
+                alloc_size,
+                error = ?error,
+                "dont-need hint failed for freed cache region",
+            );
+        }
+    }
+
+    fn release_allocations_batch(&self, removed: &[RemovedEntry]) {
+        {
+            let mut allocator = self.allocator.lock();
+            for entry in removed {
+                allocator.free(entry.offset, entry.alloc_size);
+            }
+        }
+
+        for entry in removed {
+            if let Err(error) = platform::punch_hole(&self.file, entry.offset, entry.alloc_size) {
+                warn!(
+                    object_id = entry.object_id,
+                    offset = entry.offset,
+                    alloc_size = entry.alloc_size,
+                    error = ?error,
+                    "hole punch failed for freed cache region",
+                );
+            }
+            if let Err(error) =
+                platform::advise_dont_need(&self.file, entry.offset, entry.alloc_size)
+            {
+                warn!(
+                    object_id = entry.object_id,
+                    offset = entry.offset,
+                    alloc_size = entry.alloc_size,
+                    error = ?error,
+                    "dont-need hint failed for freed cache region",
+                );
+            }
+        }
+    }
+
     fn write_snapshot_and_clear_wal(&self) -> Result<(), BlockStoreError> {
         let entries = self.index.lock().snapshot_for_persistence();
         persistence::write_snapshot(&self.config.cache_dir, &entries)?;
         self.wal.lock().clear()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn force_mapped_len_for_test(&self, mapped_len: u64) {
+        self.mmap_reader
+            .force_mapped_len_for_test(mapped_len)
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    fn mapped_len_for_test(&self) -> u64 {
+        self.mmap_reader.mapped_len_for_test()
     }
 }
 
@@ -849,6 +953,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::v2::format::{PAGE_SIZE, SUPERBLOCK_SIZE};
     use crate::v2::persistence::{WAL_HEADER_SIZE, WAL_RECORD_SIZE};
     use tempfile::TempDir;
 
@@ -1448,6 +1553,24 @@ mod tests {
         assert_eq!(got[0], 0x42);
     }
 
+    #[test]
+    fn get_falls_back_when_mapping_lags() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(1, b"alpha", true).unwrap();
+        store.put(2, b"beta", true).unwrap();
+
+        store.force_mapped_len_for_test(SUPERBLOCK_SIZE + PAGE_SIZE);
+        assert_eq!(store.mapped_len_for_test(), SUPERBLOCK_SIZE + PAGE_SIZE);
+
+        let got = store
+            .get(2)
+            .expect("stale mappings should fall back to pread");
+        assert_eq!(&got[..], b"beta");
+        assert!(store.mapped_len_for_test() > SUPERBLOCK_SIZE + PAGE_SIZE);
+    }
+
     // -----------------------------------------------------------------------
     // Concurrency
     // -----------------------------------------------------------------------
@@ -1547,6 +1670,48 @@ mod tests {
         assert_eq!(store.block_count(), 20);
         for id in 0u64..20 {
             assert!(store.contains(id));
+        }
+    }
+
+    #[test]
+    fn concurrent_reads_survive_remap_pressure() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlockStore::open(test_config(&dir)).unwrap());
+
+        let payloads: Vec<Vec<u8>> = (0u64..32)
+            .map(|id| format!("payload-{id}").into_bytes())
+            .collect();
+        for (id, payload) in payloads.iter().enumerate() {
+            store.put(id as u64, payload, true).unwrap();
+        }
+
+        let full_len = std::fs::metadata(store.data_path()).unwrap().len();
+        let narrow_len = SUPERBLOCK_SIZE + PAGE_SIZE;
+        store.force_mapped_len_for_test(narrow_len);
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let payloads = payloads.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..40 {
+                    for (id, payload) in payloads.iter().enumerate() {
+                        let got = store
+                            .get(id as u64)
+                            .expect("all blocks should stay readable");
+                        assert_eq!(&got[..], &payload[..]);
+                    }
+                }
+            }));
+        }
+
+        for _ in 0..50 {
+            store.force_mapped_len_for_test(narrow_len);
+            store.force_mapped_len_for_test(full_len);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
         }
     }
 

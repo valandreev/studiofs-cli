@@ -281,7 +281,6 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         config.cache_dir.unwrap_or_else(|| "<unset>".to_string())
     );
     println!(
-
         "  cache-size: {}",
         config
             .cache_size

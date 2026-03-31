@@ -470,7 +470,6 @@ ACL PRINCIPAL:
         /// This override only applies to the current process and is NOT saved.
         #[arg(long)]
         endpoint: Option<String>,
-
     },
 
     /// Unmount a previously mounted filesystem volume
@@ -969,20 +968,10 @@ mod tests {
 
     #[test]
     fn mount_with_options_and_detach() {
-        let cli = parse(&[
-            "mount",
-            "vol",
-            "Z:",
-            "--cache-size",
-            "200GB",
-            "-d",
-        ])
-        .unwrap();
+        let cli = parse(&["mount", "vol", "Z:", "--cache-size", "200GB", "-d"]).unwrap();
         match cli.command {
             Commands::Mount {
-                detach,
-                cache_size,
-                ..
+                detach, cache_size, ..
             } => {
                 assert!(detach);
                 assert_eq!(cache_size.unwrap(), "200GB");
