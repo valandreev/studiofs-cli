@@ -15,8 +15,8 @@ There are two generations of the cache implementation:
 ## Cache v2 — Single-file BlockStore
 
 > **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
-> dirty/uploading eviction gating, and auto-eviction are implemented. Snapshot
-> + WAL persistence remain future work.
+> dirty/uploading eviction gating, auto-eviction, snapshot/WAL persistence,
+> and startup recovery are implemented.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
@@ -26,8 +26,8 @@ free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
 ```
 {cache_dir}/
 ├── blocks.data     # single data file (all blocks)
-├── blocks.idx      # index snapshot — binary (future)
-├── blocks.wal      # index WAL — append-only (future)
+├── blocks.idx      # index snapshot — binary
+├── blocks.wal      # index WAL — append-only since last snapshot
 └── pins.json       # pin config — future
 ```
 
@@ -97,7 +97,7 @@ BlockStore::mark_evictable(id)      // clear DIRTY + UPLOADING after S3 upload
 BlockStore::mark_uploading(id)      // set transient UPLOADING flag
 BlockStore::mark_upload_failed(id)  // clear UPLOADING, preserve DIRTY
 BlockStore::sync_data()             // fdatasync
-BlockStore::close(self)             // fdatasync + drop
+BlockStore::close(self)             // fdatasync + snapshot + WAL clear
 // Drop impl: best-effort fdatasync on implicit drop
 ```
 
@@ -109,6 +109,8 @@ Implementation notes:
   post-write error or unwind happens before the new index entry is published.
 - `mark_evictable()` keeps the index lock across the tiny header `pwrite` to
   prevent disk-offset ABA reuse from corrupting a different block's header.
+- destructive mutations invalidate superseded block headers in `blocks.data`
+  so fallback recovery scans only pick up live blocks.
 
 Error variants include `CacheFull { needed, max_size, allocated, free }` for
 fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
@@ -116,15 +118,17 @@ limit on an existing file.
 
 ### Index persistence
 
-Not yet implemented.  On open, all data-region bytes are treated as free space
-(index is empty).  A WARN log is emitted when a non-empty `blocks.data` is
-opened without index persistence.
+`BlockStore::open()` restores metadata in three stages:
 
-Planned next:
-1. **Fast path** — load `blocks.idx` snapshot + replay `blocks.wal`
-2. **Crash fallback** — scan `blocks.data` block headers (`SBLK` magic + checksum)
+1. **Fast path** — load `blocks.idx` snapshot and replay `blocks.wal`
+2. **Validation pass** — re-read each recovered block header from
+  `blocks.data` so stale snapshot entries or lost WAL tails are discarded
+3. **Crash fallback** — if the metadata files are missing or corrupt, scan
+  `blocks.data` page-by-page, validate block headers, and verify payload CRCs
 
-Block headers are written today precisely to support fallback recovery.
+Snapshot and WAL records are versioned binary formats.  WAL replay ignores a
+partial trailing record so abrupt termination does not poison the whole log.
+Clean shutdown writes a fresh snapshot and truncates `blocks.wal`.
 
 ---
 

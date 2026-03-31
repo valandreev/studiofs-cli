@@ -22,6 +22,7 @@ pub mod index;
 pub mod lru;
 pub mod metrics;
 pub mod mmap_reader;
+mod persistence;
 pub mod platform;
 
 pub use block_store::{BlockStore, BlockStoreConfig, BlockStoreError};
