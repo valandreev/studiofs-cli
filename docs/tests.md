@@ -67,7 +67,7 @@ host — cross-compilation or a Linux-only CI pass does not count.
      non-mount platform tests placed in `tests/` (e.g.
      `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
-     non-mount platform tests placed in `tests/` (e.g.
+   Only the relevant runner runs each step; the other platforms skip it entirely
      `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
    Only the relevant runner runs each step; the other platforms skip it entirely
