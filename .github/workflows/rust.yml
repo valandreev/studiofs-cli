@@ -91,10 +91,11 @@ jobs:
         run: cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --nocapture
 
       - name: cargo test (studiofs-fuse — Linux paths)
-        # Sole runner for studiofs-fuse on Linux. Runs lib + non-ignored
-        # integration tests. cfg(target_os="linux") tests are exercised here;
+        # Sole runner for studiofs-fuse on Linux. Runs only lib (unit) tests;
+        # mount-requiring integration tests stay ignored.
+        # cfg(target_os="linux") tests are exercised here;
         # cfg(target_os="macos") tests are skipped by the compiler-guard.
-        run: cargo test -p studiofs-fuse -- --nocapture
+        run: cargo test -p studiofs-fuse --lib -- --nocapture
 
   # ─── macOS Verification ────────────────────────────────────────────
   macos:
@@ -129,10 +130,11 @@ jobs:
         run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
 
       - name: cargo test (studiofs-fuse — macOS paths)
-        # Sole runner for studiofs-fuse on macOS. Runs lib + non-ignored
-        # integration tests. cfg(target_os="macos") tests (volname, local,
-        # foreground) are exercised here and nowhere else.
-        run: cargo test -p studiofs-fuse -- --nocapture
+        # Sole runner for studiofs-fuse on macOS. Runs only lib (unit) tests;
+        # mount-requiring integration tests stay ignored.
+        # cfg(target_os="macos") tests (volname, local, foreground) are
+        # exercised here and nowhere else.
+        run: cargo test -p studiofs-fuse --lib -- --nocapture
 
   # ─── Windows Verification ──────────────────────────────────────────
   windows:
@@ -167,11 +169,11 @@ jobs:
         run: cargo test --workspace --all-targets --exclude studiofs-winfsp -- --nocapture
 
       - name: cargo test (studiofs-winfsp)
-        # Sole runner for studiofs-winfsp. Runs lib + non-ignored integration
-        # tests. The crate is guarded by #![cfg(windows)] so these tests only
-        # compile and run here.
+        # Sole runner for studiofs-winfsp. Runs only lib (unit) tests;
+        # mount-requiring integration tests stay ignored. The crate is guarded
+        # by #![cfg(windows)] so these tests only compile and run here.
         # --test-threads=1 serialises the env-var-manipulating unit tests
         # within this binary (ENV_LOCK already handles intra-binary
         # serialisation, but 1 thread makes the isolation explicit and avoids
         # any dependency on the lock being held across OS thread switches).
-        run: cargo test -p studiofs-winfsp -- --nocapture --test-threads=1
+        run: cargo test -p studiofs-winfsp --lib -- --nocapture --test-threads=1
