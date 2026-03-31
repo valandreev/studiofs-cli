@@ -52,6 +52,41 @@ pub fn fdatasync(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
+pub fn preallocate(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    best_effort(preallocate_impl(file, offset, len))
+}
+
+pub fn punch_hole(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    best_effort(punch_hole_impl(file, offset, len))
+}
+
+pub fn advise_will_need(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    best_effort(advise_will_need_impl(file, offset, len))
+}
+
+pub fn advise_dont_need(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    best_effort(advise_dont_need_impl(file, offset, len))
+}
+
+pub fn advise_sequential(bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    best_effort(advise_sequential_impl(bytes))
+}
+
 // ---------------------------------------------------------------------------
 // Platform raw I/O
 // ---------------------------------------------------------------------------
@@ -78,4 +113,174 @@ fn pread_raw(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 fn pwrite_raw(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_write(buf, offset)
+}
+
+fn best_effort(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_benign_best_effort_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn is_benign_best_effort_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EOPNOTSUPP
+                | libc::ENOTSUP
+                | libc::ENOSYS
+                | libc::EINVAL
+                | libc::EPERM
+                | libc::EACCES
+                | libc::ENODEV
+        )
+    )
+}
+
+#[cfg(windows)]
+fn is_benign_best_effort_error(error: &io::Error) -> bool {
+    // Keep advisory/storage hints best-effort on Windows too. Filesystems and
+    // runtimes commonly report unsupported or denied advisory requests via
+    // Win32 errors that should not fail the cache fast path.
+    matches!(
+        error.raw_os_error(),
+        Some(
+            1   // ERROR_INVALID_FUNCTION
+                | 5   // ERROR_ACCESS_DENIED
+                | 50  // ERROR_NOT_SUPPORTED
+                | 87  // ERROR_INVALID_PARAMETER
+                | 120 // ERROR_CALL_NOT_IMPLEMENTED
+        )
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn preallocate_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = u64_to_off_t(offset)?;
+    let len = u64_to_off_t(len)?;
+    let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, len) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preallocate_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn punch_hole_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = u64_to_off_t(offset)?;
+    let len = u64_to_off_t(len)?;
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    let result = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, len) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch_hole_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn advise_will_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = u64_to_off_t(offset)?;
+    let len = u64_to_off_t(len)?;
+    let result =
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_will_need_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn advise_dont_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = u64_to_off_t(offset)?;
+    let len = u64_to_off_t(len)?;
+    let result =
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_dont_need_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn advise_sequential_impl(bytes: &[u8]) -> io::Result<()> {
+    let result = unsafe {
+        libc::madvise(
+            bytes.as_ptr().cast::<libc::c_void>().cast_mut(),
+            bytes.len(),
+            libc::MADV_SEQUENTIAL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn advise_sequential_impl(_bytes: &[u8]) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
+    libc::off_t::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "offset exceeds platform off_t range",
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_best_effort_error_list_covers_common_advisory_failures() {
+        for code in [1, 5, 50, 87, 120] {
+            assert!(is_benign_best_effort_error(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+
+        assert!(!is_benign_best_effort_error(&io::Error::from_raw_os_error(
+            32
+        )));
+    }
 }

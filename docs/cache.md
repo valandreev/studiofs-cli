@@ -15,8 +15,8 @@ There are two generations of the cache implementation:
 ## Cache v2 — Single-file BlockStore
 
 > **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
-> dirty/uploading eviction gating, auto-eviction, snapshot/WAL persistence,
-> and startup recovery are implemented.
+> dirty/uploading eviction gating, auto-eviction, mmap reads with generation
+> remapping, snapshot/WAL persistence, and startup recovery are implemented.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
@@ -78,7 +78,7 @@ Key behaviours:
 | Operation | Description |
 |-----------|-------------|
 | `allocate(size)` | Best-fit from free list; grows file by `max(size, 256 MiB)` if no fit |
-| `free(offset, size)` | Returns region, coalesces left+right neighbours, truncates tail |
+| `free(offset, size)` | Returns region, coalesces left+right neighbours, and shrinks logical file end |
 | `recover(max_size, file_end, occupied)` | Rebuilds free list from live block offsets (used by future index recovery) |
 
 File extension (`set_len`) happens **inside the allocator lock** to prevent
@@ -89,13 +89,14 @@ concurrent threads from observing an inconsistent file end.
 ```rust
 BlockStore::open(config)            // create or open (validates magic, version, UUID, max_size)
 BlockStore::put(id, data, evictable)// allocate + pwrite header + payload; replace if exists
-BlockStore::get(id)                 // pread + crc32 verify → Option<Bytes>
+BlockStore::get(id)                 // mmap + pread fallback + crc32 verify → Option<Bytes>
 BlockStore::contains(id)            // index lookup only
 BlockStore::remove(id)              // free allocation, update index
 BlockStore::remove_batch(ids)       // batched remove under single allocator lock
 BlockStore::mark_evictable(id)      // clear DIRTY + UPLOADING after S3 upload
 BlockStore::mark_uploading(id)      // set transient UPLOADING flag
 BlockStore::mark_upload_failed(id)  // clear UPLOADING, preserve DIRTY
+BlockStore::advise_will_need(id)    // best-effort read-ahead hint for a cached block
 BlockStore::sync_data()             // fdatasync
 BlockStore::close(self)             // fdatasync + snapshot + WAL clear
 // Drop impl: best-effort fdatasync on implicit drop
@@ -105,12 +106,19 @@ Implementation notes:
 
 - `BlockIndex` is guarded by `Mutex<BlockIndex>` rather than `RwLock`: a cache
   hit updates LRU state, so `get()` is logically mutating.
+- `MmapReader` uses atomic generation swaps so readers stay lock-free while
+  remaps publish a larger mapping after file growth.
 - `put()` uses a pending-allocation guard so allocation is rolled back if a
   post-write error or unwind happens before the new index entry is published.
 - `mark_evictable()` keeps the index lock across the tiny header `pwrite` to
   prevent disk-offset ABA reuse from corrupting a different block's header.
 - destructive mutations invalidate superseded block headers in `blocks.data`
   so fallback recovery scans only pick up live blocks.
+- free paths issue best-effort hole-punch and `dont-need` hints, while file
+  growth issues best-effort preallocation before `set_len()`.
+- Windows keeps the same best-effort contract for advisory/storage hints by
+  treating common unsupported or denied Win32 responses as benign rather than
+  surfacing them as cache read/write failures.
 
 Error variants include `CacheFull { needed, max_size, allocated, free }` for
 fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
