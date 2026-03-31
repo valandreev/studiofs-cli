@@ -352,7 +352,10 @@ impl Materializer {
 
         for (idx, extent) in extents.into_iter().enumerate() {
             let data = extent.data;
-            if let Err(error) = vfs.block_store.put(extent.object_id, data.as_ref(), false) {
+            if let Err(error) = vfs
+                .block_store_put_async(extent.object_id, data.clone(), false)
+                .await
+            {
                 warn!(
                     ino = extent.ino,
                     block_index = extent.block_index,

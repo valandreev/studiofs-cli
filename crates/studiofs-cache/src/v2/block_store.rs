@@ -358,6 +358,71 @@ impl BlockStore {
         Some(data)
     }
 
+    /// Read a byte range from a cached block directly into `out`.
+    ///
+    /// Returns the number of bytes copied, or `None` on a cache miss or
+    /// integrity failure. The full payload checksum is verified before the
+    /// access is reported as a hit.
+    pub fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+        let (offset, data_size, checksum) = {
+            let idx = self.index.lock();
+            match idx.get(object_id) {
+                Some(e) => (e.offset, e.data_size, e.checksum),
+                None => {
+                    self.miss_count.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+
+        let (bytes_copied, actual_crc) = match self.mmap_reader.read_into(
+            offset + BLOCK_HEADER_SIZE as u64,
+            data_size as usize,
+            data_offset,
+            out,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(object_id, offset, %e, "block ranged read failed");
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        if actual_crc != checksum {
+            warn!(
+                object_id,
+                offset,
+                expected = checksum,
+                actual = actual_crc,
+                "block checksum mismatch",
+            );
+            self.miss_count.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        {
+            let mut idx = self.index.lock();
+            let metadata_matches = matches!(
+                idx.get(object_id),
+                Some(e)
+                    if e.offset == offset
+                        && e.data_size == data_size
+                        && e.checksum == checksum
+            );
+
+            if !metadata_matches {
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+
+            idx.touch(object_id);
+        }
+
+        self.hit_count.fetch_add(1, Ordering::Relaxed);
+        Some(bytes_copied)
+    }
+
     /// Check whether a block exists in the cache without reading data or
     /// updating the LRU order.
     pub fn contains(&self, object_id: u64) -> bool {
@@ -1139,6 +1204,19 @@ mod tests {
         // Cache is full (3 pages used); put(4) must evict 2 or 3, not 1.
         s2.put(4, b"clean", true).unwrap();
         assert!(s2.contains(1), "dirty block should not be evicted");
+    }
+
+    #[test]
+    fn read_into_copies_requested_range() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(7, b"abcdefgh", true).unwrap();
+
+        let mut out = [0u8; 3];
+        let read = store.read_into(7, 2, &mut out).unwrap();
+        assert_eq!(read, 3);
+        assert_eq!(&out, b"cde");
     }
 
     // -----------------------------------------------------------------------

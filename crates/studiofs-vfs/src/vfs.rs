@@ -668,15 +668,9 @@ const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 
 fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
-    if let Ok(parsed) = Uuid::parse_str(volume_uuid) {
-        return *parsed.as_bytes();
-    }
-
-    let mut derived = [0u8; 16];
-    for (idx, byte) in volume_uuid.as_bytes().iter().enumerate() {
-        derived[idx % derived.len()] ^= *byte;
-    }
-    derived
+    Uuid::parse_str(volume_uuid)
+        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
+        .into_bytes()
 }
 #[derive(Clone)]
 struct DistributedFlock {
@@ -6307,10 +6301,7 @@ impl StudioVfs {
         {
             return Ok(Some(data.clone()));
         }
-        if let Some(data) = self.load_spill_block((ino, block_index))? {
-            return Ok(Some(data));
-        }
-        // Stage 2 — BlockStore: materialized local data and committed cache contents.
+        // Stage 3 — BlockStore: materialized local data and committed cache contents.
         if let Some(extent) =
             self.pending_live_extent_record(ino, block_index, pending_content_epoch)
         {
@@ -6318,6 +6309,10 @@ impl StudioVfs {
                 return Ok(Some(data));
             }
             return Ok(self.block_cache.get_sync(extent.object_id));
+        }
+        // Stage 4 — durable spill/WAL entries that have not yet been materialized.
+        if let Some(data) = self.load_spill_block((ino, block_index))? {
+            return Ok(Some(data));
         }
         Ok(None)
     }
@@ -6349,17 +6344,18 @@ impl StudioVfs {
         {
             return Ok(Some(data.clone()));
         }
-        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
-            return Ok(Some(data));
-        }
-        // Stage 2 — BlockStore: materialized local data and committed cache contents.
+        // Stage 3 — BlockStore: materialized local data and committed cache contents.
         if let Some(extent) =
             self.pending_live_extent_record(ino, block_index, pending_content_epoch)
         {
-            if let Some(data) = self.block_store.get(extent.object_id) {
+            if let Some(data) = self.block_store_get_async(extent.object_id).await? {
                 return Ok(Some(data));
             }
             return Ok(self.block_cache.get(extent.object_id).await);
+        }
+        // Stage 4 — durable spill/WAL entries that have not yet been materialized.
+        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
+            return Ok(Some(data));
         }
         Ok(None)
     }
@@ -7071,6 +7067,26 @@ impl StudioVfs {
 
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
         self.block_store.get(object_id)
+    }
+
+    async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || Ok(block_store.get(object_id))).await
+    }
+
+    async fn block_store_put_async(
+        &self,
+        object_id: u64,
+        data: Bytes,
+        evictable: bool,
+    ) -> VfsResult<()> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || {
+            block_store
+                .put(object_id, data.as_ref(), evictable)
+                .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
+        })
+        .await
     }
 
     pub fn upload_stats(&self) -> VfsUploadStats {
@@ -10326,15 +10342,8 @@ impl StudioVfs {
             };
 
             let dst = &mut buffer[written..written + to_copy];
-            let Some(cached) = self.block_store.get(block_ref.object_id) else {
+            let Some(read) = self.block_store.read_into(block_ref.object_id, off_in, dst) else {
                 return Ok(None);
-            };
-            let read = if to_copy == 0 || off_in >= cached.len() {
-                0
-            } else {
-                let read = to_copy.min(cached.len() - off_in);
-                dst[..read].copy_from_slice(&cached[off_in..off_in + read]);
-                read
             };
             if read < to_copy {
                 dst[read..].fill(0);
@@ -10656,7 +10665,7 @@ impl StudioVfs {
             None => return Ok(None),
         };
 
-        if let Some(cached) = self.block_store.get(block_ref.object_id) {
+        if let Some(cached) = self.block_store_get_async(block_ref.object_id).await? {
             return Ok(Some(cached));
         }
 
@@ -11265,7 +11274,7 @@ impl StudioVfs {
                 Some(payload)
             } else {
                 let read_started = Instant::now();
-                let read_result = self.block_store.get(op.object_id);
+                let read_result = self.block_store_get_async(op.object_id).await?;
                 let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
                 drop(upload_io_permit);
                 self.state

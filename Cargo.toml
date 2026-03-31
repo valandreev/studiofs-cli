@@ -68,7 +68,7 @@ winfsp = "0.12"
 # Utils
 parking_lot = "0.12"
 dashmap = "6"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 tempfile = "3"
 home = "0.5"
 dotenvy = "0.15"

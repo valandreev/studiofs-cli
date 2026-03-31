@@ -78,6 +78,62 @@ impl MmapReader {
         Ok(Bytes::from(buf))
     }
 
+    pub fn read_into(
+        &self,
+        offset: u64,
+        data_len: usize,
+        data_offset: usize,
+        out: &mut [u8],
+    ) -> io::Result<(usize, u32)> {
+        let len_u64 = u64::try_from(data_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "requested mmap read exceeds u64::MAX bytes",
+            )
+        })?;
+        let end = offset.checked_add(len_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "requested mmap read overflows file offset space",
+            )
+        })?;
+
+        let copy_start = data_offset.min(data_len);
+        let copy_end = data_offset.saturating_add(out.len()).min(data_len);
+        let copy_len = copy_end.saturating_sub(copy_start);
+
+        let generation = self.current.load_full();
+        if end <= generation.mapped_len {
+            let start = usize::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "requested mmap read offset exceeds addressable space",
+                )
+            })?;
+            let end = usize::try_from(end).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "requested mmap read end exceeds addressable space",
+                )
+            })?;
+            let payload = &generation.mmap[start..end];
+            let checksum = crc32fast::hash(payload);
+            if copy_len > 0 {
+                out[..copy_len].copy_from_slice(&payload[copy_start..copy_end]);
+            }
+            return Ok((copy_len, checksum));
+        }
+
+        let mut buf = vec![0u8; data_len];
+        platform::pread(&self.file, &mut buf, offset)?;
+        let _ = self.remap_if_needed(end);
+        let checksum = crc32fast::hash(&buf);
+        if copy_len > 0 {
+            out[..copy_len].copy_from_slice(&buf[copy_start..copy_end]);
+        }
+        Ok((copy_len, checksum))
+    }
+
     pub fn remap_if_needed(&self, required_len: u64) -> io::Result<()> {
         if required_len <= self.current.load_full().mapped_len {
             return Ok(());
