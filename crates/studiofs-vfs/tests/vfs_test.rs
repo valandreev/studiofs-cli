@@ -5679,8 +5679,8 @@ fn backpressure_only_on_local_budget_exhaustion() {
             for idx in 0..4 {
                 assert_eq!(
                     vfs.ingress_pressure_for(payload.len()).lane,
-                    VfsIngressLane::Spill,
-                    "upload backlog should keep routing new writes to spill instead of backpressure"
+                    VfsIngressLane::DirtyMem,
+                    "upload backlog alone should not force write-buffer backpressure"
                 );
                 let name = format!("spill-only-{idx}.bin");
                 let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
@@ -5707,11 +5707,14 @@ fn backpressure_only_on_local_budget_exhaustion() {
     let tight_meta = Arc::new(RedbMetaEngine::open(&tight_db).unwrap());
     tight_meta.init_root(0, 0).unwrap();
     tight_meta.set_format_info(&tight_info).unwrap();
-    let tight_spill_bytes = tight_info.block_size as usize;
+    let partial_payload = vec![0x44u8; (tight_info.block_size as usize) / 2];
 
     unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", tight_spill_bytes.to_string());
+        std::env::set_var(
+            "STUDIOFS_MAX_DIRTY_BYTES",
+            partial_payload.len().to_string(),
+        );
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "0");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
@@ -5742,13 +5745,19 @@ fn backpressure_only_on_local_budget_exhaustion() {
             vfs.start().expect("failed to start StudioVfs background workers");
 
             let attr = vfs.create(1, b"budget-full.bin", 0, 0, 0o644).unwrap();
-            vfs.write(attr.ino, 0, &payload).await.unwrap();
-            vfs.flush(attr.ino).await.unwrap();
+            vfs.write(attr.ino, 0, &partial_payload).await.unwrap();
 
             assert_eq!(
-                vfs.ingress_pressure_for(payload.len()).lane,
+                vfs.ingress_pressure_for(partial_payload.len()).lane,
                 VfsIngressLane::Backpressure,
-                "foreground backpressure should appear only once local durable spill budget is actually full"
+                "foreground backpressure should appear only when pending write-buffer bytes exhaust the local limit"
+            );
+
+            vfs.flush(attr.ino).await.unwrap();
+            assert_eq!(
+                vfs.ingress_pressure_for(partial_payload.len()).lane,
+                VfsIngressLane::DirtyMem,
+                "flushing the pending write buffer should clear local backpressure"
             );
         });
         rt.shutdown_background();
