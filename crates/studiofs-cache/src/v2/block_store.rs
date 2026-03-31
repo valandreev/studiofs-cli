@@ -366,11 +366,13 @@ impl BlockStore {
 
     /// Submit a best-effort read-ahead hint for a cached block.
     pub fn advise_will_need(&self, object_id: u64) {
-        let (offset, data_size) = match {
+        let metadata = {
             let idx = self.index.lock();
             idx.get(object_id)
                 .map(|entry| (entry.offset + BLOCK_HEADER_SIZE as u64, entry.data_size))
-        } {
+        };
+
+        let (offset, data_size) = match metadata {
             Some(metadata) => metadata,
             None => return,
         };
@@ -875,12 +877,7 @@ impl BlockStore {
         }
     }
 
-    fn issue_allocation_release_hints(
-        &self,
-        offset: u64,
-        alloc_size: u64,
-        object_id: Option<u64>,
-    ) {
+    fn issue_allocation_release_hints(&self, offset: u64, alloc_size: u64, object_id: Option<u64>) {
         if let Err(error) = platform::punch_hole(&self.file, offset, alloc_size) {
             warn!(
                 object_id,

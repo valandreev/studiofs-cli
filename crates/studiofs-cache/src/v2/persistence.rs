@@ -45,6 +45,17 @@ impl WalOp {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WalRecord {
+    op: WalOp,
+    object_id: u64,
+    offset: u64,
+    alloc_size: u64,
+    data_size: u32,
+    checksum: u32,
+    flags: u8,
+}
+
 pub(super) struct WalAppender {
     file: File,
 }
@@ -64,6 +75,7 @@ impl WalAppender {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         if reset {
@@ -77,19 +89,27 @@ impl WalAppender {
     }
 
     pub(super) fn append_put(&mut self, entry: PersistedIndexEntry) -> io::Result<()> {
-        self.append_record(
-            WalOp::Put,
-            entry.object_id,
-            entry.offset,
-            entry.alloc_size,
-            entry.data_size,
-            entry.checksum,
-            persisted_flag_bits(entry.flags),
-        )
+        self.append_record(WalRecord {
+            op: WalOp::Put,
+            object_id: entry.object_id,
+            offset: entry.offset,
+            alloc_size: entry.alloc_size,
+            data_size: entry.data_size,
+            checksum: entry.checksum,
+            flags: persisted_flag_bits(entry.flags),
+        })
     }
 
     pub(super) fn append_remove(&mut self, object_id: u64) -> io::Result<()> {
-        self.append_record(WalOp::Remove, object_id, 0, 0, 0, 0, 0)
+        self.append_record(WalRecord {
+            op: WalOp::Remove,
+            object_id,
+            offset: 0,
+            alloc_size: 0,
+            data_size: 0,
+            checksum: 0,
+            flags: 0,
+        })
     }
 
     pub(super) fn append_update_flags(
@@ -97,15 +117,15 @@ impl WalAppender {
         object_id: u64,
         flags: BlockFlags,
     ) -> io::Result<()> {
-        self.append_record(
-            WalOp::UpdateFlags,
+        self.append_record(WalRecord {
+            op: WalOp::UpdateFlags,
             object_id,
-            0,
-            0,
-            0,
-            0,
-            persisted_flag_bits(flags),
-        )
+            offset: 0,
+            alloc_size: 0,
+            data_size: 0,
+            checksum: 0,
+            flags: persisted_flag_bits(flags),
+        })
     }
 
     pub(super) fn clear(&mut self) -> io::Result<()> {
@@ -114,19 +134,8 @@ impl WalAppender {
         Ok(())
     }
 
-    fn append_record(
-        &mut self,
-        op: WalOp,
-        object_id: u64,
-        offset: u64,
-        alloc_size: u64,
-        data_size: u32,
-        checksum: u32,
-        flags: u8,
-    ) -> io::Result<()> {
-        let record = wal_record_bytes(
-            op, object_id, offset, alloc_size, data_size, checksum, flags,
-        );
+    fn append_record(&mut self, record: WalRecord) -> io::Result<()> {
+        let record = wal_record_bytes(record);
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&record)?;
         Ok(())
@@ -517,23 +526,15 @@ fn snapshot_entry_bytes(entry: PersistedIndexEntry) -> [u8; SNAPSHOT_ENTRY_SIZE]
     buf
 }
 
-fn wal_record_bytes(
-    op: WalOp,
-    object_id: u64,
-    offset: u64,
-    alloc_size: u64,
-    data_size: u32,
-    checksum: u32,
-    flags: u8,
-) -> [u8; WAL_RECORD_SIZE_USIZE] {
+fn wal_record_bytes(record: WalRecord) -> [u8; WAL_RECORD_SIZE_USIZE] {
     let mut buf = [0u8; WAL_RECORD_SIZE_USIZE];
-    buf[0] = op as u8;
-    buf[1] = flags;
-    buf[8..16].copy_from_slice(&object_id.to_le_bytes());
-    buf[16..24].copy_from_slice(&offset.to_le_bytes());
-    buf[24..32].copy_from_slice(&alloc_size.to_le_bytes());
-    buf[32..36].copy_from_slice(&data_size.to_le_bytes());
-    buf[36..40].copy_from_slice(&checksum.to_le_bytes());
+    buf[0] = record.op as u8;
+    buf[1] = record.flags;
+    buf[8..16].copy_from_slice(&record.object_id.to_le_bytes());
+    buf[16..24].copy_from_slice(&record.offset.to_le_bytes());
+    buf[24..32].copy_from_slice(&record.alloc_size.to_le_bytes());
+    buf[32..36].copy_from_slice(&record.data_size.to_le_bytes());
+    buf[36..40].copy_from_slice(&record.checksum.to_le_bytes());
     let crc = crc32fast::hash(&buf[0..40]);
     buf[40..44].copy_from_slice(&crc.to_le_bytes());
     buf
