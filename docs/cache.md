@@ -8,13 +8,15 @@ There are two generations of the cache implementation:
 | Generation | Module | Status |
 |------------|--------|--------|
 | **v3 (current)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active — used by VFS |
-| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format` | Foundation laid (SFS-135); index + eviction in SFS-136 |
+| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Core store implemented; not yet wired to VFS |
 
 ---
 
 ## Cache v2 — Single-file BlockStore
 
-> **Status:** Foundation implemented in SFS-135. Not yet wired to VFS.
+> **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
+> dirty/uploading eviction gating, and auto-eviction are implemented. Snapshot
+> + WAL persistence remain future work.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
@@ -24,8 +26,8 @@ free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
 ```
 {cache_dir}/
 ├── blocks.data     # single data file (all blocks)
-├── blocks.idx      # index snapshot — binary (SFS-136)
-├── blocks.wal      # index WAL — append-only (SFS-136)
+├── blocks.idx      # index snapshot — binary (future)
+├── blocks.wal      # index WAL — append-only (future)
 └── pins.json       # pin config — future
 ```
 
@@ -77,7 +79,7 @@ Key behaviours:
 |-----------|-------------|
 | `allocate(size)` | Best-fit from free list; grows file by `max(size, 256 MiB)` if no fit |
 | `free(offset, size)` | Returns region, coalesces left+right neighbours, truncates tail |
-| `recover(max_size, file_end, occupied)` | Rebuilds free list from live block offsets (used by SFS-136 index recovery) |
+| `recover(max_size, file_end, occupied)` | Rebuilds free list from live block offsets (used by future index recovery) |
 
 File extension (`set_len`) happens **inside the allocator lock** to prevent
 concurrent threads from observing an inconsistent file end.
@@ -91,23 +93,34 @@ BlockStore::get(id)                 // pread + crc32 verify → Option<Bytes>
 BlockStore::contains(id)            // index lookup only
 BlockStore::remove(id)              // free allocation, update index
 BlockStore::remove_batch(ids)       // batched remove under single allocator lock
-BlockStore::mark_evictable(id)      // clear DIRTY flag after S3 upload
+BlockStore::mark_evictable(id)      // clear DIRTY + UPLOADING after S3 upload
+BlockStore::mark_uploading(id)      // set transient UPLOADING flag
+BlockStore::mark_upload_failed(id)  // clear UPLOADING, preserve DIRTY
 BlockStore::sync_data()             // fdatasync
 BlockStore::close(self)             // fdatasync + drop
 // Drop impl: best-effort fdatasync on implicit drop
 ```
 
+Implementation notes:
+
+- `BlockIndex` is guarded by `Mutex<BlockIndex>` rather than `RwLock`: a cache
+  hit updates LRU state, so `get()` is logically mutating.
+- `put()` uses a pending-allocation guard so allocation is rolled back if a
+  post-write error or unwind happens before the new index entry is published.
+- `mark_evictable()` keeps the index lock across the tiny header `pwrite` to
+  prevent disk-offset ABA reuse from corrupting a different block's header.
+
 Error variants include `CacheFull { needed, max_size, allocated, free }` for
 fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
 limit on an existing file.
 
-### Index persistence (SFS-136)
+### Index persistence
 
 Not yet implemented.  On open, all data-region bytes are treated as free space
 (index is empty).  A WARN log is emitted when a non-empty `blocks.data` is
 opened without index persistence.
 
-When SFS-136 lands:
+Planned next:
 1. **Fast path** — load `blocks.idx` snapshot + replay `blocks.wal`
 2. **Crash fallback** — scan `blocks.data` block headers (`SBLK` magic + checksum)
 
@@ -117,7 +130,8 @@ Block headers are written today precisely to support fallback recovery.
 
 ## Cache v3 (current) — L1 + L2
 
-> **Status:** Active.  Used by VFS.  Will be replaced by v2 once SFS-136 lands.
+> **Status:** Active.  Used by VFS.  Will be replaced by v2 after persistence
+> and VFS integration land.
 
 ## Architecture
 
