@@ -23,6 +23,9 @@ mod platform_direct_io;
 pub mod runtime;
 pub mod upload_queue;
 
+// --- Cache v2: single-file block store ---
+pub mod v2;
+
 // --- Re-exports ---
 pub use block_cache::{BlockCache, BlockCacheConfig};
 pub use upload_queue::PendingUpload;
