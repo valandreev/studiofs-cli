@@ -341,7 +341,6 @@ impl Materializer {
         results: Vec<BatchFlushResult>,
         manifests: Vec<PendingManifestSummary>,
     ) -> usize {
-        let mut l2_work: Vec<(u64, Bytes)> = Vec::with_capacity(extents.len());
         let mut upload_ops: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(extents.len());
         let mut freed_bytes = 0usize;
         let mut drained_mem_blocks = 0u64;
@@ -353,6 +352,17 @@ impl Materializer {
 
         for (idx, extent) in extents.into_iter().enumerate() {
             let data = extent.data;
+            if let Err(error) = vfs.block_store.put(extent.object_id, data.as_ref(), false) {
+                warn!(
+                    ino = extent.ino,
+                    block_index = extent.block_index,
+                    object_id = extent.object_id,
+                    error = %error,
+                    "materializer: BlockStore put failed; keeping legacy cache fallback for local reads"
+                );
+            } else {
+                vfs.block_store.mark_uploading(extent.object_id);
+            }
             vfs.block_cache.stage_l1(extent.object_id, data.clone());
             vfs.stage_upload_payload(extent.object_id, data.clone());
 
@@ -407,7 +417,6 @@ impl Materializer {
                 drained_mem_blocks = drained_mem_blocks.saturating_add(1);
                 drained_mem_bytes = drained_mem_bytes.saturating_add(data.len() as u64);
             }
-            l2_work.push((extent.object_id, data));
 
             if let Some(ref old_block) = results[idx].old_block {
                 debug!(
@@ -464,7 +473,7 @@ impl Materializer {
 
         vfs.state.dirty_buffer.dirty_drained_notify.notify_waiters();
 
-        let batch_len = l2_work.len();
+        let batch_len = upload_ops.len();
         debug!(
             "materializer: drained {} blocks ({} bytes), dirty_bytes={}, mem_blocks={}, mem_bytes={}, spill_blocks={}, spill_bytes={}",
             batch_len,
@@ -475,10 +484,6 @@ impl Materializer {
             drained_spill_blocks,
             drained_spill_bytes,
         );
-
-        if let Err(e) = vfs.block_cache.commit_l2_batch(l2_work).await {
-            warn!(error = %e, blocks = batch_len, "materializer: failed to enqueue L2 batch");
-        }
 
         batch_len
     }

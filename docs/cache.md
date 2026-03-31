@@ -8,7 +8,7 @@ There are two generations of the cache implementation:
 | Generation | Module | Status |
 |------------|--------|--------|
 | **v3 (current)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active — used by VFS |
-| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Core store implemented; not yet wired to VFS |
+| **v2 (in progress)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Foreground VFS reads and read-ahead now use BlockStore; write/upload plumbing still transitions through legacy cache helpers |
 
 ---
 
@@ -16,7 +16,8 @@ There are two generations of the cache implementation:
 
 > **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
 > dirty/uploading eviction gating, auto-eviction, mmap reads with generation
-> remapping, snapshot/WAL persistence, and startup recovery are implemented.
+> remapping, snapshot/WAL persistence, and startup recovery are implemented,
+> and the VFS foreground read path now uses BlockStore as its committed cache.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.

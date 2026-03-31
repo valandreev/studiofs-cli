@@ -49,12 +49,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{
-    BlockCache, BlockCacheConfig, CacheReadLevel, DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
-    DEFAULT_L2_COMMIT_WORKERS, DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
+    BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
+    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
 };
 use studiofs_cache::l2_disk::L2IoPriority;
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
+use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -72,6 +73,7 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::ingress_wal::{
     AppendOutcome, INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressRecordKind, IngressWal,
@@ -637,8 +639,6 @@ const UPLOAD_SCHEDULER_PENALTY_STEP_MS: u64 = 16;
 const UPLOAD_SCHEDULER_PENALTY_MAX_MS: u64 = 240;
 const UPLOAD_SCHEDULER_OVERSHOOT_MAX: u64 = 6;
 const UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS: u64 = 40;
-const UPLOAD_FALLBACK_DEFER_MIN_MS: u64 = 25;
-const UPLOAD_FALLBACK_DEFER_MAX_MS: u64 = 250;
 const FOREGROUND_READ_SPEEDOMETER_SHARDS: usize = 16;
 const FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES: usize = 4_096;
 const FOREGROUND_READ_THROUGHPUT_MIN_COVERAGE_MS: u64 = 100;
@@ -666,15 +666,18 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-/// Maximum retry attempts when a locally-accepted block is found in
-/// `live_extent_records` but is transiently absent from the block cache.
-/// This covers the narrow window between `complete_upload` (L1 unpin) and
-/// the corresponding `commit_l2_batch` write completing on local NVMe.
-/// Budget: 5 × 10 ms = 50 ms, which comfortably covers NVMe commit latency
-/// under high I/O pressure while remaining well within application read timeouts.
-const LOCAL_OVERLAY_CACHE_MISS_MAX_RETRIES: u32 = 5;
-/// Per-retry sleep duration in milliseconds for local overlay cache-miss recovery.
-const LOCAL_OVERLAY_CACHE_MISS_WAIT_MS: u64 = 10;
+
+fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
+    if let Ok(parsed) = Uuid::parse_str(volume_uuid) {
+        return *parsed.as_bytes();
+    }
+
+    let mut derived = [0u8; 16];
+    for (idx, byte) in volume_uuid.as_bytes().iter().enumerate() {
+        derived[idx % derived.len()] ^= *byte;
+    }
+    derived
+}
 #[derive(Clone)]
 struct DistributedFlock {
     op: Operator,
@@ -3654,6 +3657,8 @@ pub struct StudioVfs {
     meta_async: Arc<dyn AsyncMetaEngine>,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
+    /// Cache v2 single-file store used by the foreground read path.
+    block_store: Arc<BlockStore>,
     /// Unified two-level block cache (L1 RAM + L2 NVMe) with upload queue.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
@@ -4509,7 +4514,16 @@ impl StudioVfs {
                 initial_checkpoint_meta,
             ) = init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            // Init unified block cache (L1 RAM + L2 NVMe + upload queue)
+            let block_store = Arc::new(
+                BlockStore::open(BlockStoreConfig {
+                    cache_dir: PathBuf::from(cache_dir),
+                    max_size: cache_size,
+                    volume_uuid: derive_block_store_volume_uuid(&format_info.uuid),
+                })
+                .map_err(|e| VfsError::Other(format!("failed to open block store: {e}")))?,
+            );
+
+            // Init unified block cache (L1 RAM + upload queue; legacy L2 remains for upload fallback)
             let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
             cache_config.l2_commit_workers = config.l2_commit_workers;
             cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity;
@@ -4604,7 +4618,7 @@ impl StudioVfs {
             let transit_memory_budget = TransitMemoryBudget::new(transit_memory_budget_bytes);
             let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
                 data_read,
-                block_cache.clone(),
+                block_store.clone(),
                 fetch_aimd_config,
                 prefetch_foreground_reserve,
                 qos.clone(),
@@ -4721,6 +4735,7 @@ impl StudioVfs {
             let vfs = Arc::new(Self {
                 meta_async,
                 data_write,
+                block_store,
                 block_cache,
                 block_size,
                 data_prefix,
@@ -5405,6 +5420,7 @@ impl StudioVfs {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
         self.discard_staged_upload_payload(op.object_id);
         self.block_cache.cancel_upload(op, !has_open_handles);
+        self.block_store.remove(op.object_id);
         self.state
             .upload
             .pending_evictions
@@ -6076,60 +6092,6 @@ impl StudioVfs {
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
     }
 
-    fn upload_fallback_defer_delay(&self) -> Duration {
-        let idle_grace_ms = self
-            .upload_user_idle_grace
-            .as_millis()
-            .clamp(1, u64::MAX as u128) as u64;
-        let adaptive_penalty_ms = self.upload_scheduler.adaptive_penalty_ms();
-        let delay_ms = adaptive_penalty_ms
-            .max(idle_grace_ms.saturating_div(2))
-            .clamp(UPLOAD_FALLBACK_DEFER_MIN_MS, UPLOAD_FALLBACK_DEFER_MAX_MS);
-        Duration::from_millis(delay_ms)
-    }
-
-    async fn defer_upload_fallback_reread(
-        &self,
-        op: &PendingUpload,
-        upload_cancel_token: &CancellationToken,
-        block_index: u32,
-        reason: &'static str,
-    ) -> VfsResult<()> {
-        let defer_delay = self.upload_fallback_defer_delay();
-        self.state
-            .upload
-            .upload_fallback_deferrals
-            .fetch_add(1, Ordering::Relaxed);
-        self.state
-            .upload
-            .upload_requeues
-            .fetch_add(1, Ordering::Relaxed);
-        debug!(
-            ino = op.ino,
-            object_id = op.object_id,
-            block_index,
-            delay_ms = defer_delay.as_millis() as u64,
-            reason,
-            "process_upload deferring fallback L2 reread while foreground demand is active"
-        );
-        let should_requeue = tokio::select! {
-            _ = self.state.shutdown.uploader_shutdown_token.cancelled() => false,
-            _ = upload_cancel_token.cancelled() => false,
-            _ = tokio::time::sleep(defer_delay) => !self.uploader_shutdown_requested(),
-        };
-        if !should_requeue {
-            self.cancel_upload_if_inode_deleted(op);
-            return Ok(());
-        }
-        if !self.block_cache.requeue_upload(op.clone()) {
-            return Err(VfsError::Other(format!(
-                "failed to requeue deferred upload op {}",
-                op.object_id
-            )));
-        }
-        Ok(())
-    }
-
     fn remove_spill_entry(&self, key: (Ino, u32)) -> Option<SpillEntry> {
         let removed = self.state.ingress.ingress_live.lock().remove(&key);
         if let Some(ref entry) = removed {
@@ -6324,7 +6286,8 @@ impl StudioVfs {
         block_index: u32,
         pending_content_epoch: Option<u64>,
     ) -> VfsResult<Option<Bytes>> {
-        // Stage 1 — write-buffer: unflushed pending_blocks (active write accumulation).
+        // Stage 1 — write-buffer: local accepted data not yet represented by
+        // BlockStore (pending blocks, dirty_mem, durable spill).
         if let Some(pending_block) = self
             .state
             .write_buffer
@@ -6344,36 +6307,17 @@ impl StudioVfs {
         {
             return Ok(Some(data.clone()));
         }
-        // Stage 3 — live-extent: materialized in block cache under stage_l1 pin.
-        // Invariant: dirty_mem is cleared only AFTER record_live_extent + stage_l1 succeed,
-        // so both stages are never simultaneously absent.  The pin is held through
-        // submit_uploads_batch; it is released by complete_upload.  Between complete_upload
-        // and commit_l2_batch finishing, the block may be absent from cache — the async
-        // variant handles this with bounded retries.
-        //
-        // Safety of cache miss here: this sync function is called exclusively from two
-        // contexts:
-        //   (a) read_into_sync_cached_with_mode / probe_sync_cached_blocks — a cache miss
-        //       causes the caller to return None, which makes read_into_fh_sync_cached
-        //       fall through to the async read path where the bounded retry applies.
-        //   (b) load_local_block_bytes_sync (truncation only) — a miss falls through to the
-        //       committed block_cache lookup; all read paths clamp output to attr.size so
-        //       no user-visible data regression occurs.
-        // In both cases accepting a miss here is safe and correct.
-        if let Some(extent) =
-            self.pending_live_extent_record(ino, block_index, pending_content_epoch)
-            && let Some(data) = self.block_cache.get_sync(extent.object_id)
-        {
-            return Ok(Some(data));
-        }
-        // Stage 4 — spill WAL: CacheSafetyMode::Durable or forced-spill overflow.
-        // Note: apply_batch removes the spill entry AFTER stage_l1 + record_live_extent,
-        // so a block cannot be simultaneously absent from Stage 3 and present in Stage 4
-        // during normal materialization.  Stage 4 is therefore relevant only for blocks
-        // that were never materialized (durable mode path or blocks still in original
-        // spill WAL before any drain cycle).
         if let Some(data) = self.load_spill_block((ino, block_index))? {
             return Ok(Some(data));
+        }
+        // Stage 2 — BlockStore: materialized local data and committed cache contents.
+        if let Some(extent) =
+            self.pending_live_extent_record(ino, block_index, pending_content_epoch)
+        {
+            if let Some(data) = self.block_store.get(extent.object_id) {
+                return Ok(Some(data));
+            }
+            return Ok(self.block_cache.get_sync(extent.object_id));
         }
         Ok(None)
     }
@@ -6384,7 +6328,8 @@ impl StudioVfs {
         block_index: u32,
         pending_content_epoch: Option<u64>,
     ) -> VfsResult<Option<Bytes>> {
-        // Stage 1 — write-buffer: unflushed pending_blocks (active write accumulation).
+        // Stage 1 — write-buffer: local accepted data not yet represented by
+        // BlockStore (pending blocks, dirty_mem, durable spill).
         if let Some(pending_block) = self
             .state
             .write_buffer
@@ -6404,55 +6349,17 @@ impl StudioVfs {
         {
             return Ok(Some(data.clone()));
         }
-        // Stage 3 — live-extent: block is materialized in the block cache.
-        //
-        // The pipeline ordering guarantees:
-        //   apply_batch: stage_l1 (pin) → record_live_extent → dirty_mem.remove
-        //   upload path: submit_uploads_batch (re-pin) → complete_upload (unpin)
-        //   L2 path:     commit_l2_batch (async NVMe write, scheduled after stage_l1)
-        //   finalization: remove_live_extents_for_inode_epoch (after publish_file_manifest)
-        //
-        // Normal case: block is pinned in L1 (stage_l1 through complete_upload) or already
-        // written to L2.  Fast path returns immediately.
+        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
+            return Ok(Some(data));
+        }
+        // Stage 2 — BlockStore: materialized local data and committed cache contents.
         if let Some(extent) =
             self.pending_live_extent_record(ino, block_index, pending_content_epoch)
         {
-            if let Some(data) = self.block_cache.get(extent.object_id).await {
+            if let Some(data) = self.block_store.get(extent.object_id) {
                 return Ok(Some(data));
             }
-            // Slow path: the live extent is present but the block is transiently absent
-            // from cache.  This is the narrow window between complete_upload releasing the
-            // L1 pin and commit_l2_batch finishing the NVMe write.  Apply bounded retries
-            // to preserve local-path semantics before falling through to the remote path.
-            for _ in 0..LOCAL_OVERLAY_CACHE_MISS_MAX_RETRIES {
-                self.state
-                    .metrics
-                    .local_overlay_cache_miss_retries
-                    .fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(LOCAL_OVERLAY_CACHE_MISS_WAIT_MS)).await;
-                if let Some(data) = self.block_cache.get(extent.object_id).await {
-                    return Ok(Some(data));
-                }
-            }
-            // Retries exhausted.  The block is committed to metadata / S3; fall through
-            // to Stage 4 and then the committed remote path.  This is safe because
-            // apply_batch calls flush_blocks_batch (metadata commit) before record_live_extent,
-            // guaranteeing the block_ref is discoverable via get_file_block_async and
-            // the S3 object exists (upload completed before complete_upload ran).
-            self.state
-                .metrics
-                .local_overlay_cache_miss_retry_exhaustions
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        // Stage 4 — spill WAL: CacheSafetyMode::Durable or forced-spill overflow.
-        // Note: apply_batch removes the spill entry AFTER stage_l1 + record_live_extent,
-        // so a block that reached Stage 3 will not be found here.  Stage 4 catches blocks
-        // that were never materialized (still in original spill WAL) or that arrived via
-        // the durable-mode fast path.  After Stage 4, returning None sends the caller to
-        // read_block, which is always valid here because flush_blocks_batch in apply_batch
-        // commits the block_ref to metadata before record_live_extent fires.
-        if let Some(data) = self.load_spill_block_async((ino, block_index)).await? {
-            return Ok(Some(data));
+            return Ok(self.block_cache.get(extent.object_id).await);
         }
         Ok(None)
     }
@@ -7163,7 +7070,7 @@ impl StudioVfs {
     }
 
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
-        self.block_cache.get_sync(object_id)
+        self.block_store.get(object_id)
     }
 
     pub fn upload_stats(&self) -> VfsUploadStats {
@@ -7410,7 +7317,7 @@ impl StudioVfs {
         {
             return Ok(Some(data));
         }
-        Ok(self.block_cache.get_sync(object_id))
+        Ok(self.block_store.get(object_id))
     }
 
     fn install_truncated_pending_block(
@@ -8036,6 +7943,11 @@ impl StudioVfs {
     /// Shared reference to the block cache.
     pub fn block_cache(&self) -> &Arc<BlockCache> {
         &self.block_cache
+    }
+
+    /// Shared reference to the BlockStore used by foreground reads.
+    pub fn block_store(&self) -> &Arc<BlockStore> {
+        &self.block_store
     }
 
     /// Shared reference to the fetch scheduler.
@@ -10411,15 +10323,15 @@ impl StudioVfs {
             };
 
             let dst = &mut buffer[written..written + to_copy];
-            let maybe_read = self.block_cache.get_sync_l2_into_with_promotion(
-                block_ref.object_id,
-                off_in as u64,
-                dst,
-                access.policy.cache_promotion_on_read,
-            );
-            let read = match maybe_read {
-                Some(read) => read.min(to_copy),
-                None => return Ok(None),
+            let Some(cached) = self.block_store.get(block_ref.object_id) else {
+                return Ok(None);
+            };
+            let read = if to_copy == 0 || off_in >= cached.len() {
+                0
+            } else {
+                let read = to_copy.min(cached.len() - off_in);
+                dst[..read].copy_from_slice(&cached[off_in..off_in + read]);
+                read
             };
             if read < to_copy {
                 dst[read..].fill(0);
@@ -10482,7 +10394,7 @@ impl StudioVfs {
                 block_refs.push(None);
                 continue;
             };
-            if !self.block_cache.contains(block_ref.object_id) {
+            if !self.block_store.contains(block_ref.object_id) {
                 return Ok(None);
             }
             block_refs.push(Some(block_ref));
@@ -10542,8 +10454,10 @@ impl StudioVfs {
             }
         };
 
-        // Skip if block is already cached (L1 or L2) — avoid any S3 I/O.
-        if self.block_cache.contains(block_ref.object_id) {
+        // Skip if the block is already cached and emit an advisory hint so the
+        // OS can start faulting pages in ahead of demand.
+        if self.block_store.contains(block_ref.object_id) {
+            self.block_store.advise_will_need(block_ref.object_id);
             self.readahead.finish_prefetch(ino, block_index);
             return;
         }
@@ -10739,8 +10653,7 @@ impl StudioVfs {
             None => return Ok(None),
         };
 
-        // Try unified cache (L1 + L2)
-        if let Some(cached) = self.block_cache.get(block_ref.object_id).await {
+        if let Some(cached) = self.block_store.get(block_ref.object_id) {
             return Ok(Some(cached));
         }
 
@@ -10915,6 +10828,7 @@ impl StudioVfs {
                                     .fetch_add(1, Ordering::Relaxed);
                                 vfs.maybe_clear_deleted_inode_marker(op.ino);
                             } else {
+                                vfs.block_store.mark_upload_failed(op.object_id);
                                 vfs.mark_upload_sticky_error(op.ino, &e);
                                 let mut retry_op = op;
                                 retry_op.retry_count = retry_op.retry_count.saturating_add(1);
@@ -11170,6 +11084,7 @@ impl StudioVfs {
                 "upload cancelled: stale content epoch"
             );
             self.block_cache.cancel_upload(&op, false);
+            self.block_store.remove(op.object_id);
             self.state
                 .upload
                 .pending_evictions
@@ -11204,6 +11119,7 @@ impl StudioVfs {
                 "upload cancelled: stale block superseded by newer object"
             );
             self.block_cache.cancel_upload(&op, false);
+            self.block_store.remove(op.object_id);
             self.state
                 .upload
                 .pending_evictions
@@ -11220,6 +11136,7 @@ impl StudioVfs {
         }
 
         let t0 = Instant::now();
+        self.block_store.mark_uploading(op.object_id);
         let fragment_keys = format_object_fragment_keys(&self.data_prefix, op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
@@ -11307,18 +11224,11 @@ impl StudioVfs {
                 "process_upload using L1 payload after staged miss"
             );
             Some(payload)
-        } else if self.foreground_read_active() {
-            return self
-                .defer_upload_fallback_reread(
-                    &op,
-                    &upload_cancel_token,
-                    block_index,
-                    "foreground already active before fallback permit acquisition",
-                )
-                .await;
         } else {
-            // Hold local upload I/O slots strictly around the L2 read phase.
-            // Never keep them during network visibility checks or S3 uploads.
+            // Hold local upload I/O slots strictly around the BlockStore reread phase.
+            // Unlike the legacy cold L2 fallback, this reread must still make
+            // progress during foreground activity because recovered pending
+            // uploads may have no staged/L1 copy left after restart.
             let upload_io_cost = if self.foreground_read_active() {
                 self.state
                     .upload
@@ -11350,22 +11260,9 @@ impl StudioVfs {
                     "process_upload using L1 payload after upload slot wait"
                 );
                 Some(payload)
-            } else if self.foreground_read_active() {
-                drop(upload_io_permit);
-                return self
-                    .defer_upload_fallback_reread(
-                        &op,
-                        &upload_cancel_token,
-                        block_index,
-                        "foreground became active before fallback L2 read",
-                    )
-                    .await;
             } else {
                 let read_started = Instant::now();
-                let (read_result, read_trace) = self
-                    .block_cache
-                    .get_l2_only_with_trace_and_priority(op.object_id, L2IoPriority::Background)
-                    .await;
+                let read_result = self.block_store.get(op.object_id);
                 let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
                 drop(upload_io_permit);
                 self.state
@@ -11384,35 +11281,20 @@ impl StudioVfs {
                     .upload
                     .upload_fallback_read_max_ns
                     .fetch_max(read_ns, Ordering::Relaxed);
-                match read_trace.level {
-                    CacheReadLevel::L2 => {
-                        self.state
-                            .upload
-                            .upload_fallback_rereads
-                            .fetch_add(1, Ordering::Relaxed);
-                        if let Some(payload) = &read_result {
-                            self.state
-                                .upload
-                                .upload_fallback_reread_bytes
-                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                        }
-                    }
-                    CacheReadLevel::Miss => {
-                        self.state
-                            .upload
-                            .upload_fallback_rereads
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.state
-                            .upload
-                            .upload_fallback_reread_cache_misses
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    CacheReadLevel::L1 => {
-                        debug_assert!(
-                            false,
-                            "L2-only upload fallback unexpectedly reported an L1 hit"
-                        );
-                    }
+                self.state
+                    .upload
+                    .upload_fallback_rereads
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(payload) = &read_result {
+                    self.state
+                        .upload
+                        .upload_fallback_reread_bytes
+                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                } else {
+                    self.state
+                        .upload
+                        .upload_fallback_reread_cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 read_result
             }
@@ -11472,6 +11354,7 @@ impl StudioVfs {
                         // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                             self.block_cache.cancel_upload(&op, false);
+                            self.block_store.remove(op.object_id);
                             self.state
                                 .upload
                                 .pending_evictions
@@ -11489,6 +11372,7 @@ impl StudioVfs {
                     // through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                         self.block_cache.cancel_upload(&op, false);
+                        self.block_store.remove(op.object_id);
                         self.state
                             .upload
                             .pending_evictions
@@ -11630,6 +11514,7 @@ impl StudioVfs {
                     .unwrap_or(false) =>
             {
                 self.block_cache.complete_upload(&op);
+                self.block_store.mark_evictable(op.object_id);
                 self.discard_staged_upload_payload(op.object_id);
                 debug!(
                     ino = op.ino,
@@ -11683,6 +11568,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_with_priority(op.object_id, L2IoPriority::Background)
                 .await;
+            self.block_store.remove(op.object_id);
             debug!(
                 object_id = op.object_id,
                 "post-upload eviction: block removed (inode deleted)"
@@ -11697,6 +11583,9 @@ impl StudioVfs {
             self.block_cache
                 .remove_with_priority(op.object_id, L2IoPriority::Background)
                 .await;
+            self.block_store.remove(op.object_id);
+        } else {
+            self.block_store.mark_evictable(op.object_id);
         }
 
         debug!(
