@@ -51,6 +51,25 @@ S3-compatible side unless a test explicitly checks another provider.
 | FUSE bridge unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
+### Smoke test descriptions
+
+The `mount_sanity` integration tests in each bridge crate contain two tiers:
+
+| Test | Backend | Verifies |
+|------|---------|----------|
+| `fuse_session_mount_and_drop_smoke` | FUSE | Session creation and immediate drop (minimal lifecycle) |
+| `fuse_mount_write_read_unmount_smoke` | FUSE | Full lifecycle: mount → write → read → readdir → delete → unmount |
+| `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
+| `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
+| `macos_resource_fork_roundtrip_uses_native_xattr_store` | FUSE (macOS) | Resource fork xattr round-trip (no mount required) |
+
+The full-lifecycle tests (`*_write_read_unmount_smoke`) are the primary smoke
+tests for SFS-133. They exercise file I/O through the real OS filesystem layer,
+not just session creation.
+
+See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the
+complete smoke-test strategy, CI integration, and self-hosted runner contract.
+
 ## Platform-Gated Unit Tests
 
 `studiofs-fuse` and `studiofs-winfsp` contain unit tests that are only
@@ -221,6 +240,23 @@ $env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'
 $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'
 cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1
 ```
+
+### CI smoke workflow
+
+Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:
+
+| Trigger | Behavior |
+|---------|----------|
+| `workflow_dispatch` | Manual run — all platforms |
+| `schedule` (weekly Mon 4 AM UTC) | Automated regression detection |
+| PR with `smoke-test` label | On-demand PR validation for bridge changes |
+
+The workflow runs independently of the main `rust.yml` pipeline. macOS smoke
+tests use `continue-on-error: true` because the macFUSE system extension may
+not load on hosted runners without a reboot.
+
+See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the full
+strategy document covering hosted vs self-hosted responsibilities.
 
 ## Doc/Test Name Sync Check
 
