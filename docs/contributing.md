@@ -31,7 +31,7 @@ sufficient.
 
 | Check | Notes |
 |-------|-------|
-| Platform bridge smoke tests (FUSE mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]` |
+| Platform bridge smoke tests (FUSE mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]`. See [smoke workflow](#smoke-test-workflow) |
 | S3 / PostgreSQL integration tests | Require live RustFS + PostgreSQL; all marked `#[ignore]` |
 | Cross-client convergence tests | Require multi-process infra setup; all marked `#[ignore]` |
 
@@ -47,7 +47,7 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 - **Portable compile + clippy** — `cargo clippy` runs in Quality Gates (Linux), macOS, and Windows jobs. The Linux job does not repeat clippy; compile coverage on Linux comes from the workspace `cargo test` run. Together the three jobs catch API and cfg-gated breakage on all supported targets.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
 - **Platform unit tests** — the named backend step in each platform job (`studiofs-fuse` on Linux and macOS, `studiofs-winfsp` on Windows). This is the primary signal for platform-specific code paths.
-- **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. Run manually or on self-hosted runners with the full kernel driver available. Not a PR gate.
+- **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. These include both minimal lifecycle tests (session create/drop) and full I/O tests (mount → write → read → readdir → delete → unmount). Run via the `smoke.yml` workflow or manually on self-hosted runners with the full kernel driver available. Not a PR gate.
 - **Infra integration tests** — all `#[ignore]` tests requiring live S3 + PostgreSQL. Not a PR gate.
 
 ---
@@ -101,8 +101,28 @@ manually on the developer's own machine before merging platform-bridge changes.
 See [tests.md — Platform Bridge Smoke Tests](tests.md#platform-bridge-smoke-tests)
 for the exact commands.
 
-If self-hosted runners are added in the future, they must be documented here and
-in the workflow file comment block.
+### Smoke test workflow
+
+`.github/workflows/smoke.yml` provides automated backend smoke tests that
+exercise real mount/unmount + file I/O through the platform backends:
+
+| Trigger | Behavior |
+|---------|----------|
+| `workflow_dispatch` | Manual run — all platforms |
+| Weekly schedule (Mon 4 AM UTC) | Automated regression detection |
+| PR with `smoke-test` label | On-demand PR validation for bridge changes |
+
+The smoke workflow is **not** a required PR gate. It provides best-effort signal
+on GitHub-hosted runners and reliable signal on self-hosted runners when
+available. macOS smoke tests run with `continue-on-error: true` because the
+macFUSE system extension typically requires a reboot to load on hosted runners.
+
+See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the full strategy
+covering hosted vs self-hosted responsibilities and self-hosted runner contract.
+
+If self-hosted runners are added in the future, they must be documented here,
+in the workflow file comment block, and in
+[docs/smoke-test-strategy.md](smoke-test-strategy.md).
 
 ---
 

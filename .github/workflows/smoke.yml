@@ -1,0 +1,201 @@
+name: Backend Smoke Tests
+
+# ─── Triggers ──────────────────────────────────────────────────────────
+#
+#  Manual dispatch:       always runs all platforms
+#  Weekly schedule:       Monday 4 AM UTC — regression detection
+#  Pull request:          only when the 'smoke-test' label is present
+#
+#  Smoke tests validate real mount/unmount + file I/O through the
+#  platform backends (FUSE, WinFSP). They are separate from the main
+#  rust.yml pipeline because they require kernel drivers and may be
+#  flaky on hosted runners.
+#
+#  See docs/smoke-test-strategy.md for the full strategy rationale.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1" # Monday 4 AM UTC
+  pull_request:
+    types: [labeled, synchronize]
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: "-Dwarnings"
+  STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS: "1"
+
+jobs:
+  # ─── Gate ──────────────────────────────────────────────────────────
+  #
+  # On pull_request events, only run if the 'smoke-test' label is present.
+  # On workflow_dispatch and schedule, always run.
+  should-run:
+    name: Check trigger
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+            if echo "$LABELS" | grep -q 'smoke-test'; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping smoke tests — add the 'smoke-test' label to enable"
+            fi
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─── Linux FUSE ────────────────────────────────────────────────────
+  linux-fuse:
+    name: Linux FUSE Smoke
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify /dev/fuse availability
+        run: |
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse not available on this runner"
+            exit 1
+          fi
+          echo "/dev/fuse is available"
+          ls -la /dev/fuse
+
+      - name: Build FUSE smoke tests
+        run: cargo test -p studiofs-fuse --test mount_sanity --no-run
+
+      - name: Run FUSE smoke tests
+        run: cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
+        timeout-minutes: 5
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-fuse-smoke-logs
+          path: /tmp/studiofs-smoke-*
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ─── macOS FUSE ────────────────────────────────────────────────────
+  #
+  # continue-on-error: macFUSE system extension may not be loadable on
+  # hosted runners. This job provides best-effort signal; reliable
+  # coverage requires a self-hosted runner. See docs/smoke-test-strategy.md.
+  macos-fuse:
+    name: macOS FUSE Smoke
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install macFUSE
+        run: brew install --cask macfuse
+
+      - name: Check macFUSE status
+        run: |
+          if [ -d "/Library/Filesystems/macfuse.fs" ]; then
+            echo "macFUSE filesystem bundle is installed"
+          else
+            echo "::warning::macFUSE filesystem bundle not found"
+          fi
+          # On macOS 11+ the kext may not be loaded without a reboot.
+          # Log the state for debugging.
+          if kextstat 2>/dev/null | grep -qi fuse; then
+            echo "macFUSE kext appears to be loaded"
+          else
+            echo "::warning::macFUSE kext does not appear to be loaded — mount may fail"
+          fi
+
+      - name: Build FUSE smoke tests
+        run: cargo test -p studiofs-fuse --test mount_sanity --no-run
+
+      - name: Run FUSE smoke tests
+        run: cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
+        timeout-minutes: 5
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-fuse-smoke-logs
+          path: /tmp/studiofs-smoke-*
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ─── Windows WinFSP ───────────────────────────────────────────────
+  windows-winfsp:
+    name: Windows WinFSP Smoke
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install WinFSP
+        run: choco install winfsp -y
+
+      - name: Verify WinFSP installation
+        shell: pwsh
+        run: |
+          $dll = "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll"
+          if (Test-Path $dll) {
+            Write-Output "WinFSP DLL found: $dll"
+          } else {
+            Write-Error "WinFSP DLL not found at expected path"
+            exit 1
+          }
+
+      - name: Build WinFSP smoke tests
+        run: cargo test -p studiofs-winfsp --test mount_sanity --no-run
+
+      - name: Run WinFSP smoke tests
+        run: cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1
+        timeout-minutes: 5
+        env:
+          STUDIOFS_WINFSP_TEST_MOUNT_POINT: "Z:"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-winfsp-smoke-logs
+          path: ${{ runner.temp }}\studiofs-smoke-*
+          retention-days: 7
+          if-no-files-found: ignore

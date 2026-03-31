@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use studiofs_data::store::DataStoreConfig;
 use studiofs_fuse::StudioFuseFs;
@@ -111,4 +112,75 @@ fn macos_resource_fork_roundtrip_uses_native_xattr_store() {
         .get_xattr(file.ino, fork_name)
         .expect("get xattr after remove");
     assert_eq!(after_remove, None);
+}
+
+/// Full lifecycle smoke test: mount → write → read → readdir → delete → unmount.
+///
+/// Uses the low-level `fuser::Session` API directly (not `mount_and_serve`)
+/// because the latter calls `std::process::exit(0)` after unmount, which would
+/// kill the test harness.
+///
+/// Mount options intentionally omit `AllowOther` to avoid requiring
+/// `user_allow_other` in `/etc/fuse.conf`, making this runnable on CI hosted
+/// runners that have `/dev/fuse` available.
+#[test]
+#[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn fuse_mount_write_read_unmount_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mount_dir = tempfile::tempdir().expect("mount tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
+    let fs = StudioFuseFs::new(vfs, rt);
+
+    let options = vec![
+        fuser::MountOption::FSName("studiofs-smoke".into()),
+        fuser::MountOption::AutoUnmount,
+    ];
+
+    let mount_path = mount_dir.path().to_path_buf();
+    let mut session = fuser::Session::new(fs, &mount_path, &options).expect("create FUSE session");
+    let mut unmount = session.unmount_callable();
+
+    // Run the FUSE event loop in a background thread.
+    let session_handle = std::thread::spawn(move || {
+        if let Err(e) = session.run() {
+            eprintln!("FUSE session error (may be normal during unmount): {e}");
+        }
+    });
+
+    // Allow time for the mount to become available.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // ── Smoke: create + write ───────────────────────────────────────
+    let test_file = mount_path.join("smoke.txt");
+    let payload = b"StudioFS FUSE smoke-test payload";
+    std::fs::write(&test_file, payload).expect("write through FUSE mount");
+
+    // ── Smoke: read-back ────────────────────────────────────────────
+    let readback = std::fs::read(&test_file).expect("read through FUSE mount");
+    assert_eq!(readback, payload, "read-back must match written data");
+
+    // ── Smoke: directory listing ────────────────────────────────────
+    let entries: Vec<_> = std::fs::read_dir(&mount_path)
+        .expect("readdir through FUSE mount")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        entries.iter().any(|n| n == "smoke.txt"),
+        "directory listing must contain the created file, got: {entries:?}"
+    );
+
+    // ── Smoke: delete ───────────────────────────────────────────────
+    std::fs::remove_file(&test_file).expect("delete through FUSE mount");
+
+    // ── Clean unmount ───────────────────────────────────────────────
+    let _ = unmount.unmount();
+    session_handle
+        .join()
+        .expect("FUSE session thread should exit cleanly");
 }

@@ -122,3 +122,85 @@ fn winfsp_mount_unmount_smoke() {
     let result = handle.join().expect("mount thread panicked");
     result.expect("WinFSP mount/unmount should complete");
 }
+
+/// Full lifecycle smoke test: mount → write → read → readdir → delete → unmount.
+///
+/// Uses `mount_and_serve` in a background thread with a named Win32 event
+/// for external shutdown. File I/O is performed through the drive letter
+/// before signalling the event.
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_write_read_unmount_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP write-read smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
+    let event_name = format!("Local\\StudioFsWriteReadSmoke-{}", std::process::id());
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    // Allow time for WinFSP mount to become available.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Ensure the drive root path ends with a backslash.
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+
+    // ── Smoke: create + write ───────────────────────────────────────
+    let test_file = std::path::PathBuf::from(&drive_root).join("smoke.txt");
+    let payload = b"StudioFS WinFSP smoke-test payload";
+    std::fs::write(&test_file, payload).expect("write through WinFSP mount");
+
+    // ── Smoke: read-back ────────────────────────────────────────────
+    let readback = std::fs::read(&test_file).expect("read through WinFSP mount");
+    assert_eq!(readback, payload, "read-back must match written data");
+
+    // ── Smoke: directory listing ────────────────────────────────────
+    let entries: Vec<_> = std::fs::read_dir(&drive_root)
+        .expect("readdir through WinFSP mount")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        entries.iter().any(|n| n == "smoke.txt"),
+        "directory listing must contain the created file, got: {entries:?}"
+    );
+
+    // ── Smoke: delete ───────────────────────────────────────────────
+    std::fs::remove_file(&test_file).expect("delete through WinFSP mount");
+
+    // ── Clean unmount ───────────────────────────────────────────────
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
