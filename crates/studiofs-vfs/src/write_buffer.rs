@@ -200,6 +200,30 @@ impl StudioVfs {
         self.subtract_pending_write_buffer_bytes(removed_bytes);
     }
 
+    async fn cleanup_uncommitted_block_store_entries(
+        &self,
+        ino: Ino,
+        blocks: &[PersistedWriteBlock],
+        stage: &'static str,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let object_ids: Vec<u64> = blocks.iter().map(|block| block.object_id).collect();
+        if let Err(error) = self
+            .block_store_remove_batch_async(object_ids.clone())
+            .await
+        {
+            warn!(
+                ino,
+                stage,
+                object_count = object_ids.len(),
+                error = %error,
+                "write-buffer cleanup of uncommitted block-store entries failed"
+            );
+        }
+    }
+
     async fn persist_write_buffer_blocks(
         &self,
         ino: Ino,
@@ -258,32 +282,45 @@ impl StudioVfs {
             assign_reserved_object_ids(&mut pending, ino, &mut persisted_blocks, &fresh_object_ids);
         }
 
-        for block in &persisted_blocks {
-            self.block_store_put_async(block.object_id, block.data.clone(), false)
-                .await?;
+        // Data hits BlockStore before metadata so a successful flush/fsync only
+        // returns after local bytes are durable. If any pre-metadata step fails,
+        // remove the cache entries again: the canonical retry source remains the
+        // WriteBuffer snapshot guarded by `reserved_object_id`.
+        let pre_metadata_result: VfsResult<()> = async {
+            for block in &persisted_blocks {
+                self.block_store_put_async(block.object_id, block.data.clone(), false)
+                    .await?;
+            }
+            self.block_store_sync_data_async().await?;
+
+            let entries: Vec<BatchFlushEntry> = persisted_blocks
+                .iter()
+                .map(|block| BatchFlushEntry {
+                    ino,
+                    block_index: block.block_index,
+                    object_id: block.object_id,
+                    length: block.data.len() as u32,
+                    flags: if block.data.len() < self.block_size as usize {
+                        BlockFlags::PARTIAL_BLOCK
+                    } else {
+                        BlockFlags::empty()
+                    },
+                })
+                .collect();
+
+            run_meta(
+                self.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| engine.flush_blocks_batch(&entries),
+            )
+            .await?;
+            Ok(())
         }
-        self.block_store_sync_data_async().await?;
-
-        let entries: Vec<BatchFlushEntry> = persisted_blocks
-            .iter()
-            .map(|block| BatchFlushEntry {
-                ino,
-                block_index: block.block_index,
-                object_id: block.object_id,
-                length: block.data.len() as u32,
-                flags: if block.data.len() < self.block_size as usize {
-                    BlockFlags::PARTIAL_BLOCK
-                } else {
-                    BlockFlags::empty()
-                },
-            })
-            .collect();
-
-        run_meta(
-            self.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.flush_blocks_batch(&entries),
-        )
-        .await?;
+        .await;
+        if let Err(error) = pre_metadata_result {
+            self.cleanup_uncommitted_block_store_entries(ino, &persisted_blocks, "pre-metadata")
+                .await;
+            return Err(error);
+        }
 
         let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
             .iter()
@@ -373,6 +410,10 @@ impl StudioVfs {
     }
 
     fn snapshot_dirty_write_buffer_blocks(&self, ino: Ino) -> Vec<(u32, Bytes)> {
+        // This is a point-in-time view of the inode's dirty overlay. Writers
+        // may race ahead and mutate the same block after the snapshot is taken;
+        // commit then intentionally leaves the newer RAM bytes dirty so a later
+        // flush retries with the fresh contents instead of dropping them.
         let mut blocks: Vec<_> = self
             .state
             .write_buffer
@@ -617,7 +658,7 @@ impl StudioVfs {
             let persisted_blocks = self
                 .persist_write_buffer_blocks(
                     ino,
-                    full_blocks.clone(),
+                    full_blocks,
                     content_epoch,
                     attr_to_persist,
                     false,
@@ -651,13 +692,7 @@ impl StudioVfs {
         };
         let attr_to_clear = dirty_attr.clone();
         let persisted_blocks = self
-            .persist_write_buffer_blocks(
-                ino,
-                blocks_to_buffer.clone(),
-                content_epoch,
-                dirty_attr,
-                true,
-            )
+            .persist_write_buffer_blocks(ino, blocks_to_buffer, content_epoch, dirty_attr, true)
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
