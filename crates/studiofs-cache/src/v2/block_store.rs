@@ -389,9 +389,7 @@ impl BlockStore {
             entries.remove(&object_id)
         };
         if let Some(entry) = entry {
-            self.allocator
-                .lock()
-                .free(entry.offset, entry.alloc_size);
+            self.allocator.lock().free(entry.offset, entry.alloc_size);
             self.block_count.fetch_sub(1, Ordering::Relaxed);
             if entry.flags & format::FLAG_DIRTY != 0 {
                 self.dirty_count.fetch_sub(1, Ordering::Relaxed);
