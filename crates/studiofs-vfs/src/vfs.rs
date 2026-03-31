@@ -77,8 +77,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::ingress_wal::{
-    INITIAL_INGRESS_SEGMENT_ID, IngressLiveIndex, IngressWal, RecoveredSpillMap,
-    latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta, recover_spill_dir,
+    IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
     reset_ingress_artifacts_for_fast_mode, scan_ingress_artifacts,
 };
 
@@ -2875,7 +2874,7 @@ fn run_sync_with_timeout<T: Send + 'static>(
     }
 }
 
-type IngressRecoveryInit = (RecoveredSpillMap, usize, u64, u64, Option<(u64, u64, u64)>);
+type IngressRecoveryInit = Option<(u64, u64, u64)>;
 
 fn init_ingress_recovery_state(
     cache_safety_mode: CacheSafetyMode,
@@ -2886,12 +2885,6 @@ fn init_ingress_recovery_state(
             ingress_wal.checkpoint_dir(),
             ingress_wal.segment_dir(),
         )?;
-        let (
-            recovered_spill,
-            recovered_spill_bytes,
-            recovered_spill_seq,
-            active_ingress_segment_id,
-        ) = recover_spill_dir(ingress_wal.spill_dir())?;
         let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
             let checkpoint_path = latest_ingress_checkpoint_path(ingress_wal.checkpoint_dir());
             let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
@@ -2906,13 +2899,7 @@ fn init_ingress_recovery_state(
                 checkpoint.covered_offset,
             )
         });
-        return Ok((
-            recovered_spill,
-            recovered_spill_bytes,
-            recovered_spill_seq,
-            active_ingress_segment_id,
-            initial_checkpoint_meta,
-        ));
+        return Ok(initial_checkpoint_meta);
     }
 
     let (segment_count, checkpoint_count, state_present) =
@@ -2927,13 +2914,7 @@ fn init_ingress_recovery_state(
         );
     }
     reset_ingress_artifacts_for_fast_mode(ingress_wal.spill_dir())?;
-    Ok((
-        RecoveredSpillMap::new(),
-        0,
-        1,
-        INITIAL_INGRESS_SEGMENT_ID,
-        None,
-    ))
+    Ok(None)
 }
 
 // =============================================================================
@@ -2941,7 +2922,6 @@ fn init_ingress_recovery_state(
 // =============================================================================
 
 struct IngressState {
-    ingress_live: Mutex<IngressLiveIndex>,
     ingress_append_stats: IoStats,
     ingress_checkpoint_persists: AtomicU64,
     ingress_checkpoint_failures: AtomicU64,
@@ -2953,13 +2933,8 @@ struct IngressState {
 }
 
 impl IngressState {
-    fn new(
-        recovered_spill: RecoveredSpillMap,
-        _recovered_spill_bytes: usize,
-        initial_checkpoint_meta: Option<(u64, u64, u64)>,
-    ) -> Self {
+    fn new(initial_checkpoint_meta: Option<(u64, u64, u64)>) -> Self {
         Self {
-            ingress_live: Mutex::new(IngressLiveIndex::from_entries(recovered_spill)),
             ingress_append_stats: IoStats::default(),
             ingress_checkpoint_persists: AtomicU64::new(0),
             ingress_checkpoint_failures: AtomicU64::new(0),
@@ -3356,20 +3331,12 @@ impl MetricsState {
 
 impl VfsState {
     fn new(
-        recovered_spill: RecoveredSpillMap,
-        recovered_spill_bytes: usize,
-        _active_segment_id: u64,
-        _recovered_spill_seq: u64,
         initial_checkpoint_meta: Option<(u64, u64, u64)>,
         block_size: u32,
         cfg: &VfsConfig,
     ) -> Self {
         Self {
-            ingress: IngressState::new(
-                recovered_spill,
-                recovered_spill_bytes,
-                initial_checkpoint_meta,
-            ),
+            ingress: IngressState::new(initial_checkpoint_meta),
             upload: UploadState::new(
                 derive_upload_cache_io_foreground_cost_base(cfg.upload_cache_io_slots),
                 block_size,
@@ -4329,13 +4296,8 @@ impl StudioVfs {
             std::fs::create_dir_all(ingress_wal.segment_dir()).map_err(VfsError::Io)?;
             std::fs::create_dir_all(ingress_wal.checkpoint_dir()).map_err(VfsError::Io)?;
             let acl_principal = config.principal.clone();
-            let (
-                recovered_spill,
-                recovered_spill_bytes,
-                recovered_spill_seq,
-                active_ingress_segment_id,
-                initial_checkpoint_meta,
-            ) = init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
+            let initial_checkpoint_meta =
+                init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
             let block_store = Arc::new(
                 BlockStore::open(BlockStoreConfig {
@@ -4557,15 +4519,7 @@ impl StudioVfs {
                 data_prefix,
                 acl_principal,
                 effective_acl_cache_capacity,
-                state: Arc::new(VfsState::new(
-                    recovered_spill,
-                    recovered_spill_bytes,
-                    active_ingress_segment_id,
-                    recovered_spill_seq,
-                    initial_checkpoint_meta,
-                    block_size,
-                    &config,
-                )),
+                state: Arc::new(VfsState::new(initial_checkpoint_meta, block_size, &config)),
                 upload_scheduler,
                 upload_delay,
                 upload_requeue_base,
@@ -11273,7 +11227,6 @@ impl StudioVfs {
             "VFS shutdown: write buffer drain complete"
         );
 
-        *self.state.ingress.ingress_live.lock() = IngressLiveIndex::default();
         if let Err(e) = reset_ingress_artifacts_for_fast_mode(self.ingress_wal.spill_dir()) {
             warn!(
                 "VFS shutdown: failed to remove legacy ingress artifacts: {}",

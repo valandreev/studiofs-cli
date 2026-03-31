@@ -1,21 +1,32 @@
 use crate::vfs::{VfsError, VfsResult};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::Ino;
 
+#[cfg(test)]
+use bytes::Bytes;
+#[cfg(test)]
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::convert::TryFrom;
+#[cfg(test)]
+use std::io::{Read, Seek, SeekFrom, Write};
+
+#[cfg(test)]
 pub(crate) const INITIAL_INGRESS_SEGMENT_ID: u64 = 1;
+#[cfg(test)]
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
+#[cfg(test)]
 const INGRESS_STATE_MAGIC: [u8; 4] = *b"IWS1";
 const INGRESS_CHECKPOINT_MAGIC: [u8; 4] = *b"IWC1";
+#[cfg(test)]
 const INGRESS_RECORD_PUT: u8 = 1;
+#[cfg(test)]
 const INGRESS_RECORD_INVALIDATE: u8 = 2;
+#[cfg(test)]
 const INGRESS_RECORD_HEADER_LEN: usize = 37;
 
+#[cfg(test)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IngressRecordKind {
@@ -23,6 +34,7 @@ pub(crate) enum IngressRecordKind {
     Invalidate = INGRESS_RECORD_INVALIDATE,
 }
 
+#[cfg(test)]
 impl TryFrom<u8> for IngressRecordKind {
     type Error = VfsError;
 
@@ -37,12 +49,14 @@ impl TryFrom<u8> for IngressRecordKind {
     }
 }
 
+#[cfg(test)]
 impl IngressRecordKind {
     fn as_byte(self) -> u8 {
         self as u8
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct SpillEntry {
     pub(crate) seq: u64,
@@ -53,6 +67,7 @@ pub(crate) struct SpillEntry {
     pub(crate) created_unix_ms: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct IngressLiveIndex {
     entries: HashMap<(Ino, u32), SpillEntry>,
@@ -60,33 +75,10 @@ pub(crate) struct IngressLiveIndex {
     live_segment_counts: HashMap<u64, usize>,
 }
 
+#[cfg(test)]
 impl IngressLiveIndex {
-    pub(crate) fn from_entries(entries: HashMap<(Ino, u32), SpillEntry>) -> Self {
-        let mut by_ino_counts = HashMap::new();
-        let mut live_segment_counts = HashMap::new();
-        for (ino, _) in entries.keys() {
-            *by_ino_counts.entry(*ino).or_insert(0) += 1;
-        }
-        for entry in entries.values() {
-            *live_segment_counts.entry(entry.segment_id).or_insert(0) += 1;
-        }
-        Self {
-            entries,
-            by_ino_counts,
-            live_segment_counts,
-        }
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub(crate) fn get_cloned(&self, key: &(Ino, u32)) -> Option<SpillEntry> {
-        self.entries.get(key).cloned()
     }
 
     pub(crate) fn insert(&mut self, key: (Ino, u32), entry: SpillEntry) -> Option<SpillEntry> {
@@ -119,10 +111,6 @@ impl IngressLiveIndex {
         removed
     }
 
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &(Ino, u32)> {
-        self.entries.keys()
-    }
-
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&(Ino, u32), &SpillEntry)> {
         self.entries.iter()
     }
@@ -151,24 +139,14 @@ pub(crate) struct IngressWal {
     spill_dir: PathBuf,
     segment_dir: PathBuf,
     checkpoint_dir: PathBuf,
-    max_segment_bytes: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AppendOutcome {
-    pub(crate) offset: u64,
-    pub(crate) segment_id: u64,
-    pub(crate) path: PathBuf,
-    pub(crate) record_bytes: u64,
 }
 
 impl IngressWal {
-    pub(crate) fn new(spill_dir: PathBuf, max_segment_bytes: u64) -> Self {
+    pub(crate) fn new(spill_dir: PathBuf, _max_segment_bytes: u64) -> Self {
         Self {
             segment_dir: spill_dir.join("segments"),
             checkpoint_dir: spill_dir.join("checkpoints"),
             spill_dir,
-            max_segment_bytes,
         }
     }
 
@@ -182,46 +160,6 @@ impl IngressWal {
 
     pub(crate) fn checkpoint_dir(&self) -> &Path {
         &self.checkpoint_dir
-    }
-
-    pub(crate) fn max_segment_bytes(&self) -> u64 {
-        self.max_segment_bytes
-    }
-
-    pub(crate) fn append(
-        &self,
-        active_segment_id: &AtomicU64,
-        key: (Ino, u32),
-        seq: u64,
-        created_unix_ms: u64,
-        kind: IngressRecordKind,
-        payload: &[u8],
-    ) -> VfsResult<AppendOutcome> {
-        let record_bytes = INGRESS_RECORD_HEADER_LEN as u64 + payload.len() as u64;
-        let mut segment_id = active_segment_id.load(Ordering::Relaxed);
-        let active_path = active_ingress_segment_path(self.segment_dir(), segment_id);
-        let active_len = std::fs::metadata(&active_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        if active_len > 0 && active_len.saturating_add(record_bytes) > self.max_segment_bytes() {
-            segment_id = segment_id.saturating_add(1);
-            active_segment_id.store(segment_id, Ordering::Relaxed);
-        }
-        let offset = append_ingress_record(
-            self.segment_dir(),
-            segment_id,
-            key,
-            seq,
-            created_unix_ms,
-            kind,
-            payload,
-        )?;
-        Ok(AppendOutcome {
-            offset,
-            segment_id,
-            path: ingress_segment_path(self.segment_dir(), segment_id),
-            record_bytes,
-        })
     }
 }
 
@@ -251,6 +189,7 @@ pub(crate) struct IngressCheckpointMeta {
     pub(crate) covered_offset: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IngressStateFile {
     version: u32,
@@ -258,10 +197,14 @@ struct IngressStateFile {
     next_seq: u64,
 }
 
+#[cfg(test)]
 type RecoveredIngressMap = HashMap<(Ino, u32), SpillEntry>;
+#[cfg(test)]
 pub(crate) type RecoveredSpillMap = HashMap<(Ino, u32), SpillEntry>;
+#[cfg(test)]
 pub(crate) type RecoveredSpillState = (RecoveredSpillMap, usize, u64, u64);
 
+#[cfg(test)]
 pub(crate) fn read_ingress_entry_bytes(entry: &SpillEntry) -> VfsResult<Bytes> {
     let mut file = std::fs::File::open(&entry.path)?;
     file.seek(SeekFrom::Start(entry.offset))?;
@@ -294,6 +237,7 @@ pub(crate) fn list_ingress_segment_files(segment_dir: &Path) -> VfsResult<Vec<(u
     Ok(files)
 }
 
+#[cfg(test)]
 pub(crate) fn current_active_ingress_segment_id(segment_dir: &Path) -> VfsResult<u64> {
     let files = list_ingress_segment_files(segment_dir)?;
     Ok(files
@@ -302,6 +246,7 @@ pub(crate) fn current_active_ingress_segment_id(segment_dir: &Path) -> VfsResult
         .unwrap_or(INITIAL_INGRESS_SEGMENT_ID))
 }
 
+#[cfg(test)]
 pub(crate) fn active_ingress_segment_path(dir: &Path, active_segment_id: u64) -> PathBuf {
     ingress_segment_path(dir, active_segment_id)
 }
@@ -365,6 +310,7 @@ pub(crate) fn load_latest_ingress_checkpoint_meta(
     }))
 }
 
+#[cfg(test)]
 fn load_ingress_state(spill_dir: &Path) -> VfsResult<Option<IngressStateFile>> {
     let path = ingress_state_path(spill_dir);
     let bytes = match std::fs::read(&path) {
@@ -388,6 +334,7 @@ fn load_ingress_state(spill_dir: &Path) -> VfsResult<Option<IngressStateFile>> {
     Ok(Some(state))
 }
 
+#[cfg(test)]
 pub(crate) fn write_ingress_state(
     spill_dir: &Path,
     active_segment_id: u64,
@@ -410,6 +357,7 @@ pub(crate) fn write_ingress_state(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_ingress_checkpoint(
     checkpoint_dir: &Path,
     ingress_live: &IngressLiveIndex,
@@ -465,6 +413,7 @@ pub(crate) fn write_ingress_checkpoint(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn append_ingress_record(
     segment_dir: &Path,
     segment_id: u64,
@@ -501,6 +450,7 @@ pub(crate) fn append_ingress_record(
     Ok(start + INGRESS_RECORD_HEADER_LEN as u64)
 }
 
+#[cfg(test)]
 fn replay_ingress_segment_records(
     segment_dir: &Path,
     recovered: &mut RecoveredIngressMap,
@@ -604,6 +554,7 @@ fn recover_ingress_segment_records(segment_dir: &Path) -> VfsResult<(RecoveredIn
     Ok((recovered, next_seq))
 }
 
+#[cfg(test)]
 pub(crate) fn recover_spill_dir(spill_dir: &Path) -> VfsResult<RecoveredSpillState> {
     let segment_dir = spill_dir.join("segments");
     let checkpoint_dir = spill_dir.join("checkpoints");
