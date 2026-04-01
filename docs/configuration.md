@@ -233,7 +233,6 @@ studiofs test-cache \
   [--warmup-runs <u32>] \
   [--access-pattern <sequential|random|mixed>] \
   [--l1-limit <e.g. 2GB>] \
-  [--shim-limit <e.g. 100GB>] \
   [--profile[=pyroscope]]
 ```
 
@@ -249,7 +248,6 @@ Defaults:
 - `--warmup-runs 0`
 - `--access-pattern sequential`
 - `--l1-limit 2GB`
-- `--shim-limit 100GB`
 - `--profile` disabled by default
 - `--profile=pyroscope` enables Pyroscope sampling; `--profile` without a
   value is accepted as shorthand for the same mode
@@ -284,7 +282,7 @@ Notes:
 - JSON report includes `advanced_metrics`:
   - `size_class_boundaries` (`small_max_bytes`, `medium_max_bytes`)
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
-  - direct-shim only: `cache_levels` with L1/shim hits, misses, bytes served, and per-level latency histograms
+  - direct-shim only: `cache_levels` with L1 hits, misses, bytes served, and lookup latency histograms
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
   `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
   `post-upload-read` rows plus the pending-upload observations used to gate

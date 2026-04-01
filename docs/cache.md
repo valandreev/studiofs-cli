@@ -399,8 +399,8 @@ running `studiofs test-cache ... --profile=pyroscope`.
   (`small_max_bytes`, `medium_max_bytes`)
 - `size_class_stats`: write/read throughput and latency percentiles (p50/p95/p99)
   for `small`, `medium`, and `large`
-- `cache_levels` (direct-shim mode): L1/shim hit and miss counters, bytes served
-  from each level, and per-level lookup latency percentiles + histogram
+- `cache_levels` (direct-shim mode): L1 hit and miss counters, bytes served
+  from L1, and L1 lookup latency percentiles + histogram
 - `upload_queue`: depth and lifecycle counters
 
 ## Pyroscope Profiling

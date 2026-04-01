@@ -80,12 +80,15 @@ impl L1State {
     }
 
     fn insert(&mut self, object_id: ObjectId, data: Bytes, max_bytes: u64) -> u64 {
+        let is_new = !self.by_object.contains_key(&object_id);
         if let Some(previous) = self.by_object.remove(&object_id) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.len() as u64);
         }
         self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
         self.by_object.insert(object_id, data);
-        self.insertion_order.push_back(object_id);
+        if is_new {
+            self.insertion_order.push_back(object_id);
+        }
         self.evict_to_limit(max_bytes)
     }
 
@@ -202,7 +205,7 @@ impl BlockCache {
                 CacheReadTrace {
                     level: CacheReadLevel::Miss,
                     l1_lookup_latency: l1_latency,
-                    shim_lookup_latency: Some(Duration::ZERO),
+                    shim_lookup_latency: None,
                 },
             ),
         }

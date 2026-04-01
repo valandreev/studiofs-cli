@@ -36,7 +36,6 @@ const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
 const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
-const DEFAULT_DIRECT_SHIM_LIMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -62,7 +61,6 @@ struct TestCacheParams {
     sizes: WorkloadSizeInput,
     access_pattern: TestCacheAccessPattern,
     l1_limit: u64,
-    shim_limit: u64,
     profile: bool,
     run_id: String,
 }
@@ -175,7 +173,6 @@ struct BenchmarkReport {
     workload_large_files: usize,
     access_pattern: String,
     l1_limit: u64,
-    shim_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     work_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,7 +255,6 @@ struct SizeClassOpReport {
 #[derive(Debug, Serialize)]
 struct CacheLevelsReport {
     l1: CacheLevelReport,
-    shim: CacheLevelReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -698,10 +694,6 @@ struct CacheLevelTelemetryAccumulator {
     l1_misses: u64,
     l1_bytes_served: u64,
     l1_lookup_latency: LatencySamples,
-    shim_hits: u64,
-    shim_misses: u64,
-    shim_bytes_served: u64,
-    shim_lookup_latency: LatencySamples,
 }
 
 impl CacheLevelTelemetryAccumulator {
@@ -715,19 +707,8 @@ impl CacheLevelTelemetryAccumulator {
         }
     }
 
-    fn record_shim(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
-        self.shim_lookup_latency.record(elapsed, bytes_served);
-        if hit {
-            self.shim_hits = self.shim_hits.saturating_add(1);
-            self.shim_bytes_served = self.shim_bytes_served.saturating_add(bytes_served);
-        } else {
-            self.shim_misses = self.shim_misses.saturating_add(1);
-        }
-    }
-
     fn to_report(&self, wall_elapsed_ms: f64) -> CacheLevelsReport {
         let l1_report = self.l1_lookup_latency.to_report(wall_elapsed_ms);
-        let shim_report = self.shim_lookup_latency.to_report(wall_elapsed_ms);
         CacheLevelsReport {
             l1: CacheLevelReport {
                 hits: self.l1_hits,
@@ -740,17 +721,6 @@ impl CacheLevelTelemetryAccumulator {
                 p99_ms: l1_report.p99_ms,
                 latency_histogram: self.l1_lookup_latency.to_histogram_report(),
             },
-            shim: CacheLevelReport {
-                hits: self.shim_hits,
-                misses: self.shim_misses,
-                bytes_served: self.shim_bytes_served,
-                throughput_bytes_per_sec: shim_report.throughput_bytes_per_sec,
-                avg_latency_ms: shim_report.avg_latency_ms,
-                p50_ms: shim_report.p50_ms,
-                p95_ms: shim_report.p95_ms,
-                p99_ms: shim_report.p99_ms,
-                latency_histogram: self.shim_lookup_latency.to_histogram_report(),
-            },
         }
     }
 
@@ -760,13 +730,6 @@ impl CacheLevelTelemetryAccumulator {
         self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
         self.l1_lookup_latency
             .merge_from_ref(&other.l1_lookup_latency);
-        self.shim_hits = self.shim_hits.saturating_add(other.shim_hits);
-        self.shim_misses = self.shim_misses.saturating_add(other.shim_misses);
-        self.shim_bytes_served = self
-            .shim_bytes_served
-            .saturating_add(other.shim_bytes_served);
-        self.shim_lookup_latency
-            .merge_from_ref(&other.shim_lookup_latency);
     }
 }
 
@@ -1445,9 +1408,6 @@ async fn run_shim_reads(
                     }
                     CacheReadLevel::Miss => {
                         s.cache_levels.record_l1(false, trace.l1_lookup_latency, 0);
-                        if let Some(shim_latency) = trace.shim_lookup_latency {
-                            s.cache_levels.record_shim(false, shim_latency, 0);
-                        }
                     }
                 }
             }
@@ -1591,9 +1551,6 @@ async fn run_shim_reads_sequential_streams(
                         telemetry
                             .cache_levels
                             .record_l1(false, trace.l1_lookup_latency, 0);
-                        if let Some(shim_latency) = trace.shim_lookup_latency {
-                            telemetry.cache_levels.record_shim(false, shim_latency, 0);
-                        }
                     }
                 }
             }
@@ -2319,7 +2276,6 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         workload_large_files: workload.large_files,
         access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
         l1_limit: params.l1_limit,
-        shim_limit: params.shim_limit,
         volume: None,
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),
@@ -2596,7 +2552,6 @@ async fn run_mounted_end_to_end(
             workload_large_files: workload.large_files,
             access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
             l1_limit: params.l1_limit,
-            shim_limit: params.shim_limit,
             work_root: Some(work_root.display().to_string()),
             volume: Some(volume.to_string()),
             mount_point: Some(mount_point.display().to_string()),
@@ -2889,12 +2844,7 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
             format_bytes(advanced.size_class_boundaries.medium_max_bytes),
         );
     }
-    let _ = writeln!(
-        &mut out,
-        "Limits:    L1 {}, shim {}",
-        format_bytes(report.l1_limit),
-        format_bytes(report.shim_limit),
-    );
+    let _ = writeln!(&mut out, "Limits:    L1 {}", format_bytes(report.l1_limit),);
     if report.l1_bytes.is_some() {
         let _ = writeln!(
             &mut out,
@@ -3043,28 +2993,16 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
 
         if let Some(levels) = &advanced.cache_levels {
             let _ = writeln!(&mut out, "Cache levels");
-            let level_rows = vec![
-                vec![
-                    "L1".to_string(),
-                    levels.l1.hits.to_string(),
-                    levels.l1.misses.to_string(),
-                    format_bytes(levels.l1.bytes_served),
-                    format_throughput(levels.l1.throughput_bytes_per_sec),
-                    format_duration_ms(levels.l1.p50_ms),
-                    format_duration_ms(levels.l1.p95_ms),
-                    format_duration_ms(levels.l1.p99_ms),
-                ],
-                vec![
-                    "Shim".to_string(),
-                    levels.shim.hits.to_string(),
-                    levels.shim.misses.to_string(),
-                    format_bytes(levels.shim.bytes_served),
-                    format_throughput(levels.shim.throughput_bytes_per_sec),
-                    format_duration_ms(levels.shim.p50_ms),
-                    format_duration_ms(levels.shim.p95_ms),
-                    format_duration_ms(levels.shim.p99_ms),
-                ],
-            ];
+            let level_rows = vec![vec![
+                "L1".to_string(),
+                levels.l1.hits.to_string(),
+                levels.l1.misses.to_string(),
+                format_bytes(levels.l1.bytes_served),
+                format_throughput(levels.l1.throughput_bytes_per_sec),
+                format_duration_ms(levels.l1.p50_ms),
+                format_duration_ms(levels.l1.p95_ms),
+                format_duration_ms(levels.l1.p99_ms),
+            ]];
             let _ = write!(
                 &mut out,
                 "{}",
@@ -3319,7 +3257,6 @@ pub fn run(
     sizes: Option<String>,
     access_pattern: TestCacheAccessPattern,
     l1_limit: Option<String>,
-    shim_limit: Option<String>,
     profile: Option<TestCacheProfileMode>,
     json_output: Option<PathBuf>,
 ) -> Result<()> {
@@ -3337,7 +3274,6 @@ pub fn run(
     )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_L1_SIZE.to_string();
-    let shim_limit_default = DEFAULT_DIRECT_SHIM_LIMIT_BYTES.to_string();
     let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
     let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(
@@ -3349,10 +3285,6 @@ pub fn run(
     )?
     .max(1);
     let l1_limit = parse_size_arg("l1-limit", l1_limit.as_deref().unwrap_or(&l1_limit_default))?;
-    let shim_limit = parse_size_arg(
-        "shim-limit",
-        shim_limit.as_deref().unwrap_or(&shim_limit_default),
-    )?;
     let size_class_small_max = parse_size_arg(
         "small-max",
         small_max
@@ -3369,8 +3301,8 @@ pub fn run(
     )?;
     let sizes = parse_sizes_arg(sizes.as_deref())?;
 
-    if l1_limit < 1 || shim_limit < 1 {
-        return Err(anyhow!("cache limits must be > 0"));
+    if l1_limit < 1 {
+        return Err(anyhow!("cache limit must be > 0"));
     }
     if size_class_small_max == 0 {
         return Err(anyhow!("--small-max must be > 0"));
@@ -3409,7 +3341,6 @@ pub fn run(
         sizes,
         access_pattern,
         l1_limit,
-        shim_limit,
         profile: profile.is_some(),
         run_id: run_id.clone(),
     };
@@ -3508,7 +3439,6 @@ mod tests {
             workload_large_files: WORKLOAD_FILES_PER_TIER,
             access_pattern: "sequential".to_string(),
             l1_limit: 2 * 1024 * 1024 * 1024,
-            shim_limit: 100 * 1024 * 1024 * 1024,
             work_root: None,
             volume: None,
             mount_point: None,
@@ -3704,20 +3634,6 @@ mod tests {
                         latency_histogram: LatencyHistogramReport {
                             bucket_upper_bounds_ns: vec![50_000, 100_000],
                             bucket_counts: vec![3, 6, 7],
-                        },
-                    },
-                    shim: CacheLevelReport {
-                        hits: 7,
-                        misses: 0,
-                        bytes_served: 56 * 1024 * 1024,
-                        throughput_bytes_per_sec: 602.0 * 1024.0 * 1024.0,
-                        avg_latency_ms: 4.8,
-                        p50_ms: 4.4,
-                        p95_ms: 7.9,
-                        p99_ms: 8.4,
-                        latency_histogram: LatencyHistogramReport {
-                            bucket_upper_bounds_ns: vec![50_000, 100_000],
-                            bucket_counts: vec![0, 1, 6],
                         },
                     },
                 }),

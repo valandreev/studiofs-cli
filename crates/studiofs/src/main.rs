@@ -202,7 +202,6 @@ ENV TUNING:
   STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
   STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
   STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background local write-buffer drain wake interval (default: 10).
-  STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background local write-buffer drain (default: 0).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
   STUDIOFS_MAX_DRAIN_BATCH          Max dirty WriteBuffer blocks persisted per drain cycle (default: 1024).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Legacy durable-ingress segment rotation size (default: 256MiB).
@@ -635,10 +634,6 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         l1_limit: Option<String>,
 
-        /// On-disk shim cache limit (e.g. 100GB).
-        #[arg(long)]
-        shim_limit: Option<String>,
-
         /// JSON report output path. Defaults to an auto-named file in the
         /// current working directory.
         #[arg(long)]
@@ -820,7 +815,6 @@ fn main() -> anyhow::Result<()> {
             sizes,
             access_pattern,
             l1_limit,
-            shim_limit,
             json_output,
             profile,
         } => {
@@ -837,7 +831,6 @@ fn main() -> anyhow::Result<()> {
                 sizes,
                 access_pattern,
                 l1_limit,
-                shim_limit,
                 profile,
                 json_output,
             )?;
@@ -1159,7 +1152,6 @@ mod tests {
                 medium_max,
                 access_pattern,
                 l1_limit,
-                shim_limit,
                 json_output,
                 profile,
                 ..
@@ -1179,7 +1171,6 @@ mod tests {
                     cli::test_cache::TestCacheAccessPattern::Sequential
                 ));
                 assert!(l1_limit.is_none());
-                assert!(shim_limit.is_none());
                 assert!(json_output.is_none());
                 assert!(profile.is_none());
             }
@@ -1213,8 +1204,6 @@ mod tests {
             "random",
             "--l1-limit",
             "4GB",
-            "--shim-limit",
-            "1TB",
             "--json-output",
             "reports/cache-run.json",
             "--profile=pyroscope",
@@ -1235,7 +1224,6 @@ mod tests {
                 warmup_runs,
                 sizes,
                 l1_limit,
-                shim_limit,
                 json_output,
                 profile,
                 ..
@@ -1255,7 +1243,6 @@ mod tests {
                 assert_eq!(warmup_runs, 2);
                 assert_eq!(sizes.unwrap(), "small=60,medium=30,large=10");
                 assert_eq!(l1_limit.unwrap(), "4GB");
-                assert_eq!(shim_limit.unwrap(), "1TB");
                 assert_eq!(
                     json_output.unwrap(),
                     PathBuf::from("reports/cache-run.json")

@@ -162,7 +162,6 @@ studiofs test-cache \
   --warmup-runs 2 \
   --access-pattern mixed \
   --l1-limit 2GB \
-  --shim-limit 100GB \
   --profile=pyroscope
 ```
 
@@ -206,9 +205,8 @@ Notes:
   - `materialize_batches` batch size/duration/concurrency metrics
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
-- `direct-shim` `advanced_metrics.cache_levels` adds explicit L1/shim hit/miss
-  counters, bytes served from each level, and per-level lookup latency
-  distributions.
+- `direct-shim` `advanced_metrics.cache_levels` reports L1 hit/miss counters,
+  bytes served from L1, and L1 lookup latency distributions.
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
   `buffered_read_comparison`, which records `baseline-read`,
   `during-upload-read`, and `post-upload-read` phases plus the pending-upload
