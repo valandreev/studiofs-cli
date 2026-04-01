@@ -292,9 +292,12 @@ impl StudioVfs {
         let attr_after_commit = attr_for_meta.clone();
 
         let pre_metadata_result: VfsResult<()> = async {
-            for block in &persisted_blocks {
+            let put_results = futures::future::join_all(persisted_blocks.iter().map(|block| {
                 self.block_store_put_async(block.object_id, block.data.clone(), false)
-                    .await?;
+            }))
+            .await;
+            for result in put_results {
+                result?;
             }
             self.block_store_sync_data_async().await?;
 
