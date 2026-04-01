@@ -551,6 +551,10 @@ impl StudioVfs {
         let initial_attr = self.getattr_async(ino).await?;
         let current_size = initial_attr.size;
         self.refresh_inode_incarnation_state_from_attr(ino, &initial_attr);
+        // Keep ingress policy consistent with `ingress_pressure_for`: allow
+        // the first dirty payload to land in RAM; start backpressure only when
+        // dirty state already existed before this write.
+        let pending_before_write = self.total_pending_write_buffer_bytes();
         let mut written = 0u64;
         let mut remaining = data.len();
         let mut current_offset = offset;
@@ -663,7 +667,10 @@ impl StudioVfs {
             }
         }
 
-        if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
+        let pending_after_write = self.total_pending_write_buffer_bytes();
+        if pending_before_write > 0
+            && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
+        {
             self.apply_write_buffer_backpressure(ino).await?;
         }
 

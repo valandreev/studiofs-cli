@@ -4,6 +4,8 @@ use crate::cli::utils::format_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use studiofs_cache::v2::format::{SUPERBLOCK_SIZE, Superblock};
+use studiofs_cache::v2::platform;
 use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
 use studiofs_meta::counters;
 use uuid::Uuid;
@@ -159,14 +161,31 @@ fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
         .into_bytes()
 }
 
-fn scan_pending_uploads(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<usize> {
-    if !cache_dir.join("blocks.data").exists() {
-        return Ok(0);
+fn read_block_store_max_size(cache_dir: &Path) -> anyhow::Result<Option<u64>> {
+    let data_path = cache_dir.join("blocks.data");
+    if !data_path.exists() {
+        return Ok(None);
     }
+
+    let file = std::fs::OpenOptions::new().read(true).open(data_path)?;
+    if file.metadata()?.len() < SUPERBLOCK_SIZE {
+        return Ok(None);
+    }
+
+    let mut sb_buf = [0u8; SUPERBLOCK_SIZE as usize];
+    platform::pread(&file, &mut sb_buf, 0)?;
+    let sb = Superblock::from_bytes(&sb_buf)?;
+    Ok(Some(sb.max_size))
+}
+
+fn scan_pending_uploads(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<usize> {
+    let Some(max_size) = read_block_store_max_size(cache_dir)? else {
+        return Ok(0);
+    };
 
     let store = BlockStore::open(BlockStoreConfig {
         cache_dir: cache_dir.to_path_buf(),
-        max_size: u64::MAX,
+        max_size,
         volume_uuid: derive_block_store_volume_uuid(volume_uuid),
     })?;
     Ok(store.dirty_count() as usize)

@@ -2095,7 +2095,7 @@ fn test_crash_recovery_replays_pending_journal() {
         .into_bytes();
     let pending_count = BlockStore::open(BlockStoreConfig {
         cache_dir: cache_dir.clone(),
-        max_size: u64::MAX,
+        max_size: 1024 * 1024 * 1024,
         volume_uuid,
     })
     .unwrap()
@@ -2150,7 +2150,7 @@ fn test_crash_recovery_replays_pending_journal() {
     thread::sleep(Duration::from_millis(500));
     let pending_after = BlockStore::open(BlockStoreConfig {
         cache_dir: cache_dir.clone(),
-        max_size: u64::MAX,
+        max_size: 1024 * 1024 * 1024,
         volume_uuid,
     })
     .unwrap()
