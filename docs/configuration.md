@@ -400,7 +400,6 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
 | `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
-| `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | Legacy ingress-artifact budget retained for startup compatibility; new foreground writes do not spill into ingress |
 | `STUDIOFS_XATTR_MAX_BYTES` | `4MB` | Maximum bytes per xattr value when writing metadata (enforced in VFS before metadata persistence) |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
 | `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
@@ -465,8 +464,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
-| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` disables background drain) |
-| `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background local write-buffer drain |
+| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` is ignored) |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
 | `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from initial L1 cache budget; dynamically resized by MemoryEnvelope` | Global transit-memory credit budget for active in-flight fetch/upload buffers (managed by adaptive envelope) |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |

@@ -17,7 +17,7 @@ Holds all runtime state:
 | `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
-| `block_cache` | `Arc<BlockCache>` | Compatibility cache helpers, promotion, and upload-queue plumbing |
+| `block_cache` | `Arc<BlockCache>` | Cache-v2 compatibility shim: upload-queue orchestration and lightweight hot payload staging |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |

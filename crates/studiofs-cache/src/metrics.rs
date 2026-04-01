@@ -495,7 +495,37 @@ impl CachePipelineMetrics {
             materialize_batches: self.materialize_batches.snapshot(),
             l2_commit_scheduler: self.l2_commit_scheduler.snapshot(),
             upload_queue: self.upload_queue.snapshot(pending_uploads),
-            blocking_tasks: crate::runtime::blocking_task_stats_snapshot(),
+            blocking_tasks: empty_blocking_task_metrics_snapshot(),
         }
+    }
+}
+
+fn empty_latency_histogram_snapshot() -> LatencyHistogramSnapshot {
+    LatencyHistogramSnapshot {
+        bucket_upper_bounds_ns: LATENCY_BUCKET_UPPER_NS.to_vec(),
+        bucket_counts: vec![0; LATENCY_BUCKET_COUNT],
+    }
+}
+
+fn empty_blocking_task_stats_snapshot() -> BlockingTaskStatsSnapshot {
+    BlockingTaskStatsSnapshot {
+        active: 0,
+        active_peak: 0,
+        submitted: 0,
+        started: 0,
+        completed: 0,
+        queue_wait_total_ns: 0,
+        queue_wait_max_ns: 0,
+        queue_wait_histogram: empty_latency_histogram_snapshot(),
+        execution_total_ns: 0,
+        execution_max_ns: 0,
+        execution_histogram: empty_latency_histogram_snapshot(),
+    }
+}
+
+fn empty_blocking_task_metrics_snapshot() -> BlockingTaskMetricsSnapshot {
+    BlockingTaskMetricsSnapshot {
+        total: empty_blocking_task_stats_snapshot(),
+        by_kind: Vec::new(),
     }
 }

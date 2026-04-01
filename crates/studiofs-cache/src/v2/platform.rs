@@ -5,6 +5,7 @@
 
 use std::fs::File;
 use std::io;
+use std::path::Path;
 
 /// Read exactly `buf.len()` bytes from `file` at the given byte `offset`.
 ///
@@ -85,6 +86,56 @@ pub fn advise_sequential(bytes: &[u8]) -> io::Result<()> {
         return Ok(());
     }
     best_effort(advise_sequential_impl(bytes))
+}
+
+/// Returns `(free_bytes, total_bytes)` for the filesystem containing `path`.
+#[cfg(target_os = "windows")]
+pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_caller: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free_total: u64 = 0;
+    unsafe {
+        let ret = GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_caller, &mut total, &mut free_total);
+        if ret != 0 {
+            Some((free_caller, total))
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns `(free_bytes, total_bytes)` for the filesystem containing `path`.
+#[cfg(not(target_os = "windows"))]
+pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+
+    let c_path = CString::new(path.to_str()?).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
+            let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+            Some((free, total))
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

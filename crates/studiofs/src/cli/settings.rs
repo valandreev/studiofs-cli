@@ -36,17 +36,6 @@ pub struct SettingsArgs {
     #[arg(long = "slab-flush-interval")]
     pub slab_flush_interval_ms: Option<u64>,
 
-    /// Disable the background slab flusher.
-    #[arg(long = "disable-bg-slab-flush")]
-    pub disable_bg_slab_flush: bool,
-
-    /// Enable the background slab flusher.
-    #[arg(
-        long = "enable-bg-slab-flush",
-        overrides_with = "disable_bg_slab_flush"
-    )]
-    pub enable_bg_slab_flush: bool,
-
     /// Cache safety mode for mount write-path durability.
     #[arg(long = "cache-safety-mode", value_enum)]
     pub cache_safety_mode: Option<SettingsCacheSafetyMode>,
@@ -235,21 +224,7 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         if interval_ms > 0 {
             config.vfs.slab_flush_interval_ms = Some(interval_ms);
             changed = true;
-        } else {
-            config.vfs.background_slab_flush_enabled = Some(false);
-            changed = true;
-            eprintln!("warning: slab flush interval 0 disables background slab flush");
         }
-    }
-
-    if args.enable_bg_slab_flush {
-        config.vfs.background_slab_flush_enabled = Some(true);
-        changed = true;
-    }
-
-    if args.disable_bg_slab_flush {
-        config.vfs.background_slab_flush_enabled = Some(false);
-        changed = true;
     }
 
     if let Some(mode) = args.cache_safety_mode {
@@ -289,14 +264,6 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     println!(
         "  slab-flush-interval-ms: {}",
         resolved_vfs.slab_flush_interval_ms
-    );
-    println!(
-        "  background-slab-flush: {}",
-        if resolved_vfs.background_slab_flush_enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
     );
     println!(
         "  cache-safety-mode: {}",

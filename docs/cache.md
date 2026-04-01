@@ -7,20 +7,18 @@ There are two generations of the cache implementation:
 
 | Generation | Module | Status |
 |------------|--------|--------|
-| **v3 (compatibility path)** | `block_cache`, `l1_mem`, `l2_disk`, `lru_tracker` | Active for upload-queue compatibility, cache promotion, and fallback rereads while VFS foreground hot paths migrate |
-| **v2 (active foreground path)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Foreground VFS reads and local write durability now use BlockStore; async VFS paths route blocking BlockStore mutations through Tokio's blocking pool while some legacy cache helpers still back upload compatibility |
+| **v3 (legacy stack)** | `l1_mem`, `l2_disk`, `lru_tracker`, `runtime`, direct-I/O helpers | **Retired in SFS-143** |
+| **v2 (active path)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Canonical cache path for foreground reads, local durability, and startup dirty replay |
+| **compat shim** | `block_cache`, `upload_queue` | Thin wrapper retained for queue/observability compatibility while callers finish migrating |
 
 ---
 
 ## Cache v2 — Single-file BlockStore
 
-> **Status:** Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex,
-> dirty/uploading eviction gating, auto-eviction, mmap reads with generation
-> remapping, snapshot/WAL persistence, and startup recovery are implemented.
-> The VFS foreground read path and local write-durability path now use
-> BlockStore as the primary local data store, and async VFS workers offload
-> blocking BlockStore read/write/remove transitions onto Tokio's blocking pool
-> instead of running them on executor threads.
+> **Status:** Active and authoritative implementation.
+> Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex, dirty/uploading
+> eviction gating, auto-eviction, mmap reads with generation remapping, snapshot/WAL
+> persistence, and startup recovery are implemented.
 
 Replaces the L1/L2 split with a single `blocks.data` file managed by a native
 free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
@@ -196,6 +194,9 @@ These caches now share one generic two-tier implementation:
 
 This removes duplicated eviction/compaction logic and ensures fixes in the
 two-tier algorithm apply consistently to all metadata caches.
+
+> Legacy sections below are historical only. `l1_mem`, `l2_disk`, and
+> `lru_tracker` were removed in SFS-143.
 
 ### L1 Memory Cache (`l1_mem.rs`)
 

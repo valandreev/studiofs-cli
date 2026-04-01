@@ -165,12 +165,6 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .filter(|v| *v > 0.0)
 }
 
-fn parse_env_bool(key: &str) -> Option<bool> {
-    let value = std::env::var(key).ok()?;
-    let value = value.trim().to_ascii_lowercase();
-    Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-}
-
 fn test_vfs_config_from_env() -> VfsConfigValidated {
     load_test_env();
     // Keep existing integration tests on durable semantics unless overridden.
@@ -186,21 +180,11 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     {
         config.max_dirty_bytes = Some(bytes);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_MAX_SPILL_BYTES")
-        && let Some(bytes) = parse_size_bytes(&v)
-        && bytes > 0
-        && let Ok(bytes) = usize::try_from(bytes)
-    {
-        config.max_spill_bytes = Some(bytes);
-    }
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
     {
         config.max_ingress_segment_bytes = Some(bytes);
-    }
-    if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
-        config.background_slab_flush_enabled = Some(!disable);
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
         config.slab_flush_interval_ms = Some(ms);
@@ -2200,9 +2184,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                background_slab_flush_enabled: Some(true),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
@@ -2256,9 +2238,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             let data_config_offline = DataStoreConfig::from(&offline_info);
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                background_slab_flush_enabled: Some(false),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
@@ -3468,9 +3448,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
         rt.block_on(async {
             let online_vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                background_slab_flush_enabled: Some(true),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
@@ -3526,9 +3504,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                background_slab_flush_enabled: Some(false),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
@@ -3576,9 +3552,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
         rt.block_on(async {
             let offline_vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                background_slab_flush_enabled: Some(false),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
@@ -6443,8 +6417,6 @@ fn test_write_fast_mode_no_spill_artifacts() {
         let vfs_config = VfsConfigRaw {
             cache_safety_mode: Some(CacheSafetyMode::Fast),
             max_dirty_bytes: Some(32 * 1024 * 1024),
-            max_spill_bytes: Some(64 * 1024 * 1024),
-            background_slab_flush_enabled: Some(true),
             memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
@@ -6684,10 +6656,8 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             ensure_bucket().await;
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(4 * 256 * 1024),
-                max_spill_bytes: Some(4 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
-            background_slab_flush_enabled: Some(false),
             memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
@@ -6762,10 +6732,8 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                max_spill_bytes: Some(8 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
-                background_slab_flush_enabled: Some(false),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
@@ -6860,7 +6828,6 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
@@ -6910,7 +6877,6 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                max_spill_bytes: Some(16 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()

@@ -100,12 +100,6 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .filter(|v| *v > 0.0)
 }
 
-fn parse_env_bool(key: &str) -> Option<bool> {
-    let value = std::env::var(key).ok()?;
-    let value = value.trim().to_ascii_lowercase();
-    Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-}
-
 fn parse_env_cache_safety_mode(key: &str) -> Option<CacheSafetyMode> {
     let value = std::env::var(key).ok()?;
     let normalized = value.trim().to_ascii_lowercase();
@@ -150,7 +144,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     }
 
     set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
-    set_size!("STUDIOFS_MAX_SPILL_BYTES", max_spill_bytes);
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Ok(bytes) = parse_positive_size_arg(&v)
     {
@@ -267,15 +260,10 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     );
     set_u64!("STUDIOFS_UPLOAD_RETRY_BASE_MS", upload_retry_base_ms);
     set_u64!("STUDIOFS_UPLOAD_RETRY_MAX_MS", upload_retry_max_ms);
-    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
-        if interval_ms > 0 {
-            config.slab_flush_interval_ms = Some(interval_ms);
-        } else {
-            config.background_slab_flush_enabled = Some(false);
-        }
-    }
-    if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
-        config.background_slab_flush_enabled = Some(!disable);
+    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS")
+        && interval_ms > 0
+    {
+        config.slab_flush_interval_ms = Some(interval_ms);
     }
     set_u64!(
         "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",

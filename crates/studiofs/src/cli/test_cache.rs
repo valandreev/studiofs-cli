@@ -2232,8 +2232,6 @@ fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
 }
 
 async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<BenchmarkReport> {
-    studiofs_cache::runtime::reset_blocking_task_stats();
-
     let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit, params.l2_limit);
     let (cache, _rx) = BlockCache::open(cache_config)
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;

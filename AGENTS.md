@@ -238,20 +238,17 @@ test: add destroy tests fixes
 2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
 3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
 
-### L2 Read Priority Policy (SFS-110)
+### Cache v2 Note
 
-- `L2IoPriority::Foreground`: no artificial 1MB throttling in the block read hot path.
-- `L2IoPriority::Background`: keeps 1MB chunked reads to reduce queue starvation risk for foreground I/O.
-- `L2DiskCache::get_sync` defaults to `Background` for safer generic sync usage.
-- `BlockCache` user-facing sync fast paths explicitly request `Foreground` via
-  `get_sync_with_priority(..., L2IoPriority::Foreground)`.
+- The legacy `L2DiskCache` stack has been retired.
+- `BlockStore` is the canonical local cache implementation.
+- `BlockCache` is now a compatibility shim (upload queue + lightweight hot payload staging).
 
 ### Environment Variables
 
 Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 
 - `STUDIOFS_MAX_DIRTY_BYTES`: Memory budget for dirty blocks
-- `STUDIOFS_MAX_SPILL_BYTES`: Legacy ingress-artifact budget retained for startup compatibility; foreground writes no longer spill into ingress
 - `STUDIOFS_S3_ENDPOINT`: S3 endpoint URL
 - `STUDIOFS_S3_BUCKET`: S3 bucket name
 - `STUDIOFS_PRINCIPAL`: ACL principal for access control

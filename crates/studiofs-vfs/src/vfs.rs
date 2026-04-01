@@ -50,9 +50,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{
     BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
-    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
+    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS, L2IoPriority,
 };
-use studiofs_cache::l2_disk::L2IoPriority;
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::metrics::CacheMetrics;
@@ -604,7 +603,6 @@ const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_MAX_DIRTY_BYTES: usize = 12 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_SPILL_BYTES: usize = 64 * 1024 * 1024 * 1024usize;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
 const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
@@ -618,7 +616,6 @@ const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 2.0;
 const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
-const DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED: bool = true;
 const DEFAULT_UPLOAD_WORKER_COUNT: usize = 4;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 10;
@@ -776,9 +773,6 @@ pub struct VfsConfig {
     pub attr_read_cache_bytes: usize,
     /// Effective ACL cache entry budget.
     pub effective_acl_cache_capacity: usize,
-    /// Maximum bytes allowed in local NVMe spill.
-    /// Parsed from env via `parse_size_bytes` (for example `64GB`).
-    pub max_spill_bytes: usize,
     /// Maximum active ingress segment size.
     /// Parsed from env via `parse_size_bytes` (for example `1GB`).
     pub max_ingress_segment_bytes: u64,
@@ -820,8 +814,6 @@ pub struct VfsConfig {
     pub upload_stats_interval_secs: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
-    /// Whether background slab flushing is enabled.
-    pub background_slab_flush_enabled: bool,
     /// Periodic ingress checkpoint interval.
     pub ingress_checkpoint_interval_secs: u64,
     /// Immediate checkpoint trigger on uncheckpointed ingress bytes.
@@ -939,7 +931,6 @@ pub struct VfsConfigRaw {
     pub attr_read_cache_capacity: Option<usize>,
     pub attr_read_cache_bytes: Option<usize>,
     pub effective_acl_cache_capacity: Option<usize>,
-    pub max_spill_bytes: Option<usize>,
     pub max_ingress_segment_bytes: Option<u64>,
     pub cache_safety_mode: Option<CacheSafetyMode>,
     pub principal: Option<String>,
@@ -960,7 +951,6 @@ pub struct VfsConfigRaw {
     pub upload_requeue_max_ms: Option<u64>,
     pub upload_stats_interval_secs: Option<u64>,
     pub slab_flush_interval_ms: Option<u64>,
-    pub background_slab_flush_enabled: Option<bool>,
     pub ingress_checkpoint_interval_secs: Option<u64>,
     pub ingress_checkpoint_min_append_bytes: Option<u64>,
     pub ingress_checkpoint_min_mutations: Option<u64>,
@@ -1070,7 +1060,6 @@ impl VfsConfigRaw {
             attr_read_cache_capacity,
             attr_read_cache_bytes,
             effective_acl_cache_capacity,
-            max_spill_bytes,
             max_ingress_segment_bytes,
             cache_safety_mode,
             principal,
@@ -1091,7 +1080,6 @@ impl VfsConfigRaw {
             upload_requeue_max_ms,
             upload_stats_interval_secs,
             slab_flush_interval_ms,
-            background_slab_flush_enabled,
             ingress_checkpoint_interval_secs,
             ingress_checkpoint_min_append_bytes,
             ingress_checkpoint_min_mutations,
@@ -1171,7 +1159,6 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.attr_read_cache_capacity = cfg.attr_read_cache_capacity.max(1);
     cfg.attr_read_cache_bytes = cfg.attr_read_cache_bytes.max(1);
     cfg.effective_acl_cache_capacity = cfg.effective_acl_cache_capacity.max(1);
-    cfg.max_spill_bytes = cfg.max_spill_bytes.max(1);
     cfg.max_ingress_segment_bytes = cfg.max_ingress_segment_bytes.max(1);
     cfg.fetch_min_window = cfg.fetch_min_window.max(1.0);
     cfg.fetch_decrease_cooldown_secs = cfg.fetch_decrease_cooldown_secs.max(1);
@@ -1253,7 +1240,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             attr_read_cache_capacity: Some(cfg.attr_read_cache_capacity),
             attr_read_cache_bytes: Some(cfg.attr_read_cache_bytes),
             effective_acl_cache_capacity: Some(cfg.effective_acl_cache_capacity),
-            max_spill_bytes: Some(cfg.max_spill_bytes),
             max_ingress_segment_bytes: Some(cfg.max_ingress_segment_bytes),
             cache_safety_mode: Some(cfg.cache_safety_mode),
             principal: Some(cfg.principal),
@@ -1274,7 +1260,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
             upload_stats_interval_secs: Some(cfg.upload_stats_interval_secs),
             slab_flush_interval_ms: Some(cfg.slab_flush_interval_ms),
-            background_slab_flush_enabled: Some(cfg.background_slab_flush_enabled),
             ingress_checkpoint_interval_secs: Some(cfg.ingress_checkpoint_interval_secs),
             ingress_checkpoint_min_append_bytes: Some(cfg.ingress_checkpoint_min_append_bytes),
             ingress_checkpoint_min_mutations: Some(cfg.ingress_checkpoint_min_mutations),
@@ -1350,7 +1335,6 @@ impl Default for VfsConfig {
             attr_read_cache_capacity: DEFAULT_ATTR_READ_CACHE_CAPACITY,
             attr_read_cache_bytes: DEFAULT_ATTR_READ_CACHE_BYTES,
             effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
-            max_spill_bytes: DEFAULT_MAX_SPILL_BYTES,
             max_ingress_segment_bytes: DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
             cache_safety_mode: CacheSafetyMode::Fast,
             principal: "*".to_string(),
@@ -1371,7 +1355,6 @@ impl Default for VfsConfig {
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
             slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
-            background_slab_flush_enabled: DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED,
             ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
             ingress_checkpoint_min_append_bytes: DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES,
             ingress_checkpoint_min_mutations: DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS,
@@ -4334,7 +4317,6 @@ impl StudioVfs {
             let attr_read_cache_capacity = config.attr_read_cache_capacity;
             let attr_read_cache_bytes = config.attr_read_cache_bytes;
             let effective_acl_cache_capacity = config.effective_acl_cache_capacity;
-            let max_spill_bytes = config.max_spill_bytes;
             let cache_safety_mode = config.cache_safety_mode;
             let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
             let ingress_wal = IngressWal::new(spill_dir, config.max_ingress_segment_bytes);
@@ -4544,7 +4526,6 @@ impl StudioVfs {
                 upload_fg_read_latency_sticky_windows,
                 max_dirty_bytes,
                 max_xattr_bytes,
-                max_spill_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
                 path_shortcut_cache_capacity,
