@@ -8382,6 +8382,173 @@ fn write_eager_flush_flushes_full_blocks_below_threshold() {
     rt.shutdown_background();
 }
 
+#[test]
+fn write_eager_flush_persists_contiguous_size_when_tail_remains_buffered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-eager-tail-size-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-eager-tail-size.bin", 0, 0, 0o644)
+            .unwrap();
+        let tail = vec![0x44u8; block_size / 8];
+        let mut payload = vec![0x33u8; block_size];
+        payload.extend_from_slice(&tail);
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+
+        let live_attr = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(
+            live_attr.size,
+            payload.len() as u64,
+            "the live inode view should still expose the buffered tail bytes"
+        );
+
+        let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            block_size as u64,
+            "eager persistence should advance durable size to the contiguous locally committed range even while a tail block remains buffered"
+        );
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            1,
+            "only the contiguous full block should reach metadata before flush() persists the tail"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-backpressure-full-first-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let tail_len = block_size / 8;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(block_size + 1),
+            write_eager_flush_batch_bytes: Some(block_size * 4),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-backpressure-full-first.bin", 0, 0, 0o644)
+            .unwrap();
+        let first = vec![0x11u8; block_size];
+        let tail = vec![0x22u8; tail_len];
+
+        vfs.write(attr.ino, 0, &first).await.unwrap();
+        assert!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "the initial full block should stay buffered while eager batching is disabled"
+        );
+
+        vfs.write(attr.ino, block_size as u64, &tail).await.unwrap();
+
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            1,
+            "backpressure should flush the accumulated full block before forcing the tail block to disk"
+        );
+        assert_eq!(
+            vfs.ingress_stats().dirty_mem_bytes,
+            tail_len,
+            "after backpressure relief only the tail block should remain in the write buffer"
+        );
+
+        let live_attr = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(
+            live_attr.size,
+            (block_size + tail_len) as u64,
+            "the live inode view should still include the buffered tail after backpressure relief"
+        );
+        let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            block_size as u64,
+            "durable metadata should advance only through the locally persisted full-block frontier"
+        );
+
+        let read = vfs
+            .read(attr.ino, 0, (block_size + tail_len) as u32)
+            .await
+            .unwrap();
+        assert_eq!(&read[..block_size], first.as_slice());
+        assert_eq!(&read[block_size..], tail.as_slice());
+    });
+    rt.shutdown_background();
+}
+
 /// Truncate to zero, then write again. Verify old blocks are GC'd and new data is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
