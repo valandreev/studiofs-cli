@@ -180,6 +180,13 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     {
         config.max_dirty_bytes = Some(bytes);
     }
+    if let Ok(v) = std::env::var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
+    {
+        config.write_eager_flush_batch_bytes = Some(bytes);
+    }
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
@@ -2407,11 +2414,13 @@ fn eager_full_block_write_recovers_pending_upload_after_restart() {
     type EnvRestore = ScopedEnvVar;
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_eager = EnvRestore::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
 
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "4MB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     }
@@ -8153,9 +8162,11 @@ fn flush_failure_keeps_pending_write_buffer_data() {
 fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_eager = ScopedEnvVar::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
+        std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "512KB");
     }
 
     let tmp = tempfile::tempdir().unwrap();
