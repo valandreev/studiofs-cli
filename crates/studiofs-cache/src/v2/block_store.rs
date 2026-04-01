@@ -65,6 +65,7 @@ const PRESSURE_EVICTION_BATCH_TRIGGER_BYTES: u64 = 64 * 1024 * 1024;
 const PRESSURE_EVICTION_BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const PRESSURE_EVICTION_BATCH_MAX_BLOCKS: usize = 128;
 const DISK_HEADROOM_REFRESH_INTERVAL_NS: u64 = 250_000_000;
+const VERIFY_READ_CHECKSUMS_ENV: &str = "STUDIOFS_CACHE_VERIFY_READ_CHECKSUMS";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PressureMaintenanceReport {
@@ -141,6 +142,9 @@ pub enum BlockStoreError {
 pub struct BlockStore {
     file: File,
     config: BlockStoreConfig,
+    /// Whether read-side CRC32 verification is enabled.
+    /// Sampled at open; restart required to change the mode.
+    verify_read_checksums: bool,
     mmap_reader: MmapReader,
     /// Cached physical file length, updated only after successful growth.
     file_len: AtomicU64,
@@ -369,6 +373,7 @@ impl BlockStore {
         Ok(Self {
             file,
             config,
+            verify_read_checksums: Self::read_verify_checksums_enabled(),
             mmap_reader,
             file_len: AtomicU64::new(file_end),
             index: Mutex::new(BlockIndex::from_persisted_entries(&recovered_entries)),
@@ -412,6 +417,32 @@ impl BlockStore {
         raw.trim().parse::<u64>().ok().filter(|value| *value > 0)
     }
 
+    fn parse_env_bool(raw: &str) -> Option<bool> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "enable" | "enabled" => Some(true),
+            "0" | "false" | "no" | "off" | "disable" | "disabled" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn read_verify_checksums_enabled() -> bool {
+        match std::env::var(VERIFY_READ_CHECKSUMS_ENV) {
+            Ok(raw) => match Self::parse_env_bool(&raw) {
+                Some(value) => value,
+                None => {
+                    warn!(
+                        env = VERIFY_READ_CHECKSUMS_ENV,
+                        value = %raw,
+                        default = true,
+                        "invalid read checksum verification override; using default"
+                    );
+                    true
+                }
+            },
+            Err(_) => true,
+        }
+    }
+
     fn read_emergency_disk_free_floor_bytes() -> u64 {
         match std::env::var(EMERGENCY_DISK_FREE_FLOOR_ENV) {
             Ok(raw) => match Self::parse_positive_u64(&raw) {
@@ -437,7 +468,8 @@ impl BlockStore {
     /// Read a block from the cache.
     ///
     /// Returns `None` on a cache miss or a data-integrity failure (short read
-    /// or checksum mismatch).  Bumps the hit/miss counter.
+    /// or checksum mismatch when read verification is enabled).  Bumps the
+    /// hit/miss counter.
     ///
     /// On a hit, moves the block to the MRU position in the LRU list.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
@@ -470,20 +502,21 @@ impl BlockStore {
             }
         };
 
-        // Verify checksum.
-        let actual_crc = crc32fast::hash(&data);
-        if actual_crc != checksum {
-            warn!(
-                object_id,
-                offset,
-                expected = checksum,
-                actual = actual_crc,
-                "block checksum mismatch",
-            );
-            self.miss_count.fetch_add(1, Ordering::Relaxed);
-            self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
-            self.record_read_metrics(0, started);
-            return None;
+        if self.verify_read_checksums {
+            let actual_crc = crc32fast::hash(&data);
+            if actual_crc != checksum {
+                warn!(
+                    object_id,
+                    offset,
+                    expected = checksum,
+                    actual = actual_crc,
+                    "block checksum mismatch",
+                );
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
+                self.record_read_metrics(0, started);
+                return None;
+            }
         }
 
         // Phase 3: revalidate metadata and touch LRU under the index lock.
@@ -521,7 +554,7 @@ impl BlockStore {
     ///
     /// Returns the number of bytes copied, or `None` on a cache miss or
     /// integrity failure. The full payload checksum is verified before the
-    /// access is reported as a hit.
+    /// access is reported as a hit when read verification is enabled.
     pub fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
         let started = Instant::now();
         let (offset, data_size, checksum) = {
@@ -541,6 +574,7 @@ impl BlockStore {
             data_size as usize,
             data_offset,
             out,
+            self.verify_read_checksums,
         ) {
             Ok(result) => result,
             Err(e) => {
@@ -552,18 +586,20 @@ impl BlockStore {
             }
         };
 
-        if actual_crc != checksum {
-            warn!(
-                object_id,
-                offset,
-                expected = checksum,
-                actual = actual_crc,
-                "block checksum mismatch",
-            );
-            self.miss_count.fetch_add(1, Ordering::Relaxed);
-            self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
-            self.record_read_metrics(0, started);
-            return None;
+        if let Some(actual_crc) = actual_crc {
+            if actual_crc != checksum {
+                warn!(
+                    object_id,
+                    offset,
+                    expected = checksum,
+                    actual = actual_crc,
+                    "block checksum mismatch",
+                );
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
+                self.record_read_metrics(0, started);
+                return None;
+            }
         }
 
         {
@@ -966,14 +1002,26 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Graceful shutdown: flush data and release the file handle.
+    /// Persist the current index checkpoint and clear the WAL.
     ///
-    /// Prefer explicit `close()` over relying on [`Drop`].
-    pub fn close(self) -> Result<(), BlockStoreError> {
+    /// This is the shutdown checkpoint used by VFS so remounts can reopen the
+    /// BlockStore from metadata instead of rescanning the entire data file.
+    pub fn persist_checkpoint(&self) -> Result<(), BlockStoreError> {
+        if self.synced.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         platform::fdatasync(&self.file)?;
         self.write_snapshot_and_clear_wal()?;
         self.synced.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Graceful shutdown: flush data and release the file handle.
+    ///
+    /// Prefer explicit `close()` over relying on [`Drop`].
+    pub fn close(self) -> Result<(), BlockStoreError> {
+        self.persist_checkpoint()
     }
 
     // -----------------------------------------------------------------------
@@ -2146,6 +2194,28 @@ mod tests {
     }
 
     #[test]
+    fn read_into_can_skip_checksum_verification() {
+        let dir = TempDir::new().unwrap();
+        let mut store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(7, b"abcdefgh", true).unwrap();
+        store.verify_read_checksums = false;
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(store.data_path())
+            .unwrap();
+        platform::pwrite(&file, b"X", SUPERBLOCK_SIZE + BLOCK_HEADER_SIZE as u64 + 2).unwrap();
+
+        let mut out = [0u8; 3];
+        let read = store.read_into(7, 2, &mut out).unwrap();
+        assert_eq!(read, 3);
+        assert_eq!(&out, b"Xde");
+        assert!(store.contains(7));
+        assert_eq!(store.corruption_count(), 0);
+    }
+
+    #[test]
     fn checksum_mismatch_purges_corrupt_entry() {
         let dir = TempDir::new().unwrap();
         let store = BlockStore::open(test_config(&dir)).unwrap();
@@ -2430,6 +2500,24 @@ mod tests {
             !store2.contains(2),
             "oldest clean block should be evicted after reopen"
         );
+    }
+
+    #[test]
+    fn persist_checkpoint_writes_snapshot_without_consuming_store() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"checkpoint", true).unwrap();
+        store.persist_checkpoint().unwrap();
+
+        assert!(dir.path().join("blocks.idx").exists());
+
+        drop(store);
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert_eq!(reopened.block_count(), 1);
+        assert_eq!(&reopened.get(1).unwrap()[..], b"checkpoint");
     }
 
     #[test]

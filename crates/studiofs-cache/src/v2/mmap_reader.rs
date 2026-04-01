@@ -1,4 +1,4 @@
-//! ArcSwap-based mmap reader with lock-free remap on file growth.
+//! ArcSwap-based zero-copy mmap reader with lock-free remap on file growth.
 
 use std::fs::File;
 use std::io;
@@ -17,6 +17,18 @@ struct MmapGeneration {
     id: u64,
     mapped_len: u64,
     mmap: Mmap,
+}
+
+struct MmapBytesOwner {
+    generation: Arc<MmapGeneration>,
+    start: usize,
+    end: usize,
+}
+
+impl AsRef<[u8]> for MmapBytesOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.generation.mmap[self.start..self.end]
+    }
 }
 
 pub struct MmapReader {
@@ -52,24 +64,34 @@ impl MmapReader {
             )
         })?;
 
+        let zero_copy_bounds = match (usize::try_from(offset), usize::try_from(end)) {
+            (Ok(start), Ok(end)) => Some((start, end)),
+            _ => None,
+        };
+
         let generation = self.current.load_full();
-        if end <= generation.mapped_len {
-            let start = usize::try_from(offset).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "requested mmap read offset exceeds addressable space",
-                )
-            })?;
-            let end = usize::try_from(end).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "requested mmap read end exceeds addressable space",
-                )
-            })?;
-            // Cache v2 intentionally stays at one-copy reads for this phase.
-            // A future zero-copy path can bind Bytes to the generation Arc if
-            // profiling shows the copy is material on large blocks.
-            return Ok(Bytes::copy_from_slice(&generation.mmap[start..end]));
+        if end <= generation.mapped_len
+            && let Some((start, slice_end)) = zero_copy_bounds
+        {
+            return Ok(Bytes::from_owner(MmapBytesOwner {
+                generation,
+                start,
+                end: slice_end,
+            }));
+        }
+
+        // If the file growth is already visible, remap before falling back so
+        // this read can still stay on the zero-copy mmap path.
+        let _ = self.remap_if_needed(end);
+        let generation = self.current.load_full();
+        if end <= generation.mapped_len
+            && let Some((start, slice_end)) = zero_copy_bounds
+        {
+            return Ok(Bytes::from_owner(MmapBytesOwner {
+                generation,
+                start,
+                end: slice_end,
+            }));
         }
 
         let mut buf = vec![0u8; len];
@@ -84,7 +106,8 @@ impl MmapReader {
         data_len: usize,
         data_offset: usize,
         out: &mut [u8],
-    ) -> io::Result<(usize, u32)> {
+        verify_checksum: bool,
+    ) -> io::Result<(usize, Option<u32>)> {
         let len_u64 = u64::try_from(data_len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -102,22 +125,31 @@ impl MmapReader {
         let copy_end = data_offset.saturating_add(out.len()).min(data_len);
         let copy_len = copy_end.saturating_sub(copy_start);
 
+        let zero_copy_bounds = match (usize::try_from(offset), usize::try_from(end)) {
+            (Ok(start), Ok(end)) => Some((start, end)),
+            _ => None,
+        };
+
         let generation = self.current.load_full();
-        if end <= generation.mapped_len {
-            let start = usize::try_from(offset).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "requested mmap read offset exceeds addressable space",
-                )
-            })?;
-            let end = usize::try_from(end).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "requested mmap read end exceeds addressable space",
-                )
-            })?;
-            let payload = &generation.mmap[start..end];
-            let checksum = crc32fast::hash(payload);
+        if end <= generation.mapped_len
+            && let Some((start, slice_end)) = zero_copy_bounds
+        {
+            let payload = &generation.mmap[start..slice_end];
+            let checksum = verify_checksum.then(|| crc32fast::hash(payload));
+            if copy_len > 0 {
+                out[..copy_len].copy_from_slice(&payload[copy_start..copy_end]);
+            }
+            return Ok((copy_len, checksum));
+        }
+
+        // Try to catch up the mapping before paying the fallback copy.
+        let _ = self.remap_if_needed(end);
+        let generation = self.current.load_full();
+        if end <= generation.mapped_len
+            && let Some((start, slice_end)) = zero_copy_bounds
+        {
+            let payload = &generation.mmap[start..slice_end];
+            let checksum = verify_checksum.then(|| crc32fast::hash(payload));
             if copy_len > 0 {
                 out[..copy_len].copy_from_slice(&payload[copy_start..copy_end]);
             }
@@ -127,7 +159,7 @@ impl MmapReader {
         let mut buf = vec![0u8; data_len];
         platform::pread(&self.file, &mut buf, offset)?;
         let _ = self.remap_if_needed(end);
-        let checksum = crc32fast::hash(&buf);
+        let checksum = verify_checksum.then(|| crc32fast::hash(&buf));
         if copy_len > 0 {
             out[..copy_len].copy_from_slice(&buf[copy_start..copy_end]);
         }
@@ -239,7 +271,11 @@ mod tests {
         assert_eq!(reader.mapped_len_for_test(), PAGE_SIZE);
 
         let got = reader.read(offset, payload.len()).unwrap();
+        let generation = reader.current.load_full();
+        let start = usize::try_from(offset).unwrap();
+        let end = start + payload.len();
         assert_eq!(&got[..], payload);
+        assert_eq!(got.as_ptr(), generation.mmap[start..end].as_ptr());
         assert_eq!(reader.mapped_len_for_test(), 3 * PAGE_SIZE);
         assert!(reader.generation_for_test() >= 1);
     }
@@ -277,5 +313,24 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn read_returns_zero_copy_mmap_slice() {
+        let (_dir, file) = test_file();
+        file.set_len(PAGE_SIZE).unwrap();
+
+        let payload = b"zero-copy-mmap";
+        let offset = 128;
+        platform::pwrite(&file, payload, offset).unwrap();
+
+        let reader = MmapReader::new(&file, PAGE_SIZE).unwrap();
+        let got = reader.read(offset, payload.len()).unwrap();
+        let generation = reader.current.load_full();
+        let start = usize::try_from(offset).unwrap();
+        let end = start + payload.len();
+
+        assert_eq!(&got[..], payload);
+        assert_eq!(got.as_ptr(), generation.mmap[start..end].as_ptr());
     }
 }

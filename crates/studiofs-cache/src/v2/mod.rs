@@ -11,7 +11,7 @@
 //! | `index`        | Implemented | `BlockIndex` + `BlockFlags` + intrusive LRU (SFS-136) |
 //! | `lru`          | Implemented | `LruList` / `LruNode` intrusive doubly-linked list  |
 //! | `evictor`      | Stub        | Watermark-driven background evictor (future)        |
-//! | `mmap_reader`  | Implemented | Lock-free mmap reader with generation remapping     |
+//! | `mmap_reader`  | Implemented | Zero-copy mmap reader with generation remapping     |
 //! | `metrics`      | Implemented | Runtime counters, rates, throughput, pressure stats |
 
 pub mod allocator;

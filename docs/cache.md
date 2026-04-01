@@ -91,7 +91,7 @@ prevent concurrent threads from observing an inconsistent file end.
 ```rust
 BlockStore::open(config)            // create or open (validates magic, version, UUID, max_size)
 BlockStore::put(id, data, evictable)// allocate + pwrite header + payload; replace if exists
-BlockStore::get(id)                 // mmap + pread fallback + crc32 verify → Option<Bytes>
+BlockStore::get(id)                 // zero-copy mmap + pread fallback + optional crc32 verify → Option<Bytes>
 BlockStore::contains(id)            // index lookup only
 BlockStore::remove(id)              // free allocation, update index
 BlockStore::remove_batch(ids)       // batched remove under single allocator lock
@@ -109,7 +109,12 @@ Implementation notes:
 - `BlockIndex` is guarded by `Mutex<BlockIndex>` rather than `RwLock`: a cache
   hit updates LRU state, so `get()` is logically mutating.
 - `MmapReader` uses atomic generation swaps so readers stay lock-free while
-  remaps publish a larger mapping after file growth.
+  remaps publish a larger mapping after file growth, and mmap hits return
+  zero-copy `Bytes` backed by the live generation.
+- Read-side checksum verification is enabled by default and can be disabled
+  with `STUDIOFS_CACHE_VERIFY_READ_CHECKSUMS=false` when throughput matters
+  more than payload integrity checks. `BlockStore` reads the value at open, so
+  change the setting with a service restart.
 - `put()` uses a pending-allocation guard so allocation is rolled back if a
   post-write error or unwind happens before the new index entry is published.
 - `mark_evictable()` keeps the index lock across the tiny header `pwrite` to

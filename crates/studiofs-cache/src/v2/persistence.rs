@@ -147,27 +147,31 @@ pub(super) fn load_entries(
     data_file: &File,
 ) -> io::Result<Option<Vec<PersistedIndexEntry>>> {
     let snapshot_path = snapshot_path(cache_dir);
-    if !snapshot_path.exists() {
-        return Ok(None);
-    }
-
-    let snapshot_entries = read_snapshot(&snapshot_path)?;
-    let mut index = BlockIndex::with_capacity(snapshot_entries.len());
-    for entry in snapshot_entries {
-        index.insert(
-            entry.object_id,
-            entry.offset,
-            entry.data_size,
-            entry.alloc_size,
-            entry.checksum,
-            entry.flags,
-        );
-    }
-
     let wal_path = wal_path(cache_dir);
-    if wal_path.exists() {
+    let index = if snapshot_path.exists() {
+        let snapshot_entries = read_snapshot(&snapshot_path)?;
+        let mut index = BlockIndex::with_capacity(snapshot_entries.len());
+        for entry in snapshot_entries {
+            index.insert(
+                entry.object_id,
+                entry.offset,
+                entry.data_size,
+                entry.alloc_size,
+                entry.checksum,
+                entry.flags,
+            );
+        }
+        if wal_path.exists() {
+            replay_wal(&wal_path, &mut index)?;
+        }
+        index
+    } else if wal_path.exists() && wal_path.metadata()?.len() > WAL_HEADER_SIZE {
+        let mut index = BlockIndex::new();
         replay_wal(&wal_path, &mut index)?;
-    }
+        index
+    } else {
+        return Ok(None);
+    };
 
     Ok(Some(validate_recovered_entries(
         data_file,
