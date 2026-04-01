@@ -1243,7 +1243,12 @@ impl BlockStore {
                     "best-effort data-file preallocation failed",
                 );
             }
-            self.file.set_len(needed_len)?;
+            if let Err(error) = self.file.set_len(needed_len) {
+                // Keep allocator state consistent with on-disk file length on
+                // growth failures (e.g. ENOSPC).
+                a.free(offset, alloc);
+                return Err(error.into());
+            }
             self.file_len.store(needed_len, Ordering::Release);
         }
         Ok(Some(offset))
@@ -1501,6 +1506,8 @@ impl BlockStore {
             None => {
                 self.disk_headroom_refresh_error_count
                     .fetch_add(1, Ordering::Relaxed);
+                self.disk_headroom_last_refresh_elapsed_ns
+                    .store(self.disk_headroom_elapsed_ns(), Ordering::Release);
                 warn!(
                     cache_dir = %self.config.cache_dir.display(),
                     "failed to refresh disk headroom; falling back to cached value"
@@ -1511,11 +1518,23 @@ impl BlockStore {
     }
 
     fn refresh_disk_headroom_if_needed(&self) -> Option<(u64, u64)> {
+        if self
+            .disk_headroom_refresh_in_progress
+            .load(Ordering::Acquire)
+        {
+            self.disk_headroom_refresh_skip_inflight_count
+                .fetch_add(1, Ordering::Relaxed);
+            return self.cached_disk_headroom();
+        }
+
+        let has_cached_snapshot = self.disk_total_bytes.load(Ordering::Acquire) != 0;
         let now_elapsed_ns = self.disk_headroom_elapsed_ns();
         let last_elapsed_ns = self
             .disk_headroom_last_refresh_elapsed_ns
             .load(Ordering::Acquire);
-        if now_elapsed_ns.saturating_sub(last_elapsed_ns) < DISK_HEADROOM_REFRESH_INTERVAL_NS {
+        if has_cached_snapshot
+            && now_elapsed_ns.saturating_sub(last_elapsed_ns) < DISK_HEADROOM_REFRESH_INTERVAL_NS
+        {
             self.disk_headroom_refresh_skip_interval_count
                 .fetch_add(1, Ordering::Relaxed);
             return self.cached_disk_headroom();
@@ -1734,7 +1753,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
 
     use super::*;
     use crate::v2::format::{PAGE_SIZE, SUPERBLOCK_SIZE};
@@ -1822,14 +1840,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = BlockStore::open(test_config(&dir)).unwrap();
         store.set_cached_disk_headroom_for_test(111, 999);
-        // Wait until the refresh interval has elapsed so this call would
-        // refresh unless blocked by the in-progress guard.
-        thread::sleep(Duration::from_nanos(
-            DISK_HEADROOM_REFRESH_INTERVAL_NS.saturating_add(1_000_000),
-        ));
+        // Backdate last refresh marker so this call would refresh unless
+        // blocked by the in-progress guard.
+        let now = store.disk_headroom_elapsed_ns();
+        let backdated =
+            now.saturating_sub(DISK_HEADROOM_REFRESH_INTERVAL_NS.saturating_add(1_000_000));
         store
             .disk_headroom_last_refresh_elapsed_ns
-            .store(0, Ordering::Release);
+            .store(backdated, Ordering::Release);
         store.set_disk_headroom_refresh_in_progress_for_test(true);
 
         let attempts_before = store.disk_headroom_refresh_attempt_count();
@@ -1850,6 +1868,28 @@ mod tests {
 
         // Cleanup marker so this fixture stays isolated for future calls.
         store.set_disk_headroom_refresh_in_progress_for_test(false);
+    }
+
+    #[test]
+    fn disk_headroom_refresh_without_cache_bypasses_interval_skip() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+        store.set_disk_headroom_last_refresh_to_now_for_test();
+        store.set_cached_disk_headroom_for_test(0, 0);
+
+        let attempts_before = store.disk_headroom_refresh_attempt_count();
+        let skipped_before = store.disk_headroom_refresh_skip_interval_count();
+
+        let _ = store.refresh_disk_headroom_if_needed();
+
+        assert_eq!(
+            store.disk_headroom_refresh_attempt_count(),
+            attempts_before + 1
+        );
+        assert_eq!(
+            store.disk_headroom_refresh_skip_interval_count(),
+            skipped_before
+        );
     }
 
     #[test]
