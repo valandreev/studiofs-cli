@@ -114,6 +114,14 @@ impl StudioVfs {
             .insert(block_index);
     }
 
+    fn add_pending_write_buffer_block_indexes<I>(&self, ino: Ino, block_indexes: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        indexes.entry(ino).or_default().extend(block_indexes);
+    }
+
     fn remove_pending_write_buffer_block_indexes<I>(&self, ino: Ino, block_indexes: I)
     where
         I: IntoIterator<Item = u32>,
@@ -652,6 +660,7 @@ impl StudioVfs {
         let mut current_offset = offset;
         let mut data_offset = 0;
         let mut has_full_blocks = false;
+        let mut inserted_block_indexes = Vec::new();
 
         while remaining > 0 {
             let block_index = block_index_from_offset(current_offset, self.block_size);
@@ -691,7 +700,7 @@ impl StudioVfs {
                     }
                 };
                 if inserted_block {
-                    self.add_pending_write_buffer_block_index(ino, block_index);
+                    inserted_block_indexes.push(block_index);
                 }
                 self.add_pending_write_buffer_bytes(inserted_bytes);
             }
@@ -721,6 +730,9 @@ impl StudioVfs {
             remaining -= to_write;
             current_offset += to_write as u64;
             data_offset += to_write;
+        }
+        if !inserted_block_indexes.is_empty() {
+            self.add_pending_write_buffer_block_indexes(ino, inserted_block_indexes);
         }
 
         let mut base_attr = self.getattr_async(ino).await?;
