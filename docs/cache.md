@@ -113,7 +113,8 @@ Implementation notes:
   zero-copy `Bytes` backed by the live generation.
 - Read-side checksum verification is enabled by default and can be disabled
   with `STUDIOFS_CACHE_VERIFY_READ_CHECKSUMS=false` when throughput matters
-  more than payload integrity checks.
+  more than payload integrity checks. `BlockStore` reads the value at open, so
+  change the setting with a service restart.
 - `put()` uses a pending-allocation guard so allocation is rolled back if a
   post-write error or unwind happens before the new index entry is published.
 - `mark_evictable()` keeps the index lock across the tiny header `pwrite` to

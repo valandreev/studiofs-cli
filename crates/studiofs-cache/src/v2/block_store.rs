@@ -142,6 +142,8 @@ pub enum BlockStoreError {
 pub struct BlockStore {
     file: File,
     config: BlockStoreConfig,
+    /// Whether read-side CRC32 verification is enabled.
+    /// Sampled at open; restart required to change the mode.
     verify_read_checksums: bool,
     mmap_reader: MmapReader,
     /// Cached physical file length, updated only after successful growth.
