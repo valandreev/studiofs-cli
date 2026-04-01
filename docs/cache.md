@@ -172,8 +172,8 @@ as acceptable best-effort metadata loss and repairs it via snapshot replay or
               │     LRU Tracker (64 shards)     │
               └────────────────────────────────┘
                             │
-              ┌─────────────▼──────────────────┐
-              │     Upload Queue (journal)      │
+              ┌────────────────────────────────┐
+              │ Upload Queue (in-memory index) │
               └────────────────────────────────┘
 ```
 
@@ -387,7 +387,7 @@ Unified API combining all components above.
 | `stage_l1(id, data)` | Insert into L1 + LRU as `MemoryOnly` |
 | `commit_l2(id, data)` | Enqueue one L2 commit into bounded scheduler |
 | `commit_l2_batch(blocks)` | Consume and enqueue `Vec<(ObjectId, Bytes)>` into bounded scheduler (applies backpressure on full queue) |
-| `submit_upload(ino, offset, id)` | Enqueue for S3 upload via journal |
+| `submit_upload(ino, offset, id)` | Enqueue for S3 upload in bounded in-memory queue (intent persisted in `BlockStore` flags) |
 | `complete_upload(pending)` | Unpin block in LRU |
 | `evict_one_l1()` | Demote one block from L1 |
 | `evict_one_l2()` | Remove one block from L2 |
@@ -435,14 +435,14 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   ├─ stage upload payload window        ← retry-friendly transient RAM source for uploader
   ├─ Batch metadata commit (local staged refs only)
   ├─ commit_l2_batch() enqueue          ← consumes owned batch, bounded queue + fixed workers
-  └─ submit_upload(..., content_epoch)  ← journal + S3 queue
+  └─ submit_upload(..., content_epoch)  ← in-memory queue + S3 queue
 ```
 
 The background flusher runs every 10ms and drains continuously (keeps processing while data exists).
 Freshly materialized blocks now also seed a bounded transient upload-payload
 stage in RAM. Upload workers clone payloads from that stage first and only fall
 back to L1/L2 rereads when the stage entry was evicted or the upload was
-recovered from journal after restart. The stage budget is adaptive rather than
+replayed from `BlockStore` DIRTY state after restart. The stage budget is adaptive rather than
 fixed: it tracks the upload dispatch window, expands under queue pressure or
 staging misses, and contracts again when foreground pressure drops.
 

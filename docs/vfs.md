@@ -60,7 +60,7 @@ the capacity limit is reached.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `meta_path` | — | Path to redb database |
-| `cache_dir` | — | Root for `BlockStore`, compatibility cache data, and journals |
+| `cache_dir` | — | Root for `BlockStore` plus compatibility cache/ingress artifacts |
 | `cache_size` | 100 GiB | L2 disk cache budget |
 | `memory_adaptive` | `true` | Adaptive memory controller (SFS-130): soft target 8 GiB, ceiling 50% RAM. Initial L1 = min(4 GiB, 25% RAM). ReadHeavy dirty budget 10%. Retreat threshold 85% L1. Emergency transitions logged at `warn`. |
 | `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
@@ -256,7 +256,7 @@ Adaptive upload control:
   `effective_penalty_ms = max(adaptive_penalty_ms - waited_upload_delay_ms, 0)`.
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
 - upload workers probe L1 before taking upload local-I/O slots, and true L2 fallback rereads are deferred while foreground demand is active.
-- recovered journal uploads and staging evictions still fall back to normal cache rereads when needed, so L2 remains the correctness fallback rather than the hot path.
+- recovered dirty uploads (replayed from `BlockStore` flags) and staging evictions still fall back to normal cache rereads when needed, so L2 remains the correctness fallback rather than the hot path.
 - local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
 - QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.
 - shutdown path suppresses noisy requeue/warn loops for QoS failures triggered by uploader cancellation.
@@ -569,7 +569,7 @@ Namespace mutation updates are deterministic:
 - on create/mkdir/symlink/link: insert positive entry
 - on unlink/rmdir: insert negative entry
 - on rename: source entry becomes negative, destination becomes positive
-- deleted file blocks are removed from L1/L2 promptly; if a block is pinned by an in-flight upload, VFS cancels that inode's in-flight upload and finalizes cleanup via pending-deletion journal + cache eviction path
+- deleted file blocks are removed from L1/L2 promptly; if a block is pinned by an in-flight upload, VFS cancels that inode's in-flight upload and finalizes cleanup via pending-deletion metadata + cache eviction path
 - parent directory generation is bumped only for affected parent directories
 - broad remote namespace apply events bump global namespace epoch
 
