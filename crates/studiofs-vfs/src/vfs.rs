@@ -4211,6 +4211,7 @@ impl StudioVfs {
         }
 
         if !dirty_set.is_empty() {
+            let orphan_count = dirty_set.len() as u64;
             for object_id in &dirty_set {
                 warn!(
                     object_id,
@@ -4220,6 +4221,10 @@ impl StudioVfs {
                 self.discard_staged_upload_payload(*object_id);
                 self.state.upload.pending_evictions.lock().remove(object_id);
             }
+            self.state
+                .upload
+                .upload_canceled_stale
+                .fetch_add(orphan_count, Ordering::Relaxed);
             info!(
                 orphan_dirty_blocks = dirty_set.len(),
                 "startup cleanup removed orphan dirty BlockStore entries"
