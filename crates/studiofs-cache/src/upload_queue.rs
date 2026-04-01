@@ -166,6 +166,11 @@ impl UploadQueue {
         self.pending_state.lock().ino_counts.contains_key(&ino)
     }
 
+    /// O(1) check whether a specific object id is currently pending upload.
+    pub fn has_pending_object(&self, object_id: u64) -> bool {
+        self.pending_state.lock().by_object.contains_key(&object_id)
+    }
+
     fn mark_done(&self) {
         // Saturating decrement — guards against double-complete races.
         let result = self

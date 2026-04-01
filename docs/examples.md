@@ -48,10 +48,10 @@ STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable \
 studiofs mount myvolume Z: --profile
 ```
 
-Mount using the conservative USB L2 cache profile (for external USB SSDs):
+Mount with explicit cache safety mode override:
 
 ```bash
-studiofs mount myvolume Z: --l2-profile usb
+STUDIOFS_CACHE_SAFETY_MODE=durable studiofs mount myvolume Z:
 ```
 
 Mount with a local S3 endpoint (for low-latency access in hybrid networks):
@@ -146,7 +146,7 @@ Repair mode currently:
 
 ## 9. Benchmark Cache (`test-cache`)
 
-Direct L2 benchmark (bypass VFS/mount):
+Direct-shim benchmark (bypass VFS/mount):
 
 ```bash
 studiofs test-cache \
@@ -162,7 +162,6 @@ studiofs test-cache \
   --warmup-runs 2 \
   --access-pattern mixed \
   --l1-limit 2GB \
-  --l2-limit 100GB \
   --profile=pyroscope
 ```
 
@@ -175,7 +174,7 @@ studiofs test-cache \
 
 Notes:
 - If `<path>` is not inside an active StudioFS mount, benchmark runs in
-  `direct-l2` mode and uses `<path>` as cache dir.
+  `direct-shim` mode and uses `<path>` as cache dir.
 - If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
   through that mounted process and writes temp workload files into
   `<path>/.studiofs-test-cache`.
@@ -200,16 +199,14 @@ Notes:
 - JSON report contains an `advanced_metrics` section with:
   - size-class boundaries (`small_max_bytes`, `medium_max_bytes`)
   - per-size-class throughput and latency percentiles (p50/p95/p99)
-  - L2 commit queue and upload queue backpressure/depth counters
-- `direct-l2` JSON output includes a `cache_pipeline` section with:
-  - `l2_read` / `l2_write` throughput + latency histograms
+  - upload queue depth counters
+- `direct-shim` JSON output includes a `cache_pipeline` section with:
+  - `shim_read` / `shim_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
-  - `l2_commit_scheduler` queue depth / worker activity / backpressure counters
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
-- `direct-l2` `advanced_metrics.cache_levels` adds explicit L1/L2 hit/miss
-  counters, bytes served from each level, and per-level lookup latency
-  distributions.
+- `direct-shim` `advanced_metrics.cache_levels` reports L1 hit/miss counters,
+  bytes served from L1, and L1 lookup latency distributions.
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
   `buffered_read_comparison`, which records `baseline-read`,
   `during-upload-read`, and `post-upload-read` phases plus the pending-upload
@@ -219,3 +216,4 @@ Notes:
   pending upload counts before and after each read phase.
 - `e2e` mode still keeps filesystem-level read/write reports; cache internals
   continue to be emitted through mount logs (`upload pipeline counters`).
+

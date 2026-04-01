@@ -48,11 +48,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::block_cache::{
-    BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
-    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS,
-};
-use studiofs_cache::l2_disk::L2IoPriority;
+use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::metrics::CacheMetrics;
@@ -604,7 +600,6 @@ const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_MAX_DIRTY_BYTES: usize = 12 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_SPILL_BYTES: usize = 64 * 1024 * 1024 * 1024usize;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
 const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
@@ -618,7 +613,6 @@ const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 2.0;
 const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
-const DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED: bool = true;
 const DEFAULT_UPLOAD_WORKER_COUNT: usize = 4;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 10;
@@ -776,9 +770,6 @@ pub struct VfsConfig {
     pub attr_read_cache_bytes: usize,
     /// Effective ACL cache entry budget.
     pub effective_acl_cache_capacity: usize,
-    /// Maximum bytes allowed in local NVMe spill.
-    /// Parsed from env via `parse_size_bytes` (for example `64GB`).
-    pub max_spill_bytes: usize,
     /// Maximum active ingress segment size.
     /// Parsed from env via `parse_size_bytes` (for example `1GB`).
     pub max_ingress_segment_bytes: u64,
@@ -820,8 +811,6 @@ pub struct VfsConfig {
     pub upload_stats_interval_secs: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
-    /// Whether background slab flushing is enabled.
-    pub background_slab_flush_enabled: bool,
     /// Periodic ingress checkpoint interval.
     pub ingress_checkpoint_interval_secs: u64,
     /// Immediate checkpoint trigger on uncheckpointed ingress bytes.
@@ -873,14 +862,6 @@ pub struct VfsConfig {
     pub fetch_prefetch_acquire_wait_ms: u64,
     /// Materializer batch limit for each drain cycle.
     pub max_drain_batch: usize,
-    /// Number of L2 commit scheduler workers.
-    pub l2_commit_workers: usize,
-    /// Queue capacity for pending L2 commit jobs.
-    pub l2_commit_queue_capacity: usize,
-    /// Timeout for L2 disk reads.
-    pub l2_read_timeout_ms: u64,
-    /// Timeout for L2 disk writes.
-    pub l2_write_timeout_ms: u64,
     /// Time to wait for remote visibility before publishing a manifest.
     pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
@@ -939,7 +920,6 @@ pub struct VfsConfigRaw {
     pub attr_read_cache_capacity: Option<usize>,
     pub attr_read_cache_bytes: Option<usize>,
     pub effective_acl_cache_capacity: Option<usize>,
-    pub max_spill_bytes: Option<usize>,
     pub max_ingress_segment_bytes: Option<u64>,
     pub cache_safety_mode: Option<CacheSafetyMode>,
     pub principal: Option<String>,
@@ -960,7 +940,6 @@ pub struct VfsConfigRaw {
     pub upload_requeue_max_ms: Option<u64>,
     pub upload_stats_interval_secs: Option<u64>,
     pub slab_flush_interval_ms: Option<u64>,
-    pub background_slab_flush_enabled: Option<bool>,
     pub ingress_checkpoint_interval_secs: Option<u64>,
     pub ingress_checkpoint_min_append_bytes: Option<u64>,
     pub ingress_checkpoint_min_mutations: Option<u64>,
@@ -985,10 +964,6 @@ pub struct VfsConfigRaw {
     pub fetch_prefetch_reserve: Option<usize>,
     pub fetch_prefetch_acquire_wait_ms: Option<u64>,
     pub max_drain_batch: Option<usize>,
-    pub l2_commit_workers: Option<usize>,
-    pub l2_commit_queue_capacity: Option<usize>,
-    pub l2_read_timeout_ms: Option<u64>,
-    pub l2_write_timeout_ms: Option<u64>,
     pub publish_visibility_timeout_secs: Option<u64>,
     pub shutdown_metadata_flush_timeout_secs: Option<u64>,
     pub qos_accept_slots: Option<usize>,
@@ -1070,7 +1045,6 @@ impl VfsConfigRaw {
             attr_read_cache_capacity,
             attr_read_cache_bytes,
             effective_acl_cache_capacity,
-            max_spill_bytes,
             max_ingress_segment_bytes,
             cache_safety_mode,
             principal,
@@ -1091,7 +1065,6 @@ impl VfsConfigRaw {
             upload_requeue_max_ms,
             upload_stats_interval_secs,
             slab_flush_interval_ms,
-            background_slab_flush_enabled,
             ingress_checkpoint_interval_secs,
             ingress_checkpoint_min_append_bytes,
             ingress_checkpoint_min_mutations,
@@ -1116,10 +1089,6 @@ impl VfsConfigRaw {
             fetch_prefetch_reserve,
             fetch_prefetch_acquire_wait_ms,
             max_drain_batch,
-            l2_commit_workers,
-            l2_commit_queue_capacity,
-            l2_read_timeout_ms,
-            l2_write_timeout_ms,
             publish_visibility_timeout_secs,
             shutdown_metadata_flush_timeout_secs,
             qos_accept_slots,
@@ -1171,7 +1140,6 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.attr_read_cache_capacity = cfg.attr_read_cache_capacity.max(1);
     cfg.attr_read_cache_bytes = cfg.attr_read_cache_bytes.max(1);
     cfg.effective_acl_cache_capacity = cfg.effective_acl_cache_capacity.max(1);
-    cfg.max_spill_bytes = cfg.max_spill_bytes.max(1);
     cfg.max_ingress_segment_bytes = cfg.max_ingress_segment_bytes.max(1);
     cfg.fetch_min_window = cfg.fetch_min_window.max(1.0);
     cfg.fetch_decrease_cooldown_secs = cfg.fetch_decrease_cooldown_secs.max(1);
@@ -1190,10 +1158,6 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
     cfg.upload_fg_read_latency_sticky_windows = cfg.upload_fg_read_latency_sticky_windows.max(1);
     cfg.max_drain_batch = cfg.max_drain_batch.max(1);
-    cfg.l2_commit_workers = cfg.l2_commit_workers.max(1);
-    cfg.l2_commit_queue_capacity = cfg.l2_commit_queue_capacity.max(1);
-    cfg.l2_read_timeout_ms = cfg.l2_read_timeout_ms.max(1);
-    cfg.l2_write_timeout_ms = cfg.l2_write_timeout_ms.max(1);
     cfg.publish_visibility_timeout_secs = cfg.publish_visibility_timeout_secs.max(1);
     cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
     cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
@@ -1253,7 +1217,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             attr_read_cache_capacity: Some(cfg.attr_read_cache_capacity),
             attr_read_cache_bytes: Some(cfg.attr_read_cache_bytes),
             effective_acl_cache_capacity: Some(cfg.effective_acl_cache_capacity),
-            max_spill_bytes: Some(cfg.max_spill_bytes),
             max_ingress_segment_bytes: Some(cfg.max_ingress_segment_bytes),
             cache_safety_mode: Some(cfg.cache_safety_mode),
             principal: Some(cfg.principal),
@@ -1274,7 +1237,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
             upload_stats_interval_secs: Some(cfg.upload_stats_interval_secs),
             slab_flush_interval_ms: Some(cfg.slab_flush_interval_ms),
-            background_slab_flush_enabled: Some(cfg.background_slab_flush_enabled),
             ingress_checkpoint_interval_secs: Some(cfg.ingress_checkpoint_interval_secs),
             ingress_checkpoint_min_append_bytes: Some(cfg.ingress_checkpoint_min_append_bytes),
             ingress_checkpoint_min_mutations: Some(cfg.ingress_checkpoint_min_mutations),
@@ -1299,10 +1261,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             fetch_prefetch_reserve: Some(cfg.fetch_prefetch_reserve),
             fetch_prefetch_acquire_wait_ms: Some(cfg.fetch_prefetch_acquire_wait_ms),
             max_drain_batch: Some(cfg.max_drain_batch),
-            l2_commit_workers: Some(cfg.l2_commit_workers),
-            l2_commit_queue_capacity: Some(cfg.l2_commit_queue_capacity),
-            l2_read_timeout_ms: Some(cfg.l2_read_timeout_ms),
-            l2_write_timeout_ms: Some(cfg.l2_write_timeout_ms),
             publish_visibility_timeout_secs: Some(cfg.publish_visibility_timeout_secs),
             shutdown_metadata_flush_timeout_secs: Some(cfg.shutdown_metadata_flush_timeout_secs),
             qos_accept_slots: Some(cfg.qos_accept_slots),
@@ -1350,7 +1308,6 @@ impl Default for VfsConfig {
             attr_read_cache_capacity: DEFAULT_ATTR_READ_CACHE_CAPACITY,
             attr_read_cache_bytes: DEFAULT_ATTR_READ_CACHE_BYTES,
             effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
-            max_spill_bytes: DEFAULT_MAX_SPILL_BYTES,
             max_ingress_segment_bytes: DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
             cache_safety_mode: CacheSafetyMode::Fast,
             principal: "*".to_string(),
@@ -1371,7 +1328,6 @@ impl Default for VfsConfig {
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
             slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
-            background_slab_flush_enabled: DEFAULT_BACKGROUND_SLAB_FLUSH_ENABLED,
             ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
             ingress_checkpoint_min_append_bytes: DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES,
             ingress_checkpoint_min_mutations: DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS,
@@ -1396,10 +1352,6 @@ impl Default for VfsConfig {
             fetch_prefetch_reserve: DEFAULT_FETCH_PREFETCH_RESERVE,
             fetch_prefetch_acquire_wait_ms: DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
             max_drain_batch: DEFAULT_MAX_DRAIN_BATCH,
-            l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
-            l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
-            l2_read_timeout_ms: DEFAULT_L2_READ_TIMEOUT_MS,
-            l2_write_timeout_ms: DEFAULT_L2_WRITE_TIMEOUT_MS,
             publish_visibility_timeout_secs: DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: DEFAULT_QOS_ACCEPT_SLOTS,
@@ -3474,7 +3426,7 @@ pub struct StudioVfs {
     data_write: Arc<DataStore>,
     /// Cache v2 single-file store used by the foreground read path.
     block_store: Arc<BlockStore>,
-    /// Unified two-level block cache (L1 RAM + L2 NVMe) with upload queue.
+    /// Compatibility shim for upload queue orchestration and L1 staging.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
     block_size: u32,
@@ -4334,7 +4286,6 @@ impl StudioVfs {
             let attr_read_cache_capacity = config.attr_read_cache_capacity;
             let attr_read_cache_bytes = config.attr_read_cache_bytes;
             let effective_acl_cache_capacity = config.effective_acl_cache_capacity;
-            let max_spill_bytes = config.max_spill_bytes;
             let cache_safety_mode = config.cache_safety_mode;
             let spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
             let ingress_wal = IngressWal::new(spill_dir, config.max_ingress_segment_bytes);
@@ -4354,12 +4305,8 @@ impl StudioVfs {
                 .map_err(|e| VfsError::Other(format!("failed to open block store: {e}")))?,
             );
 
-            // Init unified block cache (L1 RAM + upload queue; legacy L2 remains for upload fallback)
-            let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
-            cache_config.l2_commit_workers = config.l2_commit_workers;
-            cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity;
-            cache_config.l2_read_timeout = Duration::from_millis(config.l2_read_timeout_ms);
-            cache_config.l2_write_timeout = Duration::from_millis(config.l2_write_timeout_ms);
+            // Init BlockCache compatibility shim (L1 staging + upload queue).
+            let cache_config = BlockCacheConfig::new(cache_dir, memory_limit);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
 
             // Init ReadAhead tracker + prefetch channel
@@ -4544,7 +4491,6 @@ impl StudioVfs {
                 upload_fg_read_latency_sticky_windows,
                 max_dirty_bytes,
                 max_xattr_bytes,
-                max_spill_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
                 path_shortcut_cache_capacity,
@@ -8590,13 +8536,11 @@ impl StudioVfs {
 
                 // Remove all blocks and mark for GC
                 let removed_ids = meta.remove_file_blocks(attr.ino)?;
-                let l2_before = self.block_cache.l2_bytes();
                 info!(
-                    "unlink ino={}: removed {} block refs, object_ids={:?}, l2_before={}",
+                    "unlink ino={}: removed {} block refs, object_ids={:?}",
                     attr.ino,
                     removed_ids.len(),
                     removed_ids,
-                    l2_before,
                 );
 
                 // Add to pending deletions (for eventual S3 deletion via background GC)
@@ -8620,14 +8564,6 @@ impl StudioVfs {
 
                 // Immediately evict all cached blocks for this inode — no need to wait for GC.
                 self.evict_inode_from_caches(attr.ino, &removed_ids).await;
-
-                let l2_after = self.block_cache.l2_bytes();
-                info!(
-                    "unlink ino={}: l2_after={}, freed={} bytes",
-                    attr.ino,
-                    l2_after,
-                    l2_before.saturating_sub(l2_after),
-                );
 
                 // Clear dirty attrs and read-through cache
                 self.clear_inode_incarnation(attr.ino);
@@ -10618,37 +10554,24 @@ impl StudioVfs {
                     materialize_batches_inflight = materialize_batches.inflight_batches,
                     materialize_batches_inflight_peak = materialize_batches.inflight_batches_peak,
                     materialize_batch_duration_histogram = ?materialize_batches.duration_histogram.bucket_counts,
-                    cache_l2_read_ops = cache_pipeline.l2_read.ops,
-                    cache_l2_read_bytes = cache_pipeline.l2_read.bytes,
-                    cache_l2_read_total_latency_ns = cache_pipeline.l2_read.total_latency_ns,
-                    cache_l2_read_max_latency_ns = cache_pipeline.l2_read.max_latency_ns,
-                    cache_l2_read_latency_histogram = ?cache_pipeline.l2_read.latency_histogram.bucket_counts,
-                    cache_l2_write_ops = cache_pipeline.l2_write.ops,
-                    cache_l2_write_bytes = cache_pipeline.l2_write.bytes,
-                    cache_l2_write_total_latency_ns = cache_pipeline.l2_write.total_latency_ns,
-                    cache_l2_write_max_latency_ns = cache_pipeline.l2_write.max_latency_ns,
-                    cache_l2_write_latency_histogram = ?cache_pipeline.l2_write.latency_histogram.bucket_counts,
-                    cache_l2_commit_queue_depth = cache_pipeline.l2_commit_scheduler.queue_depth,
-                    cache_l2_commit_queue_depth_peak = cache_pipeline.l2_commit_scheduler.queue_depth_peak,
-                    cache_l2_commit_queue_capacity = cache_pipeline.l2_commit_scheduler.queue_capacity,
-                    cache_l2_commit_workers_configured = cache_pipeline.l2_commit_scheduler.configured_workers,
-                    cache_l2_commit_workers_active = cache_pipeline.l2_commit_scheduler.active_workers,
-                    cache_l2_commit_workers_active_peak = cache_pipeline.l2_commit_scheduler.active_workers_peak,
-                    cache_l2_commit_submitted = cache_pipeline.l2_commit_scheduler.submitted,
-                    cache_l2_commit_completed = cache_pipeline.l2_commit_scheduler.completed,
-                    cache_l2_commit_failed = cache_pipeline.l2_commit_scheduler.failed,
-                    cache_l2_commit_backpressure_events = cache_pipeline.l2_commit_scheduler.backpressure_events,
-                    cache_l2_commit_backpressure_wait_total_ns = cache_pipeline.l2_commit_scheduler.backpressure_wait_total_ns,
-                    cache_l2_commit_backpressure_wait_max_ns = cache_pipeline.l2_commit_scheduler.backpressure_wait_max_ns,
-                    cache_l2_commit_backpressure_wait_histogram = ?cache_pipeline.l2_commit_scheduler.backpressure_wait_histogram.bucket_counts,
+                    cache_shim_read_ops = cache_pipeline.shim_read.ops,
+                    cache_shim_read_bytes = cache_pipeline.shim_read.bytes,
+                    cache_shim_read_total_latency_ns = cache_pipeline.shim_read.total_latency_ns,
+                    cache_shim_read_max_latency_ns = cache_pipeline.shim_read.max_latency_ns,
+                    cache_shim_read_latency_histogram = ?cache_pipeline.shim_read.latency_histogram.bucket_counts,
+                    cache_shim_write_ops = cache_pipeline.shim_write.ops,
+                    cache_shim_write_bytes = cache_pipeline.shim_write.bytes,
+                    cache_shim_write_total_latency_ns = cache_pipeline.shim_write.total_latency_ns,
+                    cache_shim_write_max_latency_ns = cache_pipeline.shim_write.max_latency_ns,
+                    cache_shim_write_latency_histogram = ?cache_pipeline.shim_write.latency_histogram.bucket_counts,
                     upload_queue_depth = cache_pipeline.upload_queue.pending_depth,
                     upload_queue_depth_peak = cache_pipeline.upload_queue.pending_depth_peak,
                     upload_queue_submitted = cache_pipeline.upload_queue.submitted,
                     upload_queue_completed = cache_pipeline.upload_queue.completed,
                     upload_queue_requeued = cache_pipeline.upload_queue.requeued,
                     upload_queue_canceled = cache_pipeline.upload_queue.canceled,
-                    cache_l2_batch_inflight = cache_pipeline.materialize_batches.inflight_batches,
-                    cache_l2_batch_inflight_peak = cache_pipeline.materialize_batches.inflight_batches_peak,
+                    cache_shim_batch_inflight = cache_pipeline.materialize_batches.inflight_batches,
+                    cache_shim_batch_inflight_peak = cache_pipeline.materialize_batches.inflight_batches_peak,
                     upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
                     qos_accept_available = self.qos.accept_available(),
                     qos_materialize_available = self.qos.materialize_available(),
@@ -10750,7 +10673,6 @@ impl StudioVfs {
                 debug!(
                     l1_evictions = self.block_cache.l1_eviction_count(),
                     l1_hits = self.block_cache.l1_hit_count(),
-                    l2_hits = self.block_cache.l2_hit_count(),
                     l1_bytes = self.block_cache.l1_bytes(),
                     l1_max_bytes = self.block_cache.l1_max_bytes(),
                     block_store_allocated_bytes = block_store_metrics.allocated_bytes,

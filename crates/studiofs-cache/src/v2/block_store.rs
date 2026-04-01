@@ -1361,7 +1361,7 @@ impl BlockStore {
     }
 
     fn evict_for_low_disk_headroom(&self, required_growth_bytes: u64) -> (u64, u64) {
-        let Some((free, total)) = crate::l2_disk::get_free_disk_space(&self.config.cache_dir)
+        let Some((free, total)) = crate::v2::platform::get_free_disk_space(&self.config.cache_dir)
         else {
             return (0, 0);
         };
@@ -1394,7 +1394,7 @@ impl BlockStore {
                 "low disk headroom: emergency cache eviction pass completed"
             );
             if let Some((free_after, _)) =
-                crate::l2_disk::get_free_disk_space(&self.config.cache_dir)
+                crate::v2::platform::get_free_disk_space(&self.config.cache_dir)
                 && free_after <= free
             {
                 warn!(

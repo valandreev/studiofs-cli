@@ -101,7 +101,6 @@ pub struct PressureSignals {
     pub l1_max_bytes: u64,
     pub l1_eviction_count: u64,
     pub l1_hits: u64,
-    pub l2_hits: u64,
     pub dirty_mem_bytes: usize,
     pub aimd_window: f64,
 }
@@ -467,7 +466,6 @@ impl MemoryEnvelope {
             l1_max_bytes: vfs.block_cache().l1_max_bytes(),
             l1_eviction_count: vfs.block_cache().l1_eviction_count(),
             l1_hits: vfs.block_cache().l1_hit_count(),
-            l2_hits: vfs.block_cache().l2_hit_count(),
             dirty_mem_bytes: ingress.dirty_mem_bytes,
             aimd_window: vfs.fetch_scheduler().window(),
         }
@@ -769,7 +767,6 @@ mod tests {
             l1_max_bytes: 2 * 1024 * 1024 * 1024,
             l1_eviction_count: 0,
             l1_hits: 0,
-            l2_hits: 0,
             dirty_mem_bytes: 0,
             aimd_window: 4.0,
         }

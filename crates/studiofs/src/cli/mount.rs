@@ -1,9 +1,9 @@
 //! `studiofs mount` — mount a filesystem volume.
 
 use chrono::Utc;
-use clap::ValueEnum;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
@@ -11,30 +11,19 @@ use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
 
-const USB_L2_COMMIT_WORKERS: usize = 4;
-const USB_L2_COMMIT_QUEUE_CAPACITY: usize = 256;
-const USB_L2_IO_TIMEOUT_MS: u64 = 10_000;
-
 /// Initial L1 RAM budget before the adaptive envelope takes over.
 /// Capped at 25 % of total RAM so low-memory machines don't overshoot.
 fn initial_l1_bytes() -> u64 {
-    const DEFAULT_L1: u64 = 4 * 1024 * 1024 * 1024;
+    const DEFAULT_INITIAL_L1_CAP_BYTES: u64 = DEFAULT_L1_SIZE * 2;
     let mut sys = System::new();
     sys.refresh_memory();
     let total_ram = sys.total_memory();
     if total_ram == 0 {
         // Fall back to a sane default if sysinfo fails to report total memory.
-        return DEFAULT_L1;
+        return DEFAULT_INITIAL_L1_CAP_BYTES;
     }
     let quarter_ram = total_ram / 4;
-    quarter_ram.min(DEFAULT_L1)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
-pub enum L2Profile {
-    #[default]
-    Default,
-    Usb,
+    quarter_ram.min(DEFAULT_INITIAL_L1_CAP_BYTES)
 }
 
 fn parse_positive_size_arg(raw: &str) -> anyhow::Result<u64> {
@@ -76,19 +65,6 @@ fn parse_env_u64(key: &str) -> Option<u64> {
         .filter(|v| *v > 0)
 }
 
-fn apply_l2_profile(mut config: VfsConfigRaw, profile: L2Profile) -> VfsConfigRaw {
-    match profile {
-        L2Profile::Default => config,
-        L2Profile::Usb => {
-            config.l2_commit_workers = Some(USB_L2_COMMIT_WORKERS);
-            config.l2_commit_queue_capacity = Some(USB_L2_COMMIT_QUEUE_CAPACITY);
-            config.l2_read_timeout_ms = Some(USB_L2_IO_TIMEOUT_MS);
-            config.l2_write_timeout_ms = Some(USB_L2_IO_TIMEOUT_MS);
-            config
-        }
-    }
-}
-
 fn parse_env_u64_any(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
@@ -98,12 +74,6 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-}
-
-fn parse_env_bool(key: &str) -> Option<bool> {
-    let value = std::env::var(key).ok()?;
-    let value = value.trim().to_ascii_lowercase();
-    Some(matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn parse_env_cache_safety_mode(key: &str) -> Option<CacheSafetyMode> {
@@ -150,7 +120,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     }
 
     set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
-    set_size!("STUDIOFS_MAX_SPILL_BYTES", max_spill_bytes);
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Ok(bytes) = parse_positive_size_arg(&v)
     {
@@ -196,13 +165,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
         prefetch_pause_on_neterr_ms
     );
     set_usize!("STUDIOFS_MAX_DRAIN_BATCH", max_drain_batch);
-    set_usize!("STUDIOFS_L2_COMMIT_WORKERS", l2_commit_workers);
-    set_usize!(
-        "STUDIOFS_L2_COMMIT_QUEUE_CAPACITY",
-        l2_commit_queue_capacity
-    );
-    set_u64!("STUDIOFS_L2_READ_TIMEOUT_MS", l2_read_timeout_ms);
-    set_u64!("STUDIOFS_L2_WRITE_TIMEOUT_MS", l2_write_timeout_ms);
     set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
     set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
     set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);
@@ -267,15 +229,10 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     );
     set_u64!("STUDIOFS_UPLOAD_RETRY_BASE_MS", upload_retry_base_ms);
     set_u64!("STUDIOFS_UPLOAD_RETRY_MAX_MS", upload_retry_max_ms);
-    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
-        if interval_ms > 0 {
-            config.slab_flush_interval_ms = Some(interval_ms);
-        } else {
-            config.background_slab_flush_enabled = Some(false);
-        }
-    }
-    if let Some(disable) = parse_env_bool("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH") {
-        config.background_slab_flush_enabled = Some(!disable);
+    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS")
+        && interval_ms > 0
+    {
+        config.slab_flush_interval_ms = Some(interval_ms);
     }
     set_u64!(
         "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
@@ -370,7 +327,6 @@ pub fn run(
     principal: Option<&str>,
     foreground: bool,
     detach: bool,
-    l2_profile: L2Profile,
     profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
@@ -381,7 +337,6 @@ pub fn run(
     let cache_dir = resolved_cache_dir;
     let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
     vfs_config_raw = overlay_vfs_env(vfs_config_raw);
-    vfs_config_raw = apply_l2_profile(vfs_config_raw, l2_profile);
     if let Some(principal) = principal {
         vfs_config_raw.principal = Some(principal.to_string());
     }
@@ -396,14 +351,6 @@ pub fn run(
     let vfs_config = vfs_config_raw
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
-    info!(
-        l2_profile = ?l2_profile,
-        l2_commit_workers = vfs_config.l2_commit_workers,
-        l2_commit_queue_capacity = vfs_config.l2_commit_queue_capacity,
-        l2_read_timeout_ms = vfs_config.l2_read_timeout_ms,
-        l2_write_timeout_ms = vfs_config.l2_write_timeout_ms,
-        "configured L2 cache profile"
-    );
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
 
     // Validate endpoint override before any mount operations (SFS-95)

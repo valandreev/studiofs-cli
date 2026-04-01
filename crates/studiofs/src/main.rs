@@ -202,13 +202,8 @@ ENV TUNING:
   STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
   STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
   STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background local write-buffer drain wake interval (default: 10).
-  STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH  Disable background local write-buffer drain (default: 0).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
   STUDIOFS_MAX_DRAIN_BATCH          Max dirty WriteBuffer blocks persisted per drain cycle (default: 1024).
-  STUDIOFS_L2_COMMIT_WORKERS        L2 commit scheduler workers (default: 32).
-  STUDIOFS_L2_COMMIT_QUEUE_CAPACITY L2 commit scheduler queue depth before backpressure (default: 4096).
-  STUDIOFS_L2_READ_TIMEOUT_MS       L2 local-read timeout before cache-miss fallback (default: 5000).
-  STUDIOFS_L2_WRITE_TIMEOUT_MS      L2 local-write timeout per attempt (default: 5000).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Legacy durable-ingress segment rotation size (default: 256MiB).
   STUDIOFS_CACHE_SAFETY_MODE         Startup recovery policy for legacy ingress artifacts: fast|durable (default: fast).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Legacy durable-ingress checkpoint interval (default: 30).
@@ -392,9 +387,6 @@ EXAMPLES:
     studiofs mount myvolume Z: --memory-limit 4GB --cache-size 500GB \\
       --cache-dir D:\\cache\\studiofs
 
-  External USB SSD profile (lower L2 concurrency + tighter local L2 I/O timeouts):
-    studiofs mount myvolume Z: --l2-profile usb
-
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
 
@@ -454,10 +446,6 @@ ACL PRINCIPAL:
         /// Enable or disable Pyroscope profiling for the mount runtime.
         #[arg(long, num_args = 0..=1, default_missing_value = "pyroscope", value_enum)]
         profile: Option<cli::mount_profile_types::MountProfileMode>,
-
-        /// L2 disk-cache profile. Use `usb` for external USB SSDs.
-        #[arg(long, value_enum, default_value_t = cli::mount::L2Profile::Default)]
-        l2_profile: cli::mount::L2Profile,
 
         /// Mount a historical snapshot id as read-only.
         #[arg(long)]
@@ -590,13 +578,13 @@ WARNING: This action is irreversible.")]
         postgresql_adress: String,
     },
 
-    /// Run cache benchmarks (direct L2 and mounted end-to-end)
+    /// Run cache benchmarks (direct shim and mounted end-to-end)
     TestCache {
         /// Target benchmark path.
         ///
         /// If path is inside an active StudioFS mount, benchmark runs end-to-end
         /// through that mounted process and stores temporary files under
-        /// `<path>/.studiofs-test-cache`. Otherwise benchmark runs direct L2 mode
+        /// `<path>/.studiofs-test-cache`. Otherwise benchmark runs direct-shim mode
         /// and treats this path as cache directory.
         path: PathBuf,
 
@@ -645,10 +633,6 @@ WARNING: This action is irreversible.")]
         /// In-memory L1 cache limit (e.g. 2GB).
         #[arg(long)]
         l1_limit: Option<String>,
-
-        /// On-disk L2 cache limit (e.g. 100GB).
-        #[arg(long)]
-        l2_limit: Option<String>,
 
         /// JSON report output path. Defaults to an auto-named file in the
         /// current working directory.
@@ -749,7 +733,6 @@ fn main() -> anyhow::Result<()> {
             principal,
             foreground,
             detach,
-            l2_profile,
             profile,
             snapshot_id,
             endpoint,
@@ -767,7 +750,6 @@ fn main() -> anyhow::Result<()> {
                 principal.as_deref(),
                 foreground,
                 detach,
-                l2_profile,
                 profile,
                 snapshot_id.as_deref(),
                 endpoint.as_deref(),
@@ -833,7 +815,6 @@ fn main() -> anyhow::Result<()> {
             sizes,
             access_pattern,
             l1_limit,
-            l2_limit,
             json_output,
             profile,
         } => {
@@ -850,7 +831,6 @@ fn main() -> anyhow::Result<()> {
                 sizes,
                 access_pattern,
                 l1_limit,
-                l2_limit,
                 profile,
                 json_output,
             )?;
@@ -1000,17 +980,6 @@ mod tests {
                 profile,
                 Some(cli::mount_profile_types::MountProfileMode::Off)
             )),
-            other => panic!("expected Mount, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn mount_parses_l2_profile_usb() {
-        let cli = parse(&["mount", "vol", "Z:", "--l2-profile", "usb"]).unwrap();
-        match cli.command {
-            Commands::Mount { l2_profile, .. } => {
-                assert_eq!(l2_profile, cli::mount::L2Profile::Usb);
-            }
             other => panic!("expected Mount, got {other:?}"),
         }
     }
@@ -1183,7 +1152,6 @@ mod tests {
                 medium_max,
                 access_pattern,
                 l1_limit,
-                l2_limit,
                 json_output,
                 profile,
                 ..
@@ -1203,7 +1171,6 @@ mod tests {
                     cli::test_cache::TestCacheAccessPattern::Sequential
                 ));
                 assert!(l1_limit.is_none());
-                assert!(l2_limit.is_none());
                 assert!(json_output.is_none());
                 assert!(profile.is_none());
             }
@@ -1237,8 +1204,6 @@ mod tests {
             "random",
             "--l1-limit",
             "4GB",
-            "--l2-limit",
-            "1TB",
             "--json-output",
             "reports/cache-run.json",
             "--profile=pyroscope",
@@ -1259,7 +1224,6 @@ mod tests {
                 warmup_runs,
                 sizes,
                 l1_limit,
-                l2_limit,
                 json_output,
                 profile,
                 ..
@@ -1279,7 +1243,6 @@ mod tests {
                 assert_eq!(warmup_runs, 2);
                 assert_eq!(sizes.unwrap(), "small=60,medium=30,large=10");
                 assert_eq!(l1_limit.unwrap(), "4GB");
-                assert_eq!(l2_limit.unwrap(), "1TB");
                 assert_eq!(
                     json_output.unwrap(),
                     PathBuf::from("reports/cache-run.json")

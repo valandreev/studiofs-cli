@@ -83,7 +83,6 @@ without requiring `discover`.
 studiofs mount <name> [<mount-point>] \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
-  [--l2-profile <default|usb>] \
   [--principal <name>] \
   [--snapshot-id <uuid>] \
   [--foreground] \
@@ -104,7 +103,6 @@ Notes:
 - `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
-- `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
 - Memory management is fully automatic via the adaptive MemoryEnvelope controller (SFS-130): soft target 8 GiB, hard ceiling 50% of total RAM. The controller grows budgets under I/O pressure and retreats when idle. The initial L1 cache is capped at `min(4 GiB, 25% RAM)` so low-memory machines don't overshoot before the envelope takes over.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
@@ -235,7 +233,6 @@ studiofs test-cache \
   [--warmup-runs <u32>] \
   [--access-pattern <sequential|random|mixed>] \
   [--l1-limit <e.g. 2GB>] \
-  [--l2-limit <e.g. 100GB>] \
   [--profile[=pyroscope]]
 ```
 
@@ -251,7 +248,6 @@ Defaults:
 - `--warmup-runs 0`
 - `--access-pattern sequential`
 - `--l1-limit 2GB`
-- `--l2-limit 100GB`
 - `--profile` disabled by default
 - `--profile=pyroscope` enables Pyroscope sampling; `--profile` without a
   value is accepted as shorthand for the same mode
@@ -268,7 +264,7 @@ Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_TENANT_ID`: optional Grafana Cloud / multi-tenant header
 
 Notes:
-- If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-l2`
+- If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-shim`
   mode and treats `<path>` as cache directory.
 - If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
   through the already running mounted process and uses
@@ -286,8 +282,7 @@ Notes:
 - JSON report includes `advanced_metrics`:
   - `size_class_boundaries` (`small_max_bytes`, `medium_max_bytes`)
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
-  - `queue_backpressure` with L2 commit queue depth/worker/backpressure percentiles
-  - direct-l2 only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
+  - direct-shim only: `cache_levels` with L1 hits, misses, bytes served, and lookup latency histograms
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
   `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
   `post-upload-read` rows plus the pending-upload observations used to gate
@@ -301,8 +296,8 @@ Notes:
   report:
   - `...-cpu.pprof.gz`
   - `...-memory.pprof.gz`
-- `direct-l2` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
-- Current built-in workload volumes are modest (`128MB` direct-l2, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
+- `direct-shim` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
+- Current built-in workload volumes are modest (`128MB` direct-shim, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
 
 ### `destroy`
 
@@ -400,7 +395,6 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
 | `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
 | `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
-| `STUDIOFS_MAX_SPILL_BYTES` | `64GB` | Legacy ingress-artifact budget retained for startup compatibility; new foreground writes do not spill into ingress |
 | `STUDIOFS_XATTR_MAX_BYTES` | `4MB` | Maximum bytes per xattr value when writing metadata (enforced in VFS before metadata persistence) |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
 | `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
@@ -412,11 +406,6 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max dirty `WriteBuffer` blocks persisted per local drain cycle |
-| `STUDIOFS_L2_COMMIT_WORKERS` | `32` | Number of bounded L2 commit scheduler workers |
-| `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `4096` | L2 commit queue capacity before enqueue backpressure |
-| `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
-| `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
-| `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` | `4096` | Capacity of L2 sync-read open-file descriptor LRU cache (set lower on hosts with strict FD limits) |
 | `STUDIOFS_FUSE_MAX_WRITE_BYTES` | `16777216` | FUSE kernel max single write request size (`fuser::KernelConfig::set_max_write`) |
 | `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` | `16777216` | FUSE kernel max readahead size (`fuser::KernelConfig::set_max_readahead`) |
 | `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
@@ -465,8 +454,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
-| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` disables background drain) |
-| `STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH` | `false` | Disables the background local write-buffer drain |
+| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` is ignored) |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
 | `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from initial L1 cache budget; dynamically resized by MemoryEnvelope` | Global transit-memory credit budget for active in-flight fetch/upload buffers (managed by adaptive envelope) |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
@@ -481,8 +469,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
 - legacy ingress artifact counters/checkpoint stats (expected to remain at zero on the Cache v2 foreground path unless recovering older artifacts)
 - local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
-- cache L2 read/write throughput and latency histograms
-- L2 commit scheduler counters (`cache_l2_commit_queue_depth`, `cache_l2_commit_queue_depth_peak`, `cache_l2_commit_workers_active`, `cache_l2_commit_workers_active_peak`, `cache_l2_commit_backpressure_events`)
+- cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
@@ -526,3 +513,4 @@ S3-compatible backend.
 | `STUDIOFS_S3_SECRET_KEY` | `studiofs123` | Test secret key |
 | `STUDIOFS_S3_BUCKET` | `studiofs-test` | Test bucket |
 | `STUDIOFS_TEST_PG_DSN` | none | PostgreSQL server DSN for ignored PG tests; StudioFS uses DB `studiofs` |
+

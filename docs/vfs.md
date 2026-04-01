@@ -17,7 +17,7 @@ Holds all runtime state:
 | `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
-| `block_cache` | `Arc<BlockCache>` | Compatibility cache helpers, promotion, and upload-queue plumbing |
+| `block_cache` | `Arc<BlockCache>` | Cache-v2 compatibility shim: upload-queue orchestration and lightweight hot payload staging |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |
@@ -67,17 +67,10 @@ the capacity limit is reached.
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |
 | `max_dirty_bytes` | 12 GiB | Local `WriteBuffer` memory limit before backpressure |
-| `l2_commit_workers` | 32 | Bounded L2 commit scheduler workers |
-| `l2_commit_queue_capacity` | 4096 | Bounded L2 commit queue capacity |
-| `l2_read_timeout_ms` | 5000 | Max wait for local L2 read before cache-miss fallback |
-| `l2_write_timeout_ms` | 5000 | Max wait for local L2 write attempt |
 | `upload_stats_interval_secs` | 1 | Upload pipeline/adaptive-control tick interval |
 | `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 latency target for upload throttling |
 | `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |
 | `upload_fg_read_latency_sticky_windows` | 2 | Keep last observed P90 for this many windows when samples pause |
-
-Mount profile note:
-- `studiofs mount --l2-profile usb` overrides L2 commit/write/read tuning for external USB SSD stability (workers=4, queue=256, read/write timeouts=10s).
 
 Local cache QoS:
 - foreground user reads/writes use the foreground L2 semaphore
@@ -329,9 +322,6 @@ Handle-aware read path:
 - WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
 - FUSE bridge uses `can_read_fh_sync_cached(...)` as a cheap probe to avoid
   output-buffer allocation on sync-cache misses.
-
-L2 sync descriptor cache budget:
-- `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` bounds the buffered sync-read open-file descriptor cache used by the local cache fast path.
 
 ## FetchScheduler (`fetch.rs`)
 
