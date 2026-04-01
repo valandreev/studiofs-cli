@@ -152,6 +152,7 @@ as acceptable best-effort metadata loss and repairs it via snapshot replay or
 
 > **Status:** Active. Legacy `l1_mem`, `l2_disk`, `lru_tracker`, and commit
 > scheduler modules were removed in SFS-143.
+> `BlockStore` (Cache v2) is the primary local-cache data plane.
 
 ## Architecture
 
@@ -191,7 +192,7 @@ two-tier algorithm apply consistently to all metadata caches.
 
 > Legacy sections below are historical only and no longer represent runtime code.
 
-### L1 Memory Cache (`l1_mem.rs`)
+### Historical: L1 Memory Cache (`l1_mem.rs`)
 
 In-memory block store using 64 sharded `HashMap<u64, Bytes>`.
 
@@ -206,7 +207,7 @@ In-memory block store using 64 sharded `HashMap<u64, Bytes>`.
 
 No internal ordering — the global LRU tracker decides which blocks to evict.
 
-### L2 Disk Cache (`l2_disk.rs`)
+### Historical: L2 Disk Cache (`l2_disk.rs`)
 
 File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 

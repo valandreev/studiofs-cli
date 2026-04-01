@@ -8536,13 +8536,11 @@ impl StudioVfs {
 
                 // Remove all blocks and mark for GC
                 let removed_ids = meta.remove_file_blocks(attr.ino)?;
-                let l2_before = self.block_cache.l2_bytes();
                 info!(
-                    "unlink ino={}: removed {} block refs, object_ids={:?}, l2_before={}",
+                    "unlink ino={}: removed {} block refs, object_ids={:?}",
                     attr.ino,
                     removed_ids.len(),
                     removed_ids,
-                    l2_before,
                 );
 
                 // Add to pending deletions (for eventual S3 deletion via background GC)
@@ -8566,14 +8564,6 @@ impl StudioVfs {
 
                 // Immediately evict all cached blocks for this inode — no need to wait for GC.
                 self.evict_inode_from_caches(attr.ino, &removed_ids).await;
-
-                let l2_after = self.block_cache.l2_bytes();
-                info!(
-                    "unlink ino={}: l2_after={}, freed={} bytes",
-                    attr.ino,
-                    l2_after,
-                    l2_before.saturating_sub(l2_after),
-                );
 
                 // Clear dirty attrs and read-through cache
                 self.clear_inode_incarnation(attr.ino);
@@ -10683,7 +10673,6 @@ impl StudioVfs {
                 debug!(
                     l1_evictions = self.block_cache.l1_eviction_count(),
                     l1_hits = self.block_cache.l1_hit_count(),
-                    l2_hits = self.block_cache.l2_hit_count(),
                     l1_bytes = self.block_cache.l1_bytes(),
                     l1_max_bytes = self.block_cache.l1_max_bytes(),
                     block_store_allocated_bytes = block_store_metrics.allocated_bytes,

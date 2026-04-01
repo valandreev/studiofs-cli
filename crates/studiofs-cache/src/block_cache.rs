@@ -62,7 +62,6 @@ pub struct CacheReadTrace {
 #[derive(Debug, Clone, Default)]
 pub struct BlockCacheStats {
     pub l1_bytes: u64,
-    pub l2_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -126,7 +125,6 @@ pub struct BlockCache {
     l1_max_bytes: AtomicU64,
     l1_eviction_count: AtomicU64,
     l1_hit_count: AtomicU64,
-    l2_hit_count: AtomicU64,
     pinned: Mutex<HashSet<ObjectId>>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
@@ -145,7 +143,6 @@ impl BlockCache {
             l1_max_bytes: AtomicU64::new(config.l1_size.max(1)),
             l1_eviction_count: AtomicU64::new(0),
             l1_hit_count: AtomicU64::new(0),
-            l2_hit_count: AtomicU64::new(0),
             pinned: Mutex::new(HashSet::new()),
             upload_queue,
             metrics: CachePipelineMetrics::default(),
@@ -344,7 +341,6 @@ impl BlockCache {
     pub fn stats(&self) -> BlockCacheStats {
         BlockCacheStats {
             l1_bytes: self.l1_bytes(),
-            l2_bytes: self.l2_bytes(),
         }
     }
 
@@ -371,14 +367,6 @@ impl BlockCache {
 
     pub fn l1_hit_count(&self) -> u64 {
         self.l1_hit_count.load(Ordering::Relaxed)
-    }
-
-    pub fn l2_hit_count(&self) -> u64 {
-        self.l2_hit_count.load(Ordering::Relaxed)
-    }
-
-    pub fn l2_bytes(&self) -> u64 {
-        0
     }
 
     pub fn cache_dir(&self) -> &Path {

@@ -2457,7 +2457,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         volume: None,
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),
-        l2_bytes: Some(cache_stats.l2_bytes),
+        l2_bytes: None,
         cache_pipeline: Some(cache_pipeline),
         profile,
         advanced_metrics: Some(advanced_metrics),
