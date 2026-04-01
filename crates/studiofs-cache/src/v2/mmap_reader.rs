@@ -1,4 +1,4 @@
-//! ArcSwap-based mmap reader with lock-free remap on file growth.
+//! ArcSwap-based zero-copy mmap reader with lock-free remap on file growth.
 
 use std::fs::File;
 use std::io;
@@ -17,6 +17,18 @@ struct MmapGeneration {
     id: u64,
     mapped_len: u64,
     mmap: Mmap,
+}
+
+struct MmapBytesOwner {
+    generation: Arc<MmapGeneration>,
+    start: usize,
+    end: usize,
+}
+
+impl AsRef<[u8]> for MmapBytesOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.generation.mmap[self.start..self.end]
+    }
 }
 
 pub struct MmapReader {
@@ -66,10 +78,11 @@ impl MmapReader {
                     "requested mmap read end exceeds addressable space",
                 )
             })?;
-            // Cache v2 intentionally stays at one-copy reads for this phase.
-            // A future zero-copy path can bind Bytes to the generation Arc if
-            // profiling shows the copy is material on large blocks.
-            return Ok(Bytes::copy_from_slice(&generation.mmap[start..end]));
+            return Ok(Bytes::from_owner(MmapBytesOwner {
+                generation,
+                start,
+                end,
+            }));
         }
 
         let mut buf = vec![0u8; len];
@@ -84,7 +97,8 @@ impl MmapReader {
         data_len: usize,
         data_offset: usize,
         out: &mut [u8],
-    ) -> io::Result<(usize, u32)> {
+        verify_checksum: bool,
+    ) -> io::Result<(usize, Option<u32>)> {
         let len_u64 = u64::try_from(data_len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -117,7 +131,7 @@ impl MmapReader {
                 )
             })?;
             let payload = &generation.mmap[start..end];
-            let checksum = crc32fast::hash(payload);
+            let checksum = verify_checksum.then(|| crc32fast::hash(payload));
             if copy_len > 0 {
                 out[..copy_len].copy_from_slice(&payload[copy_start..copy_end]);
             }
@@ -127,7 +141,7 @@ impl MmapReader {
         let mut buf = vec![0u8; data_len];
         platform::pread(&self.file, &mut buf, offset)?;
         let _ = self.remap_if_needed(end);
-        let checksum = crc32fast::hash(&buf);
+        let checksum = verify_checksum.then(|| crc32fast::hash(&buf));
         if copy_len > 0 {
             out[..copy_len].copy_from_slice(&buf[copy_start..copy_end]);
         }
@@ -277,5 +291,24 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn read_returns_zero_copy_mmap_slice() {
+        let (_dir, file) = test_file();
+        file.set_len(PAGE_SIZE).unwrap();
+
+        let payload = b"zero-copy-mmap";
+        let offset = 128;
+        platform::pwrite(&file, payload, offset).unwrap();
+
+        let reader = MmapReader::new(&file, PAGE_SIZE).unwrap();
+        let got = reader.read(offset, payload.len()).unwrap();
+        let generation = reader.current.load_full();
+        let start = usize::try_from(offset).unwrap();
+        let end = start + payload.len();
+
+        assert_eq!(&got[..], payload);
+        assert_eq!(got.as_ptr(), generation.mmap[start..end].as_ptr());
     }
 }

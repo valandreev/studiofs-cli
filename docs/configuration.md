@@ -414,6 +414,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_WINFSP_SECTOR_SIZE` | `4096` | WinFSP exposed sector size in bytes (must be positive and fit `u16`) |
 | `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` | `1048576` | WinFSP exposed allocation unit size in bytes (must be a positive multiple of sector size) |
 | `STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES` | `1073741824` | Minimum free-space floor (bytes) enforced by Cache v2 emergency eviction (`BlockStore`) |
+| `STUDIOFS_CACHE_VERIFY_READ_CHECKSUMS` | `true` | Cache v2 read-side payload CRC32 verification. Set to `false` to skip the full-block checksum on `get()` / `read_into()` hot reads |
 | `STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES` | `32MB` | Minimum completed full-block batch that `write()` coalesces before it pays the local `WriteBuffer -> BlockStore -> sync_data() -> metadata` durability boundary |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
