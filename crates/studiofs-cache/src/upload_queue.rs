@@ -97,17 +97,19 @@ impl UploadQueue {
             return;
         }
 
-        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        self.pending_count.fetch_add(1, Ordering::Release);
         if self.sender.send(op).is_err() {
-            self.remove_pending(object_id);
-            self.mark_done();
+            if self.remove_pending(object_id) {
+                self.mark_done();
+            }
         }
     }
 
     /// Mark an upload as complete.
     pub fn complete(&self, op: &PendingUpload) {
-        self.remove_pending(op.object_id);
-        self.mark_done();
+        if self.remove_pending(op.object_id) {
+            self.mark_done();
+        }
     }
 
     /// Requeue a failed upload for retry (does not increment pending count).
@@ -117,8 +119,9 @@ impl UploadQueue {
 
     /// Cancel a pending upload and decrement pending count.
     pub fn cancel(&self, op: &PendingUpload) {
-        self.remove_pending(op.object_id);
-        self.mark_done();
+        if self.remove_pending(op.object_id) {
+            self.mark_done();
+        }
     }
 
     /// Kept for API compatibility with older journal-backed behavior.
@@ -169,7 +172,7 @@ impl UploadQueue {
         // Saturating decrement — guards against double-complete races.
         let result = self
             .pending_count
-            .fetch_update(Ordering::Release, Ordering::Acquire, |v| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 if v > 0 { Some(v - 1) } else { None }
             });
         if result == Ok(1) {
@@ -190,7 +193,7 @@ impl UploadQueue {
         true
     }
 
-    fn remove_pending(&self, object_id: u64) {
+    fn remove_pending(&self, object_id: u64) -> bool {
         let mut state = self.pending_state.lock();
         if let Some(removed) = state.by_object.remove(&object_id)
             && let std::collections::hash_map::Entry::Occupied(mut e) =
@@ -200,7 +203,9 @@ impl UploadQueue {
             if *e.get() == 0 {
                 e.remove_entry();
             }
+            return true;
         }
+        false
     }
 }
 
@@ -256,6 +261,29 @@ mod tests {
         let op = rx.recv().await.unwrap();
         assert_eq!(op.object_id, 77);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_complete_does_not_undercount_other_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(10, 0, 100, 1);
+        queue.submit(11, 0, 101, 1);
+        assert_eq!(queue.pending_count(), 2);
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+
+        queue.complete(&first);
+        assert_eq!(queue.pending_count(), 1);
+
+        // Duplicate completion for the same object must be a no-op.
+        queue.complete(&first);
+        assert_eq!(queue.pending_count(), 1);
+
+        queue.complete(&second);
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test]

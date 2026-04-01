@@ -55,7 +55,7 @@ use studiofs_cache::block_cache::{
 use studiofs_cache::l2_disk::L2IoPriority;
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
+use studiofs_cache::v2::{BlockStore, BlockStoreConfig, derive_block_store_volume_uuid};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -73,7 +73,6 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::ingress_wal::{
     IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
@@ -675,11 +674,6 @@ const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 
-fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
-    Uuid::parse_str(volume_uuid)
-        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
-        .into_bytes()
-}
 #[derive(Clone)]
 struct DistributedFlock {
     op: Operator,
@@ -4199,6 +4193,10 @@ impl StudioVfs {
                 replay_ops.push((ino, offset, block_ref.object_id, attr.content_epoch));
                 self.record_live_extent(ino, block_index, block_ref.object_id, attr.content_epoch);
                 restored_live_extents = restored_live_extents.saturating_add(1);
+            }
+
+            if dirty_set.is_empty() {
+                break;
             }
         }
 

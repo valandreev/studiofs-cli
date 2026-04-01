@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use studiofs_cache::v2::format::{SUPERBLOCK_SIZE, Superblock};
 use studiofs_cache::v2::platform;
-use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
+use studiofs_cache::v2::{BlockStore, BlockStoreConfig, derive_block_store_volume_uuid};
 use studiofs_meta::counters;
+#[cfg(test)]
 use uuid::Uuid;
 
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
@@ -153,12 +154,6 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
     }
 
     Ok(stats)
-}
-
-fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
-    Uuid::parse_str(volume_uuid)
-        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
-        .into_bytes()
 }
 
 fn read_block_store_max_size(cache_dir: &Path) -> anyhow::Result<Option<u64>> {
