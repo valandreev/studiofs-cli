@@ -1034,7 +1034,7 @@ impl BlockStore {
         self.write_latency_max_ns.load(Ordering::Relaxed)
     }
 
-    /// Number of successful post-read dont-need hints issued.
+    /// Number of attempted post-read dont-need hints issued (best-effort).
     pub fn advisory_dont_need_count(&self) -> u64 {
         self.advisory_dont_need_count.load(Ordering::Relaxed)
     }
@@ -1393,6 +1393,18 @@ impl BlockStore {
                 evicted_bytes = bytes,
                 "low disk headroom: emergency cache eviction pass completed"
             );
+            if let Some((free_after, _)) =
+                crate::l2_disk::get_free_disk_space(&self.config.cache_dir)
+                && free_after <= free
+            {
+                warn!(
+                    free_bytes_before = free,
+                    free_bytes_after = free_after,
+                    evicted_blocks = blocks,
+                    evicted_bytes = bytes,
+                    "low disk headroom persists after emergency eviction; underlying filesystem may ignore hole-punch/dont-need hints"
+                );
+            }
         }
         (blocks, bytes)
     }

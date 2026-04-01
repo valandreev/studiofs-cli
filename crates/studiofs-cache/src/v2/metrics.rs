@@ -2,8 +2,8 @@
 //!
 //! [`CacheMetrics`] is a lightweight snapshot of all [`super::block_store::BlockStore`]
 //! counters, suitable for logging, health-check endpoints, or tracing spans.
-//! Values are lock-free snapshots intended for operational observability and
-//! benchmark comparisons.
+//! Values are inexpensive, point-in-time snapshots intended for operational
+//! observability and benchmark comparisons.
 
 use crate::v2::block_store::BlockStore;
 
@@ -41,7 +41,7 @@ pub struct CacheMetrics {
     pub write_bytes: u64,
     pub write_latency_total_ns: u64,
     pub write_latency_max_ns: u64,
-    /// Number of successful post-read dont-need advisory hints.
+    /// Number of attempted post-read dont-need advisory hints (best-effort).
     pub advisory_dont_need_count: u64,
 }
 
