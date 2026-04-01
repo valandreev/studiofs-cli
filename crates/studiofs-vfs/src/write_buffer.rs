@@ -748,23 +748,22 @@ impl StudioVfs {
             self.update_pending_incarnation_size(ino, attr.size);
         }
 
-        if has_full_blocks {
-            if !self
+        if has_full_blocks
+            && !self
                 .flush_dirty_full_write_buffer_blocks(
                     ino,
                     self.write_eager_flush_batch_bytes,
                     Some(base_attr.content_epoch),
                 )
                 .await?
+        {
+            let pending_after_write = self.total_pending_write_buffer_bytes();
+            if pending_before_write > 0
+                && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
             {
-                let pending_after_write = self.total_pending_write_buffer_bytes();
-                if pending_before_write > 0
-                    && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
-                {
-                    self.apply_write_buffer_backpressure(ino).await?;
-                }
-                return Ok(written as u32);
+                self.apply_write_buffer_backpressure(ino).await?;
             }
+            return Ok(written as u32);
         }
 
         let pending_after_write = self.total_pending_write_buffer_bytes();
