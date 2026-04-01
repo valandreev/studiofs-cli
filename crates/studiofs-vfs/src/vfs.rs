@@ -10377,7 +10377,6 @@ impl StudioVfs {
                     .unwrap_or(false) =>
             {
                 self.block_cache.complete_upload(&op);
-                self.block_store_mark_evictable_async(op.object_id).await?;
                 self.discard_staged_upload_payload(op.object_id);
                 debug!(
                     ino = op.ino,
