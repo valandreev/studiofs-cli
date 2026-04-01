@@ -121,6 +121,7 @@ dirty `WriteBuffer` blocks for this inode
   ├─ Take a point-in-time snapshot of dirty blocks
   ├─ Reserve/reuse per-block object IDs
   ├─ `BlockStore::put(...)` committed payloads locally
+  │   using bounded chunked pipelining (not strict 1-by-1 await)
   ├─ `BlockStore::sync_data()`
   ├─ Persist extent metadata + attrs in local metadata
   ├─ Commit `WriteBuffer` state only for bytes that actually persisted

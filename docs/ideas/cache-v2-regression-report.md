@@ -1,4 +1,8 @@
 # StudioFS Cache v2 Performance Regression Analysis
+
+> Status update (SFS-145): Root causes #2, #3, and #5 below have been
+> addressed in current code. This note is retained as historical analysis.
+
 ## Root Cause #1 (CRITICAL): Double `fsync` per 4MB block
 
 The write path in write_buffer.rs does this **for every full block batch**:
@@ -15,6 +19,9 @@ With the old 1-file-per-block design, `fdatasync` flushed a single small file an
 
 ## Root Cause #2 (HIGH): Sequential `put` with `spawn_blocking` per block
 
+Status: Mitigated. The write path now uses bounded chunked pipelining for
+`BlockStore::put(...)` calls instead of strict one-by-one awaits.
+
 In write_buffer.rs:
 
 ```rust
@@ -27,6 +34,9 @@ for block in &persisted_blocks {
 Each block goes through `spawn_blocking` → thread pool → `BlockStore::put()` → return. No pipelining. Even without the fsyncs, this serializes all I/O.
 
 ## Root Cause #3 (HIGH): `GetDiskFreeSpaceExW` on every `put`
+
+Status: Mitigated. Disk headroom is cached and refreshed periodically; refresh
+is concurrency-guarded so a single thread performs the syscall.
 
 In block_store.rs, `allocate_with_eviction` calls `evict_for_low_disk_headroom(alloc)` which calls `get_free_disk_space()` → `GetDiskFreeSpaceExW()` **on every single put**. This is a kernel round-trip (~0.5–1ms) that's completely unnecessary during normal operation.
 
@@ -42,6 +52,9 @@ self.file.set_len(needed_len)?;  // NTFS zero-fills the gap
 `preallocate_impl` is a **no-op on Windows** (only uses `fallocate` on Linux). `GROWTH_CHUNK = 256MB`, so `set_len` triggers ~256MB of NTFS zero-fill every time the cache file grows. This is done under the allocator lock, blocking all other puts.
 
 ## Root Cause #5 (MEDIUM): Unnecessary `file.metadata()?.len()` syscall per put
+
+Status: Mitigated. BlockStore tracks physical file length in memory and updates
+it after successful file growth.
 
 In `try_allocate_and_extend` (block_store.rs):
 
