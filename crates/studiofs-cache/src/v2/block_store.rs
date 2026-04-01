@@ -1298,6 +1298,9 @@ impl BlockStore {
                     a.free(offset, alloc);
                     return Err(error.into());
                 }
+                // Publish the new file length only after the physical growth
+                // has completed so Acquire readers never observe a length that
+                // still lacks backing storage.
                 self.file_len.store(needed_len, Ordering::Release);
             }
         }

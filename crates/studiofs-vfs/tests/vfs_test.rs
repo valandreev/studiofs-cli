@@ -9732,6 +9732,9 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
             post_elapsed <= MAX_SWEEP_DURATION,
             "post-upload sweep exceeded {MAX_SWEEP_DURATION:?}: baseline={baseline_elapsed:?}, during={during_elapsed:?}, post={post_elapsed:?}"
         );
+        // Keep the post-upload gate tolerant: on CI and slower Windows/macOS
+        // hosts, either an absolute floor or recovery toward baseline is a
+        // sufficient pass condition.
         assert!(
             during_throughput_mib_s >= 4.0
                 || during_throughput_mib_s >= baseline_throughput_mib_s * 0.25,
