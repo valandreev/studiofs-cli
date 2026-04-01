@@ -118,6 +118,9 @@ Implementation notes:
   so fallback recovery scans only pick up live blocks.
 - free paths issue best-effort hole-punch and `dont-need` hints, while file
   growth issues best-effort preallocation before `set_len()`.
+- on Windows, `blocks.data` is marked sparse when possible so NTFS can extend
+  the file without synchronous zero-fill; physical growth is serialized under
+  a dedicated file-growth mutex rather than the allocator lock.
 - Windows keeps the same best-effort contract for advisory/storage hints by
   treating common unsupported or denied Win32 responses as benign rather than
   surfacing them as cache read/write failures.

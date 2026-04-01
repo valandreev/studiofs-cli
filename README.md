@@ -210,6 +210,10 @@ Recent notes:
   readahead, and upload cache rereads now use `studiofs-cache` v2 as the primary
   committed cache, while async VFS workers route blocking local cache mutations
   through Tokio's blocking pool.
+- Reduced Windows cache-v2 growth stalls (SFS-146): the data file is marked
+  sparse on Windows when possible, physical growth is serialized separately
+  from allocator bookkeeping, and `set_len()` no longer holds the allocator
+  lock while NTFS extends the file.
 
 ## Documentation
 
