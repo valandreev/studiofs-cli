@@ -11189,6 +11189,11 @@ impl StudioVfs {
     /// Called at shutdown so the LRU state survives across remounts.
     pub async fn persist_cache(&self) {
         self.block_cache.shutdown().await;
+        if let Err(error) = self.block_store.persist_checkpoint() {
+            warn!(error = %error, "block store checkpoint failed during shutdown");
+        } else {
+            tracing::info!("block store checkpoint persisted");
+        }
         tracing::info!("block cache checkpoint persisted");
     }
 

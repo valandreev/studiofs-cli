@@ -1002,14 +1002,26 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Graceful shutdown: flush data and release the file handle.
+    /// Persist the current index checkpoint and clear the WAL.
     ///
-    /// Prefer explicit `close()` over relying on [`Drop`].
-    pub fn close(self) -> Result<(), BlockStoreError> {
+    /// This is the shutdown checkpoint used by VFS so remounts can reopen the
+    /// BlockStore from metadata instead of rescanning the entire data file.
+    pub fn persist_checkpoint(&self) -> Result<(), BlockStoreError> {
+        if self.synced.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         platform::fdatasync(&self.file)?;
         self.write_snapshot_and_clear_wal()?;
         self.synced.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Graceful shutdown: flush data and release the file handle.
+    ///
+    /// Prefer explicit `close()` over relying on [`Drop`].
+    pub fn close(self) -> Result<(), BlockStoreError> {
+        self.persist_checkpoint()
     }
 
     // -----------------------------------------------------------------------
@@ -2488,6 +2500,24 @@ mod tests {
             !store2.contains(2),
             "oldest clean block should be evicted after reopen"
         );
+    }
+
+    #[test]
+    fn persist_checkpoint_writes_snapshot_without_consuming_store() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+
+        let store = BlockStore::open(config.clone()).unwrap();
+        store.put(1, b"checkpoint", true).unwrap();
+        store.persist_checkpoint().unwrap();
+
+        assert!(dir.path().join("blocks.idx").exists());
+
+        drop(store);
+
+        let reopened = BlockStore::open(config).unwrap();
+        assert_eq!(reopened.block_count(), 1);
+        assert_eq!(&reopened.get(1).unwrap()[..], b"checkpoint");
     }
 
     #[test]
