@@ -48,10 +48,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::block_cache::{
-    BlockCache, BlockCacheConfig, DEFAULT_L2_COMMIT_QUEUE_CAPACITY, DEFAULT_L2_COMMIT_WORKERS,
-    DEFAULT_L2_READ_TIMEOUT_MS, DEFAULT_L2_WRITE_TIMEOUT_MS, L2IoPriority,
-};
+use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::metrics::CacheMetrics;
@@ -865,14 +862,6 @@ pub struct VfsConfig {
     pub fetch_prefetch_acquire_wait_ms: u64,
     /// Materializer batch limit for each drain cycle.
     pub max_drain_batch: usize,
-    /// Number of L2 commit scheduler workers.
-    pub l2_commit_workers: usize,
-    /// Queue capacity for pending L2 commit jobs.
-    pub l2_commit_queue_capacity: usize,
-    /// Timeout for L2 disk reads.
-    pub l2_read_timeout_ms: u64,
-    /// Timeout for L2 disk writes.
-    pub l2_write_timeout_ms: u64,
     /// Time to wait for remote visibility before publishing a manifest.
     pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
@@ -975,10 +964,6 @@ pub struct VfsConfigRaw {
     pub fetch_prefetch_reserve: Option<usize>,
     pub fetch_prefetch_acquire_wait_ms: Option<u64>,
     pub max_drain_batch: Option<usize>,
-    pub l2_commit_workers: Option<usize>,
-    pub l2_commit_queue_capacity: Option<usize>,
-    pub l2_read_timeout_ms: Option<u64>,
-    pub l2_write_timeout_ms: Option<u64>,
     pub publish_visibility_timeout_secs: Option<u64>,
     pub shutdown_metadata_flush_timeout_secs: Option<u64>,
     pub qos_accept_slots: Option<usize>,
@@ -1104,10 +1089,6 @@ impl VfsConfigRaw {
             fetch_prefetch_reserve,
             fetch_prefetch_acquire_wait_ms,
             max_drain_batch,
-            l2_commit_workers,
-            l2_commit_queue_capacity,
-            l2_read_timeout_ms,
-            l2_write_timeout_ms,
             publish_visibility_timeout_secs,
             shutdown_metadata_flush_timeout_secs,
             qos_accept_slots,
@@ -1177,10 +1158,6 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
     cfg.upload_fg_read_latency_sticky_windows = cfg.upload_fg_read_latency_sticky_windows.max(1);
     cfg.max_drain_batch = cfg.max_drain_batch.max(1);
-    cfg.l2_commit_workers = cfg.l2_commit_workers.max(1);
-    cfg.l2_commit_queue_capacity = cfg.l2_commit_queue_capacity.max(1);
-    cfg.l2_read_timeout_ms = cfg.l2_read_timeout_ms.max(1);
-    cfg.l2_write_timeout_ms = cfg.l2_write_timeout_ms.max(1);
     cfg.publish_visibility_timeout_secs = cfg.publish_visibility_timeout_secs.max(1);
     cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
     cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
@@ -1284,10 +1261,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             fetch_prefetch_reserve: Some(cfg.fetch_prefetch_reserve),
             fetch_prefetch_acquire_wait_ms: Some(cfg.fetch_prefetch_acquire_wait_ms),
             max_drain_batch: Some(cfg.max_drain_batch),
-            l2_commit_workers: Some(cfg.l2_commit_workers),
-            l2_commit_queue_capacity: Some(cfg.l2_commit_queue_capacity),
-            l2_read_timeout_ms: Some(cfg.l2_read_timeout_ms),
-            l2_write_timeout_ms: Some(cfg.l2_write_timeout_ms),
             publish_visibility_timeout_secs: Some(cfg.publish_visibility_timeout_secs),
             shutdown_metadata_flush_timeout_secs: Some(cfg.shutdown_metadata_flush_timeout_secs),
             qos_accept_slots: Some(cfg.qos_accept_slots),
@@ -1379,10 +1352,6 @@ impl Default for VfsConfig {
             fetch_prefetch_reserve: DEFAULT_FETCH_PREFETCH_RESERVE,
             fetch_prefetch_acquire_wait_ms: DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
             max_drain_batch: DEFAULT_MAX_DRAIN_BATCH,
-            l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
-            l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
-            l2_read_timeout_ms: DEFAULT_L2_READ_TIMEOUT_MS,
-            l2_write_timeout_ms: DEFAULT_L2_WRITE_TIMEOUT_MS,
             publish_visibility_timeout_secs: DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: DEFAULT_QOS_ACCEPT_SLOTS,
@@ -3457,7 +3426,7 @@ pub struct StudioVfs {
     data_write: Arc<DataStore>,
     /// Cache v2 single-file store used by the foreground read path.
     block_store: Arc<BlockStore>,
-    /// Unified two-level block cache (L1 RAM + L2 NVMe) with upload queue.
+    /// Compatibility shim for upload queue orchestration and L1 staging.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
     block_size: u32,
@@ -4336,12 +4305,8 @@ impl StudioVfs {
                 .map_err(|e| VfsError::Other(format!("failed to open block store: {e}")))?,
             );
 
-            // Init unified block cache (L1 RAM + upload queue; legacy L2 remains for upload fallback)
-            let mut cache_config = BlockCacheConfig::new(cache_dir, memory_limit, cache_size);
-            cache_config.l2_commit_workers = config.l2_commit_workers;
-            cache_config.l2_commit_queue_capacity = config.l2_commit_queue_capacity;
-            cache_config.l2_read_timeout = Duration::from_millis(config.l2_read_timeout_ms);
-            cache_config.l2_write_timeout = Duration::from_millis(config.l2_write_timeout_ms);
+            // Init BlockCache compatibility shim (L1 staging + upload queue).
+            let cache_config = BlockCacheConfig::new(cache_dir, memory_limit);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
 
             // Init ReadAhead tracker + prefetch channel

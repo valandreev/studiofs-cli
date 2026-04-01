@@ -29,50 +29,18 @@ pub enum L2IoPriority {
 
 /// Default L1 (RAM) size: 2 GiB.
 pub const DEFAULT_L1_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-/// Default L2 size retained for compatibility-only config surfaces.
-pub const DEFAULT_L2_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_DISK_FREE_RATIO: f64 = 0.10;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_L2_COMMIT_WORKERS: usize = 32;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_L2_COMMIT_QUEUE_CAPACITY: usize = 4096;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_L2_READ_TIMEOUT_MS: u64 = 5_000;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_L2_WRITE_TIMEOUT_MS: u64 = 5_000;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_L2_READ_BREAKER_TIMEOUT_THRESHOLD: u32 = 3;
-/// Compatibility default (unused by the v2-only shim).
-pub const DEFAULT_L2_READ_BREAKER_COOLDOWN_MS: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 pub struct BlockCacheConfig {
     pub l1_size: u64,
-    pub l2_size: u64,
     pub cache_dir: PathBuf,
-    pub disk_free_ratio: f64,
-    pub l2_commit_workers: usize,
-    pub l2_commit_queue_capacity: usize,
-    pub l2_read_timeout: Duration,
-    pub l2_write_timeout: Duration,
-    pub l2_read_breaker_timeout_threshold: u32,
-    pub l2_read_breaker_cooldown: Duration,
 }
 
 impl BlockCacheConfig {
-    pub fn new(cache_dir: impl Into<PathBuf>, l1_size: u64, l2_size: u64) -> Self {
+    pub fn new(cache_dir: impl Into<PathBuf>, l1_size: u64) -> Self {
         Self {
             l1_size,
-            l2_size,
             cache_dir: cache_dir.into(),
-            disk_free_ratio: DEFAULT_DISK_FREE_RATIO,
-            l2_commit_workers: DEFAULT_L2_COMMIT_WORKERS,
-            l2_commit_queue_capacity: DEFAULT_L2_COMMIT_QUEUE_CAPACITY,
-            l2_read_timeout: Duration::from_millis(DEFAULT_L2_READ_TIMEOUT_MS),
-            l2_write_timeout: Duration::from_millis(DEFAULT_L2_WRITE_TIMEOUT_MS),
-            l2_read_breaker_timeout_threshold: DEFAULT_L2_READ_BREAKER_TIMEOUT_THRESHOLD,
-            l2_read_breaker_cooldown: Duration::from_millis(DEFAULT_L2_READ_BREAKER_COOLDOWN_MS),
         }
     }
 }

@@ -48,10 +48,10 @@ STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable \
 studiofs mount myvolume Z: --profile
 ```
 
-Mount using the conservative USB L2 cache profile (for external USB SSDs):
+Mount with explicit cache safety mode override:
 
 ```bash
-studiofs mount myvolume Z: --l2-profile usb
+STUDIOFS_CACHE_SAFETY_MODE=durable studiofs mount myvolume Z:
 ```
 
 Mount with a local S3 endpoint (for low-latency access in hybrid networks):

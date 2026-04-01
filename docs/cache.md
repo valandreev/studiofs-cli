@@ -148,31 +148,25 @@ as acceptable best-effort metadata loss and repairs it via snapshot replay or
 
 ---
 
-## Cache v3 (compatibility path) — L1 + L2
+## Cache v2 Compatibility Shim
 
-> **Status:** Still active for compatibility helpers, upload-queue plumbing, and
-> fallback rereads while the foreground VFS path continues moving to v2.
+> **Status:** Active. Legacy `l1_mem`, `l2_disk`, `lru_tracker`, and commit
+> scheduler modules were removed in SFS-143.
 
 ## Architecture
 
 ```
-                  ┌────────────────────────────┐
-                  │       BlockCache           │
-                  │  (unified API + eviction)  │
-                  └─────┬───────────┬──────────┘
-                        │           │
-              ┌─────────▼──┐  ┌─────▼──────────┐
-              │  L1 Memory │  │   L2 Disk      │
-              │  (sharded) │  │  (file/block)  │
-              └─────┬──────┘  └───────┬────────┘
-                    │                 │
-              ┌─────▼─────────────────▼────────┐
-              │     LRU Tracker (64 shards)     │
-              └────────────────────────────────┘
+                ┌────────────────────────────┐
+                │       BlockCache           │
+                │   (compatibility shim)     │
+                └───────────┬────────────────┘
                             │
-              ┌────────────────────────────────┐
-              │ Upload Queue (in-memory index) │
-              └────────────────────────────────┘
+          ┌─────────────────┴──────────────────┐
+          │                                    │
+   ┌──────▼────────┐                  ┌────────▼─────────┐
+   │ L1 Staging    │                  │ Upload Queue     │
+   │ (bounded RAM) │                  │ (in-memory+journal) │
+   └───────────────┘                  └──────────────────┘
 ```
 
 ## Components
@@ -195,8 +189,7 @@ These caches now share one generic two-tier implementation:
 This removes duplicated eviction/compaction logic and ensures fixes in the
 two-tier algorithm apply consistently to all metadata caches.
 
-> Legacy sections below are historical only. `l1_mem`, `l2_disk`, and
-> `lru_tracker` were removed in SFS-143.
+> Legacy sections below are historical only and no longer represent runtime code.
 
 ### L1 Memory Cache (`l1_mem.rs`)
 
@@ -286,10 +279,6 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
   background semaphore to avoid starving interactive I/O
 - **Elastic growth** — starts at 0 bytes, grows on demand up to `max_bytes`
 - **Scan on startup** — `scan()` rebuilds in-memory byte counter and returns `(object_id, size)` pairs for LRU reload
-- **Tunable sync FD cache size** — `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY`
-  controls sync-read open-file LRU capacity (default `4096`)
-- **Tunable batch-read fan-out** — `STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT`
-  controls max in-flight reads per `get_batch*` call (default `256`)
 - **Buffered-read preallocation guard** — when size hint is absent,
   buffered L2 reads preallocate using file metadata length; if conversion to
   platform `usize` fails, fallback preallocation uses `8 MiB`.
@@ -304,125 +293,38 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 - `remove_batch_with_priority(ids, priority)` — remove many blocks in parallel
   with foreground/background QoS routing
 
-### L2 Commit Scheduler (`block_cache.rs`)
+### BlockCache Compatibility Shim (`block_cache.rs`)
 
-Bounded scheduler for asynchronous L2 commits from compatibility upload/persist paths.
+Cache v2 removed the legacy L2 commit scheduler and global LRU tracker.
+`BlockCache` now acts as a compatibility shim used by VFS for:
 
-| Property | Value |
-|----------|-------|
-| Workers | 32 (default profile), 4 (`--l2-profile usb`) |
-| Queue capacity | 4096 (default profile), 256 (`--l2-profile usb`) |
-| Backpressure | `commit_l2_batch` awaits when queue is full |
-| Batch ownership | `commit_l2_batch` consumes `Vec<(ObjectId, Bytes)>` and moves buffers into the scheduler without per-item clone in the cache layer |
-| Worker behavior | each worker writes sequentially via `l2.put_bytes()` |
-
-This replaces the previous fire-and-forget fan-out model and caps concurrent
-L2 write operations to the worker count.
-Runtime tuning is available through `STUDIOFS_L2_COMMIT_WORKERS` and
-`STUDIOFS_L2_COMMIT_QUEUE_CAPACITY`.
-For external USB SSDs, `studiofs mount --l2-profile usb` applies a conservative
-preset to avoid bridge/controller saturation.
-
-### LRU Tracker (`lru_tracker.rs`)
-
-Global LRU across both tiers, tracking block location and eviction order.
-
-| Property | Value |
-|----------|-------|
-| Shards | 64 |
-| Lock type | `parking_lot::Mutex` per shard |
-| Touch debounce | 10 seconds |
-| Data per entry | `object_id`, `size`, `location`, `last_access`, `pinned` |
-
-**Block locations:**
-- `MemoryAndDisk` — in both L1 and L2
-- `MemoryOnly` — in L1 only (pre-L2 commit)
-- `DiskOnly` — in L2 only (evicted from L1)
-
-**Eviction methods:**
-- `evict_l1()` — finds oldest unpinned `MemoryAndDisk` entry, demotes to `DiskOnly`
-- `evict_l2()` — finds oldest unpinned `DiskOnly` entry, removes completely
-
-**Pinning:** Blocks being uploaded to S3 are pinned to prevent eviction before upload completes.
-
-### Upload Queue (`upload_queue.rs`)
-
-In-memory scheduler/index for blocks pending S3 upload.
-
-| Property | Value |
-|----------|-------|
-| Persistence | In-memory only |
-| Source of truth | `BlockStore` `DIRTY` / `UPLOADING` flags |
-| Startup replay | VFS maps dirty object ids back to `(ino, block_index)` via metadata |
-
-**Lifecycle:**
-1. `submit(ino, offset, object_id)` — queues upload op in memory
-2. Upload worker receives from channel, performs S3 PUT (cancellation-aware)
-3. `complete(pending)` — removes pending op and unpins block in LRU
-4. `cancel(pending)` — removes pending op and unpins block when upload is cancelled (for example, inode deleted)
-
-### Block Cache (`block_cache.rs`)
-
-Unified API combining all components above.
+- bounded in-memory L1 staging (`stage_l1`, `get_l1_only`)
+- upload queue orchestration (`submit_upload*`, `complete_upload`, `cancel_upload`)
+- compatibility pipeline metrics consumed by CLI/VFS logs
 
 **Configuration (`BlockCacheConfig`):**
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `l1_size` | 2 GiB | Maximum L1 memory |
-| `l2_size` | 1 TiB | Maximum L2 disk |
-| `cache_dir` | — | Root directory for cache state |
-| `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
-| `l2_commit_workers` | 32 | L2 commit worker count |
-| `l2_commit_queue_capacity` | 4096 | Max queued L2 commit jobs before backpressure |
-| `l2_read_timeout` | 5000ms | L2 read timeout before fallback to cache miss |
-| `l2_write_timeout` | 5000ms | L2 write timeout per attempt |
+| `l1_size` | 2 GiB | Maximum in-memory staging budget |
+| `cache_dir` | — | Root directory used by upload-queue journal files |
 
 **Key methods:**
 
 | Method | Description |
 |--------|-------------|
-| `open(config)` | Initialize L1, L2, LRU, upload queue; scan L2 for recovery |
-| `get(id)` | L1 → L2 → miss (returns None) |
-| `get_sync_l2_into(id, off, out)` | Sync L2-only read directly into caller buffer (returns `None` on miss/bypass) |
-| `stage_l1(id, data)` | Insert into L1 + LRU as `MemoryOnly` |
-| `commit_l2(id, data)` | Enqueue one L2 commit into bounded scheduler |
-| `commit_l2_batch(blocks)` | Consume and enqueue `Vec<(ObjectId, Bytes)>` into bounded scheduler (applies backpressure on full queue) |
-| `submit_upload(ino, offset, id)` | Enqueue for S3 upload in bounded in-memory queue (intent persisted in `BlockStore` flags) |
-| `complete_upload(pending)` | Unpin block in LRU |
-| `evict_one_l1()` | Demote one block from L1 |
-| `evict_one_l2()` | Remove one block from L2 |
+| `open(config)` | Initialize L1 staging + upload queue |
+| `get(id)` / `get_with_trace(id)` | L1 lookup with compatibility trace surface |
+| `stage_l1(id, data)` | Stage payload in bounded L1 memory |
+| `submit_upload(ino, offset, id, epoch)` | Enqueue upload work |
+| `complete_upload(pending)` | Mark upload complete and unpin payload |
+| `cancel_upload(pending, remove_block)` | Cancel upload and optionally drop staged payload |
+| `wait_for_uploads_idle(timeout)` | Await queue drain |
+| `cache_pipeline_metrics()` | Snapshot compatibility counters |
 
-Timeout behavior:
-- L2 read timeout is treated as a cache miss (`get*` returns `None`) so callers can continue to remote/object-store fetch paths.
-- Repeated L2 read timeouts open a short-lived read circuit breaker (default: 3 consecutive timeouts, 5s cooldown), temporarily bypassing L2 reads to avoid piling additional blocking disk tasks during device stalls.
-- Sync L2 read-into path respects the same read circuit-breaker policy; when the breaker is open it reports miss/bypass so callers can fall back to async/remote fetch path.
-- L2 write timeout fails the direct write path and is retried by background commit workers up to the configured attempt cap before dropping the local commit job.
-- L2 write/remove operations are bounded by an internal semaphore (default 128 in-flight tasks), preventing unbounded mutation-side `spawn_blocking` growth when local disk stalls.
-- Background eviction and post-upload cleanup use the background priority pool so large delete bursts do not compete with foreground reads on the same local disk budget.
-- L2 batch reads use a sliding-window fan-out budget (`STUDIOFS_L2_READ_BATCH_MAX_IN_FLIGHT`, default 256) to avoid lock-step chunk stalls and keep read queue depth stable.
-
-**Checkpointing:** Every 60 seconds, persists LRU state to `{cache_dir}/cache.meta`. On startup, loads checkpoint and reconciles with L2 scan.
-If the serialized checkpoint payload is unchanged (same entry count + CRC), the
-writer skips the redundant tmp+rename cycle to reduce metadata-heavy file ops.
-
-Checkpoint format: magic `STFSCM` (6 bytes), version `u16`, entry count `u32`,
-entries CRC32 `u32`, then entries of 18 bytes each (`object_id: u64`, `size:
-u32`, `location: u8`, `pinned: u8`, `padding: [u8; 4]`).
-
-## Eviction Strategy
-
-1. **L1 eviction** — when `l1.total_bytes() > l1_size`:
-   - Find oldest unpinned `MemoryAndDisk` block via LRU
-   - Remove from L1, set location to `DiskOnly`
-   - Block remains in L2
-
-2. **L2 eviction** — when `l2.total_bytes() > l2_size` or disk space < `disk_free_ratio`:
-   - Find oldest unpinned `DiskOnly` block via LRU
-   - Delete file from L2
-   - Remove from LRU entirely
-
-3. **Pinned blocks** — blocks pending S3 upload cannot be evicted from either tier
+Notes:
+- legacy `STUDIOFS_L2_COMMIT_*` and L2 timeout knobs were removed;
+- `l2_bytes()` is retained for compatibility and reports `0` in v2-only mode.
 
 ## Write Pipeline Integration
 
@@ -435,15 +337,15 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   ├─ stage_l1() for each block          ← immediate L1 insert
   ├─ stage upload payload window        ← retry-friendly transient RAM source for uploader
   ├─ Batch metadata commit (local staged refs only)
-  ├─ commit_l2_batch() enqueue          ← consumes owned batch, bounded queue + fixed workers
+  ├─ Persist to BlockStore              ← cache-v2 local object store
   └─ submit_upload(..., content_epoch)  ← in-memory queue + S3 queue
 ```
 
 The background flusher runs every 10ms and drains continuously (keeps processing while data exists).
-Freshly materialized blocks now also seed a bounded transient upload-payload
-stage in RAM. Upload workers clone payloads from that stage first and only fall
-back to L1/L2 rereads when the stage entry was evicted or the upload was
-replayed from `BlockStore` DIRTY state after restart. The stage budget is adaptive rather than
+Freshly materialized blocks seed a bounded transient upload-payload stage in RAM.
+Upload workers clone payloads from that stage first and only fall back to local
+cache rereads when the stage entry was evicted or the upload was replayed from
+`BlockStore` DIRTY state after restart. The stage budget is adaptive rather than
 fixed: it tracks the upload dispatch window, expands under queue pressure or
 staging misses, and contracts again when foreground pressure drops.
 
@@ -468,11 +370,6 @@ benchmarks:
 - ingress append throughput counters and latency histogram
 - materialize batch counters (`batches`, `blocks`, `bytes`), duration histogram,
   and concurrent batch depth/peak
-- L2 commit scheduler counters:
-  - queue depth (`queue_depth`, `queue_depth_peak`, `queue_capacity`)
-  - worker utilization (`active_workers`, `active_workers_peak`, `configured_workers`)
-  - lifecycle (`submitted`, `completed`, `failed`)
-  - backpressure (`backpressure_events`, backpressure wait totals/max/histogram)
 - queue depth metrics for upload queue (`pending_depth`, `pending_depth_peak`)
 - staged upload payload metrics (`hits`, `misses`, `evictions`, `target_bytes`,
   `min_bytes`, `max_bytes`)

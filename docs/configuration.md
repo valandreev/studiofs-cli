@@ -83,7 +83,6 @@ without requiring `discover`.
 studiofs mount <name> [<mount-point>] \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
-  [--l2-profile <default|usb>] \
   [--principal <name>] \
   [--snapshot-id <uuid>] \
   [--foreground] \
@@ -104,7 +103,6 @@ Notes:
 - `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
-- `--l2-profile usb` applies conservative L2-local-cache settings intended for external USB SSDs (lower commit concurrency/queue + tighter local L2 I/O timeouts). `default` keeps high-throughput NVMe defaults.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
 - Memory management is fully automatic via the adaptive MemoryEnvelope controller (SFS-130): soft target 8 GiB, hard ceiling 50% of total RAM. The controller grows budgets under I/O pressure and retreats when idle. The initial L1 cache is capped at `min(4 GiB, 25% RAM)` so low-memory machines don't overshoot before the envelope takes over.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
@@ -411,11 +409,6 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max dirty `WriteBuffer` blocks persisted per local drain cycle |
-| `STUDIOFS_L2_COMMIT_WORKERS` | `32` | Number of bounded L2 commit scheduler workers |
-| `STUDIOFS_L2_COMMIT_QUEUE_CAPACITY` | `4096` | L2 commit queue capacity before enqueue backpressure |
-| `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
-| `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
-| `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` | `4096` | Capacity of L2 sync-read open-file descriptor LRU cache (set lower on hosts with strict FD limits) |
 | `STUDIOFS_FUSE_MAX_WRITE_BYTES` | `16777216` | FUSE kernel max single write request size (`fuser::KernelConfig::set_max_write`) |
 | `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` | `16777216` | FUSE kernel max readahead size (`fuser::KernelConfig::set_max_readahead`) |
 | `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
@@ -480,7 +473,6 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - legacy ingress artifact counters/checkpoint stats (expected to remain at zero on the Cache v2 foreground path unless recovering older artifacts)
 - local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache L2 read/write throughput and latency histograms
-- L2 commit scheduler counters (`cache_l2_commit_queue_depth`, `cache_l2_commit_queue_depth_peak`, `cache_l2_commit_workers_active`, `cache_l2_commit_workers_active_peak`, `cache_l2_commit_backpressure_events`)
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)

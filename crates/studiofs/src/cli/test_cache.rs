@@ -20,7 +20,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use studiofs_cache::block_cache::{CacheReadLevel, DEFAULT_L1_SIZE, DEFAULT_L2_SIZE};
+use studiofs_cache::block_cache::{CacheReadLevel, DEFAULT_L1_SIZE};
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_cache::{BlockCache, BlockCacheConfig};
 use studiofs_vfs::parse_size_bytes;
@@ -36,6 +36,7 @@ const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
 const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
+const DEFAULT_DIRECT_L2_LIMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -2232,7 +2233,7 @@ fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
 }
 
 async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<BenchmarkReport> {
-    let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit, params.l2_limit);
+    let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit);
     let (cache, _rx) = BlockCache::open(cache_config)
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
     cache.spawn_background_tasks();
@@ -3545,7 +3546,7 @@ pub fn run(
     )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_L1_SIZE.to_string();
-    let l2_limit_default = DEFAULT_L2_SIZE.to_string();
+    let l2_limit_default = DEFAULT_DIRECT_L2_LIMIT_BYTES.to_string();
     let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
     let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(
