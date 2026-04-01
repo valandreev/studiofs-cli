@@ -622,7 +622,7 @@ pub fn run(
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
 
-    // BlockCache will create blocks/ and upload/ subdirectories inside this UUID dir.
+    // Cache state for this volume (BlockStore + cache metadata) lives in this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
 
     let cache_path_str = cache_path

@@ -346,7 +346,6 @@ impl StudioVfs {
                 .stage_l1(block.object_id, block.data.clone());
             self.stage_upload_payload(block.object_id, block.data.clone());
             self.record_live_extent(ino, block.block_index, block.object_id, content_epoch);
-            self.block_store.mark_uploading(block.object_id);
         }
 
         if let Some(attr) = attr_after_commit {

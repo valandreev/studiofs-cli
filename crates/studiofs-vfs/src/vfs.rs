@@ -4155,42 +4155,74 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().metrics()
     }
 
-    fn restore_live_extents_from_pending_uploads(&self) {
-        let pending = self.block_cache.snapshot_pending_uploads();
-        if pending.is_empty() {
+    fn replay_dirty_uploads_from_block_store(&self) {
+        let dirty_object_ids = self.block_store.dirty_object_ids();
+        if dirty_object_ids.is_empty() {
             return;
         }
 
-        let mut restored = 0usize;
-        let mut attrs = HashMap::<Ino, Option<InodeAttr>>::new();
-        for op in pending {
-            let block_index = block_index_from_offset(op.offset, self.block_size);
-            let attr = attrs
-                .entry(op.ino)
-                .or_insert_with(|| self.sync_meta().get_attr(op.ino).ok());
-            let Some(attr) = attr.as_ref() else {
-                continue;
-            };
-            if attr.content_epoch != op.content_epoch {
-                continue;
+        let mut dirty_set: HashSet<u64> = dirty_object_ids.into_iter().collect();
+        let attrs = match self.sync_meta().list_inode_attrs() {
+            Ok(attrs) => attrs,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to list inode attrs for startup dirty-upload replay"
+                );
+                return;
             }
+        };
 
-            let current = match self.sync_meta().get_file_block(op.ino, block_index) {
-                Ok(Some(block_ref)) => block_ref,
-                _ => continue,
+        let mut replay_ops: Vec<(u64, u64, u64, u64)> = Vec::new();
+        let mut restored_live_extents = 0usize;
+
+        for attr in attrs {
+            let ino = attr.ino;
+            let blocks = match self.sync_meta().get_file_blocks(ino) {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    warn!(
+                        ino,
+                        error = %e,
+                        "failed to enumerate file blocks during startup dirty-upload replay"
+                    );
+                    continue;
+                }
             };
-            if current.object_id != op.object_id {
-                continue;
-            }
 
-            self.record_live_extent(op.ino, block_index, op.object_id, op.content_epoch);
-            restored += 1;
+            for (block_index, block_ref) in blocks {
+                if !dirty_set.remove(&block_ref.object_id) {
+                    continue;
+                }
+
+                let offset = (block_index as u64).saturating_mul(self.block_size as u64);
+                replay_ops.push((ino, offset, block_ref.object_id, attr.content_epoch));
+                self.record_live_extent(ino, block_index, block_ref.object_id, attr.content_epoch);
+                restored_live_extents = restored_live_extents.saturating_add(1);
+            }
         }
 
-        if restored > 0 {
+        if !replay_ops.is_empty() {
+            self.block_cache.submit_uploads_batch(&replay_ops);
             info!(
-                restored_live_extents = restored,
-                "restored pending live extents from upload journal"
+                replayed_dirty_blocks = replay_ops.len(),
+                restored_live_extents, "replayed dirty BlockStore blocks into upload queue"
+            );
+        }
+
+        if !dirty_set.is_empty() {
+            for object_id in &dirty_set {
+                warn!(
+                    object_id,
+                    "removing orphan dirty block without metadata reference"
+                );
+                self.block_store.remove(*object_id);
+                self.discard_staged_upload_payload(*object_id);
+                self.state.upload.pending_evictions.lock().remove(object_id);
+            }
+            info!(
+                orphan_dirty_blocks = dirty_set.len(),
+                "startup cleanup removed orphan dirty BlockStore entries"
             );
         }
     }
@@ -4594,7 +4626,7 @@ impl StudioVfs {
                 memory_envelope: std::sync::OnceLock::new(),
             });
 
-            vfs.restore_live_extents_from_pending_uploads();
+            vfs.replay_dirty_uploads_from_block_store();
 
             Ok(vfs)
         }
@@ -10008,8 +10040,8 @@ impl StudioVfs {
                         );
                         break;
                     }
-                    // Shutdown cancellation: keep op pending in journal by exiting
-                    // before any completion path.
+                    // Shutdown cancellation: keep DIRTY upload intent for
+                    // next startup replay by exiting before completion.
                     TimeoutOrCancel::Cancelled => {
                         self.cancel_upload_if_inode_deleted(&op).await?;
                         return Ok(());
@@ -10088,14 +10120,7 @@ impl StudioVfs {
                 Some(payload)
             } else {
                 let read_started = Instant::now();
-                let read_result = match self.block_store_get_async(op.object_id).await? {
-                    Some(payload) => Some(payload),
-                    None => {
-                        self.block_cache
-                            .get_with_priority(op.object_id, L2IoPriority::Background)
-                            .await
-                    }
-                };
+                let read_result = self.block_store_get_async(op.object_id).await?;
                 let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
                 drop(upload_io_permit);
                 self.state
@@ -10306,8 +10331,8 @@ impl StudioVfs {
             }
             // Treat cancellation as an intentional shutdown path:
             // do not mark sticky errors and do not trigger in-memory requeue.
-            // Because `complete_upload` is not called, the pending op remains
-            // in the persistent journal for safe resume on next mount.
+            // Because `complete_upload` is not called, DIRTY state remains in
+            // BlockStore for safe startup replay on next mount.
             if saw_cancel {
                 self.cancel_upload_if_inode_deleted(&op).await?;
                 return Ok(());
@@ -11275,9 +11300,9 @@ impl StudioVfs {
                 pending_ops.iter().take(8).map(|op| op.object_id).collect();
             info!(
                 pending = self.block_cache.pending_upload_count(),
-                pending_journal_files = pending_ops.len(),
+                pending_queue_ops = pending_ops.len(),
                 pending_object_ids_sample = ?sample_object_ids,
-                "VFS shutdown: uploader cancelled; remaining pending uploads will resume from journal"
+                "VFS shutdown: uploader cancelled; remaining dirty uploads will replay on next startup"
             );
         }
         self.join_uploader_task(background_join_timeout).await;

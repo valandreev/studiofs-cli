@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
     format_object_fragment_keys, format_object_key, read_object,
@@ -2089,15 +2090,19 @@ fn test_crash_recovery_replays_pending_journal() {
         rt.shutdown_background();
     }
 
-    let pending_dir = cache_dir.join("upload");
-    let pending_count = std::fs::read_dir(&pending_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pending"))
-        .count();
+    let volume_uuid = Uuid::parse_str(&offline_info.uuid)
+        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, offline_info.uuid.as_bytes()))
+        .into_bytes();
+    let pending_count = BlockStore::open(BlockStoreConfig {
+        cache_dir: cache_dir.clone(),
+        max_size: u64::MAX,
+        volume_uuid,
+    })
+    .unwrap()
+    .dirty_count() as usize;
     assert!(
         pending_count > 0,
-        "expected pending journal files after simulated crash"
+        "expected dirty blocks after simulated crash"
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
@@ -2141,16 +2146,18 @@ fn test_crash_recovery_replays_pending_journal() {
         );
     });
 
-    // Allow async journal cleanup task to remove completed files.
+    // Allow async cleanup to clear DIRTY flags after upload completion.
     thread::sleep(Duration::from_millis(500));
-    let pending_after = std::fs::read_dir(&pending_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pending"))
-        .count();
+    let pending_after = BlockStore::open(BlockStoreConfig {
+        cache_dir: cache_dir.clone(),
+        max_size: u64::MAX,
+        volume_uuid,
+    })
+    .unwrap()
+    .dirty_count() as usize;
     assert_eq!(
         pending_after, 0,
-        "pending upload journals must be cleaned up after recovery"
+        "dirty upload state must be cleaned up after recovery"
     );
 }
 
@@ -10405,6 +10412,7 @@ async fn pending_upload_helpers_use_live_index_without_directory_scan() {
     );
 
     let upload_dir = cache_dir.join("upload");
+    std::fs::create_dir_all(&upload_dir).unwrap();
     let hidden_dir = cache_dir.join("upload-hidden");
     std::fs::rename(&upload_dir, &hidden_dir).unwrap();
 

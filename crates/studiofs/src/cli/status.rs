@@ -4,7 +4,9 @@ use crate::cli::utils::format_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
 use studiofs_meta::counters;
+use uuid::Uuid;
 
 const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
 
@@ -151,17 +153,23 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
     Ok(stats)
 }
 
-fn scan_pending_uploads(upload_dir: &Path) -> anyhow::Result<usize> {
-    let entries = match std::fs::read_dir(upload_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
+fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
+    Uuid::parse_str(volume_uuid)
+        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
+        .into_bytes()
+}
 
-    Ok(entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pending"))
-        .count())
+fn scan_pending_uploads(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<usize> {
+    if !cache_dir.join("blocks.data").exists() {
+        return Ok(0);
+    }
+
+    let store = BlockStore::open(BlockStoreConfig {
+        cache_dir: cache_dir.to_path_buf(),
+        max_size: u64::MAX,
+        volume_uuid: derive_block_store_volume_uuid(volume_uuid),
+    })?;
+    Ok(store.dirty_count() as usize)
 }
 
 pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Result<()> {
@@ -183,7 +191,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
-    let pending_uploads = scan_pending_uploads(&cache_path.join("upload"))?;
+    let pending_uploads = scan_pending_uploads(&cache_path, &format_info.uuid)?;
 
     let remote_size = engine.remote_metadata_size()?.unwrap_or(0);
     let local_db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -291,14 +299,21 @@ mod tests {
     }
 
     #[test]
-    fn scan_pending_uploads_counts_pending_files_only() {
+    fn scan_pending_uploads_uses_block_store_dirty_flags() {
         let tmp = tempfile::tempdir().unwrap();
-        let upload_dir = tmp.path().join("upload");
-        std::fs::create_dir_all(&upload_dir).unwrap();
-        std::fs::write(upload_dir.join("one.pending"), b"x").unwrap();
-        std::fs::write(upload_dir.join("two.pending"), b"y").unwrap();
-        std::fs::write(upload_dir.join("done.txt"), b"z").unwrap();
+        let volume_uuid = Uuid::new_v4();
+        let store = BlockStore::open(BlockStoreConfig {
+            cache_dir: tmp.path().to_path_buf(),
+            max_size: 4 * 1024 * 1024,
+            volume_uuid: volume_uuid.into_bytes(),
+        })
+        .unwrap();
+        store.put(1, b"dirty", false).unwrap();
+        store.put(2, b"clean", true).unwrap();
 
-        assert_eq!(scan_pending_uploads(&upload_dir).unwrap(), 2);
+        assert_eq!(
+            scan_pending_uploads(tmp.path(), &volume_uuid.to_string()).unwrap(),
+            1
+        );
     }
 }

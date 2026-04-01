@@ -23,7 +23,7 @@ Core principles:
 studiofs (CLI)
   ├── studiofs-meta       local metadata + PostgreSQL delta sync
   ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      L1/L2 cache + upload journal/queue
+  ├── studiofs-cache      L1/L2 cache + upload queue
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   └── studiofs-winfsp     Windows bridge

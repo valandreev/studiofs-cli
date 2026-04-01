@@ -346,21 +346,19 @@ Global LRU across both tiers, tracking block location and eviction order.
 
 ### Upload Queue (`upload_queue.rs`)
 
-Crash-safe writeback journal for blocks pending S3 upload.
+In-memory scheduler/index for blocks pending S3 upload.
 
 | Property | Value |
 |----------|-------|
-| Journal dir | `{cache_dir}/upload/` |
-| File pattern | `{object_id:016x}.pending` |
-| Entry size | 48 bytes (v2) |
-| Magic | `STFSUP` |
-| Recovery | Scans `.pending` files on startup |
+| Persistence | In-memory only |
+| Source of truth | `BlockStore` `DIRTY` / `UPLOADING` flags |
+| Startup replay | VFS maps dirty object ids back to `(ino, block_index)` via metadata |
 
 **Lifecycle:**
-1. `submit(ino, offset, object_id)` — creates journal file, sends to upload channel
+1. `submit(ino, offset, object_id)` — queues upload op in memory
 2. Upload worker receives from channel, performs S3 PUT (cancellation-aware)
-3. `complete(pending)` — removes journal file, unpins block in LRU
-4. `cancel(pending)` — removes journal file and unpins block when upload is cancelled (for example, inode deleted)
+3. `complete(pending)` — removes pending op and unpins block in LRU
+4. `cancel(pending)` — removes pending op and unpins block when upload is cancelled (for example, inode deleted)
 
 ### Block Cache (`block_cache.rs`)
 
@@ -372,7 +370,7 @@ Unified API combining all components above.
 |-------|---------|-------------|
 | `l1_size` | 2 GiB | Maximum L1 memory |
 | `l2_size` | 1 TiB | Maximum L2 disk |
-| `cache_dir` | — | Root directory for L2 + journals |
+| `cache_dir` | — | Root directory for cache state |
 | `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
 | `l2_commit_workers` | 32 | L2 commit worker count |
 | `l2_commit_queue_capacity` | 4096 | Max queued L2 commit jobs before backpressure |
@@ -582,6 +580,6 @@ On startup:
 1. Load LRU checkpoint (`cache.meta`) if present
 2. Scan L2 directory to rebuild actual block inventory
 3. Reconcile: remove LRU entries for missing L2 files, add L2 entries not in checkpoint
-4. Scan upload journal (`upload/*.pending`) and re-queue pending uploads
-5. Recovered upload ops keep their persisted `content_epoch`
+4. Read dirty object ids from `BlockStore` and re-queue upload ops using metadata mapping
+5. Remove orphan dirty object ids that are no longer referenced by metadata
 6. Resume normal operation

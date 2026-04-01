@@ -237,7 +237,7 @@ Deleted-inode cancellation behavior:
 - `process_upload` short-circuits on `deleted_inodes` before metadata lookups to
   avoid metadata-backlog spikes on mass delete.
 - For `open-unlink` (inode removed from namespace but still opened by a process),
-  upload cancel is soft: pending upload journal entries are canceled, but block
+  upload cancel is soft: pending upload queue entries are canceled, but block
   data is kept locally readable until the last handle closes.
 - Marker cleanup is conservative: a deleted inode marker is cleared only after
   no open handles, no pending uploads, and inode metadata is gone.

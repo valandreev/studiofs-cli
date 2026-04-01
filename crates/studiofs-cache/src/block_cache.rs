@@ -204,7 +204,7 @@ pub struct BlockCache {
     l2: L2DiskCache,
     /// Unified LRU tracker.
     lru: LruTracker,
-    /// Upload queue (writeback journal).
+    /// Upload queue (in-memory dispatch + pending index).
     upload_queue: Arc<UploadQueue>,
     /// Configuration.
     config: BlockCacheConfig,
@@ -294,13 +294,9 @@ impl BlockCache {
             }
         }
 
-        // Create upload queue (scans upload/ for crash recovery).
+        // Create upload queue. Crash recovery replay is driven by BlockStore
+        // DIRTY flags from the VFS startup path.
         let (upload_queue, upload_rx) = UploadQueue::new(&config.cache_dir);
-
-        // Pin blocks that have pending uploads.
-        for pending in upload_queue.snapshot_pending() {
-            lru.pin(pending.object_id);
-        }
 
         let metrics = CachePipelineMetrics::default();
         metrics.l2_commit_scheduler.configure(
@@ -838,7 +834,7 @@ impl BlockCache {
 
     /// Submit multiple blocks for async S3 upload in a batch.
     ///
-    /// Each block is pinned in the LRU and a journal entry is written.
+    /// Each block is pinned in the LRU and queued in-memory.
     /// More efficient than calling `submit_upload` in a loop because it
     /// avoids re-acquiring the LRU shard lock repeatedly.
     pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
@@ -868,8 +864,8 @@ impl BlockCache {
         queued
     }
 
-    /// Cancel a pending upload: unpin the block, remove the journal entry,
-    /// and decrement the pending count.  Optionally removes the block data
+    /// Cancel a pending upload: unpin the block and decrement the pending
+    /// count. Optionally removes the block data
     /// from cache entirely (used when the owning inode was deleted).
     pub fn cancel_upload(&self, op: &PendingUpload, remove_block: bool) {
         self.lru.unpin(op.object_id);
@@ -900,6 +896,7 @@ impl BlockCache {
         self.upload_queue.has_pending_for_ino(ino)
     }
 
+    /// Backward-compatible no-op for legacy call sites.
     pub async fn flush_upload_journal(&self) {
         self.upload_queue.flush_journal().await;
     }
