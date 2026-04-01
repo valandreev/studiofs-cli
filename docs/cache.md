@@ -325,7 +325,7 @@ Cache v2 removed the legacy L2 commit scheduler and global LRU tracker.
 
 Notes:
 - legacy `STUDIOFS_L2_COMMIT_*` and L2 timeout knobs were removed;
-- `l2_bytes()` is retained for compatibility and reports `0` in v2-only mode.
+- `BlockCacheStats` now reports only active L1 staging bytes.
 
 ## Write Pipeline Integration
 
@@ -351,6 +351,10 @@ fixed: it tracks the upload dispatch window, expands under queue pressure or
 staging misses, and contracts again when foreground pressure drops.
 
 ## Performance Characteristics
+
+The labels `l2_read` / `l2_write` are retained only for compatibility in
+existing metrics and benchmark JSON schemas. They no longer imply a standalone
+legacy L2 cache subsystem.
 
 | Operation | Expected Throughput | Notes |
 |-----------|-------------------|-------|
@@ -396,11 +400,9 @@ running `studiofs test-cache ... --profile=pyroscope`.
   (`small_max_bytes`, `medium_max_bytes`)
 - `size_class_stats`: write/read throughput and latency percentiles (p50/p95/p99)
   for `small`, `medium`, and `large`
-- `cache_levels` (direct-L2 mode): L1/L2 hit and miss counters, bytes served
+- `cache_levels` (direct-shim mode): L1/L2 hit and miss counters, bytes served
   from each level, and per-level lookup latency percentiles + histogram
-- `queue_backpressure`: L2 commit queue depth, worker utilization, backpressure
-  count, backpressure wait percentiles (p50/p95/p99), plus upload queue depth
-  and lifecycle counters
+- `upload_queue`: depth and lifecycle counters
 
 ## Pyroscope Profiling
 

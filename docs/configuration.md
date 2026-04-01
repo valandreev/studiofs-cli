@@ -266,7 +266,7 @@ Profiling environment variables:
 - `STUDIOFS_PYROSCOPE_TENANT_ID`: optional Grafana Cloud / multi-tenant header
 
 Notes:
-- If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-l2`
+- If `<path>` is outside active StudioFS mounts, benchmark runs in `direct-shim`
   mode and treats `<path>` as cache directory.
 - If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
   through the already running mounted process and uses
@@ -284,8 +284,7 @@ Notes:
 - JSON report includes `advanced_metrics`:
   - `size_class_boundaries` (`small_max_bytes`, `medium_max_bytes`)
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
-  - `queue_backpressure` with L2 commit queue depth/worker/backpressure percentiles
-  - direct-l2 only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
+  - direct-shim only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
   `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
   `post-upload-read` rows plus the pending-upload observations used to gate
@@ -299,8 +298,8 @@ Notes:
   report:
   - `...-cpu.pprof.gz`
   - `...-memory.pprof.gz`
-- `direct-l2` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
-- Current built-in workload volumes are modest (`128MB` direct-l2, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
+- `direct-shim` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
+- Current built-in workload volumes are modest (`128MB` direct-shim, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
 
 ### `destroy`
 
@@ -516,3 +515,4 @@ S3-compatible backend.
 | `STUDIOFS_S3_SECRET_KEY` | `studiofs123` | Test secret key |
 | `STUDIOFS_S3_BUCKET` | `studiofs-test` | Test bucket |
 | `STUDIOFS_TEST_PG_DSN` | none | PostgreSQL server DSN for ignored PG tests; StudioFS uses DB `studiofs` |
+

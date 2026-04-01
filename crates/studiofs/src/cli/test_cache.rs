@@ -1,7 +1,7 @@
 //! `studiofs test-cache` — benchmark cache performance.
 //!
 //! Supports:
-//! - direct L2 benchmark mode (`direct-l2`) that bypasses VFS
+//! - direct shim benchmark mode (`direct-shim`) that bypasses VFS
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
 use crate::cli::test_cache_profile::TestCacheProfileSession;
@@ -36,7 +36,7 @@ const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
 const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
-const DEFAULT_DIRECT_L2_LIMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const DEFAULT_DIRECT_SHIM_LIMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -76,7 +76,7 @@ struct ActiveMount {
 
 #[derive(Clone, Debug)]
 enum ResolvedRunMode {
-    DirectL2 {
+    DirectShim {
         cache_dir: PathBuf,
     },
     MountedE2E {
@@ -185,8 +185,6 @@ struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     l1_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    l2_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     cache_pipeline: Option<CachePipelineReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<BenchmarkProfileReport>,
@@ -231,8 +229,6 @@ struct AdvancedMetricsReport {
     size_class_stats: SizeClassStatsReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_levels: Option<CacheLevelsReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    queue_backpressure: Option<QueueBackpressureReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,32 +274,6 @@ struct CacheLevelReport {
     latency_histogram: LatencyHistogramReport,
 }
 
-#[derive(Debug, Serialize)]
-struct QueueBackpressureReport {
-    l2_commit_queue: L2CommitQueueAdvancedReport,
-    upload_queue: UploadQueueStatsReport,
-}
-
-#[derive(Debug, Serialize)]
-struct L2CommitQueueAdvancedReport {
-    queue_depth: usize,
-    queue_depth_peak: usize,
-    queue_capacity: usize,
-    configured_workers: usize,
-    active_workers: usize,
-    active_workers_peak: usize,
-    submitted: u64,
-    completed: u64,
-    failed: u64,
-    backpressure_events: u64,
-    backpressure_wait_avg_ms: f64,
-    backpressure_wait_max_ms: f64,
-    backpressure_wait_p50_ms: f64,
-    backpressure_wait_p95_ms: f64,
-    backpressure_wait_p99_ms: f64,
-    backpressure_wait_histogram: LatencyHistogramReport,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct LatencyHistogramReport {
     bucket_upper_bounds_ns: Vec<u64>,
@@ -340,28 +310,10 @@ struct UploadQueueStatsReport {
 }
 
 #[derive(Debug, Serialize)]
-struct L2CommitSchedulerStatsReport {
-    queue_depth: usize,
-    queue_depth_peak: usize,
-    queue_capacity: usize,
-    configured_workers: usize,
-    active_workers: usize,
-    active_workers_peak: usize,
-    submitted: u64,
-    completed: u64,
-    failed: u64,
-    backpressure_events: u64,
-    backpressure_wait_avg_ms: f64,
-    backpressure_wait_max_ms: f64,
-    backpressure_wait_histogram: LatencyHistogramReport,
-}
-
-#[derive(Debug, Serialize)]
 struct CachePipelineReport {
     l2_read: IoStatsReport,
     l2_write: IoStatsReport,
     materialize_batches: MaterializeBatchStatsReport,
-    l2_commit_scheduler: L2CommitSchedulerStatsReport,
     upload_queue: UploadQueueStatsReport,
     blocking_tasks: BlockingTaskStatsReport,
 }
@@ -474,34 +426,6 @@ impl From<studiofs_cache::metrics::UploadQueueStatsSnapshot> for UploadQueueStat
     }
 }
 
-impl From<studiofs_cache::metrics::L2CommitSchedulerStatsSnapshot>
-    for L2CommitSchedulerStatsReport
-{
-    fn from(snapshot: studiofs_cache::metrics::L2CommitSchedulerStatsSnapshot) -> Self {
-        Self {
-            queue_depth: snapshot.queue_depth,
-            queue_depth_peak: snapshot.queue_depth_peak,
-            queue_capacity: snapshot.queue_capacity,
-            configured_workers: snapshot.configured_workers,
-            active_workers: snapshot.active_workers,
-            active_workers_peak: snapshot.active_workers_peak,
-            submitted: snapshot.submitted,
-            completed: snapshot.completed,
-            failed: snapshot.failed,
-            backpressure_events: snapshot.backpressure_events,
-            backpressure_wait_avg_ms: if snapshot.backpressure_events == 0 {
-                0.0
-            } else {
-                snapshot.backpressure_wait_total_ns as f64
-                    / snapshot.backpressure_events as f64
-                    / 1_000_000.0
-            },
-            backpressure_wait_max_ms: snapshot.backpressure_wait_max_ns as f64 / 1_000_000.0,
-            backpressure_wait_histogram: snapshot.backpressure_wait_histogram.into(),
-        }
-    }
-}
-
 impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
     fn from(snapshot: CachePipelineMetricsSnapshot) -> Self {
         let to_report = |stats: &studiofs_cache::metrics::BlockingTaskStatsSnapshot| {
@@ -540,7 +464,6 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
             l2_read: snapshot.l2_read.into(),
             l2_write: snapshot.l2_write.into(),
             materialize_batches: snapshot.materialize_batches.into(),
-            l2_commit_scheduler: snapshot.l2_commit_scheduler.into(),
             upload_queue: snapshot.upload_queue.into(),
             blocking_tasks: BlockingTaskStatsReport {
                 total: to_report(&snapshot.blocking_tasks.total),
@@ -866,50 +789,6 @@ fn classify_size(size: u64, small_max: u64, medium_max: u64) -> SizeClass {
     } else {
         SizeClass::Large
     }
-}
-
-fn histogram_percentile_ms(histogram: &LatencyHistogramReport, p: f64) -> f64 {
-    if histogram.bucket_counts.is_empty() {
-        return 0.0;
-    }
-    let total: u64 = histogram.bucket_counts.iter().sum();
-    if total == 0 {
-        return 0.0;
-    }
-    let target = ((total as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as u64;
-    let mut acc = 0u64;
-    for (idx, count) in histogram.bucket_counts.iter().enumerate() {
-        acc = acc.saturating_add(*count);
-        if acc > target {
-            let lower_ns = if idx == 0 {
-                0.0
-            } else {
-                histogram.bucket_upper_bounds_ns[idx.saturating_sub(1)] as f64
-            };
-            let upper_ns = if idx < histogram.bucket_upper_bounds_ns.len() {
-                histogram.bucket_upper_bounds_ns[idx] as f64
-            } else {
-                let tail = histogram
-                    .bucket_upper_bounds_ns
-                    .last()
-                    .copied()
-                    .unwrap_or(0) as f64;
-                (tail * 1.25).max(lower_ns + 1.0)
-            };
-            let bucket_start = acc.saturating_sub(*count);
-            let in_bucket_rank = target.saturating_sub(bucket_start) as f64;
-            let bucket_count = (*count).max(1) as f64;
-            let ratio = (in_bucket_rank / bucket_count).clamp(0.0, 1.0);
-            let estimate_ns = lower_ns + (upper_ns - lower_ns) * ratio;
-            return estimate_ns / 1_000_000.0;
-        }
-    }
-    histogram
-        .bucket_upper_bounds_ns
-        .last()
-        .copied()
-        .unwrap_or(0) as f64
-        / 1_000_000.0
 }
 
 #[derive(Clone, Debug)]
@@ -1410,7 +1289,7 @@ fn phase_telemetry_to_report(telemetry: &PhaseTelemetry, wall_elapsed: Duration)
         .to_report(wall_elapsed.as_secs_f64() * 1000.0)
 }
 
-async fn run_l2_writes(
+async fn run_shim_writes(
     cache: Arc<BlockCache>,
     sizes: &[u64],
     order: &[usize],
@@ -1489,7 +1368,7 @@ async fn run_l2_writes(
         .map_err(|_| anyhow!("L2 write latency stats lock poisoned"))
 }
 
-async fn run_l2_reads(
+async fn run_shim_reads(
     cache: Arc<BlockCache>,
     sizes: &[u64],
     order: &[usize],
@@ -1562,12 +1441,6 @@ async fn run_l2_reads(
                         s.cache_levels
                             .record_l1(true, trace.l1_lookup_latency, read as u64);
                     }
-                    CacheReadLevel::L2 => {
-                        s.cache_levels.record_l1(false, trace.l1_lookup_latency, 0);
-                        if let Some(l2_latency) = trace.l2_lookup_latency {
-                            s.cache_levels.record_l2(true, l2_latency, read as u64);
-                        }
-                    }
                     CacheReadLevel::Miss => {
                         s.cache_levels.record_l1(false, trace.l1_lookup_latency, 0);
                         if let Some(l2_latency) = trace.l2_lookup_latency {
@@ -1592,7 +1465,7 @@ async fn run_l2_reads(
         .map_err(|_| anyhow!("L2 read latency stats lock poisoned"))
 }
 
-async fn run_l2_writes_sequential_streams(
+async fn run_shim_writes_sequential_streams(
     cache: Arc<BlockCache>,
     sizes: &[u64],
     order: &[usize],
@@ -1654,7 +1527,7 @@ async fn run_l2_writes_sequential_streams(
     Ok(by_stream)
 }
 
-async fn run_l2_reads_sequential_streams(
+async fn run_shim_reads_sequential_streams(
     cache: Arc<BlockCache>,
     sizes: &[u64],
     order: &[usize],
@@ -1710,16 +1583,6 @@ async fn run_l2_reads_sequential_streams(
                             trace.l1_lookup_latency,
                             read as u64,
                         );
-                    }
-                    CacheReadLevel::L2 => {
-                        telemetry
-                            .cache_levels
-                            .record_l1(false, trace.l1_lookup_latency, 0);
-                        if let Some(l2_latency) = trace.l2_lookup_latency {
-                            telemetry
-                                .cache_levels
-                                .record_l2(true, l2_latency, read as u64);
-                        }
                     }
                     CacheReadLevel::Miss => {
                         telemetry
@@ -2144,7 +2007,7 @@ fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
             cache_path: active.cache_path,
         })
     } else {
-        Ok(ResolvedRunMode::DirectL2 {
+        Ok(ResolvedRunMode::DirectShim {
             cache_dir: target.to_path_buf(),
         })
     }
@@ -2259,7 +2122,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
             "cache benchmark warm-up cycle started"
         );
         if params.sequential_streams {
-            let _ = run_l2_writes_sequential_streams(
+            let _ = run_shim_writes_sequential_streams(
                 Arc::clone(&cache),
                 &work_sizes,
                 &order,
@@ -2268,7 +2131,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
                 size_class_bounds,
             )
             .await?;
-            let _ = run_l2_reads_sequential_streams(
+            let _ = run_shim_reads_sequential_streams(
                 Arc::clone(&cache),
                 &work_sizes,
                 &order,
@@ -2279,7 +2142,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
             )
             .await?;
         } else {
-            let _ = run_l2_writes(
+            let _ = run_shim_writes(
                 Arc::clone(&cache),
                 &work_sizes,
                 &order,
@@ -2288,7 +2151,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
                 size_class_bounds,
             )
             .await?;
-            let _ = run_l2_reads(
+            let _ = run_shim_reads(
                 Arc::clone(&cache),
                 &work_sizes,
                 &order,
@@ -2308,13 +2171,13 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     tracing::info!(
         target: "studiofs.cache.profile",
         run_id = %params.run_id,
-        phase = "direct-l2-write",
+        phase = "direct-shim-write",
         "cache benchmark phase start"
     );
     let writes_wall_start = Instant::now();
     let writes_cpu_start = process_cpu_time();
     let (writes, writes_by_stream) = if params.sequential_streams {
-        let writes_by_stream = run_l2_writes_sequential_streams(
+        let writes_by_stream = run_shim_writes_sequential_streams(
             Arc::clone(&cache),
             &work_sizes,
             &order,
@@ -2330,7 +2193,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         (merged, writes_by_stream)
     } else {
         (
-            run_l2_writes(
+            run_shim_writes(
                 Arc::clone(&cache),
                 &work_sizes,
                 &order,
@@ -2350,13 +2213,13 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
     tracing::info!(
         target: "studiofs.cache.profile",
         run_id = %params.run_id,
-        phase = "direct-l2-read",
+        phase = "direct-shim-read",
         "cache benchmark phase start"
     );
     let reads_wall_start = Instant::now();
     let reads_cpu_start = process_cpu_time();
     let (reads, reads_by_stream) = if params.sequential_streams {
-        let reads_by_stream = run_l2_reads_sequential_streams(
+        let reads_by_stream = run_shim_reads_sequential_streams(
             Arc::clone(&cache),
             &work_sizes,
             &order,
@@ -2373,7 +2236,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         (merged, reads_by_stream)
     } else {
         (
-            run_l2_reads(
+            run_shim_reads(
                 Arc::clone(&cache),
                 &work_sizes,
                 &order,
@@ -2435,7 +2298,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
 
     Ok(BenchmarkReport {
         run_id: params.run_id.clone(),
-        mode: "direct-l2".to_string(),
+        mode: "direct-shim".to_string(),
         cache_dir: cache_dir.display().to_string(),
         started_at,
         completed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -2457,7 +2320,6 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         volume: None,
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),
-        l2_bytes: None,
         cache_pipeline: Some(cache_pipeline),
         profile,
         advanced_metrics: Some(advanced_metrics),
@@ -2736,7 +2598,6 @@ async fn run_mounted_end_to_end(
             volume: Some(volume.to_string()),
             mount_point: Some(mount_point.display().to_string()),
             l1_bytes: None,
-            l2_bytes: None,
             cache_pipeline: None,
             profile,
             advanced_metrics: Some(advanced_metrics),
@@ -2774,49 +2635,10 @@ fn build_advanced_metrics(
     writes: &PhaseTelemetry,
     reads: &PhaseTelemetry,
     cache_levels: Option<&CacheLevelTelemetryAccumulator>,
-    cache_pipeline: Option<&CachePipelineReport>,
+    _cache_pipeline: Option<&CachePipelineReport>,
     writes_wall_elapsed_ms: f64,
     reads_wall_elapsed_ms: f64,
 ) -> AdvancedMetricsReport {
-    let queue_backpressure = cache_pipeline.map(|pipeline| {
-        let p50_ms = histogram_percentile_ms(
-            &pipeline.l2_commit_scheduler.backpressure_wait_histogram,
-            0.50,
-        );
-        let p95_ms = histogram_percentile_ms(
-            &pipeline.l2_commit_scheduler.backpressure_wait_histogram,
-            0.95,
-        );
-        let p99_ms = histogram_percentile_ms(
-            &pipeline.l2_commit_scheduler.backpressure_wait_histogram,
-            0.99,
-        );
-        QueueBackpressureReport {
-            l2_commit_queue: L2CommitQueueAdvancedReport {
-                queue_depth: pipeline.l2_commit_scheduler.queue_depth,
-                queue_depth_peak: pipeline.l2_commit_scheduler.queue_depth_peak,
-                queue_capacity: pipeline.l2_commit_scheduler.queue_capacity,
-                configured_workers: pipeline.l2_commit_scheduler.configured_workers,
-                active_workers: pipeline.l2_commit_scheduler.active_workers,
-                active_workers_peak: pipeline.l2_commit_scheduler.active_workers_peak,
-                submitted: pipeline.l2_commit_scheduler.submitted,
-                completed: pipeline.l2_commit_scheduler.completed,
-                failed: pipeline.l2_commit_scheduler.failed,
-                backpressure_events: pipeline.l2_commit_scheduler.backpressure_events,
-                backpressure_wait_avg_ms: pipeline.l2_commit_scheduler.backpressure_wait_avg_ms,
-                backpressure_wait_max_ms: pipeline.l2_commit_scheduler.backpressure_wait_max_ms,
-                backpressure_wait_p50_ms: p50_ms,
-                backpressure_wait_p95_ms: p95_ms,
-                backpressure_wait_p99_ms: p99_ms,
-                backpressure_wait_histogram: pipeline
-                    .l2_commit_scheduler
-                    .backpressure_wait_histogram
-                    .clone(),
-            },
-            upload_queue: pipeline.upload_queue.clone(),
-        }
-    });
-
     AdvancedMetricsReport {
         size_class_boundaries: SizeClassBoundaryReport {
             small_max_bytes: size_class_bounds.small_max,
@@ -2827,7 +2649,6 @@ fn build_advanced_metrics(
             reads: reads.by_size.to_reports(reads_wall_elapsed_ms),
         },
         cache_levels: cache_levels.map(|levels| levels.to_report(reads_wall_elapsed_ms)),
-        queue_backpressure,
     }
 }
 
@@ -3005,7 +2826,7 @@ fn save_benchmark_report(report: &BenchmarkReport, json_output: Option<&Path>) -
 
 fn render_human_summary(report: &BenchmarkReport) -> String {
     let mut out = String::new();
-    let target_label = if report.mode == "direct-l2" {
+    let target_label = if report.mode == "direct-shim" {
         "Cache dir"
     } else {
         "Target"
@@ -3071,16 +2892,12 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         format_bytes(report.l1_limit),
         format_bytes(report.l2_limit),
     );
-    if report.l1_bytes.is_some() || report.l2_bytes.is_some() {
+    if report.l1_bytes.is_some() {
         let _ = writeln!(
             &mut out,
-            "Resident:  L1 {}, L2 {}",
+            "Resident:  L1 {}",
             report
                 .l1_bytes
-                .map(format_bytes)
-                .unwrap_or_else(|| "-".to_string()),
-            report
-                .l2_bytes
                 .map(format_bytes)
                 .unwrap_or_else(|| "-".to_string()),
         );
@@ -3352,35 +3169,6 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         );
         let _ = writeln!(
             &mut out,
-            "L2 commit scheduler: queue {} / {} (peak {}), workers active {} / {} (peak {}), submitted {}, completed {}, failed {}, backpressure {} (avg {}, max {})",
-            pipeline.l2_commit_scheduler.queue_depth,
-            pipeline.l2_commit_scheduler.queue_capacity,
-            pipeline.l2_commit_scheduler.queue_depth_peak,
-            pipeline.l2_commit_scheduler.active_workers,
-            pipeline.l2_commit_scheduler.configured_workers,
-            pipeline.l2_commit_scheduler.active_workers_peak,
-            pipeline.l2_commit_scheduler.submitted,
-            pipeline.l2_commit_scheduler.completed,
-            pipeline.l2_commit_scheduler.failed,
-            pipeline.l2_commit_scheduler.backpressure_events,
-            format_duration_ms(pipeline.l2_commit_scheduler.backpressure_wait_avg_ms),
-            format_duration_ms(pipeline.l2_commit_scheduler.backpressure_wait_max_ms),
-        );
-        if let Some(backpressure) = report
-            .advanced_metrics
-            .as_ref()
-            .and_then(|metrics| metrics.queue_backpressure.as_ref())
-        {
-            let _ = writeln!(
-                &mut out,
-                "L2 backpressure percentiles: p50 {}, p95 {}, p99 {}",
-                format_duration_ms(backpressure.l2_commit_queue.backpressure_wait_p50_ms),
-                format_duration_ms(backpressure.l2_commit_queue.backpressure_wait_p95_ms),
-                format_duration_ms(backpressure.l2_commit_queue.backpressure_wait_p99_ms),
-            );
-        }
-        let _ = writeln!(
-            &mut out,
             "Blocking tasks: active {} (peak {}), submitted {}, started {}, completed {}, queue wait avg {}, max {}, exec avg {}, max {}",
             pipeline.blocking_tasks.total.active,
             pipeline.blocking_tasks.total.active_peak,
@@ -3546,7 +3334,7 @@ pub fn run(
     )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_L1_SIZE.to_string();
-    let l2_limit_default = DEFAULT_DIRECT_L2_LIMIT_BYTES.to_string();
+    let l2_limit_default = DEFAULT_DIRECT_SHIM_LIMIT_BYTES.to_string();
     let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
     let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(
@@ -3622,7 +3410,7 @@ pub fn run(
 
     let resolved_mode = resolve_run_mode(&target)?;
     let benchmark_mode = match &resolved_mode {
-        ResolvedRunMode::DirectL2 { .. } => "direct-l2",
+        ResolvedRunMode::DirectShim { .. } => "direct-shim",
         ResolvedRunMode::MountedE2E { .. } => "e2e",
     };
     let report_dir = json_output
@@ -3634,7 +3422,7 @@ pub fn run(
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let report = rt.block_on(async {
         match &resolved_mode {
-            ResolvedRunMode::DirectL2 { cache_dir } => run_direct(&params, cache_dir).await,
+            ResolvedRunMode::DirectShim { cache_dir } => run_direct(&params, cache_dir).await,
             ResolvedRunMode::MountedE2E {
                 volume,
                 mount_point,
@@ -3696,7 +3484,7 @@ mod tests {
     fn sample_report() -> BenchmarkReport {
         BenchmarkReport {
             run_id: "run-123".to_string(),
-            mode: "direct-l2".to_string(),
+            mode: "direct-shim".to_string(),
             cache_dir: r"D:\test-cache".to_string(),
             started_at: "2026-03-18T15:12:55Z".to_string(),
             completed_at: "2026-03-18T15:12:55Z".to_string(),
@@ -3719,7 +3507,6 @@ mod tests {
             volume: None,
             mount_point: None,
             l1_bytes: Some(128 * 1024 * 1024),
-            l2_bytes: Some(0),
             cache_pipeline: Some(CachePipelineReport {
                 l2_read: IoStatsReport {
                     ops: 0,
@@ -3750,24 +3537,6 @@ mod tests {
                     duration_histogram: LatencyHistogramReport {
                         bucket_upper_bounds_ns: vec![50_000],
                         bucket_counts: vec![4],
-                    },
-                },
-                l2_commit_scheduler: L2CommitSchedulerStatsReport {
-                    queue_depth: 0,
-                    queue_depth_peak: 8,
-                    queue_capacity: 512,
-                    configured_workers: 4,
-                    active_workers: 0,
-                    active_workers_peak: 4,
-                    submitted: 16,
-                    completed: 16,
-                    failed: 0,
-                    backpressure_events: 2,
-                    backpressure_wait_avg_ms: 0.4,
-                    backpressure_wait_max_ms: 1.3,
-                    backpressure_wait_histogram: LatencyHistogramReport {
-                        bucket_upper_bounds_ns: vec![50_000, 100_000],
-                        bucket_counts: vec![1, 1, 0],
                     },
                 },
                 upload_queue: UploadQueueStatsReport {
@@ -3834,11 +3603,11 @@ mod tests {
                 },
                 endpoint: Some(ProfileEndpointReport {
                     url: "http://pyroscope:4040".to_string(),
-                    application_name: "studiofs.test-cache.direct-l2".to_string(),
+                    application_name: "studiofs.test-cache.direct-shim".to_string(),
                 }),
                 artifacts: vec![ProfileArtifactSummary {
                     kind: "cpu".to_string(),
-                    path: r"D:\test-cache\studiofs-test-cache-direct-l2-run-123-cpu.pprof.gz"
+                    path: r"D:\test-cache\studiofs-test-cache-direct-shim-run-123-cpu.pprof.gz"
                         .to_string(),
                     bytes: 2048,
                     sent_to_endpoint: true,
@@ -3944,37 +3713,6 @@ mod tests {
                             bucket_upper_bounds_ns: vec![50_000, 100_000],
                             bucket_counts: vec![0, 1, 6],
                         },
-                    },
-                }),
-                queue_backpressure: Some(QueueBackpressureReport {
-                    l2_commit_queue: L2CommitQueueAdvancedReport {
-                        queue_depth: 0,
-                        queue_depth_peak: 8,
-                        queue_capacity: 512,
-                        configured_workers: 4,
-                        active_workers: 0,
-                        active_workers_peak: 4,
-                        submitted: 16,
-                        completed: 16,
-                        failed: 0,
-                        backpressure_events: 2,
-                        backpressure_wait_avg_ms: 0.4,
-                        backpressure_wait_max_ms: 1.3,
-                        backpressure_wait_p50_ms: 0.1,
-                        backpressure_wait_p95_ms: 0.1,
-                        backpressure_wait_p99_ms: 0.1,
-                        backpressure_wait_histogram: LatencyHistogramReport {
-                            bucket_upper_bounds_ns: vec![50_000, 100_000],
-                            bucket_counts: vec![1, 1, 0],
-                        },
-                    },
-                    upload_queue: UploadQueueStatsReport {
-                        pending_depth: 0,
-                        pending_depth_peak: 3,
-                        submitted: 16,
-                        completed: 16,
-                        requeued: 0,
-                        canceled: 0,
                     },
                 }),
             }),
@@ -4184,14 +3922,14 @@ mod tests {
         assert_eq!(
             first,
             temp.path()
-                .join("studiofs-test-cache-direct-l2-20260319-151255.json")
+                .join("studiofs-test-cache-direct-shim-20260319-151255.json")
         );
 
         let second = save_benchmark_report_in(&report, None, temp.path(), now).unwrap();
         assert_eq!(
             second,
             temp.path()
-                .join("studiofs-test-cache-direct-l2-20260319-151255-2.json")
+                .join("studiofs-test-cache-direct-shim-20260319-151255-2.json")
         );
     }
 
@@ -4216,7 +3954,7 @@ mod tests {
 
         let content = std::fs::read_to_string(saved).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["mode"], "direct-l2");
+        assert_eq!(parsed["mode"], "direct-shim");
         assert!(content.contains("\n  \"mode\""));
     }
 

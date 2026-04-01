@@ -175,7 +175,7 @@ studiofs test-cache \
 
 Notes:
 - If `<path>` is not inside an active StudioFS mount, benchmark runs in
-  `direct-l2` mode and uses `<path>` as cache dir.
+  `direct-shim` mode and uses `<path>` as cache dir.
 - If `<path>` is inside an active StudioFS mount, benchmark runs in `e2e` mode
   through that mounted process and writes temp workload files into
   `<path>/.studiofs-test-cache`.
@@ -200,14 +200,13 @@ Notes:
 - JSON report contains an `advanced_metrics` section with:
   - size-class boundaries (`small_max_bytes`, `medium_max_bytes`)
   - per-size-class throughput and latency percentiles (p50/p95/p99)
-  - L2 commit queue and upload queue backpressure/depth counters
-- `direct-l2` JSON output includes a `cache_pipeline` section with:
+  - upload queue depth counters
+- `direct-shim` JSON output includes a `cache_pipeline` section with:
   - `l2_read` / `l2_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
-  - `l2_commit_scheduler` queue depth / worker activity / backpressure counters
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
-- `direct-l2` `advanced_metrics.cache_levels` adds explicit L1/L2 hit/miss
+- `direct-shim` `advanced_metrics.cache_levels` adds explicit L1/L2 hit/miss
   counters, bytes served from each level, and per-level lookup latency
   distributions.
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
@@ -219,3 +218,4 @@ Notes:
   pending upload counts before and after each read phase.
 - `e2e` mode still keeps filesystem-level read/write reports; cache internals
   continue to be emitted through mount logs (`upload pipeline counters`).
+

@@ -48,7 +48,6 @@ impl BlockCacheConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheReadLevel {
     L1,
-    L2,
     Miss,
 }
 
