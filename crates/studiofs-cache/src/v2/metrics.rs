@@ -43,6 +43,13 @@ pub struct CacheMetrics {
     pub write_latency_max_ns: u64,
     /// Number of attempted post-read dont-need advisory hints (best-effort).
     pub advisory_dont_need_count: u64,
+    /// Disk-headroom refresh counters used by emergency pressure eviction.
+    pub disk_headroom_refresh_attempt_count: u64,
+    pub disk_headroom_refresh_success_count: u64,
+    pub disk_headroom_refresh_error_count: u64,
+    pub disk_headroom_refresh_skip_interval_count: u64,
+    pub disk_headroom_refresh_skip_inflight_count: u64,
+    pub disk_headroom_refresh_saved_syscall_count: u64,
 }
 
 impl CacheMetrics {
@@ -70,6 +77,15 @@ impl CacheMetrics {
             write_latency_total_ns: store.write_latency_total_ns(),
             write_latency_max_ns: store.write_latency_max_ns(),
             advisory_dont_need_count: store.advisory_dont_need_count(),
+            disk_headroom_refresh_attempt_count: store.disk_headroom_refresh_attempt_count(),
+            disk_headroom_refresh_success_count: store.disk_headroom_refresh_success_count(),
+            disk_headroom_refresh_error_count: store.disk_headroom_refresh_error_count(),
+            disk_headroom_refresh_skip_interval_count: store
+                .disk_headroom_refresh_skip_interval_count(),
+            disk_headroom_refresh_skip_inflight_count: store
+                .disk_headroom_refresh_skip_inflight_count(),
+            disk_headroom_refresh_saved_syscall_count: store
+                .disk_headroom_refresh_saved_syscall_count(),
         }
     }
 

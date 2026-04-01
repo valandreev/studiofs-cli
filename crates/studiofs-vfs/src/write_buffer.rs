@@ -1,5 +1,7 @@
 use super::*;
 
+const BLOCK_STORE_PUT_PIPELINE_WIDTH: usize = 8;
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingBlock {
     pub(super) data: BytesMut,
@@ -294,12 +296,14 @@ impl StudioVfs {
         let attr_after_commit = attr_for_meta.clone();
 
         let pre_metadata_result: VfsResult<()> = async {
-            let put_results = futures::future::join_all(persisted_blocks.iter().map(|block| {
-                self.block_store_put_async(block.object_id, block.data.clone(), false)
-            }))
-            .await;
-            for result in put_results {
-                result?;
+            for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
+                let put_results = futures::future::join_all(chunk.iter().map(|block| {
+                    self.block_store_put_async(block.object_id, block.data.clone(), false)
+                }))
+                .await;
+                for result in put_results {
+                    result?;
+                }
             }
             self.block_store_sync_data_async().await?;
 
