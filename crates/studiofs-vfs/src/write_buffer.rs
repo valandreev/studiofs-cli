@@ -104,48 +104,12 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
-    fn add_pending_write_buffer_block_index(&self, ino: Ino, block_index: u32) {
-        self.state
-            .write_buffer
-            .pending_block_indexes
-            .lock()
-            .entry(ino)
-            .or_default()
-            .insert(block_index);
-    }
-
     fn add_pending_write_buffer_block_indexes<I>(&self, ino: Ino, block_indexes: I)
     where
         I: IntoIterator<Item = u32>,
     {
         let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
         indexes.entry(ino).or_default().extend(block_indexes);
-    }
-
-    fn remove_pending_write_buffer_block_indexes<I>(&self, ino: Ino, block_indexes: I)
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
-        let Some(inode_indexes) = indexes.get_mut(&ino) else {
-            return;
-        };
-        for block_index in block_indexes {
-            inode_indexes.remove(&block_index);
-        }
-        if inode_indexes.is_empty() {
-            indexes.remove(&ino);
-        }
-    }
-
-    fn snapshot_pending_write_buffer_block_indexes(&self, ino: Ino) -> Vec<u32> {
-        self.state
-            .write_buffer
-            .pending_block_indexes
-            .lock()
-            .get(&ino)
-            .map(|indexes| indexes.iter().copied().collect())
-            .unwrap_or_default()
     }
 
     fn has_pending_write_buffer_blocks_for_inode(&self, ino: Ino) -> bool {
@@ -204,37 +168,37 @@ impl StudioVfs {
     }
 
     fn replace_pending_write_buffer_block(&self, ino: Ino, block_index: u32, block: PendingBlock) {
+        let mut pending = self.state.write_buffer.pending_blocks.lock();
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
         let new_len = block.data.len();
-        let old_len = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
+        let old_len = pending
             .insert((ino, block_index), block)
             .map(|old| old.data.len())
             .unwrap_or(0);
+        indexes.entry(ino).or_default().insert(block_index);
+        drop(indexes);
+        drop(pending);
         match new_len.cmp(&old_len) {
             std::cmp::Ordering::Greater => self.add_pending_write_buffer_bytes(new_len - old_len),
             std::cmp::Ordering::Less => self.subtract_pending_write_buffer_bytes(old_len - new_len),
             std::cmp::Ordering::Equal => {}
         }
-        self.add_pending_write_buffer_block_index(ino, block_index);
     }
 
     pub(super) fn clear_pending_blocks_for_inode(&self, ino: Ino) {
         let mut removed_bytes = 0usize;
-        let mut removed_block_indexes = Vec::new();
         let mut pending = self.state.write_buffer.pending_blocks.lock();
-        pending.retain(|(candidate, block_index), block| {
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        pending.retain(|(candidate, _), block| {
             if *candidate == ino {
                 removed_bytes += block.data.len();
-                removed_block_indexes.push(*block_index);
                 return false;
             }
             true
         });
+        indexes.remove(&ino);
+        drop(indexes);
         drop(pending);
-        self.remove_pending_write_buffer_block_indexes(ino, removed_block_indexes);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
     }
 
@@ -443,14 +407,17 @@ impl StudioVfs {
     }
 
     pub(super) fn clear_pending_block(&self, ino: Ino, block_index: u32) {
-        if let Some(removed) = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .remove(&(ino, block_index))
-        {
-            self.remove_pending_write_buffer_block_indexes(ino, [block_index]);
+        let mut pending = self.state.write_buffer.pending_blocks.lock();
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        if let Some(removed) = pending.remove(&(ino, block_index)) {
+            if let Some(inode_indexes) = indexes.get_mut(&ino) {
+                inode_indexes.remove(&block_index);
+                if inode_indexes.is_empty() {
+                    indexes.remove(&ino);
+                }
+            }
+            drop(indexes);
+            drop(pending);
             self.subtract_pending_write_buffer_bytes(removed.data.len());
         }
     }
@@ -460,34 +427,37 @@ impl StudioVfs {
         // may race ahead and mutate the same block after the snapshot is taken;
         // commit then intentionally leaves the newer RAM bytes dirty so a later
         // flush retries with the fresh contents instead of dropping them.
-        let block_indexes = self.snapshot_pending_write_buffer_block_indexes(ino);
         let pending = self.state.write_buffer.pending_blocks.lock();
-        let blocks: Vec<_> = block_indexes
+        let indexes = self.state.write_buffer.pending_block_indexes.lock();
+        indexes
+            .get(&ino)
             .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter())
             .filter_map(|block_index| {
                 pending
-                    .get(&(ino, block_index))
+                    .get(&(ino, *block_index))
                     .filter(|pending| pending.dirty)
-                    .map(|pending| (block_index, pending.data.clone().freeze()))
+                    .map(|pending| (*block_index, pending.data.clone().freeze()))
             })
-            .collect();
-        blocks
+            .collect()
     }
 
     fn snapshot_dirty_full_write_buffer_blocks(&self, ino: Ino) -> (Vec<(u32, Bytes)>, usize) {
-        let block_indexes = self.snapshot_pending_write_buffer_block_indexes(ino);
         let pending = self.state.write_buffer.pending_blocks.lock();
+        let indexes = self.state.write_buffer.pending_block_indexes.lock();
         let mut total_bytes = 0usize;
-        let blocks: Vec<_> = block_indexes
+        let blocks: Vec<_> = indexes
+            .get(&ino)
             .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter())
             .filter_map(|block_index| {
-                let pending = pending.get(&(ino, block_index))?;
+                let pending = pending.get(&(ino, *block_index))?;
                 if !pending.dirty || pending.data.len() < self.block_size as usize {
                     return None;
                 }
                 let data = pending.data.clone().freeze();
                 total_bytes += data.len();
-                Some((block_index, data))
+                Some((*block_index, data))
             })
             .collect();
         (blocks, total_bytes)
@@ -499,10 +469,19 @@ impl StudioVfs {
         }
 
         let mut pending = self.state.write_buffer.pending_blocks.lock();
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
         let (removed_bytes, removed_block_indexes) =
             commit_persisted_block_state(&mut pending, ino, blocks);
+        if let Some(inode_indexes) = indexes.get_mut(&ino) {
+            for block_index in &removed_block_indexes {
+                inode_indexes.remove(block_index);
+            }
+            if inode_indexes.is_empty() {
+                indexes.remove(&ino);
+            }
+        }
+        drop(indexes);
         drop(pending);
-        self.remove_pending_write_buffer_block_indexes(ino, removed_block_indexes);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
     }
 
