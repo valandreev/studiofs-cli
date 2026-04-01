@@ -100,15 +100,15 @@ data arrives
   ├─ Split into block-aligned chunks
   ├─ Store/merge in the per-file `WriteBuffer`
   ├─ Update local inode size and pending incarnation overlay
-  └─ If a full aligned block becomes complete, VFS may eagerly persist it
-     through `BlockStore -> sync_data() -> metadata`
+  └─ If enough full aligned blocks accumulate, VFS may eagerly persist the
+     coalesced batch through `BlockStore -> sync_data() -> metadata`
 ```
 
 Handle-aware write path:
 - `write_fh(fh, ino, offset, data)` buffers data identically to `write()`.
 - `flush_fh()` runs the normal ordered flush for the inode and then surfaces any sticky async-upload error for that inode.
 - Foreground `flush()` / `close()` keep local persistence and error reporting deterministic without waiting for remote upload or manifest publication.
-- Full-block eager flush lets aligned blocks become locally durable before the tail partial block is ready.
+- Full-block eager flush coalesces aligned blocks into a larger batch before paying the local durability boundary.
 - Foreground backpressure is driven by local `WriteBuffer` pressure; upload backlog alone does not stall writes.
 - Asynchronous upload failures are tracked as sticky inode errors; `flush_fh` / `fsync` report `EIO` deterministically until the async pipeline recovers and clears the sticky state.
 - `flush_fh`/`fsync` report sticky upload errors only after finishing the current local sync step, so newly written data is still persisted locally before `EIO` is returned.
@@ -132,6 +132,7 @@ or environment variable `STUDIOFS_CACHE_SAFETY_MODE=fast|durable`.
 
 Local durability notes:
 - Dirty bytes stay in `WriteBuffer` until the `BlockStore -> sync_data() -> metadata` sequence succeeds; failed persists do not drain RAM ownership.
+- `write()` only pays that persist boundary after enough completed full-block data accumulates (`STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES`, default `32MB`) or when `flush()` / backpressure / shutdown forces the batch out.
 - Reserved object IDs make retrying the same dirty block idempotent across metadata failures.
 - `cache_safety_mode` no longer changes the foreground persistence path. Both modes use the same local durability flow.
 - `fast` mode removes legacy ingress artifacts during startup self-heal; `durable` mode preserves checkpoint/state metadata for startup recovery compatibility.

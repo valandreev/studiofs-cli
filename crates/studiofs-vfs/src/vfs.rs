@@ -600,6 +600,7 @@ const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
 const DEFAULT_MAX_DIRTY_BYTES: usize = 12 * 1024 * 1024 * 1024;
+const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
 const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
@@ -750,6 +751,10 @@ pub struct VfsConfig {
     /// Maximum total bytes allowed in the dirty-write memory buffer.
     /// Parsed from env via `parse_size_bytes` (for example `1.5GB`).
     pub max_dirty_bytes: usize,
+    /// Minimum bytes of dirty full-block data to coalesce before `write()`
+    /// triggers an eager local persist batch.
+    /// Parsed from env via `parse_size_bytes` (for example `32MB`).
+    pub write_eager_flush_batch_bytes: usize,
     /// Maximum bytes allowed for a single xattr value.
     /// Parsed from env via `parse_size_bytes` (for example `64KB`).
     pub max_xattr_bytes: usize,
@@ -912,6 +917,7 @@ pub struct VfsConfigRaw {
     pub lock_retry_base_ms: Option<u64>,
     pub lock_retry_max_ms: Option<u64>,
     pub max_dirty_bytes: Option<usize>,
+    pub write_eager_flush_batch_bytes: Option<usize>,
     pub max_xattr_bytes: Option<usize>,
     pub dentry_cache_capacity: Option<usize>,
     pub dentry_cache_bytes: Option<usize>,
@@ -1037,6 +1043,7 @@ impl VfsConfigRaw {
             lock_retry_base_ms,
             lock_retry_max_ms,
             max_dirty_bytes,
+            write_eager_flush_batch_bytes,
             max_xattr_bytes,
             dentry_cache_capacity,
             dentry_cache_bytes,
@@ -1132,6 +1139,7 @@ fn normalize_and_validate_config(mut cfg: VfsConfig) -> VfsResult<VfsConfigValid
     cfg.lock_retry_base_ms = cfg.lock_retry_base_ms.max(1);
     cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
     cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
+    cfg.write_eager_flush_batch_bytes = cfg.write_eager_flush_batch_bytes.max(1);
     cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
     cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
     cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
@@ -1209,6 +1217,7 @@ impl From<VfsConfig> for VfsConfigRaw {
             lock_retry_base_ms: Some(cfg.lock_retry_base_ms),
             lock_retry_max_ms: Some(cfg.lock_retry_max_ms),
             max_dirty_bytes: Some(cfg.max_dirty_bytes),
+            write_eager_flush_batch_bytes: Some(cfg.write_eager_flush_batch_bytes),
             max_xattr_bytes: Some(cfg.max_xattr_bytes),
             dentry_cache_capacity: Some(cfg.dentry_cache_capacity),
             dentry_cache_bytes: Some(cfg.dentry_cache_bytes),
@@ -1300,6 +1309,7 @@ impl Default for VfsConfig {
             lock_retry_base_ms: DEFAULT_LOCK_RETRY_BASE_MS,
             lock_retry_max_ms: DEFAULT_LOCK_RETRY_MAX_MS,
             max_dirty_bytes: DEFAULT_MAX_DIRTY_BYTES,
+            write_eager_flush_batch_bytes: DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES,
             max_xattr_bytes: DEFAULT_XATTR_MAX_BYTES,
             dentry_cache_capacity: DEFAULT_DENTRY_CACHE_CAPACITY,
             dentry_cache_bytes: DEFAULT_DENTRY_CACHE_BYTES,
@@ -3482,6 +3492,9 @@ pub struct StudioVfs {
     /// `flush()` / `write()` apply backpressure.
     /// Runtime-adjustable by the adaptive memory controller.
     max_dirty_bytes: AtomicUsize,
+    /// Minimum dirty full-block batch size before `write()` pays the local
+    /// persist boundary for eager block flushes.
+    write_eager_flush_batch_bytes: usize,
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
     ingress_wal: IngressWal,
@@ -4278,6 +4291,9 @@ impl StudioVfs {
             let janitor_lease = None;
             let distributed_flock = None;
             let max_dirty_bytes = config.max_dirty_bytes;
+            let write_eager_flush_batch_bytes = config
+                .write_eager_flush_batch_bytes
+                .max(block_size as usize);
             let max_xattr_bytes = config.max_xattr_bytes;
             let dentry_cache_capacity = config.dentry_cache_capacity;
             let dentry_cache_bytes = config.dentry_cache_bytes;
@@ -4490,6 +4506,7 @@ impl StudioVfs {
                 upload_fg_read_latency_window_ms,
                 upload_fg_read_latency_sticky_windows,
                 max_dirty_bytes,
+                write_eager_flush_batch_bytes,
                 max_xattr_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
@@ -4555,6 +4572,7 @@ impl StudioVfs {
                     config.total_ram,
                 ),
                 max_dirty_bytes: AtomicUsize::new(max_dirty_bytes),
+                write_eager_flush_batch_bytes,
                 max_xattr_bytes,
                 ingress_wal,
                 handle_table: HandleTable::new(),
@@ -9532,9 +9550,9 @@ impl StudioVfs {
 
     /// Write data to a file at the given offset.
     ///
-    /// Full blocks are flushed eagerly (package + cache + upload submit) so that
-    /// the final `flush()` only handles the last partial block, eliminating the
-    /// end-of-write stall where all blocks were previously processed at once.
+    /// Completed full blocks are coalesced into a larger eager-persist batch so
+    /// `write()` avoids paying the local durability boundary for every single
+    /// block while `flush()` still handles any remaining tail blocks.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let session = self
             .enter_file_session_op(ino, FileSessionOperation::Write)
@@ -9547,9 +9565,9 @@ impl StudioVfs {
 
     /// Flush all buffered blocks for a file.
     ///
-    /// With eager flushing in `write()`, most full blocks are already flushed.
-    /// This handles only the remaining dirty blocks (typically just the last partial block).
-    /// Remaining blocks are flushed in parallel for best performance.
+    /// `write()` may have already coalesced and persisted some full blocks, but
+    /// `flush()` is still the definitive "persist everything that is left"
+    /// barrier for the inode.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         let session = self
             .enter_file_session_op(ino, FileSessionOperation::Flush)
@@ -11444,6 +11462,10 @@ mod tests {
             defaults.janitor_interval_secs
         );
         assert_eq!(validated.max_dirty_bytes, defaults.max_dirty_bytes);
+        assert_eq!(
+            validated.write_eager_flush_batch_bytes,
+            defaults.write_eager_flush_batch_bytes
+        );
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
             validated.upload_worker_count, 4,

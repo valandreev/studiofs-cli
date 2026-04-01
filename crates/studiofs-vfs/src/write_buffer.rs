@@ -16,6 +16,8 @@ struct PersistedWriteBlock {
 
 pub(super) struct WriteBufferState {
     pub(super) pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
+    pub(super) pending_block_indexes:
+        Mutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
     pub(super) pending_bytes: AtomicUsize,
     pub(super) write_backpressure_wait_ms: AtomicU64,
     pub(super) write_backpressure_events: AtomicU64,
@@ -28,6 +30,7 @@ impl WriteBufferState {
     pub(super) fn new() -> Self {
         Self {
             pending_blocks: Mutex::new(std::collections::HashMap::new()),
+            pending_block_indexes: Mutex::new(std::collections::HashMap::new()),
             pending_bytes: AtomicUsize::new(0),
             write_backpressure_wait_ms: AtomicU64::new(0),
             write_backpressure_events: AtomicU64::new(0),
@@ -73,8 +76,9 @@ fn commit_persisted_block_state(
     pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
     ino: Ino,
     blocks: &[PersistedWriteBlock],
-) -> usize {
+) -> (usize, Vec<u32>) {
     let mut removed_bytes = 0usize;
+    let mut removed_block_indexes = Vec::new();
     for block in blocks {
         let key = (ino, block.block_index);
         let mut should_remove = false;
@@ -86,9 +90,10 @@ fn commit_persisted_block_state(
         }
         if should_remove && let Some(removed) = pending.remove(&key) {
             removed_bytes += removed.data.len();
+            removed_block_indexes.push(block.block_index);
         }
     }
-    removed_bytes
+    (removed_bytes, removed_block_indexes)
 }
 
 impl StudioVfs {
@@ -99,28 +104,21 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
+    fn add_pending_write_buffer_block_indexes<I>(&self, ino: Ino, block_indexes: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        indexes.entry(ino).or_default().extend(block_indexes);
+    }
+
     fn has_pending_write_buffer_blocks_for_inode(&self, ino: Ino) -> bool {
         self.state
             .write_buffer
-            .pending_blocks
+            .pending_block_indexes
             .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
-    }
-
-    fn has_pending_write_buffer_blocks_excluding(
-        &self,
-        ino: Ino,
-        block_indexes: &HashSet<u32>,
-    ) -> bool {
-        self.state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .keys()
-            .any(|(candidate, block_index)| {
-                *candidate == ino && !block_indexes.contains(block_index)
-            })
+            .get(&ino)
+            .is_some_and(|indexes| !indexes.is_empty())
     }
 
     fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
@@ -170,15 +168,16 @@ impl StudioVfs {
     }
 
     fn replace_pending_write_buffer_block(&self, ino: Ino, block_index: u32, block: PendingBlock) {
+        let mut pending = self.state.write_buffer.pending_blocks.lock();
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
         let new_len = block.data.len();
-        let old_len = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
+        let old_len = pending
             .insert((ino, block_index), block)
             .map(|old| old.data.len())
             .unwrap_or(0);
+        indexes.entry(ino).or_default().insert(block_index);
+        drop(indexes);
+        drop(pending);
         match new_len.cmp(&old_len) {
             std::cmp::Ordering::Greater => self.add_pending_write_buffer_bytes(new_len - old_len),
             std::cmp::Ordering::Less => self.subtract_pending_write_buffer_bytes(old_len - new_len),
@@ -189,6 +188,7 @@ impl StudioVfs {
     pub(super) fn clear_pending_blocks_for_inode(&self, ino: Ino) {
         let mut removed_bytes = 0usize;
         let mut pending = self.state.write_buffer.pending_blocks.lock();
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
         pending.retain(|(candidate, _), block| {
             if *candidate == ino {
                 removed_bytes += block.data.len();
@@ -196,6 +196,8 @@ impl StudioVfs {
             }
             true
         });
+        indexes.remove(&ino);
+        drop(indexes);
         drop(pending);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
     }
@@ -292,9 +294,12 @@ impl StudioVfs {
         let attr_after_commit = attr_for_meta.clone();
 
         let pre_metadata_result: VfsResult<()> = async {
-            for block in &persisted_blocks {
+            let put_results = futures::future::join_all(persisted_blocks.iter().map(|block| {
                 self.block_store_put_async(block.object_id, block.data.clone(), false)
-                    .await?;
+            }))
+            .await;
+            for result in put_results {
+                result?;
             }
             self.block_store_sync_data_async().await?;
 
@@ -369,7 +374,12 @@ impl StudioVfs {
 
     async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
         let started = Instant::now();
-        self.flush_ordered(ino).await?;
+        let _ = self
+            .flush_dirty_full_write_buffer_blocks(ino, 1, None)
+            .await?;
+        if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
+            self.flush_ordered(ino).await?;
+        }
         let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if waited_ms > 0 {
             self.state
@@ -397,13 +407,17 @@ impl StudioVfs {
     }
 
     pub(super) fn clear_pending_block(&self, ino: Ino, block_index: u32) {
-        if let Some(removed) = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .remove(&(ino, block_index))
-        {
+        let mut pending = self.state.write_buffer.pending_blocks.lock();
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        if let Some(removed) = pending.remove(&(ino, block_index)) {
+            if let Some(inode_indexes) = indexes.get_mut(&ino) {
+                inode_indexes.remove(&block_index);
+                if inode_indexes.is_empty() {
+                    indexes.remove(&ino);
+                }
+            }
+            drop(indexes);
+            drop(pending);
             self.subtract_pending_write_buffer_bytes(removed.data.len());
         }
     }
@@ -413,17 +427,40 @@ impl StudioVfs {
         // may race ahead and mutate the same block after the snapshot is taken;
         // commit then intentionally leaves the newer RAM bytes dirty so a later
         // flush retries with the fresh contents instead of dropping them.
-        let mut blocks: Vec<_> = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .iter()
-            .filter(|((candidate, _), pending)| *candidate == ino && pending.dirty)
-            .map(|((_, block_index), pending)| (*block_index, pending.data.clone().freeze()))
+        let pending = self.state.write_buffer.pending_blocks.lock();
+        let indexes = self.state.write_buffer.pending_block_indexes.lock();
+        indexes
+            .get(&ino)
+            .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter())
+            .filter_map(|block_index| {
+                pending
+                    .get(&(ino, *block_index))
+                    .filter(|pending| pending.dirty)
+                    .map(|pending| (*block_index, pending.data.clone().freeze()))
+            })
+            .collect()
+    }
+
+    fn snapshot_dirty_full_write_buffer_blocks(&self, ino: Ino) -> (Vec<(u32, Bytes)>, usize) {
+        let pending = self.state.write_buffer.pending_blocks.lock();
+        let indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let mut total_bytes = 0usize;
+        let blocks: Vec<_> = indexes
+            .get(&ino)
+            .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter())
+            .filter_map(|block_index| {
+                let pending = pending.get(&(ino, *block_index))?;
+                if !pending.dirty || pending.data.len() < self.block_size as usize {
+                    return None;
+                }
+                let data = pending.data.clone().freeze();
+                total_bytes += data.len();
+                Some((*block_index, data))
+            })
             .collect();
-        blocks.sort_by_key(|(block_index, _)| *block_index);
-        blocks
+        (blocks, total_bytes)
     }
 
     fn commit_persisted_write_buffer_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
@@ -432,9 +469,51 @@ impl StudioVfs {
         }
 
         let mut pending = self.state.write_buffer.pending_blocks.lock();
-        let removed_bytes = commit_persisted_block_state(&mut pending, ino, blocks);
+        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let (removed_bytes, removed_block_indexes) =
+            commit_persisted_block_state(&mut pending, ino, blocks);
+        if let Some(inode_indexes) = indexes.get_mut(&ino) {
+            for block_index in &removed_block_indexes {
+                inode_indexes.remove(block_index);
+            }
+            if inode_indexes.is_empty() {
+                indexes.remove(&ino);
+            }
+        }
+        drop(indexes);
         drop(pending);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
+    }
+
+    async fn flush_dirty_full_write_buffer_blocks(
+        &self,
+        ino: Ino,
+        minimum_batch_bytes: usize,
+        fallback_content_epoch: Option<u64>,
+    ) -> VfsResult<bool> {
+        let (full_blocks, full_block_batch_bytes) =
+            self.snapshot_dirty_full_write_buffer_blocks(ino);
+        if full_blocks.is_empty() || full_block_batch_bytes < minimum_batch_bytes {
+            return Ok(false);
+        }
+
+        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else if let Some(content_epoch) = fallback_content_epoch {
+            content_epoch
+        } else {
+            self.current_content_epoch_async(ino).await?
+        };
+        let attr_to_clear = dirty_attr.clone();
+        let persisted_blocks = self
+            .persist_write_buffer_blocks(ino, full_blocks, content_epoch, dirty_attr)
+            .await?;
+        self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
+        if let Some(attr) = attr_to_clear.as_ref() {
+            self.clear_matching_dirty_attr_if_committed(ino, attr);
+        }
+        Ok(!persisted_blocks.is_empty())
     }
 
     pub(super) fn trim_local_block_staging(
@@ -559,7 +638,8 @@ impl StudioVfs {
         let mut remaining = data.len();
         let mut current_offset = offset;
         let mut data_offset = 0;
-        let mut full_blocks: Vec<(u32, Bytes)> = Vec::new();
+        let mut has_full_blocks = false;
+        let mut inserted_block_indexes = Vec::new();
 
         while remaining > 0 {
             let block_index = block_index_from_offset(current_offset, self.block_size);
@@ -584,20 +664,23 @@ impl StudioVfs {
                 } else {
                     existing_data
                 };
-                let inserted_bytes = {
+                let (inserted_block, inserted_bytes) = {
                     let mut pending = self.state.write_buffer.pending_blocks.lock();
                     match pending.entry((ino, block_index)) {
-                        std::collections::hash_map::Entry::Occupied(_) => 0,
+                        std::collections::hash_map::Entry::Occupied(_) => (false, 0),
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             entry.insert(PendingBlock {
                                 data: BytesMut::from(existing_data.as_ref()),
                                 dirty: false,
                                 reserved_object_id: None,
                             });
-                            existing_data.len()
+                            (true, existing_data.len())
                         }
                     }
                 };
+                if inserted_block {
+                    inserted_block_indexes.push(block_index);
+                }
                 self.add_pending_write_buffer_bytes(inserted_bytes);
             }
 
@@ -618,7 +701,7 @@ impl StudioVfs {
                 pending_block.dirty = true;
 
                 if pending_block.data.len() >= self.block_size as usize {
-                    full_blocks.push((block_index, pending_block.data.clone().freeze()));
+                    has_full_blocks = true;
                 }
             }
 
@@ -626,6 +709,9 @@ impl StudioVfs {
             remaining -= to_write;
             current_offset += to_write as u64;
             data_offset += to_write;
+        }
+        if !inserted_block_indexes.is_empty() {
+            self.add_pending_write_buffer_block_indexes(ino, inserted_block_indexes);
         }
 
         let mut base_attr = self.getattr_async(ino).await?;
@@ -641,30 +727,22 @@ impl StudioVfs {
             self.update_pending_incarnation_size(ino, attr.size);
         }
 
-        if !full_blocks.is_empty() {
-            let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
-            let content_epoch = dirty_attr
-                .as_ref()
-                .map(|attr| attr.content_epoch)
-                .unwrap_or(base_attr.content_epoch);
-            let full_block_indexes: HashSet<u32> = full_blocks
-                .iter()
-                .map(|(block_index, _)| *block_index)
-                .collect();
-            let attr_to_persist =
-                if self.has_pending_write_buffer_blocks_excluding(ino, &full_block_indexes) {
-                    None
-                } else {
-                    dirty_attr.clone()
-                };
-            let attr_to_clear = attr_to_persist.clone();
-            let persisted_blocks = self
-                .persist_write_buffer_blocks(ino, full_blocks, content_epoch, attr_to_persist)
-                .await?;
-            self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
-            if let Some(attr) = attr_to_clear.as_ref() {
-                self.clear_matching_dirty_attr_if_committed(ino, attr);
+        if has_full_blocks
+            && !self
+                .flush_dirty_full_write_buffer_blocks(
+                    ino,
+                    self.write_eager_flush_batch_bytes,
+                    Some(base_attr.content_epoch),
+                )
+                .await?
+        {
+            let pending_after_write = self.total_pending_write_buffer_bytes();
+            if pending_before_write > 0
+                && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
+            {
+                self.apply_write_buffer_backpressure(ino).await?;
             }
+            return Ok(written as u32);
         }
 
         let pending_after_write = self.total_pending_write_buffer_bytes();
@@ -796,9 +874,11 @@ mod tests {
             data: Bytes::from_static(b"older"),
         }];
 
-        let removed_bytes = commit_persisted_block_state(&mut pending, ino, &blocks);
+        let (removed_bytes, removed_block_indexes) =
+            commit_persisted_block_state(&mut pending, ino, &blocks);
 
         assert_eq!(removed_bytes, 0);
+        assert!(removed_block_indexes.is_empty());
         let pending_block = pending.get(&(ino, 3)).unwrap();
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, None);

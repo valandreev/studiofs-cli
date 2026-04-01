@@ -180,6 +180,13 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     {
         config.max_dirty_bytes = Some(bytes);
     }
+    if let Ok(v) = std::env::var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES")
+        && let Some(bytes) = parse_size_bytes(&v)
+        && bytes > 0
+        && let Ok(bytes) = usize::try_from(bytes)
+    {
+        config.write_eager_flush_batch_bytes = Some(bytes);
+    }
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
@@ -2407,11 +2414,13 @@ fn eager_full_block_write_recovers_pending_upload_after_restart() {
     type EnvRestore = ScopedEnvVar;
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_eager = EnvRestore::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
 
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
+        std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "4MB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     }
@@ -8153,9 +8162,11 @@ fn flush_failure_keeps_pending_write_buffer_data() {
 fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_eager = ScopedEnvVar::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
+        std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "512KB");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -8217,6 +8228,323 @@ fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
             vfs.ingress_stats().dirty_mem_bytes >= payload.len(),
             "failed eager flush must keep bytes accounted in the write buffer"
         );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn write_eager_flush_batches_full_blocks_until_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-eager-batch-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size * 2),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-eager-batch.bin", 0, 0, 0o644)
+            .unwrap();
+        let first = vec![0x11u8; block_size];
+        let second = vec![0x22u8; block_size];
+
+        vfs.write(attr.ino, 0, &first).await.unwrap();
+        assert!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "one full block should stay buffered until the eager-flush batch threshold is reached"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "no upload should be enqueued before the local batch persists"
+        );
+        let first_read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(
+            first_read.as_ref(),
+            first.as_slice(),
+            "buffered full blocks must remain readable before eager persistence"
+        );
+
+        vfs.write(attr.ino, block_size as u64, &second)
+            .await
+            .unwrap();
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "crossing the eager-flush threshold should commit the accumulated full-block batch"
+        );
+
+        let combined = vfs
+            .read(attr.ino, 0, (block_size * 2) as u32)
+            .await
+            .unwrap();
+        assert_eq!(&combined[..block_size], first.as_slice());
+        assert_eq!(&combined[block_size..], second.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn write_eager_flush_flushes_full_blocks_below_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-eager-flush-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size * 2),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-eager-flush.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x33u8; block_size];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        assert!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "full blocks below the threshold should remain buffered until flush()"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "flush() must persist remaining full blocks even when eager batching did not fire"
+        );
+        let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-eager-tail-size-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-eager-tail-size.bin", 0, 0, 0o644)
+            .unwrap();
+        let tail = vec![0x44u8; block_size / 8];
+        let mut payload = vec![0x33u8; block_size];
+        payload.extend_from_slice(&tail);
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+
+        let live_attr = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(
+            live_attr.size,
+            payload.len() as u64,
+            "the live inode view should still expose the buffered tail bytes"
+        );
+
+        let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            payload.len() as u64,
+            "eager persistence should keep logical file size advancing even while a tail block remains buffered"
+        );
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            1,
+            "only the contiguous full block should reach metadata before flush() persists the tail"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-backpressure-full-first-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let tail_len = block_size / 8;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(block_size + 1),
+            write_eager_flush_batch_bytes: Some(block_size * 4),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-backpressure-full-first.bin", 0, 0, 0o644)
+            .unwrap();
+        let first = vec![0x11u8; block_size];
+        let tail = vec![0x22u8; tail_len];
+
+        vfs.write(attr.ino, 0, &first).await.unwrap();
+        assert!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "the initial full block should stay buffered while eager batching is disabled"
+        );
+
+        vfs.write(attr.ino, block_size as u64, &tail).await.unwrap();
+
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            1,
+            "backpressure should flush the accumulated full block before forcing the tail block to disk"
+        );
+        assert_eq!(
+            vfs.ingress_stats().dirty_mem_bytes,
+            tail_len,
+            "after backpressure relief only the tail block should remain in the write buffer"
+        );
+
+        let live_attr = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(
+            live_attr.size,
+            (block_size + tail_len) as u64,
+            "the live inode view should still include the buffered tail after backpressure relief"
+        );
+        let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            (block_size + tail_len) as u64,
+            "backpressure relief should preserve the latest logical size even when the tail block remains buffered"
+        );
+
+        let read = vfs
+            .read(attr.ino, 0, (block_size + tail_len) as u32)
+            .await
+            .unwrap();
+        assert_eq!(&read[..block_size], first.as_slice());
+        assert_eq!(&read[block_size..], tail.as_slice());
     });
     rt.shutdown_background();
 }

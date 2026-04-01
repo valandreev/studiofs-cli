@@ -204,6 +204,7 @@ ENV TUNING:
   STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background local write-buffer drain wake interval (default: 10).
   STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
   STUDIOFS_MAX_DRAIN_BATCH          Max dirty WriteBuffer blocks persisted per drain cycle (default: 1024).
+  STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES  Minimum completed full-block batch `write()` coalesces before local persist (default: 32MiB).
   STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Legacy durable-ingress segment rotation size (default: 256MiB).
   STUDIOFS_CACHE_SAFETY_MODE         Startup recovery policy for legacy ingress artifacts: fast|durable (default: fast).
   STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Legacy durable-ingress checkpoint interval (default: 30).
