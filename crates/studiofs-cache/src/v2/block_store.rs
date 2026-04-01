@@ -151,10 +151,10 @@ pub struct BlockStore {
     /// Best-fit free-space allocator for `blocks.data`.
     allocator: Mutex<FreeList>,
     /// Serialises physical file extension (`set_len`) so that a logical
-    /// `file_end` advance that was recorded under the allocator lock is made
-    /// durable before any offset in the newly-grown region is returned to a
-    /// caller.  Always acquired *after* the allocator lock has been released;
-    /// never acquired while the allocator lock is held.
+    /// `file_end` advance is physically visible (i.e. the file is extended)
+    /// before any offset in the newly-grown region is returned to a caller.
+    /// Always acquired *after* the allocator lock has been released; never
+    /// acquired while the allocator lock is held.
     file_growth: Mutex<()>,
     /// Total cache hits since open.
     hit_count: AtomicU64,

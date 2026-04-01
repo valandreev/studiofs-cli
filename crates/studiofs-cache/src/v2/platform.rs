@@ -62,9 +62,11 @@ pub fn fdatasync(file: &File) -> io::Result<()> {
 /// making `set_len` a cheap metadata-only operation; physical clusters are
 /// allocated lazily on the first write to each page.
 ///
-/// This is always best-effort: failures (e.g. non-NTFS volumes, older FAT32
-/// volumes, or insufficient permissions) are logged on Windows and the caller
-/// falls back to the normal zero-fill path.
+/// On Windows this is *mostly* best-effort: common and expected failures
+/// (e.g. non-NTFS volumes, older FAT32 volumes, or insufficient permissions)
+/// are treated as benign, logged on Windows, and ignored so callers can fall
+/// back to the normal zero-fill path. Unexpected I/O errors are still
+/// returned to the caller and may cause cache open/create to fail.
 pub fn make_sparse(file: &File) -> io::Result<()> {
     match make_sparse_impl(file) {
         Ok(()) => Ok(()),

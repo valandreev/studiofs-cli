@@ -9748,7 +9748,7 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
         );
         assert!(
             post_throughput_mib_s >= 4.0 || post_throughput_mib_s >= baseline_throughput_mib_s * 0.8,
-            "post-upload throughput too low or failed to recover sufficiently: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
+            "post-upload throughput too low: need >= 4.0 MiB/s or recovery to >= 80% of baseline; baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
         );
     });
     rt.shutdown_background();

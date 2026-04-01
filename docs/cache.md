@@ -83,8 +83,8 @@ Key behaviours:
 | `free(offset, size)` | Returns region, coalesces left+right neighbours, and shrinks logical file end |
 | `recover(max_size, file_end, occupied)` | Rebuilds free list from live block offsets (used by future index recovery) |
 
-File extension (`set_len`) happens **inside the allocator lock** to prevent
-concurrent threads from observing an inconsistent file end.
+File extension (`set_len`) happens under a dedicated file-growth mutex to
+prevent concurrent threads from observing an inconsistent file end.
 
 ### `BlockStore` API
 
