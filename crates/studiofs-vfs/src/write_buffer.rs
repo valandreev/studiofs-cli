@@ -426,6 +426,16 @@ impl StudioVfs {
         blocks
     }
 
+    fn snapshot_dirty_full_write_buffer_blocks(&self, ino: Ino) -> Vec<(u32, Bytes)> {
+        let mut blocks: Vec<_> = self
+            .snapshot_dirty_write_buffer_blocks(ino)
+            .into_iter()
+            .filter(|(_, data)| data.len() >= self.block_size as usize)
+            .collect();
+        blocks.sort_by_key(|(block_index, _)| *block_index);
+        blocks
+    }
+
     fn commit_persisted_write_buffer_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
         if blocks.is_empty() {
             return;
@@ -642,6 +652,18 @@ impl StudioVfs {
         }
 
         if !full_blocks.is_empty() {
+            let full_blocks = self.snapshot_dirty_full_write_buffer_blocks(ino);
+            let full_block_batch_bytes: usize =
+                full_blocks.iter().map(|(_, data)| data.len()).sum();
+            if full_block_batch_bytes < self.write_eager_flush_batch_bytes {
+                let pending_after_write = self.total_pending_write_buffer_bytes();
+                if pending_before_write > 0
+                    && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
+                {
+                    self.apply_write_buffer_backpressure(ino).await?;
+                }
+                return Ok(written as u32);
+            }
             let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
             let content_epoch = dirty_attr
                 .as_ref()

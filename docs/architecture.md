@@ -55,7 +55,7 @@ Core invariants:
 1. App calls a VFS mutation.
 2. StudioFS updates local metadata in `redb`.
 3. File payload lands in the per-file `WriteBuffer`; full aligned blocks may be eagerly persisted to local `BlockStore` and extent metadata.
-4. `flush(ino)` / `fsync(ino)` / `close(ino)` drain dirty `WriteBuffer` blocks through `BlockStore::put(...) -> sync_data() -> metadata`, then enqueue uploads.
+4. `flush(ino)` / `fsync(ino)` / `close(ino)` drain dirty `WriteBuffer` blocks through coalesced `BlockStore::put(...) -> sync_data() -> metadata` batches, then enqueue uploads.
 5. Background workers upload each committed logical block as four independent cloud fragments.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
@@ -67,7 +67,7 @@ Core invariants:
 1. Split incoming data into blocks.
 2. Merge bytes into the per-file `WriteBuffer`.
 3. Full aligned blocks may be eagerly committed locally through `BlockStore` + metadata, while partial tails stay in RAM.
-4. `flush()` / `fsync()` / `close()` transactionally persist remaining dirty blocks and attrs via `BlockStore::put(...) -> sync_data() -> metadata -> upload queue`.
+4. `flush()` / `fsync()` / `close()` transactionally persist remaining dirty blocks and attrs via coalesced `BlockStore::put(...) -> sync_data() -> metadata -> upload queue` batches.
 5. On publish, update the remote committed incarnation and `committed_size`.
 
 This lets the local client read accepted data immediately, while remote clients

@@ -414,9 +414,10 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_WINFSP_SECTOR_SIZE` | `4096` | WinFSP exposed sector size in bytes (must be positive and fit `u16`) |
 | `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` | `1048576` | WinFSP exposed allocation unit size in bytes (must be a positive multiple of sector size) |
 | `STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES` | `1073741824` | Minimum free-space floor (bytes) enforced by Cache v2 emergency eviction (`BlockStore`) |
+| `STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES` | `32MB` | Minimum completed full-block batch that `write()` coalesces before it pays the local `WriteBuffer -> BlockStore -> sync_data() -> metadata` durability boundary |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
-| `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Startup recovery policy for legacy ingress artifacts: `fast` discards them during self-heal, `durable` preserves checkpoint/state metadata. Foreground writes use the same `WriteBuffer -> BlockStore -> sync_data() -> metadata` path in both modes |
+| `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Startup recovery policy for legacy ingress artifacts: `fast` discards them during self-heal, `durable` preserves checkpoint/state metadata. Both modes keep the same data-before-metadata persist order for each coalesced local write batch |
 | `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Legacy durable-ingress segment rotation size retained for startup recovery compatibility |
 | `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Legacy durable-ingress checkpoint cadence retained for startup recovery compatibility |
 | `STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES` | `64MB` | Legacy durable-ingress checkpoint trigger on uncheckpointed append churn |

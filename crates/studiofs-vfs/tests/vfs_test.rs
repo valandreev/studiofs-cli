@@ -8221,6 +8221,156 @@ fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
     rt.shutdown_background();
 }
 
+#[test]
+fn write_eager_flush_batches_full_blocks_until_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-eager-batch-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size * 2),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-eager-batch.bin", 0, 0, 0o644)
+            .unwrap();
+        let first = vec![0x11u8; block_size];
+        let second = vec![0x22u8; block_size];
+
+        vfs.write(attr.ino, 0, &first).await.unwrap();
+        assert!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "one full block should stay buffered until the eager-flush batch threshold is reached"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "no upload should be enqueued before the local batch persists"
+        );
+        let first_read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(
+            first_read.as_ref(),
+            first.as_slice(),
+            "buffered full blocks must remain readable before eager persistence"
+        );
+
+        vfs.write(attr.ino, block_size as u64, &second)
+            .await
+            .unwrap();
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "crossing the eager-flush threshold should commit the accumulated full-block batch"
+        );
+
+        let combined = vfs
+            .read(attr.ino, 0, (block_size * 2) as u32)
+            .await
+            .unwrap();
+        assert_eq!(&combined[..block_size], first.as_slice());
+        assert_eq!(&combined[block_size..], second.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn write_eager_flush_flushes_full_blocks_below_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("write-eager-flush-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size * 2),
+            memory_adaptive: Some(false),
+            ..VfsConfigRaw::default()
+        };
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            vfs_config
+                .validate()
+                .expect("test VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"write-eager-flush.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x33u8; block_size];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        assert!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "full blocks below the threshold should remain buffered until flush()"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "flush() must persist remaining full blocks even when eager batching did not fire"
+        );
+        let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
 /// Truncate to zero, then write again. Verify old blocks are GC'd and new data is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

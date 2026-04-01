@@ -120,6 +120,10 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     }
 
     set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
+    set_size!(
+        "STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES",
+        write_eager_flush_batch_bytes
+    );
     if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
         && let Ok(bytes) = parse_positive_size_arg(&v)
     {
