@@ -149,23 +149,6 @@ impl StudioVfs {
             .is_some_and(|indexes| !indexes.is_empty())
     }
 
-    fn has_pending_write_buffer_blocks_outside(
-        &self,
-        ino: Ino,
-        block_indexes: &std::collections::BTreeSet<u32>,
-    ) -> bool {
-        self.state
-            .write_buffer
-            .pending_block_indexes
-            .lock()
-            .get(&ino)
-            .is_some_and(|indexes| {
-                indexes
-                    .iter()
-                    .any(|block_index| !block_indexes.contains(block_index))
-            })
-    }
-
     fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
         if self.has_pending_write_buffer_blocks_for_inode(ino) {
             return;
@@ -269,62 +252,6 @@ impl StudioVfs {
                 "write-buffer cleanup of uncommitted block-store entries failed"
             );
         }
-    }
-
-    fn contiguous_visible_size_from_blocks<I>(&self, blocks: I) -> u64
-    where
-        I: IntoIterator<Item = (u32, u32)>,
-    {
-        let mut size = 0u64;
-        let mut expected = 0u32;
-        for (block_index, len) in blocks {
-            if block_index != expected {
-                break;
-            }
-            size = size.saturating_add(len as u64);
-            expected = expected.saturating_add(1);
-            if len < self.block_size {
-                break;
-            }
-        }
-        size
-    }
-
-    async fn normalize_persisted_write_buffer_attr(
-        &self,
-        ino: Ino,
-        blocks: &[(u32, Bytes)],
-        dirty_attr: Option<InodeAttr>,
-    ) -> VfsResult<Option<InodeAttr>> {
-        let Some(mut attr) = dirty_attr else {
-            return Ok(None);
-        };
-
-        let flushed_block_indexes: std::collections::BTreeSet<u32> =
-            blocks.iter().map(|(block_index, _)| *block_index).collect();
-        if !self.has_pending_write_buffer_blocks_outside(ino, &flushed_block_indexes) {
-            return Ok(Some(attr));
-        }
-
-        let existing_blocks = run_meta(
-            self.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
-        )
-        .await?;
-
-        let mut merged_blocks: std::collections::BTreeMap<u32, u32> = existing_blocks
-            .into_iter()
-            .map(|(block_index, block_ref)| (block_index, block_ref.length))
-            .collect();
-        for (block_index, data) in blocks {
-            merged_blocks.insert(*block_index, data.len() as u32);
-        }
-
-        let durable_size = self
-            .contiguous_visible_size_from_blocks(merged_blocks.into_iter())
-            .max(attr.committed_size);
-        attr.size = durable_size;
-        Ok(Some(attr))
     }
 
     async fn persist_write_buffer_blocks(
@@ -592,11 +519,8 @@ impl StudioVfs {
             self.current_content_epoch_async(ino).await?
         };
         let attr_to_clear = dirty_attr.clone();
-        let attr_to_persist = self
-            .normalize_persisted_write_buffer_attr(ino, &full_blocks, dirty_attr)
-            .await?;
         let persisted_blocks = self
-            .persist_write_buffer_blocks(ino, full_blocks, content_epoch, attr_to_persist)
+            .persist_write_buffer_blocks(ino, full_blocks, content_epoch, dirty_attr)
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
@@ -727,7 +651,7 @@ impl StudioVfs {
         let mut remaining = data.len();
         let mut current_offset = offset;
         let mut data_offset = 0;
-        let mut full_blocks: Vec<(u32, Bytes)> = Vec::new();
+        let mut has_full_blocks = false;
 
         while remaining > 0 {
             let block_index = block_index_from_offset(current_offset, self.block_size);
@@ -789,7 +713,7 @@ impl StudioVfs {
                 pending_block.dirty = true;
 
                 if pending_block.data.len() >= self.block_size as usize {
-                    full_blocks.push((block_index, pending_block.data.clone().freeze()));
+                    has_full_blocks = true;
                 }
             }
 
@@ -812,7 +736,7 @@ impl StudioVfs {
             self.update_pending_incarnation_size(ino, attr.size);
         }
 
-        if !full_blocks.is_empty() {
+        if has_full_blocks {
             if !self
                 .flush_dirty_full_write_buffer_blocks(
                     ino,

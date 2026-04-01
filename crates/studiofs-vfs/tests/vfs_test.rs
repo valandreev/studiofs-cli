@@ -8383,7 +8383,7 @@ fn write_eager_flush_flushes_full_blocks_below_threshold() {
 }
 
 #[test]
-fn write_eager_flush_persists_contiguous_size_when_tail_remains_buffered() {
+fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -8443,8 +8443,8 @@ fn write_eager_flush_persists_contiguous_size_when_tail_remains_buffered() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            block_size as u64,
-            "eager persistence should advance durable size to the contiguous locally committed range even while a tail block remains buffered"
+            payload.len() as u64,
+            "eager persistence should keep logical file size advancing even while a tail block remains buffered"
         );
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
@@ -8535,8 +8535,8 @@ fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            block_size as u64,
-            "durable metadata should advance only through the locally persisted full-block frontier"
+            (block_size + tail_len) as u64,
+            "backpressure relief should preserve the latest logical size even when the tail block remains buffered"
         );
 
         let read = vfs
