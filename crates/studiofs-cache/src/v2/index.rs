@@ -238,6 +238,23 @@ impl BlockIndex {
         snapshot
     }
 
+    /// Snapshot dirty object ids in deterministic oldest-first order.
+    pub fn dirty_object_ids(&self) -> Vec<u64> {
+        let mut object_ids = Vec::with_capacity(self.dirty_count as usize);
+        unsafe {
+            self.lru.for_each_oldest_first(|object_id| {
+                if self
+                    .entries
+                    .get(&object_id)
+                    .is_some_and(|entry| entry.flags.contains(BlockFlags::DIRTY))
+                {
+                    object_ids.push(object_id);
+                }
+            });
+        }
+        object_ids
+    }
+
     /// Return the oldest evictable block without removing it.
     pub fn peek_oldest_evictable(&self) -> Option<(u64, u64)> {
         let object_id = unsafe {
@@ -507,6 +524,16 @@ mod tests {
         idx.insert(2, 8192, 64, 4096, 0, BlockFlags::empty());
         assert_eq!(idx.dirty_count(), 1);
         assert_eq!(idx.block_count(), 2);
+    }
+
+    #[test]
+    fn dirty_object_ids_follow_oldest_first_order() {
+        let mut idx = BlockIndex::new();
+        idx.insert(1, 4096, 64, 4096, 0, BlockFlags::DIRTY);
+        idx.insert(2, 8192, 64, 4096, 0, BlockFlags::empty());
+        idx.insert(3, 12288, 64, 4096, 0, BlockFlags::DIRTY);
+
+        assert_eq!(idx.dirty_object_ids(), vec![1, 3]);
     }
 
     #[test]

@@ -783,6 +783,11 @@ impl BlockStore {
         self.index.lock().dirty_count()
     }
 
+    /// Snapshot dirty object ids in deterministic oldest-first order.
+    pub fn dirty_object_ids(&self) -> Vec<u64> {
+        self.index.lock().dirty_object_ids()
+    }
+
     /// Total cache hits since open.
     pub fn hit_count(&self) -> u64 {
         self.hit_count.load(Ordering::Relaxed)

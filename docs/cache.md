@@ -172,8 +172,8 @@ as acceptable best-effort metadata loss and repairs it via snapshot replay or
               │     LRU Tracker (64 shards)     │
               └────────────────────────────────┘
                             │
-              ┌─────────────▼──────────────────┐
-              │     Upload Queue (journal)      │
+              ┌────────────────────────────────┐
+              │ Upload Queue (in-memory index) │
               └────────────────────────────────┘
 ```
 
@@ -346,21 +346,19 @@ Global LRU across both tiers, tracking block location and eviction order.
 
 ### Upload Queue (`upload_queue.rs`)
 
-Crash-safe writeback journal for blocks pending S3 upload.
+In-memory scheduler/index for blocks pending S3 upload.
 
 | Property | Value |
 |----------|-------|
-| Journal dir | `{cache_dir}/upload/` |
-| File pattern | `{object_id:016x}.pending` |
-| Entry size | 48 bytes (v2) |
-| Magic | `STFSUP` |
-| Recovery | Scans `.pending` files on startup |
+| Persistence | In-memory only |
+| Source of truth | `BlockStore` `DIRTY` / `UPLOADING` flags |
+| Startup replay | VFS maps dirty object ids back to `(ino, block_index)` via metadata |
 
 **Lifecycle:**
-1. `submit(ino, offset, object_id)` — creates journal file, sends to upload channel
+1. `submit(ino, offset, object_id)` — queues upload op in memory
 2. Upload worker receives from channel, performs S3 PUT (cancellation-aware)
-3. `complete(pending)` — removes journal file, unpins block in LRU
-4. `cancel(pending)` — removes journal file and unpins block when upload is cancelled (for example, inode deleted)
+3. `complete(pending)` — removes pending op and unpins block in LRU
+4. `cancel(pending)` — removes pending op and unpins block when upload is cancelled (for example, inode deleted)
 
 ### Block Cache (`block_cache.rs`)
 
@@ -372,7 +370,7 @@ Unified API combining all components above.
 |-------|---------|-------------|
 | `l1_size` | 2 GiB | Maximum L1 memory |
 | `l2_size` | 1 TiB | Maximum L2 disk |
-| `cache_dir` | — | Root directory for L2 + journals |
+| `cache_dir` | — | Root directory for cache state |
 | `disk_free_ratio` | 0.10 | Reserve 10% free disk space |
 | `l2_commit_workers` | 32 | L2 commit worker count |
 | `l2_commit_queue_capacity` | 4096 | Max queued L2 commit jobs before backpressure |
@@ -389,7 +387,7 @@ Unified API combining all components above.
 | `stage_l1(id, data)` | Insert into L1 + LRU as `MemoryOnly` |
 | `commit_l2(id, data)` | Enqueue one L2 commit into bounded scheduler |
 | `commit_l2_batch(blocks)` | Consume and enqueue `Vec<(ObjectId, Bytes)>` into bounded scheduler (applies backpressure on full queue) |
-| `submit_upload(ino, offset, id)` | Enqueue for S3 upload via journal |
+| `submit_upload(ino, offset, id)` | Enqueue for S3 upload in bounded in-memory queue (intent persisted in `BlockStore` flags) |
 | `complete_upload(pending)` | Unpin block in LRU |
 | `evict_one_l1()` | Demote one block from L1 |
 | `evict_one_l2()` | Remove one block from L2 |
@@ -437,14 +435,14 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   ├─ stage upload payload window        ← retry-friendly transient RAM source for uploader
   ├─ Batch metadata commit (local staged refs only)
   ├─ commit_l2_batch() enqueue          ← consumes owned batch, bounded queue + fixed workers
-  └─ submit_upload(..., content_epoch)  ← journal + S3 queue
+  └─ submit_upload(..., content_epoch)  ← in-memory queue + S3 queue
 ```
 
 The background flusher runs every 10ms and drains continuously (keeps processing while data exists).
 Freshly materialized blocks now also seed a bounded transient upload-payload
 stage in RAM. Upload workers clone payloads from that stage first and only fall
 back to L1/L2 rereads when the stage entry was evicted or the upload was
-recovered from journal after restart. The stage budget is adaptive rather than
+replayed from `BlockStore` DIRTY state after restart. The stage budget is adaptive rather than
 fixed: it tracks the upload dispatch window, expands under queue pressure or
 staging misses, and contracts again when foreground pressure drops.
 
@@ -582,6 +580,6 @@ On startup:
 1. Load LRU checkpoint (`cache.meta`) if present
 2. Scan L2 directory to rebuild actual block inventory
 3. Reconcile: remove LRU entries for missing L2 files, add L2 entries not in checkpoint
-4. Scan upload journal (`upload/*.pending`) and re-queue pending uploads
-5. Recovered upload ops keep their persisted `content_epoch`
+4. Read dirty object ids from `BlockStore` and re-queue upload ops using metadata mapping
+5. Remove orphan dirty object ids that are no longer referenced by metadata
 6. Resume normal operation

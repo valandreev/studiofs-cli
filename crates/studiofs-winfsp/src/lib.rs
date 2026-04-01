@@ -298,8 +298,8 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     // Stop WinFSP first so no new callbacks race with the shutdown drain.
     host.stop();
     host.unmount();
-    // By default do not block process exit on remote uploads; pending journal
-    // entries are resumed on next mount.
+    // By default do not block process exit on remote uploads; remaining dirty
+    // blocks are replayed into the upload queue on next mount.
     rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
     if let Some(mut profiling) = profiling {
         profiling();
