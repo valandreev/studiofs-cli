@@ -98,10 +98,8 @@ impl UploadQueue {
         }
 
         self.pending_count.fetch_add(1, Ordering::Release);
-        if self.sender.send(op).is_err() {
-            if self.remove_pending(object_id) {
-                self.mark_done();
-            }
+        if self.sender.send(op).is_err() && self.remove_pending(object_id) {
+            self.mark_done();
         }
     }
 

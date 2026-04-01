@@ -417,9 +417,14 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_L2_READ_TIMEOUT_MS` | `5000` | Max wait for local L2 read before treating it as cache miss (read can continue from remote fetch path) |
 | `STUDIOFS_L2_WRITE_TIMEOUT_MS` | `5000` | Max wait for local L2 write/commit attempt before timeout/retry/drop behavior |
 | `STUDIOFS_L2_SYNC_FD_CACHE_CAPACITY` | `4096` | Capacity of L2 sync-read open-file descriptor LRU cache (set lower on hosts with strict FD limits) |
+| `STUDIOFS_FUSE_MAX_WRITE_BYTES` | `16777216` | FUSE kernel max single write request size (`fuser::KernelConfig::set_max_write`) |
+| `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` | `16777216` | FUSE kernel max readahead size (`fuser::KernelConfig::set_max_readahead`) |
 | `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
 | `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` | `1000` | WinFSP DirInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
+| `STUDIOFS_WINFSP_SECTOR_SIZE` | `4096` | WinFSP exposed sector size in bytes (must be positive and fit `u16`) |
+| `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` | `1048576` | WinFSP exposed allocation unit size in bytes (must be a positive multiple of sector size) |
+| `STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES` | `1073741824` | Minimum free-space floor (bytes) enforced by Cache v2 emergency eviction (`BlockStore`) |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Startup recovery policy for legacy ingress artifacts: `fast` discards them during self-heal, `durable` preserves checkpoint/state metadata. Foreground writes use the same `WriteBuffer -> BlockStore -> sync_data() -> metadata` path in both modes |
@@ -487,11 +492,13 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
+`block_store_read_throughput_bps` and `block_store_write_throughput_bps` are lifetime averages since the current `BlockStore` instance was opened (not short-window/EMA samples).
 
 Upload local-I/O tuning notes:
 - upload workers first try a transient staged payload seeded by the local persist path; local-cache I/O slots are only used on staging miss and are released immediately after the cache read.
 - queue-head staged payloads are preserved under backlog by evicting the newest staged entries first; the bounded transient stage is expanded more aggressively against the dirty-memory budget before falling back to L2.
 - upload workers check L1 before consuming upload local-I/O slots, and actual L2 fallback rereads are deferred while foreground reads are still active.
+- upload fallback rereads use `BlockStore::get_for_upload`, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
@@ -500,6 +507,7 @@ Upload local-I/O tuning notes:
 - if a single fetch request exceeds `STUDIOFS_TRANSIT_MEMORY_BUDGET`, StudioFS returns a fetch error instead of silently clamping the credit request.
 - speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.
 - upload throttling uses the same foreground-read speedometer plus the dominant access policy's `upload_pressure_boost`, so sequential media reads raise upload penalty faster than random interactive probes without adding a separate scheduler loop.
+- background/emergency pressure-maintenance eviction can switch to bounded batch mode for large reclaim targets to reduce per-block lock/scheduler overhead while preserving lock release between batches.
 
 Configuration validation notes:
 - StudioFS resolves user input through a raw/validated configuration pipeline before creating `StudioVfs`.

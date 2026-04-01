@@ -12,7 +12,7 @@
 //! | `lru`          | Implemented | `LruList` / `LruNode` intrusive doubly-linked list  |
 //! | `evictor`      | Stub        | Watermark-driven background evictor (future)        |
 //! | `mmap_reader`  | Implemented | Lock-free mmap reader with generation remapping     |
-//! | `metrics`      | Stub        | Detailed histograms and per-op counters (future)    |
+//! | `metrics`      | Implemented | Runtime counters, rates, throughput, pressure stats |
 
 pub mod allocator;
 pub mod block_store;

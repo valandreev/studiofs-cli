@@ -12,8 +12,8 @@ use thiserror::Error;
 const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
-const DEFAULT_SECTOR_SIZE: u16 = 512;
-const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 16 * 1024;
+const DEFAULT_SECTOR_SIZE: u16 = 4096;
+const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 const _: () = {
@@ -31,6 +31,8 @@ struct WinfspMountOptions {
     file_info_timeout_ms: u32,
     dir_info_timeout_ms: u32,
     volume_info_timeout_ms: u32,
+    sector_size: u16,
+    sectors_per_allocation_unit: u16,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -64,13 +66,103 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         "STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS",
         DEFAULT_VOLUME_INFO_TIMEOUT_MS,
     );
+    let (sector_size, sectors_per_allocation_unit) = parse_geometry_env();
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
         file_info_timeout_ms,
         dir_info_timeout_ms,
         volume_info_timeout_ms,
+        sector_size,
+        sectors_per_allocation_unit,
     })
+}
+
+fn parse_geometry_env() -> (u16, u16) {
+    let sector_size_raw =
+        parse_positive_u32_env("STUDIOFS_WINFSP_SECTOR_SIZE", DEFAULT_SECTOR_SIZE as u32);
+    let allocation_unit_raw = parse_positive_u32_env(
+        "STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE",
+        DEFAULT_ALLOCATION_UNIT_SIZE,
+    );
+
+    let sector_size = match u16::try_from(sector_size_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(
+                env_key = "STUDIOFS_WINFSP_SECTOR_SIZE",
+                env_value = sector_size_raw,
+                fallback_value = DEFAULT_SECTOR_SIZE,
+                "WinFSP sector size exceeds u16; using default"
+            );
+            DEFAULT_SECTOR_SIZE
+        }
+    };
+    if sector_size < 512 || !sector_size.is_power_of_two() {
+        tracing::warn!(
+            env_key = "STUDIOFS_WINFSP_SECTOR_SIZE",
+            env_value = sector_size,
+            fallback_value = DEFAULT_SECTOR_SIZE,
+            "WinFSP sector size must be a power-of-two and at least 512 bytes; using default"
+        );
+        return (DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
+    }
+
+    if !allocation_unit_raw.is_multiple_of(u32::from(sector_size)) {
+        tracing::warn!(
+            env_key = "STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE",
+            env_value = allocation_unit_raw,
+            sector_size,
+            fallback_value = DEFAULT_ALLOCATION_UNIT_SIZE,
+            "WinFSP allocation unit must be a multiple of sector size; using default"
+        );
+        return (DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
+    }
+
+    let sectors = allocation_unit_raw / u32::from(sector_size);
+    if sectors == 0 || sectors > u32::from(u16::MAX) {
+        tracing::warn!(
+            env_key = "STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE",
+            env_value = allocation_unit_raw,
+            sector_size,
+            fallback_value = DEFAULT_ALLOCATION_UNIT_SIZE,
+            "WinFSP sectors-per-allocation-unit out of range; using default"
+        );
+        return (DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
+    }
+
+    (sector_size, sectors as u16)
+}
+
+fn parse_positive_u32_env(key: &str, default: u32) -> u32 {
+    match std::env::var(key) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            match trimmed.parse::<u32>() {
+                Ok(value) if value > 0 => value,
+                Ok(_) => {
+                    tracing::warn!(
+                        env_key = key,
+                        env_value = trimmed,
+                        fallback_value = default,
+                        "WinFSP tuning override must be > 0; using default"
+                    );
+                    default
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        env_key = key,
+                        env_value = trimmed,
+                        fallback_value = default,
+                        error = %error,
+                        "invalid WinFSP tuning override; using default"
+                    );
+                    default
+                }
+            }
+        }
+        Err(_) => default,
+    }
 }
 
 fn parse_timeout_env(key: &str, default: u32) -> u32 {
@@ -108,8 +200,8 @@ fn apply_volume_params(
     volume_params.filesystem_name("StudioFS");
     // Intentionally avoid setting `Prefix` so WinFSP uses local disk-device
     // semantics for drive-letter mounts (not network redirector mode).
-    volume_params.sector_size(DEFAULT_SECTOR_SIZE);
-    volume_params.sectors_per_allocation_unit(DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
+    volume_params.sector_size(options.sector_size);
+    volume_params.sectors_per_allocation_unit(options.sectors_per_allocation_unit);
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
@@ -357,11 +449,20 @@ mod tests {
     #[test]
     fn parse_mount_options_normalizes_and_sets_defaults() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
+            std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
+        }
         let opts = parse_mount_options("  StudioFS  ").expect("options");
         assert_eq!(opts.volume_label, "StudioFS");
         assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
         assert_eq!(opts.dir_info_timeout_ms, DEFAULT_DIR_INFO_TIMEOUT_MS);
         assert_eq!(opts.volume_info_timeout_ms, DEFAULT_VOLUME_INFO_TIMEOUT_MS);
+        assert_eq!(opts.sector_size, DEFAULT_SECTOR_SIZE);
+        assert_eq!(
+            opts.sectors_per_allocation_unit,
+            DEFAULT_SECTORS_PER_ALLOCATION_UNIT
+        );
     }
 
     #[test]
@@ -401,6 +502,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_mount_options_allows_geometry_overrides() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("STUDIOFS_WINFSP_SECTOR_SIZE", "4096");
+            std::env::set_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "4194304");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert_eq!(opts.sector_size, 4096);
+        assert_eq!(opts.sectors_per_allocation_unit, 1024);
+
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
+            std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
+        }
+    }
+
+    #[test]
+    fn parse_mount_options_invalid_geometry_falls_back_to_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("STUDIOFS_WINFSP_SECTOR_SIZE", "3000");
+            std::env::set_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "1048576");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert_eq!(opts.sector_size, DEFAULT_SECTOR_SIZE);
+        assert_eq!(
+            opts.sectors_per_allocation_unit,
+            DEFAULT_SECTORS_PER_ALLOCATION_UNIT
+        );
+
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
+            std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
+        }
+    }
+
+    #[test]
     fn winfsp_drive_mount_point_validation() {
         assert!(is_drive_root_mount_point("Z:"));
         assert!(is_drive_root_mount_point("Z:\\"));
@@ -423,7 +563,7 @@ mod tests {
 
     #[test]
     fn winfsp_geometry_defaults_are_explicit_and_non_zero() {
-        assert_eq!(DEFAULT_SECTORS_PER_ALLOCATION_UNIT, 32);
+        assert_eq!(DEFAULT_SECTORS_PER_ALLOCATION_UNIT, 256);
         assert_eq!(
             u32::from(DEFAULT_SECTORS_PER_ALLOCATION_UNIT) * u32::from(DEFAULT_SECTOR_SIZE),
             DEFAULT_ALLOCATION_UNIT_SIZE
