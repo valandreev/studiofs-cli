@@ -18,7 +18,7 @@ tmp/
 .grepai/
 dif*.txt
 test*.txt
-/.gemini
-/.kilo
-/.kilocode
-/.qwen
+/.gemini/*
+/.kilo/*
+/.kilocode/*
+/.qwen/*

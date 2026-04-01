@@ -32,6 +32,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 use tracing::warn;
 
 use crate::v2::allocator::FreeList;
@@ -43,6 +44,31 @@ use crate::v2::index::{BlockFlags, BlockIndex, PersistedIndexEntry, RemovedEntry
 use crate::v2::mmap_reader::MmapReader;
 use crate::v2::persistence::{self, WalAppender};
 use crate::v2::platform;
+
+const BACKGROUND_EVICT_HIGH_WATERMARK_PERCENT: u64 = 90;
+const BACKGROUND_EVICT_LOW_WATERMARK_PERCENT: u64 = 80;
+const EMERGENCY_DISK_FREE_RATIO_NUMERATOR: u64 = 5;
+const EMERGENCY_DISK_FREE_RATIO_DENOMINATOR: u64 = 100;
+const EMERGENCY_DISK_FREE_FLOOR_ENV: &str = "STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES";
+const DEFAULT_EMERGENCY_DISK_FREE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+const PRESSURE_EVICTION_BATCH_TRIGGER_BYTES: u64 = 64 * 1024 * 1024;
+const PRESSURE_EVICTION_BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
+const PRESSURE_EVICTION_BATCH_MAX_BLOCKS: usize = 128;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PressureMaintenanceReport {
+    pub background_evicted_blocks: u64,
+    pub background_evicted_bytes: u64,
+    pub emergency_evicted_blocks: u64,
+    pub emergency_evicted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EvictionReason {
+    Allocation,
+    BackgroundWatermark,
+    EmergencyDiskPressure,
+}
 
 // ===========================================================================
 // Configuration
@@ -115,6 +141,40 @@ pub struct BlockStore {
     hit_count: AtomicU64,
     /// Total cache misses since open.
     miss_count: AtomicU64,
+    /// Total evicted blocks.
+    eviction_count: AtomicU64,
+    /// Total bytes reclaimed by evictions.
+    eviction_bytes: AtomicU64,
+    /// Blocks evicted by background high-watermark maintenance.
+    background_eviction_count: AtomicU64,
+    /// Bytes reclaimed by background high-watermark maintenance.
+    background_eviction_bytes: AtomicU64,
+    /// Blocks evicted under emergency low-free-space pressure.
+    emergency_eviction_count: AtomicU64,
+    /// Bytes reclaimed under emergency low-free-space pressure.
+    emergency_eviction_bytes: AtomicU64,
+    /// Number of blocks dropped due to corruption/integrity failures.
+    corruption_count: AtomicU64,
+    /// Read operation count (hits + misses).
+    read_ops: AtomicU64,
+    /// Bytes returned to readers.
+    read_bytes: AtomicU64,
+    /// Total read latency in nanoseconds.
+    read_latency_total_ns: AtomicU64,
+    /// Max observed read latency in nanoseconds.
+    read_latency_max_ns: AtomicU64,
+    /// Successful write operation count.
+    write_ops: AtomicU64,
+    /// Bytes accepted on successful writes.
+    write_bytes: AtomicU64,
+    /// Total successful write latency in nanoseconds.
+    write_latency_total_ns: AtomicU64,
+    /// Max observed successful write latency in nanoseconds.
+    write_latency_max_ns: AtomicU64,
+    /// Best-effort post-read cache-drop hints issued by upload rereads.
+    advisory_dont_need_count: AtomicU64,
+    /// Minimum free-space target used by emergency disk-pressure eviction.
+    emergency_disk_free_floor_bytes: u64,
     /// Set by `close()` so [`Drop`] can skip the redundant fdatasync.
     synced: AtomicBool,
 }
@@ -265,6 +325,7 @@ impl BlockStore {
 
         let cache_dir = config.cache_dir.clone();
         let mmap_reader = MmapReader::new(&file, file_end)?;
+        let emergency_disk_free_floor_bytes = Self::read_emergency_disk_free_floor_bytes();
 
         Ok(Self {
             file,
@@ -275,8 +336,47 @@ impl BlockStore {
             allocator: Mutex::new(allocator),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
+            eviction_count: AtomicU64::new(0),
+            eviction_bytes: AtomicU64::new(0),
+            background_eviction_count: AtomicU64::new(0),
+            background_eviction_bytes: AtomicU64::new(0),
+            emergency_eviction_count: AtomicU64::new(0),
+            emergency_eviction_bytes: AtomicU64::new(0),
+            corruption_count: AtomicU64::new(0),
+            read_ops: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            read_latency_total_ns: AtomicU64::new(0),
+            read_latency_max_ns: AtomicU64::new(0),
+            write_ops: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            write_latency_total_ns: AtomicU64::new(0),
+            write_latency_max_ns: AtomicU64::new(0),
+            advisory_dont_need_count: AtomicU64::new(0),
+            emergency_disk_free_floor_bytes,
             synced: AtomicBool::new(false),
         })
+    }
+
+    fn parse_positive_u64(raw: &str) -> Option<u64> {
+        raw.trim().parse::<u64>().ok().filter(|value| *value > 0)
+    }
+
+    fn read_emergency_disk_free_floor_bytes() -> u64 {
+        match std::env::var(EMERGENCY_DISK_FREE_FLOOR_ENV) {
+            Ok(raw) => match Self::parse_positive_u64(&raw) {
+                Some(value) => value,
+                None => {
+                    warn!(
+                        env = EMERGENCY_DISK_FREE_FLOOR_ENV,
+                        value = %raw,
+                        default_bytes = DEFAULT_EMERGENCY_DISK_FREE_FLOOR_BYTES,
+                        "invalid emergency free-space floor override; using default"
+                    );
+                    DEFAULT_EMERGENCY_DISK_FREE_FLOOR_BYTES
+                }
+            },
+            Err(_) => DEFAULT_EMERGENCY_DISK_FREE_FLOOR_BYTES,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -290,6 +390,7 @@ impl BlockStore {
     ///
     /// On a hit, moves the block to the MRU position in the LRU list.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
+        let started = Instant::now();
         // Phase 1: copy entry metadata under the index lock (no I/O inside lock).
         let (offset, data_size, checksum) = {
             let idx = self.index.lock();
@@ -297,6 +398,7 @@ impl BlockStore {
                 Some(e) => (e.offset, e.data_size, e.checksum),
                 None => {
                     self.miss_count.fetch_add(1, Ordering::Relaxed);
+                    self.record_read_metrics(0, started);
                     return None;
                 }
             }
@@ -311,6 +413,8 @@ impl BlockStore {
             Err(e) => {
                 warn!(object_id, offset, %e, "block read failed");
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
+                self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
+                self.record_read_metrics(0, started);
                 return None;
             }
         };
@@ -326,6 +430,8 @@ impl BlockStore {
                 "block checksum mismatch",
             );
             self.miss_count.fetch_add(1, Ordering::Relaxed);
+            self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
+            self.record_read_metrics(0, started);
             return None;
         }
 
@@ -348,6 +454,7 @@ impl BlockStore {
 
             if !metadata_matches {
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
+                self.record_read_metrics(0, started);
                 return None;
             }
 
@@ -355,6 +462,7 @@ impl BlockStore {
         }
 
         self.hit_count.fetch_add(1, Ordering::Relaxed);
+        self.record_read_metrics(data.len() as u64, started);
         Some(data)
     }
 
@@ -364,12 +472,14 @@ impl BlockStore {
     /// integrity failure. The full payload checksum is verified before the
     /// access is reported as a hit.
     pub fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+        let started = Instant::now();
         let (offset, data_size, checksum) = {
             let idx = self.index.lock();
             match idx.get(object_id) {
                 Some(e) => (e.offset, e.data_size, e.checksum),
                 None => {
                     self.miss_count.fetch_add(1, Ordering::Relaxed);
+                    self.record_read_metrics(0, started);
                     return None;
                 }
             }
@@ -385,6 +495,8 @@ impl BlockStore {
             Err(e) => {
                 warn!(object_id, offset, %e, "block ranged read failed");
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
+                self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
+                self.record_read_metrics(0, started);
                 return None;
             }
         };
@@ -398,6 +510,8 @@ impl BlockStore {
                 "block checksum mismatch",
             );
             self.miss_count.fetch_add(1, Ordering::Relaxed);
+            self.drop_corrupt_entry_if_still_current(object_id, offset, data_size, checksum);
+            self.record_read_metrics(0, started);
             return None;
         }
 
@@ -413,6 +527,7 @@ impl BlockStore {
 
             if !metadata_matches {
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
+                self.record_read_metrics(0, started);
                 return None;
             }
 
@@ -420,7 +535,16 @@ impl BlockStore {
         }
 
         self.hit_count.fetch_add(1, Ordering::Relaxed);
+        self.record_read_metrics(bytes_copied as u64, started);
         Some(bytes_copied)
+    }
+
+    /// Read a block for upload fallback and hint the OS that the pages can be
+    /// dropped from cache afterwards where supported.
+    pub fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+        let data = self.get(object_id)?;
+        self.advise_dont_need(object_id);
+        Some(data)
     }
 
     /// Check whether a block exists in the cache without reading data or
@@ -445,6 +569,41 @@ impl BlockStore {
         if let Err(error) = platform::advise_will_need(&self.file, offset, u64::from(data_size)) {
             warn!(object_id, offset, error = ?error, "explicit read-ahead hint failed");
         }
+    }
+
+    /// Submit a best-effort "drop pages" hint for a cached block.
+    pub fn advise_dont_need(&self, object_id: u64) {
+        let metadata = {
+            let idx = self.index.lock();
+            idx.get(object_id)
+                .map(|entry| Self::upload_dont_need_range(entry.offset, entry.data_size))
+        };
+
+        let (offset, len) = match metadata {
+            Some(metadata) => metadata,
+            None => return,
+        };
+
+        if let Err(error) = platform::advise_dont_need(&self.file, offset, len) {
+            warn!(
+                object_id,
+                offset,
+                len,
+                error = ?error,
+                "explicit dont-need hint failed"
+            );
+            return;
+        }
+
+        self.advisory_dont_need_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn upload_dont_need_range(entry_offset: u64, data_size: u32) -> (u64, u64) {
+        (
+            entry_offset,
+            u64::from(data_size).saturating_add(BLOCK_HEADER_SIZE as u64),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -474,6 +633,7 @@ impl BlockStore {
     where
         F: FnOnce(),
     {
+        let write_started = Instant::now();
         let data_size = u32::try_from(data.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -570,6 +730,7 @@ impl BlockStore {
             );
         }
 
+        self.record_write_metrics(data.len() as u64, write_started);
         Ok(())
     }
 
@@ -798,9 +959,152 @@ impl BlockStore {
         self.miss_count.load(Ordering::Relaxed)
     }
 
+    /// Total number of blocks evicted from cache.
+    pub fn eviction_count(&self) -> u64 {
+        self.eviction_count.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes reclaimed by eviction.
+    pub fn eviction_bytes(&self) -> u64 {
+        self.eviction_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of blocks evicted by background watermark maintenance.
+    pub fn background_eviction_count(&self) -> u64 {
+        self.background_eviction_count.load(Ordering::Relaxed)
+    }
+
+    /// Bytes reclaimed by background watermark maintenance.
+    pub fn background_eviction_bytes(&self) -> u64 {
+        self.background_eviction_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of blocks evicted by emergency disk-pressure handling.
+    pub fn emergency_eviction_count(&self) -> u64 {
+        self.emergency_eviction_count.load(Ordering::Relaxed)
+    }
+
+    /// Bytes reclaimed by emergency disk-pressure handling.
+    pub fn emergency_eviction_bytes(&self) -> u64 {
+        self.emergency_eviction_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of entries dropped due to detected corruption/integrity failures.
+    pub fn corruption_count(&self) -> u64 {
+        self.corruption_count.load(Ordering::Relaxed)
+    }
+
+    /// Total read operations observed by the store.
+    pub fn read_ops_count(&self) -> u64 {
+        self.read_ops.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes returned from successful reads.
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Total accumulated read latency in nanoseconds.
+    pub fn read_latency_total_ns(&self) -> u64 {
+        self.read_latency_total_ns.load(Ordering::Relaxed)
+    }
+
+    /// Max observed read latency in nanoseconds.
+    pub fn read_latency_max_ns(&self) -> u64 {
+        self.read_latency_max_ns.load(Ordering::Relaxed)
+    }
+
+    /// Total successful writes.
+    pub fn write_ops_count(&self) -> u64 {
+        self.write_ops.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes accepted on successful writes.
+    pub fn write_bytes(&self) -> u64 {
+        self.write_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Total accumulated successful write latency in nanoseconds.
+    pub fn write_latency_total_ns(&self) -> u64 {
+        self.write_latency_total_ns.load(Ordering::Relaxed)
+    }
+
+    /// Max observed successful write latency in nanoseconds.
+    pub fn write_latency_max_ns(&self) -> u64 {
+        self.write_latency_max_ns.load(Ordering::Relaxed)
+    }
+
+    /// Number of successful post-read dont-need hints issued.
+    pub fn advisory_dont_need_count(&self) -> u64 {
+        self.advisory_dont_need_count.load(Ordering::Relaxed)
+    }
+
+    /// Hit ratio in range `[0.0, 1.0]`.
+    pub fn hit_ratio(&self) -> f64 {
+        let hits = self.hit_count();
+        let misses = self.miss_count();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    /// Miss ratio in range `[0.0, 1.0]`.
+    pub fn miss_ratio(&self) -> f64 {
+        let hits = self.hit_count();
+        let misses = self.miss_count();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            misses as f64 / total as f64
+        }
+    }
+
+    /// Effective read throughput derived from successful reads and observed
+    /// read latency since the `BlockStore` was opened.
+    pub fn read_throughput_bytes_per_sec(&self) -> f64 {
+        let total_ns = self.read_latency_total_ns();
+        if total_ns == 0 {
+            0.0
+        } else {
+            self.read_bytes() as f64 / (total_ns as f64 / 1_000_000_000.0)
+        }
+    }
+
+    /// Effective write throughput derived from successful writes and observed
+    /// write latency since the `BlockStore` was opened.
+    pub fn write_throughput_bytes_per_sec(&self) -> f64 {
+        let total_ns = self.write_latency_total_ns();
+        if total_ns == 0 {
+            0.0
+        } else {
+            self.write_bytes() as f64 / (total_ns as f64 / 1_000_000_000.0)
+        }
+    }
+
     /// Path to the data file.
     pub fn data_path(&self) -> PathBuf {
         self.config.cache_dir.join("blocks.data")
+    }
+
+    /// Run best-effort cache pressure maintenance:
+    /// 1. background watermark eviction when occupancy is high;
+    /// 2. emergency eviction under low filesystem free-space pressure.
+    pub fn run_pressure_maintenance(&self) -> PressureMaintenanceReport {
+        let mut report = PressureMaintenanceReport::default();
+
+        let (background_blocks, background_bytes) = self.evict_down_to_low_watermark();
+        report.background_evicted_blocks = background_blocks;
+        report.background_evicted_bytes = background_bytes;
+
+        let (emergency_blocks, emergency_bytes) = self.evict_for_low_disk_headroom(0);
+        report.emergency_evicted_blocks = emergency_blocks;
+        report.emergency_evicted_bytes = emergency_bytes;
+
+        report
     }
 
     // -----------------------------------------------------------------------
@@ -816,6 +1120,8 @@ impl BlockStore {
     ///
     /// The file is extended to accommodate the new allocation before returning.
     fn allocate_with_eviction(&self, alloc: u64) -> Result<u64, BlockStoreError> {
+        let _ = self.evict_for_low_disk_headroom(alloc);
+
         // First attempt without eviction.
         if let Some(offset) = self.try_allocate_and_extend(alloc)? {
             return Ok(offset);
@@ -826,6 +1132,7 @@ impl BlockStore {
             let evicted = self.evict_one_for_allocation()?;
             match evicted {
                 Some(entry) => {
+                    self.record_eviction(entry.alloc_size, EvictionReason::Allocation);
                     self.release_allocation(entry.offset, entry.alloc_size);
                 }
                 None => {
@@ -878,6 +1185,265 @@ impl BlockStore {
             self.file.set_len(needed_len)?;
         }
         Ok(Some(offset))
+    }
+
+    fn record_read_metrics(&self, bytes: u64, started: Instant) {
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.read_latency_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.read_latency_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn record_write_metrics(&self, bytes: u64, started: Instant) {
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.write_latency_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.write_latency_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn record_eviction(&self, reclaimed_bytes: u64, reason: EvictionReason) {
+        self.eviction_count.fetch_add(1, Ordering::Relaxed);
+        self.eviction_bytes
+            .fetch_add(reclaimed_bytes, Ordering::Relaxed);
+        match reason {
+            EvictionReason::Allocation => {}
+            EvictionReason::BackgroundWatermark => {
+                self.background_eviction_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.background_eviction_bytes
+                    .fetch_add(reclaimed_bytes, Ordering::Relaxed);
+            }
+            EvictionReason::EmergencyDiskPressure => {
+                self.emergency_eviction_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.emergency_eviction_bytes
+                    .fetch_add(reclaimed_bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn evict_bytes_for_reason(&self, target_bytes: u64, reason: EvictionReason) -> (u64, u64) {
+        if target_bytes == 0 {
+            return (0, 0);
+        }
+
+        let batchable_reason = matches!(
+            reason,
+            EvictionReason::BackgroundWatermark | EvictionReason::EmergencyDiskPressure
+        );
+        let mut evicted_blocks = 0u64;
+        let mut evicted_bytes = 0u64;
+        while evicted_bytes < target_bytes {
+            let remaining = target_bytes.saturating_sub(evicted_bytes);
+            let use_batch = batchable_reason && remaining >= PRESSURE_EVICTION_BATCH_TRIGGER_BYTES;
+
+            if use_batch {
+                let (blocks, bytes) = match self.evict_batch_for_maintenance(remaining, reason) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(
+                            error = ?error,
+                            target_bytes,
+                            evicted_bytes,
+                            "eviction pass aborted due to storage error"
+                        );
+                        break;
+                    }
+                };
+                if blocks == 0 {
+                    break;
+                }
+                evicted_blocks = evicted_blocks.saturating_add(blocks);
+                evicted_bytes = evicted_bytes.saturating_add(bytes);
+                continue;
+            }
+
+            let entry = match self.evict_one_for_allocation() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        error = ?error,
+                        target_bytes,
+                        evicted_bytes,
+                        "eviction pass aborted due to storage error"
+                    );
+                    break;
+                }
+            };
+
+            evicted_blocks += 1;
+            evicted_bytes = evicted_bytes.saturating_add(entry.alloc_size);
+            self.record_eviction(entry.alloc_size, reason);
+            self.release_allocation(entry.offset, entry.alloc_size);
+        }
+
+        (evicted_blocks, evicted_bytes)
+    }
+
+    fn evict_batch_for_maintenance(
+        &self,
+        target_bytes: u64,
+        reason: EvictionReason,
+    ) -> Result<(u64, u64), BlockStoreError> {
+        let batch_target = target_bytes.min(PRESSURE_EVICTION_BATCH_TARGET_BYTES);
+        let removed = {
+            let mut idx = self.index.lock();
+            let mut wal = self.wal.lock();
+            let mut removed = Vec::with_capacity(PRESSURE_EVICTION_BATCH_MAX_BLOCKS);
+            let mut reclaimed = 0u64;
+
+            while reclaimed < batch_target && removed.len() < PRESSURE_EVICTION_BATCH_MAX_BLOCKS {
+                let Some((object_id, offset)) = idx.peek_oldest_evictable() else {
+                    break;
+                };
+
+                // Same publication ordering as single-entry eviction:
+                // invalidate header before dropping index entry.
+                self.invalidate_block_header(offset)?;
+                let entry = idx
+                    .remove(object_id)
+                    .expect("peeked eviction candidate must still exist while index lock is held");
+
+                if let Err(error) = wal.append_remove(entry.object_id) {
+                    warn!(
+                        error = ?error,
+                        object_id = entry.object_id,
+                        offset = entry.offset,
+                        "evict_batch_for_maintenance: failed to append WAL remove",
+                    );
+                }
+                reclaimed = reclaimed.saturating_add(entry.alloc_size);
+                removed.push(entry);
+            }
+
+            removed
+        };
+
+        let mut evicted_blocks = 0u64;
+        let mut evicted_bytes = 0u64;
+        for entry in &removed {
+            evicted_blocks += 1;
+            evicted_bytes = evicted_bytes.saturating_add(entry.alloc_size);
+            self.record_eviction(entry.alloc_size, reason);
+        }
+        if !removed.is_empty() {
+            self.release_allocations_batch(&removed);
+        }
+
+        Ok((evicted_blocks, evicted_bytes))
+    }
+
+    fn evict_down_to_low_watermark(&self) -> (u64, u64) {
+        let allocated = self.allocated_bytes();
+        let high = self
+            .config
+            .max_size
+            .saturating_mul(BACKGROUND_EVICT_HIGH_WATERMARK_PERCENT)
+            / 100;
+        if allocated <= high {
+            return (0, 0);
+        }
+
+        let low = self
+            .config
+            .max_size
+            .saturating_mul(BACKGROUND_EVICT_LOW_WATERMARK_PERCENT)
+            / 100;
+        let target = allocated.saturating_sub(low);
+        self.evict_bytes_for_reason(target, EvictionReason::BackgroundWatermark)
+    }
+
+    fn evict_for_low_disk_headroom(&self, required_growth_bytes: u64) -> (u64, u64) {
+        let Some((free, total)) = crate::l2_disk::get_free_disk_space(&self.config.cache_dir)
+        else {
+            return (0, 0);
+        };
+        if total == 0 {
+            return (0, 0);
+        }
+
+        let ratio_target = total.saturating_mul(EMERGENCY_DISK_FREE_RATIO_NUMERATOR)
+            / EMERGENCY_DISK_FREE_RATIO_DENOMINATOR;
+        let mut target_free = ratio_target.max(
+            self.emergency_disk_free_floor_bytes
+                .saturating_add(required_growth_bytes),
+        );
+        target_free = target_free.min(total);
+        if free >= target_free {
+            return (0, 0);
+        }
+
+        let need = target_free.saturating_sub(free);
+        let (blocks, bytes) =
+            self.evict_bytes_for_reason(need, EvictionReason::EmergencyDiskPressure);
+        if blocks > 0 {
+            warn!(
+                free_bytes = free,
+                total_bytes = total,
+                target_free_bytes = target_free,
+                need_bytes = need,
+                evicted_blocks = blocks,
+                evicted_bytes = bytes,
+                "low disk headroom: emergency cache eviction pass completed"
+            );
+        }
+        (blocks, bytes)
+    }
+
+    fn drop_corrupt_entry_if_still_current(
+        &self,
+        object_id: u64,
+        offset: u64,
+        data_size: u32,
+        checksum: u32,
+    ) {
+        let removed = {
+            let mut idx = self.index.lock();
+            let matches_snapshot = matches!(
+                idx.get(object_id),
+                Some(entry)
+                    if entry.offset == offset
+                        && entry.data_size == data_size
+                        && entry.checksum == checksum
+            );
+            if !matches_snapshot {
+                return;
+            }
+
+            if let Err(error) = self.invalidate_block_header(offset) {
+                warn!(
+                    object_id,
+                    offset,
+                    error = ?error,
+                    "failed to invalidate corrupt block header before purge"
+                );
+            }
+
+            let removed = idx.remove(object_id);
+            if let Some(entry) = removed.as_ref()
+                && let Err(error) = self.wal.lock().append_remove(entry.object_id)
+            {
+                warn!(
+                    error = ?error,
+                    object_id = entry.object_id,
+                    offset = entry.offset,
+                    "failed to append WAL remove for corrupt block purge",
+                );
+            }
+            removed
+        };
+
+        if let Some(entry) = removed {
+            self.corruption_count.fetch_add(1, Ordering::Relaxed);
+            self.release_allocation(entry.offset, entry.alloc_size);
+        }
     }
 
     fn remove_entry_for_overwrite(
@@ -1222,6 +1788,63 @@ mod tests {
         let read = store.read_into(7, 2, &mut out).unwrap();
         assert_eq!(read, 3);
         assert_eq!(&out, b"cde");
+    }
+
+    #[test]
+    fn checksum_mismatch_purges_corrupt_entry() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(1, b"healthy", true).unwrap();
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(store.data_path())
+            .unwrap();
+        platform::pwrite(&file, b"X", SUPERBLOCK_SIZE + BLOCK_HEADER_SIZE as u64).unwrap();
+
+        assert!(
+            store.get(1).is_none(),
+            "corrupt read should surface as miss"
+        );
+        assert!(!store.contains(1), "corrupt entry should be purged");
+        assert_eq!(store.block_count(), 0);
+        assert_eq!(store.corruption_count(), 1);
+    }
+
+    #[test]
+    fn get_for_upload_issues_dont_need_hint_counter() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        store.put(3, b"payload", true).unwrap();
+        let before = store.advisory_dont_need_count();
+        let got = store
+            .get_for_upload(3)
+            .expect("upload reread should still return payload");
+        assert_eq!(&got[..], b"payload");
+        assert_eq!(store.advisory_dont_need_count(), before + 1);
+    }
+
+    #[test]
+    fn run_pressure_maintenance_evicts_down_to_watermark() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 10 * format::PAGE_SIZE,
+            volume_uuid: [0xB0; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        for id in 0..10_u64 {
+            store.put(id, b"x", true).unwrap();
+        }
+        let before = store.block_count();
+        let report = store.run_pressure_maintenance();
+        let after = store.block_count();
+
+        assert!(report.background_evicted_blocks > 0);
+        assert!(after < before);
     }
 
     // -----------------------------------------------------------------------
@@ -1600,6 +2223,26 @@ mod tests {
         assert_eq!(store.miss_count(), 0);
         store.get(99);
         assert_eq!(store.miss_count(), 1);
+    }
+
+    #[test]
+    fn parse_positive_u64_accepts_only_positive_numbers() {
+        assert_eq!(BlockStore::parse_positive_u64("1"), Some(1));
+        assert_eq!(BlockStore::parse_positive_u64(" 42 "), Some(42));
+        assert_eq!(BlockStore::parse_positive_u64("0"), None);
+        assert_eq!(BlockStore::parse_positive_u64("-7"), None);
+        assert_eq!(BlockStore::parse_positive_u64("abc"), None);
+    }
+
+    #[test]
+    fn upload_dont_need_range_is_page_aligned_to_block_start() {
+        let entry_offset = SUPERBLOCK_SIZE + PAGE_SIZE;
+        let data_size = 8192u32;
+        let (offset, len) = BlockStore::upload_dont_need_range(entry_offset, data_size);
+
+        assert_eq!(offset, entry_offset);
+        assert_eq!(offset % PAGE_SIZE, 0);
+        assert_eq!(len, u64::from(data_size) + BLOCK_HEADER_SIZE as u64);
     }
 
     // -----------------------------------------------------------------------

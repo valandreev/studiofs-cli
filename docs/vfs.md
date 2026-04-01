@@ -256,10 +256,15 @@ Adaptive upload control:
   `effective_penalty_ms = max(adaptive_penalty_ms - waited_upload_delay_ms, 0)`.
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
 - upload workers probe L1 before taking upload local-I/O slots, and true L2 fallback rereads are deferred while foreground demand is active.
+- upload fallback rereads call `BlockStore::get_for_upload`, which emits a best-effort `DONT_NEED` advisory after successful local reread; on Linux this hint is issued for the full block span from block-aligned offset.
 - recovered dirty uploads (replayed from `BlockStore` flags) and staging evictions still fall back to normal cache rereads when needed, so L2 remains the correctness fallback rather than the hot path.
 - local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
 - QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.
 - shutdown path suppresses noisy requeue/warn loops for QoS failures triggered by uploader cancellation.
+
+BlockStore pressure maintenance:
+- background maintenance applies high/low watermarks (90% / 80%) and can reclaim in bounded eviction batches for large reclaim targets.
+- emergency maintenance protects local disk free space using both ratio target and absolute floor (`STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES`).
 
 Remote-visible regular-file size advances only when a full incarnation is committed
 through `committed_size`, not through the local foreground `size`.

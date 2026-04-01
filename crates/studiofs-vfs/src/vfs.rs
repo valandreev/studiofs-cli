@@ -55,6 +55,7 @@ use studiofs_cache::block_cache::{
 use studiofs_cache::l2_disk::L2IoPriority;
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
+use studiofs_cache::v2::metrics::CacheMetrics;
 use studiofs_cache::v2::{BlockStore, BlockStoreConfig, derive_block_store_volume_uuid};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -6507,6 +6508,20 @@ impl StudioVfs {
         run_blocking(move || Ok(block_store.get(object_id))).await
     }
 
+    async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || Ok(block_store.get_for_upload(object_id))).await
+    }
+
+    async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
+        let block_store = self.block_store.clone();
+        run_blocking(move || {
+            let _ = block_store.run_pressure_maintenance();
+            Ok(())
+        })
+        .await
+    }
+
     async fn block_store_put_async(
         &self,
         object_id: u64,
@@ -10123,7 +10138,7 @@ impl StudioVfs {
                 Some(payload)
             } else {
                 let read_started = Instant::now();
-                let read_result = self.block_store_get_async(op.object_id).await?;
+                let read_result = self.block_store_get_for_upload_async(op.object_id).await?;
                 let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
                 drop(upload_io_permit);
                 self.state
@@ -10475,6 +10490,9 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+            if let Err(error) = self.block_store_run_pressure_maintenance_async().await {
+                warn!(error = %error, "background BlockStore pressure maintenance failed");
+            }
             let pending = self.block_cache.pending_upload_count();
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
             let metadata_backlog = self.sync_meta().replication_backlog();
@@ -10529,6 +10547,7 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
+            let block_store_metrics = CacheMetrics::snapshot(self.block_store.as_ref());
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
 
@@ -10734,6 +10753,37 @@ impl StudioVfs {
                     l2_hits = self.block_cache.l2_hit_count(),
                     l1_bytes = self.block_cache.l1_bytes(),
                     l1_max_bytes = self.block_cache.l1_max_bytes(),
+                    block_store_allocated_bytes = block_store_metrics.allocated_bytes,
+                    block_store_block_count = block_store_metrics.block_count,
+                    block_store_dirty_count = block_store_metrics.dirty_count,
+                    block_store_hit_count = block_store_metrics.hit_count,
+                    block_store_miss_count = block_store_metrics.miss_count,
+                    block_store_hit_rate = block_store_metrics.hit_ratio(),
+                    block_store_miss_rate = block_store_metrics.miss_ratio(),
+                    block_store_eviction_count = block_store_metrics.eviction_count,
+                    block_store_eviction_bytes = block_store_metrics.eviction_bytes,
+                    block_store_background_eviction_count =
+                        block_store_metrics.background_eviction_count,
+                    block_store_background_eviction_bytes =
+                        block_store_metrics.background_eviction_bytes,
+                    block_store_emergency_eviction_count =
+                        block_store_metrics.emergency_eviction_count,
+                    block_store_emergency_eviction_bytes =
+                        block_store_metrics.emergency_eviction_bytes,
+                    block_store_corruption_count = block_store_metrics.corruption_count,
+                    block_store_read_ops = block_store_metrics.read_ops,
+                    block_store_read_bytes = block_store_metrics.read_bytes,
+                    block_store_read_latency_max_ns = block_store_metrics.read_latency_max_ns,
+                    block_store_read_throughput_bps =
+                        block_store_metrics.read_throughput_bytes_per_sec(),
+                    block_store_read_throughput_scope = "lifetime_avg",
+                    block_store_write_ops = block_store_metrics.write_ops,
+                    block_store_write_bytes = block_store_metrics.write_bytes,
+                    block_store_write_latency_max_ns = block_store_metrics.write_latency_max_ns,
+                    block_store_write_throughput_bps =
+                        block_store_metrics.write_throughput_bytes_per_sec(),
+                    block_store_write_throughput_scope = "lifetime_avg",
+                    block_store_upload_drop_hints = block_store_metrics.advisory_dont_need_count,
                     prefetch_skips = self
                         .fetch_scheduler
                         .metrics

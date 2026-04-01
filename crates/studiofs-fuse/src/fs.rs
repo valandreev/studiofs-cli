@@ -23,6 +23,39 @@ use tracing::{debug, error, warn};
 use unicode_normalization::UnicodeNormalization;
 
 const TTL: Duration = Duration::from_secs(1);
+const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+
+fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
+    match std::env::var(key) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            match trimmed.parse::<u32>() {
+                Ok(value) if value > 0 => value,
+                Ok(_) => {
+                    warn!(
+                        env_key = key,
+                        env_value = trimmed,
+                        fallback_value = default,
+                        "bridge tuning override must be > 0; using default"
+                    );
+                    default
+                }
+                Err(error) => {
+                    warn!(
+                        env_key = key,
+                        env_value = trimmed,
+                        fallback_value = default,
+                        error = %error,
+                        "invalid bridge tuning override; using default"
+                    );
+                    default
+                }
+            }
+        }
+        Err(_) => default,
+    }
+}
 
 fn os_str_bytes(name: &OsStr) -> &[u8] {
     name.as_bytes()
@@ -281,6 +314,43 @@ impl StudioFuseFs {
 }
 
 impl Filesystem for StudioFuseFs {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        let requested_max_write = parse_bridge_u32_env(
+            "STUDIOFS_FUSE_MAX_WRITE_BYTES",
+            DEFAULT_FUSE_MAX_WRITE_BYTES,
+        );
+        if let Err(max_supported) = config.set_max_write(requested_max_write) {
+            warn!(
+                requested = requested_max_write,
+                max_supported, "requested FUSE max_write exceeds kernel/libfuse limit; clamping"
+            );
+            if config.set_max_write(max_supported).is_err() {
+                return Err(libc::EINVAL);
+            }
+        }
+
+        let requested_readahead = parse_bridge_u32_env(
+            "STUDIOFS_FUSE_MAX_READAHEAD_BYTES",
+            DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+        );
+        if let Err(max_supported) = config.set_max_readahead(requested_readahead) {
+            warn!(
+                requested = requested_readahead,
+                max_supported,
+                "requested FUSE max_readahead exceeds kernel/libfuse limit; clamping"
+            );
+            if config.set_max_readahead(max_supported).is_err() {
+                return Err(libc::EINVAL);
+            }
+        }
+
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_bytes = os_str_bytes(name).to_vec();
         #[cfg(target_os = "macos")]

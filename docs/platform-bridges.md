@@ -39,8 +39,8 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Parameter | Value |
 |-----------|-------|
 | Mount type | Local disk device (drive-letter mount, no network prefix) |
-| Sector size | 512 bytes |
-| Allocation unit size | 16384 bytes |
+| Sector size | `4096` bytes by default. Override: `STUDIOFS_WINFSP_SECTOR_SIZE` |
+| Allocation unit size | `1048576` bytes by default. Override: `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` |
 | Max component length | 255 |
 | File info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
@@ -51,6 +51,8 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Reparse points | Yes |
 | Volume serial | `0x5354_4644` ("STFD") |
 | Filesystem name | "StudioFS" |
+
+`STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for Cache v2 block I/O.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -142,8 +144,12 @@ Current signature includes additional policy controls:
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
 | `allow_other` | Yes |
+| Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` |
+| Kernel `max_readahead` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
+
+`STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for Cache v2 block I/O.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
