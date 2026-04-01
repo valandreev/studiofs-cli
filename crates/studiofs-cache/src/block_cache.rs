@@ -55,7 +55,7 @@ pub enum CacheReadLevel {
 pub struct CacheReadTrace {
     pub level: CacheReadLevel,
     pub l1_lookup_latency: Duration,
-    pub l2_lookup_latency: Option<Duration>,
+    pub shim_lookup_latency: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,14 +186,14 @@ impl BlockCache {
             Some(data) => {
                 self.l1_hit_count.fetch_add(1, Ordering::Relaxed);
                 self.metrics
-                    .l2_read
+                    .shim_read
                     .record(data.len() as u64, l1_latency.max(Duration::from_nanos(1)));
                 (
                     Some(data),
                     CacheReadTrace {
                         level: CacheReadLevel::L1,
                         l1_lookup_latency: l1_latency,
-                        l2_lookup_latency: None,
+                        shim_lookup_latency: None,
                     },
                 )
             }
@@ -202,7 +202,7 @@ impl BlockCache {
                 CacheReadTrace {
                     level: CacheReadLevel::Miss,
                     l1_lookup_latency: l1_latency,
-                    l2_lookup_latency: Some(Duration::ZERO),
+                    shim_lookup_latency: Some(Duration::ZERO),
                 },
             ),
         }
@@ -226,7 +226,7 @@ impl BlockCache {
         let started = Instant::now();
         self.stage_l1(object_id, data.clone());
         self.metrics
-            .l2_write
+            .shim_write
             .record(data.len() as u64, started.elapsed());
         Ok(())
     }

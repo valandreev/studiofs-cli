@@ -233,7 +233,7 @@ studiofs test-cache \
   [--warmup-runs <u32>] \
   [--access-pattern <sequential|random|mixed>] \
   [--l1-limit <e.g. 2GB>] \
-  [--l2-limit <e.g. 100GB>] \
+  [--shim-limit <e.g. 100GB>] \
   [--profile[=pyroscope]]
 ```
 
@@ -249,7 +249,7 @@ Defaults:
 - `--warmup-runs 0`
 - `--access-pattern sequential`
 - `--l1-limit 2GB`
-- `--l2-limit 100GB`
+- `--shim-limit 100GB`
 - `--profile` disabled by default
 - `--profile=pyroscope` enables Pyroscope sampling; `--profile` without a
   value is accepted as shorthand for the same mode
@@ -284,7 +284,7 @@ Notes:
 - JSON report includes `advanced_metrics`:
   - `size_class_boundaries` (`small_max_bytes`, `medium_max_bytes`)
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
-  - direct-shim only: `cache_levels` with L1/L2 hits, misses, bytes served, and per-level latency histograms
+  - direct-shim only: `cache_levels` with L1/shim hits, misses, bytes served, and per-level latency histograms
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
   `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
   `post-upload-read` rows plus the pending-upload observations used to gate
@@ -471,7 +471,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
 - legacy ingress artifact counters/checkpoint stats (expected to remain at zero on the Cache v2 foreground path unless recovering older artifacts)
 - local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
-- cache L2 read/write throughput and latency histograms
+- cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)

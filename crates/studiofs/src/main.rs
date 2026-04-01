@@ -579,13 +579,13 @@ WARNING: This action is irreversible.")]
         postgresql_adress: String,
     },
 
-    /// Run cache benchmarks (direct L2 and mounted end-to-end)
+    /// Run cache benchmarks (direct shim and mounted end-to-end)
     TestCache {
         /// Target benchmark path.
         ///
         /// If path is inside an active StudioFS mount, benchmark runs end-to-end
         /// through that mounted process and stores temporary files under
-        /// `<path>/.studiofs-test-cache`. Otherwise benchmark runs direct L2 mode
+        /// `<path>/.studiofs-test-cache`. Otherwise benchmark runs direct-shim mode
         /// and treats this path as cache directory.
         path: PathBuf,
 
@@ -635,9 +635,9 @@ WARNING: This action is irreversible.")]
         #[arg(long)]
         l1_limit: Option<String>,
 
-        /// On-disk L2 cache limit (e.g. 100GB).
+        /// On-disk shim cache limit (e.g. 100GB).
         #[arg(long)]
-        l2_limit: Option<String>,
+        shim_limit: Option<String>,
 
         /// JSON report output path. Defaults to an auto-named file in the
         /// current working directory.
@@ -820,7 +820,7 @@ fn main() -> anyhow::Result<()> {
             sizes,
             access_pattern,
             l1_limit,
-            l2_limit,
+            shim_limit,
             json_output,
             profile,
         } => {
@@ -837,7 +837,7 @@ fn main() -> anyhow::Result<()> {
                 sizes,
                 access_pattern,
                 l1_limit,
-                l2_limit,
+                shim_limit,
                 profile,
                 json_output,
             )?;
@@ -1159,7 +1159,7 @@ mod tests {
                 medium_max,
                 access_pattern,
                 l1_limit,
-                l2_limit,
+                shim_limit,
                 json_output,
                 profile,
                 ..
@@ -1179,7 +1179,7 @@ mod tests {
                     cli::test_cache::TestCacheAccessPattern::Sequential
                 ));
                 assert!(l1_limit.is_none());
-                assert!(l2_limit.is_none());
+                assert!(shim_limit.is_none());
                 assert!(json_output.is_none());
                 assert!(profile.is_none());
             }
@@ -1213,7 +1213,7 @@ mod tests {
             "random",
             "--l1-limit",
             "4GB",
-            "--l2-limit",
+            "--shim-limit",
             "1TB",
             "--json-output",
             "reports/cache-run.json",
@@ -1235,7 +1235,7 @@ mod tests {
                 warmup_runs,
                 sizes,
                 l1_limit,
-                l2_limit,
+                shim_limit,
                 json_output,
                 profile,
                 ..
@@ -1255,7 +1255,7 @@ mod tests {
                 assert_eq!(warmup_runs, 2);
                 assert_eq!(sizes.unwrap(), "small=60,medium=30,large=10");
                 assert_eq!(l1_limit.unwrap(), "4GB");
-                assert_eq!(l2_limit.unwrap(), "1TB");
+                assert_eq!(shim_limit.unwrap(), "1TB");
                 assert_eq!(
                     json_output.unwrap(),
                     PathBuf::from("reports/cache-run.json")

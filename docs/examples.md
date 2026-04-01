@@ -146,7 +146,7 @@ Repair mode currently:
 
 ## 9. Benchmark Cache (`test-cache`)
 
-Direct L2 benchmark (bypass VFS/mount):
+Direct-shim benchmark (bypass VFS/mount):
 
 ```bash
 studiofs test-cache \
@@ -162,7 +162,7 @@ studiofs test-cache \
   --warmup-runs 2 \
   --access-pattern mixed \
   --l1-limit 2GB \
-  --l2-limit 100GB \
+  --shim-limit 100GB \
   --profile=pyroscope
 ```
 
@@ -202,11 +202,11 @@ Notes:
   - per-size-class throughput and latency percentiles (p50/p95/p99)
   - upload queue depth counters
 - `direct-shim` JSON output includes a `cache_pipeline` section with:
-  - `l2_read` / `l2_write` throughput + latency histograms
+  - `shim_read` / `shim_write` throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
-- `direct-shim` `advanced_metrics.cache_levels` adds explicit L1/L2 hit/miss
+- `direct-shim` `advanced_metrics.cache_levels` adds explicit L1/shim hit/miss
   counters, bytes served from each level, and per-level lookup latency
   distributions.
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes

@@ -353,8 +353,8 @@ impl Drop for BlockingTaskExecutionGuard<'_> {
 
 #[derive(Debug, Clone)]
 pub struct CachePipelineMetricsSnapshot {
-    pub l2_read: IoStatsSnapshot,
-    pub l2_write: IoStatsSnapshot,
+    pub shim_read: IoStatsSnapshot,
+    pub shim_write: IoStatsSnapshot,
     pub materialize_batches: MaterializeBatchStatsSnapshot,
     pub upload_queue: UploadQueueStatsSnapshot,
     pub blocking_tasks: BlockingTaskMetricsSnapshot,
@@ -362,8 +362,8 @@ pub struct CachePipelineMetricsSnapshot {
 
 #[derive(Debug, Default)]
 pub struct CachePipelineMetrics {
-    pub l2_read: IoStats,
-    pub l2_write: IoStats,
+    pub shim_read: IoStats,
+    pub shim_write: IoStats,
     pub materialize_batches: MaterializeBatchStats,
     pub upload_queue: UploadQueueStats,
 }
@@ -371,8 +371,8 @@ pub struct CachePipelineMetrics {
 impl CachePipelineMetrics {
     pub fn snapshot(&self, pending_uploads: usize) -> CachePipelineMetricsSnapshot {
         CachePipelineMetricsSnapshot {
-            l2_read: self.l2_read.snapshot(),
-            l2_write: self.l2_write.snapshot(),
+            shim_read: self.shim_read.snapshot(),
+            shim_write: self.shim_write.snapshot(),
             materialize_batches: self.materialize_batches.snapshot(),
             upload_queue: self.upload_queue.snapshot(pending_uploads),
             blocking_tasks: empty_blocking_task_metrics_snapshot(),

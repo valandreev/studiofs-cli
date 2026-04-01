@@ -352,9 +352,8 @@ staging misses, and contracts again when foreground pressure drops.
 
 ## Performance Characteristics
 
-The labels `l2_read` / `l2_write` are retained only for compatibility in
-existing metrics and benchmark JSON schemas. They no longer imply a standalone
-legacy L2 cache subsystem.
+The `shim_read` / `shim_write` counters track compatibility-shim operations in
+the Cache v2 pipeline (L1 staging + upload orchestration).
 
 | Operation | Expected Throughput | Notes |
 |-----------|-------------------|-------|
@@ -371,7 +370,7 @@ legacy L2 cache subsystem.
 StudioFS now exposes first-class cache pipeline metrics for local debugging and
 benchmarks:
 
-- L2 read/write throughput counters (`ops`, `bytes`) and latency histograms
+- shim read/write throughput counters (`ops`, `bytes`) and latency histograms
 - ingress append throughput counters and latency histogram
 - materialize batch counters (`batches`, `blocks`, `bytes`), duration histogram,
   and concurrent batch depth/peak
@@ -400,7 +399,7 @@ running `studiofs test-cache ... --profile=pyroscope`.
   (`small_max_bytes`, `medium_max_bytes`)
 - `size_class_stats`: write/read throughput and latency percentiles (p50/p95/p99)
   for `small`, `medium`, and `large`
-- `cache_levels` (direct-shim mode): L1/L2 hit and miss counters, bytes served
+- `cache_levels` (direct-shim mode): L1/shim hit and miss counters, bytes served
   from each level, and per-level lookup latency percentiles + histogram
 - `upload_queue`: depth and lifecycle counters
 

@@ -62,7 +62,7 @@ struct TestCacheParams {
     sizes: WorkloadSizeInput,
     access_pattern: TestCacheAccessPattern,
     l1_limit: u64,
-    l2_limit: u64,
+    shim_limit: u64,
     profile: bool,
     run_id: String,
 }
@@ -175,7 +175,7 @@ struct BenchmarkReport {
     workload_large_files: usize,
     access_pattern: String,
     l1_limit: u64,
-    l2_limit: u64,
+    shim_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     work_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,7 +258,7 @@ struct SizeClassOpReport {
 #[derive(Debug, Serialize)]
 struct CacheLevelsReport {
     l1: CacheLevelReport,
-    l2: CacheLevelReport,
+    shim: CacheLevelReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,8 +311,8 @@ struct UploadQueueStatsReport {
 
 #[derive(Debug, Serialize)]
 struct CachePipelineReport {
-    l2_read: IoStatsReport,
-    l2_write: IoStatsReport,
+    shim_read: IoStatsReport,
+    shim_write: IoStatsReport,
     materialize_batches: MaterializeBatchStatsReport,
     upload_queue: UploadQueueStatsReport,
     blocking_tasks: BlockingTaskStatsReport,
@@ -461,8 +461,8 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
         by_kind.sort_by(|a, b| b.stats.submitted.cmp(&a.stats.submitted));
 
         Self {
-            l2_read: snapshot.l2_read.into(),
-            l2_write: snapshot.l2_write.into(),
+            shim_read: snapshot.shim_read.into(),
+            shim_write: snapshot.shim_write.into(),
             materialize_batches: snapshot.materialize_batches.into(),
             upload_queue: snapshot.upload_queue.into(),
             blocking_tasks: BlockingTaskStatsReport {
@@ -698,10 +698,10 @@ struct CacheLevelTelemetryAccumulator {
     l1_misses: u64,
     l1_bytes_served: u64,
     l1_lookup_latency: LatencySamples,
-    l2_hits: u64,
-    l2_misses: u64,
-    l2_bytes_served: u64,
-    l2_lookup_latency: LatencySamples,
+    shim_hits: u64,
+    shim_misses: u64,
+    shim_bytes_served: u64,
+    shim_lookup_latency: LatencySamples,
 }
 
 impl CacheLevelTelemetryAccumulator {
@@ -715,19 +715,19 @@ impl CacheLevelTelemetryAccumulator {
         }
     }
 
-    fn record_l2(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
-        self.l2_lookup_latency.record(elapsed, bytes_served);
+    fn record_shim(&mut self, hit: bool, elapsed: Duration, bytes_served: u64) {
+        self.shim_lookup_latency.record(elapsed, bytes_served);
         if hit {
-            self.l2_hits = self.l2_hits.saturating_add(1);
-            self.l2_bytes_served = self.l2_bytes_served.saturating_add(bytes_served);
+            self.shim_hits = self.shim_hits.saturating_add(1);
+            self.shim_bytes_served = self.shim_bytes_served.saturating_add(bytes_served);
         } else {
-            self.l2_misses = self.l2_misses.saturating_add(1);
+            self.shim_misses = self.shim_misses.saturating_add(1);
         }
     }
 
     fn to_report(&self, wall_elapsed_ms: f64) -> CacheLevelsReport {
         let l1_report = self.l1_lookup_latency.to_report(wall_elapsed_ms);
-        let l2_report = self.l2_lookup_latency.to_report(wall_elapsed_ms);
+        let shim_report = self.shim_lookup_latency.to_report(wall_elapsed_ms);
         CacheLevelsReport {
             l1: CacheLevelReport {
                 hits: self.l1_hits,
@@ -740,16 +740,16 @@ impl CacheLevelTelemetryAccumulator {
                 p99_ms: l1_report.p99_ms,
                 latency_histogram: self.l1_lookup_latency.to_histogram_report(),
             },
-            l2: CacheLevelReport {
-                hits: self.l2_hits,
-                misses: self.l2_misses,
-                bytes_served: self.l2_bytes_served,
-                throughput_bytes_per_sec: l2_report.throughput_bytes_per_sec,
-                avg_latency_ms: l2_report.avg_latency_ms,
-                p50_ms: l2_report.p50_ms,
-                p95_ms: l2_report.p95_ms,
-                p99_ms: l2_report.p99_ms,
-                latency_histogram: self.l2_lookup_latency.to_histogram_report(),
+            shim: CacheLevelReport {
+                hits: self.shim_hits,
+                misses: self.shim_misses,
+                bytes_served: self.shim_bytes_served,
+                throughput_bytes_per_sec: shim_report.throughput_bytes_per_sec,
+                avg_latency_ms: shim_report.avg_latency_ms,
+                p50_ms: shim_report.p50_ms,
+                p95_ms: shim_report.p95_ms,
+                p99_ms: shim_report.p99_ms,
+                latency_histogram: self.shim_lookup_latency.to_histogram_report(),
             },
         }
     }
@@ -760,11 +760,13 @@ impl CacheLevelTelemetryAccumulator {
         self.l1_bytes_served = self.l1_bytes_served.saturating_add(other.l1_bytes_served);
         self.l1_lookup_latency
             .merge_from_ref(&other.l1_lookup_latency);
-        self.l2_hits = self.l2_hits.saturating_add(other.l2_hits);
-        self.l2_misses = self.l2_misses.saturating_add(other.l2_misses);
-        self.l2_bytes_served = self.l2_bytes_served.saturating_add(other.l2_bytes_served);
-        self.l2_lookup_latency
-            .merge_from_ref(&other.l2_lookup_latency);
+        self.shim_hits = self.shim_hits.saturating_add(other.shim_hits);
+        self.shim_misses = self.shim_misses.saturating_add(other.shim_misses);
+        self.shim_bytes_served = self
+            .shim_bytes_served
+            .saturating_add(other.shim_bytes_served);
+        self.shim_lookup_latency
+            .merge_from_ref(&other.shim_lookup_latency);
     }
 }
 
@@ -1322,11 +1324,11 @@ async fn run_shim_writes(
                 let permit = sem
                     .acquire()
                     .await
-                    .map_err(|e| anyhow!("L2 write semaphore closed: {e}"))?;
+                    .map_err(|e| anyhow!("shim write semaphore closed: {e}"))?;
                 let _permit = permit;
 
                 let data_len =
-                    usize::try_from(sizes[work_index]).context("L2 write size overflow")?;
+                    usize::try_from(sizes[work_index]).context("shim write size overflow")?;
                 let object_id = (work_index as u64) + 1;
                 let data = deterministic_bytes(
                     data_len,
@@ -1339,7 +1341,7 @@ async fn run_shim_writes(
                 cache
                     .put(object_id, Bytes::from(data))
                     .await
-                    .context("L2 put failed")?;
+                    .context("shim put failed")?;
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     sizes[work_index],
@@ -1349,7 +1351,7 @@ async fn run_shim_writes(
 
                 let mut s = stats
                     .lock()
-                    .map_err(|_| anyhow!("L2 write latency stats lock poisoned"))?;
+                    .map_err(|_| anyhow!("shim write latency stats lock poisoned"))?;
                 s.record(class, elapsed, sizes[work_index]);
             }
         }));
@@ -1358,14 +1360,14 @@ async fn run_shim_writes(
     for handle in handles {
         handle
             .await
-            .context("L2 write worker panicked")?
-            .context("L2 write worker failed")?;
+            .context("shim write worker panicked")?
+            .context("shim write worker failed")?;
     }
 
     Arc::try_unwrap(stats)
-        .map_err(|_| anyhow!("L2 write worker coordination failed"))?
+        .map_err(|_| anyhow!("shim write worker coordination failed"))?
         .into_inner()
-        .map_err(|_| anyhow!("L2 write latency stats lock poisoned"))
+        .map_err(|_| anyhow!("shim write latency stats lock poisoned"))
 }
 
 async fn run_shim_reads(
@@ -1402,24 +1404,24 @@ async fn run_shim_reads(
                 let permit = sem
                     .acquire()
                     .await
-                    .map_err(|e| anyhow!("L2 read semaphore closed: {e}"))?;
+                    .map_err(|e| anyhow!("shim read semaphore closed: {e}"))?;
                 let _permit = permit;
 
                 let object_id = (work_index as u64) + 1;
                 let op_start = Instant::now();
                 let (payload, trace) = cache.get_with_trace(object_id).await;
                 let payload =
-                    payload.with_context(|| format!("L2 read missed object id {object_id}"))?;
+                    payload.with_context(|| format!("shim read missed object id {object_id}"))?;
                 let read = usize::try_from(read_size.min(sizes[work_index]).max(1))
-                    .context("L2 read size overflow")?;
+                    .context("shim read size overflow")?;
                 if payload.is_empty() {
                     return Err(anyhow!(
-                        "L2 read returned empty payload for object id {object_id}"
+                        "shim read returned empty payload for object id {object_id}"
                     ));
                 }
                 if payload.len() < read {
                     return Err(anyhow!(
-                        "L2 read requested {} bytes but object {} had only {} bytes",
+                        "shim read requested {} bytes but object {} had only {} bytes",
                         read,
                         object_id,
                         payload.len()
@@ -1434,7 +1436,7 @@ async fn run_shim_reads(
                 );
                 let mut s = stats
                     .lock()
-                    .map_err(|_| anyhow!("L2 read latency stats lock poisoned"))?;
+                    .map_err(|_| anyhow!("shim read latency stats lock poisoned"))?;
                 s.phase.record(class, elapsed, read as u64);
                 match trace.level {
                     CacheReadLevel::L1 => {
@@ -1443,8 +1445,8 @@ async fn run_shim_reads(
                     }
                     CacheReadLevel::Miss => {
                         s.cache_levels.record_l1(false, trace.l1_lookup_latency, 0);
-                        if let Some(l2_latency) = trace.l2_lookup_latency {
-                            s.cache_levels.record_l2(false, l2_latency, 0);
+                        if let Some(shim_latency) = trace.shim_lookup_latency {
+                            s.cache_levels.record_shim(false, shim_latency, 0);
                         }
                     }
                 }
@@ -1455,14 +1457,14 @@ async fn run_shim_reads(
     for handle in handles {
         handle
             .await
-            .context("L2 read worker panicked")?
-            .context("L2 read worker failed")?;
+            .context("shim read worker panicked")?
+            .context("shim read worker failed")?;
     }
 
     Arc::try_unwrap(stats)
-        .map_err(|_| anyhow!("L2 read worker coordination failed"))?
+        .map_err(|_| anyhow!("shim read worker coordination failed"))?
         .into_inner()
-        .map_err(|_| anyhow!("L2 read latency stats lock poisoned"))
+        .map_err(|_| anyhow!("shim read latency stats lock poisoned"))
 }
 
 async fn run_shim_writes_sequential_streams(
@@ -1488,10 +1490,10 @@ async fn run_shim_writes_sequential_streams(
                 let permit = sem
                     .acquire()
                     .await
-                    .map_err(|e| anyhow!("L2 sequential write semaphore closed: {e}"))?;
+                    .map_err(|e| anyhow!("shim sequential write semaphore closed: {e}"))?;
                 let _permit = permit;
                 let data_len = usize::try_from(sizes[work_index])
-                    .context("L2 sequential write size overflow")?;
+                    .context("shim sequential write size overflow")?;
                 let object_id = (work_index as u64) + 1;
                 let data = deterministic_bytes(
                     data_len,
@@ -1503,7 +1505,7 @@ async fn run_shim_writes_sequential_streams(
                 cache
                     .put(object_id, Bytes::from(data))
                     .await
-                    .context("L2 sequential put failed")?;
+                    .context("shim sequential put failed")?;
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     sizes[work_index],
@@ -1520,8 +1522,8 @@ async fn run_shim_writes_sequential_streams(
     for handle in handles {
         let (stream_id, telemetry) = handle
             .await
-            .context("L2 sequential write stream panicked")?
-            .context("L2 sequential write stream failed")?;
+            .context("shim sequential write stream panicked")?
+            .context("shim sequential write stream failed")?;
         by_stream[stream_id] = telemetry;
     }
     Ok(by_stream)
@@ -1551,19 +1553,20 @@ async fn run_shim_reads_sequential_streams(
                 let permit = sem
                     .acquire()
                     .await
-                    .map_err(|e| anyhow!("L2 sequential read semaphore closed: {e}"))?;
+                    .map_err(|e| anyhow!("shim sequential read semaphore closed: {e}"))?;
                 let _permit = permit;
 
                 let object_id = (work_index as u64) + 1;
                 let op_start = Instant::now();
                 let (payload, trace) = cache.get_with_trace(object_id).await;
-                let payload = payload
-                    .with_context(|| format!("L2 sequential read missed object id {object_id}"))?;
+                let payload = payload.with_context(|| {
+                    format!("shim sequential read missed object id {object_id}")
+                })?;
                 let read = usize::try_from(read_size.min(sizes[work_index]).max(1))
-                    .context("L2 sequential read size overflow")?;
+                    .context("shim sequential read size overflow")?;
                 if payload.len() < read {
                     return Err(anyhow!(
-                        "L2 sequential read requested {} bytes but object {} had only {} bytes",
+                        "shim sequential read requested {} bytes but object {} had only {} bytes",
                         read,
                         object_id,
                         payload.len()
@@ -1588,8 +1591,8 @@ async fn run_shim_reads_sequential_streams(
                         telemetry
                             .cache_levels
                             .record_l1(false, trace.l1_lookup_latency, 0);
-                        if let Some(l2_latency) = trace.l2_lookup_latency {
-                            telemetry.cache_levels.record_l2(false, l2_latency, 0);
+                        if let Some(shim_latency) = trace.shim_lookup_latency {
+                            telemetry.cache_levels.record_shim(false, shim_latency, 0);
                         }
                     }
                 }
@@ -1602,8 +1605,8 @@ async fn run_shim_reads_sequential_streams(
     for handle in handles {
         let (stream_id, telemetry) = handle
             .await
-            .context("L2 sequential read stream panicked")?
-            .context("L2 sequential read stream failed")?;
+            .context("shim sequential read stream panicked")?
+            .context("shim sequential read stream failed")?;
         by_stream[stream_id] = telemetry;
     }
     Ok(by_stream)
@@ -2316,7 +2319,7 @@ async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<Benchm
         workload_large_files: workload.large_files,
         access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
         l1_limit: params.l1_limit,
-        l2_limit: params.l2_limit,
+        shim_limit: params.shim_limit,
         volume: None,
         mount_point: None,
         l1_bytes: Some(cache_stats.l1_bytes),
@@ -2593,7 +2596,7 @@ async fn run_mounted_end_to_end(
             workload_large_files: workload.large_files,
             access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
             l1_limit: params.l1_limit,
-            l2_limit: params.l2_limit,
+            shim_limit: params.shim_limit,
             work_root: Some(work_root.display().to_string()),
             volume: Some(volume.to_string()),
             mount_point: Some(mount_point.display().to_string()),
@@ -2888,9 +2891,9 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     }
     let _ = writeln!(
         &mut out,
-        "Limits:    L1 {}, L2 {}",
+        "Limits:    L1 {}, shim {}",
         format_bytes(report.l1_limit),
-        format_bytes(report.l2_limit),
+        format_bytes(report.shim_limit),
     );
     if report.l1_bytes.is_some() {
         let _ = writeln!(
@@ -3052,14 +3055,14 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
                     format_duration_ms(levels.l1.p99_ms),
                 ],
                 vec![
-                    "L2".to_string(),
-                    levels.l2.hits.to_string(),
-                    levels.l2.misses.to_string(),
-                    format_bytes(levels.l2.bytes_served),
-                    format_throughput(levels.l2.throughput_bytes_per_sec),
-                    format_duration_ms(levels.l2.p50_ms),
-                    format_duration_ms(levels.l2.p95_ms),
-                    format_duration_ms(levels.l2.p99_ms),
+                    "Shim".to_string(),
+                    levels.shim.hits.to_string(),
+                    levels.shim.misses.to_string(),
+                    format_bytes(levels.shim.bytes_served),
+                    format_throughput(levels.shim.throughput_bytes_per_sec),
+                    format_duration_ms(levels.shim.p50_ms),
+                    format_duration_ms(levels.shim.p95_ms),
+                    format_duration_ms(levels.shim.p99_ms),
                 ],
             ];
             let _ = write!(
@@ -3123,24 +3126,24 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
         let _ = writeln!(&mut out, "Cache pipeline");
         let pipeline_rows = vec![
             vec![
-                "L2 write".to_string(),
-                pipeline.l2_write.ops.to_string(),
-                format_bytes(pipeline.l2_write.bytes),
+                "shim write".to_string(),
+                pipeline.shim_write.ops.to_string(),
+                format_bytes(pipeline.shim_write.bytes),
                 format_duration_ms(avg_latency_ms(
-                    pipeline.l2_write.total_latency_ns,
-                    pipeline.l2_write.ops,
+                    pipeline.shim_write.total_latency_ns,
+                    pipeline.shim_write.ops,
                 )),
-                format_duration_ms(pipeline.l2_write.max_latency_ns as f64 / 1_000_000.0),
+                format_duration_ms(pipeline.shim_write.max_latency_ns as f64 / 1_000_000.0),
             ],
             vec![
-                "L2 read".to_string(),
-                pipeline.l2_read.ops.to_string(),
-                format_bytes(pipeline.l2_read.bytes),
+                "shim read".to_string(),
+                pipeline.shim_read.ops.to_string(),
+                format_bytes(pipeline.shim_read.bytes),
                 format_duration_ms(avg_latency_ms(
-                    pipeline.l2_read.total_latency_ns,
-                    pipeline.l2_read.ops,
+                    pipeline.shim_read.total_latency_ns,
+                    pipeline.shim_read.ops,
                 )),
-                format_duration_ms(pipeline.l2_read.max_latency_ns as f64 / 1_000_000.0),
+                format_duration_ms(pipeline.shim_read.max_latency_ns as f64 / 1_000_000.0),
             ],
         ];
         let _ = write!(
@@ -3316,7 +3319,7 @@ pub fn run(
     sizes: Option<String>,
     access_pattern: TestCacheAccessPattern,
     l1_limit: Option<String>,
-    l2_limit: Option<String>,
+    shim_limit: Option<String>,
     profile: Option<TestCacheProfileMode>,
     json_output: Option<PathBuf>,
 ) -> Result<()> {
@@ -3334,7 +3337,7 @@ pub fn run(
     )?;
     let block_size_default = block_size.to_string();
     let l1_limit_default = DEFAULT_L1_SIZE.to_string();
-    let l2_limit_default = DEFAULT_DIRECT_SHIM_LIMIT_BYTES.to_string();
+    let shim_limit_default = DEFAULT_DIRECT_SHIM_LIMIT_BYTES.to_string();
     let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
     let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(
@@ -3346,7 +3349,10 @@ pub fn run(
     )?
     .max(1);
     let l1_limit = parse_size_arg("l1-limit", l1_limit.as_deref().unwrap_or(&l1_limit_default))?;
-    let l2_limit = parse_size_arg("l2-limit", l2_limit.as_deref().unwrap_or(&l2_limit_default))?;
+    let shim_limit = parse_size_arg(
+        "shim-limit",
+        shim_limit.as_deref().unwrap_or(&shim_limit_default),
+    )?;
     let size_class_small_max = parse_size_arg(
         "small-max",
         small_max
@@ -3363,7 +3369,7 @@ pub fn run(
     )?;
     let sizes = parse_sizes_arg(sizes.as_deref())?;
 
-    if l1_limit < 1 || l2_limit < 1 {
+    if l1_limit < 1 || shim_limit < 1 {
         return Err(anyhow!("cache limits must be > 0"));
     }
     if size_class_small_max == 0 {
@@ -3403,7 +3409,7 @@ pub fn run(
         sizes,
         access_pattern,
         l1_limit,
-        l2_limit,
+        shim_limit,
         profile: profile.is_some(),
         run_id: run_id.clone(),
     };
@@ -3502,13 +3508,13 @@ mod tests {
             workload_large_files: WORKLOAD_FILES_PER_TIER,
             access_pattern: "sequential".to_string(),
             l1_limit: 2 * 1024 * 1024 * 1024,
-            l2_limit: 100 * 1024 * 1024 * 1024,
+            shim_limit: 100 * 1024 * 1024 * 1024,
             work_root: None,
             volume: None,
             mount_point: None,
             l1_bytes: Some(128 * 1024 * 1024),
             cache_pipeline: Some(CachePipelineReport {
-                l2_read: IoStatsReport {
+                shim_read: IoStatsReport {
                     ops: 0,
                     bytes: 0,
                     total_latency_ns: 0,
@@ -3518,7 +3524,7 @@ mod tests {
                         bucket_counts: vec![0],
                     },
                 },
-                l2_write: IoStatsReport {
+                shim_write: IoStatsReport {
                     ops: 16,
                     bytes: 128 * 1024 * 1024,
                     total_latency_ns: 64_000_000,
@@ -3561,7 +3567,7 @@ mod tests {
                     },
                     by_kind: vec![
                         BlockingTaskKindStatsReport {
-                            task_kind: "l2_put_batch".to_string(),
+                            task_kind: "shim_put_batch".to_string(),
                             stats: BlockingTaskSingleStatsReport {
                                 active: 0,
                                 active_peak: 3,
@@ -3575,7 +3581,7 @@ mod tests {
                             },
                         },
                         BlockingTaskKindStatsReport {
-                            task_kind: "l2_get_batch".to_string(),
+                            task_kind: "shim_get_batch".to_string(),
                             stats: BlockingTaskSingleStatsReport {
                                 active: 0,
                                 active_peak: 2,
@@ -3700,7 +3706,7 @@ mod tests {
                             bucket_counts: vec![3, 6, 7],
                         },
                     },
-                    l2: CacheLevelReport {
+                    shim: CacheLevelReport {
                         hits: 7,
                         misses: 0,
                         bytes_served: 56 * 1024 * 1024,
