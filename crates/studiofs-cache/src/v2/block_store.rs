@@ -54,6 +54,7 @@ const DEFAULT_EMERGENCY_DISK_FREE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 const PRESSURE_EVICTION_BATCH_TRIGGER_BYTES: u64 = 64 * 1024 * 1024;
 const PRESSURE_EVICTION_BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const PRESSURE_EVICTION_BATCH_MAX_BLOCKS: usize = 128;
+const DISK_HEADROOM_REFRESH_INTERVAL_NS: u64 = 250_000_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PressureMaintenanceReport {
@@ -131,6 +132,8 @@ pub struct BlockStore {
     file: File,
     config: BlockStoreConfig,
     mmap_reader: MmapReader,
+    /// Cached physical file length, updated only after successful growth.
+    file_len: AtomicU64,
     /// Combined block map + LRU list + dirty/block counters.
     index: Mutex<BlockIndex>,
     /// Append-only metadata journal for mutations since the last snapshot.
@@ -175,6 +178,17 @@ pub struct BlockStore {
     advisory_dont_need_count: AtomicU64,
     /// Minimum free-space target used by emergency disk-pressure eviction.
     emergency_disk_free_floor_bytes: u64,
+    /// Cached filesystem free-space state; refreshed periodically instead of on every put.
+    disk_free_bytes: AtomicU64,
+    disk_total_bytes: AtomicU64,
+    disk_headroom_last_refresh_elapsed_ns: AtomicU64,
+    disk_headroom_clock_start: Instant,
+    disk_headroom_refresh_in_progress: AtomicBool,
+    disk_headroom_refresh_attempt_count: AtomicU64,
+    disk_headroom_refresh_success_count: AtomicU64,
+    disk_headroom_refresh_error_count: AtomicU64,
+    disk_headroom_refresh_skip_interval_count: AtomicU64,
+    disk_headroom_refresh_skip_inflight_count: AtomicU64,
     /// Set by `close()` so [`Drop`] can skip the redundant fdatasync.
     synced: AtomicBool,
 }
@@ -331,6 +345,7 @@ impl BlockStore {
             file,
             config,
             mmap_reader,
+            file_len: AtomicU64::new(file_end),
             index: Mutex::new(BlockIndex::from_persisted_entries(&recovered_entries)),
             wal: Mutex::new(WalAppender::open(&cache_dir, reset_wal)?),
             allocator: Mutex::new(allocator),
@@ -353,6 +368,16 @@ impl BlockStore {
             write_latency_max_ns: AtomicU64::new(0),
             advisory_dont_need_count: AtomicU64::new(0),
             emergency_disk_free_floor_bytes,
+            disk_free_bytes: AtomicU64::new(0),
+            disk_total_bytes: AtomicU64::new(0),
+            disk_headroom_last_refresh_elapsed_ns: AtomicU64::new(0),
+            disk_headroom_clock_start: Instant::now(),
+            disk_headroom_refresh_in_progress: AtomicBool::new(false),
+            disk_headroom_refresh_attempt_count: AtomicU64::new(0),
+            disk_headroom_refresh_success_count: AtomicU64::new(0),
+            disk_headroom_refresh_error_count: AtomicU64::new(0),
+            disk_headroom_refresh_skip_interval_count: AtomicU64::new(0),
+            disk_headroom_refresh_skip_inflight_count: AtomicU64::new(0),
             synced: AtomicBool::new(false),
         })
     }
@@ -1039,6 +1064,42 @@ impl BlockStore {
         self.advisory_dont_need_count.load(Ordering::Relaxed)
     }
 
+    /// Number of attempted disk-headroom refresh syscalls.
+    pub fn disk_headroom_refresh_attempt_count(&self) -> u64 {
+        self.disk_headroom_refresh_attempt_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of successful disk-headroom refresh syscalls.
+    pub fn disk_headroom_refresh_success_count(&self) -> u64 {
+        self.disk_headroom_refresh_success_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of failed disk-headroom refresh syscalls.
+    pub fn disk_headroom_refresh_error_count(&self) -> u64 {
+        self.disk_headroom_refresh_error_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of refresh requests skipped because refresh interval has not elapsed.
+    pub fn disk_headroom_refresh_skip_interval_count(&self) -> u64 {
+        self.disk_headroom_refresh_skip_interval_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of refresh requests skipped because another thread is refreshing now.
+    pub fn disk_headroom_refresh_skip_inflight_count(&self) -> u64 {
+        self.disk_headroom_refresh_skip_inflight_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Approximate number of avoided disk-headroom syscalls.
+    pub fn disk_headroom_refresh_saved_syscall_count(&self) -> u64 {
+        self.disk_headroom_refresh_skip_interval_count()
+            .saturating_add(self.disk_headroom_refresh_skip_inflight_count())
+    }
+
     /// Hit ratio in range `[0.0, 1.0]`.
     pub fn hit_ratio(&self) -> f64 {
         let hits = self.hit_count();
@@ -1100,7 +1161,7 @@ impl BlockStore {
         report.background_evicted_blocks = background_blocks;
         report.background_evicted_bytes = background_bytes;
 
-        let (emergency_blocks, emergency_bytes) = self.evict_for_low_disk_headroom(0);
+        let (emergency_blocks, emergency_bytes) = self.evict_for_low_disk_headroom_if_needed(0);
         report.emergency_evicted_blocks = emergency_blocks;
         report.emergency_evicted_bytes = emergency_bytes;
 
@@ -1120,7 +1181,7 @@ impl BlockStore {
     ///
     /// The file is extended to accommodate the new allocation before returning.
     fn allocate_with_eviction(&self, alloc: u64) -> Result<u64, BlockStoreError> {
-        let _ = self.evict_for_low_disk_headroom(alloc);
+        let _ = self.evict_for_low_disk_headroom_if_needed(alloc);
 
         // First attempt without eviction.
         if let Some(offset) = self.try_allocate_and_extend(alloc)? {
@@ -1170,7 +1231,7 @@ impl BlockStore {
         // that a concurrent free+allocate in another thread cannot race with
         // set_len.
         let needed_len = a.file_end();
-        let current_len = self.file.metadata()?.len();
+        let current_len = self.file_len.load(Ordering::Acquire);
         if needed_len > current_len {
             if let Err(error) =
                 platform::preallocate(&self.file, current_len, needed_len - current_len)
@@ -1182,7 +1243,13 @@ impl BlockStore {
                     "best-effort data-file preallocation failed",
                 );
             }
-            self.file.set_len(needed_len)?;
+            if let Err(error) = self.file.set_len(needed_len) {
+                // Keep allocator state consistent with on-disk file length on
+                // growth failures (e.g. ENOSPC).
+                a.free(offset, alloc);
+                return Err(error.into());
+            }
+            self.file_len.store(needed_len, Ordering::Release);
         }
         Ok(Some(offset))
     }
@@ -1360,9 +1427,8 @@ impl BlockStore {
         self.evict_bytes_for_reason(target, EvictionReason::BackgroundWatermark)
     }
 
-    fn evict_for_low_disk_headroom(&self, required_growth_bytes: u64) -> (u64, u64) {
-        let Some((free, total)) = crate::v2::platform::get_free_disk_space(&self.config.cache_dir)
-        else {
+    fn evict_for_low_disk_headroom_if_needed(&self, required_growth_bytes: u64) -> (u64, u64) {
+        let Some((free, total)) = self.refresh_disk_headroom_if_needed() else {
             return (0, 0);
         };
         if total == 0 {
@@ -1393,8 +1459,8 @@ impl BlockStore {
                 evicted_bytes = bytes,
                 "low disk headroom: emergency cache eviction pass completed"
             );
-            if let Some((free_after, _)) =
-                crate::v2::platform::get_free_disk_space(&self.config.cache_dir)
+            self.refresh_disk_headroom_snapshot();
+            if let Some((free_after, _)) = self.cached_disk_headroom()
                 && free_after <= free
             {
                 warn!(
@@ -1407,6 +1473,84 @@ impl BlockStore {
             }
         }
         (blocks, bytes)
+    }
+
+    fn disk_headroom_elapsed_ns(&self) -> u64 {
+        self.disk_headroom_clock_start
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn cached_disk_headroom(&self) -> Option<(u64, u64)> {
+        let total = self.disk_total_bytes.load(Ordering::Acquire);
+        if total == 0 {
+            return None;
+        }
+        Some((self.disk_free_bytes.load(Ordering::Acquire), total))
+    }
+
+    fn refresh_disk_headroom_snapshot(&self) -> Option<(u64, u64)> {
+        self.disk_headroom_refresh_attempt_count
+            .fetch_add(1, Ordering::Relaxed);
+        match crate::v2::platform::get_free_disk_space(&self.config.cache_dir) {
+            Some((free, total)) => {
+                self.disk_free_bytes.store(free, Ordering::Release);
+                self.disk_total_bytes.store(total, Ordering::Release);
+                self.disk_headroom_last_refresh_elapsed_ns
+                    .store(self.disk_headroom_elapsed_ns(), Ordering::Release);
+                self.disk_headroom_refresh_success_count
+                    .fetch_add(1, Ordering::Relaxed);
+                Some((free, total))
+            }
+            None => {
+                self.disk_headroom_refresh_error_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.disk_headroom_last_refresh_elapsed_ns
+                    .store(self.disk_headroom_elapsed_ns(), Ordering::Release);
+                warn!(
+                    cache_dir = %self.config.cache_dir.display(),
+                    "failed to refresh disk headroom; falling back to cached value"
+                );
+                self.cached_disk_headroom()
+            }
+        }
+    }
+
+    fn refresh_disk_headroom_if_needed(&self) -> Option<(u64, u64)> {
+        if self
+            .disk_headroom_refresh_in_progress
+            .load(Ordering::Acquire)
+        {
+            self.disk_headroom_refresh_skip_inflight_count
+                .fetch_add(1, Ordering::Relaxed);
+            return self.cached_disk_headroom();
+        }
+
+        let has_cached_snapshot = self.disk_total_bytes.load(Ordering::Acquire) != 0;
+        let now_elapsed_ns = self.disk_headroom_elapsed_ns();
+        let last_elapsed_ns = self
+            .disk_headroom_last_refresh_elapsed_ns
+            .load(Ordering::Acquire);
+        if has_cached_snapshot
+            && now_elapsed_ns.saturating_sub(last_elapsed_ns) < DISK_HEADROOM_REFRESH_INTERVAL_NS
+        {
+            self.disk_headroom_refresh_skip_interval_count
+                .fetch_add(1, Ordering::Relaxed);
+            return self.cached_disk_headroom();
+        }
+        if self
+            .disk_headroom_refresh_in_progress
+            .swap(true, Ordering::AcqRel)
+        {
+            self.disk_headroom_refresh_skip_inflight_count
+                .fetch_add(1, Ordering::Relaxed);
+            return self.cached_disk_headroom();
+        }
+        let refreshed = self.refresh_disk_headroom_snapshot();
+        self.disk_headroom_refresh_in_progress
+            .store(false, Ordering::Release);
+        refreshed
     }
 
     fn drop_corrupt_entry_if_still_current(
@@ -1564,6 +1708,29 @@ impl BlockStore {
     fn mapped_len_for_test(&self) -> u64 {
         self.mmap_reader.mapped_len_for_test()
     }
+
+    #[cfg(test)]
+    fn cached_file_len_for_test(&self) -> u64 {
+        self.file_len.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn set_cached_disk_headroom_for_test(&self, free: u64, total: u64) {
+        self.disk_free_bytes.store(free, Ordering::Release);
+        self.disk_total_bytes.store(total, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn set_disk_headroom_last_refresh_to_now_for_test(&self) {
+        self.disk_headroom_last_refresh_elapsed_ns
+            .store(self.disk_headroom_elapsed_ns(), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn set_disk_headroom_refresh_in_progress_for_test(&self, in_progress: bool) {
+        self.disk_headroom_refresh_in_progress
+            .store(in_progress, Ordering::Release);
+    }
 }
 
 impl Drop for BlockStore {
@@ -1627,6 +1794,102 @@ mod tests {
         assert_eq!(&got[..], data);
         assert_eq!(store.hit_count(), 1);
         assert_eq!(store.miss_count(), 0);
+    }
+
+    #[test]
+    fn file_len_cache_tracks_growth() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+
+        let initial_len = store.cached_file_len_for_test();
+        store.put(1, &vec![0xAB; PAGE_SIZE as usize], true).unwrap();
+
+        let cached_len = store.cached_file_len_for_test();
+        let actual_len = std::fs::metadata(store.data_path()).unwrap().len();
+
+        assert!(cached_len >= initial_len);
+        assert_eq!(cached_len, actual_len);
+    }
+
+    #[test]
+    fn disk_headroom_refresh_interval_uses_cached_value() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+        store.set_cached_disk_headroom_for_test(123, 456);
+        store.set_disk_headroom_last_refresh_to_now_for_test();
+
+        let attempts_before = store.disk_headroom_refresh_attempt_count();
+        let skipped_before = store.disk_headroom_refresh_skip_interval_count();
+        let saved_before = store.disk_headroom_refresh_saved_syscall_count();
+
+        let got = store.refresh_disk_headroom_if_needed();
+        assert_eq!(got, Some((123, 456)));
+        assert_eq!(store.disk_headroom_refresh_attempt_count(), attempts_before);
+        assert_eq!(
+            store.disk_headroom_refresh_skip_interval_count(),
+            skipped_before + 1
+        );
+        assert_eq!(
+            store.disk_headroom_refresh_saved_syscall_count(),
+            saved_before + 1
+        );
+    }
+
+    #[test]
+    fn disk_headroom_refresh_inflight_uses_cached_value() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+        store.set_cached_disk_headroom_for_test(111, 999);
+        // Backdate last refresh marker so this call would refresh unless
+        // blocked by the in-progress guard.
+        let now = store.disk_headroom_elapsed_ns();
+        let backdated =
+            now.saturating_sub(DISK_HEADROOM_REFRESH_INTERVAL_NS.saturating_add(1_000_000));
+        store
+            .disk_headroom_last_refresh_elapsed_ns
+            .store(backdated, Ordering::Release);
+        store.set_disk_headroom_refresh_in_progress_for_test(true);
+
+        let attempts_before = store.disk_headroom_refresh_attempt_count();
+        let skipped_before = store.disk_headroom_refresh_skip_inflight_count();
+        let saved_before = store.disk_headroom_refresh_saved_syscall_count();
+
+        let got = store.refresh_disk_headroom_if_needed();
+        assert_eq!(got, Some((111, 999)));
+        assert_eq!(store.disk_headroom_refresh_attempt_count(), attempts_before);
+        assert_eq!(
+            store.disk_headroom_refresh_skip_inflight_count(),
+            skipped_before + 1
+        );
+        assert_eq!(
+            store.disk_headroom_refresh_saved_syscall_count(),
+            saved_before + 1
+        );
+
+        // Cleanup marker so this fixture stays isolated for future calls.
+        store.set_disk_headroom_refresh_in_progress_for_test(false);
+    }
+
+    #[test]
+    fn disk_headroom_refresh_without_cache_bypasses_interval_skip() {
+        let dir = TempDir::new().unwrap();
+        let store = BlockStore::open(test_config(&dir)).unwrap();
+        store.set_disk_headroom_last_refresh_to_now_for_test();
+        store.set_cached_disk_headroom_for_test(0, 0);
+
+        let attempts_before = store.disk_headroom_refresh_attempt_count();
+        let skipped_before = store.disk_headroom_refresh_skip_interval_count();
+
+        let _ = store.refresh_disk_headroom_if_needed();
+
+        assert_eq!(
+            store.disk_headroom_refresh_attempt_count(),
+            attempts_before + 1
+        );
+        assert_eq!(
+            store.disk_headroom_refresh_skip_interval_count(),
+            skipped_before
+        );
     }
 
     #[test]

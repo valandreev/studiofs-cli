@@ -121,6 +121,12 @@ Implementation notes:
 - Windows keeps the same best-effort contract for advisory/storage hints by
   treating common unsupported or denied Win32 responses as benign rather than
   surfacing them as cache read/write failures.
+- emergency disk-headroom checks use a short refresh interval cache rather than
+  issuing `get_free_disk_space()` on every `put`; concurrent refreshes are
+  guarded so only one thread performs the syscall while others reuse cached
+  values.
+- physical `blocks.data` length is tracked in-memory and updated after
+  successful growth, avoiding per-allocation metadata length syscalls.
 
 Error variants include `CacheFull { needed, max_size, allocated, free }` for
 fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
@@ -379,6 +385,12 @@ benchmarks:
   `min_bytes`, `max_bytes`)
 - backpressure metrics (`write_backpressure_wait_ms`, `write_backpressure_events`)
 - transit-memory budget snapshot (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, foreground/background waiter counts)
+- disk-headroom refresh metrics (`disk_headroom_refresh_attempt_count`,
+  `disk_headroom_refresh_success_count`,
+  `disk_headroom_refresh_error_count`,
+  `disk_headroom_refresh_skip_interval_count`,
+  `disk_headroom_refresh_skip_inflight_count`,
+  `disk_headroom_refresh_saved_syscall_count`)
 - blocking-task pressure metrics for cache hot paths:
   - active blocking tasks (`active`, `active_peak`)
   - lifecycle counters (`submitted`, `started`, `completed`)
