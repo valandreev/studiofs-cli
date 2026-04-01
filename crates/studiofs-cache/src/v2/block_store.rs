@@ -11,12 +11,22 @@
 //! | [`BlockIndex`] (map + LRU + counters) | `Mutex<BlockIndex>` |
 //! | Metadata WAL appender | `Mutex<WalAppender>` |
 //! | [`FreeList`] (allocator) | `Mutex<FreeList>` |
+//! | Physical file extension (`set_len`) | `Mutex<()>` (`file_growth`) |
 //! | Hit / miss counters | `AtomicU64` |
 //!
 //! The allocator lock is never held at the same time as the index lock.
 //! Some metadata mutations briefly hold the index and WAL locks together,
 //! but there is no reverse `wal -> index -> allocator` path.  That lock
 //! ordering prevents deadlocks while keeping WAL appends serialized.
+//!
+//! The `file_growth` lock is always acquired **after** the allocator lock has
+//! been released.  It serialises `set_len` calls so that a logical `file_end`
+//! advance from one thread's allocation is made physically visible before any
+//! allocated offset in the new range is returned to a caller.  Holding the
+//! allocator lock across the (potentially slow) `set_len` syscall is therefore
+//! no longer necessary, which eliminates the Windows zero-fill stall that
+//! previously blocked all concurrent allocations for up to hundreds of
+//! milliseconds per 256 MiB growth event.
 //!
 //! ## Eviction
 //!
@@ -140,6 +150,12 @@ pub struct BlockStore {
     wal: Mutex<WalAppender>,
     /// Best-fit free-space allocator for `blocks.data`.
     allocator: Mutex<FreeList>,
+    /// Serialises physical file extension (`set_len`) so that a logical
+    /// `file_end` advance that was recorded under the allocator lock is made
+    /// durable before any offset in the newly-grown region is returned to a
+    /// caller.  Always acquired *after* the allocator lock has been released;
+    /// never acquired while the allocator lock is held.
+    file_growth: Mutex<()>,
     /// Total cache hits since open.
     hit_count: AtomicU64,
     /// Total cache misses since open.
@@ -243,6 +259,10 @@ impl BlockStore {
 
         let (file, file_len) = if data_path.exists() {
             let file = OpenOptions::new().read(true).write(true).open(&data_path)?;
+            // Re-apply the sparse attribute each open; NTFS preserves it, but
+            // calling it again is idempotent and ensures existing non-sparse
+            // files benefit from the optimisation after an upgrade.
+            platform::make_sparse(&file)?;
             let len = file.metadata()?.len();
 
             if len < SUPERBLOCK_SIZE {
@@ -294,6 +314,11 @@ impl BlockStore {
                 .write(true)
                 .create_new(true)
                 .open(&data_path)?;
+
+            // Enable the sparse-file attribute before the first set_len so
+            // that future file-extension calls are not stalled by synchronous
+            // NTFS zero-fill (Windows only; no-op on other platforms).
+            platform::make_sparse(&file)?;
 
             let sb = Superblock::new(config.max_size, config.volume_uuid);
             platform::pwrite(&file, &sb.to_bytes(), 0)?;
@@ -349,6 +374,7 @@ impl BlockStore {
             index: Mutex::new(BlockIndex::from_persisted_entries(&recovered_entries)),
             wal: Mutex::new(WalAppender::open(&cache_dir, reset_wal)?),
             allocator: Mutex::new(allocator),
+            file_growth: Mutex::new(()),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
             eviction_count: AtomicU64::new(0),
@@ -1222,34 +1248,58 @@ impl BlockStore {
     /// Returns `Ok(Some(offset))` on success, `Ok(None)` when the free list
     /// cannot satisfy the request without eviction.
     fn try_allocate_and_extend(&self, alloc: u64) -> Result<Option<u64>, BlockStoreError> {
-        let mut a = self.allocator.lock();
-        let offset = match a.allocate(alloc) {
-            Ok(off) => off,
-            Err(_) => return Ok(None),
-        };
-        // Extend the physical file while still holding the allocator lock so
-        // that a concurrent free+allocate in another thread cannot race with
-        // set_len.
-        let needed_len = a.file_end();
+        // Phase 1 — logical allocation (fast, in-memory only).
+        //
+        // Acquire the allocator lock only long enough to advance the
+        // in-memory free list and record the new logical `file_end`.  We
+        // deliberately release the lock *before* calling `set_len` so that
+        // concurrent allocations from existing free space can proceed while
+        // one thread performs the (potentially slow) physical file extension.
+        let (offset, needed_len) = {
+            let mut a = self.allocator.lock();
+            let offset = match a.allocate(alloc) {
+                Ok(off) => off,
+                Err(_) => return Ok(None),
+            };
+            let needed_len = a.file_end();
+            (offset, needed_len)
+        }; // allocator lock released
+
+        // Phase 2 — physical file extension (may be slow on Windows without
+        // sparse support due to synchronous NTFS zero-fill).
+        //
+        // The `file_growth` lock serialises concurrent extension attempts so
+        // that the physical file always covers the logical `file_end` before
+        // any offset in the newly-grown region is returned to a caller.  Only
+        // one thread performs the actual `set_len`; the rest re-check after
+        // acquiring the lock and skip if the file already reaches `needed_len`.
         let current_len = self.file_len.load(Ordering::Acquire);
         if needed_len > current_len {
-            if let Err(error) =
-                platform::preallocate(&self.file, current_len, needed_len - current_len)
-            {
-                warn!(
-                    current_len,
-                    needed_len,
-                    error = ?error,
-                    "best-effort data-file preallocation failed",
-                );
+            let _growth_guard = self.file_growth.lock();
+            // Re-check: another thread may have extended the file while we
+            // were waiting for the growth lock.
+            let current_len = self.file_len.load(Ordering::Acquire);
+            if needed_len > current_len {
+                if let Err(error) =
+                    platform::preallocate(&self.file, current_len, needed_len - current_len)
+                {
+                    warn!(
+                        current_len,
+                        needed_len,
+                        error = ?error,
+                        "best-effort data-file preallocation failed",
+                    );
+                }
+                if let Err(error) = self.file.set_len(needed_len) {
+                    // Growth failed: free the allocation we recorded in Phase 1
+                    // so the allocator stays consistent with the physical file.
+                    drop(_growth_guard);
+                    let mut a = self.allocator.lock();
+                    a.free(offset, alloc);
+                    return Err(error.into());
+                }
+                self.file_len.store(needed_len, Ordering::Release);
             }
-            if let Err(error) = self.file.set_len(needed_len) {
-                // Keep allocator state consistent with on-disk file length on
-                // growth failures (e.g. ENOSPC).
-                a.free(offset, alloc);
-                return Err(error.into());
-            }
-            self.file_len.store(needed_len, Ordering::Release);
         }
         Ok(Some(offset))
     }
@@ -1767,6 +1817,13 @@ mod tests {
         }
     }
 
+    fn reopen_store_with_read_only_data_file(store: &mut BlockStore) {
+        let data_path = store.data_path();
+        store.file = OpenOptions::new().read(true).open(&data_path).unwrap();
+        let file_len = store.file.metadata().unwrap().len();
+        store.mmap_reader = MmapReader::new(&store.file, file_len).unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Baseline correctness
     // -----------------------------------------------------------------------
@@ -1809,6 +1866,26 @@ mod tests {
 
         assert!(cached_len >= initial_len);
         assert_eq!(cached_len, actual_len);
+    }
+
+    #[test]
+    fn try_allocate_and_extend_rolls_back_on_set_len_failure() {
+        let dir = TempDir::new().unwrap();
+        let mut store = BlockStore::open(test_config(&dir)).unwrap();
+        reopen_store_with_read_only_data_file(&mut store);
+
+        let file_len_before = store.file_len.load(Ordering::Acquire);
+        let file_end_before = store.allocator.lock().file_end();
+        let allocated_before = store.allocator.lock().allocated_bytes();
+
+        let result = store.try_allocate_and_extend(PAGE_SIZE);
+
+        assert!(matches!(result, Err(BlockStoreError::Io(_))));
+        assert_eq!(store.file_len.load(Ordering::Acquire), file_len_before);
+
+        let allocator = store.allocator.lock();
+        assert_eq!(allocator.file_end(), file_end_before);
+        assert_eq!(allocator.allocated_bytes(), allocated_before);
     }
 
     #[test]
