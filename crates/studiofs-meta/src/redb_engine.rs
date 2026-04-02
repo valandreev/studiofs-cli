@@ -6,7 +6,7 @@ use crate::engine::*;
 use crate::types::*;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,6 +46,17 @@ const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("f
 /// Remote-visible committed file blocks: (ino, block_index) -> BlockRef.
 const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("committed_file_blocks");
+
+/// Local overlay regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
+const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("regular_file_overlay");
+
+/// Remote-visible base regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
+const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("regular_file_base");
+
+type RegularFileChunkSignature = Vec<(SliceId, SliceOrder, SliceRange, Option<BlockRef>)>;
+type RegularFileGraphSignature = BTreeMap<ChunkId, RegularFileChunkSignature>;
 
 /// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)
 const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
@@ -106,6 +117,10 @@ pub struct RedbSnapshot {
     pub dentries: Vec<(Vec<u8>, Vec<u8>)>,
     pub file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
     pub committed_file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
+    #[serde(default)]
+    pub regular_file_overlay: Vec<(u64, Vec<u8>)>,
+    #[serde(default)]
+    pub regular_file_base: Vec<(u64, Vec<u8>)>,
     pub pending_deletions: Vec<(u64, i64)>,
     pub symlinks: Vec<(u64, Vec<u8>)>,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
@@ -153,6 +168,26 @@ fn decode_file_block_key(key: &[u8]) -> (Ino, u32) {
 
 /// The prefix for scanning all blocks of an inode.
 fn file_block_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
+/// Encode a regular-file chunk key: ino (8 bytes LE) + chunk_id (8 bytes LE).
+fn encode_regular_file_chunk_key(ino: Ino, chunk_id: ChunkId) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&ino.to_le_bytes());
+    buf[8..16].copy_from_slice(&chunk_id.0.to_le_bytes());
+    buf
+}
+
+/// Decode a regular-file chunk key back to (ino, chunk_id).
+fn decode_regular_file_chunk_key(key: &[u8]) -> (Ino, ChunkId) {
+    let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
+    let chunk_id = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    (ino, ChunkId(chunk_id))
+}
+
+/// The prefix for scanning all chunk rows of an inode.
+fn regular_file_chunk_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
 
@@ -387,6 +422,8 @@ impl RedbMetaEngine {
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
             let _ = txn.open_table(FILE_BLOCKS_TABLE);
             let _ = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE);
+            let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
+            let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
             let _ = txn.open_table(PENDING_CREATES_TABLE);
             let _ = txn.open_table(DEFERRED_DELETES_TABLE);
@@ -600,7 +637,157 @@ impl RedbMetaEngine {
             }
         }
 
+        let regular_overlay =
+            Self::regular_file_chunk_states_from_txn(txn, REGULAR_FILE_OVERLAY_TABLE)?;
+        let regular_base = Self::regular_file_chunk_states_from_txn(txn, REGULAR_FILE_BASE_TABLE)?;
+        for (ino, overlay_chunks) in regular_overlay {
+            let overlay_signature = Self::regular_file_graph_signature(&overlay_chunks);
+            if overlay_signature.is_empty() {
+                continue;
+            }
+            let base_signature = regular_base
+                .get(&ino)
+                .map(Self::regular_file_graph_signature)
+                .unwrap_or_default();
+            if overlay_signature != base_signature {
+                overlay.insert(ino);
+            }
+        }
+
         Ok(overlay)
+    }
+
+    fn regular_file_chunk_states_from_txn(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+    ) -> MetaResult<BTreeMap<Ino, BTreeMap<ChunkId, RegularFileChunkState>>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut states: BTreeMap<Ino, BTreeMap<ChunkId, RegularFileChunkState>> = BTreeMap::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            let chunk_state: RegularFileChunkState = decode(value.value())?;
+            states.entry(ino).or_default().insert(chunk_id, chunk_state);
+        }
+        Ok(states)
+    }
+
+    /// Build a data-only signature for a regular-file chunk graph.
+    ///
+    /// Internal counters and slice lifecycle fields are intentionally ignored so
+    /// callers can detect real overlay data divergence without flagging pure
+    /// bookkeeping changes.
+    fn regular_file_graph_signature(
+        chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
+    ) -> RegularFileGraphSignature {
+        let mut signature = BTreeMap::new();
+        for (chunk_id, chunk) in chunks {
+            if chunk.slices.is_empty() {
+                continue;
+            }
+            let mut chunk_signature = Vec::with_capacity(chunk.slices.len());
+            for slice in chunk.slices.values() {
+                chunk_signature.push((
+                    slice.slice_id,
+                    slice.order,
+                    slice.range,
+                    slice.block.clone(),
+                ));
+            }
+            signature.insert(*chunk_id, chunk_signature);
+        }
+        signature
+    }
+
+    fn clear_table_in_txn<K, V>(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<K, V>,
+    ) -> MetaResult<()>
+    where
+        K: redb::Key + 'static,
+        V: redb::Value + 'static,
+    {
+        let mut table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .retain(|_, _| false)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn regular_file_snapshot_rows_from_txn<TState, F>(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        wrap_state: F,
+    ) -> MetaResult<Vec<(u64, Vec<u8>)>>
+    where
+        TState: serde::Serialize,
+        F: Fn(BTreeMap<ChunkId, RegularFileChunkState>) -> TState,
+    {
+        let states = Self::regular_file_chunk_states_from_txn(txn, table_def)?;
+        let mut snapshot_rows = Vec::with_capacity(states.len());
+        for (ino, chunks) in states {
+            let state = wrap_state(chunks);
+            snapshot_rows.push((ino, encode(&state)?));
+        }
+        Ok(snapshot_rows)
+    }
+
+    fn clear_regular_file_chunk_rows_in_txn(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = regular_file_chunk_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        table
+            .retain_in(prefix.as_ref()..range_end.as_ref(), |_, _| false)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn clear_regular_file_graph_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
+        Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
+        Ok(())
+    }
+
+    fn replace_regular_file_chunk_rows_from_snapshot_rows<F>(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        snapshot_rows: &[(u64, Vec<u8>)],
+        parse_chunks: F,
+    ) -> MetaResult<()>
+    where
+        F: Fn(&[u8]) -> MetaResult<BTreeMap<ChunkId, RegularFileChunkState>>,
+    {
+        let mut table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .retain(|_, _| false)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for (ino, bytes) in snapshot_rows {
+            let chunks = parse_chunks(bytes)?;
+            for (chunk_id, chunk_state) in chunks {
+                let key = encode_regular_file_chunk_key(*ino, chunk_id);
+                let encoded = encode(&chunk_state)?;
+                table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn local_overlay_attr_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
@@ -1525,6 +1712,8 @@ impl RedbMetaEngine {
             Self::remove_xattr_overlay_in_txn(txn, ino, &name)?;
         }
 
+        Self::clear_regular_file_graph_in_txn(txn, ino)?;
+
         let base_keys = {
             let txn_read = txn
                 .open_table(BASE_XATTRS_TABLE)
@@ -1616,9 +1805,14 @@ impl RedbMetaEngine {
     }
 
     fn compute_committed_size_in_txn(
+        txn: &redb::WriteTransaction,
         committed: &redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
     ) -> MetaResult<u64> {
+        if let Some(size) = Self::regular_file_committed_size_in_txn(txn, ino)? {
+            return Ok(size);
+        }
+
         let prefix = file_block_prefix(ino);
         let mut range_end = prefix.to_vec();
         *range_end.last_mut().unwrap() += 1;
@@ -1641,6 +1835,40 @@ impl RedbMetaEngine {
             }
         }
         Ok(size)
+    }
+
+    fn regular_file_committed_size_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<u64>> {
+        let table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = regular_file_chunk_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let mut size = 0u64;
+        let mut saw_row = false;
+        for row in table
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            if decoded_ino != ino {
+                break;
+            }
+            saw_row = true;
+            let chunk: RegularFileChunkState = decode(value.value())?;
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            for slice in chunk.slices.values() {
+                if slice.block.is_some() {
+                    let slice_end = chunk_start.saturating_add(slice.range.end as u64);
+                    size = size.max(slice_end);
+                }
+            }
+        }
+        Ok(saw_row.then_some(size))
     }
 
     fn committed_manifest_in_txn(
@@ -1824,6 +2052,20 @@ impl RedbMetaEngine {
             }
         }
         {
+            snapshot.regular_file_overlay = Self::regular_file_snapshot_rows_from_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                |chunks| RegularFileOverlayState { chunks },
+            )?;
+        }
+        {
+            snapshot.regular_file_base = Self::regular_file_snapshot_rows_from_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                |chunks| RegularFileBaseState { chunks },
+            )?;
+        }
+        {
             let table = txn
                 .open_table(PENDING_DELETIONS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1976,16 +2218,31 @@ impl RedbMetaEngine {
         }
         snapshot.inodes = projected_inodes;
 
-        let committed_used_space =
-            snapshot
-                .committed_file_blocks
-                .iter()
-                .try_fold(0_u64, |acc, (_, bytes)| {
-                    let block: BlockRef = decode(bytes)?;
-                    Ok::<u64, MetaError>(acc.saturating_add(block.length as u64))
-                })?;
+        let mut referenced_objects = BTreeMap::new();
+        for (_, bytes) in &snapshot.committed_file_blocks {
+            let block: BlockRef = decode(bytes)?;
+            referenced_objects
+                .entry(block.object_id)
+                .or_insert(block.length as u64);
+        }
+        for (_, bytes) in &snapshot.regular_file_base {
+            let regular: RegularFileBaseState = decode(bytes)?;
+            for chunk in regular.chunks.values() {
+                for slice in chunk.slices.values() {
+                    if let Some(block) = slice.block.as_ref() {
+                        referenced_objects
+                            .entry(block.object_id)
+                            .or_insert(block.length as u64);
+                    }
+                }
+            }
+        }
+        let committed_used_space = referenced_objects
+            .values()
+            .fold(0_u64, |acc, len| acc.saturating_add(*len));
 
         snapshot.file_blocks = snapshot.committed_file_blocks.clone();
+        snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
         snapshot.event_log.clear();
         snapshot
             .counters
@@ -2237,6 +2494,13 @@ impl RedbMetaEngine {
                 .next()
                 .is_some()
             || txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some()
+            || txn
                 .open_table(BASE_SYMLINKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?
                 .iter()
@@ -2280,14 +2544,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(SETTINGS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<String> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_str());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.settings {
                 table
                     .insert(k.as_str(), v.as_slice())
@@ -2298,14 +2557,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<String> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_str());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.counters {
                 table
                     .insert(k.as_str(), *v)
@@ -2316,14 +2570,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.inodes {
                 table
                     .insert(*k, v.as_slice())
@@ -2334,14 +2583,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(BASE_INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.inodes {
                 table
                     .insert(*k, v.as_slice())
@@ -2349,30 +2593,15 @@ impl RedbMetaEngine {
             }
         }
         {
-            let mut table = txn
-                .open_table(INODE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            Self::clear_table_in_txn(&txn, INODE_TOMBSTONES_TABLE)?;
         }
         {
             let mut table = txn
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.dentries {
                 table
                     .insert(k.as_slice(), v.as_slice())
@@ -2380,30 +2609,15 @@ impl RedbMetaEngine {
             }
         }
         {
-            let mut table = txn
-                .open_table(DENTRY_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
         }
         {
             let mut table = txn
                 .open_table(BASE_DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.dentries {
                 table
                     .insert(k.as_slice(), v.as_slice())
@@ -2414,14 +2628,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.file_blocks {
                 table
                     .insert(k.as_slice(), v.as_slice())
@@ -2432,14 +2641,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.committed_file_blocks {
                 table
                     .insert(k.as_slice(), v.as_slice())
@@ -2447,17 +2651,34 @@ impl RedbMetaEngine {
             }
         }
         {
+            Self::replace_regular_file_chunk_rows_from_snapshot_rows(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                &snapshot.regular_file_overlay,
+                |bytes| {
+                    let state: RegularFileOverlayState = decode(bytes)?;
+                    Ok(state.chunks)
+                },
+            )?;
+        }
+        {
+            Self::replace_regular_file_chunk_rows_from_snapshot_rows(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                &snapshot.regular_file_base,
+                |bytes| {
+                    let state: RegularFileBaseState = decode(bytes)?;
+                    Ok(state.chunks)
+                },
+            )?;
+        }
+        {
             let mut table = txn
                 .open_table(PENDING_DELETIONS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.pending_deletions {
                 table
                     .insert(*k, *v)
@@ -2465,30 +2686,15 @@ impl RedbMetaEngine {
             }
         }
         {
-            let mut table = txn
-                .open_table(SYMLINKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            Self::clear_table_in_txn(&txn, SYMLINKS_TABLE)?;
         }
         {
             let mut table = txn
                 .open_table(BASE_SYMLINKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.symlinks {
                 table
                     .insert(*k, v.as_slice())
@@ -2496,43 +2702,18 @@ impl RedbMetaEngine {
             }
         }
         {
-            let mut table = txn
-                .open_table(SYMLINK_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            Self::clear_table_in_txn(&txn, SYMLINK_TOMBSTONES_TABLE)?;
         }
         {
-            let mut table = txn
-                .open_table(XATTRS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            Self::clear_table_in_txn(&txn, XATTRS_TABLE)?;
         }
         {
             let mut table = txn
                 .open_table(BASE_XATTRS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.xattrs {
                 let name = xattr_name_from_key(k.as_slice());
                 let stored = encode_xattr_value_for_storage(name, v.as_slice());
@@ -2542,43 +2723,18 @@ impl RedbMetaEngine {
             }
         }
         {
-            let mut table = txn
-                .open_table(XATTR_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            Self::clear_table_in_txn(&txn, XATTR_TOMBSTONES_TABLE)?;
         }
         {
-            let mut table = txn
-                .open_table(ACL_RULES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            Self::clear_table_in_txn(&txn, ACL_RULES_TABLE)?;
         }
         {
             let mut table = txn
                 .open_table(BASE_ACL_RULES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.acl_rules {
                 table
                     .insert(k.as_slice(), *v)
@@ -2586,30 +2742,15 @@ impl RedbMetaEngine {
             }
         }
         {
-            let mut table = txn
-                .open_table(ACL_RULE_TOMBSTONES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_slice());
-            }
+            Self::clear_table_in_txn(&txn, ACL_RULE_TOMBSTONES_TABLE)?;
         }
         {
             let mut table = txn
                 .open_table(EVENT_LOG_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<u64> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key);
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.event_log {
                 table
                     .insert(*k, v.as_slice())
@@ -2620,14 +2761,9 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(SNAPSHOTS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let keys: Vec<String> = table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            for key in keys {
-                let _ = table.remove(key.as_str());
-            }
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.snapshots {
                 table
                     .insert(k.as_str(), v.as_slice())
@@ -3403,11 +3539,13 @@ impl MetaFsOps for RedbMetaEngine {
             displaced_ino = if let Some(dst_entry) = dst_entry_opt.clone() {
                 if dst_entry.kind == FileType::Directory {
                     Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
+                    Self::clear_inode_overlay_aux_in_txn(&txn, dst_entry.ino)?;
                 } else {
                     if let Some(mut attr) = displaced_attr_seed.clone() {
                         attr.nlink = attr.nlink.saturating_sub(1);
                         if attr.nlink == 0 {
                             Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
+                            Self::clear_inode_overlay_aux_in_txn(&txn, dst_entry.ino)?;
                             displaced_attr_event =
                                 Some(crate::events::MetaEvent::RemoveAttr { ino: dst_entry.ino });
                         } else {
@@ -5122,7 +5260,8 @@ impl MetaBlocks for RedbMetaEngine {
                 removed_id = Some(block.object_id);
                 let _ = committed.remove(key.as_slice());
 
-                let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
+                let new_committed_size =
+                    Self::compute_committed_size_in_txn(&txn, &committed, ino)?;
                 drop(committed);
                 let mut inodes = txn
                     .open_table(INODES_TABLE)
@@ -5285,7 +5424,7 @@ impl MetaBlocks for RedbMetaEngine {
                 .insert(key.as_slice(), data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            let new_committed_size = Self::compute_committed_size_in_txn(&committed, ino)?;
+            let new_committed_size = Self::compute_committed_size_in_txn(&txn, &committed, ino)?;
             drop(committed);
 
             let previous_committed_size = attr.committed_size;
@@ -7811,6 +7950,324 @@ mod tests {
         assert!(refs.contains(&21));
         assert!(refs.contains(&22));
         assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"graph.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let mut overlay_slices = BTreeMap::new();
+        overlay_slices.insert(
+            SliceId(1),
+            SliceRecord::new(
+                SliceId(1),
+                SliceOrder(1),
+                SliceRange::new(0, 4096).expect("valid overlay slice"),
+                BlockRef::new_partial(301, 4096),
+            ),
+        );
+        let overlay_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(2),
+            next_slice_order: SliceOrder(2),
+            slices: overlay_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
+
+        let mut overlay_state = RegularFileOverlayState::default();
+        overlay_state
+            .chunks
+            .insert(ChunkId(11), overlay_chunk.clone());
+
+        let mut base_slices = BTreeMap::new();
+        base_slices.insert(
+            SliceId(3),
+            SliceRecord::new(
+                SliceId(3),
+                SliceOrder(3),
+                SliceRange::new(0, 4096).expect("valid base slice"),
+                BlockRef::new_partial(401, 4096),
+            ),
+        );
+        let base_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(4),
+            next_slice_order: SliceOrder(4),
+            slices: base_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
+
+        let mut base_state = RegularFileBaseState::default();
+        base_state.chunks.insert(ChunkId(11), base_chunk.clone());
+
+        let legacy_block = BlockRef::new_partial(901, 1024);
+        let legacy_bytes = encode(&legacy_block).expect("encode legacy block");
+        let legacy_key = encode_file_block_key(ino, 0);
+        let overlay_bytes = encode(&overlay_chunk).expect("encode overlay chunk");
+        let base_bytes = encode(&base_chunk).expect("encode base chunk");
+        let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(11));
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut committed_table = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE).unwrap();
+            committed_table
+                .insert(legacy_key.as_slice(), legacy_bytes.as_slice())
+                .unwrap();
+
+            let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            overlay_table
+                .insert(chunk_key.as_slice(), overlay_bytes.as_slice())
+                .unwrap();
+
+            let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+            base_table
+                .insert(chunk_key.as_slice(), base_bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(engine.local_overlay_inodes().unwrap().contains(&ino));
+
+        let snapshot = engine.export_snapshot().unwrap();
+        assert_eq!(
+            snapshot.regular_file_overlay,
+            vec![(
+                ino,
+                encode(&overlay_state).expect("encode overlay snapshot")
+            )]
+        );
+        assert_eq!(
+            snapshot.regular_file_base,
+            vec![(ino, encode(&base_state).expect("encode base snapshot"))]
+        );
+        let imported = temp_engine();
+        imported.import_snapshot(&snapshot).unwrap();
+
+        let txn = imported.db.begin_read().unwrap();
+        let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let overlay_row = overlay_table
+            .get(chunk_key.as_slice())
+            .unwrap()
+            .expect("imported overlay row");
+        let imported_overlay: RegularFileChunkState =
+            decode(overlay_row.value()).expect("decode imported overlay");
+        assert_eq!(imported_overlay, overlay_chunk);
+
+        let base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+        let base_row = base_table
+            .get(chunk_key.as_slice())
+            .unwrap()
+            .expect("imported base row");
+        let imported_base: RegularFileChunkState =
+            decode(base_row.value()).expect("decode imported base");
+        assert_eq!(imported_base, base_chunk);
+
+        let remote_snapshot = engine.export_remote_snapshot().unwrap();
+        assert_eq!(
+            remote_snapshot.regular_file_overlay,
+            remote_snapshot.regular_file_base
+        );
+        assert_eq!(
+            remote_snapshot.regular_file_base,
+            snapshot.regular_file_base
+        );
+        let used_space = remote_snapshot
+            .counters
+            .iter()
+            .find(|(name, _)| name.as_str() == counters::USED_SPACE)
+            .map(|(_, value)| *value)
+            .expect("used space counter");
+        assert_eq!(used_space, 1024 + 4096);
+    }
+
+    #[test]
+    fn test_regular_file_overlay_detection_ignores_counter_only_changes() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"counter-only.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let mut overlay_slice = SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid overlay slice"),
+            BlockRef::new_partial(501, 4096),
+        );
+        overlay_slice.block_state = BlockRefState::Uploading;
+        let mut overlay_slices = BTreeMap::new();
+        overlay_slices.insert(overlay_slice.slice_id, overlay_slice);
+        let overlay_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(2),
+            next_slice_order: SliceOrder(2),
+            slices: overlay_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
+
+        let mut base_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(9),
+            next_slice_order: SliceOrder(9),
+            slices: overlay_chunk.slices.clone(),
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 0,
+                tombstone_slices: 1,
+                overlapping_slices: 2,
+                fragmented_bytes: 8192,
+            },
+        };
+        base_chunk
+            .slices
+            .get_mut(&SliceId(1))
+            .expect("base slice")
+            .block_state = BlockRefState::Published;
+
+        let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(11));
+        let overlay_bytes = encode(&overlay_chunk).expect("encode overlay chunk");
+        let base_bytes = encode(&base_chunk).expect("encode base chunk");
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            overlay_table
+                .insert(chunk_key.as_slice(), overlay_bytes.as_slice())
+                .unwrap();
+
+            let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+            base_table
+                .insert(chunk_key.as_slice(), base_bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(!engine.local_overlay_inodes().unwrap().contains(&ino));
+    }
+
+    #[test]
+    fn test_compute_committed_size_prefers_regular_file_base_rows() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"committed-size.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let mut chunk = RegularFileChunkState::default();
+        chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid committed slice"),
+            BlockRef::new_partial(601, 4096),
+        ));
+
+        let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(1));
+        let chunk_bytes = encode(&chunk).expect("encode committed chunk");
+        let legacy_key = encode_file_block_key(ino, 0);
+        let legacy_block = BlockRef::new_partial(701, 1024);
+        let legacy_bytes = encode(&legacy_block).expect("encode legacy block");
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            {
+                let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+                base_table
+                    .insert(chunk_key.as_slice(), chunk_bytes.as_slice())
+                    .unwrap();
+            }
+
+            let mut committed_table = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE).unwrap();
+            committed_table
+                .insert(legacy_key.as_slice(), legacy_bytes.as_slice())
+                .unwrap();
+            let committed_size =
+                RedbMetaEngine::compute_committed_size_in_txn(&txn, &committed_table, ino)
+                    .expect("compute committed size");
+            assert_eq!(
+                committed_size,
+                chunk_start_offset(ChunkId(1), DEFAULT_CHUNK_SIZE) + 4096
+            );
+        }
+    }
+
+    #[test]
+    fn test_redb_snapshot_defaults_missing_regular_file_fields() {
+        let snapshot_json = r#"{
+            "settings": [],
+            "counters": [],
+            "inodes": [],
+            "dentries": [],
+            "file_blocks": [],
+            "committed_file_blocks": [],
+            "pending_deletions": [],
+            "symlinks": [],
+            "xattrs": [],
+            "acl_rules": [],
+            "event_log": [],
+            "snapshots": []
+        }"#;
+        let snapshot: RedbSnapshot = serde_json::from_str(snapshot_json).unwrap();
+        assert!(snapshot.regular_file_overlay.is_empty());
+        assert!(snapshot.regular_file_base.is_empty());
+    }
+
+    #[test]
+    fn test_regular_file_graph_rows_removed_on_unlink() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"unlink-graph.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let mut chunk = RegularFileChunkState::default();
+        chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid slice"),
+            BlockRef::new_partial(777, 4096),
+        ));
+        let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(0));
+        let chunk_bytes = encode(&chunk).expect("encode chunk state");
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            overlay_table
+                .insert(chunk_key.as_slice(), chunk_bytes.as_slice())
+                .unwrap();
+
+            let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+            base_table
+                .insert(chunk_key.as_slice(), chunk_bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        engine.unlink(ROOT_INO, b"unlink-graph.bin").unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        assert!(overlay_table.get(chunk_key.as_slice()).unwrap().is_none());
+        let base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+        assert!(base_table.get(chunk_key.as_slice()).unwrap().is_none());
     }
 
     #[test]

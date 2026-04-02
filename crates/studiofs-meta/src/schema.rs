@@ -1,15 +1,15 @@
 //! StudioFS Metadata Types
 //!
-//! Core types for the virtual filesystem metadata.
+//! Core types for the virtual filesystem metadata and the chunk/slice/block model.
 //!
 //! Architecture Key Changes:
-//! - Files are split into fixed-size blocks (default 16MB)
-//! - Each block has a sequential ID (not content hash)
+//! - Regular files can be represented as chunk/slice/block graphs
 //! - Blocks are immutable - never modified, only created/deleted
-//! - No deduplication = no reference counting overhead
+//! - Local overlay and remote-visible base views are modeled explicitly
 //! - All metadata in redb, S3 stores only raw data blocks
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 // =============================================================================
@@ -18,8 +18,10 @@ use std::time::SystemTime;
 
 /// Default block size: 16 MiB (configurable at volume init).
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
+/// Default chunk size for the chunk/slice/block graph: 64 MiB.
+pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 /// Current on-disk metadata format version.
-pub const CURRENT_FORMAT_VERSION: u16 = 1;
+pub const CURRENT_FORMAT_VERSION: u16 = 2;
 
 /// Root inode number.
 pub const ROOT_INO: Ino = 1;
@@ -411,6 +413,243 @@ impl BlockRef {
 }
 
 // =============================================================================
+// Chunk / Slice Graph Types
+// =============================================================================
+
+/// Chunk identity within a regular file.
+///
+/// Chunks are fixed file-range partitions and are stable for a given format
+/// version.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct ChunkId(pub u64);
+
+/// Slice identity within a chunk.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct SliceId(pub u64);
+
+/// Ordering token used to resolve overlaps within a chunk.
+///
+/// Later accepted slices win within the same visibility tier.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct SliceOrder(pub u64);
+
+/// Chunk-relative byte range for one slice.
+///
+/// Ranges are half-open: `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl SliceRange {
+    /// Create a non-empty half-open slice range.
+    pub fn new(start: u32, end: u32) -> Option<Self> {
+        if start < end && end <= DEFAULT_CHUNK_SIZE {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    /// Return the covered length in bytes.
+    pub fn len(self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Returns `true` when the range does not cover any bytes.
+    pub fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    /// Returns `true` when `offset` falls inside the range.
+    pub fn contains(self, offset: u32) -> bool {
+        self.start <= offset && offset < self.end
+    }
+}
+
+/// Lifecycle state attached to a slice's block reference.
+///
+/// The separate state makes the upload/publication/recovery lifecycle explicit
+/// without changing the immutable block payload itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockRefState {
+    /// Accepted locally but not yet uploaded.
+    #[default]
+    LocalOnly,
+    /// Upload is in flight.
+    Uploading,
+    /// Payload has been uploaded and is awaiting publication.
+    Uploaded,
+    /// Slice is remote-visible.
+    Published,
+    /// State is being reconstructed after a crash or replay.
+    Recovering,
+}
+
+/// Per-chunk fragmentation counters and compaction hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ChunkFragmentationCounters {
+    /// Number of live data-bearing slices in the chunk.
+    #[serde(default)]
+    pub live_slices: u32,
+    /// Number of tombstones stored for the chunk.
+    #[serde(default)]
+    pub tombstone_slices: u32,
+    /// Number of overlapping slices that compaction may want to rewrite.
+    #[serde(default)]
+    pub overlapping_slices: u32,
+    /// Estimated fragmented bytes in the chunk.
+    #[serde(default)]
+    pub fragmented_bytes: u64,
+}
+
+/// One slice entry inside a chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceRecord {
+    /// Stable slice identity.
+    pub slice_id: SliceId,
+    /// Precedence order within the chunk.
+    pub order: SliceOrder,
+    /// Chunk-relative byte range for the slice.
+    pub range: SliceRange,
+    /// Block payload reference; `None` represents a tombstone.
+    #[serde(default)]
+    pub block: Option<BlockRef>,
+    /// Upload/publication/recovery lifecycle for the referenced block.
+    #[serde(default)]
+    pub block_state: BlockRefState,
+}
+
+impl SliceRecord {
+    /// Create a data-bearing slice record.
+    pub fn new(slice_id: SliceId, order: SliceOrder, range: SliceRange, block: BlockRef) -> Self {
+        Self {
+            slice_id,
+            order,
+            range,
+            block: Some(block),
+            block_state: BlockRefState::LocalOnly,
+        }
+    }
+
+    /// Create a tombstone slice record.
+    pub fn tombstone(slice_id: SliceId, order: SliceOrder, range: SliceRange) -> Self {
+        Self {
+            slice_id,
+            order,
+            range,
+            block: None,
+            block_state: BlockRefState::LocalOnly,
+        }
+    }
+
+    /// Returns `true` when this slice removes coverage instead of providing data.
+    pub fn is_tombstone(&self) -> bool {
+        self.block.is_none()
+    }
+}
+
+/// Chunk-local slice state for the local overlay view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RegularFileOverlayState {
+    /// Chunk graph keyed by chunk identity.
+    #[serde(default)]
+    pub chunks: BTreeMap<ChunkId, RegularFileChunkState>,
+}
+
+/// Chunk-local slice state for the remote-visible base view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RegularFileBaseState {
+    /// Chunk graph keyed by chunk identity.
+    #[serde(default)]
+    pub chunks: BTreeMap<ChunkId, RegularFileChunkState>,
+}
+
+/// Per-chunk slice state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RegularFileChunkState {
+    /// Next slice id to allocate for this chunk.
+    #[serde(default)]
+    pub next_slice_id: SliceId,
+    /// Next slice order to allocate for this chunk.
+    #[serde(default)]
+    pub next_slice_order: SliceOrder,
+    /// Slice records keyed by slice identity.
+    #[serde(default)]
+    pub slices: BTreeMap<SliceId, SliceRecord>,
+    /// Fragmentation counters and future compaction hooks.
+    #[serde(default)]
+    pub fragmentation: ChunkFragmentationCounters,
+}
+
+impl RegularFileChunkState {
+    /// Try to allocate the next slice id.
+    ///
+    /// Returns `None` if the counter would overflow.
+    pub fn try_alloc_slice_id(&mut self) -> Option<SliceId> {
+        let id = self.next_slice_id;
+        self.next_slice_id = SliceId(self.next_slice_id.0.checked_add(1)?);
+        Some(id)
+    }
+
+    /// Allocate the next slice id.
+    ///
+    /// Panics if the counter overflows. Prefer [`Self::try_alloc_slice_id`] when
+    /// the caller wants to handle exhaustion explicitly.
+    pub fn alloc_slice_id(&mut self) -> SliceId {
+        self.try_alloc_slice_id().expect("slice id overflow")
+    }
+
+    /// Try to allocate the next slice order.
+    ///
+    /// Returns `None` if the counter would overflow.
+    pub fn try_alloc_slice_order(&mut self) -> Option<SliceOrder> {
+        let order = self.next_slice_order;
+        self.next_slice_order = SliceOrder(self.next_slice_order.0.checked_add(1)?);
+        Some(order)
+    }
+
+    /// Allocate the next slice order.
+    ///
+    /// Panics if the counter overflows. Prefer
+    /// [`Self::try_alloc_slice_order`] when the caller wants to handle
+    /// exhaustion explicitly.
+    pub fn alloc_slice_order(&mut self) -> SliceOrder {
+        self.try_alloc_slice_order().expect("slice order overflow")
+    }
+
+    /// Insert a slice record, keyed by its slice id.
+    pub fn insert_slice(&mut self, slice: SliceRecord) -> Option<SliceRecord> {
+        self.slices.insert(slice.slice_id, slice)
+    }
+
+    /// Returns `true` when the chunk carries no slices.
+    pub fn is_empty(&self) -> bool {
+        self.slices.is_empty()
+    }
+}
+
+/// Full regular-file state with explicit overlay and base views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RegularFileState {
+    #[serde(default)]
+    pub overlay: RegularFileOverlayState,
+    #[serde(default)]
+    pub base: RegularFileBaseState,
+}
+
+// =============================================================================
 // Format Info
 // =============================================================================
 
@@ -598,6 +837,24 @@ pub fn offset_within_block(offset: u64, block_size: u32) -> u32 {
     (offset % block_size as u64) as u32
 }
 
+/// Calculate the chunk id for a given file offset.
+#[inline]
+pub fn chunk_id_from_offset(offset: u64, chunk_size: u32) -> ChunkId {
+    ChunkId(offset / chunk_size as u64)
+}
+
+/// Calculate the offset within a chunk for a given file offset.
+#[inline]
+pub fn offset_within_chunk(offset: u64, chunk_size: u32) -> u32 {
+    (offset % chunk_size as u64) as u32
+}
+
+/// Calculate the starting file offset for a chunk.
+#[inline]
+pub fn chunk_start_offset(chunk_id: ChunkId, chunk_size: u32) -> u64 {
+    chunk_id.0.saturating_mul(chunk_size as u64)
+}
+
 // =============================================================================
 // Directory Entries (with Name)
 // =============================================================================
@@ -693,6 +950,103 @@ mod tests {
         let partial_block = BlockRef::new_partial(124, 1000);
         assert!(partial_block.is_partial());
         assert!(!partial_block.is_compressed());
+    }
+
+    #[test]
+    fn test_chunk_and_slice_helpers() {
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+        let chunk = chunk_id_from_offset(chunk_size as u64 + 123, chunk_size);
+        assert_eq!(chunk.0, 1);
+        assert_eq!(
+            offset_within_chunk(chunk_size as u64 + 123, chunk_size),
+            123
+        );
+        assert_eq!(chunk_start_offset(chunk, chunk_size), chunk_size as u64);
+
+        let range = SliceRange::new(10, 42).expect("valid range");
+        assert_eq!(range.len(), 32);
+        assert!(range.contains(10));
+        assert!(range.contains(41));
+        assert!(!range.contains(42));
+        assert!(SliceRange::new(5, 5).is_none());
+        assert!(SliceRange::new(9, 3).is_none());
+        assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE).is_some());
+        assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE + 1).is_none());
+    }
+
+    #[test]
+    fn test_regular_file_chunk_state_allocators_detect_overflow() {
+        let mut chunk = RegularFileChunkState {
+            next_slice_id: SliceId(u64::MAX),
+            next_slice_order: SliceOrder(u64::MAX),
+            ..Default::default()
+        };
+
+        assert!(chunk.try_alloc_slice_id().is_none());
+        assert!(chunk.try_alloc_slice_order().is_none());
+    }
+
+    #[test]
+    fn test_regular_file_state_roundtrip() {
+        let block = BlockRef::new_partial(9001, 4096);
+        let slice = SliceRecord::new(
+            SliceId(7),
+            SliceOrder(3),
+            SliceRange::new(0, 4096).expect("valid slice"),
+            block.clone(),
+        );
+
+        let mut slices = BTreeMap::new();
+        slices.insert(slice.slice_id, slice);
+        let chunk = RegularFileChunkState {
+            next_slice_id: SliceId(8),
+            next_slice_order: SliceOrder(4),
+            slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
+
+        let mut overlay = RegularFileOverlayState::default();
+        overlay.chunks.insert(ChunkId(1), chunk.clone());
+
+        let mut base = RegularFileBaseState::default();
+        base.chunks.insert(ChunkId(1), chunk);
+
+        let state = RegularFileState { overlay, base };
+        let encoded = postcard::to_stdvec(&state).expect("encode regular file state");
+        let decoded: RegularFileState =
+            postcard::from_bytes(&encoded).expect("decode regular file state");
+
+        assert_eq!(decoded, state);
+        assert_eq!(
+            decoded
+                .overlay
+                .chunks
+                .get(&ChunkId(1))
+                .unwrap()
+                .slices
+                .len(),
+            1
+        );
+        assert_eq!(
+            decoded
+                .overlay
+                .chunks
+                .get(&ChunkId(1))
+                .unwrap()
+                .slices
+                .get(&SliceId(7))
+                .unwrap()
+                .block
+                .as_ref()
+                .unwrap()
+                .object_id,
+            9001
+        );
     }
 
     #[test]
