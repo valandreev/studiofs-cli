@@ -12,6 +12,8 @@ Core principles:
 - Runtime file visibility is split into local accepted state and remote-visible
   committed state.
 - Local `BlockStore` plus compatibility cache helpers hide most object-store latency.
+- The canonical chunk/slice/block vocabulary for follow-up work is frozen in
+  [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
 
 - `flush()` and `close()` must make accepted data readable locally without waiting for S3/upload/metadata.
 - Remote readers observe only coarse states: `uploading`, `updating`, `ready`.
