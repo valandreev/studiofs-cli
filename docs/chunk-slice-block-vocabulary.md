@@ -74,6 +74,19 @@ Precedence is strict and deterministic:
 
 This means the effective file view is always `overlay over base`.
 
+### Tombstone Representation
+
+A tombstone is a metadata-only slice record:
+
+- it carries a chunk-relative byte range
+- it has no payload block reference
+- it behaves as a deletion marker for that range
+- it is used to remove coverage before lower-precedence slices can apply
+
+For implementation purposes, a tombstone may be represented as a slice record
+with a `None`/absent block reference or an explicit tombstone kind, as long as
+the resolver can distinguish it from a normal data-bearing slice.
+
 ### Block Immutability Rules
 
 1. A block is written once and then never changed.

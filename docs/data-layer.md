@@ -2,6 +2,8 @@
 
 `studiofs-data` handles object I/O against S3-compatible storage and object encoding/decoding.
 
+> Warning: this document still uses legacy `logical block` / `fragment` wording for the current storage path. For the frozen redesign vocabulary, see [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
+
 ## Responsibilities
 
 - PUT/GET/DELETE/HEAD object operations via `opendal`.

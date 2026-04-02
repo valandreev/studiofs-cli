@@ -2,6 +2,8 @@
 
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
+> Warning: this document still uses legacy `logical block` / `fragment` wording for older runtime paths. For the frozen redesign vocabulary, see [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
+
 
 - `flush()`/`fsync()` and the local `WriteBuffer -> BlockStore -> sync_data() -> metadata`
   commit path guarantee immediate read-after-write for the same mounted client.
