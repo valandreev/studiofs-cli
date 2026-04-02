@@ -47,6 +47,14 @@ const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("f
 const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("committed_file_blocks");
 
+/// Local overlay regular-file chunk graphs: ino -> RegularFileOverlayState.
+const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("regular_file_overlay");
+
+/// Remote-visible base regular-file chunk graphs: ino -> RegularFileBaseState.
+const REGULAR_FILE_BASE_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("regular_file_base");
+
 /// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)
 const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
     TableDefinition::new("pending_deletions");
@@ -106,6 +114,8 @@ pub struct RedbSnapshot {
     pub dentries: Vec<(Vec<u8>, Vec<u8>)>,
     pub file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
     pub committed_file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
+    pub regular_file_overlay: Vec<(u64, Vec<u8>)>,
+    pub regular_file_base: Vec<(u64, Vec<u8>)>,
     pub pending_deletions: Vec<(u64, i64)>,
     pub symlinks: Vec<(u64, Vec<u8>)>,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
@@ -387,6 +397,8 @@ impl RedbMetaEngine {
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
             let _ = txn.open_table(FILE_BLOCKS_TABLE);
             let _ = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE);
+            let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
+            let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);
             let _ = txn.open_table(PENDING_DELETIONS_TABLE);
             let _ = txn.open_table(PENDING_CREATES_TABLE);
             let _ = txn.open_table(DEFERRED_DELETES_TABLE);
@@ -594,6 +606,29 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             match committed_value {
                 Some(committed_value) if committed_value.value() == value.value() => {}
+                _ => {
+                    overlay.insert(ino);
+                }
+            }
+        }
+
+        let regular_overlay = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let regular_base = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in regular_overlay
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, current_bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let ino = ino.value();
+            match regular_base
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_bytes) if base_bytes.value() == current_bytes.value() => {}
                 _ => {
                     overlay.insert(ino);
                 }
@@ -1825,6 +1860,34 @@ impl RedbMetaEngine {
         }
         {
             let table = txn
+                .open_table(REGULAR_FILE_OVERLAY_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .regular_file_overlay
+                    .push((k.value(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .regular_file_base
+                    .push((k.value(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
                 .open_table(PENDING_DELETIONS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for row in table
@@ -1976,16 +2039,34 @@ impl RedbMetaEngine {
         }
         snapshot.inodes = projected_inodes;
 
-        let committed_used_space =
+        let committed_used_space = if !snapshot.regular_file_base.is_empty() {
+            let mut seen_object_ids = HashSet::new();
+            let mut total = 0_u64;
+            for (_, bytes) in &snapshot.regular_file_base {
+                let regular: RegularFileBaseState = decode(bytes)?;
+                for chunk in regular.chunks.values() {
+                    for slice in chunk.slices.values() {
+                        if let Some(block) = slice.block.as_ref() {
+                            if seen_object_ids.insert(block.object_id) {
+                                total = total.saturating_add(block.length as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            total
+        } else {
             snapshot
                 .committed_file_blocks
                 .iter()
                 .try_fold(0_u64, |acc, (_, bytes)| {
                     let block: BlockRef = decode(bytes)?;
                     Ok::<u64, MetaError>(acc.saturating_add(block.length as u64))
-                })?;
+                })?
+        };
 
         snapshot.file_blocks = snapshot.committed_file_blocks.clone();
+        snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
         snapshot.event_log.clear();
         snapshot
             .counters
@@ -2237,6 +2318,13 @@ impl RedbMetaEngine {
                 .next()
                 .is_some()
             || txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some()
+            || txn
                 .open_table(BASE_SYMLINKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?
                 .iter()
@@ -2443,6 +2531,42 @@ impl RedbMetaEngine {
             for (k, v) in &snapshot.committed_file_blocks {
                 table
                     .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(REGULAR_FILE_OVERLAY_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key);
+            }
+            for (k, v) in &snapshot.regular_file_overlay {
+                table
+                    .insert(*k, v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in keys {
+                let _ = table.remove(key);
+            }
+            for (k, v) in &snapshot.regular_file_base {
+                table
+                    .insert(*k, v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
@@ -7811,6 +7935,91 @@ mod tests {
         assert!(refs.contains(&21));
         assert!(refs.contains(&22));
         assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"graph.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let mut overlay_chunk = RegularFileChunkState::default();
+        overlay_chunk.next_slice_id = SliceId(2);
+        overlay_chunk.next_slice_order = SliceOrder(2);
+        overlay_chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid overlay slice"),
+            BlockRef::new_partial(301, 4096),
+        ));
+        overlay_chunk.fragmentation.live_slices = 1;
+        overlay_chunk.fragmentation.fragmented_bytes = 4096;
+
+        let mut overlay_state = RegularFileOverlayState::default();
+        overlay_state.chunks.insert(ChunkId(11), overlay_chunk);
+
+        let mut base_chunk = RegularFileChunkState::default();
+        base_chunk.next_slice_id = SliceId(4);
+        base_chunk.next_slice_order = SliceOrder(4);
+        base_chunk.insert_slice(SliceRecord::new(
+            SliceId(3),
+            SliceOrder(3),
+            SliceRange::new(0, 4096).expect("valid base slice"),
+            BlockRef::new_partial(401, 4096),
+        ));
+        base_chunk.fragmentation.live_slices = 1;
+        base_chunk.fragmentation.fragmented_bytes = 4096;
+
+        let mut base_state = RegularFileBaseState::default();
+        base_state.chunks.insert(ChunkId(11), base_chunk);
+
+        let overlay_bytes = encode(&overlay_state).expect("encode overlay state");
+        let base_bytes = encode(&base_state).expect("encode base state");
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            overlay_table.insert(ino, overlay_bytes.as_slice()).unwrap();
+
+            let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+            base_table.insert(ino, base_bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(engine.local_overlay_inodes().unwrap().contains(&ino));
+
+        let snapshot = engine.export_snapshot().unwrap();
+        let imported = temp_engine();
+        imported.import_snapshot(&snapshot).unwrap();
+
+        let txn = imported.db.begin_read().unwrap();
+        let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let overlay_row = overlay_table
+            .get(ino)
+            .unwrap()
+            .expect("imported overlay row");
+        let imported_overlay: RegularFileOverlayState =
+            decode(overlay_row.value()).expect("decode imported overlay");
+        assert_eq!(imported_overlay, overlay_state);
+
+        let base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+        let base_row = base_table.get(ino).unwrap().expect("imported base row");
+        let imported_base: RegularFileBaseState =
+            decode(base_row.value()).expect("decode imported base");
+        assert_eq!(imported_base, base_state);
+
+        let remote_snapshot = engine.export_remote_snapshot().unwrap();
+        assert_eq!(
+            remote_snapshot.regular_file_overlay,
+            remote_snapshot.regular_file_base
+        );
+        assert_eq!(
+            remote_snapshot.regular_file_base,
+            snapshot.regular_file_base
+        );
     }
 
     #[test]
