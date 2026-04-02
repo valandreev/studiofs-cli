@@ -996,12 +996,19 @@ mod tests {
             block.clone(),
         );
 
-        let mut chunk = RegularFileChunkState::default();
-        chunk.next_slice_id = SliceId(8);
-        chunk.next_slice_order = SliceOrder(4);
-        chunk.insert_slice(slice);
-        chunk.fragmentation.live_slices = 1;
-        chunk.fragmentation.fragmented_bytes = 4096;
+        let mut slices = BTreeMap::new();
+        slices.insert(slice.slice_id, slice);
+        let chunk = RegularFileChunkState {
+            next_slice_id: SliceId(8),
+            next_slice_order: SliceOrder(4),
+            slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
 
         let mut overlay = RegularFileOverlayState::default();
         overlay.chunks.insert(ChunkId(1), chunk.clone());

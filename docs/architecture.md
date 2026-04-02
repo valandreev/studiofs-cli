@@ -11,6 +11,7 @@ Core principles:
 - File payloads live in immutable S3 objects; each 16 MiB logical block is stored as four 4 MiB cloud fragments.
 - Runtime file visibility is split into local accepted state and remote-visible
   committed state.
+- Regular files now use chunk-local overlay/base slice graphs in metadata, not just a flat block table.
 - Local `BlockStore` plus compatibility cache helpers hide most object-store latency.
 - The canonical chunk/slice/block vocabulary for follow-up work is frozen in
   [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
@@ -49,10 +50,12 @@ Core invariants:
 - local pending incarnation data may be ahead of remote-visible committed manifest
 - remote-visible manifest switches only after full pending incarnation publish
 - local echoed PostgreSQL batches are applied only to remote-visible/base state reconciliation and do not clobber local overlay
+- regular-file overlay state may be ahead of remote-visible `regular_file_base`
+- local regular-file overlay precedence is `overlay over base` at the chunk/slice level
 - ordinary restart/reopen should recover pending metadata convergence without
   requiring local metadata wipe + `discover`
 - foreign namespace/attr/symlink/xattr apply lands in local `base_*`
-- local mutations remain in overlay tables (`inodes`, `dentries`, `symlinks`, `xattrs`)
+- local mutations remain in overlay tables (`inodes`, `dentries`, `symlinks`, `xattrs`, `regular_file_overlay`)
 - local tombstones hide remote-visible base state for dentries, symlinks, and xattrs
 
 ## High-Level Mutation Flow

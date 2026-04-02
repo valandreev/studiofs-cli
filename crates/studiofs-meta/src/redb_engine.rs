@@ -7961,34 +7961,54 @@ mod tests {
             .unwrap();
         let ino = attr.ino;
 
-        let mut overlay_chunk = RegularFileChunkState::default();
-        overlay_chunk.next_slice_id = SliceId(2);
-        overlay_chunk.next_slice_order = SliceOrder(2);
-        overlay_chunk.insert_slice(SliceRecord::new(
+        let mut overlay_slices = BTreeMap::new();
+        overlay_slices.insert(
             SliceId(1),
-            SliceOrder(1),
-            SliceRange::new(0, 4096).expect("valid overlay slice"),
-            BlockRef::new_partial(301, 4096),
-        ));
-        overlay_chunk.fragmentation.live_slices = 1;
-        overlay_chunk.fragmentation.fragmented_bytes = 4096;
+            SliceRecord::new(
+                SliceId(1),
+                SliceOrder(1),
+                SliceRange::new(0, 4096).expect("valid overlay slice"),
+                BlockRef::new_partial(301, 4096),
+            ),
+        );
+        let overlay_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(2),
+            next_slice_order: SliceOrder(2),
+            slices: overlay_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
 
         let mut overlay_state = RegularFileOverlayState::default();
         overlay_state
             .chunks
             .insert(ChunkId(11), overlay_chunk.clone());
 
-        let mut base_chunk = RegularFileChunkState::default();
-        base_chunk.next_slice_id = SliceId(4);
-        base_chunk.next_slice_order = SliceOrder(4);
-        base_chunk.insert_slice(SliceRecord::new(
+        let mut base_slices = BTreeMap::new();
+        base_slices.insert(
             SliceId(3),
-            SliceOrder(3),
-            SliceRange::new(0, 4096).expect("valid base slice"),
-            BlockRef::new_partial(401, 4096),
-        ));
-        base_chunk.fragmentation.live_slices = 1;
-        base_chunk.fragmentation.fragmented_bytes = 4096;
+            SliceRecord::new(
+                SliceId(3),
+                SliceOrder(3),
+                SliceRange::new(0, 4096).expect("valid base slice"),
+                BlockRef::new_partial(401, 4096),
+            ),
+        );
+        let base_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(4),
+            next_slice_order: SliceOrder(4),
+            slices: base_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
 
         let mut base_state = RegularFileBaseState::default();
         base_state.chunks.insert(ChunkId(11), base_chunk.clone());
@@ -8082,35 +8102,37 @@ mod tests {
             .unwrap();
         let ino = attr.ino;
 
-        let mut overlay_chunk = RegularFileChunkState::default();
-        overlay_chunk.next_slice_id = SliceId(2);
-        overlay_chunk.next_slice_order = SliceOrder(2);
-        overlay_chunk.insert_slice(SliceRecord::new(
+        let mut overlay_slice = SliceRecord::new(
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 4096).expect("valid overlay slice"),
             BlockRef::new_partial(501, 4096),
-        ));
-        overlay_chunk.fragmentation = ChunkFragmentationCounters {
-            live_slices: 1,
-            tombstone_slices: 0,
-            overlapping_slices: 0,
-            fragmented_bytes: 4096,
+        );
+        overlay_slice.block_state = BlockRefState::Uploading;
+        let mut overlay_slices = BTreeMap::new();
+        overlay_slices.insert(overlay_slice.slice_id, overlay_slice);
+        let overlay_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(2),
+            next_slice_order: SliceOrder(2),
+            slices: overlay_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
         };
-        overlay_chunk
-            .slices
-            .get_mut(&SliceId(1))
-            .expect("overlay slice")
-            .block_state = BlockRefState::Uploading;
 
-        let mut base_chunk = overlay_chunk.clone();
-        base_chunk.next_slice_id = SliceId(9);
-        base_chunk.next_slice_order = SliceOrder(9);
-        base_chunk.fragmentation = ChunkFragmentationCounters {
-            live_slices: 0,
-            tombstone_slices: 1,
-            overlapping_slices: 2,
-            fragmented_bytes: 8192,
+        let mut base_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(9),
+            next_slice_order: SliceOrder(9),
+            slices: overlay_chunk.slices.clone(),
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 0,
+                tombstone_slices: 1,
+                overlapping_slices: 2,
+                fragmented_bytes: 8192,
+            },
         };
         base_chunk
             .slices

@@ -35,7 +35,8 @@ contracts fail at compile time.
 Local embedded serving store.
 - ACID local transactions
 - foreground source of truth for the mounted client
-- stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, staged blocks, committed blocks, counters, local event log
+- stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, staged blocks, committed blocks, chunk-local regular-file graphs, counters, local event log
+- regular-file graphs are stored as chunk-local rows in `regular_file_overlay` and `regular_file_base`, keyed by `(ino, chunk_id)`
 
 ### `PgMetaEngine`
 
@@ -102,12 +103,19 @@ For regular files StudioFS keeps two views:
 - local view:
   - `size`
   - staged `file_blocks`
+  - local-visible regular-file overlay graph in `regular_file_overlay`
 - remote-visible view:
   - `committed_size`
   - `committed_file_blocks`
+  - remote-visible regular-file base graph in `regular_file_base`
 
 This is required so a client can finish local writes immediately while remote
 clients only see blocks that have actually finished uploading.
+
+Regular-file graph rules:
+- slices are chunk-relative and stay within a single chunk
+- overlay and base graphs resolve as `overlay over base`
+- `committed_size` follows the remote-visible committed state, which is now derived from the committed manifest or the regular-file base graph during the transition period
 
 For namespace, attrs, symlink targets, and xattrs StudioFS also keeps two views:
 - base view:
@@ -267,13 +275,21 @@ Regular files now use two size/generation concepts:
 
 ## Important Block Tables
 
-Local `redb` distinguishes:
+Legacy block tables:
 - `file_blocks`
   - staged/local-serving block refs
 - `committed_file_blocks`
   - remote-visible block refs
 
-Read serving merges them as:
+Regular-file graph tables:
+- `regular_file_overlay`
+  - local-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
+- `regular_file_base`
+  - remote-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
+- `SliceRange`
+  - validated as chunk-relative half-open ranges and rejected if they cross the current chunk size
+
+Legacy block serving merges them as:
 - local staged block wins
 - otherwise fall back to committed block
 
