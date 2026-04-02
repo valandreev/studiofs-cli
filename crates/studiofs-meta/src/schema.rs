@@ -454,7 +454,7 @@ pub struct SliceRange {
 impl SliceRange {
     /// Create a non-empty half-open slice range.
     pub fn new(start: u32, end: u32) -> Option<Self> {
-        if start < end {
+        if start < end && end <= DEFAULT_CHUNK_SIZE {
             Some(Self { start, end })
         } else {
             None
@@ -594,18 +594,39 @@ pub struct RegularFileChunkState {
 }
 
 impl RegularFileChunkState {
-    /// Allocate the next slice id.
-    pub fn alloc_slice_id(&mut self) -> SliceId {
+    /// Try to allocate the next slice id.
+    ///
+    /// Returns `None` if the counter would overflow.
+    pub fn try_alloc_slice_id(&mut self) -> Option<SliceId> {
         let id = self.next_slice_id;
-        self.next_slice_id = SliceId(self.next_slice_id.0.saturating_add(1));
-        id
+        self.next_slice_id = SliceId(self.next_slice_id.0.checked_add(1)?);
+        Some(id)
+    }
+
+    /// Allocate the next slice id.
+    ///
+    /// Panics if the counter overflows. Prefer [`Self::try_alloc_slice_id`] when
+    /// the caller wants to handle exhaustion explicitly.
+    pub fn alloc_slice_id(&mut self) -> SliceId {
+        self.try_alloc_slice_id().expect("slice id overflow")
+    }
+
+    /// Try to allocate the next slice order.
+    ///
+    /// Returns `None` if the counter would overflow.
+    pub fn try_alloc_slice_order(&mut self) -> Option<SliceOrder> {
+        let order = self.next_slice_order;
+        self.next_slice_order = SliceOrder(self.next_slice_order.0.checked_add(1)?);
+        Some(order)
     }
 
     /// Allocate the next slice order.
+    ///
+    /// Panics if the counter overflows. Prefer
+    /// [`Self::try_alloc_slice_order`] when the caller wants to handle
+    /// exhaustion explicitly.
     pub fn alloc_slice_order(&mut self) -> SliceOrder {
-        let order = self.next_slice_order;
-        self.next_slice_order = SliceOrder(self.next_slice_order.0.saturating_add(1));
-        order
+        self.try_alloc_slice_order().expect("slice order overflow")
     }
 
     /// Insert a slice record, keyed by its slice id.
@@ -949,6 +970,20 @@ mod tests {
         assert!(!range.contains(42));
         assert!(SliceRange::new(5, 5).is_none());
         assert!(SliceRange::new(9, 3).is_none());
+        assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE).is_some());
+        assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE + 1).is_none());
+    }
+
+    #[test]
+    fn test_regular_file_chunk_state_allocators_detect_overflow() {
+        let mut chunk = RegularFileChunkState {
+            next_slice_id: SliceId(u64::MAX),
+            next_slice_order: SliceOrder(u64::MAX),
+            ..Default::default()
+        };
+
+        assert!(chunk.try_alloc_slice_id().is_none());
+        assert!(chunk.try_alloc_slice_order().is_none());
     }
 
     #[test]
