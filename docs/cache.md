@@ -110,19 +110,33 @@ BlockStore::close(self)             // fdatasync + snapshot + WAL clear
 path:
 
 ```rust
-trait LocalBlockBackend {
-    // read path
-    fn get(&self, object_id: u64) -> Option<Bytes>;
-    fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
-    fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;
+pub trait LocalBlockBackend: Send + Sync {
+  // read path
+  fn get(&self, object_id: u64) -> Option<Bytes>;
+  fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
+  fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;
+  fn contains(&self, object_id: u64) -> bool;
+  fn advise_will_need(&self, object_id: u64);
 
-    // write + lifecycle
-    fn put(&self, object_id: u64, data: &[u8], evictable: bool) -> Result<(), LocalBlockBackendError>;
-    fn mark_uploading(&self, object_id: u64);
-    fn mark_upload_failed(&self, object_id: u64);
-    fn mark_uploaded(&self, object_id: u64); // clears DIRTY/UPLOADING in BlockStore
-    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
-    fn is_evictable(&self, object_id: u64) -> bool;
+  // write + lifecycle
+  fn put(
+    &self,
+    object_id: u64,
+    data: &[u8],
+    evictable: bool,
+  ) -> Result<(), LocalBlockBackendError>;
+  fn sync_data(&self) -> Result<(), LocalBlockBackendError>;
+
+  fn mark_uploading(&self, object_id: u64);
+  fn mark_upload_failed(&self, object_id: u64);
+  fn mark_uploaded(&self, object_id: u64); // clears DIRTY/UPLOADING in BlockStore
+
+  fn remove(&self, object_id: u64);
+  fn remove_batch(&self, object_ids: &[u64]);
+
+  fn dirty_object_ids(&self) -> Vec<u64>;
+  fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
+  fn is_evictable(&self, object_id: u64) -> bool;
 }
 ```
 

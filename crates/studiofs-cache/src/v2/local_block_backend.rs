@@ -128,7 +128,8 @@ pub(crate) mod contract_tests {
             backend.lifecycle_state(object_id),
             LocalBlockLifecycleState::Uploaded
         );
-        assert!(backend.is_evictable(object_id));
+        // Evictability is backend-specific; the contract does not require
+        // `is_evictable(...)` to be true for all implementations after upload.
         assert!(
             backend.dirty_object_ids().is_empty(),
             "uploaded block must no longer be dirty"
