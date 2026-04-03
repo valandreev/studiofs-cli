@@ -8713,6 +8713,97 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() {
+        let engine = temp_engine();
+        let ino = engine
+            .create_file(ROOT_INO, b"lookup-boundary-split.bin", 1000, 1000, 0o644)
+            .unwrap()
+            .ino;
+
+        let tail_start = DEFAULT_CHUNK_SIZE - 1024;
+
+        let mut chunk0_base = RegularFileChunkState::default();
+        chunk0_base.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(tail_start, DEFAULT_CHUNK_SIZE).expect("valid chunk0 base"),
+            BlockRef::new_partial(2101, 1024),
+        ));
+        let mut chunk1_base = RegularFileChunkState::default();
+        chunk1_base.insert_slice(SliceRecord::new(
+            SliceId(2),
+            SliceOrder(1),
+            SliceRange::new(0, 1024).expect("valid chunk1 base"),
+            BlockRef::new_partial(2102, 1024),
+        ));
+
+        let mut chunk0_overlay = RegularFileChunkState::default();
+        chunk0_overlay.insert_slice(SliceRecord::new(
+            SliceId(10),
+            SliceOrder(1),
+            SliceRange::new(tail_start + 512, DEFAULT_CHUNK_SIZE).expect("valid chunk0 overlay"),
+            BlockRef::new_partial(2201, 512),
+        ));
+        let mut chunk1_overlay = RegularFileChunkState::default();
+        chunk1_overlay.insert_slice(SliceRecord::new(
+            SliceId(11),
+            SliceOrder(1),
+            SliceRange::new(0, 512).expect("valid chunk1 overlay"),
+            BlockRef::new_partial(2202, 512),
+        ));
+
+        set_regular_file_chunk_rows(
+            &engine,
+            ino,
+            &[(ChunkId(0), chunk0_overlay), (ChunkId(1), chunk1_overlay)],
+            &[(ChunkId(0), chunk0_base), (ChunkId(1), chunk1_base)],
+        );
+
+        let spans = engine
+            .lookup_regular_file_slices(ino, DEFAULT_CHUNK_SIZE as u64 - 1024, 2048)
+            .unwrap();
+        assert_eq!(spans.len(), 4);
+
+        assert_eq!(spans[0].chunk_id, ChunkId(0));
+        assert_eq!(
+            spans[0].range,
+            SliceRange {
+                start: tail_start,
+                end: tail_start + 512
+            }
+        );
+        assert_eq!(spans[0].source, ResolvedSliceSource::Base);
+        assert_eq!(spans[0].block.as_ref().unwrap().object_id, 2101);
+
+        assert_eq!(spans[1].chunk_id, ChunkId(0));
+        assert_eq!(
+            spans[1].range,
+            SliceRange {
+                start: tail_start + 512,
+                end: DEFAULT_CHUNK_SIZE
+            }
+        );
+        assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
+        assert_eq!(spans[1].block.as_ref().unwrap().object_id, 2201);
+
+        assert_eq!(spans[2].chunk_id, ChunkId(1));
+        assert_eq!(spans[2].range, SliceRange { start: 0, end: 512 });
+        assert_eq!(spans[2].source, ResolvedSliceSource::Overlay);
+        assert_eq!(spans[2].block.as_ref().unwrap().object_id, 2202);
+
+        assert_eq!(spans[3].chunk_id, ChunkId(1));
+        assert_eq!(
+            spans[3].range,
+            SliceRange {
+                start: 512,
+                end: 1024
+            }
+        );
+        assert_eq!(spans[3].source, ResolvedSliceSource::Base);
+        assert_eq!(spans[3].block.as_ref().unwrap().object_id, 2102);
+    }
+
+    #[test]
     fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
         let engine = temp_engine();
         let file = engine

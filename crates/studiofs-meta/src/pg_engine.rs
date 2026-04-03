@@ -1805,6 +1805,9 @@ impl PgMetaEngine {
     where
         F: FnOnce(&RedbMetaEngine) -> MetaResult<T>,
     {
+        // `f` is expected to execute one local redb operation that is already
+        // atomic at the engine layer (single redb write txn where applicable).
+        // This wrapper only tracks local event-seq growth for replication.
         let before_seq = self.local.get_counter("nextEventSeq")?;
         let result = f(&self.local)?;
         let after_seq = self.local.get_counter("nextEventSeq")?;
