@@ -3025,10 +3025,6 @@ impl UploadPayloadStage {
         true
     }
 
-    fn target_bytes(&self) -> usize {
-        self.target_bytes
-    }
-
     fn snapshot(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.by_object.len(),
@@ -5373,39 +5369,6 @@ impl StudioVfs {
         let jitter_seed = op.object_id ^ Self::now_unix_millis();
         let jitter_ms = jitter_seed % jitter_max;
         capped.saturating_add(Duration::from_millis(jitter_ms))
-    }
-
-    fn retune_staged_upload_payload_budget(&self, additional_pending: usize, miss_hint: bool) {
-        let pending_uploads = self
-            .block_cache
-            .pending_upload_count()
-            .saturating_add(additional_pending)
-            .max(1);
-        let dispatch_capacity = self.upload_worker_count.max(1).saturating_mul(4);
-        let dispatch_bytes = (self.block_size as usize)
-            .saturating_mul(dispatch_capacity)
-            .max(self.block_size as usize);
-        let mut desired_bytes = (self.block_size as usize)
-            .saturating_mul(pending_uploads)
-            .max(dispatch_bytes);
-        if self.foreground_read_active() {
-            desired_bytes = desired_bytes.saturating_add(dispatch_bytes);
-        }
-
-        let evicted = {
-            let mut stage = self.state.upload.staged_payloads.lock();
-            if miss_hint {
-                desired_bytes =
-                    desired_bytes.max(stage.target_bytes().saturating_add(dispatch_bytes));
-            }
-            stage.retarget(desired_bytes)
-        };
-        if evicted > 0 {
-            self.state
-                .upload
-                .staged_payload_evictions
-                .fetch_add(evicted as u64, Ordering::Relaxed);
-        }
     }
 
     /// Resize the staged upload payload budget to the given byte target.
@@ -10010,6 +9973,10 @@ impl StudioVfs {
         // Read raw block payload from the persisted local backend when we
         // really need to upload. Queue correctness is anchored on this reread
         // path rather than transient in-memory staging.
+        // Note: we intentionally do not probe L1/staged payloads first here.
+        // A single persisted-source path keeps restart replay and live uploads
+        // behaviorally identical, trading some extra local I/O for simpler
+        // correctness reasoning.
         let raw_payload: Option<Bytes> = if remote_object_visible {
             self.discard_staged_upload_payload(op.object_id);
             None
@@ -10439,7 +10406,6 @@ impl StudioVfs {
                 foreground_read_protection.p90_latency_ns,
                 foreground_read_protection.dominant_upload_pressure_boost,
             );
-            self.retune_staged_upload_payload_budget(0, false);
             let (
                 staged_payload_count,
                 staged_payload_bytes,
