@@ -686,18 +686,17 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
 
-            Self::remove_all_file_blocks_in_txn(
-                &mut txn
-                    .open_table(FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?,
-                ino,
-            )?;
-            Self::remove_all_committed_blocks_in_txn(
-                &mut txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?,
-                ino,
-            )?;
+            // Keep the legacy block tables populated for now.
+            //
+            // Existing MetaBlocks methods (`get_file_block`, `get_file_blocks`,
+            // `set_file_block`, `remove_file_block`) and VFS startup flows still
+            // read from FILE_BLOCKS_TABLE / COMMITTED_FILE_BLOCKS_TABLE. Deleting
+            // those rows here would make migrated volumes appear to have empty
+            // manifests until all consumers are switched to the chunk/slice APIs.
+            //
+            // The migration therefore remains additive: it backfills the regular
+            // file chunk tables while preserving the legacy source of truth for
+            // compatibility.
         }
 
         txn.commit()
