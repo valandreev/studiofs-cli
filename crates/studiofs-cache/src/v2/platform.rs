@@ -158,8 +158,8 @@ pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-            let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+            let total = stat.f_blocks * stat.f_frsize;
+            let free = stat.f_bavail * stat.f_frsize;
             Some((free, total))
         } else {
             None
@@ -209,7 +209,6 @@ fn is_benign_best_effort_error(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(
             libc::EOPNOTSUPP
-                | libc::ENOTSUP
                 | libc::ENOSYS
                 | libc::EINVAL
                 | libc::EPERM
