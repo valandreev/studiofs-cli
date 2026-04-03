@@ -1354,6 +1354,7 @@ impl Filesystem for StudioFuseFs {
         reply.ok();
     }
 
+    #[allow(clippy::unnecessary_cast)]
     fn setlk(
         &mut self,
         _req: &Request<'_>,
@@ -1384,6 +1385,7 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
+    #[allow(clippy::unnecessary_cast)]
     fn getlk(
         &mut self,
         _req: &Request<'_>,
