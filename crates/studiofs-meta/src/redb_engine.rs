@@ -6080,7 +6080,7 @@ impl MetaBlocks for RedbMetaEngine {
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-            let mut total_used_space_added = 0;
+            let mut space_delta: i64 = 0;
 
             for (chunk_id, new_slices) in chunk_slices {
                 let key = encode_regular_file_chunk_key(ino, *chunk_id);
@@ -6093,19 +6093,35 @@ impl MetaBlocks for RedbMetaEngine {
                     crate::schema::RegularFileChunkState::default()
                 };
 
+                // Pre-calculate which existing slices are fully covered by the incoming ones.
+                // This bounds metadata growth and performs O(N*M) where N is incoming slices and M is existing in one chunk.
+                let mut fully_covered = Vec::new();
+                for (id, existing) in &state.slices {
+                    for new_slice in new_slices.iter() {
+                        if new_slice.range.start <= existing.range.start
+                            && new_slice.range.end >= existing.range.end
+                        {
+                            fully_covered.push(*id);
+                            break;
+                        }
+                    }
+                }
+
+                for id in fully_covered {
+                    if let Some(removed) = state.slices.remove(&id) {
+                        if let Some(block) = &removed.block {
+                            space_delta -= block.length as i64;
+                        }
+                    }
+                }
+
                 for mut new_slice in new_slices.iter().cloned() {
-                    new_slice.slice_id = state.alloc_slice_id();
                     new_slice.order = state.alloc_slice_order();
 
                     if let Some(block) = &new_slice.block {
-                        total_used_space_added += block.length as u64;
+                        space_delta += block.length as i64;
                     }
 
-                    // Remove existing slices that overlap strictly, assuming higher level
-                    // takes care of slicing properly if splitting was needed. Wait!
-                    // In SFS, we just append to slices and let resolution handle overlaps.
-                    // But to prevent unbounded growth, we could remove exactly matching or subsumed
-                    // slices. For now, since ADR says "Later accepted slices win", we just append.
                     state.slices.insert(new_slice.slice_id, new_slice);
                 }
 
@@ -6115,7 +6131,7 @@ impl MetaBlocks for RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
 
-            if total_used_space_added > 0 {
+            if space_delta != 0 {
                 let current_used = match counters
                     .get(counters::USED_SPACE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -6124,7 +6140,10 @@ impl MetaBlocks for RedbMetaEngine {
                     None => 0,
                 };
                 counters
-                    .insert(counters::USED_SPACE, current_used + total_used_space_added)
+                    .insert(
+                        counters::USED_SPACE,
+                        current_used.saturating_add_signed(space_delta),
+                    )
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }

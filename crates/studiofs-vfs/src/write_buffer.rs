@@ -318,10 +318,25 @@ impl StudioVfs {
                 let chunk_start = chunk_id * chunk_size;
                 let slice_start = (block_start - chunk_start) as u32;
                 let slice_end = slice_start + (block.data.len() as u32);
-                let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                    .unwrap_or_else(|| {
-                        panic!("invalid slice range {}..{}", slice_start, slice_end)
-                    });
+                if slice_end > studiofs_meta::schema::DEFAULT_CHUNK_SIZE {
+                    return Err(crate::VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "slice transcends chunk bounds: start={}, end={}, chunk={}",
+                            slice_start, slice_end, studiofs_meta::schema::DEFAULT_CHUNK_SIZE
+                        ),
+                    )));
+                }
+
+                let slice_range = match studiofs_meta::schema::SliceRange::new(slice_start, slice_end) {
+                    Some(range) => range,
+                    None => {
+                        return Err(crate::VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid slice range {}..{}", slice_start, slice_end),
+                        )));
+                    }
+                };
 
                 let mut flags = studiofs_meta::schema::BlockFlags::empty();
                 if block.data.len() < self.block_size as usize {
