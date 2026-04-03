@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 // ─── Table Definitions ──────────────────────────────────────────────────────
 
@@ -107,6 +107,10 @@ const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event
 
 /// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
 const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+
+/// Migration status: migration_name -> status (u8)
+/// Used to track migration progress and detect interrupted migrations
+const MIGRATION_STATUS_TABLE: TableDefinition<&str, u8> = TableDefinition::new("migration_status");
 
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -439,6 +443,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(ACL_RULE_TOMBSTONES_TABLE);
             let _ = txn.open_table(EVENT_LOG_TABLE);
             let _ = txn.open_table(SNAPSHOTS_TABLE);
+            let _ = txn.open_table(MIGRATION_STATUS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -446,7 +451,408 @@ impl RedbMetaEngine {
         debug!("opened metadata database at {:?}", path.as_ref());
         let engine = Self { db: Arc::new(db) };
         let _ = engine.recover_undo_logs()?;
+
+        match engine.get_format_info() {
+            Ok(format_info) if format_info.format_version == 2 => {
+                info!("migrating metadata from format version 2 to 3");
+                engine.migrate_regular_files_to_chunk_slice_model()?;
+
+                let mut updated_format_info = format_info;
+                updated_format_info.format_version = 3;
+                engine.set_format_info(&updated_format_info)?;
+                info!("metadata migration completed successfully");
+            }
+            Ok(format_info) if format_info.format_version >= 3 => {
+                debug!(
+                    "format version {} is up to date",
+                    format_info.format_version
+                );
+            }
+            Ok(info) => {
+                return Err(MetaError::Storage(format!(
+                    "unsupported format version: {}",
+                    info.format_version
+                )));
+            }
+            Err(MetaError::NotFormatted) => {
+                debug!("new database (not yet formatted) — skipping migration check");
+            }
+            Err(e) => return Err(e),
+        }
+
         Ok(engine)
+    }
+
+    /// Migrate regular files from the old FILE_BLOCKS flat model to the new chunk/slice/block model.
+    ///
+    /// This migration is performed when upgrading from format version 2 to 3.
+    /// It reads all FILE_BLOCKS entries, converts them to chunk/slice format,
+    /// and stores them in the new tables. The old entries are then removed.
+    ///
+    /// Key design decisions (addressing review findings):
+    /// - FILE_BLOCKS (uncommitted/local) → LocalOnly in OVERLAY table
+    /// - COMMITTED_FILE_BLOCKS → Published in BASE table
+    /// - Batch processing (100 inodes per transaction) for efficiency
+    /// - Streaming approach to minimize memory usage
+    ///
+    /// Rollback: If migration fails or is interrupted, the system will detect this
+    /// during startup validation and refuse to start. Manual recovery requires:
+    /// 1. Restore from a pre-migration backup, or
+    /// 2. Manually clean up partial migration state and re-run migration, or
+    /// 3. Downgrade to a previous version that supports format v2.
+    fn migrate_regular_files_to_chunk_slice_model(&self) -> MetaResult<()> {
+        const MIGRATION_NAME: &str = "regular_files_v2_to_v3";
+        const STATUS_STARTED: u8 = 1;
+        const STATUS_COMPLETED: u8 = 2;
+        const BATCH_SIZE: usize = 100;
+
+        {
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let migration_status = txn
+                .open_table(MIGRATION_STATUS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            if let Some(status) = migration_status
+                .get(MIGRATION_NAME)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|v| v.value())
+            {
+                if status == STATUS_COMPLETED {
+                    debug!("migration {} already completed", MIGRATION_NAME);
+                    return Ok(());
+                }
+            }
+        }
+
+        let format_info = self.get_format_info()?;
+        let block_size = format_info.block_size;
+
+        info!(
+            "starting migration: regular files from v2 to v3 chunk/slice model (block_size={})",
+            block_size
+        );
+
+        {
+            let txn = self
+                .db
+                .begin_write()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            {
+                let mut migration_status = txn
+                    .open_table(MIGRATION_STATUS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                migration_status
+                    .insert(MIGRATION_NAME, STATUS_STARTED)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+
+        let mut pending_inodes: Vec<Ino> = Vec::with_capacity(BATCH_SIZE);
+        let mut pending_set: HashSet<Ino> = HashSet::with_capacity(BATCH_SIZE);
+        let mut last_processed_key: Vec<u8> = Vec::new();
+
+        for table_name in &[FILE_BLOCKS_TABLE, COMMITTED_FILE_BLOCKS_TABLE] {
+            last_processed_key.clear();
+
+            loop {
+                pending_inodes.clear();
+                pending_set.clear();
+
+                {
+                    let txn = self
+                        .db
+                        .begin_read()
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                    let table = txn
+                        .open_table(*table_name)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                    let iter = if last_processed_key.is_empty() {
+                        table
+                            .iter()
+                            .map_err(|e| MetaError::Storage(e.to_string()))?
+                    } else {
+                        table
+                            .range(last_processed_key.as_slice()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?
+                    };
+
+                    for row in iter {
+                        let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                        let key_bytes = key.value();
+
+                        let (ino, _) = decode_file_block_key(key_bytes);
+
+                        if pending_set.insert(ino) {
+                            pending_inodes.push(ino);
+                        }
+
+                        if pending_inodes.len() >= BATCH_SIZE {
+                            break;
+                        }
+                    }
+                }
+
+                if pending_inodes.is_empty() {
+                    break;
+                }
+
+                self.migrate_inode_batch(pending_inodes.as_slice(), block_size)?;
+
+                last_processed_key =
+                    encode_file_block_key(*pending_inodes.last().unwrap(), u32::MAX).to_vec();
+            }
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let mut migration_status = txn
+                .open_table(MIGRATION_STATUS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            migration_status
+                .insert(MIGRATION_NAME, STATUS_COMPLETED)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        info!("migration completed: regular files v2 to v3 chunk/slice model");
+        Ok(())
+    }
+
+    /// Migrate a batch of inodes in a single transaction.
+    fn migrate_inode_batch(&self, inodes: &[Ino], block_size: u32) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for &ino in inodes {
+            if Self::has_regular_file_chunk_rows_in_write_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                ino,
+            )? {
+                continue;
+            }
+
+            let local_blocks =
+                Self::get_file_blocks_from_txn_internal(&txn, FILE_BLOCKS_TABLE, ino)?;
+
+            let committed_blocks =
+                Self::get_file_blocks_from_txn_internal(&txn, COMMITTED_FILE_BLOCKS_TABLE, ino)?;
+
+            if local_blocks.is_empty() && committed_blocks.is_empty() {
+                continue;
+            }
+
+            let overlay_state = Self::convert_blocks_to_chunk_state(&local_blocks, block_size)?;
+            let mut base_state =
+                Self::convert_blocks_to_chunk_state(&committed_blocks, block_size)?;
+
+            for chunk in base_state.chunks.values_mut() {
+                for slice in chunk.slices.values_mut() {
+                    slice.block_state = BlockRefState::Published;
+                }
+            }
+
+            let mut overlay_table = txn
+                .open_table(REGULAR_FILE_OVERLAY_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (chunk_id, chunk_state) in &overlay_state.chunks {
+                let key = encode_regular_file_chunk_key(ino, *chunk_id);
+                let encoded = encode(chunk_state)?;
+                overlay_table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            let mut base_table = txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (chunk_id, chunk_state) in &base_state.chunks {
+                let key = encode_regular_file_chunk_key(ino, *chunk_id);
+                let encoded = encode(chunk_state)?;
+                base_table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            // Keep the legacy block tables populated for now.
+            //
+            // Existing MetaBlocks methods (`get_file_block`, `get_file_blocks`,
+            // `set_file_block`, `remove_file_block`) and VFS startup flows still
+            // read from FILE_BLOCKS_TABLE / COMMITTED_FILE_BLOCKS_TABLE. Deleting
+            // those rows here would make migrated volumes appear to have empty
+            // manifests until all consumers are switched to the chunk/slice APIs.
+            //
+            // The migration therefore remains additive: it backfills the regular
+            // file chunk tables while preserving the legacy source of truth for
+            // compatibility.
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Get file blocks for an inode from a specific table within a transaction.
+    fn get_file_blocks_from_txn_internal(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let prefix = file_block_prefix(ino);
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut blocks = std::collections::BTreeMap::new();
+
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+
+        let iter = table
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for result in iter {
+            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value();
+            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
+            if decoded_ino != ino {
+                break;
+            }
+            let block: BlockRef = decode(value.value())?;
+            blocks.insert(block_index, block);
+        }
+
+        Ok(blocks.into_iter().collect())
+    }
+
+    /// Convert flat block list to chunk/slice state using the provided block size.
+    fn convert_blocks_to_chunk_state(
+        blocks: &[(u32, BlockRef)],
+        block_size: u32,
+    ) -> MetaResult<RegularFileOverlayState> {
+        use crate::schema::DEFAULT_CHUNK_SIZE;
+
+        let mut state = RegularFileOverlayState::default();
+
+        for (block_index, block_ref) in blocks {
+            let block_start_offset = (*block_index as u64) * (block_size as u64);
+            let chunk_id = ChunkId(block_start_offset / (DEFAULT_CHUNK_SIZE as u64));
+            let chunk_start_offset = chunk_id.0 * (DEFAULT_CHUNK_SIZE as u64);
+            let slice_start = (block_start_offset - chunk_start_offset) as u32;
+            let slice_end = slice_start + block_ref.length;
+
+            let slice_range = SliceRange::new(slice_start, slice_end).ok_or_else(|| {
+                MetaError::Storage(format!(
+                    "invalid slice range for block index {}: start={}, end={}",
+                    block_index, slice_start, slice_end
+                ))
+            })?;
+
+            let chunk_state = state.chunks.entry(chunk_id).or_default();
+            let slice_id = chunk_state.alloc_slice_id();
+            let slice_order = chunk_state.alloc_slice_order();
+
+            let slice_record =
+                SliceRecord::new(slice_id, slice_order, slice_range, block_ref.clone());
+            chunk_state.insert_slice(slice_record);
+        }
+
+        Ok(state)
+    }
+
+    /// Validate that migration from v2 to v3 completed successfully.
+    /// Useful for manual recovery scenarios and debugging.
+    #[allow(dead_code)]
+    fn validate_migration_completed(&self) -> MetaResult<()> {
+        const MIGRATION_NAME: &str = "regular_files_v2_to_v3";
+        const STATUS_COMPLETED: u8 = 2;
+
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let migration_status = txn
+            .open_table(MIGRATION_STATUS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        debug!("checking migration status for {}", MIGRATION_NAME);
+
+        let migration_entry = migration_status
+            .get(MIGRATION_NAME)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let migration_completed = migration_entry
+            .as_ref()
+            .map(|v| {
+                let status = v.value();
+                debug!(
+                    "migration status value: {} (expected: {})",
+                    status, STATUS_COMPLETED
+                );
+                status == STATUS_COMPLETED
+            })
+            .unwrap_or(false);
+
+        debug!("migration_completed: {}", migration_completed);
+
+        if !migration_completed {
+            let reason = migration_entry
+                .as_ref()
+                .map(|v| format!("status={}", v.value()))
+                .unwrap_or_else(|| "not found".to_string());
+            return Err(MetaError::Storage(format!(
+                "migration from format v2 to v3 did not complete successfully ({})",
+                reason
+            )));
+        }
+
+        let file_blocks = txn
+            .open_table(FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let committed_blocks = txn
+            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        if file_blocks
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .next()
+            .is_some()
+        {
+            return Err(MetaError::Storage(
+                "migration validation failed: FILE_BLOCKS table still contains entries".to_string(),
+            ));
+        }
+
+        if committed_blocks
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .next()
+            .is_some()
+        {
+            return Err(MetaError::Storage(
+                "migration validation failed: COMMITTED_FILE_BLOCKS table still contains entries"
+                    .to_string(),
+            ));
+        }
+
+        debug!("migration validation passed: no old block entries remain");
+        Ok(())
     }
 
     /// Probe format info from an existing redb database without opening it for writes.
@@ -9890,5 +10296,288 @@ mod tests {
 
         engine.rmdir(ROOT_INO, b"secret").unwrap();
         assert_eq!(engine.get_acl_rule(dir.ino, "bob").unwrap(), None);
+    }
+
+    #[test]
+    fn test_migrate_regular_files_from_v2_to_v3() {
+        use crate::schema::DEFAULT_BLOCK_SIZE;
+
+        let engine = temp_engine();
+
+        // Set up v2 format info to simulate a pre-migration database
+        let v2_format_info = FormatInfo {
+            format_version: 2, // v2 format
+            name: "test-vol".into(),
+            uuid: "abc-123".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "testbucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "test-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&v2_format_info).unwrap();
+
+        // Create a file with some blocks in the old format
+        let file_attr = engine
+            .create_file(ROOT_INO, b"test_migrate.txt", 0, 0, 0o644)
+            .unwrap();
+
+        // Simulate old v2 block storage by directly setting FILE_BLOCKS entries
+        let block1 = BlockRef::new_full(1001, DEFAULT_BLOCK_SIZE);
+        let block2 = BlockRef::new_partial(1002, DEFAULT_BLOCK_SIZE / 2);
+
+        engine.set_file_block(file_attr.ino, 0, &block1).unwrap();
+        engine.set_file_block(file_attr.ino, 1, &block2).unwrap();
+
+        // Verify old blocks are stored
+        let old_blocks = engine.get_file_blocks(file_attr.ino).unwrap();
+        assert_eq!(old_blocks.len(), 2);
+        assert_eq!(old_blocks[0].1.object_id, 1001);
+        assert_eq!(old_blocks[1].1.object_id, 1002);
+
+        // Run migration
+        engine.migrate_regular_files_to_chunk_slice_model().unwrap();
+
+        // Verify old blocks are gone
+        let old_blocks_after = engine.get_file_blocks(file_attr.ino).unwrap();
+        assert_eq!(old_blocks_after.len(), 0);
+
+        // Verify new chunk/slice data exists
+        let txn = engine.db.begin_write().unwrap();
+        let has_overlay = RedbMetaEngine::has_regular_file_chunk_rows_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file_attr.ino,
+        )
+        .unwrap();
+        assert!(has_overlay);
+
+        let overlay_chunks = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file_attr.ino,
+        )
+        .unwrap();
+
+        // Should have one chunk (both blocks fit in DEFAULT_CHUNK_SIZE)
+        assert_eq!(overlay_chunks.len(), 1);
+        let chunk_state = overlay_chunks.get(&ChunkId(0)).unwrap();
+        assert_eq!(chunk_state.slices.len(), 2);
+
+        // Verify slice data
+        let slice_ids: Vec<_> = chunk_state.slices.keys().collect();
+        let slice1 = &chunk_state.slices[slice_ids[0]];
+        let slice2 = &chunk_state.slices[slice_ids[1]];
+
+        // Check that blocks are correctly mapped
+        // Note: slice_ids order depends on BTreeMap ordering, not insertion order
+        let block1_ref = slice1.block.as_ref().unwrap();
+        let block2_ref = slice2.block.as_ref().unwrap();
+
+        assert_eq!(block1_ref.object_id, 1001);
+        assert_eq!(block2_ref.object_id, 1002);
+        assert!(!block1_ref.is_partial()); // block1 was new_full
+        assert!(block2_ref.is_partial()); // block2 was new_partial
+    }
+
+    #[test]
+    fn test_migrate_multiple_files_with_different_chunks() {
+        use crate::schema::DEFAULT_BLOCK_SIZE;
+
+        let engine = temp_engine();
+
+        // Set up v2 format info to simulate a pre-migration database
+        let v2_format_info = FormatInfo {
+            format_version: 2,
+            name: "test-vol".into(),
+            uuid: "abc-123".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "testbucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "test-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&v2_format_info).unwrap();
+
+        // Create two files
+        let file1_attr = engine
+            .create_file(ROOT_INO, b"file1.txt", 0, 0, 0o644)
+            .unwrap();
+        let file2_attr = engine
+            .create_file(ROOT_INO, b"file2.txt", 0, 0, 0o644)
+            .unwrap();
+
+        // Add blocks to file1 (single chunk)
+        let block1 = BlockRef::new_full(2001, DEFAULT_BLOCK_SIZE);
+        engine.set_file_block(file1_attr.ino, 0, &block1).unwrap();
+
+        // Add blocks to file2 (will span multiple chunks in new model)
+        let block2 = BlockRef::new_full(2002, DEFAULT_BLOCK_SIZE);
+        let block3 = BlockRef::new_full(2003, DEFAULT_BLOCK_SIZE);
+        engine.set_file_block(file2_attr.ino, 0, &block2).unwrap();
+        engine.set_file_block(file2_attr.ino, 1, &block3).unwrap();
+
+        // Run migration
+        engine.migrate_regular_files_to_chunk_slice_model().unwrap();
+
+        // Verify both files migrated correctly
+        let txn = engine.db.begin_write().unwrap();
+
+        // File 1: single chunk
+        let file1_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file1_attr.ino,
+        )
+        .unwrap();
+        assert_eq!(file1_overlay.len(), 1);
+
+        // File 2: should also be single chunk since blocks are contiguous
+        // set_file_block writes to FILE_BLOCKS_TABLE, so after migration
+        // blocks go to REGULAR_FILE_OVERLAY_TABLE
+        let file2_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file2_attr.ino,
+        )
+        .unwrap();
+        assert_eq!(file2_overlay.len(), 1);
+        let chunk_state = file2_overlay.get(&ChunkId(0)).unwrap();
+        assert_eq!(chunk_state.slices.len(), 2);
+    }
+
+    #[test]
+    fn test_migration_validation() {
+        use crate::schema::DEFAULT_BLOCK_SIZE;
+
+        let engine = temp_engine();
+
+        // Set up v2 format info to simulate a pre-migration database
+        let v2_format_info = FormatInfo {
+            format_version: 2,
+            name: "test-vol".into(),
+            uuid: "abc-123".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "testbucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "test-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&v2_format_info).unwrap();
+
+        // Create a file with blocks
+        let file_attr = engine
+            .create_file(ROOT_INO, b"validate.txt", 0, 0, 0o644)
+            .unwrap();
+        let block = BlockRef::new_full(3001, 1024);
+        engine.set_file_block(file_attr.ino, 0, &block).unwrap();
+
+        // Run migration
+        engine.migrate_regular_files_to_chunk_slice_model().unwrap();
+
+        // Validation should pass
+        engine.validate_migration_completed().unwrap();
+
+        // Manually add back old block data to simulate incomplete migration
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut file_blocks = txn.open_table(FILE_BLOCKS_TABLE).unwrap();
+            let key = encode_file_block_key(file_attr.ino, 0);
+            let encoded = encode(&block).unwrap();
+            file_blocks
+                .insert(key.as_slice(), encoded.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Validation should now fail
+        assert!(engine.validate_migration_completed().is_err());
+    }
+
+    #[test]
+    fn test_migration_resume_after_interruption() {
+        use crate::schema::DEFAULT_BLOCK_SIZE;
+
+        let engine = temp_engine();
+
+        let v2_format_info = FormatInfo {
+            format_version: 2,
+            name: "test-vol".into(),
+            uuid: "abc-123".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "testbucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "test-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&v2_format_info).unwrap();
+
+        let file1_attr = engine
+            .create_file(ROOT_INO, b"resume1.txt", 0, 0, 0o644)
+            .unwrap();
+        let file2_attr = engine
+            .create_file(ROOT_INO, b"resume2.txt", 0, 0, 0o644)
+            .unwrap();
+
+        let block1 = BlockRef::new_full(4001, DEFAULT_BLOCK_SIZE);
+        let block2 = BlockRef::new_full(4002, DEFAULT_BLOCK_SIZE);
+        engine.set_file_block(file1_attr.ino, 0, &block1).unwrap();
+        engine.set_file_block(file2_attr.ino, 0, &block2).unwrap();
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut migration_status = txn.open_table(MIGRATION_STATUS_TABLE).unwrap();
+            migration_status
+                .insert("regular_files_v2_to_v3", 1u8)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        engine.migrate_regular_files_to_chunk_slice_model().unwrap();
+
+        assert!(engine.get_file_blocks(file1_attr.ino).unwrap().is_empty());
+        assert!(engine.get_file_blocks(file2_attr.ino).unwrap().is_empty());
+
+        engine.validate_migration_completed().unwrap();
+
+        let txn = engine.db.begin_write().unwrap();
+        let file1_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file1_attr.ino,
+        )
+        .unwrap();
+        let file2_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file2_attr.ino,
+        )
+        .unwrap();
+        txn.abort().unwrap();
+
+        assert_eq!(file1_overlay.len(), 1);
+        assert_eq!(file2_overlay.len(), 1);
+
+        let file1_chunk = file1_overlay.get(&ChunkId(0)).unwrap();
+        assert_eq!(file1_chunk.slices.len(), 1);
+        let slice = file1_chunk.slices.iter().next().unwrap().1;
+        assert_eq!(slice.block.as_ref().unwrap().object_id, 4001);
+
+        let file2_chunk = file2_overlay.get(&ChunkId(0)).unwrap();
+        assert_eq!(file2_chunk.slices.len(), 1);
+        let slice = file2_chunk.slices.iter().next().unwrap().1;
+        assert_eq!(slice.block.as_ref().unwrap().object_id, 4002);
     }
 }

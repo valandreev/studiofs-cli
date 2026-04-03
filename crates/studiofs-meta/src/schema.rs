@@ -25,7 +25,7 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
 /// migration/versioning is introduced.
 pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 /// Current on-disk metadata format version.
-pub const CURRENT_FORMAT_VERSION: u16 = 2;
+pub const CURRENT_FORMAT_VERSION: u16 = 3;
 
 /// Root inode number.
 pub const ROOT_INO: Ino = 1;
