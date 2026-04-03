@@ -476,6 +476,10 @@ impl BlockStore {
     ///
     /// On a hit, moves the block to the MRU position in the LRU list.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
+        self.get_inner(object_id, true)
+    }
+
+    fn get_inner(&self, object_id: u64, touch_lru: bool) -> Option<Bytes> {
         let started = Instant::now();
         // Phase 1: copy entry metadata under the index lock (no I/O inside lock).
         let (offset, data_size, checksum) = {
@@ -522,7 +526,7 @@ impl BlockStore {
             }
         }
 
-        // Phase 3: revalidate metadata and touch LRU under the index lock.
+        // Phase 3: revalidate metadata and optionally touch LRU under index lock.
         //
         // This closes an ABA window where the on-disk region at `offset` could
         // have been freed and reallocated to a different object between the
@@ -545,7 +549,9 @@ impl BlockStore {
                 return None;
             }
 
-            idx.touch(object_id);
+            if touch_lru {
+                idx.touch(object_id);
+            }
         }
 
         self.hit_count.fetch_add(1, Ordering::Relaxed);
@@ -632,7 +638,8 @@ impl BlockStore {
     /// Read a block for upload fallback and hint the OS that the pages can be
     /// dropped from cache afterwards where supported.
     pub fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
-        let data = self.get(object_id)?;
+        // Upload rereads should not pollute foreground-read recency.
+        let data = self.get_inner(object_id, false)?;
         self.advise_dont_need(object_id);
         Some(data)
     }
@@ -1049,6 +1056,14 @@ impl BlockStore {
     /// Snapshot dirty object ids in deterministic oldest-first order.
     pub fn dirty_object_ids(&self) -> Vec<u64> {
         self.index.lock().dirty_object_ids()
+    }
+
+    /// Returns true when the current block flags allow eviction.
+    pub fn is_evictable(&self, object_id: u64) -> bool {
+        self.index
+            .lock()
+            .get(object_id)
+            .is_some_and(|entry| entry.flags.is_evictable())
     }
 
     /// Return current lifecycle state for `object_id`.
@@ -1857,7 +1872,7 @@ impl From<BlockStoreError> for LocalBlockBackendError {
             BlockStoreError::CacheFull { needed, free, .. } => {
                 Self::CapacityExhausted { needed, free }
             }
-            other => Self::Other(other.to_string()),
+            other => Self::Other(Box::new(other)),
         }
     }
 }
@@ -1922,6 +1937,10 @@ impl LocalBlockBackend for BlockStore {
 
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
         BlockStore::lifecycle_state(self, object_id)
+    }
+
+    fn is_evictable(&self, object_id: u64) -> bool {
+        BlockStore::is_evictable(self, object_id)
     }
 }
 
@@ -2341,6 +2360,33 @@ mod tests {
             .expect("upload reread should still return payload");
         assert_eq!(&got[..], b"payload");
         assert_eq!(store.advisory_dont_need_count(), before + 1);
+    }
+
+    #[test]
+    fn get_for_upload_does_not_touch_lru() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0xC3; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        store.put(1, b"a", true).unwrap();
+        store.put(2, b"b", true).unwrap();
+        store.put(3, b"c", true).unwrap();
+
+        let _ = store.get_for_upload(1).expect("upload reread must succeed");
+
+        // If upload reread touched LRU, object 2 would be evicted here.
+        store.put(4, b"d", true).unwrap();
+        assert!(
+            !store.contains(1),
+            "upload reread must not refresh LRU recency"
+        );
+        assert!(store.contains(2));
+        assert!(store.contains(3));
+        assert!(store.contains(4));
     }
 
     #[test]

@@ -63,8 +63,8 @@ use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::engine::BatchFlushEntry;
 use studiofs_meta::schema::{DirEntry, ROOT_INO, SetattrArgs, UploadState as MetaUploadState};
 use studiofs_meta::types::{
-    AccessLevel, BlockFlags, BlockRef, FileType, Ino, InodeAttr, block_index_from_offset,
-    offset_within_block,
+    AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
+    block_index_from_offset, offset_within_block,
 };
 use studiofs_meta::{AsyncMetaEngine, MetaEngine, MetaError, MetaResult, SyncMetaEngineAdapter};
 use thiserror::Error;
@@ -7614,9 +7614,9 @@ impl StudioVfs {
                 }
                 block_ref.length = last_block_offset + 1;
                 if block_ref.length < self.block_size {
-                    block_ref.flags |= BlockFlags::PARTIAL_BLOCK;
+                    block_ref.flags |= MetaBlockFlags::PARTIAL_BLOCK;
                 } else {
-                    block_ref.flags.remove(BlockFlags::PARTIAL_BLOCK);
+                    block_ref.flags.remove(MetaBlockFlags::PARTIAL_BLOCK);
                 }
                 self.sync_meta()
                     .set_file_block(ino, new_last_block, &block_ref)?;

@@ -15,7 +15,11 @@ pub enum LocalBlockLifecycleState {
     Dirty,
     /// Block is present and currently in-flight for upload.
     Uploading,
-    /// Block is present and uploaded (evictable).
+    /// Block is present and uploaded (not dirty/uploading).
+    ///
+    /// Note: this does not imply the block is evictable in every backend.
+    /// Backend-specific constraints (for example pinning) may still prevent
+    /// eviction.
     Uploaded,
 }
 
@@ -27,7 +31,7 @@ pub enum LocalBlockBackendError {
     #[error("local backend full: need {needed} bytes, free {free} bytes")]
     CapacityExhausted { needed: u64, free: u64 },
     #[error("local backend operation failed: {0}")]
-    Other(String),
+    Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Minimal local block API required by read/write/upload paths.
@@ -55,6 +59,7 @@ pub trait LocalBlockBackend: Send + Sync {
 
     fn dirty_object_ids(&self) -> Vec<u64>;
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
+    fn is_evictable(&self, object_id: u64) -> bool;
 }
 
 #[cfg(test)]
@@ -123,6 +128,7 @@ pub(crate) mod contract_tests {
             backend.lifecycle_state(object_id),
             LocalBlockLifecycleState::Uploaded
         );
+        assert!(backend.is_evictable(object_id));
         assert!(
             backend.dirty_object_ids().is_empty(),
             "uploaded block must no longer be dirty"

@@ -315,9 +315,9 @@ impl StudioVfs {
                     object_id: block.object_id,
                     length: block.data.len() as u32,
                     flags: if block.data.len() < self.block_size as usize {
-                        BlockFlags::PARTIAL_BLOCK
+                        MetaBlockFlags::PARTIAL_BLOCK
                     } else {
-                        BlockFlags::empty()
+                        MetaBlockFlags::empty()
                     },
                 })
                 .collect();
