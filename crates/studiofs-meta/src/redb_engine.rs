@@ -544,6 +544,7 @@ impl RedbMetaEngine {
         }
 
         let mut pending_inodes: Vec<Ino> = Vec::with_capacity(BATCH_SIZE);
+        let mut pending_set: HashSet<Ino> = HashSet::with_capacity(BATCH_SIZE);
         let mut last_processed_key: Vec<u8> = Vec::new();
 
         loop {
@@ -575,16 +576,9 @@ impl RedbMetaEngine {
                         let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                         let key_bytes = key.value();
 
-                        if !pending_inodes.is_empty()
-                            && !last_processed_key.is_empty()
-                            && key_bytes == &last_processed_key[..]
-                        {
-                            continue;
-                        }
-
                         let (ino, _) = decode_file_block_key(key_bytes);
 
-                        if !pending_inodes.contains(&ino) {
+                        if pending_set.insert(ino) {
                             pending_inodes.push(ino);
                         }
 
@@ -603,14 +597,12 @@ impl RedbMetaEngine {
                 break;
             }
 
-            pending_inodes.sort();
-            pending_inodes.dedup();
-
             self.migrate_inode_batch(pending_inodes.as_slice(), block_size)?;
 
-            let last_ino = *pending_inodes.last().unwrap();
-            last_processed_key = encode_file_block_key(last_ino, u32::MAX).to_vec();
+            last_processed_key =
+                encode_file_block_key(*pending_inodes.last().unwrap(), u32::MAX).to_vec();
             pending_inodes.clear();
+            pending_set.clear();
         }
 
         let txn = self
