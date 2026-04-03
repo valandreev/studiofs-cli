@@ -307,25 +307,60 @@ impl StudioVfs {
             }
             self.block_store_sync_data_async().await?;
 
-            let entries: Vec<BatchFlushEntry> = persisted_blocks
-                .iter()
-                .map(|block| BatchFlushEntry {
-                    ino,
-                    block_index: block.block_index,
+            let mut chunks: std::collections::BTreeMap<
+                u64,
+                Vec<studiofs_meta::schema::SliceRecord>,
+            > = std::collections::BTreeMap::new();
+            for block in &persisted_blocks {
+                let block_start = (block.block_index as u64) * (self.block_size as u64);
+                let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+                let chunk_id = block_start / chunk_size;
+                let chunk_start = chunk_id * chunk_size;
+                let slice_start = (block_start - chunk_start) as u32;
+                let slice_end = slice_start + (block.data.len() as u32);
+                let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                    .unwrap_or_else(|| {
+                        panic!("invalid slice range {}..{}", slice_start, slice_end)
+                    });
+
+                let mut flags = studiofs_meta::schema::BlockFlags::empty();
+                if block.data.len() < self.block_size as usize {
+                    flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+                }
+
+                let block_ref = studiofs_meta::schema::BlockRef {
                     object_id: block.object_id,
+                    offset: 0,
                     length: block.data.len() as u32,
-                    flags: if block.data.len() < self.block_size as usize {
-                        MetaBlockFlags::PARTIAL_BLOCK
-                    } else {
-                        MetaBlockFlags::empty()
-                    },
-                })
+                    flags,
+                };
+
+                let record = studiofs_meta::schema::SliceRecord {
+                    slice_id: studiofs_meta::schema::SliceId::default(),
+                    order: studiofs_meta::schema::SliceOrder::default(),
+                    range: slice_range,
+                    block: Some(block_ref),
+                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                };
+                chunks.entry(chunk_id).or_default().push(record);
+            }
+
+            let chunk_slices: Vec<(
+                studiofs_meta::schema::ChunkId,
+                Vec<studiofs_meta::schema::SliceRecord>,
+            )> = chunks
+                .into_iter()
+                .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
                 .collect();
 
             run_meta(
                 self.meta_async.clone(),
                 move |engine: Arc<dyn MetaEngine>| {
-                    engine.flush_blocks_batch_with_attr(&entries, attr_for_meta.as_ref())
+                    engine.flush_regular_file_overlay_slices_with_attr(
+                        ino,
+                        &chunk_slices,
+                        attr_for_meta.as_ref(),
+                    )
                 },
             )
             .await?;

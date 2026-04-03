@@ -3415,6 +3415,8 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
                 crate::events::MetaEvent::RenameEntry { .. } => {}
                 crate::events::MetaEvent::SetFileBlock { .. } => {}
+                crate::events::MetaEvent::SetRegularFileOverlaySlices { .. } => {}
+
                 crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
                     let key = encode_file_block_key(*ino, *block_index);
                     let mut committed = txn
@@ -3773,6 +3775,7 @@ impl RedbMetaEngine {
                     let _ = table.remove(key.as_slice());
                 }
                 crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::SetRegularFileOverlaySlices { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::SetFileBlocksBatch { .. }
@@ -3946,6 +3949,7 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::SetRegularFileOverlaySlices { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::SetFileBlocksBatch { .. }
@@ -6056,6 +6060,86 @@ impl MetaBlocks for RedbMetaEngine {
     /// one transaction - reducing commit overhead by ~100-300x.
     fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
         self.flush_blocks_batch_with_attr_txn(entries, None)
+    }
+
+    fn flush_regular_file_overlay_slices(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        {
+            let mut overlay_table = txn
+                .open_table(REGULAR_FILE_OVERLAY_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let mut total_used_space_added = 0;
+
+            for (chunk_id, new_slices) in chunk_slices {
+                let key = encode_regular_file_chunk_key(ino, *chunk_id);
+                let mut state = if let Some(entry) = overlay_table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    decode::<crate::schema::RegularFileChunkState>(entry.value())?
+                } else {
+                    crate::schema::RegularFileChunkState::default()
+                };
+
+                for mut new_slice in new_slices.iter().cloned() {
+                    new_slice.slice_id = state.alloc_slice_id();
+                    new_slice.order = state.alloc_slice_order();
+
+                    if let Some(block) = &new_slice.block {
+                        total_used_space_added += block.length as u64;
+                    }
+
+                    // Remove existing slices that overlap strictly, assuming higher level
+                    // takes care of slicing properly if splitting was needed. Wait!
+                    // In SFS, we just append to slices and let resolution handle overlaps.
+                    // But to prevent unbounded growth, we could remove exactly matching or subsumed
+                    // slices. For now, since ADR says "Later accepted slices win", we just append.
+                    state.slices.insert(new_slice.slice_id, new_slice);
+                }
+
+                let data = encode(&state)?;
+                overlay_table
+                    .insert(key.as_slice(), data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            if total_used_space_added > 0 {
+                let current_used = match counters
+                    .get(counters::USED_SPACE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    Some(v) => v.value(),
+                    None => 0,
+                };
+                counters
+                    .insert(counters::USED_SPACE, current_used + total_used_space_added)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+
+        Self::append_event_in_txn(
+            &txn,
+            &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                ino,
+                chunk_slices: chunk_slices.to_vec(),
+            },
+        )?;
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     fn commit_uploaded_block(
