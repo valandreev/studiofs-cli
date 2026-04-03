@@ -6116,13 +6116,20 @@ impl MetaBlocks for RedbMetaEngine {
                 }
 
                 for mut new_slice in new_slices.iter().cloned() {
-                    new_slice.order = state.alloc_slice_order();
+                    let slice_id = state
+                        .try_alloc_slice_id()
+                        .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                    let slice_order = state
+                        .try_alloc_slice_order()
+                        .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+                    new_slice.slice_id = slice_id;
+                    new_slice.order = slice_order;
 
                     if let Some(block) = &new_slice.block {
                         space_delta += block.length as i64;
                     }
 
-                    state.slices.insert(new_slice.slice_id, new_slice);
+                    state.slices.insert(slice_id, new_slice);
                 }
 
                 let data = encode(&state)?;
@@ -9293,6 +9300,104 @@ mod tests {
         txn.commit().unwrap();
 
         assert!(!engine.local_overlay_inodes().unwrap().contains(&ino));
+    }
+
+    #[test]
+    fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"overlay-flush.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let chunk_id = ChunkId(11);
+        let chunk_key = encode_regular_file_chunk_key(ino, chunk_id);
+
+        let mut existing_slices = BTreeMap::new();
+        existing_slices.insert(
+            SliceId(3),
+            SliceRecord::new(
+                SliceId(3),
+                SliceOrder(8),
+                SliceRange::new(0, 4096).expect("valid existing slice"),
+                BlockRef::new_partial(601, 4096),
+            ),
+        );
+        let existing_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(7),
+            next_slice_order: SliceOrder(11),
+            slices: existing_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
+        let existing_bytes = encode(&existing_chunk).expect("encode existing chunk");
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            overlay_table
+                .insert(chunk_key.as_slice(), existing_bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let incoming = vec![
+            SliceRecord {
+                slice_id: SliceId::default(),
+                order: SliceOrder::default(),
+                range: SliceRange::new(0, 4096).expect("valid replacement slice"),
+                block: Some(BlockRef::new_partial(701, 4096)),
+                block_state: BlockRefState::LocalOnly,
+            },
+            SliceRecord {
+                slice_id: SliceId::default(),
+                order: SliceOrder::default(),
+                range: SliceRange::new(4096, 8192).expect("valid appended slice"),
+                block: Some(BlockRef::new_partial(702, 4096)),
+                block_state: BlockRefState::LocalOnly,
+            },
+        ];
+
+        engine
+            .flush_regular_file_overlay_slices(ino, &[(chunk_id, incoming)])
+            .unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let row = overlay_table
+            .get(chunk_key.as_slice())
+            .unwrap()
+            .expect("flushed overlay row");
+        let chunk: RegularFileChunkState = decode(row.value()).expect("decode flushed chunk");
+
+        assert_eq!(chunk.next_slice_id, SliceId(9));
+        assert_eq!(chunk.next_slice_order, SliceOrder(13));
+        assert_eq!(chunk.slices.len(), 2);
+
+        let slices: Vec<_> = chunk.slices.values().collect();
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.slice_id)
+                .collect::<Vec<_>>(),
+            vec![SliceId(7), SliceId(8)]
+        );
+        assert_eq!(
+            slices.iter().map(|slice| slice.order).collect::<Vec<_>>(),
+            vec![SliceOrder(11), SliceOrder(12)]
+        );
+        assert_eq!(
+            slices[0].range,
+            SliceRange::new(0, 4096).expect("first flushed range")
+        );
+        assert_eq!(
+            slices[1].range,
+            SliceRange::new(4096, 8192).expect("second flushed range")
+        );
     }
 
     #[test]
