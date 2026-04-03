@@ -5,8 +5,8 @@
 //!
 //! ## Algorithm
 //!
-//! Each inode gets a [`ReadState`] that keeps the last block index read and a
-//! *score* (0–[`MAX_SCORE`]), plus a dynamic prefetch width.  On every recorded
+//! Each inode gets a `ReadState` that keeps the last block index read and a
+//! *score* (0–`MAX_SCORE`), plus a dynamic prefetch width.  On every recorded
 //! read:
 //!
 //! - If the new first block follows the previous last block consecutively

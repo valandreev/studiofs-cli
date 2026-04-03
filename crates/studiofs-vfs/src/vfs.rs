@@ -3484,7 +3484,7 @@ pub struct StudioVfs {
     /// Directory-level prefetch tracker.
     dir_prefetch: Arc<DirAccessTracker>,
     /// Channel sender for background prefetch planning and execution.
-    /// The receiver lives in a spawned task that has an Arc<Self>.
+    /// The receiver lives in a spawned task that has an `Arc<Self>`.
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
     /// One-time startup state used by `start()` to spawn background workers.
     startup: StartupState,
