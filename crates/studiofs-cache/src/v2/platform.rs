@@ -478,6 +478,7 @@ fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
