@@ -51,6 +51,9 @@ use crate::v2::format::{
     alloc_size_for,
 };
 use crate::v2::index::{BlockFlags, BlockIndex, PersistedIndexEntry, RemovedEntry};
+use crate::v2::local_block_backend::{
+    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState,
+};
 use crate::v2::mmap_reader::MmapReader;
 use crate::v2::persistence::{self, WalAppender};
 use crate::v2::platform;
@@ -1048,6 +1051,19 @@ impl BlockStore {
         self.index.lock().dirty_object_ids()
     }
 
+    /// Return current lifecycle state for `object_id`.
+    pub fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        let flags = self.index.lock().get(object_id).map(|entry| entry.flags);
+        match flags {
+            None => LocalBlockLifecycleState::Missing,
+            Some(flags) if flags.contains(BlockFlags::UPLOADING) => {
+                LocalBlockLifecycleState::Uploading
+            }
+            Some(flags) if flags.contains(BlockFlags::DIRTY) => LocalBlockLifecycleState::Dirty,
+            Some(_) => LocalBlockLifecycleState::Uploaded,
+        }
+    }
+
     /// Total cache hits since open.
     pub fn hit_count(&self) -> u64 {
         self.hit_count.load(Ordering::Relaxed)
@@ -1834,6 +1850,81 @@ impl BlockStore {
     }
 }
 
+impl From<BlockStoreError> for LocalBlockBackendError {
+    fn from(value: BlockStoreError) -> Self {
+        match value {
+            BlockStoreError::Io(error) => Self::Io(error),
+            BlockStoreError::CacheFull { needed, free, .. } => {
+                Self::CapacityExhausted { needed, free }
+            }
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl LocalBlockBackend for BlockStore {
+    fn get(&self, object_id: u64) -> Option<Bytes> {
+        BlockStore::get(self, object_id)
+    }
+
+    fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+        BlockStore::read_into(self, object_id, data_offset, out)
+    }
+
+    fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+        BlockStore::get_for_upload(self, object_id)
+    }
+
+    fn contains(&self, object_id: u64) -> bool {
+        BlockStore::contains(self, object_id)
+    }
+
+    fn advise_will_need(&self, object_id: u64) {
+        BlockStore::advise_will_need(self, object_id);
+    }
+
+    fn put(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+    ) -> Result<(), LocalBlockBackendError> {
+        BlockStore::put(self, object_id, data, evictable).map_err(Into::into)
+    }
+
+    fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+        BlockStore::sync_data(self).map_err(Into::into)
+    }
+
+    fn mark_uploading(&self, object_id: u64) {
+        BlockStore::mark_uploading(self, object_id);
+    }
+
+    fn mark_upload_failed(&self, object_id: u64) {
+        BlockStore::mark_upload_failed(self, object_id);
+    }
+
+    fn mark_uploaded(&self, object_id: u64) {
+        BlockStore::mark_evictable(self, object_id);
+    }
+
+    fn remove(&self, object_id: u64) {
+        BlockStore::remove(self, object_id);
+    }
+
+    fn remove_batch(&self, object_ids: &[u64]) {
+        BlockStore::remove_batch(self, object_ids);
+    }
+
+    fn dirty_object_ids(&self) -> Vec<u64> {
+        BlockStore::dirty_object_ids(self)
+    }
+
+    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        BlockStore::lifecycle_state(self, object_id)
+    }
+}
+
 impl Drop for BlockStore {
     fn drop(&mut self) {
         if self.synced.load(Ordering::Relaxed) {
@@ -1857,6 +1948,7 @@ mod tests {
 
     use super::*;
     use crate::v2::format::{PAGE_SIZE, SUPERBLOCK_SIZE};
+    use crate::v2::local_block_backend::contract_tests::assert_local_block_backend_contract;
     use crate::v2::persistence::{WAL_HEADER_SIZE, WAL_RECORD_SIZE};
     use tempfile::TempDir;
 
@@ -2894,5 +2986,14 @@ mod tests {
         for i in (0u64..100).step_by(2) {
             assert!(store.contains(i));
         }
+    }
+
+    #[test]
+    fn local_block_backend_contract() {
+        assert_local_block_backend_contract(|| {
+            let dir = TempDir::new().unwrap();
+            let store = BlockStore::open(test_config(&dir)).unwrap();
+            (store, dir)
+        });
     }
 }

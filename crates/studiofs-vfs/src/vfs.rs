@@ -52,7 +52,9 @@ use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::metrics::CacheMetrics;
-use studiofs_cache::v2::{BlockStore, BlockStoreConfig, derive_block_store_volume_uuid};
+use studiofs_cache::v2::{
+    BlockStore, BlockStoreConfig, LocalBlockBackend, derive_block_store_volume_uuid,
+};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -7162,6 +7164,11 @@ impl StudioVfs {
     /// Shared reference to the BlockStore used by foreground reads.
     pub fn block_store(&self) -> &Arc<BlockStore> {
         &self.block_store
+    }
+
+    /// Shared reference to the local block backend contract.
+    pub fn local_block_backend(&self) -> &(dyn LocalBlockBackend + 'static) {
+        self.block_store.as_ref()
     }
 
     /// Shared reference to the fetch scheduler.

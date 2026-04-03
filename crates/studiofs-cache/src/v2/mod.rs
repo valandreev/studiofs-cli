@@ -19,6 +19,7 @@ pub mod block_store;
 pub mod evictor;
 pub mod format;
 pub mod index;
+pub mod local_block_backend;
 pub mod lru;
 pub mod metrics;
 pub mod mmap_reader;
@@ -27,6 +28,9 @@ pub mod platform;
 
 pub use block_store::{BlockStore, BlockStoreConfig, BlockStoreError};
 pub use index::BlockFlags;
+pub use local_block_backend::{
+    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState,
+};
 use uuid::Uuid;
 
 /// Derive stable 16-byte BlockStore volume UUID from format UUID string.
