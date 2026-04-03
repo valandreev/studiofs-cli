@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::sync::Arc;
 use studiofs_data::store::DataStoreConfig;
 use studiofs_fuse::StudioFuseFs;
