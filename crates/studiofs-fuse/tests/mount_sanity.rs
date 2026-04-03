@@ -73,11 +73,13 @@ fn fuse_session_mount_and_drop_smoke() {
     // On Linux, AutoUnmount in fuser v0.16 can implicitly add 'allow_other',
     // which fails on CI. Since we just drop the session here (and move to next test
     // or end), we either need it or we don't. For smoke tests, let's try to be minimal.
-    #[cfg(not(target_os = "linux"))]
-    options.push(fuser::MountOption::AutoUnmount);
-
-    #[cfg(target_os = "macos")]
-    options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    // Use if cfg!() instead of #[cfg] to avoid unused_mut warnings on Linux.
+    if !cfg!(target_os = "linux") {
+        options.push(fuser::MountOption::AutoUnmount);
+    }
+    if cfg!(target_os = "macos") {
+        options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    }
 
     let session = fuser::Session::new(fs, mount_dir.path(), &options).expect("create FUSE session");
     drop(session);
@@ -143,8 +145,13 @@ fn fuse_mount_write_read_unmount_smoke() {
     let mut options = vec![fuser::MountOption::FSName("studiofs-smoke".into())];
     // Manually unmounting at the end of the test, so AutoUnmount is optional.
     // On Linux CI, AutoUnmount may trigger 'allow_other' checks in fusermount3.
-    #[cfg(not(target_os = "linux"))]
-    options.push(fuser::MountOption::AutoUnmount);
+    // Use if cfg!() instead of #[cfg] to avoid unused_mut warnings on Linux.
+    if !cfg!(target_os = "linux") {
+        options.push(fuser::MountOption::AutoUnmount);
+    }
+    if cfg!(target_os = "macos") {
+        options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    }
 
     let mount_path = mount_dir.path().to_path_buf();
 
