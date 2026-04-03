@@ -1480,6 +1480,7 @@ mod tests {
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
         posix_flags_to_open_flags, should_log_fuse_invalidation_error, vfs_err_to_errno,
     };
+    #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
     #[cfg(target_os = "macos")]
