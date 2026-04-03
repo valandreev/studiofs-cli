@@ -104,6 +104,37 @@ BlockStore::close(self)             // fdatasync + snapshot + WAL clear
 // Drop impl: best-effort fdatasync on implicit drop
 ```
 
+### `LocalBlockBackend` contract (SFS-159)
+
+`BlockStore` now implements a backend boundary used by the redesigned data
+path:
+
+```rust
+trait LocalBlockBackend {
+    // read path
+    fn get(&self, object_id: u64) -> Option<Bytes>;
+    fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
+    fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;
+
+    // write + lifecycle
+    fn put(&self, object_id: u64, data: &[u8], evictable: bool) -> Result<(), LocalBlockBackendError>;
+    fn mark_uploading(&self, object_id: u64);
+    fn mark_upload_failed(&self, object_id: u64);
+    fn mark_uploaded(&self, object_id: u64); // clears DIRTY/UPLOADING in BlockStore
+    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
+    fn is_evictable(&self, object_id: u64) -> bool;
+}
+```
+
+Lifecycle semantics:
+
+- `Missing` = no local block entry.
+- `Dirty` = persisted locally, needs upload.
+- `Uploading` = in-flight upload.
+- `Uploaded` = not dirty/uploading anymore.
+  This does **not** imply evictable in all backends; use `is_evictable(...)`
+  when eviction eligibility matters.
+
 Implementation notes:
 
 - `BlockIndex` is guarded by `Mutex<BlockIndex>` rather than `RwLock`: a cache
@@ -135,6 +166,8 @@ Implementation notes:
   values.
 - physical `blocks.data` length is tracked in-memory and updated after
   successful growth, avoiding per-allocation metadata length syscalls.
+- `get_for_upload()` intentionally avoids LRU `touch()`: upload rereads should
+  not refresh recency and displace foreground-hot entries.
 
 Error variants include `CacheFull { needed, max_size, allocated, free }` for
 fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
