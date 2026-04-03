@@ -1,8 +1,8 @@
 //! Adaptive Memory Budget Controller (SFS-130).
 //!
 //! `MemoryEnvelope` is a background coordinator that distributes a global memory
-//! budget across elastic subsystems (L1 cache, transit buffer, dirty buffer,
-//! plus a reserved upload-staging slice for future tuning). It runs a 1-second
+//! budget across elastic subsystems (L1 cache, transit buffer, dirty buffer).
+//! It runs a 1-second
 //! tick loop that:
 //!
 //!  1. **Observes** pressure signals from existing atomic counters.
@@ -60,13 +60,13 @@ pub enum WorkloadPhase {
 }
 
 impl WorkloadPhase {
-    /// Budget ratios: (l1, transit, dirty, staged).  Fractions must sum to 1.0.
-    fn ratios(self) -> (f64, f64, f64, f64) {
+    /// Budget ratios: (l1, transit, dirty). Fractions must sum to 1.0.
+    fn ratios(self) -> (f64, f64, f64) {
         match self {
-            Self::ReadHeavy => (0.60, 0.25, 0.10, 0.05),
-            Self::WriteHeavy => (0.35, 0.15, 0.40, 0.10),
-            Self::Mixed => (0.55, 0.25, 0.15, 0.05),
-            Self::Idle => (0.50, 0.20, 0.20, 0.10),
+            Self::ReadHeavy => (0.63, 0.27, 0.10),
+            Self::WriteHeavy => (0.39, 0.17, 0.44),
+            Self::Mixed => (0.58, 0.26, 0.16),
+            Self::Idle => (0.56, 0.22, 0.22),
         }
     }
 
@@ -114,27 +114,20 @@ pub struct SubsystemFloors {
     pub l1: u64,
     pub transit: u64,
     pub dirty: u64,
-    pub staged: u64,
 }
 
 impl SubsystemFloors {
-    /// Compute floors from the block size and upload worker count.
-    ///
-    /// The staged floor reserves headroom for upload-side buffering knobs.
-    /// Today this reservation is not actively applied in `StudioVfs`, but we
-    /// keep the envelope shape stable for follow-up tuning work.
-    pub fn new(block_size: u64, upload_worker_count: usize) -> Self {
-        let dispatch_capacity = upload_worker_count.max(1) as u64 * 4;
+    /// Compute floors from the block size.
+    pub fn new(block_size: u64) -> Self {
         Self {
             l1: 32 * block_size,                         // ~512 MB at 16 MB blocks
             transit: 4 * (block_size + 8 * 1024 * 1024), // ~128 MB (+ headroom)
             dirty: block_size,                           // 16 MB
-            staged: block_size * dispatch_capacity,      // 256 MB at 16 MB blocks, 4 workers
         }
     }
 
     pub fn total(&self) -> u64 {
-        self.l1 + self.transit + self.dirty + self.staged
+        self.l1 + self.transit + self.dirty
     }
 }
 
@@ -212,7 +205,6 @@ pub struct EnvelopeSnapshot {
     pub l1_budget: u64,
     pub transit_budget: u64,
     pub dirty_budget: u64,
-    pub staged_budget: u64,
     pub emergency: bool,
 }
 
@@ -224,7 +216,6 @@ impl MemoryEnvelope {
     /// - `soft_target_bytes`: Absolute soft target in bytes (e.g. 4 GiB).
     /// - `ceiling_pct`: Hard ceiling as fraction of total RAM (e.g. 0.50).
     /// - `block_size`: VFS block size in bytes (typically 16 MiB).
-    /// - `upload_worker_count`: Number of upload workers (for staged floor).
     /// - `block_cache`: Shared block cache handle.
     /// - `transit_budget`: Shared transit memory budget handle.
     /// - `fetch_scheduler`: Shared fetch scheduler handle.
@@ -234,13 +225,12 @@ impl MemoryEnvelope {
         soft_target_bytes: u64,
         ceiling_pct: f64,
         block_size: u64,
-        upload_worker_count: usize,
         block_cache: Arc<BlockCache>,
         transit_budget: Arc<TransitMemoryBudget>,
         fetch_scheduler: Arc<FetchScheduler>,
     ) -> Self {
         let hard_ceiling = (total_ram as f64 * ceiling_pct) as u64;
-        let floors = SubsystemFloors::new(block_size, upload_worker_count);
+        let floors = SubsystemFloors::new(block_size);
 
         // Ensure soft target is at least enough to meet all floor constraints.
         let minimum_grant = floors.total() + FIXED_OVERHEAD_BYTES;
@@ -311,14 +301,13 @@ impl MemoryEnvelope {
     pub fn snapshot(&self) -> EnvelopeSnapshot {
         let grant = self.grant();
         let ps = self.phase.lock();
-        let (l1, transit, dirty, staged) = self.compute_budgets(grant, ps.current_phase);
+        let (l1, transit, dirty) = self.compute_budgets(grant, ps.current_phase);
         EnvelopeSnapshot {
             current_grant: grant,
             phase: ps.current_phase,
             l1_budget: l1,
             transit_budget: transit,
             dirty_budget: dirty,
-            staged_budget: staged,
             emergency: ps.emergency,
         }
     }
@@ -432,8 +421,8 @@ impl MemoryEnvelope {
         drop(ps);
 
         // 3. Act — apply budgets.
-        let (l1, transit, dirty, staged) = self.compute_budgets(new_grant, phase);
-        self.apply_budgets(l1, transit, dirty, staged, &signals, vfs);
+        let (l1, transit, dirty) = self.compute_budgets(new_grant, phase);
+        self.apply_budgets(l1, transit, dirty, &signals, vfs);
 
         debug!(
             grant_mb = new_grant / (1024 * 1024),
@@ -441,7 +430,6 @@ impl MemoryEnvelope {
             l1_mb = l1 / (1024 * 1024),
             transit_mb = transit / (1024 * 1024),
             dirty_mb = dirty / (1024 * 1024),
-            staged_mb = staged / (1024 * 1024),
             "envelope tick"
         );
     }
@@ -541,22 +529,21 @@ impl MemoryEnvelope {
 
     // ── Budget computation ─────────────────────────────────────
 
-    fn compute_budgets(&self, grant: u64, phase: WorkloadPhase) -> (u64, u64, u64, u64) {
+    fn compute_budgets(&self, grant: u64, phase: WorkloadPhase) -> (u64, u64, u64) {
         let allocatable = grant.saturating_sub(FIXED_OVERHEAD_BYTES);
         if allocatable == 0 {
-            return (0, 0, 0, 0);
+            return (0, 0, 0);
         }
 
-        let (r_l1, r_transit, r_dirty, _r_staged) = phase.ratios();
+        let (r_l1, r_transit, r_dirty) = phase.ratios();
         let floor_total = self.floors.total();
 
         if allocatable <= floor_total {
             // Not enough for floors — scale them down proportionally.
             let l1 = self.floors.l1.saturating_mul(allocatable) / floor_total;
             let transit = self.floors.transit.saturating_mul(allocatable) / floor_total;
-            let dirty = self.floors.dirty.saturating_mul(allocatable) / floor_total;
-            let staged = allocatable.saturating_sub(l1 + transit + dirty);
-            return (l1, transit, dirty, staged);
+            let dirty = allocatable.saturating_sub(l1 + transit);
+            return (l1, transit, dirty);
         }
 
         // Floors fit — give each subsystem its floor, then distribute the
@@ -565,15 +552,15 @@ impl MemoryEnvelope {
         let extra_l1 = (remaining as f64 * r_l1) as u64;
         let extra_transit = (remaining as f64 * r_transit) as u64;
         let extra_dirty = (remaining as f64 * r_dirty) as u64;
-        // Give rounding leftovers to staged (smallest subsystem).
-        let extra_staged = remaining.saturating_sub(extra_l1 + extra_transit + extra_dirty);
+        // Give rounding leftovers to dirty (write safety path).
+        let extra_dirty = extra_dirty
+            .saturating_add(remaining.saturating_sub(extra_l1 + extra_transit + extra_dirty));
 
         let l1 = self.floors.l1 + extra_l1;
         let transit = self.floors.transit + extra_transit;
         let dirty = self.floors.dirty + extra_dirty;
-        let staged = self.floors.staged + extra_staged;
 
-        (l1, transit, dirty, staged)
+        (l1, transit, dirty)
     }
 
     // ── Budget application ─────────────────────────────────────
@@ -583,7 +570,6 @@ impl MemoryEnvelope {
         l1: u64,
         transit: u64,
         dirty: u64,
-        _staged: u64,
         signals: &PressureSignals,
         vfs: &StudioVfs,
     ) {
@@ -607,9 +593,6 @@ impl MemoryEnvelope {
             .min(l1 * 2) // never more than 2× L1
             .min(12 * 1024 * 1024 * 1024); // 12 GB legacy cap
         vfs.set_max_dirty_bytes(effective_dirty as usize);
-
-        // Staged upload reservation is currently inert: uploader correctness
-        // is sourced from persisted local blocks, not transient staged payloads.
 
         // ── Adaptive prefetch timeout ──
         self.adjust_prefetch_timeout(signals);
@@ -658,7 +641,6 @@ impl MemoryEnvelope {
             l1_floor_mb = self.floors.l1 / (1024 * 1024),
             transit_floor_mb = self.floors.transit / (1024 * 1024),
             dirty_floor_mb = self.floors.dirty / (1024 * 1024),
-            staged_floor_mb = self.floors.staged / (1024 * 1024),
             "emergency mode — budgets at floor"
         );
     }
@@ -701,8 +683,8 @@ mod tests {
             WorkloadPhase::Mixed,
             WorkloadPhase::Idle,
         ] {
-            let (a, b, c, d) = phase.ratios();
-            let sum = a + b + c + d;
+            let (a, b, c) = phase.ratios();
+            let sum = a + b + c;
             assert!(
                 (sum - 1.0).abs() < 1e-9,
                 "phase {phase:?} ratios sum to {sum}"
@@ -713,11 +695,9 @@ mod tests {
     #[test]
     fn floors_from_block_size() {
         let block_size = 16 * 1024 * 1024; // 16 MiB
-        let floors = SubsystemFloors::new(block_size, 4);
+        let floors = SubsystemFloors::new(block_size);
         assert_eq!(floors.l1, 512 * 1024 * 1024);
         assert_eq!(floors.dirty, 16 * 1024 * 1024);
-        // staged = 16 MiB * (4 workers * 4) = 256 MiB
-        assert_eq!(floors.staged, 256 * 1024 * 1024);
         // transit = 4 * (16 MiB + 8 MiB) = 96 MiB
         assert_eq!(floors.transit, 4 * (16 + 8) * 1024 * 1024);
     }

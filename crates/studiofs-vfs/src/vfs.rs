@@ -4765,7 +4765,6 @@ impl StudioVfs {
             DEFAULT_SOFT_TARGET_BYTES,
             DEFAULT_CEILING_PCT,
             self.block_size as u64,
-            self.upload_worker_count,
             self.block_cache.clone(),
             self.transit_memory_budget.clone(),
             self.fetch_scheduler.clone(),

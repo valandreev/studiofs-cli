@@ -475,8 +475,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
-- staged upload payload metrics (`upload_staged_payload_hits`, `upload_staged_payload_misses`, `upload_staged_payload_evictions`, `upload_staged_payload_target_bytes`, `upload_staged_payload_min_bytes`, `upload_staged_payload_max_bytes`)
-- upload fallback reread metrics (`upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
+- upload local reread metrics (`upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)
 
@@ -484,14 +483,13 @@ Dentry/path shortcut logs also include negative-hit ratio. The summary `upload p
 `block_store_read_throughput_bps` and `block_store_write_throughput_bps` are lifetime averages since the current `BlockStore` instance was opened (not short-window/EMA samples).
 
 Upload local-I/O tuning notes:
-- upload workers first try a transient staged payload seeded by the local persist path; local-cache I/O slots are only used on staging miss and are released immediately after the cache read.
-- queue-head staged payloads are preserved under backlog by evicting the newest staged entries first; the bounded transient stage is expanded more aggressively against the dirty-memory budget before falling back to L2.
-- upload workers check L1 before consuming upload local-I/O slots, and actual L2 fallback rereads are deferred while foreground reads are still active.
+- upload workers source payload bytes from persisted local blocks (`BlockStore::get_for_upload`) after dequeue; upload correctness does not depend on transient staged buffers.
+- upload local-cache I/O slots are held only around that persisted reread phase and then released before remote upload work continues.
+- upload workers do not short-circuit through L1/staged payload probes; the persisted-source path is kept uniform so live uploads and startup replay share the same correctness model.
 - upload fallback rereads use `BlockStore::get_for_upload`, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
-- staged upload payload sizing is internal and adaptive rather than a user-facing knob; it is anchored to upload dispatch capacity and bounded by dirty-memory budget.
 - fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
 - if a single fetch request exceeds `STUDIOFS_TRANSIT_MEMORY_BUDGET`, StudioFS returns a fetch error instead of silently clamping the credit request.
 - speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.
