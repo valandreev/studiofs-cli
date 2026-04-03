@@ -74,24 +74,7 @@ jobs:
           # Run audit and emit JSON to parse results. Keep non-zero exit temporary
           # so we can decide failure only on actual vulnerabilities.
           cargo audit --json --file ./Cargo.lock > cargo-audit.json || true
-            python - <<'PY'
-            import json,sys
-            try:
-              j=json.load(open('cargo-audit.json'))
-            except Exception as e:
-              print('Failed to parse cargo-audit output:', e)
-              sys.exit(1)
-            if j.get('vulnerabilities',{}).get('found',False):
-              print('VULNERABILITIES FOUND')
-              sys.exit(1)
-            warns = j.get('warnings',{}).get('unmaintained',[])
-            if warns:
-              print('Unmaintained dependencies (non-fatal):')
-              for w in warns:
-                pkg = w.get('package',{})
-                print('-', pkg.get('name'), pkg.get('version'))
-            sys.exit(0)
-            PY
+              python -c 'import json,sys; j=json.load(open("cargo-audit.json")); if j.get("vulnerabilities",{}).get("found",False): print("VULNERABILITIES FOUND"); sys.exit(1); warns=j.get("warnings",{}).get("unmaintained",[]); if warns: print("Unmaintained dependencies (non-fatal):"); [print("-", (w.get("package") or {}).get("name"), (w.get("package") or {}).get("version")) for w in warns]; sys.exit(0)'
 
   # ─── Linux Verification ────────────────────────────────────────────
   linux:
