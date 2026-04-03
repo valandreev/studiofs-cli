@@ -2977,6 +2977,7 @@ impl UploadPayloadStage {
         }
     }
 
+    #[cfg(test)]
     fn stage(&mut self, object_id: u64, data: Bytes) -> usize {
         if let Some(previous) = self.by_object.remove(&object_id) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.len());
@@ -3011,6 +3012,7 @@ impl UploadPayloadStage {
         evicted
     }
 
+    #[cfg(test)]
     fn get_cloned(&self, object_id: u64) -> Option<Bytes> {
         self.by_object.get(&object_id).cloned()
     }
@@ -5373,21 +5375,6 @@ impl StudioVfs {
         capped.saturating_add(Duration::from_millis(jitter_ms))
     }
 
-    fn stage_upload_payload(&self, object_id: u64, data: Bytes) {
-        let evicted = self
-            .state
-            .upload
-            .staged_payloads
-            .lock()
-            .stage(object_id, data);
-        if evicted > 0 {
-            self.state
-                .upload
-                .staged_payload_evictions
-                .fetch_add(evicted as u64, Ordering::Relaxed);
-        }
-    }
-
     fn retune_staged_upload_payload_budget(&self, additional_pending: usize, miss_hint: bool) {
         let pending_uploads = self
             .block_cache
@@ -5436,25 +5423,6 @@ impl StudioVfs {
                 .staged_payload_evictions
                 .fetch_add(evicted as u64, Ordering::Relaxed);
         }
-    }
-
-    fn take_staged_upload_payload(&self, object_id: u64) -> Option<Bytes> {
-        let payload = self
-            .state
-            .upload
-            .staged_payloads
-            .lock()
-            .get_cloned(object_id);
-        let counter = if payload.is_some() {
-            &self.state.upload.staged_payload_hits
-        } else {
-            &self.state.upload.staged_payload_misses
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-        if payload.is_none() {
-            self.retune_staged_upload_payload_budget(0, true);
-        }
-        payload
     }
 
     fn discard_staged_upload_payload(&self, object_id: u64) {
@@ -10039,33 +10007,17 @@ impl StudioVfs {
             }
         }
 
-        // Read raw block payload from cache only when we really need to upload.
+        // Read raw block payload from the persisted local backend when we
+        // really need to upload. Queue correctness is anchored on this reread
+        // path rather than transient in-memory staging.
         let raw_payload: Option<Bytes> = if remote_object_visible {
             self.discard_staged_upload_payload(op.object_id);
             None
-        } else if let Some(payload) = self.take_staged_upload_payload(op.object_id) {
-            debug!(
-                ino = op.ino,
-                object_id = op.object_id,
-                block_index,
-                payload_len = payload.len(),
-                "process_upload using staged payload"
-            );
-            Some(payload)
-        } else if let Some(payload) = self.block_cache.get_l1_only(op.object_id) {
-            debug!(
-                ino = op.ino,
-                object_id = op.object_id,
-                block_index,
-                payload_len = payload.len(),
-                "process_upload using L1 payload after staged miss"
-            );
-            Some(payload)
         } else {
-            // Hold local upload I/O slots strictly around the BlockStore reread phase.
-            // Unlike the legacy cold L2 fallback, this reread must still make
-            // progress during foreground activity because recovered pending
-            // uploads may have no staged/L1 copy left after restart.
+            // Hold local upload I/O slots strictly around the BlockStore reread
+            // phase. This path must continue making progress during foreground
+            // activity because startup replay reconstructs pending uploads from
+            // metadata + persisted local blocks.
             let upload_io_cost = if self.foreground_read_active() {
                 self.state
                     .upload
@@ -10087,62 +10039,52 @@ impl StudioVfs {
                     message: e.to_string(),
                 })?;
             let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-            if let Some(payload) = self.block_cache.get_l1_only(op.object_id) {
-                drop(upload_io_permit);
-                debug!(
-                    ino = op.ino,
-                    object_id = op.object_id,
-                    block_index,
-                    payload_len = payload.len(),
-                    "process_upload using L1 payload after upload slot wait"
-                );
-                Some(payload)
+            let read_started = Instant::now();
+            let read_result = self.block_store_get_for_upload_async(op.object_id).await?;
+            let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+            drop(upload_io_permit);
+            self.state
+                .upload
+                .upload_fallback_wait_ns
+                .fetch_add(wait_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_wait_max_ns
+                .fetch_max(wait_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_read_ns
+                .fetch_add(read_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_read_max_ns
+                .fetch_max(read_ns, Ordering::Relaxed);
+            self.state
+                .upload
+                .upload_fallback_rereads
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(payload) = &read_result {
+                self.state
+                    .upload
+                    .upload_fallback_reread_bytes
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                self.discard_staged_upload_payload(op.object_id);
             } else {
-                let read_started = Instant::now();
-                let read_result = self.block_store_get_for_upload_async(op.object_id).await?;
-                let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
-                drop(upload_io_permit);
                 self.state
                     .upload
-                    .upload_fallback_wait_ns
-                    .fetch_add(wait_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_wait_max_ns
-                    .fetch_max(wait_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_read_ns
-                    .fetch_add(read_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_read_max_ns
-                    .fetch_max(read_ns, Ordering::Relaxed);
-                self.state
-                    .upload
-                    .upload_fallback_rereads
+                    .upload_fallback_reread_cache_misses
                     .fetch_add(1, Ordering::Relaxed);
-                if let Some(payload) = &read_result {
-                    self.state
-                        .upload
-                        .upload_fallback_reread_bytes
-                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                } else {
-                    self.state
-                        .upload
-                        .upload_fallback_reread_cache_misses
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                read_result
             }
+            read_result
         };
 
         let raw_payload = match raw_payload {
             Some(data) => data,
             None if remote_object_visible => Bytes::new(),
             None => {
-                // Block data is missing from cache. If remote already has
-                // this object, we can still continue with commit reconcile.
+                // Block data is missing from the persisted local backend. If
+                // remote already has this object, we can still continue with
+                // commit reconcile.
                 if op.retry_count > 0 {
                     let checks = fragment_keys.iter().map(|key| {
                         let cancel_token = upload_cancel_token.clone();
@@ -10181,7 +10123,7 @@ impl StudioVfs {
                             ino = op.ino,
                             block_index,
                             retry_count = op.retry_count,
-                            "upload reconcile: cache entry missing but remote object exists"
+                            "upload reconcile: local backend missing block but remote object exists"
                         );
                         remote_object_visible = true;
                         Bytes::new()
@@ -10200,13 +10142,13 @@ impl StudioVfs {
                             return Ok(());
                         }
                         return Err(VfsError::Other(format!(
-                            "object {} missing from cache",
+                            "object {} missing from local block backend",
                             op.object_id
                         )));
                     }
                 } else {
-                    // First attempt without cache data is unexpected; retry
-                    // through normal error path.
+                    // First attempt without a local persisted block is
+                    // unexpected; retry through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                         self.block_cache.cancel_upload(&op, false);
                         self.block_store_remove_async(op.object_id).await?;
@@ -10218,7 +10160,7 @@ impl StudioVfs {
                         return Ok(());
                     }
                     return Err(VfsError::Other(format!(
-                        "object {} missing from cache",
+                        "object {} missing from local block backend",
                         op.object_id
                     )));
                 }
