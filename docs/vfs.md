@@ -19,6 +19,7 @@ Holds all runtime state:
 | `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
+| `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides BlockStore-specific internals |
 | `block_cache` | `Arc<BlockCache>` | Cache-v2 compatibility shim: upload-queue orchestration and lightweight hot payload staging |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
@@ -254,6 +255,7 @@ Adaptive upload control:
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
 - upload workers probe L1 before taking upload local-I/O slots, and true L2 fallback rereads are deferred while foreground demand is active.
 - upload fallback rereads call `BlockStore::get_for_upload`, which emits a best-effort `DONT_NEED` advisory after successful local reread; on Linux this hint is issued for the full block span from block-aligned offset.
+- upload fallback rereads intentionally do not update LRU recency, so upload churn does not pollute foreground read hotness.
 - recovered dirty uploads (replayed from `BlockStore` flags) and staging evictions still fall back to normal cache rereads when needed, so L2 remains the correctness fallback rather than the hot path.
 - local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
 - QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.

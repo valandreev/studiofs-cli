@@ -52,7 +52,9 @@ use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::metrics::CacheMetrics;
-use studiofs_cache::v2::{BlockStore, BlockStoreConfig, derive_block_store_volume_uuid};
+use studiofs_cache::v2::{
+    BlockStore, BlockStoreConfig, LocalBlockBackend, derive_block_store_volume_uuid,
+};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -61,8 +63,8 @@ use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 use studiofs_meta::engine::BatchFlushEntry;
 use studiofs_meta::schema::{DirEntry, ROOT_INO, SetattrArgs, UploadState as MetaUploadState};
 use studiofs_meta::types::{
-    AccessLevel, BlockFlags, BlockRef, FileType, Ino, InodeAttr, block_index_from_offset,
-    offset_within_block,
+    AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
+    block_index_from_offset, offset_within_block,
 };
 use studiofs_meta::{AsyncMetaEngine, MetaEngine, MetaError, MetaResult, SyncMetaEngineAdapter};
 use thiserror::Error;
@@ -7164,6 +7166,11 @@ impl StudioVfs {
         &self.block_store
     }
 
+    /// Shared reference to the local block backend contract.
+    pub fn local_block_backend(&self) -> &(dyn LocalBlockBackend + 'static) {
+        self.block_store.as_ref()
+    }
+
     /// Shared reference to the fetch scheduler.
     pub fn fetch_scheduler(&self) -> &Arc<crate::fetch::FetchScheduler> {
         &self.fetch_scheduler
@@ -7607,9 +7614,9 @@ impl StudioVfs {
                 }
                 block_ref.length = last_block_offset + 1;
                 if block_ref.length < self.block_size {
-                    block_ref.flags |= BlockFlags::PARTIAL_BLOCK;
+                    block_ref.flags |= MetaBlockFlags::PARTIAL_BLOCK;
                 } else {
-                    block_ref.flags.remove(BlockFlags::PARTIAL_BLOCK);
+                    block_ref.flags.remove(MetaBlockFlags::PARTIAL_BLOCK);
                 }
                 self.sync_meta()
                     .set_file_block(ino, new_last_block, &block_ref)?;

@@ -51,6 +51,9 @@ use crate::v2::format::{
     alloc_size_for,
 };
 use crate::v2::index::{BlockFlags, BlockIndex, PersistedIndexEntry, RemovedEntry};
+use crate::v2::local_block_backend::{
+    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState,
+};
 use crate::v2::mmap_reader::MmapReader;
 use crate::v2::persistence::{self, WalAppender};
 use crate::v2::platform;
@@ -473,6 +476,10 @@ impl BlockStore {
     ///
     /// On a hit, moves the block to the MRU position in the LRU list.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
+        self.get_inner(object_id, true)
+    }
+
+    fn get_inner(&self, object_id: u64, touch_lru: bool) -> Option<Bytes> {
         let started = Instant::now();
         // Phase 1: copy entry metadata under the index lock (no I/O inside lock).
         let (offset, data_size, checksum) = {
@@ -519,7 +526,7 @@ impl BlockStore {
             }
         }
 
-        // Phase 3: revalidate metadata and touch LRU under the index lock.
+        // Phase 3: revalidate metadata and optionally touch LRU under index lock.
         //
         // This closes an ABA window where the on-disk region at `offset` could
         // have been freed and reallocated to a different object between the
@@ -542,7 +549,9 @@ impl BlockStore {
                 return None;
             }
 
-            idx.touch(object_id);
+            if touch_lru {
+                idx.touch(object_id);
+            }
         }
 
         self.hit_count.fetch_add(1, Ordering::Relaxed);
@@ -629,7 +638,8 @@ impl BlockStore {
     /// Read a block for upload fallback and hint the OS that the pages can be
     /// dropped from cache afterwards where supported.
     pub fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
-        let data = self.get(object_id)?;
+        // Upload rereads should not pollute foreground-read recency.
+        let data = self.get_inner(object_id, false)?;
         self.advise_dont_need(object_id);
         Some(data)
     }
@@ -1046,6 +1056,27 @@ impl BlockStore {
     /// Snapshot dirty object ids in deterministic oldest-first order.
     pub fn dirty_object_ids(&self) -> Vec<u64> {
         self.index.lock().dirty_object_ids()
+    }
+
+    /// Returns true when the current block flags allow eviction.
+    pub fn is_evictable(&self, object_id: u64) -> bool {
+        self.index
+            .lock()
+            .get(object_id)
+            .is_some_and(|entry| entry.flags.is_evictable())
+    }
+
+    /// Return current lifecycle state for `object_id`.
+    pub fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        let flags = self.index.lock().get(object_id).map(|entry| entry.flags);
+        match flags {
+            None => LocalBlockLifecycleState::Missing,
+            Some(flags) if flags.contains(BlockFlags::UPLOADING) => {
+                LocalBlockLifecycleState::Uploading
+            }
+            Some(flags) if flags.contains(BlockFlags::DIRTY) => LocalBlockLifecycleState::Dirty,
+            Some(_) => LocalBlockLifecycleState::Uploaded,
+        }
     }
 
     /// Total cache hits since open.
@@ -1834,6 +1865,85 @@ impl BlockStore {
     }
 }
 
+impl From<BlockStoreError> for LocalBlockBackendError {
+    fn from(value: BlockStoreError) -> Self {
+        match value {
+            BlockStoreError::Io(error) => Self::Io(error),
+            BlockStoreError::CacheFull { needed, free, .. } => {
+                Self::CapacityExhausted { needed, free }
+            }
+            other => Self::Other(Box::new(other)),
+        }
+    }
+}
+
+impl LocalBlockBackend for BlockStore {
+    fn get(&self, object_id: u64) -> Option<Bytes> {
+        BlockStore::get(self, object_id)
+    }
+
+    fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+        BlockStore::read_into(self, object_id, data_offset, out)
+    }
+
+    fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+        BlockStore::get_for_upload(self, object_id)
+    }
+
+    fn contains(&self, object_id: u64) -> bool {
+        BlockStore::contains(self, object_id)
+    }
+
+    fn advise_will_need(&self, object_id: u64) {
+        BlockStore::advise_will_need(self, object_id);
+    }
+
+    fn put(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+    ) -> Result<(), LocalBlockBackendError> {
+        BlockStore::put(self, object_id, data, evictable).map_err(Into::into)
+    }
+
+    fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+        BlockStore::sync_data(self).map_err(Into::into)
+    }
+
+    fn mark_uploading(&self, object_id: u64) {
+        BlockStore::mark_uploading(self, object_id);
+    }
+
+    fn mark_upload_failed(&self, object_id: u64) {
+        BlockStore::mark_upload_failed(self, object_id);
+    }
+
+    fn mark_uploaded(&self, object_id: u64) {
+        BlockStore::mark_evictable(self, object_id);
+    }
+
+    fn remove(&self, object_id: u64) {
+        BlockStore::remove(self, object_id);
+    }
+
+    fn remove_batch(&self, object_ids: &[u64]) {
+        BlockStore::remove_batch(self, object_ids);
+    }
+
+    fn dirty_object_ids(&self) -> Vec<u64> {
+        BlockStore::dirty_object_ids(self)
+    }
+
+    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        BlockStore::lifecycle_state(self, object_id)
+    }
+
+    fn is_evictable(&self, object_id: u64) -> bool {
+        BlockStore::is_evictable(self, object_id)
+    }
+}
+
 impl Drop for BlockStore {
     fn drop(&mut self) {
         if self.synced.load(Ordering::Relaxed) {
@@ -1857,6 +1967,7 @@ mod tests {
 
     use super::*;
     use crate::v2::format::{PAGE_SIZE, SUPERBLOCK_SIZE};
+    use crate::v2::local_block_backend::contract_tests::assert_local_block_backend_contract;
     use crate::v2::persistence::{WAL_HEADER_SIZE, WAL_RECORD_SIZE};
     use tempfile::TempDir;
 
@@ -2249,6 +2360,33 @@ mod tests {
             .expect("upload reread should still return payload");
         assert_eq!(&got[..], b"payload");
         assert_eq!(store.advisory_dont_need_count(), before + 1);
+    }
+
+    #[test]
+    fn get_for_upload_does_not_touch_lru() {
+        let dir = TempDir::new().unwrap();
+        let config = BlockStoreConfig {
+            cache_dir: dir.path().to_path_buf(),
+            max_size: SUPERBLOCK_SIZE + 3 * format::PAGE_SIZE,
+            volume_uuid: [0xC3; 16],
+        };
+        let store = BlockStore::open(config).unwrap();
+
+        store.put(1, b"a", true).unwrap();
+        store.put(2, b"b", true).unwrap();
+        store.put(3, b"c", true).unwrap();
+
+        let _ = store.get_for_upload(1).expect("upload reread must succeed");
+
+        // If upload reread touched LRU, object 2 would be evicted here.
+        store.put(4, b"d", true).unwrap();
+        assert!(
+            !store.contains(1),
+            "upload reread must not refresh LRU recency"
+        );
+        assert!(store.contains(2));
+        assert!(store.contains(3));
+        assert!(store.contains(4));
     }
 
     #[test]
@@ -2894,5 +3032,14 @@ mod tests {
         for i in (0u64..100).step_by(2) {
             assert!(store.contains(i));
         }
+    }
+
+    #[test]
+    fn local_block_backend_contract() {
+        assert_local_block_backend_contract(|| {
+            let dir = TempDir::new().unwrap();
+            let store = BlockStore::open(test_config(&dir)).unwrap();
+            (store, dir)
+        });
     }
 }

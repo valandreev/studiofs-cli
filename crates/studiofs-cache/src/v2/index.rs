@@ -239,6 +239,11 @@ impl BlockIndex {
     }
 
     /// Snapshot dirty object ids in deterministic oldest-first order.
+    ///
+    /// Complexity: O(total_blocks) because this filters the full LRU ordering.
+    /// This keeps ordering deterministic without extra index maintenance; if
+    /// dirty blocks become sparse at very large cache sizes, consider a
+    /// dedicated dirty-order structure.
     pub fn dirty_object_ids(&self) -> Vec<u64> {
         let mut object_ids = Vec::with_capacity(self.dirty_count as usize);
         unsafe {
