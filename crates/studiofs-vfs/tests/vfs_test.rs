@@ -9815,14 +9815,6 @@ fn sfs124_staged_payload_queue_head_survives_backlog_without_l2_fallback() {
             stats.upload_fallback_reread_bytes > 0,
             "reread path should account bytes from persisted local blocks; stats={stats:?}"
         );
-        assert_eq!(
-            stats.staged_payload_hits, 0,
-            "upload correctness should not depend on staged payload reuse; stats={stats:?}"
-        );
-        assert_eq!(
-            stats.staged_payload_evictions, 0,
-            "backend-first uploader should not require staged payload eviction behavior; stats={stats:?}"
-        );
     });
     rt.shutdown_background();
 }

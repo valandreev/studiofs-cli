@@ -1,8 +1,9 @@
 //! Adaptive Memory Budget Controller (SFS-130).
 //!
 //! `MemoryEnvelope` is a background coordinator that distributes a global memory
-//! budget across four elastic subsystems (L1 cache, transit buffer, dirty buffer,
-//! staged upload).  It runs a 1-second tick loop that:
+//! budget across elastic subsystems (L1 cache, transit buffer, dirty buffer,
+//! plus a reserved upload-staging slice for future tuning). It runs a 1-second
+//! tick loop that:
 //!
 //!  1. **Observes** pressure signals from existing atomic counters.
 //!  2. **Decides** the workload phase and grant size.
@@ -119,11 +120,9 @@ pub struct SubsystemFloors {
 impl SubsystemFloors {
     /// Compute floors from the block size and upload worker count.
     ///
-    /// The staged floor must match the effective minimum of
-    /// `UploadPayloadStage::retarget`, which clamps to
-    /// `block_size × upload_workers × 4`.  Using a lower floor here would
-    /// create a dead zone where the envelope cannot actually shrink staged
-    /// below the stage's internal clamp.
+    /// The staged floor reserves headroom for upload-side buffering knobs.
+    /// Today this reservation is not actively applied in `StudioVfs`, but we
+    /// keep the envelope shape stable for follow-up tuning work.
     pub fn new(block_size: u64, upload_worker_count: usize) -> Self {
         let dispatch_capacity = upload_worker_count.max(1) as u64 * 4;
         Self {
@@ -584,7 +583,7 @@ impl MemoryEnvelope {
         l1: u64,
         transit: u64,
         dirty: u64,
-        staged: u64,
+        _staged: u64,
         signals: &PressureSignals,
         vfs: &StudioVfs,
     ) {
@@ -609,8 +608,8 @@ impl MemoryEnvelope {
             .min(12 * 1024 * 1024 * 1024); // 12 GB legacy cap
         vfs.set_max_dirty_bytes(effective_dirty as usize);
 
-        // Staged upload.
-        vfs.retarget_staged_upload(staged as usize);
+        // Staged upload reservation is currently inert: uploader correctness
+        // is sourced from persisted local blocks, not transient staged payloads.
 
         // ── Adaptive prefetch timeout ──
         self.adjust_prefetch_timeout(signals);
@@ -650,7 +649,6 @@ impl MemoryEnvelope {
         self.transit_budget
             .set_budget_bytes(self.floors.transit as usize);
         vfs.set_max_dirty_bytes(self.floors.dirty as usize);
-        vfs.retarget_staged_upload(self.floors.staged as usize);
 
         // Aggressive prefetch cutoff.
         self.fetch_scheduler.set_prefetch_acquire_wait_ms(0);
