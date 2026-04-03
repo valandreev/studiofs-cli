@@ -1980,6 +1980,25 @@ impl MetaBlocks for PgMetaEngine {
         self.local.get_file_blocks(ino)
     }
 
+    fn lookup_regular_file_chunk_slices(
+        &self,
+        ino: Ino,
+        chunk_id: ChunkId,
+        chunk_range: SliceRange,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        self.local
+            .lookup_regular_file_chunk_slices(ino, chunk_id, chunk_range)
+    }
+
+    fn lookup_regular_file_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        self.local.lookup_regular_file_slices(ino, offset, length)
+    }
+
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
         self.mutate(|local| local.remove_file_blocks(ino))
     }
@@ -2023,6 +2042,20 @@ impl MetaBlocks for PgMetaEngine {
     ) -> MetaResult<bool> {
         let result = self.mutate(|local| {
             local.publish_file_manifest_if_matches(ino, expected_epoch, expected_manifest)
+        });
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+
+    fn publish_regular_file_overlay_to_base_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+    ) -> MetaResult<bool> {
+        let result = self.mutate(|local| {
+            local.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
         });
         if matches!(result, Ok(true)) {
             self.request_pending_flush();

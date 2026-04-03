@@ -339,6 +339,30 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Get all block references for a file.
     fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
 
+    /// Resolve merged regular-file slice coverage for one chunk-local range.
+    ///
+    /// Implementations must apply deterministic precedence:
+    /// - local overlay over remote-visible base
+    /// - later `SliceOrder` wins within a tier
+    /// - tombstones mask lower-precedence slices
+    fn lookup_regular_file_chunk_slices(
+        &self,
+        ino: Ino,
+        chunk_id: ChunkId,
+        chunk_range: SliceRange,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>>;
+
+    /// Resolve merged regular-file slice coverage for a file range.
+    ///
+    /// `offset` and `length` are byte offsets in file coordinates. The returned
+    /// spans are chunk-local and include chunk identity.
+    fn lookup_regular_file_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>>;
+
     /// Remove all blocks for a file (used when deleting).
     /// Returns the list of removed block IDs for GC.
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>;
@@ -425,6 +449,17 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         ino: Ino,
         expected_epoch: u64,
         expected_manifest: &[(u32, BlockRef)],
+    ) -> MetaResult<bool>;
+
+    /// Promote the local regular-file overlay graph to the remote-visible base
+    /// graph for a specific inode/content epoch.
+    ///
+    /// Returns `Ok(true)` when promotion succeeds and `Ok(false)` when
+    /// preconditions fail (inode missing or epoch mismatch).
+    fn publish_regular_file_overlay_to_base_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
     ) -> MetaResult<bool>;
 }
 

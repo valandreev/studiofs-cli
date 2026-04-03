@@ -9,6 +9,7 @@
 //! - All metadata in redb, S3 stores only raw data blocks
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
@@ -475,6 +476,18 @@ impl SliceRange {
     pub fn contains(self, offset: u32) -> bool {
         self.start <= offset && offset < self.end
     }
+
+    /// Returns `true` when two ranges overlap.
+    pub fn intersects(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+
+    /// Returns the intersection between two ranges.
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let start = self.start.max(other.start);
+        let end = self.end.min(other.end);
+        Self::new(start, end)
+    }
 }
 
 /// Lifecycle state attached to a slice's block reference.
@@ -647,6 +660,188 @@ pub struct RegularFileState {
     pub overlay: RegularFileOverlayState,
     #[serde(default)]
     pub base: RegularFileBaseState,
+}
+
+/// Visibility tier that produced a resolved slice span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedSliceSource {
+    Overlay,
+    Base,
+    OverlayTombstone,
+    BaseTombstone,
+    Hole,
+}
+
+/// Deterministic resolved span for one chunk-local byte range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSliceSpan {
+    /// Chunk containing this span.
+    pub chunk_id: ChunkId,
+    /// Chunk-relative covered range.
+    pub range: SliceRange,
+    /// Source tier that won this range.
+    pub source: ResolvedSliceSource,
+    /// Winning slice id when the span comes from a slice.
+    #[serde(default)]
+    pub slice_id: Option<SliceId>,
+    /// Winning slice order when the span comes from a slice.
+    #[serde(default)]
+    pub slice_order: Option<SliceOrder>,
+    /// Block ref backing the span, when data-bearing.
+    #[serde(default)]
+    pub block: Option<BlockRef>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolveTier {
+    Overlay,
+    Base,
+}
+
+#[derive(Debug, Clone)]
+struct ResolveCandidate {
+    tier: ResolveTier,
+    slice_id: SliceId,
+    slice_order: SliceOrder,
+    range: SliceRange,
+    block: Option<BlockRef>,
+}
+
+impl ResolveCandidate {
+    fn source(&self) -> ResolvedSliceSource {
+        match (self.tier, self.block.as_ref()) {
+            (ResolveTier::Overlay, Some(_)) => ResolvedSliceSource::Overlay,
+            (ResolveTier::Base, Some(_)) => ResolvedSliceSource::Base,
+            (ResolveTier::Overlay, None) => ResolvedSliceSource::OverlayTombstone,
+            (ResolveTier::Base, None) => ResolvedSliceSource::BaseTombstone,
+        }
+    }
+
+    fn precedence_key(&self) -> (u8, u64, u64) {
+        let tier = match self.tier {
+            ResolveTier::Overlay => 2,
+            ResolveTier::Base => 1,
+        };
+        (tier, self.slice_order.0, self.slice_id.0)
+    }
+}
+
+fn push_candidate_set(
+    out: &mut Vec<ResolveCandidate>,
+    chunk: Option<&RegularFileChunkState>,
+    tier: ResolveTier,
+    query: SliceRange,
+) {
+    let Some(chunk) = chunk else {
+        return;
+    };
+    for slice in chunk.slices.values() {
+        if let Some(range) = slice.range.intersection(query) {
+            out.push(ResolveCandidate {
+                tier,
+                slice_id: slice.slice_id,
+                slice_order: slice.order,
+                range,
+                block: slice.block.clone(),
+            });
+        }
+    }
+}
+
+fn subtract_range(base: SliceRange, cut: SliceRange, out: &mut Vec<SliceRange>) {
+    if let Some(overlap) = base.intersection(cut) {
+        if base.start < overlap.start
+            && let Some(left) = SliceRange::new(base.start, overlap.start)
+        {
+            out.push(left);
+        }
+        if overlap.end < base.end
+            && let Some(right) = SliceRange::new(overlap.end, base.end)
+        {
+            out.push(right);
+        }
+    } else {
+        out.push(base);
+    }
+}
+
+fn merge_adjacent_spans(mut spans: Vec<ResolvedSliceSpan>) -> Vec<ResolvedSliceSpan> {
+    spans.sort_by_key(|span| (span.chunk_id.0, span.range.start, span.range.end));
+    let mut merged: Vec<ResolvedSliceSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && last.chunk_id == span.chunk_id
+            && last.range.end == span.range.start
+            && last.source == span.source
+            && last.slice_id == span.slice_id
+            && last.slice_order == span.slice_order
+            && last.block == span.block
+        {
+            last.range.end = span.range.end;
+            continue;
+        }
+        merged.push(span);
+    }
+    merged
+}
+
+/// Resolve deterministic chunk-local coverage for a read query.
+///
+/// Rules:
+/// - overlay beats base
+/// - within each tier, later slice order wins
+/// - tombstones remove coverage before lower-precedence slices
+/// - uncovered bytes are returned as explicit hole spans
+pub fn resolve_chunk_slice_spans(
+    chunk_id: ChunkId,
+    query: SliceRange,
+    overlay: Option<&RegularFileChunkState>,
+    base: Option<&RegularFileChunkState>,
+) -> Vec<ResolvedSliceSpan> {
+    let mut candidates = Vec::new();
+    push_candidate_set(&mut candidates, overlay, ResolveTier::Overlay, query);
+    push_candidate_set(&mut candidates, base, ResolveTier::Base, query);
+    candidates.sort_by_key(|candidate| Reverse(candidate.precedence_key()));
+
+    let mut unresolved = vec![query];
+    let mut resolved = Vec::new();
+
+    for candidate in candidates {
+        if unresolved.is_empty() {
+            break;
+        }
+        let mut next_unresolved = Vec::new();
+        for pending in unresolved {
+            if let Some(overlap) = pending.intersection(candidate.range) {
+                subtract_range(pending, overlap, &mut next_unresolved);
+                resolved.push(ResolvedSliceSpan {
+                    chunk_id,
+                    range: overlap,
+                    source: candidate.source(),
+                    slice_id: Some(candidate.slice_id),
+                    slice_order: Some(candidate.slice_order),
+                    block: candidate.block.clone(),
+                });
+            } else {
+                next_unresolved.push(pending);
+            }
+        }
+        unresolved = next_unresolved;
+    }
+
+    for hole in unresolved {
+        resolved.push(ResolvedSliceSpan {
+            chunk_id,
+            range: hole,
+            source: ResolvedSliceSource::Hole,
+            slice_id: None,
+            slice_order: None,
+            block: None,
+        });
+    }
+
+    merge_adjacent_spans(resolved)
 }
 
 // =============================================================================
@@ -972,6 +1167,80 @@ mod tests {
         assert!(SliceRange::new(9, 3).is_none());
         assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE).is_some());
         assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE + 1).is_none());
+        let a = SliceRange::new(100, 300).expect("range a");
+        let b = SliceRange::new(250, 450).expect("range b");
+        assert!(a.intersects(b));
+        assert_eq!(a.intersection(b), SliceRange::new(250, 300));
+    }
+
+    #[test]
+    fn test_resolve_chunk_slice_spans_overlay_over_base_with_hole() {
+        let query = SliceRange::new(0, 8192).expect("query range");
+
+        let mut base_chunk = RegularFileChunkState::default();
+        base_chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 8192).expect("base range"),
+            BlockRef::new_partial(2001, 8192),
+        ));
+
+        let mut overlay_chunk = RegularFileChunkState::default();
+        overlay_chunk.insert_slice(SliceRecord::new(
+            SliceId(2),
+            SliceOrder(1),
+            SliceRange::new(1024, 3072).expect("overlay range"),
+            BlockRef::new_partial(2002, 2048),
+        ));
+        overlay_chunk.insert_slice(SliceRecord::tombstone(
+            SliceId(3),
+            SliceOrder(2),
+            SliceRange::new(4096, 5120).expect("tombstone range"),
+        ));
+
+        let spans =
+            resolve_chunk_slice_spans(ChunkId(0), query, Some(&overlay_chunk), Some(&base_chunk));
+        assert_eq!(spans.len(), 5);
+        assert_eq!(
+            spans[0].range,
+            SliceRange {
+                start: 0,
+                end: 1024
+            }
+        );
+        assert_eq!(spans[0].source, ResolvedSliceSource::Base);
+        assert_eq!(
+            spans[1].range,
+            SliceRange {
+                start: 1024,
+                end: 3072
+            }
+        );
+        assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
+        assert_eq!(
+            spans[2].range,
+            SliceRange {
+                start: 3072,
+                end: 4096
+            }
+        );
+        assert_eq!(spans[2].source, ResolvedSliceSource::Base);
+        assert_eq!(
+            spans[3].range,
+            SliceRange {
+                start: 4096,
+                end: 5120
+            }
+        );
+        assert_eq!(spans[3].source, ResolvedSliceSource::OverlayTombstone);
+        assert_eq!(
+            spans[4].range,
+            SliceRange {
+                start: 5120,
+                end: 8192
+            }
+        );
+        assert_eq!(spans[4].source, ResolvedSliceSource::Base);
     }
 
     #[test]
