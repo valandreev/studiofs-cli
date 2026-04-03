@@ -8,6 +8,7 @@ on:
 
 env:
   RUSTFLAGS: "-Dwarnings"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 # ─── Jobs ──────────────────────────────────────────────────────────────
 #
@@ -38,7 +39,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.REPO_READ_PAT }}
           fetch-depth: 0
@@ -106,7 +107,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.REPO_READ_PAT }}
           fetch-depth: 0
@@ -145,7 +146,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.REPO_READ_PAT }}
           fetch-depth: 0
@@ -187,7 +188,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.REPO_READ_PAT }}
           fetch-depth: 0
