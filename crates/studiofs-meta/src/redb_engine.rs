@@ -452,10 +452,8 @@ impl RedbMetaEngine {
         let engine = Self { db: Arc::new(db) };
         let _ = engine.recover_undo_logs()?;
 
-        // Check if migration is needed from format version 2 to 3
-        // Note: get_format_info returns NotFormatted for new databases before init_root is called
-        if let Ok(format_info) = engine.get_format_info() {
-            if format_info.format_version == 2 {
+        match engine.get_format_info() {
+            Ok(format_info) if format_info.format_version == 2 => {
                 info!("migrating metadata from format version 2 to 3");
                 engine.migrate_regular_files_to_chunk_slice_model()?;
 
@@ -463,9 +461,15 @@ impl RedbMetaEngine {
                 updated_format_info.format_version = 3;
                 engine.set_format_info(&updated_format_info)?;
                 info!("metadata migration completed successfully");
-            } else if format_info.format_version == 3 {
+            }
+            Ok(format_info) if format_info.format_version == 3 => {
                 engine.validate_migration_completed()?;
             }
+            Ok(_) => {}
+            Err(MetaError::NotFormatted) => {
+                debug!("new database (not yet formatted) — skipping migration check");
+            }
+            Err(e) => return Err(e),
         }
 
         Ok(engine)
@@ -540,7 +544,7 @@ impl RedbMetaEngine {
         }
 
         let mut pending_inodes: Vec<Ino> = Vec::with_capacity(BATCH_SIZE);
-        let mut last_ino: Option<Ino> = None;
+        let mut last_processed_key: Vec<u8> = Vec::new();
 
         loop {
             {
@@ -557,23 +561,24 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
 
                 for table in &[file_blocks, committed_blocks] {
-                    let start_key = last_ino
-                        .map(|ino| {
-                            let mut key = ino.to_le_bytes().to_vec();
-                            key.extend_from_slice(&0u32.to_le_bytes());
-                            key
-                        })
-                        .unwrap_or_default();
-
-                    let iter = table
-                        .iter()
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let iter = if last_processed_key.is_empty() {
+                        table
+                            .iter()
+                            .map_err(|e| MetaError::Storage(e.to_string()))?
+                    } else {
+                        table
+                            .range(last_processed_key.as_slice()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?
+                    };
 
                     for row in iter {
                         let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                         let key_bytes = key.value();
 
-                        if !start_key.is_empty() && key_bytes <= &start_key[..] {
+                        if !pending_inodes.is_empty()
+                            && !last_processed_key.is_empty()
+                            && key_bytes == &last_processed_key[..]
+                        {
                             continue;
                         }
 
@@ -603,12 +608,9 @@ impl RedbMetaEngine {
 
             self.migrate_inode_batch(pending_inodes.as_slice(), block_size)?;
 
-            last_ino = pending_inodes.last().copied();
+            let last_ino = *pending_inodes.last().unwrap();
+            last_processed_key = encode_file_block_key(last_ino, u32::MAX).to_vec();
             pending_inodes.clear();
-
-            if last_ino.is_none() {
-                break;
-            }
         }
 
         let txn = self
@@ -10482,5 +10484,83 @@ mod tests {
 
         // Validation should now fail
         assert!(engine.validate_migration_completed().is_err());
+    }
+
+    #[test]
+    fn test_migration_resume_after_interruption() {
+        use crate::schema::DEFAULT_BLOCK_SIZE;
+
+        let engine = temp_engine();
+
+        let v2_format_info = FormatInfo {
+            format_version: 2,
+            name: "test-vol".into(),
+            uuid: "abc-123".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "testbucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "test-volume/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&v2_format_info).unwrap();
+
+        let file1_attr = engine
+            .create_file(ROOT_INO, b"resume1.txt", 0, 0, 0o644)
+            .unwrap();
+        let file2_attr = engine
+            .create_file(ROOT_INO, b"resume2.txt", 0, 0, 0o644)
+            .unwrap();
+
+        let block1 = BlockRef::new_full(4001, DEFAULT_BLOCK_SIZE);
+        let block2 = BlockRef::new_full(4002, DEFAULT_BLOCK_SIZE);
+        engine.set_file_block(file1_attr.ino, 0, &block1).unwrap();
+        engine.set_file_block(file2_attr.ino, 0, &block2).unwrap();
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut migration_status = txn.open_table(MIGRATION_STATUS_TABLE).unwrap();
+            migration_status
+                .insert("regular_files_v2_to_v3", 1u8)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        engine.migrate_regular_files_to_chunk_slice_model().unwrap();
+
+        assert!(engine.get_file_blocks(file1_attr.ino).unwrap().is_empty());
+        assert!(engine.get_file_blocks(file2_attr.ino).unwrap().is_empty());
+
+        engine.validate_migration_completed().unwrap();
+
+        let txn = engine.db.begin_write().unwrap();
+        let file1_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file1_attr.ino,
+        )
+        .unwrap();
+        let file2_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            file2_attr.ino,
+        )
+        .unwrap();
+        txn.abort().unwrap();
+
+        assert_eq!(file1_overlay.len(), 1);
+        assert_eq!(file2_overlay.len(), 1);
+
+        let file1_chunk = file1_overlay.get(&ChunkId(0)).unwrap();
+        assert_eq!(file1_chunk.slices.len(), 1);
+        let slice = file1_chunk.slices.iter().next().unwrap().1;
+        assert_eq!(slice.block.as_ref().unwrap().object_id, 4001);
+
+        let file2_chunk = file2_overlay.get(&ChunkId(0)).unwrap();
+        assert_eq!(file2_chunk.slices.len(), 1);
+        let slice = file2_chunk.slices.iter().next().unwrap().1;
+        assert_eq!(slice.block.as_ref().unwrap().object_id, 4002);
     }
 }
