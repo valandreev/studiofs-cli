@@ -11473,7 +11473,7 @@ mod tests {
         );
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
-            validated.upload_worker_count, 4,
+            validated.upload_worker_count, 128,
             "validation should materialize upload worker default"
         );
     }
@@ -11523,7 +11523,7 @@ mod tests {
             DEFAULT_PREFETCH_CONCURRENCY_MIN
         );
         assert_eq!(validated.slab_flush_interval_ms, 1);
-        assert_eq!(validated.upload_worker_count, 4);
+        assert_eq!(validated.upload_worker_count, 128);
         assert_eq!(validated.principal, "*");
     }
 

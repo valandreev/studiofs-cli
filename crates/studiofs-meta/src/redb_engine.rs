@@ -462,10 +462,18 @@ impl RedbMetaEngine {
                 engine.set_format_info(&updated_format_info)?;
                 info!("metadata migration completed successfully");
             }
-            Ok(format_info) if format_info.format_version == 3 => {
-                engine.validate_migration_completed()?;
+            Ok(format_info) if format_info.format_version >= 3 => {
+                debug!(
+                    "format version {} is up to date",
+                    format_info.format_version
+                );
             }
-            Ok(_) => {}
+            Ok(info) => {
+                return Err(MetaError::Storage(format!(
+                    "unsupported format version: {}",
+                    info.format_version
+                )));
+            }
             Err(MetaError::NotFormatted) => {
                 debug!("new database (not yet formatted) — skipping migration check");
             }
@@ -547,21 +555,23 @@ impl RedbMetaEngine {
         let mut pending_set: HashSet<Ino> = HashSet::with_capacity(BATCH_SIZE);
         let mut last_processed_key: Vec<u8> = Vec::new();
 
-        loop {
-            {
-                let txn = self
-                    .db
-                    .begin_read()
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for table_name in &[FILE_BLOCKS_TABLE, COMMITTED_FILE_BLOCKS_TABLE] {
+            last_processed_key.clear();
 
-                let file_blocks = txn
-                    .open_table(FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let committed_blocks = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            loop {
+                pending_inodes.clear();
+                pending_set.clear();
 
-                for table in &[file_blocks, committed_blocks] {
+                {
+                    let txn = self
+                        .db
+                        .begin_read()
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                    let table = txn
+                        .open_table(*table_name)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+
                     let iter = if last_processed_key.is_empty() {
                         table
                             .iter()
@@ -586,23 +596,17 @@ impl RedbMetaEngine {
                             break;
                         }
                     }
-
-                    if pending_inodes.len() >= BATCH_SIZE {
-                        break;
-                    }
                 }
+
+                if pending_inodes.is_empty() {
+                    break;
+                }
+
+                self.migrate_inode_batch(pending_inodes.as_slice(), block_size)?;
+
+                last_processed_key =
+                    encode_file_block_key(*pending_inodes.last().unwrap(), u32::MAX).to_vec();
             }
-
-            if pending_inodes.is_empty() {
-                break;
-            }
-
-            self.migrate_inode_batch(pending_inodes.as_slice(), block_size)?;
-
-            last_processed_key =
-                encode_file_block_key(*pending_inodes.last().unwrap(), u32::MAX).to_vec();
-            pending_inodes.clear();
-            pending_set.clear();
         }
 
         let txn = self
@@ -772,6 +776,8 @@ impl RedbMetaEngine {
     }
 
     /// Validate that migration from v2 to v3 completed successfully.
+    /// Useful for manual recovery scenarios and debugging.
+    #[allow(dead_code)]
     fn validate_migration_completed(&self) -> MetaResult<()> {
         const MIGRATION_NAME: &str = "regular_files_v2_to_v3";
         const STATUS_COMPLETED: u8 = 2;
@@ -784,16 +790,36 @@ impl RedbMetaEngine {
         let migration_status = txn
             .open_table(MIGRATION_STATUS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let migration_completed = migration_status
+
+        debug!("checking migration status for {}", MIGRATION_NAME);
+
+        let migration_entry = migration_status
             .get(MIGRATION_NAME)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .map(|v| v.value() == STATUS_COMPLETED)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let migration_completed = migration_entry
+            .as_ref()
+            .map(|v| {
+                let status = v.value();
+                debug!(
+                    "migration status value: {} (expected: {})",
+                    status, STATUS_COMPLETED
+                );
+                status == STATUS_COMPLETED
+            })
             .unwrap_or(false);
 
+        debug!("migration_completed: {}", migration_completed);
+
         if !migration_completed {
-            return Err(MetaError::Storage(
-                "migration from format v2 to v3 did not complete successfully".to_string(),
-            ));
+            let reason = migration_entry
+                .as_ref()
+                .map(|v| format!("status={}", v.value()))
+                .unwrap_or_else(|| "not found".to_string());
+            return Err(MetaError::Storage(format!(
+                "migration from format v2 to v3 did not complete successfully ({})",
+                reason
+            )));
         }
 
         let file_blocks = txn
