@@ -158,8 +158,10 @@ pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            #[allow(clippy::unnecessary_cast)]
             let f_blocks: u64 = stat.f_blocks as u64;
             let f_frsize: u64 = stat.f_frsize as u64;
+            #[allow(clippy::unnecessary_cast)]
             let f_bavail: u64 = stat.f_bavail as u64;
 
             let total_bytes: u64 = f_blocks * f_frsize;
