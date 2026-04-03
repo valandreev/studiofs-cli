@@ -9754,9 +9754,8 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
     rt.shutdown_background();
 }
 
-/// Force a staged-payload backlog larger than the transient budget and verify
-/// the uploader still preserves queue-head payloads instead of immediately
-/// falling back to local rereads.
+/// Force an upload backlog and verify the uploader progresses via persisted
+/// local-block rereads instead of depending on transient staged payload state.
 #[test]
 fn sfs124_staged_payload_queue_head_survives_backlog_without_l2_fallback() {
     let tmp = tempfile::tempdir().unwrap();
@@ -9800,35 +9799,29 @@ fn sfs124_staged_payload_queue_head_survives_backlog_without_l2_fallback() {
 
         assert!(
             wait_until(Duration::from_secs(10), || {
-                vfs.foreground_read_protection_stats()
-                    .staged_payload_evictions
-                    > 0
-            })
-            .await,
-            "expected staged payload backlog to evict newer entries before queue-head upload"
-        );
-
-        assert!(
-            wait_until(Duration::from_secs(10), || {
                 let stats = vfs.foreground_read_protection_stats();
-                stats.staged_payload_hits > 0 || stats.upload_fallback_rereads > 0
+                stats.upload_fallback_rereads > 0
             })
             .await,
-            "expected at least one upload source decision"
+            "expected uploader to reread persisted local blocks under backlog"
         );
 
         let stats = vfs.foreground_read_protection_stats();
         assert!(
-            stats.staged_payload_evictions > 0,
-            "test setup must force staged backlog eviction; stats={stats:?}"
+            stats.upload_fallback_rereads > 0,
+            "upload backlog should trigger persisted local-block rereads; stats={stats:?}"
         );
         assert!(
-            stats.staged_payload_hits > 0,
-            "queue-head uploads should consume staged payload under backlog; stats={stats:?}"
+            stats.upload_fallback_reread_bytes > 0,
+            "reread path should account bytes from persisted local blocks; stats={stats:?}"
         );
         assert_eq!(
-            stats.upload_fallback_rereads, 0,
-            "queue-head backlog should not force immediate L2 fallback; stats={stats:?}"
+            stats.staged_payload_hits, 0,
+            "upload correctness should not depend on staged payload reuse; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.staged_payload_evictions, 0,
+            "backend-first uploader should not require staged payload eviction behavior; stats={stats:?}"
         );
     });
     rt.shutdown_background();
