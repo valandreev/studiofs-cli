@@ -542,8 +542,9 @@ impl MemoryEnvelope {
             // Not enough for floors — scale them down proportionally.
             let l1 = self.floors.l1.saturating_mul(allocatable) / floor_total;
             let transit = self.floors.transit.saturating_mul(allocatable) / floor_total;
-            let dirty = allocatable.saturating_sub(l1 + transit);
-            return (l1, transit, dirty);
+            let dirty = self.floors.dirty.saturating_mul(allocatable) / floor_total;
+            let dirty_rounding = allocatable.saturating_sub(l1 + transit + dirty);
+            return (l1, transit, dirty.saturating_add(dirty_rounding));
         }
 
         // Floors fit — give each subsystem its floor, then distribute the

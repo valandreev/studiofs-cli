@@ -9757,7 +9757,7 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
 /// Force an upload backlog and verify the uploader progresses via persisted
 /// local-block rereads instead of depending on transient staged payload state.
 #[test]
-fn sfs124_staged_payload_queue_head_survives_backlog_without_l2_fallback() {
+fn sfs124_upload_backlog_progresses_via_persisted_local_block_rereads() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");

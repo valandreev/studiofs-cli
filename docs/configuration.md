@@ -486,7 +486,7 @@ Upload local-I/O tuning notes:
 - upload workers source payload bytes from persisted local blocks (`BlockStore::get_for_upload`) after dequeue; upload correctness does not depend on transient staged buffers.
 - upload local-cache I/O slots are held only around that persisted reread phase and then released before remote upload work continues.
 - upload workers do not short-circuit through L1/staged payload probes; the persisted-source path is kept uniform so live uploads and startup replay share the same correctness model.
-- upload fallback rereads use `BlockStore::get_for_upload`, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
+- upload local rereads use `BlockStore::get_for_upload`, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
