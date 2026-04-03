@@ -289,6 +289,10 @@ Regular-file graph tables:
 - `SliceRange`
   - validated as chunk-relative half-open ranges and rejected if they cross the current chunk size
 
+Upgrade marker:
+- `migration_status["regular_files_v2_to_v3"] = 2` means the v2 -> v3 regular-file migration completed successfully.
+- That migration is additive: it backfills the chunk/slice tables and preserves the legacy flat block tables during the transition.
+
 Legacy block serving merges them as:
 - local staged block wins
 - otherwise fall back to committed block
