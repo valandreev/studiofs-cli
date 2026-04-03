@@ -6072,9 +6072,7 @@ impl MetaBlocks for RedbMetaEngine {
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed_manifest;
-
-        committed_manifest = {
+        let committed_manifest = {
             let mut inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
