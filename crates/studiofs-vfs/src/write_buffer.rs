@@ -353,7 +353,6 @@ impl StudioVfs {
         for block in &persisted_blocks {
             self.block_cache
                 .stage_l1(block.object_id, block.data.clone());
-            self.stage_upload_payload(block.object_id, block.data.clone());
             self.record_live_extent(ino, block.block_index, block.object_id, content_epoch);
         }
 
