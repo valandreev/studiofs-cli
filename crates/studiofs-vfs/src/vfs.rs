@@ -60,7 +60,7 @@ use studiofs_data::object::{
     parse_object_id_from_key,
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
-use studiofs_meta::engine::BatchFlushEntry;
+
 use studiofs_meta::schema::{DirEntry, ROOT_INO, SetattrArgs, UploadState as MetaUploadState};
 use studiofs_meta::types::{
     AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,

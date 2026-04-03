@@ -3415,6 +3415,8 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
                 crate::events::MetaEvent::RenameEntry { .. } => {}
                 crate::events::MetaEvent::SetFileBlock { .. } => {}
+                crate::events::MetaEvent::SetRegularFileOverlaySlices { .. } => {}
+
                 crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
                     let key = encode_file_block_key(*ino, *block_index);
                     let mut committed = txn
@@ -3773,6 +3775,7 @@ impl RedbMetaEngine {
                     let _ = table.remove(key.as_slice());
                 }
                 crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::SetRegularFileOverlaySlices { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::SetFileBlocksBatch { .. }
@@ -3946,6 +3949,7 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::SetRegularFileOverlaySlices { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::SetFileBlocksBatch { .. }
@@ -6056,6 +6060,112 @@ impl MetaBlocks for RedbMetaEngine {
     /// one transaction - reducing commit overhead by ~100-300x.
     fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
         self.flush_blocks_batch_with_attr_txn(entries, None)
+    }
+
+    fn flush_regular_file_overlay_slices(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        {
+            let mut overlay_table = txn
+                .open_table(REGULAR_FILE_OVERLAY_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let mut space_delta: i64 = 0;
+
+            for (chunk_id, new_slices) in chunk_slices {
+                let key = encode_regular_file_chunk_key(ino, *chunk_id);
+                let mut state = if let Some(entry) = overlay_table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    decode::<crate::schema::RegularFileChunkState>(entry.value())?
+                } else {
+                    crate::schema::RegularFileChunkState::default()
+                };
+
+                // Pre-calculate which existing slices are fully covered by the incoming ones.
+                // This bounds metadata growth and performs O(N*M) where N is incoming slices and M is existing in one chunk.
+                let mut fully_covered = Vec::new();
+                for (id, existing) in &state.slices {
+                    for new_slice in new_slices.iter() {
+                        if new_slice.range.start <= existing.range.start
+                            && new_slice.range.end >= existing.range.end
+                        {
+                            fully_covered.push(*id);
+                            break;
+                        }
+                    }
+                }
+
+                for id in fully_covered {
+                    if let Some(removed) = state.slices.remove(&id) {
+                        if let Some(block) = &removed.block {
+                            space_delta -= block.length as i64;
+                        }
+                    }
+                }
+
+                for mut new_slice in new_slices.iter().cloned() {
+                    let slice_id = state
+                        .try_alloc_slice_id()
+                        .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                    let slice_order = state
+                        .try_alloc_slice_order()
+                        .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+                    new_slice.slice_id = slice_id;
+                    new_slice.order = slice_order;
+
+                    if let Some(block) = &new_slice.block {
+                        space_delta += block.length as i64;
+                    }
+
+                    state.slices.insert(slice_id, new_slice);
+                }
+
+                let data = encode(&state)?;
+                overlay_table
+                    .insert(key.as_slice(), data.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            if space_delta != 0 {
+                let current_used = match counters
+                    .get(counters::USED_SPACE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    Some(v) => v.value(),
+                    None => 0,
+                };
+                counters
+                    .insert(
+                        counters::USED_SPACE,
+                        current_used.saturating_add_signed(space_delta),
+                    )
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+
+        Self::append_event_in_txn(
+            &txn,
+            &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                ino,
+                chunk_slices: chunk_slices.to_vec(),
+            },
+        )?;
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     fn commit_uploaded_block(
@@ -9190,6 +9300,104 @@ mod tests {
         txn.commit().unwrap();
 
         assert!(!engine.local_overlay_inodes().unwrap().contains(&ino));
+    }
+
+    #[test]
+    fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
+        let engine = temp_engine();
+
+        let attr = engine
+            .create_file(ROOT_INO, b"overlay-flush.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let chunk_id = ChunkId(11);
+        let chunk_key = encode_regular_file_chunk_key(ino, chunk_id);
+
+        let mut existing_slices = BTreeMap::new();
+        existing_slices.insert(
+            SliceId(3),
+            SliceRecord::new(
+                SliceId(3),
+                SliceOrder(8),
+                SliceRange::new(0, 4096).expect("valid existing slice"),
+                BlockRef::new_partial(601, 4096),
+            ),
+        );
+        let existing_chunk = RegularFileChunkState {
+            next_slice_id: SliceId(7),
+            next_slice_order: SliceOrder(11),
+            slices: existing_slices,
+            fragmentation: ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 0,
+                overlapping_slices: 0,
+                fragmented_bytes: 4096,
+            },
+        };
+        let existing_bytes = encode(&existing_chunk).expect("encode existing chunk");
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            overlay_table
+                .insert(chunk_key.as_slice(), existing_bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let incoming = vec![
+            SliceRecord {
+                slice_id: SliceId::default(),
+                order: SliceOrder::default(),
+                range: SliceRange::new(0, 4096).expect("valid replacement slice"),
+                block: Some(BlockRef::new_partial(701, 4096)),
+                block_state: BlockRefState::LocalOnly,
+            },
+            SliceRecord {
+                slice_id: SliceId::default(),
+                order: SliceOrder::default(),
+                range: SliceRange::new(4096, 8192).expect("valid appended slice"),
+                block: Some(BlockRef::new_partial(702, 4096)),
+                block_state: BlockRefState::LocalOnly,
+            },
+        ];
+
+        engine
+            .flush_regular_file_overlay_slices(ino, &[(chunk_id, incoming)])
+            .unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let row = overlay_table
+            .get(chunk_key.as_slice())
+            .unwrap()
+            .expect("flushed overlay row");
+        let chunk: RegularFileChunkState = decode(row.value()).expect("decode flushed chunk");
+
+        assert_eq!(chunk.next_slice_id, SliceId(9));
+        assert_eq!(chunk.next_slice_order, SliceOrder(13));
+        assert_eq!(chunk.slices.len(), 2);
+
+        let slices: Vec<_> = chunk.slices.values().collect();
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.slice_id)
+                .collect::<Vec<_>>(),
+            vec![SliceId(7), SliceId(8)]
+        );
+        assert_eq!(
+            slices.iter().map(|slice| slice.order).collect::<Vec<_>>(),
+            vec![SliceOrder(11), SliceOrder(12)]
+        );
+        assert_eq!(
+            slices[0].range,
+            SliceRange::new(0, 4096).expect("first flushed range")
+        );
+        assert_eq!(
+            slices[1].range,
+            SliceRange::new(4096, 8192).expect("second flushed range")
+        );
     }
 
     #[test]

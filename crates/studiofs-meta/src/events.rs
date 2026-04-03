@@ -69,6 +69,12 @@ pub enum MetaEvent {
         blocks: Vec<(u32, BlockRef)>,
     },
 
+    /// Set a batch of local overlay slices for a regular file.
+    SetRegularFileOverlaySlices {
+        ino: u64,
+        chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
+    },
+
     // ─── Target & Extended Attributes ────────────────────────────────────────
     /// Set a symlink target.
     SetSymlinkTarget { ino: u64, target: Vec<u8> },
@@ -123,6 +129,7 @@ impl MetaEvent {
             Self::SetFileBlocksBatch { .. } => "set_file_blocks_batch",
             Self::CommitFileBlock { .. } => "commit_file_block",
             Self::PublishFileManifest { .. } => "publish_file_manifest",
+            Self::SetRegularFileOverlaySlices { .. } => "set_regular_file_overlay_slices",
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",
@@ -157,6 +164,7 @@ impl MetaEvent {
             Self::SetFileBlocksBatch { blocks } => blocks.first().map(|(ino, _, _)| *ino),
             Self::CommitFileBlock { ino, .. } => Some(*ino),
             Self::PublishFileManifest { ino, .. } => Some(*ino),
+            Self::SetRegularFileOverlaySlices { ino, .. } => Some(*ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),
             Self::SetXattr { ino, .. } => Some(*ino),
             Self::RemoveXattr { ino, .. } => Some(*ino),

@@ -809,7 +809,7 @@ impl PgMetaEngine {
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
-            MetaEvent::SetFileBlock { .. } => false,
+            MetaEvent::SetFileBlock { .. } | MetaEvent::SetRegularFileOverlaySlices { .. } => false,
             MetaEvent::RemoveFileBlock { ino, .. } | MetaEvent::RemoveFileBlocks { ino } => {
                 if removed_inodes.contains(ino) {
                     return Ok(false);
@@ -867,6 +867,7 @@ impl PgMetaEngine {
             | MetaEvent::UpdateSnapshotState { .. } => true,
             MetaEvent::SetAttr { .. }
             | MetaEvent::SetFileBlock { .. }
+            | MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::SetFileBlocksBatch { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
@@ -959,6 +960,7 @@ impl PgMetaEngine {
                     }
                 }
                 MetaEvent::SetFileBlock { ino, .. }
+                | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
                 | MetaEvent::RemoveFileBlock { ino, .. }
                 | MetaEvent::RemoveFileBlocks { ino }
                 | MetaEvent::CommitFileBlock { ino, .. }
@@ -1064,6 +1066,7 @@ impl PgMetaEngine {
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
             MetaEvent::SetFileBlock { .. }
+            | MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveFileBlock { .. }
             | MetaEvent::RemoveFileBlocks { .. }
             | MetaEvent::SetFileBlocksBatch { .. }
@@ -2022,6 +2025,14 @@ impl MetaBlocks for PgMetaEngine {
         self.mutate(|local| local.flush_blocks_batch(entries))
     }
 
+    fn flush_regular_file_overlay_slices(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<()> {
+        self.mutate(|local| local.flush_regular_file_overlay_slices(ino, chunk_slices))
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,
@@ -2307,6 +2318,17 @@ impl crate::engine::MetaEngine for PgMetaEngine {
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Vec<BatchFlushResult>> {
         self.mutate(|local| local.flush_blocks_batch_with_attr(entries, attr))
+    }
+
+    fn flush_regular_file_overlay_slices_with_attr(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<()> {
+        self.mutate(|local| {
+            local.flush_regular_file_overlay_slices_with_attr(ino, chunk_slices, attr)
+        })
     }
 }
 

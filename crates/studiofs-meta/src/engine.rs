@@ -416,6 +416,16 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         Ok(results)
     }
 
+    /// Flush new local overlay slices for a regular file.
+    ///
+    /// The incoming slices are appended/merged into the overlay `RegularFileOverlayState`
+    /// for the specified chunks.
+    fn flush_regular_file_overlay_slices(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+    ) -> MetaResult<()>;
+
     /// Mark a block as remote-visible after its object upload has completed.
     ///
     /// Remote-backed engines can use this to publish block visibility and
@@ -630,5 +640,22 @@ pub trait MetaEngine:
             self.set_attr(attr)?;
         }
         Ok(results)
+    }
+
+    /// Flush local regular-file overlay slices and optionally inode attributes
+    /// in one logical foreground persist step.
+    ///
+    /// Backends should override this to make the operation atomic if possible.
+    fn flush_regular_file_overlay_slices_with_attr(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<()> {
+        self.flush_regular_file_overlay_slices(ino, chunk_slices)?;
+        if let Some(attr) = attr {
+            self.set_attr(attr)?;
+        }
+        Ok(())
     }
 }
