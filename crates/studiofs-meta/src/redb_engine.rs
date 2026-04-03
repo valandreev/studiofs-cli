@@ -102,6 +102,10 @@ const BASE_ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("b
 const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("acl_rule_tombstones");
 
+const REGULAR_FILE_MIGRATION_NAME: &str = "regular_files_v2_to_v3";
+const MIGRATION_STATUS_STARTED: u8 = 1;
+const MIGRATION_STATUS_COMPLETED: u8 = 2;
+
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
@@ -460,9 +464,11 @@ impl RedbMetaEngine {
                 let mut updated_format_info = format_info;
                 updated_format_info.format_version = 3;
                 engine.set_format_info(&updated_format_info)?;
+                engine.validate_migration_completed()?;
                 info!("metadata migration completed successfully");
             }
             Ok(format_info) if format_info.format_version >= 3 => {
+                engine.validate_migration_completed()?;
                 debug!(
                     "format version {} is up to date",
                     format_info.format_version
@@ -487,7 +493,8 @@ impl RedbMetaEngine {
     ///
     /// This migration is performed when upgrading from format version 2 to 3.
     /// It reads all FILE_BLOCKS entries, converts them to chunk/slice format,
-    /// and stores them in the new tables. The old entries are then removed.
+    /// and stores them in the new tables while keeping the legacy flat tables
+    /// populated for compatibility during the transition.
     ///
     /// Key design decisions (addressing review findings):
     /// - FILE_BLOCKS (uncommitted/local) → LocalOnly in OVERLAY table
@@ -495,15 +502,9 @@ impl RedbMetaEngine {
     /// - Batch processing (100 inodes per transaction) for efficiency
     /// - Streaming approach to minimize memory usage
     ///
-    /// Rollback: If migration fails or is interrupted, the system will detect this
-    /// during startup validation and refuse to start. Manual recovery requires:
-    /// 1. Restore from a pre-migration backup, or
-    /// 2. Manually clean up partial migration state and re-run migration, or
-    /// 3. Downgrade to a previous version that supports format v2.
+    /// Rollback is not supported in-place; interrupted upgrades are detected by
+    /// startup validation and can be resumed by rerunning the migration.
     fn migrate_regular_files_to_chunk_slice_model(&self) -> MetaResult<()> {
-        const MIGRATION_NAME: &str = "regular_files_v2_to_v3";
-        const STATUS_STARTED: u8 = 1;
-        const STATUS_COMPLETED: u8 = 2;
         const BATCH_SIZE: usize = 100;
 
         {
@@ -515,12 +516,15 @@ impl RedbMetaEngine {
                 .open_table(MIGRATION_STATUS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             if let Some(status) = migration_status
-                .get(MIGRATION_NAME)
+                .get(REGULAR_FILE_MIGRATION_NAME)
                 .map_err(|e| MetaError::Storage(e.to_string()))?
                 .map(|v| v.value())
             {
-                if status == STATUS_COMPLETED {
-                    debug!("migration {} already completed", MIGRATION_NAME);
+                if status == MIGRATION_STATUS_COMPLETED {
+                    debug!(
+                        "migration {} already completed",
+                        REGULAR_FILE_MIGRATION_NAME
+                    );
                     return Ok(());
                 }
             }
@@ -544,7 +548,7 @@ impl RedbMetaEngine {
                     .open_table(MIGRATION_STATUS_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
                 migration_status
-                    .insert(MIGRATION_NAME, STATUS_STARTED)
+                    .insert(REGULAR_FILE_MIGRATION_NAME, MIGRATION_STATUS_STARTED)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
             txn.commit()
@@ -618,7 +622,7 @@ impl RedbMetaEngine {
                 .open_table(MIGRATION_STATUS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             migration_status
-                .insert(MIGRATION_NAME, STATUS_COMPLETED)
+                .insert(REGULAR_FILE_MIGRATION_NAME, MIGRATION_STATUS_COMPLETED)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         txn.commit()
@@ -778,9 +782,6 @@ impl RedbMetaEngine {
     /// Useful for manual recovery scenarios and debugging.
     #[allow(dead_code)]
     fn validate_migration_completed(&self) -> MetaResult<()> {
-        const MIGRATION_NAME: &str = "regular_files_v2_to_v3";
-        const STATUS_COMPLETED: u8 = 2;
-
         let txn = self
             .db
             .begin_read()
@@ -790,10 +791,13 @@ impl RedbMetaEngine {
             .open_table(MIGRATION_STATUS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        debug!("checking migration status for {}", MIGRATION_NAME);
+        debug!(
+            "checking migration status for {}",
+            REGULAR_FILE_MIGRATION_NAME
+        );
 
         let migration_entry = migration_status
-            .get(MIGRATION_NAME)
+            .get(REGULAR_FILE_MIGRATION_NAME)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         let migration_completed = migration_entry
@@ -802,9 +806,9 @@ impl RedbMetaEngine {
                 let status = v.value();
                 debug!(
                     "migration status value: {} (expected: {})",
-                    status, STATUS_COMPLETED
+                    status, MIGRATION_STATUS_COMPLETED
                 );
-                status == STATUS_COMPLETED
+                status == MIGRATION_STATUS_COMPLETED
             })
             .unwrap_or(false);
 
@@ -821,37 +825,7 @@ impl RedbMetaEngine {
             )));
         }
 
-        let file_blocks = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed_blocks = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        if file_blocks
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .next()
-            .is_some()
-        {
-            return Err(MetaError::Storage(
-                "migration validation failed: FILE_BLOCKS table still contains entries".to_string(),
-            ));
-        }
-
-        if committed_blocks
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .next()
-            .is_some()
-        {
-            return Err(MetaError::Storage(
-                "migration validation failed: COMMITTED_FILE_BLOCKS table still contains entries"
-                    .to_string(),
-            ));
-        }
-
-        debug!("migration validation passed: no old block entries remain");
+        debug!("migration validation passed: completion marker is set");
         Ok(())
     }
 
@@ -5155,6 +5129,15 @@ impl MetaFormat for RedbMetaEngine {
             table
                 .insert("format", json.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            drop(table);
+            if info.format_version == CURRENT_FORMAT_VERSION {
+                let mut migration_status = txn
+                    .open_table(MIGRATION_STATUS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                migration_status
+                    .insert(REGULAR_FILE_MIGRATION_NAME, MIGRATION_STATUS_COMPLETED)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -7239,6 +7222,7 @@ mod tests {
             block_size: DEFAULT_BLOCK_SIZE,
         };
         engine.set_format_info(&info).unwrap();
+        engine.validate_migration_completed().unwrap();
         let loaded = engine.get_format_info().unwrap();
         assert_eq!(loaded.name, "test-vol");
         assert_eq!(loaded.endpoint, "http://localhost:9000");
@@ -10341,9 +10325,9 @@ mod tests {
         // Run migration
         engine.migrate_regular_files_to_chunk_slice_model().unwrap();
 
-        // Verify old blocks are gone
+        // Verify legacy blocks are preserved while the chunk/slice tables are backfilled
         let old_blocks_after = engine.get_file_blocks(file_attr.ino).unwrap();
-        assert_eq!(old_blocks_after.len(), 0);
+        assert_eq!(old_blocks_after, old_blocks);
 
         // Verify new chunk/slice data exists
         let txn = engine.db.begin_write().unwrap();
@@ -10439,8 +10423,7 @@ mod tests {
         assert_eq!(file1_overlay.len(), 1);
 
         // File 2: should also be single chunk since blocks are contiguous
-        // set_file_block writes to FILE_BLOCKS_TABLE, so after migration
-        // blocks go to REGULAR_FILE_OVERLAY_TABLE
+        // Migration backfills the overlay rows without removing legacy blocks.
         let file2_overlay = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
             &txn,
             REGULAR_FILE_OVERLAY_TABLE,
@@ -10487,14 +10470,12 @@ mod tests {
         // Validation should pass
         engine.validate_migration_completed().unwrap();
 
-        // Manually add back old block data to simulate incomplete migration
+        // Downgrade the upgrade marker to simulate an incomplete migration.
         let txn = engine.db.begin_write().unwrap();
         {
-            let mut file_blocks = txn.open_table(FILE_BLOCKS_TABLE).unwrap();
-            let key = encode_file_block_key(file_attr.ino, 0);
-            let encoded = encode(&block).unwrap();
-            file_blocks
-                .insert(key.as_slice(), encoded.as_slice())
+            let mut migration_status = txn.open_table(MIGRATION_STATUS_TABLE).unwrap();
+            migration_status
+                .insert(REGULAR_FILE_MIGRATION_NAME, MIGRATION_STATUS_STARTED)
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -10540,15 +10521,19 @@ mod tests {
         {
             let mut migration_status = txn.open_table(MIGRATION_STATUS_TABLE).unwrap();
             migration_status
-                .insert("regular_files_v2_to_v3", 1u8)
+                .insert(REGULAR_FILE_MIGRATION_NAME, MIGRATION_STATUS_STARTED)
                 .unwrap();
         }
         txn.commit().unwrap();
 
         engine.migrate_regular_files_to_chunk_slice_model().unwrap();
 
-        assert!(engine.get_file_blocks(file1_attr.ino).unwrap().is_empty());
-        assert!(engine.get_file_blocks(file2_attr.ino).unwrap().is_empty());
+        let file1_blocks = engine.get_file_blocks(file1_attr.ino).unwrap();
+        let file2_blocks = engine.get_file_blocks(file2_attr.ino).unwrap();
+        assert_eq!(file1_blocks.len(), 1);
+        assert_eq!(file2_blocks.len(), 1);
+        assert_eq!(file1_blocks[0].1.object_id, 4001);
+        assert_eq!(file2_blocks[0].1.object_id, 4002);
 
         engine.validate_migration_completed().unwrap();
 
