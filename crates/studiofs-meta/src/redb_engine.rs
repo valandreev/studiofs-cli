@@ -677,23 +677,6 @@ impl RedbMetaEngine {
         Ok(states)
     }
 
-    fn regular_file_chunk_state_from_read_txn(
-        txn: &redb::ReadTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
-        ino: Ino,
-        chunk_id: ChunkId,
-    ) -> MetaResult<Option<RegularFileChunkState>> {
-        let table = txn
-            .open_table(table_def)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let key = encode_regular_file_chunk_key(ino, chunk_id);
-        table
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .map(|value| decode(value.value()))
-            .transpose()
-    }
-
     fn regular_file_chunk_states_for_inode_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -894,6 +877,9 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<u64> {
+        // Publication semantics are "overlay becomes the new remote-visible
+        // base" for the inode, so base rows are reconciled to exactly match the
+        // normalized overlay graph.
         let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
             txn,
             REGULAR_FILE_OVERLAY_TABLE,
@@ -5348,18 +5334,23 @@ impl MetaBlocks for RedbMetaEngine {
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay = Self::regular_file_chunk_state_from_read_txn(
-            &txn,
-            REGULAR_FILE_OVERLAY_TABLE,
-            ino,
-            chunk_id,
-        )?;
-        let base = Self::regular_file_chunk_state_from_read_txn(
-            &txn,
-            REGULAR_FILE_BASE_TABLE,
-            ino,
-            chunk_id,
-        )?;
+        let overlay_table = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let key = encode_regular_file_chunk_key(ino, chunk_id);
+        let overlay: Option<RegularFileChunkState> = overlay_table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        let base: Option<RegularFileChunkState> = base_table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode(value.value()))
+            .transpose()?;
         Ok(resolve_chunk_slice_spans(
             chunk_id,
             chunk_range,
@@ -5384,6 +5375,12 @@ impl MetaBlocks for RedbMetaEngine {
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_table = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut spans = Vec::new();
         let mut cursor = offset;
         while cursor < end {
@@ -5396,18 +5393,17 @@ impl MetaBlocks for RedbMetaEngine {
             let query = SliceRange::new(start_in_chunk, end_in_chunk).ok_or_else(|| {
                 MetaError::Storage("invalid chunk-local lookup range".to_string())
             })?;
-            let overlay = Self::regular_file_chunk_state_from_read_txn(
-                &txn,
-                REGULAR_FILE_OVERLAY_TABLE,
-                ino,
-                chunk_id,
-            )?;
-            let base = Self::regular_file_chunk_state_from_read_txn(
-                &txn,
-                REGULAR_FILE_BASE_TABLE,
-                ino,
-                chunk_id,
-            )?;
+            let key = encode_regular_file_chunk_key(ino, chunk_id);
+            let overlay: Option<RegularFileChunkState> = overlay_table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            let base: Option<RegularFileChunkState> = base_table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| decode(value.value()))
+                .transpose()?;
             spans.extend(resolve_chunk_slice_spans(
                 chunk_id,
                 query,
@@ -5416,23 +5412,7 @@ impl MetaBlocks for RedbMetaEngine {
             ));
             cursor = query_end;
         }
-        spans.sort_by_key(|span| (span.chunk_id.0, span.range.start, span.range.end));
-        let mut merged: Vec<ResolvedSliceSpan> = Vec::with_capacity(spans.len());
-        for span in spans {
-            if let Some(last) = merged.last_mut()
-                && last.chunk_id == span.chunk_id
-                && last.range.end == span.range.start
-                && last.source == span.source
-                && last.slice_id == span.slice_id
-                && last.slice_order == span.slice_order
-                && last.block == span.block
-            {
-                last.range.end = span.range.end;
-                continue;
-            }
-            merged.push(span);
-        }
-        Ok(merged)
+        Ok(merge_adjacent_spans(spans))
     }
 
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
@@ -6770,6 +6750,73 @@ mod tests {
             }
         }
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_regular_file_prefix_scan_is_exact_per_inode() {
+        let engine = temp_engine();
+
+        let mut chunk_1 = RegularFileChunkState::default();
+        chunk_1.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid slice ino 1"),
+            BlockRef::new_partial(3001, 4096),
+        ));
+        let mut chunk_10 = RegularFileChunkState::default();
+        chunk_10.insert_slice(SliceRecord::new(
+            SliceId(2),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid slice ino 10"),
+            BlockRef::new_partial(3010, 4096),
+        ));
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            let key_1 = encode_regular_file_chunk_key(1, ChunkId(0));
+            let key_10 = encode_regular_file_chunk_key(10, ChunkId(0));
+            let bytes_1 = encode(&chunk_1).unwrap();
+            let bytes_10 = encode(&chunk_10).unwrap();
+            overlay
+                .insert(key_1.as_slice(), bytes_1.as_slice())
+                .unwrap();
+            overlay
+                .insert(key_10.as_slice(), bytes_10.as_slice())
+                .unwrap();
+        }
+
+        let only_1 = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            1,
+        )
+        .unwrap();
+        let only_10 = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(only_1.len(), 1);
+        assert_eq!(
+            only_1
+                .get(&ChunkId(0))
+                .expect("chunk for ino 1")
+                .slices
+                .len(),
+            1
+        );
+        assert_eq!(only_10.len(), 1);
+        assert_eq!(
+            only_10
+                .get(&ChunkId(0))
+                .expect("chunk for ino 10")
+                .slices
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -8864,6 +8911,38 @@ mod tests {
         );
         assert_eq!(published_attr.committed_content_epoch, 7);
         assert_eq!(published_attr.upload_state, UploadState::Ready);
+    }
+
+    #[test]
+    fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size() {
+        let engine = temp_engine();
+        let file = engine
+            .create_file(ROOT_INO, b"publish-sparse-tail.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.content_epoch = 5;
+        attr.size = 16 * 1024;
+        engine.set_attr(&attr).unwrap();
+
+        let mut overlay_chunk = RegularFileChunkState::default();
+        overlay_chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("valid sparse data slice"),
+            BlockRef::new_partial(2601, 4096),
+        ));
+        set_regular_file_chunk_rows(&engine, file.ino, &[(ChunkId(0), overlay_chunk)], &[]);
+
+        assert!(
+            engine
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 5)
+                .unwrap()
+        );
+
+        let published_attr = engine.get_attr(file.ino).unwrap();
+        assert_eq!(published_attr.size, 16 * 1024);
+        assert_eq!(published_attr.committed_size, 4096);
+        assert!(published_attr.committed_size < published_attr.size);
     }
 
     #[test]

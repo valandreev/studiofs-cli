@@ -771,7 +771,10 @@ fn subtract_range(base: SliceRange, cut: SliceRange, out: &mut Vec<SliceRange>) 
     }
 }
 
-fn merge_adjacent_spans(mut spans: Vec<ResolvedSliceSpan>) -> Vec<ResolvedSliceSpan> {
+/// Merge adjacent resolved spans with identical metadata.
+///
+/// Spans are sorted by `(chunk_id, start, end)` before merging.
+pub fn merge_adjacent_spans(mut spans: Vec<ResolvedSliceSpan>) -> Vec<ResolvedSliceSpan> {
     spans.sort_by_key(|span| (span.chunk_id.0, span.range.start, span.range.end));
     let mut merged: Vec<ResolvedSliceSpan> = Vec::with_capacity(spans.len());
     for span in spans {
