@@ -323,20 +323,23 @@ impl StudioVfs {
                         std::io::ErrorKind::InvalidInput,
                         format!(
                             "slice transcends chunk bounds: start={}, end={}, chunk={}",
-                            slice_start, slice_end, studiofs_meta::schema::DEFAULT_CHUNK_SIZE
+                            slice_start,
+                            slice_end,
+                            studiofs_meta::schema::DEFAULT_CHUNK_SIZE
                         ),
                     )));
                 }
 
-                let slice_range = match studiofs_meta::schema::SliceRange::new(slice_start, slice_end) {
-                    Some(range) => range,
-                    None => {
-                        return Err(crate::VfsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("invalid slice range {}..{}", slice_start, slice_end),
-                        )));
-                    }
-                };
+                let slice_range =
+                    match studiofs_meta::schema::SliceRange::new(slice_start, slice_end) {
+                        Some(range) => range,
+                        None => {
+                            return Err(crate::VfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("invalid slice range {}..{}", slice_start, slice_end),
+                            )));
+                        }
+                    };
 
                 let mut flags = studiofs_meta::schema::BlockFlags::empty();
                 if block.data.len() < self.block_size as usize {
