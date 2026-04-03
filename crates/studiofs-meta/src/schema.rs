@@ -480,11 +480,6 @@ impl SliceRange {
         self.start <= offset && offset < self.end
     }
 
-    /// Returns `true` when two ranges overlap.
-    pub fn intersects(self, other: Self) -> bool {
-        self.start < other.end && other.start < self.end
-    }
-
     /// Returns the intersection between two ranges.
     pub fn intersection(self, other: Self) -> Option<Self> {
         let start = self.start.max(other.start);
@@ -1179,7 +1174,6 @@ mod tests {
         assert!(SliceRange::new(0, DEFAULT_CHUNK_SIZE + 1).is_none());
         let a = SliceRange::new(100, 300).expect("range a");
         let b = SliceRange::new(250, 450).expect("range b");
-        assert!(a.intersects(b));
         assert_eq!(a.intersection(b), SliceRange::new(250, 300));
     }
 

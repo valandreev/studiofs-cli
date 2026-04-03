@@ -690,13 +690,11 @@ impl RedbMetaEngine {
         for row in table
             .range(prefix.as_ref()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
-            .take_while(|row| {
-                row.as_ref()
-                    .map(|(key, _)| key.value().starts_with(prefix.as_ref()))
-                    .unwrap_or(false)
-            })
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
             let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
             debug_assert_eq!(decoded_ino, ino);
             let chunk_state: RegularFileChunkState = decode(value.value())?;
@@ -797,16 +795,17 @@ impl RedbMetaEngine {
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = regular_file_chunk_prefix(ino);
-        let keys_to_remove: Vec<Vec<u8>> = table
+        let mut keys_to_remove = Vec::new();
+        for row in table
             .range(prefix.as_ref()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
-            .take_while(|row| {
-                row.as_ref()
-                    .map(|(key, _)| key.value().starts_with(prefix.as_ref()))
-                    .unwrap_or(false)
-            })
-            .filter_map(|row| row.ok().map(|(key, _)| key.value().to_vec()))
-            .collect();
+        {
+            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+            keys_to_remove.push(key.value().to_vec());
+        }
         for key in keys_to_remove {
             let _ = table
                 .remove(key.as_slice())
@@ -1987,13 +1986,11 @@ impl RedbMetaEngine {
         for row in table
             .range(prefix.as_ref()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
-            .take_while(|row| {
-                row.as_ref()
-                    .map(|(key, _)| key.value().starts_with(prefix.as_ref()))
-                    .unwrap_or(false)
-            })
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
             let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
             debug_assert_eq!(decoded_ino, ino);
             saw_row = true;
