@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use studiofs_data::store::DataStoreConfig;
 use studiofs_fuse::StudioFuseFs;
-use studiofs_meta::{CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine};
+use studiofs_meta::{
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
+};
 use studiofs_vfs::{StudioVfs, VfsConfig};
 use tempfile::tempdir;
 
@@ -60,22 +62,25 @@ fn test_macos_logic_smoke_virtual() {
     println!("FUSE Handshake (INIT) successful.");
 
     // 3. Simulate LOOKUP of root directory (inode 1)
-    // Note: Since we can't easily construct a Request, we might need a wrapper or 
-    // to just test components. But StudioFuseFs methods are public-ish? 
+    // Note: Since we can't easily construct a Request, we might need a wrapper or
+    // to just test components. But StudioFuseFs methods are public-ish?
     // No, they are trait implementations.
-    
-    // Actually, we can test the VFS logic on macOS directly in this test 
+
+    // Actually, we can test the VFS logic on macOS directly in this test
     // to ensure XAttrs and other platform-specific code paths pass.
-    
+
     #[cfg(target_os = "macos")]
     {
         println!("Verifying macOS-specific logic (XAttr, etc.)...");
         // Test resource fork handling in VFS directly since that's what the bridge uses.
-        let file = vfs.create(1, b"test.txt", 0, 0, 0o644).expect("create file");
+        let file = vfs
+            .create(1, b"test.txt", 0, 0, 0o644)
+            .expect("create file");
         let fork_name = b"com.apple.ResourceFork";
         let fork_data = b"RSRC_DATA";
-        
-        vfs.set_xattr(file.ino, fork_name, fork_data, 0).expect("set xattr");
+
+        vfs.set_xattr(file.ino, fork_name, fork_data, 0)
+            .expect("set xattr");
         let got = vfs.get_xattr(file.ino, fork_name).expect("get xattr");
         assert_eq!(got, Some(fork_data.to_vec()));
         println!("macOS ResourceFork xattr handling confirmed.");
