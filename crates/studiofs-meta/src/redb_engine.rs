@@ -6,7 +6,7 @@ use crate::engine::*;
 use crate::types::*;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
@@ -703,18 +703,19 @@ impl RedbMetaEngine {
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = regular_file_chunk_prefix(ino);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
         let mut chunks = BTreeMap::new();
         for row in table
-            .range(prefix.as_ref()..range_end.as_ref())
+            .range(prefix.as_ref()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
+            .take_while(|row| {
+                row.as_ref()
+                    .map(|(key, _)| key.value().starts_with(prefix.as_ref()))
+                    .unwrap_or(false)
+            })
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
-            if decoded_ino != ino {
-                break;
-            }
+            debug_assert_eq!(decoded_ino, ino);
             let chunk_state: RegularFileChunkState = decode(value.value())?;
             chunks.insert(chunk_id, chunk_state);
         }
@@ -730,16 +731,13 @@ impl RedbMetaEngine {
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = regular_file_chunk_prefix(ino);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
         let mut iter = table
-            .range(prefix.as_ref()..range_end.as_ref())
+            .range(prefix.as_ref()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         match iter.next() {
             Some(row) => {
                 let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                let (decoded_ino, _) = decode_regular_file_chunk_key(key.value());
-                Ok(decoded_ino == ino)
+                Ok(key.value().starts_with(prefix.as_ref()))
             }
             None => Ok(false),
         }
@@ -816,11 +814,21 @@ impl RedbMetaEngine {
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = regular_file_chunk_prefix(ino);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-        table
-            .retain_in(prefix.as_ref()..range_end.as_ref(), |_, _| false)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let keys_to_remove: Vec<Vec<u8>> = table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .take_while(|row| {
+                row.as_ref()
+                    .map(|(key, _)| key.value().starts_with(prefix.as_ref()))
+                    .unwrap_or(false)
+            })
+            .filter_map(|row| row.ok().map(|(key, _)| key.value().to_vec()))
+            .collect();
+        for key in keys_to_remove {
+            let _ = table
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -891,18 +899,42 @@ impl RedbMetaEngine {
             REGULAR_FILE_OVERLAY_TABLE,
             ino,
         )?;
-        Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
-        if !overlay_chunks.is_empty() {
-            let mut base = txn
-                .open_table(REGULAR_FILE_BASE_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for (chunk_id, chunk_state) in &overlay_chunks {
-                let key = encode_regular_file_chunk_key(ino, *chunk_id);
-                let normalized = Self::chunk_for_published_base(chunk_state);
-                let encoded = encode(&normalized)?;
-                base.insert(key.as_slice(), encoded.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let existing_base = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+
+        let mut desired_base = BTreeMap::new();
+        for (chunk_id, chunk_state) in &overlay_chunks {
+            desired_base.insert(*chunk_id, Self::chunk_for_published_base(chunk_state));
+        }
+
+        let mut stale_chunk_ids: BTreeSet<ChunkId> = existing_base.keys().copied().collect();
+        let mut base = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for (chunk_id, desired_chunk) in &desired_base {
+            stale_chunk_ids.remove(chunk_id);
+            let unchanged = existing_base
+                .get(chunk_id)
+                .is_some_and(|existing_chunk| existing_chunk == desired_chunk);
+            if unchanged {
+                continue;
             }
+
+            let key = encode_regular_file_chunk_key(ino, *chunk_id);
+            let encoded = encode(desired_chunk)?;
+            base.insert(key.as_slice(), encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+
+        for chunk_id in stale_chunk_ids {
+            let key = encode_regular_file_chunk_key(ino, chunk_id);
+            let _ = base
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         Ok(Self::regular_file_committed_size_from_chunks(
             &overlay_chunks,
@@ -1964,19 +1996,20 @@ impl RedbMetaEngine {
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = regular_file_chunk_prefix(ino);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
         let mut size = 0u64;
         let mut saw_row = false;
         for row in table
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_ref()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
+            .take_while(|row| {
+                row.as_ref()
+                    .map(|(key, _)| key.value().starts_with(prefix.as_ref()))
+                    .unwrap_or(false)
+            })
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
-            if decoded_ino != ino {
-                break;
-            }
+            debug_assert_eq!(decoded_ino, ino);
             saw_row = true;
             let chunk: RegularFileChunkState = decode(value.value())?;
             let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
@@ -5383,7 +5416,23 @@ impl MetaBlocks for RedbMetaEngine {
             ));
             cursor = query_end;
         }
-        Ok(spans)
+        spans.sort_by_key(|span| (span.chunk_id.0, span.range.start, span.range.end));
+        let mut merged: Vec<ResolvedSliceSpan> = Vec::with_capacity(spans.len());
+        for span in spans {
+            if let Some(last) = merged.last_mut()
+                && last.chunk_id == span.chunk_id
+                && last.range.end == span.range.start
+                && last.source == span.source
+                && last.slice_id == span.slice_id
+                && last.slice_order == span.slice_order
+                && last.block == span.block
+            {
+                last.range.end = span.range.end;
+                continue;
+            }
+            merged.push(span);
+        }
+        Ok(merged)
     }
 
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
@@ -5775,7 +5824,9 @@ impl MetaBlocks for RedbMetaEngine {
                 )?;
             }
 
-            attr.committed_size = regular_graph_committed_size.unwrap_or(attr.size);
+            attr.committed_size = regular_graph_committed_size
+                .map(|size| size.min(attr.size))
+                .unwrap_or(attr.size);
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
             let attr_data = encode(&attr)?;
@@ -5828,7 +5879,7 @@ impl MetaBlocks for RedbMetaEngine {
             }
 
             let committed_size = Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
-            attr.committed_size = committed_size;
+            attr.committed_size = committed_size.min(attr.size);
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
             let encoded = encode(&attr)?;

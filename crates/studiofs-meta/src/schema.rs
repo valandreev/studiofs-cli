@@ -718,6 +718,8 @@ impl ResolveCandidate {
         }
     }
 
+    // Higher tuple wins. `slice_id` is the deterministic tie-breaker when
+    // multiple slices share the same tier and order.
     fn precedence_key(&self) -> (u8, u64, u64) {
         let tier = match self.tier {
             ResolveTier::Overlay => 2,
