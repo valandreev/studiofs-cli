@@ -69,11 +69,15 @@ fn fuse_session_mount_and_drop_smoke() {
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let fs = StudioFuseFs::new(vfs, rt);
-    let options = vec![
-        fuser::MountOption::FSName("studiofs-test".into()),
-        fuser::MountOption::AutoUnmount,
-        fuser::MountOption::CUSTOM("foreground".into()),
-    ];
+    let mut options = vec![fuser::MountOption::FSName("studiofs-test".into())];
+    // On Linux, AutoUnmount in fuser v0.16 can implicitly add 'allow_other',
+    // which fails on CI. Since we just drop the session here (and move to next test
+    // or end), we either need it or we don't. For smoke tests, let's try to be minimal.
+    #[cfg(not(target_os = "linux"))]
+    options.push(fuser::MountOption::AutoUnmount);
+
+    #[cfg(target_os = "macos")]
+    options.push(fuser::MountOption::CUSTOM("foreground".into()));
 
     let session = fuser::Session::new(fs, mount_dir.path(), &options).expect("create FUSE session");
     drop(session);
@@ -136,10 +140,11 @@ fn fuse_mount_write_read_unmount_smoke() {
     let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
     let fs = StudioFuseFs::new(vfs, rt);
 
-    let options = vec![
-        fuser::MountOption::FSName("studiofs-smoke".into()),
-        fuser::MountOption::AutoUnmount,
-    ];
+    let mut options = vec![fuser::MountOption::FSName("studiofs-smoke".into())];
+    // Manually unmounting at the end of the test, so AutoUnmount is optional.
+    // On Linux CI, AutoUnmount may trigger 'allow_other' checks in fusermount3.
+    #[cfg(not(target_os = "linux"))]
+    options.push(fuser::MountOption::AutoUnmount);
 
     let mount_path = mount_dir.path().to_path_buf();
 
@@ -150,17 +155,21 @@ fn fuse_mount_write_read_unmount_smoke() {
         .expect("mount dir should exist before session creation")
         .dev();
 
+    println!("Creating FUSE session at {:?}...", mount_path);
     let mut session = fuser::Session::new(fs, &mount_path, &options).expect("create FUSE session");
     let mut unmount = session.unmount_callable();
 
     // Run the FUSE event loop in a background thread.
+    println!("Starting FUSE background loop...");
     let session_handle = std::thread::spawn(move || {
         if let Err(e) = session.run() {
             eprintln!("FUSE session error (may be normal during unmount): {e}");
         }
+        println!("FUSE background loop exited.");
     });
 
     // Poll until the FUSE filesystem is overlaid (device ID diverges from pre-mount value).
+    println!("Waiting for FUSE mount to become available...");
     // A plain is_ok() check would pass immediately because the temp dir already exists.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

@@ -119,6 +119,7 @@ jobs:
         run: brew install --cask macfuse
 
       - name: Check macFUSE status
+        id: macfuse-check
         run: |
           if [ -d "/Library/Filesystems/macfuse.fs" ]; then
             echo "macFUSE filesystem bundle is installed"
@@ -129,19 +130,22 @@ jobs:
           # Log the state for debugging.
           if kextstat 2>/dev/null | grep -qi fuse; then
             echo "macFUSE kext appears to be loaded"
+            echo "loaded=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::macFUSE kext does not appear to be loaded — mount may fail"
+            echo "loaded=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build FUSE smoke tests
         run: cargo test -p studiofs-fuse --test mount_sanity --no-run
 
       - name: Run FUSE smoke tests
+        if: steps.macfuse-check.outputs.loaded == 'true'
         run: cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
         timeout-minutes: 5
 
       - name: Capture test output on failure
-        if: failure()
+        if: failure() && steps.macfuse-check.outputs.loaded == 'true'
         run: |
           echo '### macOS FUSE Smoke Test Failure' >> $GITHUB_STEP_SUMMARY
           echo 'Test output is available in the "Run FUSE smoke tests" step log above.' >> $GITHUB_STEP_SUMMARY
@@ -170,9 +174,11 @@ jobs:
       - name: Verify WinFSP installation
         shell: pwsh
         run: |
-          $dll = "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll"
+          $bin = "C:\Program Files (x86)\WinFsp\bin"
+          $dll = "$bin\winfsp-x64.dll"
           if (Test-Path $dll) {
             Write-Output "WinFSP DLL found: $dll"
+            Write-Output "$bin" >> $env:GITHUB_PATH
           } else {
             Write-Error "WinFSP DLL not found at expected path"
             exit 1

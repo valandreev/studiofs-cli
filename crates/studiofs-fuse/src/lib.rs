@@ -46,8 +46,11 @@ fn build_mount_options(
     let mut options = vec![
         fuser::MountOption::FSName(volume_name.into()),
         fuser::MountOption::AutoUnmount,
-        fuser::MountOption::AllowOther,
     ];
+    if std::env::var("STUDIOFS_FUSE_ALLOW_OTHER").as_deref() == Ok("1") || cfg!(target_os = "macos")
+    {
+        options.push(fuser::MountOption::AllowOther);
+    }
     #[cfg(target_os = "macos")]
     {
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
