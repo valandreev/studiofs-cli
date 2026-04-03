@@ -139,10 +139,24 @@ jobs:
       - name: Build FUSE smoke tests
         run: cargo test -p studiofs-fuse --test mount_sanity --no-run
 
-      - name: Run FUSE smoke tests
-        if: steps.macfuse-check.outputs.loaded == 'true'
-        run: cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
+      - name: Run Virtualized macOS FUSE Logic Smoke
+        run: cargo test -p studiofs-fuse --test virtual_mount_test -- --nocapture
         timeout-minutes: 5
+
+      - name: Run optional Kernel FUSE smoke tests
+        if: steps.macfuse-check.outputs.loaded == 'true'
+        run: |
+          echo "Kernel extension loaded. Running system-level smoke test."
+          cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1
+        timeout-minutes: 5
+
+      - name: Report macOS Kernel Limitation
+        if: steps.macfuse-check.outputs.loaded == 'false'
+        run: |
+          echo "### macOS FUSE CI Notice" >> $GITHUB_STEP_SUMMARY
+          echo "Standard GitHub-hosted macOS runners do not support third-party kernel extensions (KEXTs)." >> $GITHUB_STEP_SUMMARY
+          echo "The **Virtualized FUSE Logic Smoke** was executed instead to verify all StudioFS bridge logic." >> $GITHUB_STEP_SUMMARY
+          echo "System-level mount tests are recommended for local or self-hosted environments." >> $GITHUB_STEP_SUMMARY
 
       - name: Capture test output on failure
         if: failure() && steps.macfuse-check.outputs.loaded == 'true'

@@ -162,9 +162,9 @@ pub fn get_free_disk_space(path: &Path) -> Option<(u64, u64)> {
             let f_frsize: u64 = stat.f_frsize as u64;
             let f_bavail: u64 = stat.f_bavail as u64;
 
-            let total = f_blocks * f_frsize;
-            let free = f_bavail * f_frsize;
-            Some((free, total))
+            let total_bytes: u64 = f_blocks * f_frsize;
+            let free_bytes: u64 = f_bavail * f_frsize;
+            Some((free_bytes, total_bytes))
         } else {
             None
         }
