@@ -5,10 +5,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
+use fuser::ReplyIoctl;
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite,
-    ReplyXattr, Request,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
+    Request,
 };
 use studiofs_meta::FileType;
 #[cfg(target_os = "macos")]
@@ -1367,9 +1369,9 @@ impl Filesystem for StudioFuseFs {
     ) {
         // File-level semantics only (byte ranges ignored)
         let op = match typ {
-            x if x == libc::F_RDLCK as i32 => LockKind::Shared,
-            x if x == libc::F_WRLCK as i32 => LockKind::Exclusive,
-            x if x == libc::F_UNLCK as i32 => LockKind::Unlock,
+            libc::F_RDLCK => LockKind::Shared,
+            libc::F_WRLCK => LockKind::Exclusive,
+            libc::F_UNLCK => LockKind::Unlock,
             _ => {
                 reply.error(libc::EINVAL);
                 return;
@@ -1394,7 +1396,7 @@ impl Filesystem for StudioFuseFs {
         reply: fuser::ReplyLock,
     ) {
         // Report no conflicting locks (single-node simplification)
-        reply.locked(start, end, libc::F_UNLCK as i32, 0);
+        reply.locked(start, end, libc::F_UNLCK, 0);
     }
 
     fn fallocate(
