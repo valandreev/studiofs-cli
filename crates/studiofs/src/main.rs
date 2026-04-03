@@ -291,10 +291,10 @@ RUNTIME POLICY:
     STUDIOFS_PG_SYNC_POLL_SECS
 ")]
     Init {
-        /// Disk name (used in object paths like <name>/objects)
+        /// Disk name (used in object paths like `<name>/objects`)
         name: String,
 
-        /// S3 endpoint URL (e.g. https://s3.amazonaws.com, http://127.0.0.1:9000)
+        /// S3 endpoint URL (e.g. <https://s3.amazonaws.com>, <http://127.0.0.1:9000>)
         #[arg(long)]
         endpoint: String,
 
@@ -422,7 +422,7 @@ ACL PRINCIPAL:
         /// Mount point: drive letter on Windows (Z:), directory path on Unix (/mnt/studio)
         mount_point: Option<String>,
 
-        /// Disk cache directory (defaults to <meta-dir>/cache)
+        /// Disk cache directory (defaults to `<meta-dir>/cache`)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
 
@@ -482,7 +482,7 @@ EXAMPLES:
         /// Volume name
         name: String,
 
-        /// Override local cache base directory (defaults to <meta-dir>/cache)
+        /// Override local cache base directory (defaults to `<meta-dir>/cache`)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },

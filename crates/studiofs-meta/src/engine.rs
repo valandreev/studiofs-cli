@@ -12,8 +12,8 @@ use std::collections::HashSet;
 
 /// Input for one block in a batched flush operation.
 ///
-/// The caller pre-allocates `object_id` via [`MetaEngine::next_block_ids`]
-/// before calling [`MetaEngine::flush_blocks_batch`].
+/// The caller pre-allocates `object_id` via [`MetaBlocks::next_block_ids`]
+/// before calling [`MetaBlocks::flush_blocks_batch`].
 #[derive(Debug, Clone)]
 pub struct BatchFlushEntry {
     pub ino: Ino,

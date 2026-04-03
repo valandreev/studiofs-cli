@@ -185,7 +185,7 @@ impl BlockIndex {
     /// Look up an entry without altering the LRU order.
     ///
     /// Use this for `contains` checks and when copying entry metadata for I/O
-    /// (before releasing the lock).  Call [`touch`] separately when the access
+    /// (before releasing the lock).  Call `BlockIndex::touch` separately when the access
     /// should update recency.
     #[inline]
     pub fn get(&self, object_id: u64) -> Option<&IndexEntry> {
@@ -347,7 +347,7 @@ impl BlockIndex {
 
     /// Replace the flags for `object_id` wholesale and adjust `dirty_count`.
     ///
-    /// Prefer [`modify_flags`] for callers that only know *which bits to
+    /// Prefer `BlockIndex::modify_flags` for callers that only know *which bits to
     /// change*, not the full desired flag set.
     ///
     /// Returns `false` if the entry does not exist.
@@ -370,7 +370,7 @@ impl BlockIndex {
     /// Atomically apply `(current & !clear) | set` to the flags for
     /// `object_id`, adjusting `dirty_count` for any DIRTY transitions.
     ///
-    /// Unlike [`update_flags`] the caller does not need to read the current
+    /// Unlike `BlockIndex::update_flags` the caller does not need to read the current
     /// flags first: the operation is a single locked read-modify-write, so
     /// concurrent flag mutations by other threads (e.g. a concurrent
     /// `mark_uploading` call) cannot be silently clobbered.

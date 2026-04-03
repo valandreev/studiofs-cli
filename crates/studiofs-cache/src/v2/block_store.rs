@@ -30,7 +30,7 @@
 //!
 //! ## Eviction
 //!
-//! When [`put`] cannot obtain enough space, it repeatedly calls
+//! When `BlockStore::put` cannot obtain enough space, it repeatedly calls
 //! `BlockIndex::evict_one` to pop the oldest *evictable* LRU entry (blocks
 //! with `DIRTY`, `PINNED`, or `UPLOADING` are skipped), frees the recovered
 //! allocation, and retries.  If no evictable blocks remain it returns
@@ -701,7 +701,7 @@ impl BlockStore {
     ///
     /// * `evictable = false` marks the block as *dirty* (sets the `DIRTY`
     ///   flag); the block will not be chosen for LRU eviction until
-    ///   [`mark_evictable`] is called.
+    ///   `BlockStore::mark_evictable` is called.
     /// * If the block already exists it is replaced in the cache.
     /// * When the cache is full, eligible LRU blocks are evicted automatically
     ///   to make room.  Returns [`BlockStoreError::CacheFull`] only when all
@@ -961,7 +961,7 @@ impl BlockStore {
     /// Remove multiple blocks in a single call.
     ///
     /// Unknown IDs are silently skipped.  More efficient than calling
-    /// [`remove`] in a loop because the allocator lock is acquired only once.
+    /// `BlockStore::remove` in a loop because the allocator lock is acquired only once.
     pub fn remove_batch(&self, object_ids: &[u64]) {
         let removed = {
             let mut idx = self.index.lock();
