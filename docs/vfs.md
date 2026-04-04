@@ -2,7 +2,9 @@
 
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
-> Warning: this document still uses legacy `logical block` / `fragment` wording for older runtime paths. For the frozen redesign vocabulary, see [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
+This document uses the frozen chunk/slice/block vocabulary for the active data
+path. Where the compatibility shim still exposes historical names, those are
+called out explicitly.
 
 
 - `flush()`/`fsync()` and the local `WriteBuffer -> BlockStore -> sync_data() -> metadata`
@@ -20,7 +22,7 @@ Holds all runtime state:
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
 | `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides BlockStore-specific internals |
-| `block_cache` | `Arc<BlockCache>` | Cache-v2 compatibility shim: upload-queue orchestration and pending-upload pinning |
+| `block_cache` | `Arc<BlockCache>` | Narrow compatibility shim for upload-queue orchestration and pending-upload pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |
@@ -64,8 +66,8 @@ the capacity limit is reached.
 |-------|---------|-------------|
 | `meta_path` | — | Path to redb database |
 | `cache_dir` | — | Root for `BlockStore` plus compatibility cache/ingress artifacts |
-| `cache_size` | 100 GiB | L2 disk cache budget |
-| `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
+| `cache_size` | 100 GiB | `BlockStore` size budget |
+| `block_size` | 16 MiB | Chunk size (from format info); cloud transfer uses 4x4 MiB blocks |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |
 | `max_dirty_bytes` | 12 GiB | Local `WriteBuffer` memory limit before backpressure |
@@ -74,9 +76,9 @@ the capacity limit is reached.
 | `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |
 | `upload_fg_read_latency_sticky_windows` | 2 | Keep last observed P90 for this many windows when samples pause |
 
-Local cache QoS:
-- foreground user reads/writes use the foreground L2 semaphore
-- upload worker reads and cache eviction use the background L2 semaphore
+Local data-path QoS:
+- foreground user reads/writes use the foreground local-data semaphore
+- upload worker reads and cache eviction use the background local-data semaphore
 - cache-only delete/rename cleanup keeps the public VFS API synchronous, but the internal block eviction path is batched and routed through the background priority pool
 
 Runtime principal selection:
@@ -99,10 +101,10 @@ Adaptive upload throttling overrides:
 ```
 data arrives
   │
-  ├─ Split into block-aligned chunks
+  ├─ Split into chunk-aligned ranges
   ├─ Store/merge in the per-file `WriteBuffer`
   ├─ Update local inode size and pending incarnation overlay
-  └─ If enough full aligned blocks accumulate, VFS may eagerly persist the
+  └─ If enough full aligned chunks accumulate, VFS may eagerly persist the
      coalesced batch through `BlockStore -> sync_data() -> metadata`
 ```
 
@@ -172,19 +174,19 @@ Consumes from upload queue channel:
 ```
 Persisted extent queued
   │
-  ├─ Acquire local-cache I/O permits only for the local reread phase
+  ├─ Acquire local-data I/O permits only for the local reread phase
   ├─ Reread the committed payload from `BlockStore::get_for_upload` as the primary source
   ├─ Run blocking local I/O on Tokio's blocking pool
   ├─ Reject stale op if inode/incarnation no longer match
-  ├─ Split logical block into 4 cloud fragments (up to 4 MiB each)
-  ├─ Network phase: upload fragments to S3 (no local-cache I/O slot held)
-  ├─ Build fragment `Buffer`s (header + raw payload chunk), compute xxh64 checksums
-  ├─ PUT fragment objects to S3 in parallel via UploadScheduler (AIMD + retry/timeout policy)
+  ├─ Split each chunk into 4 cloud blocks (up to 4 MiB each)
+  ├─ Network phase: upload blocks to S3 (no local-data I/O slot held)
+  ├─ Build block `Buffer`s (header + raw payload chunk), compute xxh64 checksums
+  ├─ PUT block objects to S3 in parallel via UploadScheduler (AIMD + retry/timeout policy)
   ├─ Mark extent record as uploaded only after upload success
   ├─ Release local cache bookkeeping / eviction gating
-  ├─ post-upload cache cleanup (`mark_evictable` / deferred remove) runs via
+  ├─ post-upload local cleanup (`mark_evictable` / deferred remove) runs via
   │  blocking-pool wrappers so the async uploader never performs direct local
-  │  cache file I/O on executor threads
+  │  data-store I/O on executor threads
   │
   └─ On failure: requeue with backoff
 ```
@@ -243,7 +245,7 @@ Adaptive upload control:
 - workers use cooperative scheduler yielding (`tokio::task::yield_now()`) periodically to avoid starving foreground tasks.
 - upload backpressure uses a foreground-read P90 speedometer on each control tick.
 - foreground-read latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
-- adaptive sleep is applied in `process_upload` before local-cache I/O permit acquisition, so disk quiet windows happen before L2 reads.
+- adaptive sleep is applied in `process_upload` before local-data I/O permit acquisition, so disk quiet windows happen before compatibility reads.
 - when `upload_delay_ms` already slept for the current op, the pre-read adaptive sleep uses the remaining budget only:
   `effective_penalty_ms = max(adaptive_penalty_ms - waited_upload_delay_ms, 0)`.
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
@@ -273,8 +275,8 @@ local metadata view ──┬─ dirty `WriteBuffer`
          ▼
   resolve block data ─── ┌─ `WriteBuffer`
   (first match wins)     ├─ committed local extents in `BlockStore`
-                         ├─ compatibility cache helpers
-                         └─ FetchScheduler → S3 fragment fetch (parallel, per-fragment retry)
+                         ├─ compatibility cache shim
+  └─ FetchScheduler → S3 block fetch (parallel, per-block retry)
          │
          ▼
   enqueue prefetch hint ── lightweight `(ino, first..last)` send
@@ -314,12 +316,12 @@ Handle-aware read path:
 - `read_into_fh(fh, ino, ...)` uses the same buffered-first read pipeline for every handle.
 - Each open handle maintains its own access classifier in core VFS, so one random reader no longer suppresses sequential-media prefetch on a different handle for the same inode.
 - Handle-less `read()` calls fall back to per-inode classifier state, which preserves the buffered path without requiring bridge-specific policy code.
-- Best-effort prefetch and the normal L1/L2 lookup path stay enabled for committed blocks regardless of platform or caller open style.
+- Best-effort prefetch and the normal local-data lookup path stay enabled for committed blocks regardless of platform or caller open style.
 - VFS also provides a synchronous cache-only fast path (`read_into_fh_sync_cached`):
   - probes all requested blocks first,
   - serves synchronously only when the full request can be satisfied locally,
-  - reads L2 hits directly into caller-provided output slices,
-  - promotes L2 hits back into L1 only for access classes that opt into read promotion,
+  - reads local hits directly into caller-provided output slices,
+  - promotes local hits back into the read hotset only for access classes that opt into read promotion,
   - returns fallback (`None`) on miss so S3/object-store fetch remains async.
 - WinFSP bridge integration uses caller-provided callback buffers directly for both `read` and `write` requests, avoiding bridge-layer intermediate allocations/copies on the hot path.
 - FUSE bridge uses `can_read_fh_sync_cached(...)` as a cheap probe to avoid
@@ -336,14 +338,14 @@ Adaptive S3 block fetcher with deduplication and congestion control.
 | `AimdController` | TCP-cwnd–style concurrency limiter |
 | `DashMap<u64, broadcast::Sender>` | Singleflight dedup |
 | `DataStore` | S3 connection (read-optimized pool) |
-| `BlockCache` | Populate on fetch |
+| `BlockStore` | Populate on fetch |
 
 ### Fetch Flow
 
 ```
 fetch_block(object_id)
   │
-  ├─ Fast path: check L1 + L2 cache → hit? return
+  ├─ Fast path: check local data store + compatibility shim → hit? return
   │
   ├─ Singleflight check: join existing in-flight fetch? → wait + return
   │
@@ -353,7 +355,7 @@ fetch_block(object_id)
   ├─ S3 GET with configurable timeout (default 45s)
   ├─ Decode object from `opendal::Buffer` + verify checksum incrementally
   ├─ Return zero-copy payload when a single payload chunk is available
-  ├─ Populate L1 + L2 cache
+  ├─ Populate local data store + compatibility shim
   ├─ Resolve AIMD permit (success/failure)
   │
   ├─ Broadcast result to singleflight waiters
@@ -371,7 +373,7 @@ Prefetch reads use `fetch_block_prefetch()`:
 
 | Metric | Meaning |
 |--------|---------|
-| `cache_hits` | Served from L1/L2 |
+| `cache_hits` | Served from the local data store / compatibility shim |
 | `s3_fetches` | Downloads from S3 |
 | `s3_errors` | Failed S3 requests |
 | `singleflight_joins` | Deduplicated requests |
@@ -400,7 +402,7 @@ The buffered read path classifies active streams into:
 These classes stay in core VFS and drive:
 - readahead width and minimum prefetch depth
 - whether read hints are eligible for best-effort prefetch
-- whether synchronous L2 hits are promoted back into L1
+- whether synchronous local hits are promoted back into the read hotset
 - how aggressively foreground-read telemetry boosts upload backpressure
 
 ### Algorithm
@@ -566,7 +568,7 @@ Namespace mutation updates are deterministic:
 - on create/mkdir/symlink/link: insert positive entry
 - on unlink/rmdir: insert negative entry
 - on rename: source entry becomes negative, destination becomes positive
-- deleted file blocks are removed from L1/L2 promptly; if a block is pinned by an in-flight upload, VFS cancels that inode's in-flight upload and finalizes cleanup via pending-deletion metadata + cache eviction path
+- deleted file blocks are removed from the local data store promptly; if a block is pinned by an in-flight upload, VFS cancels that inode's in-flight upload and finalizes cleanup via pending-deletion metadata + cache eviction path
 - parent directory generation is bumped only for affected parent directories
 - broad remote namespace apply events bump global namespace epoch
 

@@ -1,7 +1,7 @@
-//! `studiofs test-cache` — benchmark cache performance.
+//! `studiofs test-cache` — benchmark the StudioFS data path.
 //!
 //! Supports:
-//! - direct shim benchmark mode (`direct-shim`) that bypasses VFS
+//! - compatibility-shim benchmark mode (`direct-shim`) for the BlockStore-backed local path
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
 use crate::cli::test_cache_profile::TestCacheProfileSession;
@@ -2752,12 +2752,12 @@ fn save_benchmark_report(report: &BenchmarkReport, json_output: Option<&Path>) -
 fn render_human_summary(report: &BenchmarkReport) -> String {
     let mut out = String::new();
     let target_label = if report.mode == "direct-shim" {
-        "Cache dir"
+        "Local path"
     } else {
         "Target"
     };
 
-    let _ = writeln!(&mut out, "Cache benchmark");
+    let _ = writeln!(&mut out, "StudioFS data-path benchmark");
     let _ = writeln!(&mut out, "Run ID:    {}", report.run_id);
     let _ = writeln!(&mut out, "{target_label}: {}", report.cache_dir);
     let _ = writeln!(&mut out, "Mode:      {}", report.mode);

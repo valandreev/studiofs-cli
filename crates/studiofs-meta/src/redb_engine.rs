@@ -11500,6 +11500,20 @@ mod tests {
     #[test]
     fn redb_partial_update_does_not_expose_new_blocks_before_publish() {
         let engine = temp_engine();
+        let format_info = FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: "partial-update-test".into(),
+            uuid: "partial-update-test-uuid".into(),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "partial-update-test".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: "partial-update-test/objects/".into(),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        engine.set_format_info(&format_info).unwrap();
 
         let file = engine
             .create_file(ROOT_INO, b"partial-update.bin", 1000, 1000, 0o644)
