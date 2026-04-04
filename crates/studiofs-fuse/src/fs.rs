@@ -777,37 +777,6 @@ impl Filesystem for StudioFuseFs {
             return;
         }
 
-        let can_sync = match self
-            .vfs
-            .can_read_fh_sync_cached(fh, ino, offset as u64, clamped_size)
-        {
-            Ok(can_sync) => can_sync,
-            Err(e) => {
-                error!("can_read_sync_cached({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-                return;
-            }
-        };
-
-        if can_sync {
-            let mut out = vec![0u8; clamped_size as usize];
-            match self
-                .vfs
-                .read_into_fh_sync_cached(fh, ino, offset as u64, &mut out)
-            {
-                Ok(Some(n)) => {
-                    reply.data(&out[..n as usize]);
-                    return;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    error!("read_sync_cached({ino}, off={offset}, sz={size}) -> {e}");
-                    reply.error(vfs_err_to_errno(&e));
-                    return;
-                }
-            }
-        }
-
         let mut out = vec![0u8; clamped_size as usize];
         match self
             .rt
