@@ -207,34 +207,43 @@ impl StudioVfs {
         }
     }
 
-    fn next_pending_slice_seq(&self) -> u64 {
-        self.state
+    fn next_pending_slice_seq_batch(&self, count: usize) -> std::ops::Range<u64> {
+        let start = self
+            .state
             .write_buffer
             .next_pending_slice_seq
-            .fetch_add(1, Ordering::Relaxed)
+            .fetch_add(count as u64, Ordering::Relaxed);
+        start..start.saturating_add(count as u64)
     }
 
-    fn record_pending_dirty_slice(
+    fn record_pending_dirty_slices_batch(
         &self,
         ino: Ino,
-        chunk_id: studiofs_meta::schema::ChunkId,
-        range: studiofs_meta::schema::SliceRange,
-        block_index: u32,
-        block_offset: u32,
+        slices: &[(
+            studiofs_meta::schema::ChunkId,
+            studiofs_meta::schema::SliceRange,
+            u32,
+            u32,
+        )],
     ) {
-        let seq = self.next_pending_slice_seq();
+        if slices.is_empty() {
+            return;
+        }
+        let seqs = self.next_pending_slice_seq_batch(slices.len());
         let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
-        pending_chunk_slices
-            .entry(ino)
-            .or_default()
-            .entry(chunk_id.0)
-            .or_default()
-            .push(PendingDirtySlice {
-                range,
-                block_index,
-                block_offset,
-                seq,
-            });
+        let inode_chunks = pending_chunk_slices.entry(ino).or_default();
+        for (seq, (chunk_id, range, block_index, block_offset)) in seqs.zip(slices.iter().copied())
+        {
+            inode_chunks
+                .entry(chunk_id.0)
+                .or_default()
+                .push(PendingDirtySlice {
+                    range,
+                    block_index,
+                    block_offset,
+                    seq,
+                });
+        }
     }
 
     fn clear_pending_dirty_slices_for_inode(&self, ino: Ino) {
@@ -273,6 +282,42 @@ impl StudioVfs {
             if chunks.is_empty() {
                 pending_chunk_slices.remove(&ino);
             }
+        }
+    }
+
+    fn clear_pending_dirty_slices_exceeding_len(&self, ino: Ino, block_index: u32, new_len: usize) {
+        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        let Some(chunks) = pending_chunk_slices.get_mut(&ino) else {
+            return;
+        };
+
+        chunks.retain(|_, slices| {
+            slices.retain_mut(|slice| {
+                if slice.block_index != block_index {
+                    return true;
+                }
+                let slice_len = slice.range.len() as usize;
+                if slice.block_offset as usize >= new_len {
+                    return false;
+                }
+                let allowed_len = new_len.saturating_sub(slice.block_offset as usize);
+                if slice_len <= allowed_len {
+                    return true;
+                }
+                let new_end = (slice.range.start as usize).saturating_add(allowed_len);
+                if new_end <= slice.range.start as usize
+                    || new_end > studiofs_meta::schema::DEFAULT_CHUNK_SIZE as usize
+                {
+                    return false;
+                }
+                slice.range.end = new_end as u32;
+                true
+            });
+            !slices.is_empty()
+        });
+
+        if chunks.is_empty() {
+            pending_chunk_slices.remove(&ino);
         }
     }
 
@@ -804,6 +849,9 @@ impl StudioVfs {
                 changed = true;
             }
         }
+        if changed {
+            self.clear_pending_dirty_slices_exceeding_len(ino, block_index, new_len);
+        }
 
         Ok(changed)
     }
@@ -846,6 +894,7 @@ impl StudioVfs {
                 reserved_object_id,
             },
         );
+        self.clear_pending_dirty_slices_exceeding_len(ino, block_index, new_len);
     }
 
     async fn read_block_if_exists(&self, ino: Ino, block_index: u32) -> VfsResult<Option<Bytes>> {
@@ -908,6 +957,12 @@ impl StudioVfs {
         let mut data_offset = 0;
         let mut has_full_blocks = false;
         let mut inserted_block_indexes = Vec::new();
+        let mut pending_slices_batch: Vec<(
+            studiofs_meta::schema::ChunkId,
+            studiofs_meta::schema::SliceRange,
+            u32,
+            u32,
+        )> = Vec::new();
 
         while remaining > 0 {
             let block_index = block_index_from_offset(current_offset, self.block_size);
@@ -989,15 +1044,18 @@ impl StudioVfs {
             if slice_end == 0 && write_end > write_start {
                 slice_end = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
             }
-            if let Some(range) = studiofs_meta::schema::SliceRange::new(slice_start, slice_end) {
-                self.record_pending_dirty_slice(
-                    ino,
-                    chunk_id,
-                    range,
-                    block_index,
-                    offset_in_block as u32,
-                );
-            }
+            let range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end).ok_or_else(
+                || {
+                    VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "invalid dirty slice range during write: ino={}, offset={}..{}, chunk_id={}, range={}..{}",
+                            ino, write_start, write_end, chunk_id.0, slice_start, slice_end
+                        ),
+                    ))
+                },
+            )?;
+            pending_slices_batch.push((chunk_id, range, block_index, offset_in_block as u32));
 
             written += to_write as u64;
             remaining -= to_write;
@@ -1007,6 +1065,7 @@ impl StudioVfs {
         if !inserted_block_indexes.is_empty() {
             self.add_pending_write_buffer_block_indexes(ino, inserted_block_indexes);
         }
+        self.record_pending_dirty_slices_batch(ino, &pending_slices_batch);
 
         let mut base_attr = self.getattr_async(ino).await?;
         self.begin_pending_incarnation(ino, &mut base_attr);
