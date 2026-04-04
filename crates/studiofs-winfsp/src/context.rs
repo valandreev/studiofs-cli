@@ -35,6 +35,8 @@ const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
 const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
 const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
 const STATUS_DATA_ERROR: NTSTATUS = NTSTATUS(0xC000_003E_u32 as i32);
+const STATUS_IO_TIMEOUT: NTSTATUS = NTSTATUS(0xC000_00B5_u32 as i32);
+const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = NTSTATUS(0xC000_009A_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
 const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
 const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
@@ -405,6 +407,25 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             debug!("vfs remote content pending: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
         }
+        studiofs_vfs::VfsError::Fetch(fetch_err) => match fetch_err {
+            studiofs_vfs::fetch::FetchError::NotFound { .. } => {
+                winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND)
+            }
+            studiofs_vfs::fetch::FetchError::Exhausted { .. } => {
+                winfsp::FspError::from(STATUS_IO_TIMEOUT)
+            }
+            studiofs_vfs::fetch::FetchError::PrefetchSkipped => {
+                winfsp::FspError::from(STATUS_UNSUCCESSFUL)
+            }
+            studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall { .. } => {
+                winfsp::FspError::from(STATUS_INSUFFICIENT_RESOURCES)
+            }
+            studiofs_vfs::fetch::FetchError::Decode(_)
+            | studiofs_vfs::fetch::FetchError::CacheAccess(_)
+            | studiofs_vfs::fetch::FetchError::CorruptFragment { .. } => {
+                winfsp::FspError::from(STATUS_DATA_ERROR)
+            }
+        },
         _ => {
             error!("vfs error: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
@@ -1233,9 +1254,9 @@ mod tests {
         FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
         FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator, build_notify_info,
-        ino_to_windows_path, notify_filter_for_kind, open_flags_from_create_options,
-        vfs_to_winfsp_err,
+        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator,
+        build_notify_info, ino_to_windows_path, notify_filter_for_kind,
+        open_flags_from_create_options, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1358,6 +1379,13 @@ mod tests {
         });
         let status = vfs_to_winfsp_err(fragmented).to_ntstatus();
         assert_eq!(status, STATUS_DATA_ERROR.0);
+
+        let exhausted = VfsError::Fetch(studiofs_vfs::fetch::FetchError::Exhausted {
+            attempts: 3,
+            source: studiofs_data::store::DataError::Storage("timeout".into()),
+        });
+        let status = vfs_to_winfsp_err(exhausted).to_ntstatus();
+        assert_eq!(status, STATUS_IO_TIMEOUT.0);
     }
 
     #[test]

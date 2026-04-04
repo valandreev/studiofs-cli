@@ -121,6 +121,9 @@ pub enum VfsError {
         message: String,
     },
 
+    #[error("fetch error: {0}")]
+    Fetch(#[from] crate::fetch::FetchError),
+
     #[error("{0}")]
     Other(String),
 }
@@ -3049,6 +3052,12 @@ impl IncarnationState {
     }
 }
 
+#[derive(Debug, Clone)]
+enum PendingOverlayBlockSource {
+    Pending(Bytes),
+    Extent(u64),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ForegroundReadSample {
     timestamp_ms: u64,
@@ -5722,13 +5731,13 @@ impl StudioVfs {
         Some(recovered)
     }
 
-    fn read_pending_overlay_block_sync(
+    fn pending_overlay_block_source(
         &self,
         ino: Ino,
         block_index: u32,
         pending_content_epoch: Option<u64>,
         pending_upload_index: Option<&PendingUploadIndex>,
-    ) -> VfsResult<Option<Bytes>> {
+    ) -> Option<PendingOverlayBlockSource> {
         // Stage 1 — WriteBuffer: newest local bytes not yet represented by
         // committed BlockStore-backed metadata.
         if let Some(pending_block) = self
@@ -5738,21 +5747,42 @@ impl StudioVfs {
             .lock()
             .get(&(ino, block_index))
         {
-            return Ok(Some(pending_block.data.clone().freeze()));
+            return Some(PendingOverlayBlockSource::Pending(
+                pending_block.data.clone().freeze(),
+            ));
         }
         // Stage 2 — committed local cache state for the pending epoch.
-        if let Some(extent) = self.pending_live_extent_record(
+        self.pending_live_extent_record(
             ino,
             block_index,
             pending_content_epoch,
             pending_upload_index,
-        ) {
-            if let Some(data) = self.block_store.get(extent.object_id) {
-                return Ok(Some(data));
-            }
-            return Ok(self.block_cache.get_sync(extent.object_id));
-        }
-        Ok(None)
+        )
+        .map(|extent| PendingOverlayBlockSource::Extent(extent.object_id))
+    }
+
+    fn read_pending_overlay_block_sync(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        pending_content_epoch: Option<u64>,
+        pending_upload_index: Option<&PendingUploadIndex>,
+    ) -> VfsResult<Option<Bytes>> {
+        let Some(source) = self.pending_overlay_block_source(
+            ino,
+            block_index,
+            pending_content_epoch,
+            pending_upload_index,
+        ) else {
+            return Ok(None);
+        };
+        Ok(match source {
+            PendingOverlayBlockSource::Pending(data) => Some(data),
+            PendingOverlayBlockSource::Extent(object_id) => self
+                .block_store
+                .get(object_id)
+                .or_else(|| self.block_cache.get_sync(object_id)),
+        })
     }
 
     async fn read_pending_overlay_block_async(
@@ -5762,30 +5792,23 @@ impl StudioVfs {
         pending_content_epoch: Option<u64>,
         pending_upload_index: Option<&PendingUploadIndex>,
     ) -> VfsResult<Option<Bytes>> {
-        // Stage 1 — WriteBuffer: newest local bytes not yet represented by
-        // committed BlockStore-backed metadata.
-        if let Some(pending_block) = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .get(&(ino, block_index))
-        {
-            return Ok(Some(pending_block.data.clone().freeze()));
-        }
-        // Stage 2 — committed local cache state for the pending epoch.
-        if let Some(extent) = self.pending_live_extent_record(
+        let Some(source) = self.pending_overlay_block_source(
             ino,
             block_index,
             pending_content_epoch,
             pending_upload_index,
-        ) {
-            if let Some(data) = self.block_store_get_async(extent.object_id).await? {
-                return Ok(Some(data));
+        ) else {
+            return Ok(None);
+        };
+        match source {
+            PendingOverlayBlockSource::Pending(data) => Ok(Some(data)),
+            PendingOverlayBlockSource::Extent(object_id) => {
+                if let Some(data) = self.block_store_get_async(object_id).await? {
+                    return Ok(Some(data));
+                }
+                Ok(self.block_cache.get(object_id).await)
             }
-            return Ok(self.block_cache.get(extent.object_id).await);
         }
-        Ok(None)
     }
 
     fn inode_has_local_overlay(&self, ino: Ino) -> bool {
@@ -7412,6 +7435,105 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    async fn lookup_regular_file_slices_async(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> VfsResult<Vec<studiofs_meta::schema::ResolvedSliceSpan>> {
+        let meta = self.meta_async.clone();
+        match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            engine.lookup_regular_file_slices(ino, offset, length)
+        })
+        .await
+        {
+            Ok(resolved) => Ok(resolved),
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                self.clear_pending_blocks_for_inode(ino);
+                self.clear_inode_incarnation(ino);
+                self.state.namespace.dirty_attrs.lock().remove(&ino);
+                self.state.namespace.attr_read_cache.lock().remove(ino);
+                let _ = self.handle_table.take_orphan(ino);
+                Err(VfsError::Meta(MetaError::InodeNotFound(ino)))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn resolve_read_metadata_async(
+        &self,
+        ino: Ino,
+        offset: u64,
+        buffer_len: u64,
+    ) -> VfsResult<(InodeAttr, Vec<studiofs_meta::schema::ResolvedSliceSpan>)> {
+        if let Some(attr) = self.ignored_entry_attr(ino) {
+            return Ok((attr, Vec::new()));
+        }
+
+        let dirty_attr = {
+            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
+            dirty_attrs.get(&ino).cloned()
+        };
+        if let Some(attr) = dirty_attr {
+            let read_len = attr.size.saturating_sub(offset).min(buffer_len) as usize;
+            let resolved = if read_len == 0 {
+                Vec::new()
+            } else {
+                self.lookup_regular_file_slices_async(ino, offset, read_len as u64)
+                    .await?
+            };
+            return Ok((attr, resolved));
+        }
+
+        let cached_attr = {
+            let mut attr_cache = self.state.namespace.attr_read_cache.lock();
+            attr_cache.get(ino, Instant::now())
+        };
+        if let Some(attr) = cached_attr {
+            let read_len = attr.size.saturating_sub(offset).min(buffer_len) as usize;
+            let resolved = if read_len == 0 {
+                Vec::new()
+            } else {
+                self.lookup_regular_file_slices_async(ino, offset, read_len as u64)
+                    .await?
+            };
+            return Ok((attr, resolved));
+        }
+
+        let meta = self.meta_async.clone();
+        let (attr, resolved) = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            let attr = engine.get_attr(ino)?;
+            let read_len = attr.size.saturating_sub(offset).min(buffer_len) as usize;
+            let resolved = if read_len == 0 {
+                Vec::new()
+            } else {
+                engine.lookup_regular_file_slices(ino, offset, read_len as u64)?
+            };
+            Ok((attr, resolved))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                self.clear_pending_blocks_for_inode(ino);
+                self.clear_inode_incarnation(ino);
+                self.state.namespace.dirty_attrs.lock().remove(&ino);
+                self.state.namespace.attr_read_cache.lock().remove(ino);
+                let _ = self.handle_table.take_orphan(ino);
+                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
+            }
+            Err(err) => return Err(err),
+        };
+
+        self.state.namespace.attr_read_cache.lock().put(
+            ino,
+            attr.clone(),
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+        Ok((attr, resolved))
+    }
+
     /// Set file attributes (partial update).
     ///
     /// Accepts `SetattrArgs` — any field set to `None`/`Omit` is left unchanged.
@@ -8997,16 +9119,11 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
-        if let Some(attr) = self.ignored_entry_attr(ino) {
-            let end = (offset + buffer.len() as u64).min(attr.size);
-            let len = end.saturating_sub(offset) as usize;
-            if len > 0 {
-                buffer[..len].fill(0);
-            }
-            return Ok(len as u32);
-        }
-
-        let attr = self.getattr_async(ino).await?;
+        let (attr, resolved_slices) = self
+            .resolve_read_metadata_async(ino, offset, buffer.len() as u64)
+            .await?;
+        self.enforce_access_async(ino, AccessLevel::ReadOnly)
+            .await?;
         if self.remote_upload_placeholder_visible(ino, &attr) {
             return Err(VfsError::RemoteContentPending);
         }
@@ -9025,7 +9142,13 @@ impl StudioVfs {
         let access = self.observe_read_access(fh, ino, offset, buffer.len());
         let mut guard = ForegroundReadScope::new(self, access.policy);
         let mut read_plan = self
-            .build_read_plan(ino, offset, read_len as u64, pending_content_epoch)
+            .build_read_plan(
+                ino,
+                offset,
+                read_len as u64,
+                pending_content_epoch,
+                Some(resolved_slices.as_slice()),
+            )
             .await?;
         read_plan.sort_by_key(|span| span.range.start);
         let missing_remote = self.prefetch_remote_blocks_for_plan(&read_plan).await?;
@@ -9075,6 +9198,7 @@ impl StudioVfs {
         offset: u64,
         length: u64,
         pending_content_epoch: Option<u64>,
+        resolved_regular_file_slices: Option<&[studiofs_meta::schema::ResolvedSliceSpan]>,
     ) -> VfsResult<Vec<ReadPlanSpan>> {
         if length == 0 {
             return Ok(Vec::new());
@@ -9173,28 +9297,46 @@ impl StudioVfs {
         }
 
         if !unresolved.is_empty() {
-            let meta = self.meta_async.clone();
-            let resolved = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.lookup_regular_file_slices(ino, offset, length)
-            })
-            .await?;
-
-            unresolved = self.claim_meta_spans_into_plan(
-                resolved.iter(),
-                unresolved,
-                &mut plan,
-                requested,
-                ResolvedSliceSource::Overlay,
-                |block| ReadPlanSource::Overlay { block },
-            );
-            unresolved = self.claim_meta_spans_into_plan(
-                resolved.iter(),
-                unresolved,
-                &mut plan,
-                requested,
-                ResolvedSliceSource::Base,
-                |block| ReadPlanSource::Base { block },
-            );
+            if let Some(resolved) = resolved_regular_file_slices {
+                unresolved = self.claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Overlay,
+                    |block| ReadPlanSource::Overlay { block },
+                );
+                unresolved = self.claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Base,
+                    |block| ReadPlanSource::Base { block },
+                );
+            } else {
+                let meta = self.meta_async.clone();
+                let resolved = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                    engine.lookup_regular_file_slices(ino, offset, length)
+                })
+                .await?;
+                unresolved = self.claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Overlay,
+                    |block| ReadPlanSource::Overlay { block },
+                );
+                unresolved = self.claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Base,
+                    |block| ReadPlanSource::Base { block },
+                );
+            }
         }
 
         for gap in unresolved {
@@ -9432,10 +9574,7 @@ impl StudioVfs {
                             }
                             Err(crate::fetch::FetchError::NotFound { .. }) => dst.fill(0),
                             Err(error) => {
-                                return Err(VfsError::Other(format!(
-                                    "read planner fetch failed for object_id={}: {error}",
-                                    block.object_id
-                                )));
+                                return Err(VfsError::Fetch(error));
                             }
                         }
                     }
@@ -9660,7 +9799,13 @@ impl StudioVfs {
                     continue;
                 }
                 let plan = self
-                    .build_read_plan(ino, block_start, block_len, context.pending_content_epoch)
+                    .build_read_plan(
+                        ino,
+                        block_start,
+                        block_len,
+                        context.pending_content_epoch,
+                        None,
+                    )
                     .await?;
                 // Prefetch is best-effort warming, so we intentionally drop the
                 // NotFound set here; foreground reads still resolve the final path.

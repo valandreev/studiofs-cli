@@ -240,6 +240,15 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
         VfsError::Join(_) => libc::EIO,
         VfsError::WouldBlock | VfsError::RemoteContentPending => libc::EAGAIN,
         VfsError::InvalidName(_) => libc::EINVAL,
+        VfsError::Fetch(fetch_err) => match fetch_err {
+            studiofs_vfs::fetch::FetchError::NotFound { .. } => libc::ENOENT,
+            studiofs_vfs::fetch::FetchError::Exhausted { .. } => libc::ETIMEDOUT,
+            studiofs_vfs::fetch::FetchError::PrefetchSkipped => libc::EAGAIN,
+            studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall { .. } => libc::ENOMEM,
+            studiofs_vfs::fetch::FetchError::Decode(_)
+            | studiofs_vfs::fetch::FetchError::CacheAccess(_)
+            | studiofs_vfs::fetch::FetchError::CorruptFragment { .. } => libc::EIO,
+        },
         VfsError::Io(ioe) => match ioe.kind() {
             std::io::ErrorKind::NotFound => libc::ENOENT,
             std::io::ErrorKind::PermissionDenied => libc::EACCES,
@@ -1518,6 +1527,12 @@ mod tests {
             block_index: 3,
         });
         assert_eq!(vfs_err_to_errno(&fragmented), libc::EIO);
+
+        let exhausted = VfsError::Fetch(studiofs_vfs::fetch::FetchError::Exhausted {
+            attempts: 3,
+            source: studiofs_data::store::DataError::Storage("timeout".into()),
+        });
+        assert_eq!(vfs_err_to_errno(&exhausted), libc::ETIMEDOUT);
     }
 
     #[test]
