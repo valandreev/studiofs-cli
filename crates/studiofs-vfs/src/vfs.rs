@@ -9397,6 +9397,28 @@ impl StudioVfs {
         }
     }
 
+    fn contiguous_prefetch_block_ranges(block_indices: &mut Vec<u32>) -> Vec<(u32, u32)> {
+        block_indices.sort_unstable();
+        block_indices.dedup();
+
+        let mut ranges = Vec::new();
+        let Some(mut range_start) = block_indices.first().copied() else {
+            return ranges;
+        };
+        let mut range_end = range_start;
+        for &block_idx in block_indices.iter().skip(1) {
+            if range_end.checked_add(1) == Some(block_idx) {
+                range_end = block_idx;
+            } else {
+                ranges.push((range_start, range_end));
+                range_start = block_idx;
+                range_end = block_idx;
+            }
+        }
+        ranges.push((range_start, range_end));
+        ranges
+    }
+
     async fn fetch_block_for_ref(
         &self,
         block: &BlockRef,
@@ -9903,22 +9925,24 @@ impl StudioVfs {
                 return Ok(());
             }
 
-            let first_block = *block_indices.first().expect("non-empty batch");
-            let last_block = *block_indices.last().expect("non-empty batch");
-            let block_start = (first_block as u64).saturating_mul(self.block_size as u64);
-            let block_end = ((last_block as u64).saturating_add(1))
-                .saturating_mul(self.block_size as u64)
-                .min(context.size);
-            let block_len = block_end.saturating_sub(block_start);
-            if block_len == 0 {
-                return Ok(());
+            for (first_block, last_block) in
+                Self::contiguous_prefetch_block_ranges(&mut block_indices)
+            {
+                let block_start = (first_block as u64).saturating_mul(self.block_size as u64);
+                let block_end = ((last_block as u64).saturating_add(1))
+                    .saturating_mul(self.block_size as u64)
+                    .min(context.size);
+                let block_len = block_end.saturating_sub(block_start);
+                if block_len == 0 {
+                    continue;
+                }
+                let plan = self
+                    .build_read_plan(ino, block_start, block_len, context.pending_content_epoch)
+                    .await?;
+                // Prefetch is best-effort warming, so we intentionally drop the
+                // NotFound set here; foreground reads still resolve the final path.
+                let _ = self.prefetch_remote_blocks_for_plan(&plan).await?;
             }
-            let plan = self
-                .build_read_plan(ino, block_start, block_len, context.pending_content_epoch)
-                .await?;
-            // Prefetch is best-effort warming, so we intentionally drop the
-            // NotFound set here; foreground reads still resolve the final path.
-            let _ = self.prefetch_remote_blocks_for_plan(&plan).await?;
             Ok::<(), VfsError>(())
         }
         .await;
@@ -11957,6 +11981,16 @@ mod tests {
         assert_eq!(refs.len(), 1);
         let block = refs.get(&42).expect("collected block ref");
         assert_eq!(block, &first, "first ref should win when object ids match");
+    }
+
+    #[test]
+    fn contiguous_prefetch_block_ranges_sort_and_split_sparse_batches() {
+        let mut blocks = vec![9, 1, 3, 2, 8, 7, 7];
+
+        let ranges = StudioVfs::contiguous_prefetch_block_ranges(&mut blocks);
+
+        assert_eq!(blocks, vec![1, 2, 3, 7, 8, 9]);
+        assert_eq!(ranges, vec![(1, 3), (7, 9)]);
     }
 
     #[test]
