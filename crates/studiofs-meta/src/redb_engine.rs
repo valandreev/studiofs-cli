@@ -1335,6 +1335,34 @@ impl RedbMetaEngine {
                 .remove(key.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
+        Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
+        Ok(())
+    }
+
+    fn clear_regular_file_pending_compaction_rows_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let mut pending = txn
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = regular_file_chunk_prefix(ino);
+        let mut keys_to_remove = Vec::new();
+        for row in pending
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+            keys_to_remove.push(key.value().to_vec());
+        }
+        for key in keys_to_remove {
+            let _ = pending
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -8119,6 +8147,24 @@ mod tests {
         txn.commit().unwrap();
     }
 
+    fn set_regular_file_pending_compaction_rows(
+        engine: &RedbMetaEngine,
+        ino: Ino,
+        chunks: &[ChunkId],
+    ) {
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut pending = txn
+                .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+                .unwrap();
+            for chunk_id in chunks {
+                let key = encode_regular_file_chunk_key(ino, *chunk_id);
+                pending.insert(key.as_slice(), 1).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
     #[test]
     fn test_regular_file_prefix_scan_is_exact_per_inode() {
         let engine = temp_engine();
@@ -8183,6 +8229,72 @@ mod tests {
                 .slices
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn test_clear_regular_file_graph_clears_pending_compaction_rows() {
+        let engine = temp_engine();
+        let ino = engine
+            .create_file(ROOT_INO, b"clear-graph.bin", 1000, 1000, 0o644)
+            .unwrap()
+            .ino;
+
+        set_regular_file_pending_compaction_rows(&engine, ino, &[ChunkId(3), ChunkId(7)]);
+
+        let txn = engine.db.begin_write().unwrap();
+        RedbMetaEngine::clear_regular_file_graph_in_txn(&txn, ino).unwrap();
+        txn.commit().unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let pending = txn
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .unwrap();
+        assert!(
+            pending
+                .get(encode_regular_file_chunk_key(ino, ChunkId(3)).as_slice())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pending
+                .get(encode_regular_file_chunk_key(ino, ChunkId(7)).as_slice())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_legacy_block_replace_clears_pending_compaction_rows() {
+        let engine = temp_engine();
+        let ino = engine
+            .create_file(ROOT_INO, b"legacy-replace.bin", 1000, 1000, 0o644)
+            .unwrap()
+            .ino;
+
+        set_regular_file_pending_compaction_rows(&engine, ino, &[ChunkId(11)]);
+
+        let txn = engine.db.begin_write().unwrap();
+        RedbMetaEngine::replace_regular_file_chunk_rows_from_blocks_in_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+            &[(0, BlockRef::new_partial(1001, 4096))],
+            DEFAULT_BLOCK_SIZE,
+            false,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let txn = engine.db.begin_read().unwrap();
+        let pending = txn
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .unwrap();
+        assert!(
+            pending
+                .get(encode_regular_file_chunk_key(ino, ChunkId(11)).as_slice())
+                .unwrap()
+                .is_none()
         );
     }
 
