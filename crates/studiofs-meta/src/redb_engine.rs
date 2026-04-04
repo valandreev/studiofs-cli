@@ -55,7 +55,11 @@ const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
 const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_base");
 
-type RegularFileChunkSignature = Vec<(SliceId, SliceOrder, SliceRange, Option<BlockRef>)>;
+/// Pending overlay chunk compaction work: (ino, chunk_id) -> marker.
+const PENDING_REGULAR_FILE_COMPACTION_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("pending_regular_file_compaction");
+
+type RegularFileChunkSignature = Vec<(SliceRange, Option<BlockRef>)>;
 type RegularFileGraphSignature = BTreeMap<ChunkId, RegularFileChunkSignature>;
 
 /// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)
@@ -1143,12 +1147,7 @@ impl RedbMetaEngine {
             }
             let mut chunk_signature = Vec::with_capacity(chunk.slices.len());
             for slice in chunk.slices.values() {
-                chunk_signature.push((
-                    slice.slice_id,
-                    slice.order,
-                    slice.range,
-                    slice.block.clone(),
-                ));
+                chunk_signature.push((slice.range, slice.block.clone()));
             }
             signature.insert(*chunk_id, chunk_signature);
         }
@@ -6800,83 +6799,136 @@ impl MetaBlocks for RedbMetaEngine {
         }
 
         let mut compacted = 0usize;
-        let table_defs = [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE];
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let pending_table = txn
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut candidates: Vec<(Ino, ChunkId)> = Vec::new();
 
-        for table_def in table_defs {
+        for row in pending_table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            candidates.push((ino, chunk_id));
+            if candidates.len() >= max_chunks {
+                break;
+            }
+        }
+        drop(pending_table);
+        drop(txn);
+
+        for (ino, chunk_id) in candidates {
             if compacted >= max_chunks {
                 break;
             }
 
             let txn = self
                 .db
-                .begin_read()
+                .begin_write()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let table = txn
-                .open_table(table_def)
+            let mut overlay_table = txn
+                .open_table(REGULAR_FILE_OVERLAY_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut candidates: Vec<(Ino, ChunkId)> = Vec::new();
-
-            for row in table
-                .iter()
+            let mut pending_table = txn
+                .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key = encode_regular_file_chunk_key(ino, chunk_id);
+            let current = overlay_table
+                .get(key.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                let (ino, chunk_id) = decode_regular_file_chunk_key(key.value());
-                let chunk: RegularFileChunkState = decode(value.value())?;
-                if chunk.fragmentation_metrics().should_compact() {
-                    candidates.push((ino, chunk_id));
-                    if compacted + candidates.len() >= max_chunks {
-                        break;
-                    }
-                }
+                .map(|value| decode::<RegularFileChunkState>(value.value()))
+                .transpose()?;
+
+            let Some(current) = current else {
+                let _ = pending_table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(pending_table);
+                drop(overlay_table);
+                txn.commit()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                continue;
+            };
+            if !current.fragmentation_metrics().should_compact() {
+                let _ = pending_table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(pending_table);
+                drop(overlay_table);
+                txn.commit()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                continue;
             }
-            drop(table);
-            drop(txn);
 
-            for (ino, chunk_id) in candidates {
-                if compacted >= max_chunks {
-                    break;
-                }
-
-                let txn = self
-                    .db
-                    .begin_write()
+            let Some(compacted_chunk) = Self::compact_regular_file_chunk_state(chunk_id, &current)?
+            else {
+                let _ = overlay_table
+                    .remove(key.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let mut table = txn
-                    .open_table(table_def)
+                let _ = pending_table
+                    .remove(key.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let key = encode_regular_file_chunk_key(ino, chunk_id);
-                let current = table
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                    .map(|value| decode::<RegularFileChunkState>(value.value()))
-                    .transpose()?;
-
-                let Some(current) = current else {
-                    continue;
-                };
-                if !current.fragmentation_metrics().should_compact() {
-                    continue;
-                }
-
-                match Self::compact_regular_file_chunk_state(chunk_id, &current)? {
-                    Some(compacted_chunk) => {
-                        let encoded = encode(&compacted_chunk)?;
-                        table
-                            .insert(key.as_slice(), encoded.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                    None => {
-                        let _ = table
-                            .remove(key.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                }
-                drop(table);
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                        ino,
+                        chunk_slices: vec![(chunk_id, Vec::new())],
+                    },
+                )?;
+                drop(pending_table);
+                drop(overlay_table);
                 txn.commit()
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
                 compacted = compacted.saturating_add(1);
+                continue;
+            };
+
+            if compacted_chunk == current {
+                let _ = pending_table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(pending_table);
+                drop(overlay_table);
+                txn.commit()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                continue;
             }
+
+            let encoded = encode(&compacted_chunk)?;
+            overlay_table
+                .insert(key.as_slice(), encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+            let compacted_slices: Vec<crate::schema::SliceRecord> =
+                compacted_chunk.slices.values().cloned().collect();
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                    ino,
+                    chunk_slices: vec![(chunk_id, compacted_slices)],
+                },
+            )?;
+
+            if compacted_chunk.fragmentation.should_compact() {
+                let _ = pending_table
+                    .insert(key.as_slice(), 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            } else {
+                let _ = pending_table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            drop(pending_table);
+            drop(overlay_table);
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            compacted = compacted.saturating_add(1);
         }
 
         Ok(compacted)
@@ -6918,6 +6970,9 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut counters = txn
                 .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut pending_compaction = txn
+                .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             let mut space_delta: i64 = 0;
@@ -6973,6 +7028,16 @@ impl RedbMetaEngine {
                 }
 
                 state.refresh_fragmentation_metrics();
+
+                if state.fragmentation.should_compact() {
+                    pending_compaction
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                } else {
+                    let _ = pending_compaction
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
 
                 let data = encode(&state)?;
                 overlay_table
@@ -9945,6 +10010,35 @@ mod tests {
     }
 
     #[test]
+    fn test_regular_file_graph_signature_ignores_slice_identity_changes() {
+        let mut chunk_a = RegularFileChunkState::default();
+        chunk_a.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("slice a"),
+            BlockRef::new_partial(501, 4096),
+        ));
+
+        let mut chunk_b = RegularFileChunkState::default();
+        chunk_b.insert_slice(SliceRecord::new(
+            SliceId(9),
+            SliceOrder(17),
+            SliceRange::new(0, 4096).expect("slice b"),
+            BlockRef::new_partial(501, 4096),
+        ));
+
+        let mut chunks_a = BTreeMap::new();
+        chunks_a.insert(ChunkId(0), chunk_a);
+        let mut chunks_b = BTreeMap::new();
+        chunks_b.insert(ChunkId(0), chunk_b);
+
+        assert_eq!(
+            RedbMetaEngine::regular_file_graph_signature(&chunks_a),
+            RedbMetaEngine::regular_file_graph_signature(&chunks_b)
+        );
+    }
+
+    #[test]
     fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
         let engine = temp_engine();
 
@@ -10217,6 +10311,16 @@ mod tests {
         ));
 
         set_regular_file_chunk_rows(&engine, ino, &[(ChunkId(0), overlay_chunk.clone())], &[]);
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut pending = txn
+                .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+                .unwrap();
+            let key = encode_regular_file_chunk_key(ino, ChunkId(0));
+            pending.insert(key.as_slice(), 1).unwrap();
+        }
+        txn.commit().unwrap();
 
         let query = SliceRange::new(0, 6144).expect("lookup query");
         let before = engine
