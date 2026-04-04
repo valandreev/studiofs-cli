@@ -17,6 +17,15 @@ struct PendingDirtySlice {
     seq: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingDirtyReadSpan {
+    pub(super) start: u64,
+    pub(super) end: u64,
+    pub(super) block_index: u32,
+    pub(super) block_offset: u32,
+    pub(super) seq: u64,
+}
+
 #[derive(Debug, Clone)]
 struct DirtyWriteSnapshot {
     block_index: u32,
@@ -801,6 +810,67 @@ impl StudioVfs {
             }
         }
         slices_by_chunk
+    }
+
+    pub(super) fn snapshot_pending_dirty_slice_read_spans(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> Vec<PendingDirtyReadSpan> {
+        if length == 0 {
+            return Vec::new();
+        }
+        let Some(end) = offset.checked_add(length) else {
+            return Vec::new();
+        };
+        let pending_blocks = self.state.write_buffer.pending_blocks.lock();
+        let pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        let Some(chunks) = pending_chunk_slices.get(&ino) else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for (chunk_id, slices) in chunks {
+            let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                studiofs_meta::schema::ChunkId(*chunk_id),
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            );
+            for slice in slices {
+                let Some(pending_block) = pending_blocks.get(&(ino, slice.block_index)) else {
+                    continue;
+                };
+                let slice_start = chunk_start.saturating_add(slice.range.start as u64);
+                let slice_end = chunk_start.saturating_add(slice.range.end as u64);
+                let start = slice_start.max(offset);
+                let stop = slice_end.min(end);
+                if start >= stop {
+                    continue;
+                }
+                let advance = start.saturating_sub(slice_start);
+                let Some(advance_u32) = u32::try_from(advance).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = slice.block_offset.checked_add(advance_u32) else {
+                    continue;
+                };
+                let span_len = (stop - start) as usize;
+                let Some(block_offset_usize) = usize::try_from(block_offset).ok() else {
+                    continue;
+                };
+                if block_offset_usize.saturating_add(span_len) > pending_block.data.len() {
+                    continue;
+                }
+                spans.push(PendingDirtyReadSpan {
+                    start,
+                    end: stop,
+                    block_index: slice.block_index,
+                    block_offset,
+                    seq: slice.seq,
+                });
+            }
+        }
+        spans.sort_by_key(|span| std::cmp::Reverse(span.seq));
+        spans
     }
 
     fn commit_persisted_write_buffer_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {

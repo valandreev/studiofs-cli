@@ -61,7 +61,10 @@ use studiofs_data::object::{
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
-use studiofs_meta::schema::{DirEntry, ROOT_INO, SetattrArgs, UploadState as MetaUploadState};
+use studiofs_meta::schema::{
+    DEFAULT_CHUNK_SIZE, DirEntry, ROOT_INO, ResolvedSliceSource, SetattrArgs,
+    UploadState as MetaUploadState, chunk_start_offset,
+};
 use studiofs_meta::types::{
     AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
     block_index_from_offset, offset_within_block,
@@ -3442,6 +3445,34 @@ impl Drop for ForegroundReadScope<'_> {
         );
         self.vfs.unmark_foreground_read();
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadRange {
+    start: u64,
+    end: u64,
+}
+
+impl ReadRange {
+    fn intersection(self, other: Self) -> Option<Self> {
+        let start = self.start.max(other.start);
+        let end = self.end.min(other.end);
+        (start < end).then_some(Self { start, end })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ReadPlanSource {
+    Dirty { block_index: u32, block_offset: u32 },
+    Overlay { block: BlockRef },
+    Base { block: BlockRef },
+    Zero,
+}
+
+#[derive(Debug, Clone)]
+struct ReadPlanSpan {
+    range: ReadRange,
+    source: ReadPlanSource,
 }
 
 macro_rules! with_sync_meta {
@@ -8865,105 +8896,312 @@ impl StudioVfs {
         if self.remote_upload_placeholder_visible(ino, &attr) {
             return Err(VfsError::RemoteContentPending);
         }
-        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-        let pending_content_epoch = incarnation_state
-            .pending_incarnation
-            .as_ref()
-            .map(|pending| pending.content_epoch);
+        self.refresh_inode_incarnation_state_from_attr(ino, &attr);
 
-        // Clamp read to file size
-        let blocks_needed = self.calculate_blocks_needed(offset, buffer.len(), attr.size);
-        if blocks_needed.is_empty() {
+        let read_end = (offset + buffer.len() as u64).min(attr.size);
+        let read_len = read_end.saturating_sub(offset) as usize;
+        if read_len == 0 {
             return Ok(0);
         }
+        let blocks_needed = self.calculate_blocks_needed(offset, read_len, attr.size);
         let access = self.observe_read_access(fh, ino, offset, buffer.len());
         let mut guard = ForegroundReadScope::new(self, access.policy);
-
-        // If only one block, read sequentially to avoid overhead
-        if blocks_needed.len() == 1 {
-            let (block_idx, off_in, to_copy) = blocks_needed[0];
-            return match self
-                .read_block_or_pending(ino, block_idx, pending_content_epoch)
-                .await
-            {
-                Ok(block_data) => {
-                    let copy_len = if to_copy == 0 || off_in >= block_data.len() {
-                        0
-                    } else {
-                        to_copy.min(block_data.len() - off_in)
-                    };
-                    if copy_len > 0 {
-                        buffer[..copy_len].copy_from_slice(&block_data[off_in..off_in + copy_len]);
-                    }
-                    self.enqueue_prefetch_hint(
-                        ino,
-                        access.stream_id,
-                        access.policy,
-                        &blocks_needed,
-                    );
-                    guard.record_bytes(copy_len as u64);
-                    Ok(copy_len as u32)
-                }
-                Err(VfsError::BlockNotFound(_, _)) => {
-                    buffer[..to_copy].fill(0u8);
-                    self.enqueue_prefetch_hint(
-                        ino,
-                        access.stream_id,
-                        access.policy,
-                        &blocks_needed,
-                    );
-                    guard.record_bytes(to_copy as u64);
-                    Ok(to_copy as u32)
-                }
-                Err(e) => Err(e),
-            };
-        }
-
-        // Parallel fetch — concurrency is governed by the AIMD controller
-        // inside FetchScheduler, so no external semaphore is needed here.
-        let fetch_futures: Vec<_> = blocks_needed
-            .iter()
-            .map(|(idx, _, _)| {
-                let block_idx = *idx;
-                async move {
-                    self.read_block_or_pending(ino, block_idx, pending_content_epoch)
-                        .await
-                }
-            })
-            .collect();
-
-        // Execute all fetches in parallel
-        let fetched = futures::future::join_all(fetch_futures).await;
-
-        // Write results directly to output buffer
-        let mut written = 0usize;
-        for (i, block_result) in fetched.into_iter().enumerate() {
-            let (_block_idx, off_in, to_copy) = blocks_needed[i];
-            match block_result {
-                Ok(block_data) => {
-                    let copy_len = if to_copy == 0 || off_in >= block_data.len() {
-                        0
-                    } else {
-                        to_copy.min(block_data.len() - off_in)
-                    };
-                    if copy_len > 0 && written + copy_len <= buffer.len() {
-                        buffer[written..written + copy_len]
-                            .copy_from_slice(&block_data[off_in..off_in + copy_len]);
-                        written += copy_len;
-                    }
-                }
-                Err(VfsError::BlockNotFound(_, _)) => {
-                    let zeros_len = to_copy.min(buffer.len().saturating_sub(written));
-                    buffer[written..written + zeros_len].fill(0u8);
-                    written += zeros_len;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let mut read_plan = self.build_read_plan(ino, offset, read_len as u64).await?;
+        read_plan.sort_by_key(|span| span.range.start);
+        let missing_remote = self.prefetch_remote_blocks_for_plan(&read_plan).await?;
+        let written = self
+            .assemble_read_plan(ino, offset, &read_plan, &missing_remote, buffer)
+            .await?;
 
         self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         guard.record_bytes(written as u64);
         Ok(written as u32)
+    }
+
+    fn claim_unresolved_ranges(
+        unresolved: Vec<ReadRange>,
+        candidate: ReadRange,
+    ) -> (Vec<ReadRange>, Vec<ReadRange>) {
+        let mut next_unresolved = Vec::new();
+        let mut claimed = Vec::new();
+        for range in unresolved {
+            let Some(overlap) = range.intersection(candidate) else {
+                next_unresolved.push(range);
+                continue;
+            };
+            if range.start < overlap.start {
+                next_unresolved.push(ReadRange {
+                    start: range.start,
+                    end: overlap.start,
+                });
+            }
+            claimed.push(overlap);
+            if overlap.end < range.end {
+                next_unresolved.push(ReadRange {
+                    start: overlap.end,
+                    end: range.end,
+                });
+            }
+        }
+        (next_unresolved, claimed)
+    }
+
+    async fn build_read_plan(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> VfsResult<Vec<ReadPlanSpan>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(read_end) = offset.checked_add(length) else {
+            return Err(VfsError::Other(format!(
+                "read range overflow: ino={ino}, offset={offset}, length={length}"
+            )));
+        };
+        let requested = ReadRange {
+            start: offset,
+            end: read_end,
+        };
+        let mut unresolved = vec![requested];
+        let mut plan = Vec::new();
+
+        let dirty_spans = self.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
+        for dirty in dirty_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let dirty_range = ReadRange {
+                start: dirty.start,
+                end: dirty.end,
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(dirty.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                plan.push(ReadPlanSpan {
+                    range: overlap,
+                    source: ReadPlanSource::Dirty {
+                        block_index: dirty.block_index,
+                        block_offset,
+                    },
+                });
+            }
+        }
+
+        if !unresolved.is_empty() {
+            let meta = self.meta_async.clone();
+            let resolved = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.lookup_regular_file_slices(ino, offset, length)
+            })
+            .await?;
+
+            unresolved = self.claim_meta_spans_into_plan(
+                resolved.iter(),
+                unresolved,
+                &mut plan,
+                requested,
+                ResolvedSliceSource::Overlay,
+                |block| ReadPlanSource::Overlay { block },
+            );
+            unresolved = self.claim_meta_spans_into_plan(
+                resolved.iter(),
+                unresolved,
+                &mut plan,
+                requested,
+                ResolvedSliceSource::Base,
+                |block| ReadPlanSource::Base { block },
+            );
+        }
+
+        for gap in unresolved {
+            plan.push(ReadPlanSpan {
+                range: gap,
+                source: ReadPlanSource::Zero,
+            });
+        }
+        Ok(plan)
+    }
+
+    fn claim_meta_spans_into_plan<'a, I, F>(
+        &self,
+        resolved: I,
+        unresolved: Vec<ReadRange>,
+        plan: &mut Vec<ReadPlanSpan>,
+        requested: ReadRange,
+        source_filter: ResolvedSliceSource,
+        source_ctor: F,
+    ) -> Vec<ReadRange>
+    where
+        I: Iterator<Item = &'a studiofs_meta::schema::ResolvedSliceSpan>,
+        F: Fn(BlockRef) -> ReadPlanSource + Copy,
+    {
+        let mut unresolved = unresolved;
+        for span in resolved {
+            if unresolved.is_empty() {
+                break;
+            }
+            if span.source != source_filter {
+                continue;
+            }
+            let Some(block) = span.block.as_ref() else {
+                continue;
+            };
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let span_range = ReadRange {
+                start: chunk_base.saturating_add(span.range.start as u64),
+                end: chunk_base.saturating_add(span.range.end as u64),
+            };
+            let Some(clipped) = span_range.intersection(requested) else {
+                continue;
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, clipped);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(span_range.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = block.offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                let length = overlap.end.saturating_sub(overlap.start);
+                let Some(block_length) = u32::try_from(length).ok() else {
+                    continue;
+                };
+                let mut planned_block = block.clone();
+                planned_block.offset = block_offset;
+                planned_block.length = block_length;
+                plan.push(ReadPlanSpan {
+                    range: overlap,
+                    source: source_ctor(planned_block),
+                });
+            }
+        }
+        unresolved
+    }
+
+    async fn prefetch_remote_blocks_for_plan(
+        &self,
+        plan: &[ReadPlanSpan],
+    ) -> VfsResult<HashSet<u64>> {
+        let mut missing = BTreeSet::new();
+        for span in plan {
+            let block = match &span.source {
+                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
+                ReadPlanSource::Dirty { .. } | ReadPlanSource::Zero => continue,
+            };
+            if !self.block_store.contains(block.object_id) {
+                missing.insert(block.object_id);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let fetches = missing.into_iter().map(|object_id| async move {
+            let keys = format_object_fragment_keys(&self.data_prefix, object_id);
+            match self.fetch_scheduler.fetch_block(object_id, &keys).await {
+                Ok(_) => Ok((object_id, false)),
+                Err(crate::fetch::FetchError::NotFound { .. }) => Ok((object_id, true)),
+                Err(error) => Err(VfsError::Other(format!(
+                    "read planner fetch failed for object_id={object_id}: {error}"
+                ))),
+            }
+        });
+        let mut not_found = HashSet::new();
+        for result in join_all(fetches).await {
+            let (object_id, was_not_found) = result?;
+            if was_not_found {
+                not_found.insert(object_id);
+            }
+        }
+        Ok(not_found)
+    }
+
+    fn copy_block_payload_into_range(&self, data: &[u8], block_offset: u32, dst: &mut [u8]) {
+        let src_start = block_offset as usize;
+        if src_start >= data.len() {
+            dst.fill(0);
+            return;
+        }
+        let copy_len = dst.len().min(data.len().saturating_sub(src_start));
+        if copy_len > 0 {
+            dst[..copy_len].copy_from_slice(&data[src_start..src_start + copy_len]);
+        }
+        if copy_len < dst.len() {
+            dst[copy_len..].fill(0);
+        }
+    }
+
+    async fn assemble_read_plan(
+        &self,
+        ino: Ino,
+        offset: u64,
+        plan: &[ReadPlanSpan],
+        remote_not_found: &HashSet<u64>,
+        buffer: &mut [u8],
+    ) -> VfsResult<usize> {
+        let mut written = 0usize;
+        for span in plan {
+            let dst_start = span.range.start.saturating_sub(offset) as usize;
+            let dst_end = span.range.end.saturating_sub(offset) as usize;
+            if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
+                continue;
+            }
+            let dst = &mut buffer[dst_start..dst_end];
+            match &span.source {
+                ReadPlanSource::Dirty {
+                    block_index,
+                    block_offset,
+                } => {
+                    let pending = self.state.write_buffer.pending_blocks.lock();
+                    if let Some(block) = pending.get(&(ino, *block_index)) {
+                        self.copy_block_payload_into_range(block.data.as_ref(), *block_offset, dst);
+                    } else {
+                        dst.fill(0);
+                    }
+                }
+                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
+                    if remote_not_found.contains(&block.object_id) {
+                        dst.fill(0);
+                    } else if let Some(data) = self.block_store_get_async(block.object_id).await? {
+                        self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
+                    } else {
+                        let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
+                        match self
+                            .fetch_scheduler
+                            .fetch_block(block.object_id, &keys)
+                            .await
+                        {
+                            Ok(data) => {
+                                self.copy_block_payload_into_range(
+                                    data.as_ref(),
+                                    block.offset,
+                                    dst,
+                                );
+                            }
+                            Err(crate::fetch::FetchError::NotFound { .. }) => dst.fill(0),
+                            Err(error) => {
+                                return Err(VfsError::Other(format!(
+                                    "read planner fetch failed for object_id={}: {error}",
+                                    block.object_id
+                                )));
+                            }
+                        }
+                    }
+                }
+                ReadPlanSource::Zero => dst.fill(0),
+            }
+            written = written.max(dst_end);
+        }
+        Ok(written)
     }
 
     /// Enqueue a read hint for background prefetch planning and execution.
@@ -9106,24 +9344,6 @@ impl StudioVfs {
             budget = budget.saturating_sub(1);
         }
         planned
-    }
-
-    /// Read a block from the local pending incarnation overlay first, then
-    /// fall back to the committed/current base.
-    async fn read_block_or_pending(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        pending_content_epoch: Option<u64>,
-    ) -> VfsResult<Bytes> {
-        if let Some(data) = self
-            .read_pending_overlay_block_async(ino, block_index, pending_content_epoch)
-            .await?
-        {
-            return Ok(data);
-        }
-
-        self.read_block(ino, block_index).await
     }
 
     fn read_into_sync_cached_impl(
@@ -9328,33 +9548,6 @@ impl StudioVfs {
             .fetch_block_prefetch(block_ref.object_id, &keys)
             .await;
         self.readahead.finish_prefetch(ino, block_index);
-    }
-
-    /// Read a single block from S3 via the adaptive FetchScheduler.
-    ///
-    /// The scheduler handles:
-    /// - L1/L2 cache checks (fast path)
-    /// - Singleflight request coalescing (only one S3 GET per object_id)
-    /// - AIMD-governed concurrency (TCP-cwnd–like adaptive window)
-    /// - Retry with exponential backoff on transient errors
-    /// - Cache population on success
-    async fn read_block(&self, ino: Ino, block_index: u32) -> VfsResult<Bytes> {
-        // Get block reference from metadata
-        let block_ref = self
-            .get_file_block_async(ino, block_index)
-            .await?
-            .ok_or(VfsError::BlockNotFound(ino, block_index))?;
-
-        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
-        self.fetch_scheduler
-            .fetch_block(block_ref.object_id, &keys)
-            .await
-            .map_err(|e| match e {
-                crate::fetch::FetchError::NotFound { .. } => {
-                    VfsError::BlockNotFound(ino, block_index)
-                }
-                other => VfsError::Other(other.to_string()),
-            })
     }
 
     // =========================================================================
