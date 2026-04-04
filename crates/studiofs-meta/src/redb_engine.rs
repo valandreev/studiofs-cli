@@ -1386,10 +1386,11 @@ impl RedbMetaEngine {
     }
 
     fn synthesize_block_ref_from_resolved_spans(
+        ino: Ino,
         spans: &[ResolvedSliceSpan],
         block_index: u32,
         block_size: u32,
-    ) -> Option<BlockRef> {
+    ) -> MetaResult<Option<BlockRef>> {
         #[derive(Clone, Copy)]
         struct Range {
             start: u64,
@@ -1475,7 +1476,7 @@ impl RedbMetaEngine {
         }
 
         if claimed_refs.is_empty() {
-            return None;
+            return Ok(None);
         }
         claimed_refs.sort_by_key(|(start, _)| *start);
 
@@ -1485,7 +1486,7 @@ impl RedbMetaEngine {
                 if existing.object_id != part.object_id
                     || existing.offset.saturating_add(existing.length) != part.offset
                 {
-                    return None;
+                    return Err(MetaError::FragmentedBlock { ino, block_index });
                 }
                 existing.length = existing.length.saturating_add(part.length);
                 existing.flags |= part.flags;
@@ -1494,7 +1495,7 @@ impl RedbMetaEngine {
             }
         }
 
-        chosen.filter(|block| block.length > 0)
+        Ok(chosen.filter(|block| block.length > 0))
     }
 
     fn lookup_regular_file_slices_in_write_txn(
@@ -2648,10 +2649,11 @@ impl RedbMetaEngine {
             for idx in 0..block_count {
                 let block_index = idx as u32;
                 if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
+                    ino,
                     spans.as_slice(),
                     block_index,
                     block_size,
-                ) {
+                )? {
                     synthesized.push((block_index, block));
                 }
             }
@@ -5828,11 +5830,12 @@ impl MetaBlocks for RedbMetaEngine {
         let block_start = (block_index as u64).saturating_mul(block_size as u64);
         let spans = self.lookup_regular_file_slices(ino, block_start, block_size as u64)?;
         if !spans.is_empty() {
-            return Ok(Self::synthesize_block_ref_from_resolved_spans(
+            return Self::synthesize_block_ref_from_resolved_spans(
+                ino,
                 spans.as_slice(),
                 block_index,
                 block_size,
-            ));
+            );
         }
 
         let key = encode_file_block_key(ino, block_index);
@@ -5965,16 +5968,15 @@ impl MetaBlocks for RedbMetaEngine {
                 for idx in 0..block_count {
                     let block_index = idx as u32;
                     if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
+                        ino,
                         spans.as_slice(),
                         block_index,
                         block_size,
-                    ) {
+                    )? {
                         synthesized.push((block_index, block));
                     }
                 }
-                if !synthesized.is_empty() {
-                    return Ok(synthesized);
-                }
+                return Ok(synthesized);
             }
         }
 
@@ -8865,6 +8867,41 @@ mod tests {
         assert_eq!(all_blocks.len(), 1);
         assert_eq!(all_blocks[0].0, 0);
         assert_eq!(all_blocks[0].1.object_id, 7);
+    }
+
+    #[test]
+    fn test_synthesize_block_ref_rejects_fragmented_block() {
+        let spans = vec![
+            ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(0, 4096).unwrap(),
+                source: ResolvedSliceSource::Overlay,
+                slice_id: Some(SliceId(1)),
+                slice_order: Some(SliceOrder(1)),
+                block: Some(BlockRef::new_partial(7, 4096)),
+            },
+            ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(4096, 8192).unwrap(),
+                source: ResolvedSliceSource::Overlay,
+                slice_id: Some(SliceId(2)),
+                slice_order: Some(SliceOrder(2)),
+                block: Some(BlockRef::new_partial(8, 4096)),
+            },
+        ];
+
+        let err = RedbMetaEngine::synthesize_block_ref_from_resolved_spans(
+            ROOT_INO,
+            spans.as_slice(),
+            0,
+            8192,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MetaError::FragmentedBlock { ino, block_index }
+                if ino == ROOT_INO && block_index == 0
+        ));
     }
 
     #[test]

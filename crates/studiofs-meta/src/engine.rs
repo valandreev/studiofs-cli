@@ -38,6 +38,9 @@ pub enum MetaError {
     #[error("inode not found: {0}")]
     InodeNotFound(Ino),
 
+    #[error("fragmented regular-file block: ino={ino}, block_index={block_index}")]
+    FragmentedBlock { ino: Ino, block_index: u32 },
+
     #[error("entry not found: {name:?} in parent {parent}")]
     EntryNotFound { parent: Ino, name: String },
 
