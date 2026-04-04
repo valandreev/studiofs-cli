@@ -1384,6 +1384,162 @@ impl RedbMetaEngine {
             Err(err) => Err(err),
         }
     }
+
+    fn synthesize_block_ref_from_resolved_spans(
+        ino: Ino,
+        spans: &[ResolvedSliceSpan],
+        block_index: u32,
+        block_size: u32,
+    ) -> MetaResult<Option<BlockRef>> {
+        #[derive(Clone, Copy)]
+        struct Range {
+            start: u64,
+            end: u64,
+        }
+
+        fn claim_ranges(unresolved: Vec<Range>, candidate: Range) -> (Vec<Range>, Vec<Range>) {
+            let mut next_unresolved = Vec::new();
+            let mut claimed = Vec::new();
+            for range in unresolved {
+                let overlap_start = range.start.max(candidate.start);
+                let overlap_end = range.end.min(candidate.end);
+                if overlap_start >= overlap_end {
+                    next_unresolved.push(range);
+                    continue;
+                }
+                if range.start < overlap_start {
+                    next_unresolved.push(Range {
+                        start: range.start,
+                        end: overlap_start,
+                    });
+                }
+                claimed.push(Range {
+                    start: overlap_start,
+                    end: overlap_end,
+                });
+                if overlap_end < range.end {
+                    next_unresolved.push(Range {
+                        start: overlap_end,
+                        end: range.end,
+                    });
+                }
+            }
+            (next_unresolved, claimed)
+        }
+
+        let block_start = (block_index as u64).saturating_mul(block_size as u64);
+        let block_end = block_start.saturating_add(block_size as u64);
+        let mut unresolved = vec![Range {
+            start: block_start,
+            end: block_end,
+        }];
+        let mut claimed_refs: Vec<(u64, BlockRef)> = Vec::new();
+
+        for source in [ResolvedSliceSource::Overlay, ResolvedSliceSource::Base] {
+            for span in spans.iter().filter(|span| span.source == source) {
+                if unresolved.is_empty() {
+                    break;
+                }
+                let Some(block) = span.block.as_ref() else {
+                    continue;
+                };
+                let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                let span_range = Range {
+                    start: chunk_start.saturating_add(span.range.start as u64),
+                    end: chunk_start.saturating_add(span.range.end as u64),
+                };
+                let (next_unresolved, claimed) = claim_ranges(unresolved, span_range);
+                unresolved = next_unresolved;
+                for overlap in claimed {
+                    let delta = overlap.start.saturating_sub(span_range.start);
+                    let Some(delta_u32) = u32::try_from(delta).ok() else {
+                        continue;
+                    };
+                    let Some(block_offset) = block.offset.checked_add(delta_u32) else {
+                        continue;
+                    };
+                    let take_len = overlap.end.saturating_sub(overlap.start);
+                    let Some(take_len_u32) = u32::try_from(take_len).ok() else {
+                        continue;
+                    };
+                    claimed_refs.push((
+                        overlap.start,
+                        BlockRef {
+                            object_id: block.object_id,
+                            offset: block_offset,
+                            length: take_len_u32,
+                            flags: block.flags,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if claimed_refs.is_empty() {
+            return Ok(None);
+        }
+        claimed_refs.sort_by_key(|(start, _)| *start);
+
+        let mut chosen: Option<BlockRef> = None;
+        for (_, part) in claimed_refs {
+            if let Some(existing) = chosen.as_mut() {
+                if existing.object_id != part.object_id
+                    || existing.offset.saturating_add(existing.length) != part.offset
+                {
+                    return Err(MetaError::FragmentedBlock { ino, block_index });
+                }
+                existing.length = existing.length.saturating_add(part.length);
+                existing.flags |= part.flags;
+            } else {
+                chosen = Some(part);
+            }
+        }
+
+        Ok(chosen.filter(|block| block.length > 0))
+    }
+
+    fn lookup_regular_file_slices_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| MetaError::Storage("regular-file lookup range overflow".to_string()))?;
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        let mut spans = Vec::new();
+        let mut cursor = offset;
+        while cursor < end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let chunk_end = chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64);
+            let query_end = end.min(chunk_end);
+            let start_in_chunk = (cursor - chunk_start) as u32;
+            let end_in_chunk = (query_end - chunk_start) as u32;
+            let query = SliceRange::new(start_in_chunk, end_in_chunk).ok_or_else(|| {
+                MetaError::Storage("invalid chunk-local lookup range".to_string())
+            })?;
+            let overlay = overlay_chunks.get(&chunk_id);
+            let base = base_chunks.get(&chunk_id);
+            spans.extend(resolve_chunk_slice_spans(chunk_id, query, overlay, base));
+            cursor = query_end;
+        }
+        Ok(merge_adjacent_spans(spans))
+    }
+
     fn local_overlay_attr_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
         let current = txn
             .open_table(INODES_TABLE)
@@ -2474,6 +2630,36 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let attr = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)?
+            .or_else(|| {
+                Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)
+                    .ok()
+                    .flatten()
+            })
+            .ok_or(MetaError::InodeNotFound(ino))?;
+        if attr.size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let spans = Self::lookup_regular_file_slices_in_write_txn(txn, ino, 0, attr.size)?;
+        if !spans.is_empty() {
+            let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
+            let block_count = ((attr.size.saturating_sub(1)) / block_size as u64).saturating_add(1);
+            let mut synthesized = Vec::new();
+            for idx in 0..block_count {
+                let block_index = idx as u32;
+                if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
+                    ino,
+                    spans.as_slice(),
+                    block_index,
+                    block_size,
+                )? {
+                    synthesized.push((block_index, block));
+                }
+            }
+            return Ok(synthesized);
+        }
+
         let blocks = txn
             .open_table(FILE_BLOCKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2507,6 +2693,23 @@ impl RedbMetaEngine {
             merged.entry(block_index).or_insert(decode(value.value())?);
         }
         Ok(merged.into_iter().collect())
+    }
+
+    fn format_info_from_write_txn(txn: &redb::WriteTransaction) -> MetaResult<FormatInfo> {
+        let table = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let entry = table
+            .get("format")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .ok_or(MetaError::NotFormatted)?;
+        serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
+    }
+
+    fn regular_file_graph_block_size_from_write_txn(
+        txn: &redb::WriteTransaction,
+    ) -> MetaResult<u32> {
+        Ok(Self::format_info_from_write_txn(txn)?.block_size)
     }
 
     fn transition_upload_state_for_local_mutation(
@@ -5623,6 +5826,18 @@ impl MetaNamespace for RedbMetaEngine {
 }
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
+        let block_size = self.regular_file_graph_block_size()?;
+        let block_start = (block_index as u64).saturating_mul(block_size as u64);
+        let spans = self.lookup_regular_file_slices(ino, block_start, block_size as u64)?;
+        if !spans.is_empty() {
+            return Self::synthesize_block_ref_from_resolved_spans(
+                ino,
+                spans.as_slice(),
+                block_index,
+                block_size,
+            );
+        }
+
         let key = encode_file_block_key(ino, block_index);
         let txn = self
             .db
@@ -5737,6 +5952,34 @@ impl MetaBlocks for RedbMetaEngine {
     }
 
     fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let block_size = self.regular_file_graph_block_size()?;
+        let file_size = match self.get_attr(ino) {
+            Ok(attr) => attr.size,
+            Err(MetaError::InodeNotFound(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        if file_size > 0 {
+            let spans = self.lookup_regular_file_slices(ino, 0, file_size)?;
+            if !spans.is_empty() {
+                let block_count =
+                    ((file_size.saturating_sub(1)) / block_size as u64).saturating_add(1);
+                let mut synthesized = Vec::new();
+                for idx in 0..block_count {
+                    let block_index = idx as u32;
+                    if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
+                        ino,
+                        spans.as_slice(),
+                        block_index,
+                        block_size,
+                    )? {
+                        synthesized.push((block_index, block));
+                    }
+                }
+                return Ok(synthesized);
+            }
+        }
+
         let prefix = file_block_prefix(ino);
         let txn = self
             .db
@@ -5783,7 +6026,6 @@ impl MetaBlocks for RedbMetaEngine {
             }
             blocks.entry(block_index).or_insert(decode(value.value())?);
         }
-
         Ok(blocks.into_iter().collect())
     }
 
@@ -6145,7 +6387,7 @@ impl MetaBlocks for RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let committed_manifest = {
-            let mut inodes = txn
+            let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let attr_bytes = match inodes
@@ -6159,6 +6401,7 @@ impl MetaBlocks for RedbMetaEngine {
             if attr.content_epoch != expected_epoch {
                 return Ok(false);
             }
+            drop(inodes);
 
             let blocks = txn
                 .open_table(FILE_BLOCKS_TABLE)
@@ -6209,9 +6452,13 @@ impl MetaBlocks for RedbMetaEngine {
                 || previous_committed_epoch != attr.committed_content_epoch
                 || previous_upload_state != attr.upload_state;
             let attr_data = encode(&attr)?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             inodes
                 .insert(ino, attr_data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            drop(inodes);
 
             Self::append_event_in_txn(
                 &txn,
@@ -6280,7 +6527,7 @@ impl MetaBlocks for RedbMetaEngine {
 
         let published_blocks;
         {
-            let mut inodes = txn
+            let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let attr_bytes = match inodes
@@ -6294,6 +6541,7 @@ impl MetaBlocks for RedbMetaEngine {
             if attr.content_epoch != expected_epoch {
                 return Ok(false);
             }
+            drop(inodes);
 
             published_blocks = Self::current_manifest_in_txn(&txn, ino)?;
             if published_blocks.as_slice() != expected_manifest {
@@ -6358,6 +6606,9 @@ impl MetaBlocks for RedbMetaEngine {
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
             let attr_data = encode(&attr)?;
+            let mut inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             inodes
                 .insert(ino, attr_data.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -8616,6 +8867,41 @@ mod tests {
         assert_eq!(all_blocks.len(), 1);
         assert_eq!(all_blocks[0].0, 0);
         assert_eq!(all_blocks[0].1.object_id, 7);
+    }
+
+    #[test]
+    fn test_synthesize_block_ref_rejects_fragmented_block() {
+        let spans = vec![
+            ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(0, 4096).unwrap(),
+                source: ResolvedSliceSource::Overlay,
+                slice_id: Some(SliceId(1)),
+                slice_order: Some(SliceOrder(1)),
+                block: Some(BlockRef::new_partial(7, 4096)),
+            },
+            ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(4096, 8192).unwrap(),
+                source: ResolvedSliceSource::Overlay,
+                slice_id: Some(SliceId(2)),
+                slice_order: Some(SliceOrder(2)),
+                block: Some(BlockRef::new_partial(8, 4096)),
+            },
+        ];
+
+        let err = RedbMetaEngine::synthesize_block_ref_from_resolved_spans(
+            ROOT_INO,
+            spans.as_slice(),
+            0,
+            8192,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MetaError::FragmentedBlock { ino, block_index }
+                if ino == ROOT_INO && block_index == 0
+        ));
     }
 
     #[test]

@@ -232,6 +232,7 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
             MetaError::IsADirectory(_) => libc::EISDIR,
             MetaError::DirNotEmpty(_) => libc::ENOTEMPTY,
             MetaError::NotFormatted => libc::ENODEV,
+            MetaError::FragmentedBlock { .. } => libc::EIO,
             MetaError::XattrValueTooLarge { .. } => libc::E2BIG,
             _ => libc::EIO,
         },
@@ -1542,6 +1543,12 @@ mod tests {
             limit: 16,
         });
         assert_eq!(vfs_err_to_errno(&xattr_too_big), libc::E2BIG);
+
+        let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
+            ino: 7,
+            block_index: 3,
+        });
+        assert_eq!(vfs_err_to_errno(&fragmented), libc::EIO);
     }
 
     #[test]

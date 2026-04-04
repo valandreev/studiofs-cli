@@ -34,6 +34,7 @@ const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = NTSTATUS(0xC000_0101_u32 as i32);
 const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
 const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
 const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
+const STATUS_DATA_ERROR: NTSTATUS = NTSTATUS(0xC000_003E_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
 const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
 const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
@@ -372,6 +373,9 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             }
             studiofs_meta::MetaError::NotFormatted => {
                 winfsp::FspError::from(STATUS_UNRECOGNIZED_VOLUME)
+            }
+            studiofs_meta::MetaError::FragmentedBlock { .. } => {
+                winfsp::FspError::from(STATUS_DATA_ERROR)
             }
             studiofs_meta::MetaError::XattrValueTooLarge { .. } => {
                 winfsp::FspError::from(STATUS_EA_TOO_LARGE)
@@ -1244,7 +1248,7 @@ mod tests {
     use super::{
         FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
         FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-        STATUS_ACCESS_DENIED, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
+        STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator, build_notify_info,
         ino_to_windows_path, notify_filter_for_kind, open_flags_from_create_options,
         vfs_to_winfsp_err,
@@ -1363,6 +1367,13 @@ mod tests {
         });
         let status = vfs_to_winfsp_err(xattr_too_big).to_ntstatus();
         assert_eq!(status, STATUS_EA_TOO_LARGE.0);
+
+        let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
+            ino: 7,
+            block_index: 3,
+        });
+        let status = vfs_to_winfsp_err(fragmented).to_ntstatus();
+        assert_eq!(status, STATUS_DATA_ERROR.0);
     }
 
     #[test]
