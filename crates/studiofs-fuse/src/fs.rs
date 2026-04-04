@@ -240,6 +240,15 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
         VfsError::Join(_) => libc::EIO,
         VfsError::WouldBlock | VfsError::RemoteContentPending => libc::EAGAIN,
         VfsError::InvalidName(_) => libc::EINVAL,
+        VfsError::Fetch(fetch_err) => match fetch_err {
+            studiofs_vfs::fetch::FetchError::NotFound { .. } => libc::ENOENT,
+            studiofs_vfs::fetch::FetchError::Exhausted { .. } => libc::ETIMEDOUT,
+            studiofs_vfs::fetch::FetchError::PrefetchSkipped => libc::EAGAIN,
+            studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall { .. } => libc::ENOMEM,
+            studiofs_vfs::fetch::FetchError::Decode(_)
+            | studiofs_vfs::fetch::FetchError::CacheAccess(_)
+            | studiofs_vfs::fetch::FetchError::CorruptFragment { .. } => libc::EIO,
+        },
         VfsError::Io(ioe) => match ioe.kind() {
             std::io::ErrorKind::NotFound => libc::ENOENT,
             std::io::ErrorKind::PermissionDenied => libc::EACCES,
@@ -775,37 +784,6 @@ impl Filesystem for StudioFuseFs {
         if clamped_size == 0 {
             reply.data(&[]);
             return;
-        }
-
-        let can_sync = match self
-            .vfs
-            .can_read_fh_sync_cached(fh, ino, offset as u64, clamped_size)
-        {
-            Ok(can_sync) => can_sync,
-            Err(e) => {
-                error!("can_read_sync_cached({ino}, off={offset}, sz={size}) -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-                return;
-            }
-        };
-
-        if can_sync {
-            let mut out = vec![0u8; clamped_size as usize];
-            match self
-                .vfs
-                .read_into_fh_sync_cached(fh, ino, offset as u64, &mut out)
-            {
-                Ok(Some(n)) => {
-                    reply.data(&out[..n as usize]);
-                    return;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    error!("read_sync_cached({ino}, off={offset}, sz={size}) -> {e}");
-                    reply.error(vfs_err_to_errno(&e));
-                    return;
-                }
-            }
         }
 
         let mut out = vec![0u8; clamped_size as usize];
@@ -1549,6 +1527,12 @@ mod tests {
             block_index: 3,
         });
         assert_eq!(vfs_err_to_errno(&fragmented), libc::EIO);
+
+        let exhausted = VfsError::Fetch(studiofs_vfs::fetch::FetchError::Exhausted {
+            attempts: 3,
+            source: studiofs_data::store::DataError::Storage("timeout".into()),
+        });
+        assert_eq!(vfs_err_to_errno(&exhausted), libc::ETIMEDOUT);
     }
 
     #[test]
