@@ -207,13 +207,28 @@ impl StudioVfs {
         }
     }
 
-    fn next_pending_slice_seq_batch(&self, count: usize) -> std::ops::Range<u64> {
+    fn next_pending_slice_seq_batch(&self, count: usize) -> VfsResult<std::ops::Range<u64>> {
+        let count_u64 = u64::try_from(count).map_err(|_| {
+            VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("pending dirty-slice batch too large: {}", count),
+            ))
+        })?;
         let start = self
             .state
             .write_buffer
             .next_pending_slice_seq
-            .fetch_add(count as u64, Ordering::Relaxed);
-        start..start.saturating_add(count as u64)
+            .fetch_add(count_u64, Ordering::Relaxed);
+        let end = start.checked_add(count_u64).ok_or_else(|| {
+            VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "pending dirty-slice sequence overflow: start={}, count={}",
+                    start, count_u64
+                ),
+            ))
+        })?;
+        Ok(start..end)
     }
 
     fn record_pending_dirty_slices_batch(
@@ -225,11 +240,11 @@ impl StudioVfs {
             u32,
             u32,
         )],
-    ) {
+    ) -> VfsResult<()> {
         if slices.is_empty() {
-            return;
+            return Ok(());
         }
-        let seqs = self.next_pending_slice_seq_batch(slices.len());
+        let seqs = self.next_pending_slice_seq_batch(slices.len())?;
         let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
         let inode_chunks = pending_chunk_slices.entry(ino).or_default();
         for (seq, (chunk_id, range, block_index, block_offset)) in seqs.zip(slices.iter().copied())
@@ -244,6 +259,7 @@ impl StudioVfs {
                     seq,
                 });
         }
+        Ok(())
     }
 
     fn clear_pending_dirty_slices_for_inode(&self, ino: Ino) {
@@ -753,7 +769,7 @@ impl StudioVfs {
             .get(&ino)
         {
             for (chunk_id, slices) in chunks {
-                let mut filtered: Vec<_> = slices
+                let filtered: Vec<_> = slices
                     .iter()
                     .copied()
                     .filter(|slice| {
@@ -765,7 +781,7 @@ impl StudioVfs {
                             })
                     })
                     .collect();
-                filtered.sort_by_key(|slice| slice.seq);
+                debug_assert!(filtered.windows(2).all(|pair| pair[0].seq <= pair[1].seq));
                 if !filtered.is_empty() {
                     slices_by_chunk.insert(*chunk_id, filtered);
                 }
@@ -1011,7 +1027,12 @@ impl StudioVfs {
 
             {
                 let mut pending = self.state.write_buffer.pending_blocks.lock();
-                let pending_block = pending.get_mut(&(ino, block_index)).unwrap();
+                let pending_block = pending.get_mut(&(ino, block_index)).ok_or_else(|| {
+                    VfsError::Io(std::io::Error::other(format!(
+                        "pending write-buffer block missing during write: ino={}, block_index={}",
+                        ino, block_index
+                    )))
+                })?;
                 self.remove_live_extent(ino, block_index);
 
                 let end_pos = offset_in_block + to_write;
@@ -1029,33 +1050,54 @@ impl StudioVfs {
                     has_full_blocks = true;
                 }
             }
-            let chunk_id = studiofs_meta::schema::chunk_id_from_offset(
-                write_start,
-                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-            );
-            let slice_start = studiofs_meta::schema::offset_within_chunk(
-                write_start,
-                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-            );
-            let mut slice_end = studiofs_meta::schema::offset_within_chunk(
-                write_end,
-                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-            );
-            if slice_end == 0 && write_end > write_start {
-                slice_end = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
-            }
-            let range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end).ok_or_else(
-                || {
+            let mut slice_cursor = write_start;
+            while slice_cursor < write_end {
+                let chunk_id = studiofs_meta::schema::chunk_id_from_offset(
+                    slice_cursor,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                    chunk_id,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                let chunk_end = chunk_start + studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+                let slice_file_end = write_end.min(chunk_end);
+                let slice_start = studiofs_meta::schema::offset_within_chunk(
+                    slice_cursor,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                let mut slice_end = studiofs_meta::schema::offset_within_chunk(
+                    slice_file_end,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                if slice_end == 0 && slice_file_end > slice_cursor {
+                    slice_end = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
+                }
+                let range =
+                    studiofs_meta::schema::SliceRange::new(slice_start, slice_end).ok_or_else(
+                        || {
+                            VfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "invalid dirty slice range during write: ino={}, offset={}..{}, chunk_id={}, range={}..{}",
+                                    ino, slice_cursor, slice_file_end, chunk_id.0, slice_start, slice_end
+                                ),
+                            ))
+                        },
+                    )?;
+                let slice_block_offset = (offset_in_block as u64) + (slice_cursor - write_start);
+                let slice_block_offset = u32::try_from(slice_block_offset).map_err(|_| {
                     VfsError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
-                            "invalid dirty slice range during write: ino={}, offset={}..{}, chunk_id={}, range={}..{}",
-                            ino, write_start, write_end, chunk_id.0, slice_start, slice_end
+                            "dirty slice block offset overflow: ino={}, block_index={}, offset={}",
+                            ino, block_index, slice_block_offset
                         ),
                     ))
-                },
-            )?;
-            pending_slices_batch.push((chunk_id, range, block_index, offset_in_block as u32));
+                })?;
+                pending_slices_batch.push((chunk_id, range, block_index, slice_block_offset));
+                slice_cursor = slice_file_end;
+            }
 
             written += to_write as u64;
             remaining -= to_write;
@@ -1065,7 +1107,7 @@ impl StudioVfs {
         if !inserted_block_indexes.is_empty() {
             self.add_pending_write_buffer_block_indexes(ino, inserted_block_indexes);
         }
-        self.record_pending_dirty_slices_batch(ino, &pending_slices_batch);
+        self.record_pending_dirty_slices_batch(ino, &pending_slices_batch)?;
 
         let mut base_attr = self.getattr_async(ino).await?;
         self.begin_pending_incarnation(ino, &mut base_attr);
