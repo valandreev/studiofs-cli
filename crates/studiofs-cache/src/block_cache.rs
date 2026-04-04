@@ -123,8 +123,6 @@ pub struct BlockCache {
     config: BlockCacheConfig,
     l1: Mutex<L1State>,
     l1_max_bytes: AtomicU64,
-    l1_eviction_count: AtomicU64,
-    l1_hit_count: AtomicU64,
     pinned: Mutex<HashSet<ObjectId>>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
@@ -141,8 +139,6 @@ impl BlockCache {
         let cache = Arc::new(Self {
             l1: Mutex::new(L1State::default()),
             l1_max_bytes: AtomicU64::new(config.l1_size.max(1)),
-            l1_eviction_count: AtomicU64::new(0),
-            l1_hit_count: AtomicU64::new(0),
             pinned: Mutex::new(HashSet::new()),
             upload_queue,
             metrics: CachePipelineMetrics::default(),
@@ -166,10 +162,6 @@ impl BlockCache {
         self.get_with_trace(object_id).await.0
     }
 
-    pub fn get_l1_only(&self, object_id: ObjectId) -> Option<Bytes> {
-        self.l1.lock().get_cloned(object_id)
-    }
-
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
         self.get_with_trace_and_priority(object_id, L2IoPriority::Foreground)
             .await
@@ -184,20 +176,14 @@ impl BlockCache {
         let l1_hit = self.l1.lock().get_cloned(object_id);
         let l1_latency = started.elapsed();
         match l1_hit {
-            Some(data) => {
-                self.l1_hit_count.fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .shim_read
-                    .record(data.len() as u64, l1_latency.max(Duration::from_nanos(1)));
-                (
-                    Some(data),
-                    CacheReadTrace {
-                        level: CacheReadLevel::L1,
-                        l1_lookup_latency: l1_latency,
-                        shim_lookup_latency: None,
-                    },
-                )
-            }
+            Some(data) => (
+                Some(data),
+                CacheReadTrace {
+                    level: CacheReadLevel::L1,
+                    l1_lookup_latency: l1_latency,
+                    shim_lookup_latency: None,
+                },
+            ),
             None => (
                 None,
                 CacheReadTrace {
@@ -209,26 +195,8 @@ impl BlockCache {
         }
     }
 
-    pub fn get_sync(&self, object_id: ObjectId) -> Option<Bytes> {
-        self.get_l1_only(object_id)
-    }
-
-    pub async fn get_with_priority(
-        &self,
-        object_id: ObjectId,
-        priority: L2IoPriority,
-    ) -> Option<Bytes> {
-        self.get_with_trace_and_priority(object_id, priority)
-            .await
-            .0
-    }
-
     pub async fn put(&self, object_id: ObjectId, data: Bytes) -> io::Result<()> {
-        let started = Instant::now();
         self.stage_l1(object_id, data.clone());
-        self.metrics
-            .shim_write
-            .record(data.len() as u64, started.elapsed());
         Ok(())
     }
 
@@ -270,10 +238,7 @@ impl BlockCache {
 
     pub fn stage_l1(&self, object_id: ObjectId, data: Bytes) {
         let max_bytes = self.l1_max_bytes.load(Ordering::Acquire).max(1);
-        let evicted = self.l1.lock().insert(object_id, data, max_bytes);
-        if evicted > 0 {
-            self.l1_eviction_count.fetch_add(evicted, Ordering::Relaxed);
-        }
+        let _ = self.l1.lock().insert(object_id, data, max_bytes);
     }
 
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
@@ -334,10 +299,6 @@ impl BlockCache {
         self.upload_queue.flush_journal().await;
     }
 
-    pub fn resize_l2(&self, _new_max: u64) {
-        // No-op in Cache v2-only mode.
-    }
-
     pub fn stats(&self) -> BlockCacheStats {
         BlockCacheStats {
             l1_bytes: self.l1_bytes(),
@@ -352,23 +313,6 @@ impl BlockCache {
         self.l1_max_bytes.load(Ordering::Acquire)
     }
 
-    pub fn set_l1_max_bytes(&self, value: u64) {
-        let value = value.max(1);
-        self.l1_max_bytes.store(value, Ordering::Release);
-        let evicted = self.l1.lock().evict_to_limit(value);
-        if evicted > 0 {
-            self.l1_eviction_count.fetch_add(evicted, Ordering::Relaxed);
-        }
-    }
-
-    pub fn l1_eviction_count(&self) -> u64 {
-        self.l1_eviction_count.load(Ordering::Relaxed)
-    }
-
-    pub fn l1_hit_count(&self) -> u64 {
-        self.l1_hit_count.load(Ordering::Relaxed)
-    }
-
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
@@ -380,9 +324,5 @@ impl BlockCache {
     pub async fn shutdown(&self) {
         self.flush_upload_journal().await;
         self.shutdown_notify.notify_waiters();
-    }
-
-    pub fn promote_to_l1(&self, object_id: ObjectId, data: Bytes) {
-        self.stage_l1(object_id, data);
     }
 }

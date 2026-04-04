@@ -561,7 +561,7 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let mem_limit = initial_cache_bytes();
+    let block_cache_l1_limit = initial_cache_bytes();
     let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
@@ -604,7 +604,7 @@ pub fn run(
         &data_config,
         cache_path_str,
         cache_size_bytes,
-        mem_limit,
+        block_cache_l1_limit,
         vfs_config,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;

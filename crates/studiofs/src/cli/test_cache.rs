@@ -277,15 +277,6 @@ struct LatencyHistogramReport {
 }
 
 #[derive(Debug, Serialize)]
-struct IoStatsReport {
-    ops: u64,
-    bytes: u64,
-    total_latency_ns: u64,
-    max_latency_ns: u64,
-    latency_histogram: LatencyHistogramReport,
-}
-
-#[derive(Debug, Serialize)]
 struct MaterializeBatchStatsReport {
     batches: u64,
     blocks: u64,
@@ -307,8 +298,6 @@ struct UploadQueueStatsReport {
 
 #[derive(Debug, Serialize)]
 struct CachePipelineReport {
-    shim_read: IoStatsReport,
-    shim_write: IoStatsReport,
     materialize_batches: MaterializeBatchStatsReport,
     upload_queue: UploadQueueStatsReport,
     blocking_tasks: BlockingTaskStatsReport,
@@ -384,18 +373,6 @@ impl From<studiofs_cache::metrics::LatencyHistogramSnapshot> for LatencyHistogra
     }
 }
 
-impl From<studiofs_cache::metrics::IoStatsSnapshot> for IoStatsReport {
-    fn from(snapshot: studiofs_cache::metrics::IoStatsSnapshot) -> Self {
-        Self {
-            ops: snapshot.ops,
-            bytes: snapshot.bytes,
-            total_latency_ns: snapshot.total_latency_ns,
-            max_latency_ns: snapshot.max_latency_ns,
-            latency_histogram: snapshot.latency_histogram.into(),
-        }
-    }
-}
-
 impl From<studiofs_cache::metrics::MaterializeBatchStatsSnapshot> for MaterializeBatchStatsReport {
     fn from(snapshot: studiofs_cache::metrics::MaterializeBatchStatsSnapshot) -> Self {
         Self {
@@ -457,8 +434,6 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
         by_kind.sort_by(|a, b| b.stats.submitted.cmp(&a.stats.submitted));
 
         Self {
-            shim_read: snapshot.shim_read.into(),
-            shim_write: snapshot.shim_write.into(),
             materialize_batches: snapshot.materialize_batches.into(),
             upload_queue: snapshot.upload_queue.into(),
             blocking_tasks: BlockingTaskStatsReport {
@@ -2580,14 +2555,6 @@ fn format_duration_ms(ms: f64) -> String {
     }
 }
 
-fn avg_latency_ms(total_latency_ns: u64, ops: u64) -> f64 {
-    if ops == 0 {
-        0.0
-    } else {
-        total_latency_ns as f64 / ops as f64 / 1_000_000.0
-    }
-}
-
 fn build_advanced_metrics(
     size_class_bounds: SizeClassBounds,
     writes: &PhaseTelemetry,
@@ -3062,33 +3029,6 @@ fn render_human_summary(report: &BenchmarkReport) -> String {
     if let Some(pipeline) = &report.cache_pipeline {
         out.push('\n');
         let _ = writeln!(&mut out, "Cache pipeline");
-        let pipeline_rows = vec![
-            vec![
-                "shim write".to_string(),
-                pipeline.shim_write.ops.to_string(),
-                format_bytes(pipeline.shim_write.bytes),
-                format_duration_ms(avg_latency_ms(
-                    pipeline.shim_write.total_latency_ns,
-                    pipeline.shim_write.ops,
-                )),
-                format_duration_ms(pipeline.shim_write.max_latency_ns as f64 / 1_000_000.0),
-            ],
-            vec![
-                "shim read".to_string(),
-                pipeline.shim_read.ops.to_string(),
-                format_bytes(pipeline.shim_read.bytes),
-                format_duration_ms(avg_latency_ms(
-                    pipeline.shim_read.total_latency_ns,
-                    pipeline.shim_read.ops,
-                )),
-                format_duration_ms(pipeline.shim_read.max_latency_ns as f64 / 1_000_000.0),
-            ],
-        ];
-        let _ = write!(
-            &mut out,
-            "{}",
-            format_table(&["Stage", "Ops", "Data", "Avg", "Max"], &pipeline_rows)
-        );
         let _ = writeln!(
             &mut out,
             "Upload queue: depth {} (peak {}), submitted {}, completed {}, requeued {}, canceled {}",
@@ -3444,26 +3384,6 @@ mod tests {
             mount_point: None,
             l1_bytes: Some(128 * 1024 * 1024),
             cache_pipeline: Some(CachePipelineReport {
-                shim_read: IoStatsReport {
-                    ops: 0,
-                    bytes: 0,
-                    total_latency_ns: 0,
-                    max_latency_ns: 0,
-                    latency_histogram: LatencyHistogramReport {
-                        bucket_upper_bounds_ns: vec![50_000],
-                        bucket_counts: vec![0],
-                    },
-                },
-                shim_write: IoStatsReport {
-                    ops: 16,
-                    bytes: 128 * 1024 * 1024,
-                    total_latency_ns: 64_000_000,
-                    max_latency_ns: 8_000_000,
-                    latency_histogram: LatencyHistogramReport {
-                        bucket_upper_bounds_ns: vec![50_000],
-                        bucket_counts: vec![16],
-                    },
-                },
                 materialize_batches: MaterializeBatchStatsReport {
                     batches: 4,
                     blocks: 16,

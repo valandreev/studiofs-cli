@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
-use studiofs_cache::metrics::{IoStats, MaterializeBatchStats};
+use studiofs_cache::metrics::MaterializeBatchStats;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::metrics::CacheMetrics;
 use studiofs_cache::v2::{
@@ -2867,7 +2867,6 @@ fn init_ingress_recovery_state(
 // =============================================================================
 
 struct IngressState {
-    ingress_append_stats: IoStats,
     ingress_checkpoint_persists: AtomicU64,
     ingress_checkpoint_failures: AtomicU64,
     ingress_last_checkpoint_unix_ms: AtomicU64,
@@ -2880,7 +2879,6 @@ struct IngressState {
 impl IngressState {
     fn new(initial_checkpoint_meta: Option<(u64, u64, u64)>) -> Self {
         Self {
-            ingress_append_stats: IoStats::default(),
             ingress_checkpoint_persists: AtomicU64::new(0),
             ingress_checkpoint_failures: AtomicU64::new(0),
             ingress_last_checkpoint_unix_ms: AtomicU64::new(
@@ -4243,7 +4241,7 @@ impl StudioVfs {
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
-        memory_limit: u64,
+        block_cache_l1_limit: u64,
         config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>> {
         {
@@ -4363,7 +4361,8 @@ impl StudioVfs {
             );
 
             // Init BlockCache upload queue state for pending write replay.
-            let cache_config = BlockCacheConfig::new(cache_dir, memory_limit);
+            // Compatibility-only L1 limit for the BlockCache shim path.
+            let cache_config = BlockCacheConfig::new(cache_dir, block_cache_l1_limit);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
 
             // Init ReadAhead tracker + prefetch channel
@@ -4440,7 +4439,7 @@ impl StudioVfs {
             let transit_memory_budget_bytes = if config.transit_memory_budget_bytes > 0 {
                 config.transit_memory_budget_bytes
             } else {
-                let derived = ((memory_limit as u128)
+                let derived = ((block_cache_l1_limit as u128)
                     .saturating_mul(DEFAULT_TRANSIT_MEMORY_BUDGET_RATIO_PERCENT as u128)
                     / 100)
                     .max(1)
@@ -10847,7 +10846,6 @@ impl StudioVfs {
 
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
-            let ingress_append = self.state.ingress.ingress_append_stats.snapshot();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
             let upload_queue = self.block_cache.cache_pipeline_metrics().upload_queue;
             let foreground_read_protection = self.foreground_read_protection_stats();
@@ -10914,11 +10912,6 @@ impl StudioVfs {
                     fast_backpressure_wait_ms = ingress.fast_backpressure_wait_ms,
                     fast_backpressure_events = ingress.fast_backpressure_events,
                     fast_backpressure_stall_max_ms = ingress.fast_backpressure_stall_max_ms,
-                    ingress_append_ops = ingress_append.ops,
-                    ingress_append_bytes = ingress_append.bytes,
-                    ingress_append_total_latency_ns = ingress_append.total_latency_ns,
-                    ingress_append_max_latency_ns = ingress_append.max_latency_ns,
-                    ingress_append_latency_histogram = ?ingress_append.latency_histogram.bucket_counts,
                     materialize_batches_total = materialize_batches.batches,
                     materialize_batches_blocks = materialize_batches.blocks,
                     materialize_batches_bytes = materialize_batches.bytes,

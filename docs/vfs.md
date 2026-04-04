@@ -20,7 +20,7 @@ Holds all runtime state:
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
 | `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides BlockStore-specific internals |
-| `block_cache` | `Arc<BlockCache>` | Cache-v2 compatibility shim: upload-queue orchestration and lightweight hot payload staging |
+| `block_cache` | `Arc<BlockCache>` | Cache-v2 compatibility shim: upload-queue orchestration and pending-upload pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |
@@ -65,7 +65,6 @@ the capacity limit is reached.
 | `meta_path` | — | Path to redb database |
 | `cache_dir` | — | Root for `BlockStore` plus compatibility cache/ingress artifacts |
 | `cache_size` | 100 GiB | L2 disk cache budget |
-| `memory_adaptive` | `true` | Adaptive memory controller (SFS-130): soft target 8 GiB, ceiling 50% RAM. Initial L1 = min(4 GiB, 25% RAM). ReadHeavy dirty budget 10%. Retreat threshold 85% L1. Emergency transitions logged at `warn`. |
 | `block_size` | 16 MiB | Logical block size (from format info); cloud transfer uses 4x4 MiB fragments |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |
@@ -91,7 +90,7 @@ Adaptive upload throttling overrides:
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` sets the speedometer sampling window.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` controls how long last P90 is retained.
 - upload worker foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` and current congestion instead of being user-configured separately.
-- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers (managed by the adaptive MemoryEnvelope controller).
+- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers.
 
 ## Write Path
 

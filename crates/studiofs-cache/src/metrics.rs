@@ -78,51 +78,6 @@ impl LatencyHistogram {
 }
 
 #[derive(Debug, Clone)]
-pub struct IoStatsSnapshot {
-    pub ops: u64,
-    pub bytes: u64,
-    pub total_latency_ns: u64,
-    pub max_latency_ns: u64,
-    pub latency_histogram: LatencyHistogramSnapshot,
-}
-
-#[derive(Debug, Default)]
-pub struct IoStats {
-    ops: AtomicU64,
-    bytes: AtomicU64,
-    total_latency_ns: AtomicU64,
-    max_latency_ns: AtomicU64,
-    latency_histogram: LatencyHistogram,
-}
-
-impl IoStats {
-    pub fn record(&self, bytes: u64, elapsed: Duration) {
-        let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-        self.record_ns(bytes, elapsed_ns);
-    }
-
-    pub fn record_ns(&self, bytes: u64, elapsed_ns: u64) {
-        self.ops.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.total_latency_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
-        self.latency_histogram.observe_ns(elapsed_ns);
-
-        self.max_latency_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> IoStatsSnapshot {
-        IoStatsSnapshot {
-            ops: self.ops.load(Ordering::Relaxed),
-            bytes: self.bytes.load(Ordering::Relaxed),
-            total_latency_ns: self.total_latency_ns.load(Ordering::Relaxed),
-            max_latency_ns: self.max_latency_ns.load(Ordering::Relaxed),
-            latency_histogram: self.latency_histogram.snapshot(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct MaterializeBatchStatsSnapshot {
     pub batches: u64,
     pub blocks: u64,
@@ -353,8 +308,6 @@ impl Drop for BlockingTaskExecutionGuard<'_> {
 
 #[derive(Debug, Clone)]
 pub struct CachePipelineMetricsSnapshot {
-    pub shim_read: IoStatsSnapshot,
-    pub shim_write: IoStatsSnapshot,
     pub materialize_batches: MaterializeBatchStatsSnapshot,
     pub upload_queue: UploadQueueStatsSnapshot,
     pub blocking_tasks: BlockingTaskMetricsSnapshot,
@@ -362,8 +315,6 @@ pub struct CachePipelineMetricsSnapshot {
 
 #[derive(Debug, Default)]
 pub struct CachePipelineMetrics {
-    pub shim_read: IoStats,
-    pub shim_write: IoStats,
     pub materialize_batches: MaterializeBatchStats,
     pub upload_queue: UploadQueueStats,
 }
@@ -371,8 +322,6 @@ pub struct CachePipelineMetrics {
 impl CachePipelineMetrics {
     pub fn snapshot(&self, pending_uploads: usize) -> CachePipelineMetricsSnapshot {
         CachePipelineMetricsSnapshot {
-            shim_read: self.shim_read.snapshot(),
-            shim_write: self.shim_write.snapshot(),
             materialize_batches: self.materialize_batches.snapshot(),
             upload_queue: self.upload_queue.snapshot(pending_uploads),
             blocking_tasks: empty_blocking_task_metrics_snapshot(),
