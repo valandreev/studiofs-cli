@@ -4027,9 +4027,10 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().metrics()
     }
 
-    fn replay_dirty_uploads_from_block_store(&self) {
+    fn replay_dirty_uploads_from_block_store(&self, pending_uploads: &[PendingUpload]) {
         let dirty_object_ids = self.block_store.dirty_object_ids();
         if dirty_object_ids.is_empty() {
+            self.seed_live_extents_from_pending_uploads(pending_uploads);
             return;
         }
 
@@ -4144,10 +4145,12 @@ impl StudioVfs {
                 "startup cleanup removed orphan dirty BlockStore entries"
             );
         }
+
+        self.seed_live_extents_from_pending_uploads(pending_uploads);
     }
 
-    fn seed_live_extents_from_pending_uploads(&self) {
-        for op in self.block_cache.snapshot_pending_uploads() {
+    fn seed_live_extents_from_pending_uploads(&self, pending_uploads: &[PendingUpload]) {
+        for op in pending_uploads {
             if op.offset % self.block_size as u64 != 0 {
                 continue;
             }
@@ -4554,8 +4557,8 @@ impl StudioVfs {
                 memory_envelope: std::sync::OnceLock::new(),
             });
 
-            vfs.replay_dirty_uploads_from_block_store();
-            vfs.seed_live_extents_from_pending_uploads();
+            let pending_uploads = vfs.block_cache.snapshot_pending_uploads();
+            vfs.replay_dirty_uploads_from_block_store(pending_uploads.as_slice());
 
             Ok(vfs)
         }
@@ -9063,6 +9066,9 @@ impl StudioVfs {
         let written = self
             .assemble_read_plan(offset, &read_plan, &missing_remote, buffer)
             .await?;
+        // Drop the plan as soon as the copy is complete so dirty Bytes do not
+        // stay alive across the remaining bookkeeping work.
+        drop(read_plan);
 
         self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         guard.record_bytes(written as u64);
