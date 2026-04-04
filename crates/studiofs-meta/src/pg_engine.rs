@@ -2084,6 +2084,14 @@ impl MetaBlocks for PgMetaEngine {
         }
         result
     }
+
+    fn compact_fragmented_regular_file_chunks(&self, max_chunks: usize) -> MetaResult<usize> {
+        let result = self.mutate(|local| local.compact_fragmented_regular_file_chunks(max_chunks));
+        if matches!(result, Ok(count) if count > 0) {
+            self.request_pending_flush();
+        }
+        result
+    }
 }
 impl MetaGc for PgMetaEngine {
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {

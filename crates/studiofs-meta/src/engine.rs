@@ -495,6 +495,16 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         ino: Ino,
         expected_epoch: u64,
     ) -> MetaResult<bool>;
+
+    /// Best-effort background compaction for fragmented regular-file chunk
+    /// graphs.
+    ///
+    /// Implementations may compact fewer than `max_chunks` candidates and are
+    /// allowed to skip rows that change while compaction is in flight.
+    fn compact_fragmented_regular_file_chunks(&self, max_chunks: usize) -> MetaResult<usize> {
+        let _ = max_chunks;
+        Ok(0)
+    }
 }
 
 pub trait MetaGc: Send + Sync {

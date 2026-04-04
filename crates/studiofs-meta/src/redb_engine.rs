@@ -774,6 +774,10 @@ impl RedbMetaEngine {
             chunk_state.insert_slice(slice_record);
         }
 
+        for chunk_state in state.chunks.values_mut() {
+            chunk_state.refresh_fragmentation_metrics();
+        }
+
         Ok(state)
     }
 
@@ -1345,6 +1349,88 @@ impl RedbMetaEngine {
             slice.block_state = BlockRefState::Published;
         }
         published
+    }
+
+    fn compact_regular_file_chunk_state(
+        chunk_id: ChunkId,
+        chunk: &RegularFileChunkState,
+    ) -> MetaResult<Option<RegularFileChunkState>> {
+        let full_range = SliceRange::new(0, DEFAULT_CHUNK_SIZE)
+            .expect("full chunk range should always be valid");
+        let resolved = resolve_chunk_slice_spans(chunk_id, full_range, Some(chunk), None);
+        let mut compacted = RegularFileChunkState {
+            next_slice_id: chunk.next_slice_id,
+            next_slice_order: chunk.next_slice_order,
+            slices: BTreeMap::new(),
+            fragmentation: ChunkFragmentationCounters::default(),
+        };
+        let mut merged: Vec<(SliceRange, Option<BlockRef>, BlockRefState)> = Vec::new();
+
+        for span in resolved {
+            let Some(slice_id) = span.slice_id else {
+                continue;
+            };
+            let source_state = chunk
+                .slices
+                .get(&slice_id)
+                .map(|slice| slice.block_state)
+                .ok_or_else(|| {
+                    MetaError::Storage("compaction source slice is missing".to_string())
+                })?;
+            let block = span.block.clone();
+
+            if let Some((last_range, last_block, last_state)) = merged.last_mut() {
+                match (last_block.as_mut(), block.as_ref()) {
+                    (Some(last_block), Some(block))
+                        if *last_state == source_state
+                            && last_block.object_id == block.object_id
+                            && last_block.offset.saturating_add(last_block.length)
+                                == block.offset
+                            && last_block.flags == block.flags
+                            && last_range.end == span.range.start =>
+                    {
+                        last_range.end = span.range.end;
+                        last_block.length = last_block.length.saturating_add(block.length);
+                        continue;
+                    }
+                    (None, None)
+                        if *last_state == source_state && last_range.end == span.range.start =>
+                    {
+                        last_range.end = span.range.end;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            merged.push((span.range, block, source_state));
+        }
+
+        if merged.is_empty() {
+            return Ok(None);
+        }
+
+        for (range, block, block_state) in merged {
+            let slice_id = compacted
+                .try_alloc_slice_id()
+                .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+            let slice_order = compacted
+                .try_alloc_slice_order()
+                .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+            compacted.slices.insert(
+                slice_id,
+                SliceRecord {
+                    slice_id,
+                    order: slice_order,
+                    range,
+                    block,
+                    block_state,
+                },
+            );
+        }
+
+        compacted.refresh_fragmentation_metrics();
+        Ok(Some(compacted))
     }
 
     fn publish_regular_file_overlay_to_base_in_txn(
@@ -6707,6 +6793,94 @@ impl MetaBlocks for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(true)
     }
+
+    fn compact_fragmented_regular_file_chunks(&self, max_chunks: usize) -> MetaResult<usize> {
+        if max_chunks == 0 {
+            return Ok(0);
+        }
+
+        let mut compacted = 0usize;
+        let table_defs = [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE];
+
+        for table_def in table_defs {
+            if compacted >= max_chunks {
+                break;
+            }
+
+            let txn = self
+                .db
+                .begin_read()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let table = txn
+                .open_table(table_def)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut candidates: Vec<(Ino, ChunkId)> = Vec::new();
+
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let (ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+                let chunk: RegularFileChunkState = decode(value.value())?;
+                if chunk.fragmentation_metrics().should_compact() {
+                    candidates.push((ino, chunk_id));
+                    if compacted + candidates.len() >= max_chunks {
+                        break;
+                    }
+                }
+            }
+            drop(table);
+            drop(txn);
+
+            for (ino, chunk_id) in candidates {
+                if compacted >= max_chunks {
+                    break;
+                }
+
+                let txn = self
+                    .db
+                    .begin_write()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut table = txn
+                    .open_table(table_def)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key = encode_regular_file_chunk_key(ino, chunk_id);
+                let current = table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode::<RegularFileChunkState>(value.value()))
+                    .transpose()?;
+
+                let Some(current) = current else {
+                    continue;
+                };
+                if !current.fragmentation_metrics().should_compact() {
+                    continue;
+                }
+
+                match Self::compact_regular_file_chunk_state(chunk_id, &current)? {
+                    Some(compacted_chunk) => {
+                        let encoded = encode(&compacted_chunk)?;
+                        table
+                            .insert(key.as_slice(), encoded.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                    None => {
+                        let _ = table
+                            .remove(key.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+                drop(table);
+                txn.commit()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                compacted = compacted.saturating_add(1);
+            }
+        }
+
+        Ok(compacted)
+    }
 }
 
 impl RedbMetaEngine {
@@ -6797,6 +6971,8 @@ impl RedbMetaEngine {
 
                     state.slices.insert(slice_id, new_slice);
                 }
+
+                state.refresh_fragmentation_metrics();
 
                 let data = encode(&state)?;
                 overlay_table
@@ -10011,6 +10187,80 @@ mod tests {
         );
         assert_eq!(spans[4].source, ResolvedSliceSource::Base);
         assert_eq!(spans[4].block.as_ref().unwrap().object_id, 902);
+    }
+
+    #[test]
+    fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
+        let engine = temp_engine();
+        let ino = engine
+            .create_file(ROOT_INO, b"compact-overlay.bin", 1000, 1000, 0o644)
+            .unwrap()
+            .ino;
+
+        let mut overlay_chunk = RegularFileChunkState::default();
+        overlay_chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("shadowed slice"),
+            BlockRef::new_partial(1201, 4096),
+        ));
+        overlay_chunk.insert_slice(SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(0, 4096).expect("visible slice"),
+            BlockRef::new_partial(1202, 4096),
+        ));
+        overlay_chunk.insert_slice(SliceRecord::tombstone(
+            SliceId(3),
+            SliceOrder(3),
+            SliceRange::new(4096, 6144).expect("tombstone range"),
+        ));
+
+        set_regular_file_chunk_rows(&engine, ino, &[(ChunkId(0), overlay_chunk.clone())], &[]);
+
+        let query = SliceRange::new(0, 6144).expect("lookup query");
+        let before = engine
+            .lookup_regular_file_chunk_slices(ino, ChunkId(0), query)
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[0].source, ResolvedSliceSource::Overlay);
+        assert_eq!(before[0].block.as_ref().unwrap().object_id, 1202);
+        assert_eq!(before[1].source, ResolvedSliceSource::OverlayTombstone);
+        assert!(before[1].block.is_none());
+
+        let compacted = engine.compact_fragmented_regular_file_chunks(1).unwrap();
+        assert_eq!(compacted, 1);
+
+        let after = engine
+            .lookup_regular_file_chunk_slices(ino, ChunkId(0), query)
+            .unwrap();
+        assert_eq!(after.len(), before.len());
+        for (expected, actual) in before.iter().zip(after.iter()) {
+            assert_eq!(actual.range, expected.range);
+            assert_eq!(actual.source, expected.source);
+            assert_eq!(actual.block, expected.block);
+        }
+
+        let txn = engine.db.begin_read().unwrap();
+        let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let key = encode_regular_file_chunk_key(ino, ChunkId(0));
+        let row = overlay_table
+            .get(key.as_slice())
+            .unwrap()
+            .expect("compacted overlay chunk");
+        let compacted_chunk: RegularFileChunkState =
+            decode(row.value()).expect("decode compacted chunk");
+        assert_eq!(compacted_chunk.slices.len(), 2);
+        assert_eq!(
+            compacted_chunk.fragmentation,
+            ChunkFragmentationCounters {
+                live_slices: 1,
+                tombstone_slices: 1,
+                overlapping_slices: 0,
+                fragmented_bytes: 0,
+            }
+        );
+        assert!(!compacted_chunk.fragmentation.should_compact());
     }
 
     #[test]
