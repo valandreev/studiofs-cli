@@ -1158,11 +1158,11 @@ impl RedbMetaEngine {
     fn regular_file_graph_object_ids_from_table(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
-    ) -> MetaResult<HashSet<u64>> {
+        refs: &mut HashSet<u64>,
+    ) -> MetaResult<()> {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut refs = HashSet::new();
         for row in table
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -1175,7 +1175,7 @@ impl RedbMetaEngine {
                 }
             }
         }
-        Ok(refs)
+        Ok(())
     }
 
     /// Collect object IDs reachable from the regular-file chunk graph.
@@ -1187,14 +1187,8 @@ impl RedbMetaEngine {
         txn: &redb::ReadTransaction,
     ) -> MetaResult<HashSet<u64>> {
         let mut refs = HashSet::new();
-        refs.extend(Self::regular_file_graph_object_ids_from_table(
-            txn,
-            REGULAR_FILE_OVERLAY_TABLE,
-        )?);
-        refs.extend(Self::regular_file_graph_object_ids_from_table(
-            txn,
-            REGULAR_FILE_BASE_TABLE,
-        )?);
+        Self::regular_file_graph_object_ids_from_table(txn, REGULAR_FILE_OVERLAY_TABLE, &mut refs)?;
+        Self::regular_file_graph_object_ids_from_table(txn, REGULAR_FILE_BASE_TABLE, &mut refs)?;
         Ok(refs)
     }
 

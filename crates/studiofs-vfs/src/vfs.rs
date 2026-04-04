@@ -4187,7 +4187,8 @@ impl StudioVfs {
 
         if !dirty_set.is_empty() {
             if quarantined_inodes.is_empty() {
-                let reachable_object_ids = match self.sync_meta().get_referenced_object_ids() {
+                let meta = self.sync_meta();
+                let reachable_object_ids = match meta.get_referenced_object_ids() {
                     Ok(ids) => Some(ids),
                     Err(e) => {
                         warn!(
