@@ -644,8 +644,6 @@ impl StudioVfs {
 
         let mut live_extents = Vec::with_capacity(persisted_blocks.len());
         for block in &persisted_blocks {
-            self.block_cache
-                .stage_l1(block.object_id, block.data.clone());
             live_extents.push((ino, block.block_index, block.object_id, content_epoch));
         }
         self.record_live_extents(&live_extents);

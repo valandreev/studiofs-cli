@@ -104,7 +104,7 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
-- Memory management is fully automatic via the adaptive MemoryEnvelope controller (SFS-130): soft target 8 GiB, hard ceiling 50% of total RAM. The controller grows budgets under I/O pressure and retreats when idle. The initial L1 cache is capped at `min(4 GiB, 25% RAM)` so low-memory machines don't overshoot before the envelope takes over.
+- Memory management is intentionally bounded and local: `STUDIOFS_MAX_DIRTY_BYTES` caps write-buffer pressure, `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` caps upload-side local I/O, and `STUDIOFS_TRANSIT_MEMORY_BUDGET` caps in-flight fetch/upload transit buffers. There is no adaptive envelope controller in the runtime path.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
 - Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
@@ -458,7 +458,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
 | `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` is ignored) |
 | `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
-| `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from initial L1 cache budget; dynamically resized by MemoryEnvelope` | Global transit-memory credit budget for active in-flight fetch/upload buffers (managed by adaptive envelope) |
+| `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from mount-time cache budget` | Global transit-memory credit budget for active in-flight fetch/upload buffers |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `35` | Foreground-read P90 latency target for upload throttling |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `1500` | Foreground-read speedometer window |

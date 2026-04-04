@@ -11,19 +11,19 @@ use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
 
-/// Initial L1 RAM budget before the adaptive envelope takes over.
+/// Initial local-cache budget used to size the mount-time cache directory.
 /// Capped at 25 % of total RAM so low-memory machines don't overshoot.
-fn initial_l1_bytes() -> u64 {
-    const DEFAULT_INITIAL_L1_CAP_BYTES: u64 = DEFAULT_L1_SIZE * 2;
+fn initial_cache_bytes() -> u64 {
+    const DEFAULT_INITIAL_CACHE_CAP_BYTES: u64 = DEFAULT_L1_SIZE * 2;
     let mut sys = System::new();
     sys.refresh_memory();
     let total_ram = sys.total_memory();
     if total_ram == 0 {
         // Fall back to a sane default if sysinfo fails to report total memory.
-        return DEFAULT_INITIAL_L1_CAP_BYTES;
+        return DEFAULT_INITIAL_CACHE_CAP_BYTES;
     }
     let quarter_ram = total_ram / 4;
-    quarter_ram.min(DEFAULT_INITIAL_L1_CAP_BYTES)
+    quarter_ram.min(DEFAULT_INITIAL_CACHE_CAP_BYTES)
 }
 
 fn parse_positive_size_arg(raw: &str) -> anyhow::Result<u64> {
@@ -345,13 +345,6 @@ pub fn run(
         vfs_config_raw.principal = Some(principal.to_string());
     }
 
-    // Detect total RAM and pass it to VfsConfig for the MemoryEnvelope.
-    {
-        let mut system = System::new();
-        system.refresh_memory();
-        vfs_config_raw.total_ram = Some(system.total_memory());
-    }
-
     let vfs_config = vfs_config_raw
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
@@ -568,7 +561,7 @@ pub fn run(
     let data_config = DataStoreConfig::from(&format_info);
 
     // Set up caches
-    let mem_limit = initial_l1_bytes();
+    let block_cache_l1_limit = initial_cache_bytes();
     let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
@@ -611,7 +604,7 @@ pub fn run(
         &data_config,
         cache_path_str,
         cache_size_bytes,
-        mem_limit,
+        block_cache_l1_limit,
         vfs_config,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
