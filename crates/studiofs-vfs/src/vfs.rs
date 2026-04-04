@@ -4049,7 +4049,7 @@ impl StudioVfs {
         &self,
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
-    ) -> HashSet<Ino> {
+    ) {
         let dirty_object_ids = self.block_store.dirty_object_ids();
         let mut dirty_set: HashSet<u64> = dirty_object_ids.into_iter().collect();
         let mut quarantined_inodes = HashSet::new();
@@ -4077,8 +4077,10 @@ impl StudioVfs {
                             "quarantining invalid regular-file graph during startup recovery"
                         );
                         quarantined_inodes.insert(ino);
-                        let protected =
-                            self.quarantine_invalid_regular_file_graph(ino, attr.size, &error);
+                        let protected = self
+                            .quarantine_invalid_regular_file_graph_for_startup_recovery(
+                                ino, attr.size, &error,
+                            );
                         quarantined_object_ids.extend(protected);
                     } else {
                         warn!(
@@ -4215,8 +4217,6 @@ impl StudioVfs {
         if !quarantined_inodes.is_empty() {
             self.cancel_pending_uploads_for_inodes(&quarantined_inodes);
         }
-
-        quarantined_inodes
     }
 
     fn seed_live_extents_from_pending_uploads(
@@ -4638,10 +4638,7 @@ impl StudioVfs {
 
             let pending_uploads = vfs.block_cache.snapshot_pending_uploads();
             let attrs = vfs.sync_meta().list_inode_attrs()?;
-            let _quarantined_inodes = vfs.replay_dirty_uploads_from_block_store(
-                pending_uploads.as_slice(),
-                attrs.as_slice(),
-            );
+            vfs.replay_dirty_uploads_from_block_store(pending_uploads.as_slice(), attrs.as_slice());
 
             Ok(vfs)
         }
@@ -5036,8 +5033,7 @@ impl StudioVfs {
                             error = %err,
                             "epoch finalization failed due invalid regular-file graph, quarantining inode"
                         );
-                        let _ = self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
-                        self.cancel_pending_uploads_for_inode(ino);
+                        self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
                         self.note_file_session_background_transition(
                             ino,
                             FileSessionOperation::Finalize,
@@ -6557,9 +6553,31 @@ impl StudioVfs {
         size: u64,
         error: &VfsError,
     ) -> HashSet<u64> {
+        self.quarantine_invalid_regular_file_graph_impl(ino, size, error, true)
+    }
+
+    fn quarantine_invalid_regular_file_graph_for_startup_recovery(
+        &self,
+        ino: Ino,
+        size: u64,
+        error: &VfsError,
+    ) -> HashSet<u64> {
+        self.quarantine_invalid_regular_file_graph_impl(ino, size, error, false)
+    }
+
+    fn quarantine_invalid_regular_file_graph_impl(
+        &self,
+        ino: Ino,
+        size: u64,
+        error: &VfsError,
+        cancel_pending_uploads: bool,
+    ) -> HashSet<u64> {
         self.mark_upload_sticky_error(ino, error);
         self.remove_live_extents_for_inode(ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);
+        if cancel_pending_uploads {
+            self.cancel_pending_uploads_for_inode(ino);
+        }
         self.collect_regular_file_object_ids_for_recovery(ino, size)
     }
 
@@ -10069,12 +10087,9 @@ impl StudioVfs {
                                     "upload failed due invalid regular-file graph, quarantining inode"
                                 );
                                 vfs.block_store.mark_upload_failed(op.object_id);
-                                let _ = vfs.quarantine_invalid_regular_file_graph(
-                                    op.ino,
-                                    attr_size,
-                                    &e,
+                                vfs.quarantine_invalid_regular_file_graph(
+                                    op.ino, attr_size, &e,
                                 );
-                                vfs.cancel_pending_uploads_for_inode(op.ino);
                             } else if vfs.state.upload.deleted_inodes.lock().contains(&op.ino) {
                                 // If the inode was deleted, don't retry — cancel the upload.
                                 info!(
