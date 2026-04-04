@@ -276,12 +276,6 @@ EXAMPLES:
       --bucket test-bucket --access-key studiofs --secret-key studiofs123 \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
-  Custom block size (16 MiB instead of default 8 MiB):
-    studiofs init custom --endpoint http://127.0.0.1:9000 \\
-      --bucket test-bucket --access-key studiofs --secret-key studiofs123 \\
-      --meta postgres://studiofs:studiofs@127.0.0.1:5432 \\
-      --block-size 16MB
-
 RUNTIME POLICY:
   PG batching / sync cadence is configured per client at mount/runtime, not
   stored in the volume. Use environment variables such as:
@@ -337,11 +331,6 @@ RUNTIME POLICY:
         /// Deprecated legacy option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_region: Option<String>,
-
-        /// Block size in bytes (e.g. 4MB, 16MB, 32MB). Defaults to 16MB if not specified.
-        /// Larger blocks reduce metadata overhead but increase memory usage per operation.
-        #[arg(long)]
-        block_size: Option<String>,
     },
 
     /// Discover an existing PostgreSQL-backed volume and create local metadata for this client
@@ -702,7 +691,6 @@ fn main() -> anyhow::Result<()> {
             metadata_access_key,
             metadata_secret_key,
             metadata_region,
-            block_size,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
             cli::init::run(
@@ -719,7 +707,6 @@ fn main() -> anyhow::Result<()> {
                 metadata_secret_key.as_deref(),
                 metadata_region.as_deref(),
                 &meta_dir,
-                block_size.as_deref(),
             )?;
         }
         Commands::Discover { name, meta } => {
@@ -1056,6 +1043,30 @@ mod tests {
             }
             other => panic!("expected Mount, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn init_rejects_block_size_flag() {
+        let err = match parse(&[
+            "init",
+            "vol",
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--bucket",
+            "test",
+            "--access-key",
+            "ak",
+            "--secret-key",
+            "sk",
+            "--meta",
+            "postgres://u:p@127.0.0.1:5432",
+            "--block-size",
+            "4MB",
+        ]) {
+            Ok(_) => panic!("expected clap error for removed --block-size"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
     // ── umount ───────────────────────────────────────────────────────────────

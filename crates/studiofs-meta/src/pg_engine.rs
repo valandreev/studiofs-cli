@@ -2037,6 +2037,10 @@ impl MetaBlocks for PgMetaEngine {
         self.local.has_local_regular_file_overlay(ino)
     }
 
+    fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.local.get_regular_file_overlay_object_ids(ino)
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,

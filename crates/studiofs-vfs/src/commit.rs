@@ -59,6 +59,27 @@ impl CommitCoordinator {
         )
         .await?;
         let published = if has_persisted_overlay {
+            let overlay_object_ids = run_meta(
+                vfs.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| engine.get_regular_file_overlay_object_ids(ino),
+            )
+            .await?;
+            if !overlay_object_ids.is_empty() {
+                let extents_to_verify: Vec<(u32, ExtentRecordId)> = overlay_object_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, object_id)| {
+                        (
+                            idx as u32,
+                            ExtentRecordId {
+                                object_id: *object_id,
+                                content_epoch,
+                            },
+                        )
+                    })
+                    .collect();
+                Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await?;
+            }
             run_meta(
                 vfs.meta_async.clone(),
                 move |engine: Arc<dyn MetaEngine>| {

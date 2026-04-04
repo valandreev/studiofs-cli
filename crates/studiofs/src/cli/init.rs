@@ -12,19 +12,10 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetadataBackend,
     MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
 };
-use studiofs_vfs::parse_size_bytes;
 use tracing::info;
 use uuid::Uuid;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn parse_block_size(size_str: &str) -> anyhow::Result<u32> {
-    let bytes = parse_size_bytes(size_str)
-        .filter(|&bytes| bytes > 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid size '{}' (must be > 0)", size_str))?;
-    u32::try_from(bytes)
-        .map_err(|_| anyhow::anyhow!("block size too large: {} (max 4GB)", size_str))
-}
 
 #[cfg(unix)]
 fn get_current_ids() -> (u32, u32) {
@@ -327,7 +318,6 @@ pub fn run(
     metadata_secret_key: Option<&str>,
     metadata_region: Option<&str>,
     meta_dir: &Path,
-    block_size: Option<&str>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let meta_dsn = postgres_dsn.ok_or_else(|| {
@@ -407,12 +397,7 @@ pub fn run(
 
     let engine = RedbMetaEngine::open(&db_path)?;
 
-    // Parse block size if provided, otherwise use default
-    let actual_block_size = if let Some(size_str) = block_size {
-        parse_block_size(size_str)?
-    } else {
-        DEFAULT_BLOCK_SIZE
-    };
+    let actual_block_size = DEFAULT_BLOCK_SIZE;
     let volume_uuid = Uuid::new_v4().to_string();
 
     let data_prefix = format!("{name}/objects/");
@@ -471,62 +456,4 @@ pub fn run(
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_size_bytes() {
-        assert_eq!(parse_block_size("100").unwrap(), 100);
-        assert_eq!(parse_block_size("100B").unwrap(), 100);
-    }
-
-    #[test]
-    fn test_parse_size_kb() {
-        assert_eq!(parse_block_size("1KB").unwrap(), 1024);
-        assert_eq!(parse_block_size("512KB").unwrap(), 512 * 1024);
-    }
-
-    #[test]
-    fn test_parse_size_mb() {
-        assert_eq!(parse_block_size("1MB").unwrap(), 1024 * 1024);
-        assert_eq!(parse_block_size("4MB").unwrap(), 4 * 1024 * 1024);
-        assert_eq!(parse_block_size("8MB").unwrap(), 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_size_gb() {
-        assert_eq!(parse_block_size("1GB").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_block_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_size_case_insensitive() {
-        assert_eq!(parse_block_size("1mb").unwrap(), 1024 * 1024);
-        assert_eq!(parse_block_size("4MB").unwrap(), 4 * 1024 * 1024);
-        assert_eq!(parse_block_size("8mB").unwrap(), 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_size_whitespace() {
-        assert_eq!(parse_block_size("  4MB  ").unwrap(), 4 * 1024 * 1024);
-        assert_eq!(parse_block_size("4 MB").unwrap(), 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_size_invalid_suffix() {
-        assert!(parse_block_size("4XB").is_err());
-    }
-
-    #[test]
-    fn test_parse_size_invalid_number() {
-        assert!(parse_block_size("abcMB").is_err());
-    }
-
-    #[test]
-    fn test_parse_size_zero_rejected() {
-        assert!(parse_block_size("0").is_err());
-    }
 }

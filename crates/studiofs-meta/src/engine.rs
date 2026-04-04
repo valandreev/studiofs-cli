@@ -435,6 +435,18 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         Ok(false)
     }
 
+    /// Collect object ids currently referenced by local regular-file overlay.
+    ///
+    /// Backends with a dedicated overlay graph should override this to read from
+    /// overlay metadata directly. The default falls back to the merged manifest.
+    fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        let mut ids = HashSet::new();
+        for (_, block) in self.get_file_blocks(ino)? {
+            ids.insert(block.object_id);
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     /// Mark a block as remote-visible after its object upload has completed.
     ///
     /// Remote-backed engines can use this to publish block visibility and

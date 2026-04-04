@@ -28,12 +28,12 @@ pub const VERSION: u16 = 2;
 /// Maximum object size (for safety check, e.g., 64MB).
 pub const MAX_OBJECT_SIZE: u32 = 64 * 1024 * 1024;
 
-/// Default block size: 16 MiB.
-pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
+/// Fixed logical block size: 4 MiB.
+pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 /// Cloud fragment size per logical block: 4 MiB.
 pub const CLOUD_FRAGMENT_SIZE: usize = 4 * 1024 * 1024;
 /// Number of cloud fragments per logical block.
-pub const CLOUD_FRAGMENT_COUNT: usize = 4;
+pub const CLOUD_FRAGMENT_COUNT: usize = 1;
 /// Compile-time invariant: one logical block must map exactly to fixed cloud fragments.
 const _: [(); DEFAULT_BLOCK_SIZE as usize] = [(); CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT];
 
@@ -467,7 +467,7 @@ pub fn format_object_fragment_key(data_prefix: &str, object_id: u64, fragment_in
     )
 }
 
-/// Format all cloud fragment keys for an object in stable order [0..4).
+/// Format all cloud fragment keys for an object in stable order [0..N).
 pub fn format_object_fragment_keys(
     data_prefix: &str,
     object_id: u64,
@@ -772,14 +772,22 @@ mod tests {
     #[test]
     fn test_validate_cloud_fragment_layout_ok() {
         let full = CLOUD_FRAGMENT_SIZE;
-        let total = validate_cloud_fragment_layout(&[full, full, 123, 0]).unwrap();
-        assert_eq!(total, full * 2 + 123);
+        let mut lengths = vec![0usize; CLOUD_FRAGMENT_COUNT];
+        lengths[0] = full.saturating_sub(123);
+        let total = validate_cloud_fragment_layout(&lengths).unwrap();
+        assert_eq!(total, full.saturating_sub(123));
     }
 
     #[test]
     fn test_validate_cloud_fragment_layout_rejects_non_empty_after_short() {
+        if CLOUD_FRAGMENT_COUNT < 2 {
+            return;
+        }
         let full = CLOUD_FRAGMENT_SIZE;
-        let err = validate_cloud_fragment_layout(&[full, 7, 1, 0]).unwrap_err();
+        let mut lengths = vec![0usize; CLOUD_FRAGMENT_COUNT];
+        lengths[0] = full.saturating_sub(1);
+        lengths[1] = 1;
+        let err = validate_cloud_fragment_layout(&lengths).unwrap_err();
         assert!(matches!(err, ObjectError::InvalidFragmentLayout(_)));
     }
 

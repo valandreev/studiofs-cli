@@ -6102,6 +6102,34 @@ impl MetaBlocks for RedbMetaEngine {
         Self::has_regular_file_chunk_rows_in_read_txn(&txn, REGULAR_FILE_OVERLAY_TABLE, ino)
     }
 
+    fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = regular_file_chunk_prefix(ino);
+        let mut ids = std::collections::BTreeSet::new();
+        for row in table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+            let chunk: RegularFileChunkState = decode(value.value())?;
+            for slice in chunk.slices.values() {
+                if let Some(block) = &slice.block {
+                    ids.insert(block.object_id);
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,

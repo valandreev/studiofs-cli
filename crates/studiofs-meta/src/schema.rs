@@ -17,8 +17,8 @@ use std::time::SystemTime;
 // Constants
 // =============================================================================
 
-/// Default block size: 16 MiB (configurable at volume init).
-pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
+/// Fixed block size: 4 MiB.
+pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 /// Default chunk size for the chunk/slice/block graph: 64 MiB.
 ///
 /// Follow-up: promote this into persisted `FormatInfo` once chunk-size
