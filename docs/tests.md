@@ -160,6 +160,9 @@ regressions:
 
 Run a single focused regression:
 
+Each command below is copy-paste ready and includes the full crate and test
+binary prefix where applicable.
+
 ```bash
 cargo test -p studiofs-meta test_resolve_chunk_slice_spans_overlay_over_base_with_hole -- --nocapture
 cargo test -p studiofs-meta redb_partial_update_does_not_expose_new_blocks_before_publish -- --nocapture

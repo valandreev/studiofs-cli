@@ -63,7 +63,7 @@ Core invariants:
 2. StudioFS updates local metadata in `redb`.
 3. File payload lands in the per-file `WriteBuffer`; full chunk-aligned writes may be eagerly persisted to local `BlockStore` and extent metadata.
 4. `flush(ino)` / `fsync(ino)` / `close(ino)` drain dirty `WriteBuffer` chunks through coalesced `BlockStore::put(...) -> sync_data() -> metadata` batches, then enqueue uploads.
-5. Background workers upload each committed chunk as four independent block fragments.
+5. Background workers upload each committed chunk as four independent block objects.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
 8. Other clients pull only newer foreign batches and apply remote-visible namespace/attrs/symlinks/xattrs to local `base_*`.

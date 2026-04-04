@@ -245,7 +245,7 @@ Adaptive upload control:
 - workers use cooperative scheduler yielding (`tokio::task::yield_now()`) periodically to avoid starving foreground tasks.
 - upload backpressure uses a foreground-read P90 speedometer on each control tick.
 - foreground-read latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
-- adaptive sleep is applied in `process_upload` before local-data I/O permit acquisition, so disk quiet windows happen before compatibility reads.
+- adaptive sleep is applied in `process_upload` before local-data I/O permit acquisition, so disk quiet windows happen before BlockStore reads.
 - when `upload_delay_ms` already slept for the current op, the pre-read adaptive sleep uses the remaining budget only:
   `effective_penalty_ms = max(adaptive_penalty_ms - waited_upload_delay_ms, 0)`.
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
@@ -292,13 +292,13 @@ local metadata view ──┬─ dirty `WriteBuffer`
   assemble response bytes
 ```
 
-**Two-level local read semantics**
+**Two-stage local read semantics**
 
 StudioFS now uses a two-level local-data availability model for foreground reads:
 
-- Level 1 — `WriteBuffer`: dirty bytes that have not yet been committed locally,
+- Stage 1 — `WriteBuffer`: dirty bytes that have not yet been committed locally,
   including newer writes that may have arrived after a point-in-time persist snapshot was taken.
-- Level 2 — committed local cache state: extents already written to `BlockStore`
+- Stage 2 — committed local storage state: extents already written to `BlockStore`
   and referenced by local metadata / pending incarnation state.
 
 Notes:

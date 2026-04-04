@@ -11513,7 +11513,9 @@ mod tests {
             metadata: MetadataConfig::default(),
             block_size: DEFAULT_BLOCK_SIZE,
         };
-        engine.set_format_info(&format_info).unwrap();
+        engine
+            .set_format_info(&format_info)
+            .expect("failed to set format info");
 
         let file = engine
             .create_file(ROOT_INO, b"partial-update.bin", 1000, 1000, 0o644)
