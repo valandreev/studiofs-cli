@@ -1151,6 +1151,30 @@ impl RedbMetaEngine {
         signature
     }
 
+    /// Collect object IDs reachable from the regular-file chunk graph.
+    ///
+    /// Publication races can leave both overlay and base rows alive at the
+    /// same time, so the raw slice refs from both tables are treated as
+    /// reachable until the graph is reconciled.
+    fn regular_file_graph_object_ids_from_txn(
+        txn: &redb::ReadTransaction,
+    ) -> MetaResult<HashSet<u64>> {
+        let mut refs = HashSet::new();
+        for table_def in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
+            let states = Self::regular_file_chunk_states_from_txn(txn, table_def)?;
+            for chunks in states.values() {
+                for chunk in chunks.values() {
+                    for slice in chunk.slices.values() {
+                        if let Some(block) = &slice.block {
+                            refs.insert(block.object_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(refs)
+    }
+
     fn clear_table_in_txn<K, V>(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<K, V>,
@@ -4244,8 +4268,12 @@ impl RedbMetaEngine {
             let attr = self.get_attr(ino)?;
             match attr.kind {
                 FileType::RegularFile => {
-                    for (_index, block) in self.get_file_blocks(ino)? {
-                        pinned.insert(block.object_id);
+                    // Snapshots pin the visible file contents, so resolve the
+                    // overlay/base view instead of reading legacy flat blocks.
+                    for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+                        if let Some(block) = span.block {
+                            pinned.insert(block.object_id);
+                        }
                     }
                 }
                 FileType::Directory => {
@@ -7097,6 +7125,7 @@ impl MetaGc for RedbMetaEngine {
             let block: BlockRef = decode(v.value())?;
             refs.insert(block.object_id);
         }
+        refs.extend(Self::regular_file_graph_object_ids_from_txn(&txn)?);
         for item in snapshots
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -7863,13 +7892,45 @@ mod tests {
         let file = engine
             .create_file(ROOT_INO, b"snap.txt", 1000, 1000, 0o644)
             .unwrap();
-        let block = BlockRef::new_partial(9_001, 128);
-        engine.set_file_block(file.ino, 0, &block).unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = DEFAULT_CHUNK_SIZE as u64;
+        engine.set_attr(&attr).unwrap();
+
+        let mut overlay_chunk = RegularFileChunkState::default();
+        let mut overlay_slice = SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid overlay slice"),
+            BlockRef::new_partial(9_001, DEFAULT_CHUNK_SIZE),
+        );
+        overlay_slice.block_state = BlockRefState::Uploaded;
+        overlay_chunk.insert_slice(overlay_slice);
+
+        let mut base_chunk = RegularFileChunkState::default();
+        let mut base_slice = SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid base slice"),
+            BlockRef::new_partial(9_002, DEFAULT_CHUNK_SIZE),
+        );
+        base_slice.block_state = BlockRefState::Published;
+        base_chunk.insert_slice(base_slice);
+
+        set_regular_file_chunk_rows(
+            &engine,
+            file.ino,
+            &[(ChunkId(0), overlay_chunk)],
+            &[(ChunkId(0), base_chunk)],
+        );
+
+        let refs_before = engine.get_referenced_object_ids().unwrap();
+        assert!(refs_before.contains(&9_001));
+        assert!(refs_before.contains(&9_002));
 
         let snapshot = engine.create_snapshot(ROOT_INO).unwrap();
         assert_eq!(snapshot.root_ino, ROOT_INO);
         assert_eq!(snapshot.state, SnapshotState::Pending);
-        assert!(snapshot.pinned_object_ids.contains(&9_001));
+        assert_eq!(snapshot.pinned_object_ids, vec![9_001]);
         assert!(!snapshot.snapshot_payload.is_empty());
 
         let listed = engine.list_snapshots().unwrap();
@@ -7885,6 +7946,10 @@ mod tests {
         assert!(
             refs.contains(&9_001),
             "snapshot pins should keep object ids referenced"
+        );
+        assert!(
+            !refs.contains(&9_002),
+            "shadowed base object should not stay pinned after unlink"
         );
     }
 

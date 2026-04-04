@@ -508,7 +508,11 @@ pub trait MetaGc: Send + Sync {
     /// Get all pending deletions (object_id, timestamp).
     fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>;
 
-    /// Get currently referenced object IDs from FILE_BLOCKS metadata.
+    /// Get currently referenced object IDs from the full reachability graph.
+    ///
+    /// Backends should include flat block tables, chunk/slice overlay/base
+    /// rows, and snapshot pins so cleanup can reason about publication races
+    /// and shadow refs directly from metadata reachability.
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
 }
 
