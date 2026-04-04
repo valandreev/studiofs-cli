@@ -69,7 +69,10 @@ pub enum MetaEvent {
         blocks: Vec<(u32, BlockRef)>,
     },
 
-    /// Set a batch of local overlay slices for a regular file.
+    /// Replace the local overlay slices for a regular file chunk batch.
+    ///
+    /// The payload carries the final row state for each chunk. An empty slice
+    /// vector means the chunk row should be removed.
     SetRegularFileOverlaySlices {
         ino: u64,
         chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
