@@ -214,21 +214,23 @@ impl StudioVfs {
                 format!("pending dirty-slice batch too large: {}", count),
             ))
         })?;
-        let start = self
-            .state
-            .write_buffer
-            .next_pending_slice_seq
-            .fetch_add(count_u64, Ordering::Relaxed);
-        let end = start.checked_add(count_u64).ok_or_else(|| {
-            VfsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "pending dirty-slice sequence overflow: start={}, count={}",
-                    start, count_u64
-                ),
-            ))
-        })?;
-        Ok(start..end)
+        let next_seq = &self.state.write_buffer.next_pending_slice_seq;
+        let mut start = next_seq.load(Ordering::Relaxed);
+        loop {
+            let end = start.checked_add(count_u64).ok_or_else(|| {
+                VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "pending dirty-slice sequence overflow: start={}, count={}",
+                        start, count_u64
+                    ),
+                ))
+            })?;
+            match next_seq.compare_exchange_weak(start, end, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Ok(start..end),
+                Err(observed) => start = observed,
+            }
+        }
     }
 
     fn record_pending_dirty_slices_batch(
@@ -463,21 +465,21 @@ impl StudioVfs {
                 std::collections::BTreeMap::new();
             let object_ids_by_block_index: std::collections::HashMap<u32, u64> = persisted_blocks
                 .iter()
-                .map(|block| (block.block_index, block.object_id))
+                .map(|persisted| (persisted.block_index, persisted.object_id))
                 .collect();
             let block_lengths_by_block_index: std::collections::HashMap<u32, usize> = persisted_blocks
                 .iter()
-                .map(|block| (block.block_index, block.data.len()))
+                .map(|persisted| (persisted.block_index, persisted.data.len()))
                 .collect();
 
             if dirty_chunk_slices.is_empty() {
-                for block in &persisted_blocks {
-                    let block_start = (block.block_index as u64) * (self.block_size as u64);
+                for persisted in &persisted_blocks {
+                    let block_start = (persisted.block_index as u64) * (self.block_size as u64);
                     let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
                     let chunk_id = block_start / chunk_size;
                     let chunk_start = chunk_id * chunk_size;
                     let slice_start = (block_start - chunk_start) as u32;
-                    let slice_end = slice_start + (block.data.len() as u32);
+                    let slice_end = slice_start + (persisted.data.len() as u32);
                     let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
                         .ok_or_else(|| {
                             crate::VfsError::Io(std::io::Error::new(
@@ -486,7 +488,7 @@ impl StudioVfs {
                             ))
                         })?;
                     let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                    if block.data.len() < self.block_size as usize {
+                    if persisted.data.len() < self.block_size as usize {
                         flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
                     }
                     chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
@@ -494,9 +496,9 @@ impl StudioVfs {
                         order: studiofs_meta::schema::SliceOrder::default(),
                         range: slice_range,
                         block: Some(studiofs_meta::schema::BlockRef {
-                            object_id: block.object_id,
+                            object_id: persisted.object_id,
                             offset: 0,
-                            length: block.data.len() as u32,
+                            length: persisted.data.len() as u32,
                             flags,
                         }),
                         block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
@@ -544,16 +546,16 @@ impl StudioVfs {
                         });
                     }
                 }
-                for block in &persisted_blocks {
-                    if covered_blocks.contains(&block.block_index) {
+                for persisted in &persisted_blocks {
+                    if covered_blocks.contains(&persisted.block_index) {
                         continue;
                     }
-                    let block_start = (block.block_index as u64) * (self.block_size as u64);
+                    let block_start = (persisted.block_index as u64) * (self.block_size as u64);
                     let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
                     let chunk_id = block_start / chunk_size;
                     let chunk_start = chunk_id * chunk_size;
                     let slice_start = (block_start - chunk_start) as u32;
-                    let slice_end = slice_start + (block.data.len() as u32);
+                    let slice_end = slice_start + (persisted.data.len() as u32);
                     let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
                         .ok_or_else(|| {
                             crate::VfsError::Io(std::io::Error::new(
@@ -562,7 +564,7 @@ impl StudioVfs {
                             ))
                         })?;
                     let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                    if block.data.len() < self.block_size as usize {
+                    if persisted.data.len() < self.block_size as usize {
                         flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
                     }
                     chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
@@ -570,9 +572,9 @@ impl StudioVfs {
                         order: studiofs_meta::schema::SliceOrder::default(),
                         range: slice_range,
                         block: Some(studiofs_meta::schema::BlockRef {
-                            object_id: block.object_id,
+                            object_id: persisted.object_id,
                             offset: 0,
-                            length: block.data.len() as u32,
+                            length: persisted.data.len() as u32,
                             flags,
                         }),
                         block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
