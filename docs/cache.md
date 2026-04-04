@@ -360,7 +360,7 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 Cache v2 removed the legacy L2 commit scheduler and global LRU tracker.
 `BlockCache` now acts as a compatibility shim used by VFS for:
 
-- bounded in-memory L1 staging (`stage_l1`, `get_l1_only`)
+- bounded in-memory L1 staging (`stage_l1`, `get`, `get_with_trace`)
 - upload queue orchestration (`submit_upload*`, `complete_upload`, `cancel_upload`)
 - compatibility pipeline metrics consumed by CLI/VFS logs
 
@@ -413,8 +413,9 @@ staging misses, and contracts again when foreground pressure drops.
 
 ## Performance Characteristics
 
-The `shim_read` / `shim_write` counters track compatibility-shim operations in
-the Cache v2 pipeline (L1 staging + upload orchestration).
+The compatibility shim still exposes benchmark-facing L1 staging and upload
+orchestration timing, but the old `shim_read` / `shim_write` counter names are
+gone.
 
 | Operation | Expected Throughput | Notes |
 |-----------|-------------------|-------|
@@ -431,7 +432,7 @@ the Cache v2 pipeline (L1 staging + upload orchestration).
 StudioFS now exposes first-class cache pipeline metrics for local debugging and
 benchmarks:
 
-- shim read/write throughput counters (`ops`, `bytes`) and latency histograms
+- L1 staging throughput counters (`ops`, `bytes`) and latency histograms
 - ingress append throughput counters and latency histogram
 - materialize batch counters (`batches`, `blocks`, `bytes`), duration histogram,
   and concurrent batch depth/peak

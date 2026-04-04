@@ -2,7 +2,10 @@
 //!
 //! The old two-tier cache stack has been retired. This module now focuses on
 //! pending-upload pinning, queue orchestration, and the small in-memory helper
-//! surface still used by benchmark and compatibility call sites.
+//! surface still used by benchmark and compatibility call sites. The L1 state
+//! in this shim is intentionally retained only for `test-cache` performance
+//! benchmarks and legacy compatibility; the VFS main data path uses
+//! `BlockStore` directly.
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -119,6 +122,9 @@ impl L1State {
 /// - pending-upload pinning state
 /// - in-memory `UploadQueue`
 /// - compatibility metrics counters
+///
+/// The L1 map is kept as a benchmark/compatibility-only surface and is not part
+/// of the VFS primary data path.
 pub struct BlockCache {
     config: BlockCacheConfig,
     l1: Mutex<L1State>,

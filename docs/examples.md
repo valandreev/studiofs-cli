@@ -201,7 +201,7 @@ Notes:
   - per-size-class throughput and latency percentiles (p50/p95/p99)
   - upload queue depth counters
 - `direct-shim` JSON output includes a `cache_pipeline` section with:
-  - `shim_read` / `shim_write` throughput + latency histograms
+  - L1 staging throughput + latency histograms
   - `materialize_batches` batch size/duration/concurrency metrics
   - `upload_queue` depth and queue counters
   - `blocking_tasks` counters for blocking-pool pressure and queue wait timing
