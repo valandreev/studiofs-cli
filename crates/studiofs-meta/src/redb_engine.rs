@@ -1151,6 +1151,33 @@ impl RedbMetaEngine {
         signature
     }
 
+    /// Collect object IDs reachable from a regular-file chunk table.
+    ///
+    /// This streams the table row-by-row so reachability checks never need to
+    /// materialize the whole chunk graph in memory.
+    fn regular_file_graph_object_ids_from_table(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+    ) -> MetaResult<HashSet<u64>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut refs = HashSet::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let chunk: RegularFileChunkState = decode(value.value())?;
+            for slice in chunk.slices.values() {
+                if let Some(block) = &slice.block {
+                    refs.insert(block.object_id);
+                }
+            }
+        }
+        Ok(refs)
+    }
+
     /// Collect object IDs reachable from the regular-file chunk graph.
     ///
     /// Publication races can leave both overlay and base rows alive at the
@@ -1160,18 +1187,14 @@ impl RedbMetaEngine {
         txn: &redb::ReadTransaction,
     ) -> MetaResult<HashSet<u64>> {
         let mut refs = HashSet::new();
-        for table_def in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
-            let states = Self::regular_file_chunk_states_from_txn(txn, table_def)?;
-            for chunks in states.values() {
-                for chunk in chunks.values() {
-                    for slice in chunk.slices.values() {
-                        if let Some(block) = &slice.block {
-                            refs.insert(block.object_id);
-                        }
-                    }
-                }
-            }
-        }
+        refs.extend(Self::regular_file_graph_object_ids_from_table(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+        )?);
+        refs.extend(Self::regular_file_graph_object_ids_from_table(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+        )?);
         Ok(refs)
     }
 
