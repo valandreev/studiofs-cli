@@ -9,6 +9,20 @@ pub(super) struct PendingBlock {
     pub(super) reserved_object_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingDirtySlice {
+    range: studiofs_meta::schema::SliceRange,
+    block_index: u32,
+    block_offset: u32,
+    seq: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyWriteSnapshot {
+    block_index: u32,
+    data: Bytes,
+}
+
 #[derive(Debug, Clone)]
 struct PersistedWriteBlock {
     block_index: u32,
@@ -20,6 +34,10 @@ pub(super) struct WriteBufferState {
     pub(super) pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
     pub(super) pending_block_indexes:
         Mutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
+    pending_chunk_slices: Mutex<
+        std::collections::HashMap<Ino, std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>>,
+    >,
+    next_pending_slice_seq: AtomicU64,
     pub(super) pending_bytes: AtomicUsize,
     pub(super) write_backpressure_wait_ms: AtomicU64,
     pub(super) write_backpressure_events: AtomicU64,
@@ -33,6 +51,8 @@ impl WriteBufferState {
         Self {
             pending_blocks: Mutex::new(std::collections::HashMap::new()),
             pending_block_indexes: Mutex::new(std::collections::HashMap::new()),
+            pending_chunk_slices: Mutex::new(std::collections::HashMap::new()),
+            next_pending_slice_seq: AtomicU64::new(1),
             pending_bytes: AtomicUsize::new(0),
             write_backpressure_wait_ms: AtomicU64::new(0),
             write_backpressure_events: AtomicU64::new(0),
@@ -187,6 +207,75 @@ impl StudioVfs {
         }
     }
 
+    fn next_pending_slice_seq(&self) -> u64 {
+        self.state
+            .write_buffer
+            .next_pending_slice_seq
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn record_pending_dirty_slice(
+        &self,
+        ino: Ino,
+        chunk_id: studiofs_meta::schema::ChunkId,
+        range: studiofs_meta::schema::SliceRange,
+        block_index: u32,
+        block_offset: u32,
+    ) {
+        let seq = self.next_pending_slice_seq();
+        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        pending_chunk_slices
+            .entry(ino)
+            .or_default()
+            .entry(chunk_id.0)
+            .or_default()
+            .push(PendingDirtySlice {
+                range,
+                block_index,
+                block_offset,
+                seq,
+            });
+    }
+
+    fn clear_pending_dirty_slices_for_inode(&self, ino: Ino) {
+        self.state
+            .write_buffer
+            .pending_chunk_slices
+            .lock()
+            .remove(&ino);
+    }
+
+    fn clear_pending_dirty_slices_for_block(&self, ino: Ino, block_index: u32) {
+        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        if let Some(chunks) = pending_chunk_slices.get_mut(&ino) {
+            chunks.retain(|_, slices| {
+                slices.retain(|slice| slice.block_index != block_index);
+                !slices.is_empty()
+            });
+            if chunks.is_empty() {
+                pending_chunk_slices.remove(&ino);
+            }
+        }
+    }
+
+    fn clear_pending_dirty_slices_for_blocks(&self, ino: Ino, block_indexes: &[u32]) {
+        if block_indexes.is_empty() {
+            return;
+        }
+        let block_index_set: std::collections::HashSet<u32> =
+            block_indexes.iter().copied().collect();
+        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        if let Some(chunks) = pending_chunk_slices.get_mut(&ino) {
+            chunks.retain(|_, slices| {
+                slices.retain(|slice| !block_index_set.contains(&slice.block_index));
+                !slices.is_empty()
+            });
+            if chunks.is_empty() {
+                pending_chunk_slices.remove(&ino);
+            }
+        }
+    }
+
     pub(super) fn clear_pending_blocks_for_inode(&self, ino: Ino) {
         let mut removed_bytes = 0usize;
         let mut pending = self.state.write_buffer.pending_blocks.lock();
@@ -202,6 +291,7 @@ impl StudioVfs {
         drop(indexes);
         drop(pending);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
+        self.clear_pending_dirty_slices_for_inode(ino);
     }
 
     async fn cleanup_uncommitted_block_store_entries(
@@ -231,7 +321,8 @@ impl StudioVfs {
     async fn persist_write_buffer_blocks(
         &self,
         ino: Ino,
-        blocks: Vec<(u32, Bytes)>,
+        blocks: Vec<DirtyWriteSnapshot>,
+        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
     ) -> VfsResult<Vec<PersistedWriteBlock>> {
@@ -252,10 +343,10 @@ impl StudioVfs {
 
         let mut persisted_blocks: Vec<PersistedWriteBlock> = blocks
             .into_iter()
-            .map(|(block_index, data)| PersistedWriteBlock {
-                block_index,
+            .map(|block| PersistedWriteBlock {
+                block_index: block.block_index,
                 object_id: 0,
-                data,
+                data: block.data,
             })
             .collect();
         let missing_object_id_count = {
@@ -307,60 +398,125 @@ impl StudioVfs {
             }
             self.block_store_sync_data_async().await?;
 
-            let mut chunks: std::collections::BTreeMap<
-                u64,
-                Vec<studiofs_meta::schema::SliceRecord>,
-            > = std::collections::BTreeMap::new();
-            for block in &persisted_blocks {
-                let block_start = (block.block_index as u64) * (self.block_size as u64);
-                let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-                let chunk_id = block_start / chunk_size;
-                let chunk_start = chunk_id * chunk_size;
-                let slice_start = (block_start - chunk_start) as u32;
-                let slice_end = slice_start + (block.data.len() as u32);
-                if slice_end > studiofs_meta::schema::DEFAULT_CHUNK_SIZE {
-                    return Err(crate::VfsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "slice transcends chunk bounds: start={}, end={}, chunk={}",
-                            slice_start,
-                            slice_end,
-                            studiofs_meta::schema::DEFAULT_CHUNK_SIZE
-                        ),
-                    )));
-                }
+            let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
+                std::collections::BTreeMap::new();
+            let object_ids_by_block_index: std::collections::HashMap<u32, u64> = persisted_blocks
+                .iter()
+                .map(|block| (block.block_index, block.object_id))
+                .collect();
+            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> = persisted_blocks
+                .iter()
+                .map(|block| (block.block_index, block.data.len()))
+                .collect();
 
-                let slice_range =
-                    match studiofs_meta::schema::SliceRange::new(slice_start, slice_end) {
-                        Some(range) => range,
-                        None => {
-                            return Err(crate::VfsError::Io(std::io::Error::new(
+            if dirty_chunk_slices.is_empty() {
+                for block in &persisted_blocks {
+                    let block_start = (block.block_index as u64) * (self.block_size as u64);
+                    let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+                    let chunk_id = block_start / chunk_size;
+                    let chunk_start = chunk_id * chunk_size;
+                    let slice_start = (block_start - chunk_start) as u32;
+                    let slice_end = slice_start + (block.data.len() as u32);
+                    let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                        .ok_or_else(|| {
+                            crate::VfsError::Io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 format!("invalid slice range {}..{}", slice_start, slice_end),
+                            ))
+                        })?;
+                    let mut flags = studiofs_meta::schema::BlockFlags::empty();
+                    if block.data.len() < self.block_size as usize {
+                        flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+                    }
+                    chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
+                        slice_id: studiofs_meta::schema::SliceId::default(),
+                        order: studiofs_meta::schema::SliceOrder::default(),
+                        range: slice_range,
+                        block: Some(studiofs_meta::schema::BlockRef {
+                            object_id: block.object_id,
+                            offset: 0,
+                            length: block.data.len() as u32,
+                            flags,
+                        }),
+                        block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                    });
+                }
+            } else {
+                let mut covered_blocks = std::collections::HashSet::new();
+                for (chunk_id, mut slices) in dirty_chunk_slices {
+                    slices.sort_by_key(|slice| slice.seq);
+                    for slice in slices {
+                        let Some(&object_id) = object_ids_by_block_index.get(&slice.block_index) else {
+                            continue;
+                        };
+                        let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index) else {
+                            continue;
+                        };
+                        let slice_len = slice.range.len();
+                        let block_offset = slice.block_offset;
+                        let block_end = (block_offset as usize).saturating_add(slice_len as usize);
+                        if block_end > block_len {
+                            return Err(crate::VfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "dirty slice exceeds block length: ino={}, block_index={}, block_len={}, block_offset={}, slice_len={}",
+                                    ino, slice.block_index, block_len, block_offset, slice_len
+                                ),
                             )));
                         }
-                    };
-
-                let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                if block.data.len() < self.block_size as usize {
-                    flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+                        covered_blocks.insert(slice.block_index);
+                        let mut flags = studiofs_meta::schema::BlockFlags::empty();
+                        if block_len < self.block_size as usize {
+                            flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+                        }
+                        chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
+                            slice_id: studiofs_meta::schema::SliceId::default(),
+                            order: studiofs_meta::schema::SliceOrder::default(),
+                            range: slice.range,
+                            block: Some(studiofs_meta::schema::BlockRef {
+                                object_id,
+                                offset: block_offset,
+                                length: slice_len,
+                                flags,
+                            }),
+                            block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                        });
+                    }
                 }
-
-                let block_ref = studiofs_meta::schema::BlockRef {
-                    object_id: block.object_id,
-                    offset: 0,
-                    length: block.data.len() as u32,
-                    flags,
-                };
-
-                let record = studiofs_meta::schema::SliceRecord {
-                    slice_id: studiofs_meta::schema::SliceId::default(),
-                    order: studiofs_meta::schema::SliceOrder::default(),
-                    range: slice_range,
-                    block: Some(block_ref),
-                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                };
-                chunks.entry(chunk_id).or_default().push(record);
+                for block in &persisted_blocks {
+                    if covered_blocks.contains(&block.block_index) {
+                        continue;
+                    }
+                    let block_start = (block.block_index as u64) * (self.block_size as u64);
+                    let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+                    let chunk_id = block_start / chunk_size;
+                    let chunk_start = chunk_id * chunk_size;
+                    let slice_start = (block_start - chunk_start) as u32;
+                    let slice_end = slice_start + (block.data.len() as u32);
+                    let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                        .ok_or_else(|| {
+                            crate::VfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("invalid slice range {}..{}", slice_start, slice_end),
+                            ))
+                        })?;
+                    let mut flags = studiofs_meta::schema::BlockFlags::empty();
+                    if block.data.len() < self.block_size as usize {
+                        flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+                    }
+                    chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
+                        slice_id: studiofs_meta::schema::SliceId::default(),
+                        order: studiofs_meta::schema::SliceOrder::default(),
+                        range: slice_range,
+                        block: Some(studiofs_meta::schema::BlockRef {
+                            object_id: block.object_id,
+                            offset: 0,
+                            length: block.data.len() as u32,
+                            flags,
+                        }),
+                        block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                    });
+                }
             }
 
             let chunk_slices: Vec<(
@@ -475,14 +631,14 @@ impl StudioVfs {
             drop(indexes);
             drop(pending);
             self.subtract_pending_write_buffer_bytes(removed.data.len());
+            self.clear_pending_dirty_slices_for_block(ino, block_index);
         }
     }
 
-    fn snapshot_dirty_write_buffer_blocks(&self, ino: Ino) -> Vec<(u32, Bytes)> {
-        // This is a point-in-time view of the inode's dirty overlay. Writers
-        // may race ahead and mutate the same block after the snapshot is taken;
-        // commit then intentionally leaves the newer RAM bytes dirty so a later
-        // flush retries with the fresh contents instead of dropping them.
+    fn snapshot_dirty_write_buffer_blocks(&self, ino: Ino) -> Vec<DirtyWriteSnapshot> {
+        // Point-in-time view of dirty local-visible payload. Writers may race
+        // ahead after this snapshot; commit keeps newer bytes dirty so a later
+        // flush retries with the fresh view instead of dropping updates.
         let pending = self.state.write_buffer.pending_blocks.lock();
         let indexes = self.state.write_buffer.pending_block_indexes.lock();
         indexes
@@ -493,12 +649,18 @@ impl StudioVfs {
                 pending
                     .get(&(ino, *block_index))
                     .filter(|pending| pending.dirty)
-                    .map(|pending| (*block_index, pending.data.clone().freeze()))
+                    .map(|pending| DirtyWriteSnapshot {
+                        block_index: *block_index,
+                        data: pending.data.clone().freeze(),
+                    })
             })
             .collect()
     }
 
-    fn snapshot_dirty_full_write_buffer_blocks(&self, ino: Ino) -> (Vec<(u32, Bytes)>, usize) {
+    fn snapshot_dirty_full_write_buffer_blocks(
+        &self,
+        ino: Ino,
+    ) -> (Vec<DirtyWriteSnapshot>, usize) {
         let pending = self.state.write_buffer.pending_blocks.lock();
         let indexes = self.state.write_buffer.pending_block_indexes.lock();
         let mut total_bytes = 0usize;
@@ -513,10 +675,58 @@ impl StudioVfs {
                 }
                 let data = pending.data.clone().freeze();
                 total_bytes += data.len();
-                Some((*block_index, data))
+                Some(DirtyWriteSnapshot {
+                    block_index: *block_index,
+                    data,
+                })
             })
             .collect();
         (blocks, total_bytes)
+    }
+
+    fn snapshot_dirty_write_buffer_chunk_slices(
+        &self,
+        ino: Ino,
+        blocks: &[DirtyWriteSnapshot],
+    ) -> std::collections::BTreeMap<u64, Vec<PendingDirtySlice>> {
+        let selected_block_indexes: std::collections::HashSet<u32> =
+            blocks.iter().map(|block| block.block_index).collect();
+        let block_lengths: std::collections::HashMap<u32, usize> = blocks
+            .iter()
+            .map(|block| (block.block_index, block.data.len()))
+            .collect();
+        if selected_block_indexes.is_empty() {
+            return std::collections::BTreeMap::new();
+        }
+
+        let mut slices_by_chunk = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
+        if let Some(chunks) = self
+            .state
+            .write_buffer
+            .pending_chunk_slices
+            .lock()
+            .get(&ino)
+        {
+            for (chunk_id, slices) in chunks {
+                let mut filtered: Vec<_> = slices
+                    .iter()
+                    .copied()
+                    .filter(|slice| {
+                        selected_block_indexes.contains(&slice.block_index)
+                            && block_lengths.get(&slice.block_index).is_some_and(|len| {
+                                (slice.block_offset as usize)
+                                    .saturating_add(slice.range.len() as usize)
+                                    <= *len
+                            })
+                    })
+                    .collect();
+                filtered.sort_by_key(|slice| slice.seq);
+                if !filtered.is_empty() {
+                    slices_by_chunk.insert(*chunk_id, filtered);
+                }
+            }
+        }
+        slices_by_chunk
     }
 
     fn commit_persisted_write_buffer_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
@@ -539,6 +749,7 @@ impl StudioVfs {
         drop(indexes);
         drop(pending);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
+        self.clear_pending_dirty_slices_for_blocks(ino, &removed_block_indexes);
     }
 
     async fn flush_dirty_full_write_buffer_blocks(
@@ -561,9 +772,10 @@ impl StudioVfs {
         } else {
             self.current_content_epoch_async(ino).await?
         };
+        let chunk_slices = self.snapshot_dirty_write_buffer_chunk_slices(ino, &full_blocks);
         let attr_to_clear = dirty_attr.clone();
         let persisted_blocks = self
-            .persist_write_buffer_blocks(ino, full_blocks, content_epoch, dirty_attr)
+            .persist_write_buffer_blocks(ino, full_blocks, chunk_slices, content_epoch, dirty_attr)
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
@@ -702,6 +914,8 @@ impl StudioVfs {
             let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
             let space_in_block = self.block_size as usize - offset_in_block;
             let to_write = remaining.min(space_in_block);
+            let write_start = current_offset;
+            let write_end = current_offset.saturating_add(to_write as u64);
 
             let need_load = !self
                 .state
@@ -759,6 +973,30 @@ impl StudioVfs {
                 if pending_block.data.len() >= self.block_size as usize {
                     has_full_blocks = true;
                 }
+            }
+            let chunk_id = studiofs_meta::schema::chunk_id_from_offset(
+                write_start,
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            );
+            let slice_start = studiofs_meta::schema::offset_within_chunk(
+                write_start,
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            );
+            let mut slice_end = studiofs_meta::schema::offset_within_chunk(
+                write_end,
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            );
+            if slice_end == 0 && write_end > write_start {
+                slice_end = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
+            }
+            if let Some(range) = studiofs_meta::schema::SliceRange::new(slice_start, slice_end) {
+                self.record_pending_dirty_slice(
+                    ino,
+                    chunk_id,
+                    range,
+                    block_index,
+                    offset_in_block as u32,
+                );
             }
 
             written += to_write as u64;
@@ -824,9 +1062,16 @@ impl StudioVfs {
         } else {
             self.current_content_epoch_async(ino).await?
         };
+        let chunk_slices = self.snapshot_dirty_write_buffer_chunk_slices(ino, &blocks_to_buffer);
         let attr_to_clear = dirty_attr.clone();
         let persisted_blocks = self
-            .persist_write_buffer_blocks(ino, blocks_to_buffer, content_epoch, dirty_attr)
+            .persist_write_buffer_blocks(
+                ino,
+                blocks_to_buffer,
+                chunk_slices,
+                content_epoch,
+                dirty_attr,
+            )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
