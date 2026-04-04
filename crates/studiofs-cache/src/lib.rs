@@ -2,7 +2,7 @@
 //!
 //! `v2::BlockStore` is the canonical local cache implementation.
 //! `block_cache` remains as a compatibility shim for upload-queue and
-//! observability surfaces during migration cleanup.
+//! pending-upload tracking at the write-path boundary.
 
 pub mod block_cache;
 pub mod metrics;

@@ -171,7 +171,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     // Keep existing integration tests on durable semantics unless overridden.
     let mut config = VfsConfigRaw {
         cache_safety_mode: Some(CacheSafetyMode::Durable),
-        memory_adaptive: Some(false),
         ..VfsConfigRaw::default()
     };
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
@@ -2193,7 +2192,6 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -2247,7 +2245,6 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3459,7 +3456,6 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let online_vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3515,7 +3511,6 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3563,7 +3558,6 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             let offline_vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -6556,7 +6550,6 @@ fn test_write_fast_mode_no_spill_artifacts() {
         let vfs_config = VfsConfigRaw {
             cache_safety_mode: Some(CacheSafetyMode::Fast),
             max_dirty_bytes: Some(32 * 1024 * 1024),
-            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -6797,7 +6790,6 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
                 max_dirty_bytes: Some(4 * 256 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
-            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -6873,7 +6865,6 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -6968,7 +6959,6 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -7017,7 +7007,6 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
                 cache_safety_mode: Some(CacheSafetyMode::Durable),
-                memory_adaptive: Some(false),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -8387,7 +8376,6 @@ fn write_eager_flush_batches_full_blocks_until_threshold() {
         let vfs_config = VfsConfigRaw {
             max_dirty_bytes: Some(16 * 1024 * 1024),
             write_eager_flush_batch_bytes: Some(block_size * 2),
-            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -8471,7 +8459,6 @@ fn write_eager_flush_flushes_full_blocks_below_threshold() {
         let vfs_config = VfsConfigRaw {
             max_dirty_bytes: Some(16 * 1024 * 1024),
             write_eager_flush_batch_bytes: Some(block_size * 2),
-            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -8537,7 +8524,6 @@ fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
         let vfs_config = VfsConfigRaw {
             max_dirty_bytes: Some(16 * 1024 * 1024),
             write_eager_flush_batch_bytes: Some(block_size),
-            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -8614,7 +8600,6 @@ fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
         let vfs_config = VfsConfigRaw {
             max_dirty_bytes: Some(block_size + 1),
             write_eager_flush_batch_bytes: Some(block_size * 4),
-            memory_adaptive: Some(false),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(

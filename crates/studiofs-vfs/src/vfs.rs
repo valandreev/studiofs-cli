@@ -873,10 +873,6 @@ pub struct VfsConfig {
     pub qos_fetch_slots: usize,
     /// Number of shards for foreground read speedometer.
     pub foreground_read_speedometer_shards: usize,
-    /// Enable adaptive memory controller (SFS-130).
-    pub memory_adaptive: bool,
-    /// Total system RAM in bytes (detected at mount time, 0 = auto).
-    pub total_ram: u64,
 }
 
 /// Parsed user-provided VFS configuration.
@@ -968,8 +964,6 @@ pub struct VfsConfigRaw {
     pub qos_commit_slots: Option<usize>,
     pub qos_fetch_slots: Option<usize>,
     pub foreground_read_speedometer_shards: Option<usize>,
-    pub memory_adaptive: Option<bool>,
-    pub total_ram: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1094,8 +1088,6 @@ impl VfsConfigRaw {
             qos_commit_slots,
             qos_fetch_slots,
             foreground_read_speedometer_shards,
-            memory_adaptive,
-            total_ram,
         );
 
         cfg
@@ -1268,8 +1260,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             qos_commit_slots: Some(cfg.qos_commit_slots),
             qos_fetch_slots: Some(cfg.qos_fetch_slots),
             foreground_read_speedometer_shards: Some(cfg.foreground_read_speedometer_shards),
-            memory_adaptive: Some(cfg.memory_adaptive),
-            total_ram: Some(cfg.total_ram),
         }
     }
 }
@@ -1360,8 +1350,6 @@ impl Default for VfsConfig {
             qos_commit_slots: DEFAULT_QOS_COMMIT_SLOTS,
             qos_fetch_slots: DEFAULT_QOS_FETCH_SLOTS,
             foreground_read_speedometer_shards: FOREGROUND_READ_SPEEDOMETER_SHARDS,
-            memory_adaptive: true,
-            total_ram: 0,
         }
     }
 }
@@ -3294,8 +3282,6 @@ struct StartupState {
     lifecycle: Mutex<StartupLifecycle>,
     lifecycle_notify: Condvar,
     metadata_invalidation_sync_interval: Duration,
-    memory_adaptive: bool,
-    total_ram: u64,
 }
 
 impl StartupState {
@@ -3304,8 +3290,6 @@ impl StartupState {
         prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
         upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
         metadata_invalidation_sync_interval: Duration,
-        memory_adaptive: bool,
-        total_ram: u64,
     ) -> Self {
         Self {
             lifecycle: Mutex::new(StartupLifecycle {
@@ -3317,8 +3301,6 @@ impl StartupState {
             }),
             lifecycle_notify: Condvar::new(),
             metadata_invalidation_sync_interval,
-            memory_adaptive,
-            total_ram,
         }
     }
 }
@@ -3335,7 +3317,7 @@ pub struct StudioVfs {
     data_write: Arc<DataStore>,
     /// Cache v2 single-file store used by the foreground read path.
     block_store: Arc<BlockStore>,
-    /// Compatibility shim for upload queue orchestration and L1 staging.
+    /// Upload queue and pending-upload pinning for the write path.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
     block_size: u32,
@@ -3389,7 +3371,6 @@ pub struct StudioVfs {
     startup: StartupState,
     /// Maximum total bytes allowed in the dirty-write memory buffer before
     /// `flush()` / `write()` apply backpressure.
-    /// Runtime-adjustable by the adaptive memory controller.
     max_dirty_bytes: AtomicUsize,
     /// Minimum dirty full-block batch size before `write()` pays the local
     /// persist boundary for eager block flushes.
@@ -3419,9 +3400,6 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
-    /// Adaptive memory budget controller (SFS-130). Empty when `VfsConfigRaw.memory_adaptive`
-    /// (config/env) is disabled.
-    memory_envelope: std::sync::OnceLock<Arc<crate::memory_envelope::MemoryEnvelope>>,
 }
 
 struct ForegroundReadScope<'a> {
@@ -4384,7 +4362,7 @@ impl StudioVfs {
                 .map_err(|e| VfsError::Other(format!("failed to open block store: {e}")))?,
             );
 
-            // Init BlockCache compatibility shim (L1 staging + upload queue).
+            // Init BlockCache upload queue state for pending write replay.
             let cache_config = BlockCacheConfig::new(cache_dir, memory_limit);
             let (block_cache, upload_rx) = BlockCache::open(cache_config).map_err(VfsError::Io)?;
 
@@ -4631,8 +4609,6 @@ impl StudioVfs {
                     prefetch_rx,
                     upload_rx,
                     metadata_invalidation_sync_interval,
-                    config.memory_adaptive,
-                    config.total_ram,
                 ),
                 max_dirty_bytes: AtomicUsize::new(max_dirty_bytes),
                 write_eager_flush_batch_bytes,
@@ -4654,7 +4630,6 @@ impl StudioVfs {
                 fetch_scheduler: fetch_scheduler.clone(),
                 distributed_flock,
                 kernel_invalidator: RwLock::new(None),
-                memory_envelope: std::sync::OnceLock::new(),
             });
 
             let pending_uploads = vfs.block_cache.snapshot_pending_uploads();
@@ -4918,11 +4893,6 @@ impl StudioVfs {
                     vfs_clone.background_janitor().await;
                 }));
 
-                // Spawn adaptive MemoryEnvelope controller (SFS-130).
-                if self.startup.memory_adaptive {
-                    self.init_memory_envelope();
-                }
-
                 Ok(())
             },
         )) {
@@ -4954,46 +4924,6 @@ impl StudioVfs {
         self.startup.lifecycle_notify.notify_all();
         drop(lifecycle);
         start_result
-    }
-
-    /// Initialise and spawn the adaptive MemoryEnvelope background task.
-    fn init_memory_envelope(self: &Arc<Self>) {
-        use crate::memory_envelope::MemoryEnvelope;
-
-        /// Default soft target: 8 GiB.  L1 alone gets ~5 GiB under ReadHeavy
-        /// (65% of 8 GiB − overhead).  Actual RSS when idle is much lower
-        /// because L1 evicts unused blocks — the grant is only a ceiling.
-        const DEFAULT_SOFT_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-        /// Hard ceiling: 50% of total RAM.
-        const DEFAULT_CEILING_PCT: f64 = 0.50;
-
-        let total_ram = if self.startup.total_ram > 0 {
-            self.startup.total_ram
-        } else {
-            use sysinfo::System;
-            let mut sys = System::new();
-            sys.refresh_memory();
-            sys.total_memory()
-        };
-
-        let envelope = Arc::new(MemoryEnvelope::new(
-            total_ram,
-            DEFAULT_SOFT_TARGET_BYTES,
-            DEFAULT_CEILING_PCT,
-            self.block_size as u64,
-            self.block_cache.clone(),
-            self.transit_memory_budget.clone(),
-            self.fetch_scheduler.clone(),
-        ));
-
-        // Store the envelope on self so `snapshot()` can be called for status output.
-        let _ = self.memory_envelope.set(envelope.clone());
-
-        let cancel = self.state.shutdown.uploader_shutdown_token.child_token();
-        let vfs = self.clone();
-        self.track_background_task(tokio::spawn(async move {
-            envelope.run(vfs, cancel).await;
-        }));
     }
 
     fn track_background_task(&self, handle: JoinHandle<()>) {
@@ -5863,10 +5793,7 @@ impl StudioVfs {
         };
         Ok(match source {
             PendingOverlayBlockSource::Pending(data) => Some(data),
-            PendingOverlayBlockSource::Extent(object_id) => self
-                .block_store
-                .get(object_id)
-                .or_else(|| self.block_cache.get_sync(object_id)),
+            PendingOverlayBlockSource::Extent(object_id) => self.block_store.get(object_id),
         })
     }
 
@@ -5888,10 +5815,7 @@ impl StudioVfs {
         match source {
             PendingOverlayBlockSource::Pending(data) => Ok(Some(data)),
             PendingOverlayBlockSource::Extent(object_id) => {
-                if let Some(data) = self.block_store_get_async(object_id).await? {
-                    return Ok(Some(data));
-                }
-                Ok(self.block_cache.get(object_id).await)
+                self.block_store_get_async(object_id).await
             }
         }
     }
@@ -7340,11 +7264,6 @@ impl StudioVfs {
     /// Shared reference to the transit memory budget.
     pub fn transit_memory_budget(&self) -> &Arc<crate::qos::TransitMemoryBudget> {
         &self.transit_memory_budget
-    }
-
-    /// Snapshot of the adaptive memory envelope (if enabled).
-    pub fn memory_envelope_snapshot(&self) -> Option<crate::memory_envelope::EnvelopeSnapshot> {
-        self.memory_envelope.get().map(|e| e.snapshot())
     }
 
     /// Wait until all pending S3 uploads complete or `timeout` elapses.
@@ -9651,7 +9570,7 @@ impl StudioVfs {
         for (object_id, block) in Self::collect_data_block_refs(plan) {
             if self.block_store.contains(object_id) {
                 cached.insert(object_id);
-            } else if self.block_cache.get_sync(object_id).is_none() {
+            } else {
                 missing.insert(object_id, block);
             }
         }
@@ -9730,8 +9649,6 @@ impl StudioVfs {
                     if remote_not_found.contains(&block.object_id) {
                         dst.fill(0);
                     } else if let Some(data) = self.block_store_get_async(block.object_id).await? {
-                        self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
-                    } else if let Some(data) = self.block_cache.get(block.object_id).await {
                         self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
                     } else {
                         match self.fetch_block_for_ref(block, false).await {
@@ -10932,7 +10849,7 @@ impl StudioVfs {
             let ingress = self.ingress_stats();
             let ingress_append = self.state.ingress.ingress_append_stats.snapshot();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
-            let cache_pipeline = self.block_cache.cache_pipeline_metrics();
+            let upload_queue = self.block_cache.cache_pipeline_metrics().upload_queue;
             let foreground_read_protection = self.foreground_read_protection_stats();
             self.adjust_upload_backpressure_from_metrics(
                 foreground_read_protection.p90_latency_ns,
@@ -11008,24 +10925,12 @@ impl StudioVfs {
                     materialize_batches_inflight = materialize_batches.inflight_batches,
                     materialize_batches_inflight_peak = materialize_batches.inflight_batches_peak,
                     materialize_batch_duration_histogram = ?materialize_batches.duration_histogram.bucket_counts,
-                    cache_shim_read_ops = cache_pipeline.shim_read.ops,
-                    cache_shim_read_bytes = cache_pipeline.shim_read.bytes,
-                    cache_shim_read_total_latency_ns = cache_pipeline.shim_read.total_latency_ns,
-                    cache_shim_read_max_latency_ns = cache_pipeline.shim_read.max_latency_ns,
-                    cache_shim_read_latency_histogram = ?cache_pipeline.shim_read.latency_histogram.bucket_counts,
-                    cache_shim_write_ops = cache_pipeline.shim_write.ops,
-                    cache_shim_write_bytes = cache_pipeline.shim_write.bytes,
-                    cache_shim_write_total_latency_ns = cache_pipeline.shim_write.total_latency_ns,
-                    cache_shim_write_max_latency_ns = cache_pipeline.shim_write.max_latency_ns,
-                    cache_shim_write_latency_histogram = ?cache_pipeline.shim_write.latency_histogram.bucket_counts,
-                    upload_queue_depth = cache_pipeline.upload_queue.pending_depth,
-                    upload_queue_depth_peak = cache_pipeline.upload_queue.pending_depth_peak,
-                    upload_queue_submitted = cache_pipeline.upload_queue.submitted,
-                    upload_queue_completed = cache_pipeline.upload_queue.completed,
-                    upload_queue_requeued = cache_pipeline.upload_queue.requeued,
-                    upload_queue_canceled = cache_pipeline.upload_queue.canceled,
-                    cache_shim_batch_inflight = cache_pipeline.materialize_batches.inflight_batches,
-                    cache_shim_batch_inflight_peak = cache_pipeline.materialize_batches.inflight_batches_peak,
+                    upload_queue_depth = upload_queue.pending_depth,
+                    upload_queue_depth_peak = upload_queue.pending_depth_peak,
+                    upload_queue_submitted = upload_queue.submitted,
+                    upload_queue_completed = upload_queue.completed,
+                    upload_queue_requeued = upload_queue.requeued,
+                    upload_queue_canceled = upload_queue.canceled,
                     upload_io_slots_available = self.upload_cache_io_slots.available_permits(),
                     qos_accept_available = self.qos.accept_available(),
                     qos_materialize_available = self.qos.materialize_available(),
@@ -11116,10 +11021,6 @@ impl StudioVfs {
                     "upload pipeline transit memory"
                 );
                 debug!(
-                    l1_evictions = self.block_cache.l1_eviction_count(),
-                    l1_hits = self.block_cache.l1_hit_count(),
-                    l1_bytes = self.block_cache.l1_bytes(),
-                    l1_max_bytes = self.block_cache.l1_max_bytes(),
                     block_store_allocated_bytes = block_store_metrics.allocated_bytes,
                     block_store_block_count = block_store_metrics.block_count,
                     block_store_dirty_count = block_store_metrics.dirty_count,
@@ -11156,7 +11057,7 @@ impl StudioVfs {
                         .metrics
                         .prefetch_skips
                         .load(Ordering::Relaxed),
-                    "adaptive memory counters"
+                    "block store and fetch counters"
                 );
                 debug!(
                     upload_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,

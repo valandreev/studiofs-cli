@@ -1,10 +1,8 @@
 //! Cache-v2 compatibility shim for legacy `BlockCache` call sites.
 //!
-//! The legacy two-tier cache stack (L1/L2/LRU/runtime) has been removed.
-//! This module now provides only:
-//! - lightweight in-memory hot payload staging (`stage_l1` / `get_l1_only`)
-//! - upload queue orchestration (`submit_upload*`, `complete_upload`, ...)
-//! - compatibility metrics/surfaces used by VFS/CLI reporting
+//! The old two-tier cache stack has been retired. This module now focuses on
+//! pending-upload pinning, queue orchestration, and the small in-memory helper
+//! surface still used by benchmark and compatibility call sites.
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -118,7 +116,7 @@ impl L1State {
 /// Compatibility `BlockCache` wrapper.
 ///
 /// Backed by:
-/// - bounded L1 staging map
+/// - pending-upload pinning state
 /// - in-memory `UploadQueue`
 /// - compatibility metrics counters
 pub struct BlockCache {
