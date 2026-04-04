@@ -2033,6 +2033,10 @@ impl MetaBlocks for PgMetaEngine {
         self.mutate(|local| local.flush_regular_file_overlay_slices(ino, chunk_slices))
     }
 
+    fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool> {
+        self.local.has_local_regular_file_overlay(ino)
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,

@@ -426,6 +426,15 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
     ) -> MetaResult<()>;
 
+    /// Return true when a file has persisted local overlay chunk/slice rows.
+    ///
+    /// This is used by epoch finalization to avoid publishing while local
+    /// overlay metadata is still pending promotion to committed/base state.
+    fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool> {
+        let _ = ino;
+        Ok(false)
+    }
+
     /// Mark a block as remote-visible after its object upload has completed.
     ///
     /// Remote-backed engines can use this to publish block visibility and

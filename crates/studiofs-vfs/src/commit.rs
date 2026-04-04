@@ -53,43 +53,60 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        let required_blocks = run_meta(
+        let has_persisted_overlay = run_meta(
             vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
+            move |engine: Arc<dyn MetaEngine>| engine.has_local_regular_file_overlay(ino),
         )
         .await?;
-        if !required_blocks.is_empty() {
-            let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
-                .iter()
-                .map(|(block_index, block_ref)| {
-                    (
-                        *block_index,
-                        ExtentRecordId {
-                            object_id: block_ref.object_id,
-                            content_epoch,
-                        },
-                    )
-                })
-                .collect();
-            if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
-            {
-                requeue_missing_manifest_uploads(vfs, ino, content_epoch, &required_blocks).await;
-                return Err(err);
+        let published = if has_persisted_overlay {
+            run_meta(
+                vfs.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| {
+                    engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                },
+            )
+            .await?
+        } else {
+            let required_blocks = run_meta(
+                vfs.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
+            )
+            .await?;
+            if !required_blocks.is_empty() {
+                let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
+                    .iter()
+                    .map(|(block_index, block_ref)| {
+                        (
+                            *block_index,
+                            ExtentRecordId {
+                                object_id: block_ref.object_id,
+                                content_epoch,
+                            },
+                        )
+                    })
+                    .collect();
+                if let Err(err) =
+                    Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
+                {
+                    requeue_missing_manifest_uploads(vfs, ino, content_epoch, &required_blocks)
+                        .await;
+                    return Err(err);
+                }
             }
-        }
 
-        let expected_manifest = required_blocks.clone();
-        let published = run_meta(
-            vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| {
-                engine.publish_file_manifest_if_matches(
-                    ino,
-                    content_epoch,
-                    expected_manifest.as_slice(),
-                )
-            },
-        )
-        .await?;
+            let expected_manifest = required_blocks.clone();
+            run_meta(
+                vfs.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| {
+                    engine.publish_file_manifest_if_matches(
+                        ino,
+                        content_epoch,
+                        expected_manifest.as_slice(),
+                    )
+                },
+            )
+            .await?
+        };
         if !published {
             let latest_attr = match run_meta(
                 vfs.meta_async.clone(),

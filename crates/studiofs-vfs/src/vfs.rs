@@ -5612,12 +5612,29 @@ impl StudioVfs {
     }
 
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
-        self.state
+        if self
+            .state
             .write_buffer
             .pending_blocks
             .lock()
             .keys()
             .any(|(candidate, _)| *candidate == ino)
+        {
+            return true;
+        }
+
+        let meta = self.sync_meta();
+        match meta.has_local_regular_file_overlay(ino) {
+            Ok(has_overlay) => has_overlay && self.inode_has_pending_uploads(ino),
+            Err(err) => {
+                tracing::warn!(
+                    ino,
+                    error = %err,
+                    "failed to probe persisted regular-file overlay; deferring finalize"
+                );
+                true
+            }
+        }
     }
 
     fn inode_has_pending_uploads(&self, ino: Ino) -> bool {

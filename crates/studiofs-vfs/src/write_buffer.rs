@@ -582,6 +582,17 @@ impl StudioVfs {
                 }
             }
 
+            for slices in chunks.values_mut() {
+                let mut next_slice_id = 1u64;
+                let mut next_slice_order = 1u64;
+                for slice in slices.iter_mut() {
+                    slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
+                    slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
+                    next_slice_id = next_slice_id.saturating_add(1);
+                    next_slice_order = next_slice_order.saturating_add(1);
+                }
+            }
+
             let chunk_slices: Vec<(
                 studiofs_meta::schema::ChunkId,
                 Vec<studiofs_meta::schema::SliceRecord>,
