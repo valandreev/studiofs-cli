@@ -1384,6 +1384,124 @@ impl RedbMetaEngine {
             Err(err) => Err(err),
         }
     }
+
+    fn block_ref_from_regular_file_slices(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block_size: u32,
+    ) -> MetaResult<Option<BlockRef>> {
+        let block_start = (block_index as u64).saturating_mul(block_size as u64);
+        let spans = self.lookup_regular_file_slices(ino, block_start, block_size as u64)?;
+        if spans.is_empty() {
+            return Ok(None);
+        }
+
+        #[derive(Clone, Copy)]
+        struct Range {
+            start: u64,
+            end: u64,
+        }
+
+        fn claim_ranges(unresolved: Vec<Range>, candidate: Range) -> (Vec<Range>, Vec<Range>) {
+            let mut next_unresolved = Vec::new();
+            let mut claimed = Vec::new();
+            for range in unresolved {
+                let overlap_start = range.start.max(candidate.start);
+                let overlap_end = range.end.min(candidate.end);
+                if overlap_start >= overlap_end {
+                    next_unresolved.push(range);
+                    continue;
+                }
+                if range.start < overlap_start {
+                    next_unresolved.push(Range {
+                        start: range.start,
+                        end: overlap_start,
+                    });
+                }
+                claimed.push(Range {
+                    start: overlap_start,
+                    end: overlap_end,
+                });
+                if overlap_end < range.end {
+                    next_unresolved.push(Range {
+                        start: overlap_end,
+                        end: range.end,
+                    });
+                }
+            }
+            (next_unresolved, claimed)
+        }
+
+        let block_end = block_start.saturating_add(block_size as u64);
+        let mut unresolved = vec![Range {
+            start: block_start,
+            end: block_end,
+        }];
+        let mut claimed_refs: Vec<(u64, BlockRef)> = Vec::new();
+
+        for source in [ResolvedSliceSource::Overlay, ResolvedSliceSource::Base] {
+            for span in spans.iter().filter(|span| span.source == source) {
+                if unresolved.is_empty() {
+                    break;
+                }
+                let Some(block) = span.block.as_ref() else {
+                    continue;
+                };
+                let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                let span_range = Range {
+                    start: chunk_start.saturating_add(span.range.start as u64),
+                    end: chunk_start.saturating_add(span.range.end as u64),
+                };
+                let (next_unresolved, claimed) = claim_ranges(unresolved, span_range);
+                unresolved = next_unresolved;
+                for overlap in claimed {
+                    let delta = overlap.start.saturating_sub(span_range.start);
+                    let Some(delta_u32) = u32::try_from(delta).ok() else {
+                        continue;
+                    };
+                    let Some(block_offset) = block.offset.checked_add(delta_u32) else {
+                        continue;
+                    };
+                    let take_len = overlap.end.saturating_sub(overlap.start);
+                    let Some(take_len_u32) = u32::try_from(take_len).ok() else {
+                        continue;
+                    };
+                    claimed_refs.push((
+                        overlap.start,
+                        BlockRef {
+                            object_id: block.object_id,
+                            offset: block_offset,
+                            length: take_len_u32,
+                            flags: block.flags,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if claimed_refs.is_empty() {
+            return Ok(None);
+        }
+        claimed_refs.sort_by_key(|(start, _)| *start);
+
+        let mut chosen: Option<BlockRef> = None;
+        for (_, part) in claimed_refs {
+            if let Some(existing) = chosen.as_mut() {
+                if existing.object_id != part.object_id
+                    || existing.offset.saturating_add(existing.length) != part.offset
+                {
+                    return Ok(None);
+                }
+                existing.length = existing.length.saturating_add(part.length);
+                existing.flags |= part.flags;
+            } else {
+                chosen = Some(part);
+            }
+        }
+
+        Ok(chosen.filter(|block| block.length > 0))
+    }
     fn local_overlay_attr_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
         let current = txn
             .open_table(INODES_TABLE)
@@ -5651,7 +5769,10 @@ impl MetaBlocks for RedbMetaEngine {
                         let block: BlockRef = decode(entry.value())?;
                         Ok(Some(block))
                     }
-                    None => Ok(None),
+                    None => {
+                        let block_size = self.regular_file_graph_block_size()?;
+                        self.block_ref_from_regular_file_slices(ino, block_index, block_size)
+                    }
                 }
             }
         }
@@ -5784,7 +5905,31 @@ impl MetaBlocks for RedbMetaEngine {
             blocks.entry(block_index).or_insert(decode(value.value())?);
         }
 
-        Ok(blocks.into_iter().collect())
+        if !blocks.is_empty() {
+            return Ok(blocks.into_iter().collect());
+        }
+
+        let block_size = self.regular_file_graph_block_size()?;
+        let file_size = match self.get_attr(ino) {
+            Ok(attr) => attr.size,
+            Err(MetaError::InodeNotFound(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        if file_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let block_count = ((file_size.saturating_sub(1)) / block_size as u64).saturating_add(1);
+        let mut synthesized = Vec::new();
+        for idx in 0..block_count {
+            let block_index = idx as u32;
+            if let Some(block) =
+                self.block_ref_from_regular_file_slices(ino, block_index, block_size)?
+            {
+                synthesized.push((block_index, block));
+            }
+        }
+        Ok(synthesized)
     }
 
     fn lookup_regular_file_chunk_slices(

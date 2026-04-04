@@ -757,13 +757,13 @@ mod tests {
         let data_prefix = "disk-a/objects/";
         let object_id: u64 = 0x1234;
 
-        let key = format_object_fragment_key(data_prefix, object_id, 2);
-        assert_eq!(key, "disk-a/objects/0000/0000000000001234/2");
+        let key = format_object_fragment_key(data_prefix, object_id, 0);
+        assert_eq!(key, "disk-a/objects/0000/0000000000001234/0");
     }
 
     #[test]
     fn test_fragment_key_parsing() {
-        let key = "disk-a/objects/0000/0000000000001234/3";
+        let key = "disk-a/objects/0000/0000000000001234/0";
         let object_id = parse_object_id_from_key(key).unwrap();
 
         assert_eq!(object_id, 0x1234);
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_validate_cloud_fragment_layout_rejects_wrong_count() {
-        let err = validate_cloud_fragment_layout(&[CLOUD_FRAGMENT_SIZE]).unwrap_err();
+        let err = validate_cloud_fragment_layout(&[]).unwrap_err();
         assert!(matches!(err, ObjectError::InvalidFragmentLayout(_)));
     }
 

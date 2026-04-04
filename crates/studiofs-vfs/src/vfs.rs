@@ -3464,6 +3464,7 @@ impl ReadRange {
 #[derive(Debug, Clone)]
 enum ReadPlanSource {
     Dirty { block_index: u32, block_offset: u32 },
+    PendingOverlay { block_index: u32, block_offset: u32 },
     Overlay { block: BlockRef },
     Base { block: BlockRef },
     Zero,
@@ -4070,6 +4071,45 @@ impl StudioVfs {
                 restored_live_extents = restored_live_extents.saturating_add(1);
             }
 
+            if !dirty_set.is_empty() && attr.size > 0 {
+                match self
+                    .sync_meta()
+                    .lookup_regular_file_slices(ino, 0, attr.size)
+                {
+                    Ok(spans) => {
+                        for span in spans {
+                            let Some(block) = span.block else {
+                                continue;
+                            };
+                            if !dirty_set.remove(&block.object_id) {
+                                continue;
+                            }
+                            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                            let absolute_start = chunk_base.saturating_add(span.range.start as u64);
+                            let block_index =
+                                block_index_from_offset(absolute_start, self.block_size);
+                            let offset =
+                                (block_index as u64).saturating_mul(self.block_size as u64);
+                            replay_ops.push((ino, offset, block.object_id, attr.content_epoch));
+                            self.record_live_extent(
+                                ino,
+                                block_index,
+                                block.object_id,
+                                attr.content_epoch,
+                            );
+                            restored_live_extents = restored_live_extents.saturating_add(1);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            ino,
+                            error = %e,
+                            "failed to enumerate regular-file slices during startup dirty-upload replay"
+                        );
+                    }
+                }
+            }
+
             if dirty_set.is_empty() {
                 break;
             }
@@ -4101,6 +4141,16 @@ impl StudioVfs {
                 orphan_dirty_blocks = dirty_set.len(),
                 "startup cleanup removed orphan dirty BlockStore entries"
             );
+        }
+    }
+
+    fn seed_live_extents_from_pending_uploads(&self) {
+        for op in self.block_cache.snapshot_pending_uploads() {
+            if op.offset % self.block_size as u64 != 0 {
+                continue;
+            }
+            let block_index = (op.offset / self.block_size as u64) as u32;
+            self.record_live_extent(op.ino, block_index, op.object_id, op.content_epoch);
         }
     }
 
@@ -4503,6 +4553,7 @@ impl StudioVfs {
             });
 
             vfs.replay_dirty_uploads_from_block_store();
+            vfs.seed_live_extents_from_pending_uploads();
 
             Ok(vfs)
         }
@@ -5550,14 +5601,40 @@ impl StudioVfs {
         block_index: u32,
         pending_content_epoch: Option<u64>,
     ) -> Option<ExtentRecordId> {
-        let pending_content_epoch = pending_content_epoch?;
-        self.state
+        if let Some(extent) = self
+            .state
             .incarnation
             .live_extent_records
             .lock()
             .get(&(ino, block_index))
             .copied()
-            .filter(|extent| extent.content_epoch == pending_content_epoch)
+        {
+            if pending_content_epoch.is_none_or(|epoch| extent.content_epoch == epoch) {
+                return Some(extent);
+            }
+        }
+
+        let block_offset = (block_index as u64).saturating_mul(self.block_size as u64);
+        let recovered = self
+            .block_cache
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| {
+                op.ino == ino
+                    && op.offset == block_offset
+                    && pending_content_epoch.is_none_or(|epoch| op.content_epoch == epoch)
+            })
+            .map(|op| ExtentRecordId {
+                object_id: op.object_id,
+                content_epoch: op.content_epoch,
+            })?;
+
+        self.state
+            .incarnation
+            .live_extent_records
+            .lock()
+            .insert((ino, block_index), recovered);
+        Some(recovered)
     }
 
     fn read_pending_overlay_block_sync(
@@ -8883,6 +8960,10 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
+        if let Some(cached) = self.read_into_sync_cached_impl(fh, ino, offset, buffer)? {
+            return Ok(cached);
+        }
+
         if let Some(attr) = self.ignored_entry_attr(ino) {
             let end = (offset + buffer.len() as u64).min(attr.size);
             let len = end.saturating_sub(offset) as usize;
@@ -8896,7 +8977,11 @@ impl StudioVfs {
         if self.remote_upload_placeholder_visible(ino, &attr) {
             return Err(VfsError::RemoteContentPending);
         }
-        self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        let pending_content_epoch = incarnation_state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch);
 
         let read_end = (offset + buffer.len() as u64).min(attr.size);
         let read_len = read_end.saturating_sub(offset) as usize;
@@ -8906,11 +8991,20 @@ impl StudioVfs {
         let blocks_needed = self.calculate_blocks_needed(offset, read_len, attr.size);
         let access = self.observe_read_access(fh, ino, offset, buffer.len());
         let mut guard = ForegroundReadScope::new(self, access.policy);
-        let mut read_plan = self.build_read_plan(ino, offset, read_len as u64).await?;
+        let mut read_plan = self
+            .build_read_plan(ino, offset, read_len as u64, pending_content_epoch)
+            .await?;
         read_plan.sort_by_key(|span| span.range.start);
         let missing_remote = self.prefetch_remote_blocks_for_plan(&read_plan).await?;
         let written = self
-            .assemble_read_plan(ino, offset, &read_plan, &missing_remote, buffer)
+            .assemble_read_plan(
+                ino,
+                offset,
+                pending_content_epoch,
+                &read_plan,
+                &missing_remote,
+                buffer,
+            )
             .await?;
 
         self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
@@ -8951,6 +9045,7 @@ impl StudioVfs {
         ino: Ino,
         offset: u64,
         length: u64,
+        pending_content_epoch: Option<u64>,
     ) -> VfsResult<Vec<ReadPlanSpan>> {
         if length == 0 {
             return Ok(Vec::new());
@@ -8993,6 +9088,53 @@ impl StudioVfs {
                         block_offset,
                     },
                 });
+            }
+        }
+
+        if !unresolved.is_empty() {
+            let mut candidate_blocks = BTreeSet::new();
+            for range in &unresolved {
+                let start_block = block_index_from_offset(range.start, self.block_size);
+                let end_block =
+                    block_index_from_offset(range.end.saturating_sub(1), self.block_size);
+                for block_index in start_block..=end_block {
+                    candidate_blocks.insert(block_index);
+                }
+            }
+            for block_index in candidate_blocks {
+                if unresolved.is_empty() {
+                    break;
+                }
+                if self
+                    .read_pending_overlay_block_async(ino, block_index, pending_content_epoch)
+                    .await?
+                    .is_none()
+                {
+                    continue;
+                }
+                let block_start = (block_index as u64).saturating_mul(self.block_size as u64);
+                let block_end = block_start.saturating_add(self.block_size as u64);
+                let (next_unresolved, claimed) = Self::claim_unresolved_ranges(
+                    unresolved,
+                    ReadRange {
+                        start: block_start,
+                        end: block_end,
+                    },
+                );
+                unresolved = next_unresolved;
+                for overlap in claimed {
+                    let delta = overlap.start.saturating_sub(block_start);
+                    let Some(block_offset) = u32::try_from(delta).ok() else {
+                        continue;
+                    };
+                    plan.push(ReadPlanSpan {
+                        range: overlap,
+                        source: ReadPlanSource::PendingOverlay {
+                            block_index,
+                            block_offset,
+                        },
+                    });
+                }
             }
         }
 
@@ -9096,9 +9238,13 @@ impl StudioVfs {
         for span in plan {
             let block = match &span.source {
                 ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
-                ReadPlanSource::Dirty { .. } | ReadPlanSource::Zero => continue,
+                ReadPlanSource::Dirty { .. }
+                | ReadPlanSource::PendingOverlay { .. }
+                | ReadPlanSource::Zero => continue,
             };
-            if !self.block_store.contains(block.object_id) {
+            if !self.block_store.contains(block.object_id)
+                && self.block_cache.get_sync(block.object_id).is_none()
+            {
                 missing.insert(block.object_id);
             }
         }
@@ -9108,11 +9254,18 @@ impl StudioVfs {
         let fetches = missing.into_iter().map(|object_id| async move {
             let keys = format_object_fragment_keys(&self.data_prefix, object_id);
             match self.fetch_scheduler.fetch_block(object_id, &keys).await {
-                Ok(_) => Ok((object_id, false)),
-                Err(crate::fetch::FetchError::NotFound { .. }) => Ok((object_id, true)),
-                Err(error) => Err(VfsError::Other(format!(
-                    "read planner fetch failed for object_id={object_id}: {error}"
-                ))),
+                Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
+                Err(crate::fetch::FetchError::NotFound { .. }) => {
+                    Ok::<(u64, bool), VfsError>((object_id, true))
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        object_id,
+                        error = %error,
+                        "read planner prefetch failed; falling back to on-demand resolution"
+                    );
+                    Ok::<(u64, bool), VfsError>((object_id, false))
+                }
             }
         });
         let mut not_found = HashSet::new();
@@ -9144,6 +9297,7 @@ impl StudioVfs {
         &self,
         ino: Ino,
         offset: u64,
+        pending_content_epoch: Option<u64>,
         plan: &[ReadPlanSpan],
         remote_not_found: &HashSet<u64>,
         buffer: &mut [u8],
@@ -9168,10 +9322,25 @@ impl StudioVfs {
                         dst.fill(0);
                     }
                 }
+                ReadPlanSource::PendingOverlay {
+                    block_index,
+                    block_offset,
+                } => {
+                    if let Some(data) = self
+                        .read_pending_overlay_block_async(ino, *block_index, pending_content_epoch)
+                        .await?
+                    {
+                        self.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                    } else {
+                        dst.fill(0);
+                    }
+                }
                 ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
                     if remote_not_found.contains(&block.object_id) {
                         dst.fill(0);
                     } else if let Some(data) = self.block_store_get_async(block.object_id).await? {
+                        self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
+                    } else if let Some(data) = self.block_cache.get(block.object_id).await {
                         self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
                     } else {
                         let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
@@ -9417,11 +9586,14 @@ impl StudioVfs {
             };
 
             let dst = &mut buffer[written..written + to_copy];
-            let Some(read) = self.block_store.read_into(block_ref.object_id, off_in, dst) else {
+            if let Some(read) = self.block_store.read_into(block_ref.object_id, off_in, dst) {
+                if read < to_copy {
+                    dst[read..].fill(0);
+                }
+            } else if let Some(cached) = self.block_cache.get_sync(block_ref.object_id) {
+                self.copy_block_payload_into_range(cached.as_ref(), off_in as u32, dst);
+            } else {
                 return Ok(None);
-            };
-            if read < to_copy {
-                dst[read..].fill(0);
             }
             written += to_copy;
         }
@@ -9481,7 +9653,9 @@ impl StudioVfs {
                 block_refs.push(None);
                 continue;
             };
-            if !self.block_store.contains(block_ref.object_id) {
+            if !self.block_store.contains(block_ref.object_id)
+                && self.block_cache.get_sync(block_ref.object_id).is_none()
+            {
                 return Ok(None);
             }
             block_refs.push(Some(block_ref));
