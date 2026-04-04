@@ -11221,6 +11221,23 @@ impl StudioVfs {
                 continue;
             }
 
+            const CHUNK_COMPACTION_BATCH_LIMIT: usize = 32;
+            let meta = self.meta_async.clone();
+            match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.compact_fragmented_regular_file_chunks(CHUNK_COMPACTION_BATCH_LIMIT)
+            })
+            .await
+            {
+                Ok(compacted_chunks) if compacted_chunks > 0 => {
+                    info!(
+                        compacted_chunks,
+                        "background GC compacted fragmented regular-file chunk rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "background GC chunk compaction failed"),
+            }
+
             let meta = self.meta_async.clone();
             let referenced_object_ids = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
                 engine.get_referenced_object_ids()

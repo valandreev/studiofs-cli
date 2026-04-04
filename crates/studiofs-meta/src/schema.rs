@@ -525,6 +525,28 @@ pub struct ChunkFragmentationCounters {
     pub fragmented_bytes: u64,
 }
 
+/// Background compaction trigger thresholds for a chunk.
+///
+/// The defaults intentionally bias toward stable graphs:
+/// - at least two live slices,
+/// - at least one shadowing overlap or tombstone,
+/// - or at least one MiB of shadowed bytes.
+pub const DEFAULT_CHUNK_COMPACTION_MIN_LIVE_SLICES: u32 = 2;
+pub const DEFAULT_CHUNK_COMPACTION_MIN_OVERLAPPING_SLICES: u32 = 1;
+pub const DEFAULT_CHUNK_COMPACTION_MIN_TOMBSTONE_SLICES: u32 = 1;
+pub const DEFAULT_CHUNK_COMPACTION_MIN_FRAGMENTED_BYTES: u64 = 1024 * 1024;
+
+impl ChunkFragmentationCounters {
+    /// Returns `true` when this chunk should be compacted by the background
+    /// maintenance pass.
+    pub fn should_compact(self) -> bool {
+        self.live_slices >= DEFAULT_CHUNK_COMPACTION_MIN_LIVE_SLICES
+            && (self.overlapping_slices >= DEFAULT_CHUNK_COMPACTION_MIN_OVERLAPPING_SLICES
+                || self.tombstone_slices >= DEFAULT_CHUNK_COMPACTION_MIN_TOMBSTONE_SLICES
+                || self.fragmented_bytes >= DEFAULT_CHUNK_COMPACTION_MIN_FRAGMENTED_BYTES)
+    }
+}
+
 /// One slice entry inside a chunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SliceRecord {
@@ -605,6 +627,70 @@ pub struct RegularFileChunkState {
 }
 
 impl RegularFileChunkState {
+    fn insert_covered_range(covered: &mut Vec<SliceRange>, range: SliceRange) {
+        if range.is_empty() {
+            return;
+        }
+
+        let mut start = range.start;
+        let mut end = range.end;
+        let mut idx = 0;
+        while idx < covered.len() {
+            let current = covered[idx];
+            if current.end < start {
+                idx += 1;
+                continue;
+            }
+            if end < current.start {
+                break;
+            }
+            start = start.min(current.start);
+            end = end.max(current.end);
+            covered.remove(idx);
+        }
+        covered.insert(idx, SliceRange { start, end });
+    }
+
+    /// Recompute the per-chunk fragmentation counters from the current slice set.
+    pub fn fragmentation_metrics(&self) -> ChunkFragmentationCounters {
+        let mut slices: Vec<&SliceRecord> = self.slices.values().collect();
+        slices.sort_unstable_by(|left, right| {
+            right
+                .order
+                .cmp(&left.order)
+                .then_with(|| right.slice_id.cmp(&left.slice_id))
+        });
+
+        let mut covered: Vec<SliceRange> = Vec::new();
+        let mut counters = ChunkFragmentationCounters::default();
+
+        for slice in slices {
+            let shadowed_bytes = covered
+                .iter()
+                .filter_map(|range| range.intersection(slice.range))
+                .map(|range| u64::from(range.len()))
+                .sum::<u64>();
+            if shadowed_bytes > 0 {
+                counters.overlapping_slices = counters.overlapping_slices.saturating_add(1);
+            }
+            if slice.block.is_some() {
+                counters.live_slices = counters.live_slices.saturating_add(1);
+                counters.fragmented_bytes =
+                    counters.fragmented_bytes.saturating_add(shadowed_bytes);
+            } else {
+                counters.tombstone_slices = counters.tombstone_slices.saturating_add(1);
+            }
+            Self::insert_covered_range(&mut covered, slice.range);
+        }
+
+        counters
+    }
+
+    /// Refresh the cached fragmentation counters in-place.
+    pub fn refresh_fragmentation_metrics(&mut self) {
+        self.fragmentation = self.fragmentation_metrics();
+    }
+
     /// Try to allocate the next slice id.
     ///
     /// Returns `None` if the counter would overflow.
@@ -1245,6 +1331,38 @@ mod tests {
             }
         );
         assert_eq!(spans[4].source, ResolvedSliceSource::Base);
+    }
+
+    #[test]
+    fn test_regular_file_chunk_fragmentation_metrics_count_overlaps_and_tombstones() {
+        let mut chunk = RegularFileChunkState::default();
+        chunk.insert_slice(SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).expect("first slice"),
+            BlockRef::new_partial(1001, 4096),
+        ));
+        chunk.insert_slice(SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(0, 4096).expect("shadowed slice"),
+            BlockRef::new_partial(1002, 4096),
+        ));
+        chunk.insert_slice(SliceRecord::tombstone(
+            SliceId(3),
+            SliceOrder(3),
+            SliceRange::new(4096, 6144).expect("tombstone range"),
+        ));
+
+        let metrics = chunk.fragmentation_metrics();
+        assert_eq!(metrics.live_slices, 2);
+        assert_eq!(metrics.tombstone_slices, 1);
+        assert_eq!(metrics.overlapping_slices, 1);
+        assert_eq!(metrics.fragmented_bytes, 4096);
+        assert!(metrics.should_compact());
+
+        chunk.refresh_fragmentation_metrics();
+        assert_eq!(chunk.fragmentation, metrics);
     }
 
     #[test]
