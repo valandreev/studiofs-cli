@@ -513,6 +513,9 @@ pub trait MetaGc: Send + Sync {
     /// Backends should include flat block tables, chunk/slice overlay/base
     /// rows, and snapshot pins so cleanup can reason about publication races
     /// and shadow refs directly from metadata reachability.
+    ///
+    /// Prefer streaming the underlying rows into a shared accumulator instead
+    /// of materializing intermediate per-table graphs.
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
 }
 

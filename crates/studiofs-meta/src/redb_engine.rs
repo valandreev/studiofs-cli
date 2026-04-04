@@ -1178,20 +1178,6 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// Collect object IDs reachable from the regular-file chunk graph.
-    ///
-    /// Publication races can leave both overlay and base rows alive at the
-    /// same time, so the raw slice refs from both tables are treated as
-    /// reachable until the graph is reconciled.
-    fn regular_file_graph_object_ids_from_txn(
-        txn: &redb::ReadTransaction,
-    ) -> MetaResult<HashSet<u64>> {
-        let mut refs = HashSet::new();
-        Self::regular_file_graph_object_ids_from_table(txn, REGULAR_FILE_OVERLAY_TABLE, &mut refs)?;
-        Self::regular_file_graph_object_ids_from_table(txn, REGULAR_FILE_BASE_TABLE, &mut refs)?;
-        Ok(refs)
-    }
-
     fn clear_table_in_txn<K, V>(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<K, V>,
@@ -7126,6 +7112,8 @@ impl MetaGc for RedbMetaEngine {
             .open_table(SNAPSHOTS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut refs = HashSet::new();
+        // Stream each table directly into the shared accumulator so we never
+        // build a second temporary set or materialize the chunk graph.
         for item in table
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -7142,7 +7130,12 @@ impl MetaGc for RedbMetaEngine {
             let block: BlockRef = decode(v.value())?;
             refs.insert(block.object_id);
         }
-        refs.extend(Self::regular_file_graph_object_ids_from_txn(&txn)?);
+        Self::regular_file_graph_object_ids_from_table(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            &mut refs,
+        )?;
+        Self::regular_file_graph_object_ids_from_table(&txn, REGULAR_FILE_BASE_TABLE, &mut refs)?;
         for item in snapshots
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?

@@ -4187,6 +4187,8 @@ impl StudioVfs {
 
         if !dirty_set.is_empty() {
             if quarantined_inodes.is_empty() {
+                // Cache the sync handle once so the recovery error path does
+                // not re-enter metadata lookup while we are already cleaning up.
                 let meta = self.sync_meta();
                 let reachable_object_ids = match meta.get_referenced_object_ids() {
                     Ok(ids) => Some(ids),
