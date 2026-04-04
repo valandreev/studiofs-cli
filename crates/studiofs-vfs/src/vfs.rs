@@ -4187,23 +4187,44 @@ impl StudioVfs {
 
         if !dirty_set.is_empty() {
             if quarantined_inodes.is_empty() {
-                let orphan_count = dirty_set.len() as u64;
-                for object_id in &dirty_set {
-                    warn!(
-                        object_id,
-                        "removing orphan dirty block without metadata reference"
-                    );
-                    self.block_store.remove(*object_id);
-                    self.state.upload.pending_evictions.lock().remove(object_id);
+                // Cache the sync handle once so the recovery error path does
+                // not re-enter metadata lookup while we are already cleaning up.
+                let meta = self.sync_meta();
+                let reachable_object_ids = match meta.get_referenced_object_ids() {
+                    Ok(ids) => Some(ids),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "failed to enumerate metadata reachability during startup recovery; preserving dirty blocks"
+                        );
+                        None
+                    }
+                };
+                if let Some(reachable_object_ids) = reachable_object_ids {
+                    dirty_set.retain(|object_id| !reachable_object_ids.contains(object_id));
+                } else {
+                    dirty_set.clear();
                 }
-                self.state
-                    .upload
-                    .upload_canceled_stale
-                    .fetch_add(orphan_count, Ordering::Relaxed);
-                info!(
-                    orphan_dirty_blocks = dirty_set.len(),
-                    "startup cleanup removed orphan dirty BlockStore entries"
-                );
+
+                if !dirty_set.is_empty() {
+                    let orphan_count = dirty_set.len() as u64;
+                    for object_id in &dirty_set {
+                        warn!(
+                            object_id,
+                            "removing orphan dirty block without metadata reference"
+                        );
+                        self.block_store.remove(*object_id);
+                        self.state.upload.pending_evictions.lock().remove(object_id);
+                    }
+                    self.state
+                        .upload
+                        .upload_canceled_stale
+                        .fetch_add(orphan_count, Ordering::Relaxed);
+                    info!(
+                        orphan_dirty_blocks = dirty_set.len(),
+                        "startup cleanup removed orphan dirty BlockStore entries"
+                    );
+                }
             } else {
                 warn!(
                     quarantined_inodes = quarantined_inodes.len(),
@@ -11201,8 +11222,8 @@ impl StudioVfs {
             }
 
             let meta = self.meta_async.clone();
-            let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.get_global_snapshot_pins()
+            let referenced_object_ids = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.get_referenced_object_ids()
             })
             .await
             {
@@ -11213,7 +11234,10 @@ impl StudioVfs {
                         engine.release_global_janitor_lock()
                     })
                     .await;
-                    warn!(error = %e, "background GC skipped: snapshot pin query failed");
+                    warn!(
+                        error = %e,
+                        "background GC skipped: metadata reachability query failed"
+                    );
                     continue;
                 }
             };
@@ -11234,8 +11258,8 @@ impl StudioVfs {
                 Ok(pending) => {
                     let mut deleted_count = 0;
                     for (object_id, timestamp) in pending {
-                        if global_snapshot_pins.contains(&object_id) {
-                            debug!("skipping object {} - pinned by snapshot", object_id);
+                        if referenced_object_ids.contains(&object_id) {
+                            debug!(object_id, "skipping object - still reachable in metadata");
                             continue;
                         }
 
