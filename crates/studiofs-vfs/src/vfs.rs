@@ -4799,12 +4799,18 @@ impl StudioVfs {
             };
 
             match commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch).await {
-                Ok(commit::EpochFinalizeStatus::Published)
-                | Ok(commit::EpochFinalizeStatus::Skipped) => {
+                Ok(commit::EpochFinalizeStatus::Published) => {
                     self.note_file_session_background_transition(
                         ino,
                         FileSessionOperation::Finalize,
                         "published",
+                    );
+                }
+                Ok(commit::EpochFinalizeStatus::Skipped) => {
+                    self.note_file_session_background_transition(
+                        ino,
+                        FileSessionOperation::Finalize,
+                        "skipped",
                     );
                 }
                 Ok(commit::EpochFinalizeStatus::Deferred) => {
@@ -6042,7 +6048,7 @@ impl StudioVfs {
         self.state.file_session.counters.note_transition();
         self.file_session_for_inode(ino)
             .record_transition(op, phase);
-        if matches!(phase, "complete" | "published" | "recovered") {
+        if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
             self.maybe_gc_file_session(ino);
         }
     }
@@ -7749,6 +7755,17 @@ impl StudioVfs {
             self.state.namespace.dirty_attrs.lock().remove(&ino);
             self.state.namespace.attr_read_cache.lock().remove(ino);
             self.maybe_clear_deleted_inode_marker(ino);
+        } else {
+            let writable_handle = open_file.flags.contains(OpenFlags::WRONLY)
+                || open_file.flags.contains(OpenFlags::RDWR);
+            let has_local_dirty_state = self.has_pending_write_buffer_blocks_for_inode(ino)
+                || self.state.namespace.dirty_attrs.lock().contains_key(&ino);
+            if has_local_dirty_state {
+                self.flush_ordered(ino).await?;
+            }
+            if writable_handle || has_local_dirty_state {
+                self.consume_upload_sticky_error(ino)?;
+            }
         }
         self.maybe_gc_file_session(ino);
         Ok(())
@@ -11516,6 +11533,40 @@ mod tests {
             );
             vfs.clear_upload_sticky_error(ino);
             vfs.fsync(ino, false).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-release-order");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"sticky-release.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let payload = b"persist-before-release-sticky-report";
+
+            vfs.write(ino, 0, payload).await.unwrap();
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+
+            let release_err = vfs.release_fh(fh).await.unwrap_err();
+            assert!(
+                release_err.to_string().contains("sticky upload error"),
+                "release_fh should surface sticky upload errors"
+            );
+            assert_eq!(
+                vfs.open_count(ino),
+                0,
+                "release_fh should still close the handle"
+            );
+
+            let after = vfs.getattr(ino).unwrap();
+            assert_eq!(
+                after.size,
+                payload.len() as u64,
+                "release_fh must persist local dirty state before reporting sticky EIO"
+            );
         });
     }
 

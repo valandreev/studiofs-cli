@@ -134,7 +134,7 @@ impl StudioVfs {
         indexes.entry(ino).or_default().extend(block_indexes);
     }
 
-    fn has_pending_write_buffer_blocks_for_inode(&self, ino: Ino) -> bool {
+    pub(super) fn has_pending_write_buffer_blocks_for_inode(&self, ino: Ino) -> bool {
         self.state
             .write_buffer
             .pending_block_indexes
