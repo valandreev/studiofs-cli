@@ -4045,14 +4045,19 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().metrics()
     }
 
-    fn replay_dirty_uploads_from_block_store(&self, pending_uploads: &[PendingUpload]) {
+    fn replay_dirty_uploads_from_block_store(
+        &self,
+        pending_uploads: &[PendingUpload],
+    ) -> HashSet<Ino> {
         let dirty_object_ids = self.block_store.dirty_object_ids();
         if dirty_object_ids.is_empty() {
             self.seed_live_extents_from_pending_uploads(pending_uploads);
-            return;
+            return HashSet::new();
         }
 
         let mut dirty_set: HashSet<u64> = dirty_object_ids.into_iter().collect();
+        let mut quarantined_inodes = HashSet::new();
+        let mut quarantined_object_ids = HashSet::new();
         let attrs = match self.sync_meta().list_inode_attrs() {
             Ok(attrs) => attrs,
             Err(e) => {
@@ -4060,7 +4065,7 @@ impl StudioVfs {
                     error = %e,
                     "failed to list inode attrs for startup dirty-upload replay"
                 );
-                return;
+                return HashSet::new();
             }
         };
 
@@ -4072,11 +4077,24 @@ impl StudioVfs {
             let blocks = match self.sync_meta().get_file_blocks(ino) {
                 Ok(blocks) => blocks,
                 Err(e) => {
-                    warn!(
-                        ino,
-                        error = %e,
-                        "failed to enumerate file blocks during startup dirty-upload replay"
-                    );
+                    let error = VfsError::Meta(e);
+                    if Self::is_invalid_regular_file_graph_error(&error) {
+                        warn!(
+                            ino,
+                            error = %error,
+                            "quarantining invalid regular-file graph during startup dirty-upload replay"
+                        );
+                        quarantined_inodes.insert(ino);
+                        let protected =
+                            self.quarantine_invalid_regular_file_graph(ino, attr.size, &error);
+                        quarantined_object_ids.extend(protected);
+                    } else {
+                        warn!(
+                            ino,
+                            error = %error,
+                            "failed to enumerate file blocks during startup dirty-upload replay"
+                        );
+                    }
                     continue;
                 }
             };
@@ -4136,6 +4154,10 @@ impl StudioVfs {
             }
         }
 
+        if !quarantined_object_ids.is_empty() {
+            dirty_set.retain(|object_id| !quarantined_object_ids.contains(object_id));
+        }
+
         if !replay_ops.is_empty() {
             self.block_cache.submit_uploads_batch(&replay_ops);
             info!(
@@ -4145,26 +4167,35 @@ impl StudioVfs {
         }
 
         if !dirty_set.is_empty() {
-            let orphan_count = dirty_set.len() as u64;
-            for object_id in &dirty_set {
-                warn!(
-                    object_id,
-                    "removing orphan dirty block without metadata reference"
+            if quarantined_inodes.is_empty() {
+                let orphan_count = dirty_set.len() as u64;
+                for object_id in &dirty_set {
+                    warn!(
+                        object_id,
+                        "removing orphan dirty block without metadata reference"
+                    );
+                    self.block_store.remove(*object_id);
+                    self.state.upload.pending_evictions.lock().remove(object_id);
+                }
+                self.state
+                    .upload
+                    .upload_canceled_stale
+                    .fetch_add(orphan_count, Ordering::Relaxed);
+                info!(
+                    orphan_dirty_blocks = dirty_set.len(),
+                    "startup cleanup removed orphan dirty BlockStore entries"
                 );
-                self.block_store.remove(*object_id);
-                self.state.upload.pending_evictions.lock().remove(object_id);
+            } else {
+                warn!(
+                    quarantined_inodes = quarantined_inodes.len(),
+                    orphan_dirty_blocks = dirty_set.len(),
+                    "startup recovery preserved dirty BlockStore entries because invalid graphs were quarantined"
+                );
             }
-            self.state
-                .upload
-                .upload_canceled_stale
-                .fetch_add(orphan_count, Ordering::Relaxed);
-            info!(
-                orphan_dirty_blocks = dirty_set.len(),
-                "startup cleanup removed orphan dirty BlockStore entries"
-            );
         }
 
         self.seed_live_extents_from_pending_uploads(pending_uploads);
+        quarantined_inodes
     }
 
     fn seed_live_extents_from_pending_uploads(&self, pending_uploads: &[PendingUpload]) {
@@ -4576,7 +4607,9 @@ impl StudioVfs {
             });
 
             let pending_uploads = vfs.block_cache.snapshot_pending_uploads();
-            vfs.replay_dirty_uploads_from_block_store(pending_uploads.as_slice());
+            let quarantined_inodes =
+                vfs.replay_dirty_uploads_from_block_store(pending_uploads.as_slice());
+            vfs.seed_epoch_finalizations_from_meta(&quarantined_inodes);
 
             Ok(vfs)
         }
@@ -4789,8 +4822,6 @@ impl StudioVfs {
                     vfs_clone.background_uploader(upload_rx).await;
                 }));
 
-                self.seed_epoch_finalizations_from_meta();
-
                 let vfs_clone = self.clone();
                 self.track_background_task(tokio::spawn(async move {
                     vfs_clone.background_epoch_finalizer().await;
@@ -4958,6 +4989,29 @@ impl StudioVfs {
                     self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
                 }
                 Err(err) => {
+                    if Self::is_invalid_regular_file_graph_error(&err) {
+                        let attr_size = run_meta(
+                            self.meta_async.clone(),
+                            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
+                        )
+                        .await
+                        .ok()
+                        .map(|attr| attr.size)
+                        .unwrap_or(0);
+                        warn!(
+                            ino,
+                            content_epoch,
+                            error = %err,
+                            "epoch finalization failed due invalid regular-file graph, quarantining inode"
+                        );
+                        let _ = self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
+                        self.note_file_session_background_transition(
+                            ino,
+                            FileSessionOperation::Finalize,
+                            "failed",
+                        );
+                        continue;
+                    }
                     if self.shutdown_requested() {
                         break;
                     }
@@ -6034,6 +6088,7 @@ impl StudioVfs {
             .lock()
             .remove(&ino);
         self.state.upload.upload_sticky_errors.lock().remove(&ino);
+        self.remove_pending_epoch_finalizations_for_inode(ino);
         self.maybe_gc_file_session(ino);
     }
 
@@ -6327,6 +6382,10 @@ impl StudioVfs {
         Ok(())
     }
 
+    fn is_invalid_regular_file_graph_error(error: &VfsError) -> bool {
+        matches!(error, VfsError::Meta(MetaError::FragmentedBlock { .. }))
+    }
+
     fn needs_epoch_finalization(attr: &InodeAttr) -> bool {
         attr.kind == FileType::RegularFile
             && attr.upload_state != MetaUploadState::Ready
@@ -6354,6 +6413,35 @@ impl StudioVfs {
         }
     }
 
+    fn remove_pending_epoch_finalizations_for_inode(&self, ino: Ino) {
+        self.state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .retain(|(candidate, _)| *candidate != ino);
+    }
+
+    fn cancel_pending_uploads_for_inode(&self, ino: Ino) {
+        let pending_uploads: Vec<_> = self
+            .block_cache
+            .snapshot_pending_uploads()
+            .into_iter()
+            .filter(|op| op.ino == ino)
+            .collect();
+        if pending_uploads.is_empty() {
+            return;
+        }
+
+        for op in &pending_uploads {
+            self.block_cache.cancel_upload(op, false);
+        }
+
+        let mut pending_evictions = self.state.upload.pending_evictions.lock();
+        for op in pending_uploads {
+            pending_evictions.remove(&op.object_id);
+        }
+    }
+
     fn pop_epoch_finalization(&self) -> Option<(Ino, u64)> {
         let next = self
             .state
@@ -6371,7 +6459,50 @@ impl StudioVfs {
         next
     }
 
-    fn seed_epoch_finalizations_from_meta(&self) {
+    fn seed_live_extents_from_file_blocks(
+        &self,
+        ino: Ino,
+        content_epoch: u64,
+        blocks: &[(u32, BlockRef)],
+    ) {
+        for (block_index, block_ref) in blocks {
+            self.record_live_extent(ino, *block_index, block_ref.object_id, content_epoch);
+        }
+    }
+
+    fn collect_regular_file_object_ids_for_recovery(&self, ino: Ino, size: u64) -> HashSet<u64> {
+        let mut object_ids = HashSet::new();
+        if size > 0
+            && let Ok(spans) = self.sync_meta().lookup_regular_file_slices(ino, 0, size)
+        {
+            for span in spans {
+                if let Some(block) = span.block {
+                    object_ids.insert(block.object_id);
+                }
+            }
+        }
+
+        if let Ok(ids) = self.sync_meta().get_regular_file_overlay_object_ids(ino) {
+            object_ids.extend(ids);
+        }
+
+        object_ids
+    }
+
+    fn quarantine_invalid_regular_file_graph(
+        &self,
+        ino: Ino,
+        size: u64,
+        error: &VfsError,
+    ) -> HashSet<u64> {
+        self.mark_upload_sticky_error(ino, error);
+        self.remove_live_extents_for_inode(ino);
+        self.remove_pending_epoch_finalizations_for_inode(ino);
+        self.cancel_pending_uploads_for_inode(ino);
+        self.collect_regular_file_object_ids_for_recovery(ino, size)
+    }
+
+    fn seed_epoch_finalizations_from_meta(&self, quarantined_inodes: &HashSet<Ino>) {
         let attrs = match self.sync_meta().list_inode_attrs() {
             Ok(attrs) => attrs,
             Err(err) => {
@@ -6382,7 +6513,37 @@ impl StudioVfs {
 
         let mut queued = 0usize;
         for attr in attrs {
+            if quarantined_inodes.contains(&attr.ino) {
+                continue;
+            }
             if Self::needs_epoch_finalization(&attr) {
+                let blocks = match self.sync_meta().get_file_blocks(attr.ino) {
+                    Ok(blocks) => blocks,
+                    Err(err) => {
+                        let error = VfsError::Meta(err);
+                        if Self::is_invalid_regular_file_graph_error(&error) {
+                            warn!(
+                                ino = attr.ino,
+                                error = %error,
+                                "quarantining invalid regular-file graph during startup epoch seeding"
+                            );
+                            let _ = self
+                                .quarantine_invalid_regular_file_graph(attr.ino, attr.size, &error);
+                        } else {
+                            warn!(
+                                ino = attr.ino,
+                                error = %error,
+                                "failed to seed epoch finalizer queue from metadata"
+                            );
+                        }
+                        continue;
+                    }
+                };
+                self.seed_live_extents_from_file_blocks(
+                    attr.ino,
+                    attr.content_epoch,
+                    blocks.as_slice(),
+                );
                 self.queue_epoch_finalization(attr.ino, attr.content_epoch);
                 queued = queued.saturating_add(1);
             }
@@ -9896,8 +10057,35 @@ impl StudioVfs {
                             if vfs.uploader_shutdown_requested() {
                                 break;
                             }
-                            // If the inode was deleted, don't retry — cancel the upload.
-                            if vfs.state.upload.deleted_inodes.lock().contains(&op.ino) {
+                            if Self::is_invalid_regular_file_graph_error(&e) {
+                                let attr_size = run_meta(
+                                    vfs.meta_async.clone(),
+                                    move |engine: Arc<dyn MetaEngine>| engine.get_attr(op.ino),
+                                )
+                                .await
+                                .ok()
+                                .map(|attr| attr.size)
+                                .unwrap_or(0);
+                                warn!(
+                                    object_id = op.object_id,
+                                    ino = op.ino,
+                                    error = %e,
+                                    "upload failed due invalid regular-file graph, quarantining inode"
+                                );
+                                vfs.block_store.mark_upload_failed(op.object_id);
+                                vfs.block_cache.cancel_upload(&op, false);
+                                vfs.state
+                                    .upload
+                                    .pending_evictions
+                                    .lock()
+                                    .remove(&op.object_id);
+                                let _ = vfs.quarantine_invalid_regular_file_graph(
+                                    op.ino,
+                                    attr_size,
+                                    &e,
+                                );
+                            } else if vfs.state.upload.deleted_inodes.lock().contains(&op.ino) {
+                                // If the inode was deleted, don't retry — cancel the upload.
                                 info!(
                                     object_id = op.object_id,
                                     ino = op.ino,

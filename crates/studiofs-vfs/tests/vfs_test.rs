@@ -33,6 +33,7 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaInodes,
     MetadataBackend, MetadataConfig, PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine,
     ensure_studiofs_database,
+    schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
@@ -5331,6 +5332,135 @@ fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_upload
 
         let data = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
         assert_eq!(data.as_ref(), replacement_payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirty_blocks() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("restart-quarantine-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let block_size_u32 = format_info.block_size;
+    let payload = vec![0x5Au8; block_size];
+    let mut ino = 0u64;
+    let mut dirty_object_id = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            let attr = vfs
+                .create(1, b"startup-quarantine.bin", 0, 0, 0o644)
+                .unwrap();
+            ino = attr.ino;
+
+            vfs.write(ino, 0, &payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 1
+                })
+                .await,
+                "first boot should leave one pending upload for the local-only block"
+            );
+
+            dirty_object_id = vfs.pending_uploads_for_inode(ino)[0].1;
+
+            let object_ids = meta.next_block_ids(2).unwrap();
+            let half = (block_size_u32 / 2) as u32;
+            let slices = vec![
+                SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(0, half).unwrap(),
+                    BlockRef::new_partial(object_ids[0], half),
+                ),
+                SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(half, block_size_u32).unwrap(),
+                    BlockRef::new_partial(object_ids[1], half),
+                ),
+            ];
+            meta.flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), slices)], None)
+                .unwrap();
+        });
+        rt.shutdown_background();
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "startup quarantine should clear the invalid inode's upload queue"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(ino).is_empty(),
+            "startup quarantine should clear live extents for the invalid inode"
+        );
+        assert!(
+            vfs.block_store()
+                .dirty_object_ids()
+                .contains(&dirty_object_id),
+            "startup quarantine must preserve the original dirty block"
+        );
+
+        let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
+        assert!(
+            fsync_err.to_string().contains("sticky upload error"),
+            "quarantined inode should surface a sticky upload error"
+        );
     });
     rt.shutdown_background();
 }
