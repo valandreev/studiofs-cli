@@ -643,6 +643,9 @@ impl RedbMetaEngine {
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut pending_compaction = txn
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         for &ino in inodes {
             if Self::has_regular_file_chunk_rows_in_write_txn(
@@ -682,6 +685,15 @@ impl RedbMetaEngine {
                 overlay_table
                     .insert(key.as_slice(), encoded.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+                if chunk_state.fragmentation.should_compact() {
+                    pending_compaction
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                } else {
+                    let _ = pending_compaction
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
             }
 
             let mut base_table = txn
@@ -708,6 +720,7 @@ impl RedbMetaEngine {
             // compatibility.
         }
 
+        drop(pending_compaction);
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
@@ -1335,7 +1348,6 @@ impl RedbMetaEngine {
                 .remove(key.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
-        Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
         Ok(())
     }
 
@@ -1367,6 +1379,7 @@ impl RedbMetaEngine {
     }
 
     fn clear_regular_file_graph_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
         Ok(())
@@ -1379,7 +1392,11 @@ impl RedbMetaEngine {
         blocks: &[(u32, BlockRef)],
         block_size: u32,
         published: bool,
+        track_pending_compaction: bool,
     ) -> MetaResult<()> {
+        if track_pending_compaction {
+            Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
+        }
         Self::clear_regular_file_chunk_rows_in_txn(txn, table_def, ino)?;
         if blocks.is_empty() {
             return Ok(());
@@ -1400,6 +1417,14 @@ impl RedbMetaEngine {
             table
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            if track_pending_compaction && chunk_state.fragmentation.should_compact() {
+                let mut pending = txn
+                    .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                pending
+                    .insert(key.as_slice(), 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -1409,6 +1434,7 @@ impl RedbMetaEngine {
         table_def: TableDefinition<&[u8], &[u8]>,
         snapshot_rows: &[(u64, Vec<u8>)],
         parse_chunks: F,
+        track_pending_compaction: bool,
     ) -> MetaResult<()>
     where
         F: Fn(&[u8]) -> MetaResult<BTreeMap<ChunkId, RegularFileChunkState>>,
@@ -1427,6 +1453,14 @@ impl RedbMetaEngine {
                 table
                     .insert(key.as_slice(), encoded.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+                if track_pending_compaction && chunk_state.fragmentation.should_compact() {
+                    let mut pending = txn
+                        .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    pending
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
             }
         }
         Ok(())
@@ -3554,6 +3588,8 @@ impl RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
+        Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
+
         {
             let mut table = txn
                 .open_table(SETTINGS_TABLE)
@@ -3673,6 +3709,7 @@ impl RedbMetaEngine {
                     let state: RegularFileOverlayState = decode(bytes)?;
                     Ok(state.chunks)
                 },
+                true,
             )?;
         }
         {
@@ -3684,6 +3721,7 @@ impl RedbMetaEngine {
                     let state: RegularFileBaseState = decode(bytes)?;
                     Ok(state.chunks)
                 },
+                false,
             )?;
         }
         {
@@ -6207,6 +6245,7 @@ impl MetaBlocks for RedbMetaEngine {
             current_blocks.as_slice(),
             block_size,
             false,
+            true,
         )?;
 
         Self::append_event_in_txn(
@@ -6520,6 +6559,7 @@ impl MetaBlocks for RedbMetaEngine {
                 current_blocks.as_slice(),
                 block_size,
                 false,
+                true,
             )?;
 
             if let Some(committed_manifest) = committed_manifest.as_ref() {
@@ -6530,6 +6570,7 @@ impl MetaBlocks for RedbMetaEngine {
                     committed_manifest.as_slice(),
                     block_size,
                     true,
+                    false,
                 )?;
             }
         }
@@ -6778,6 +6819,7 @@ impl MetaBlocks for RedbMetaEngine {
             committed_manifest.as_slice(),
             block_size,
             true,
+            false,
         )?;
 
         txn.commit()
@@ -7403,6 +7445,7 @@ impl RedbMetaEngine {
                         current_blocks.as_slice(),
                         block_size,
                         false,
+                        true,
                     )?;
                 }
                 Self::append_event_in_txn(
@@ -8282,6 +8325,7 @@ mod tests {
             &[(0, BlockRef::new_partial(1001, 4096))],
             DEFAULT_BLOCK_SIZE,
             false,
+            true,
         )
         .unwrap();
         txn.commit().unwrap();
@@ -10182,6 +10226,83 @@ mod tests {
             .map(|(_, value)| *value)
             .expect("used space counter");
         assert_eq!(used_space, 1024 + 4096);
+    }
+
+    #[test]
+    fn test_import_snapshot_rebuilds_pending_compaction_rows() {
+        let source = temp_engine();
+        let file = source
+            .create_file(ROOT_INO, b"snapshot-pending.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let ino = file.ino;
+
+        let mut chunk_slices = BTreeMap::new();
+        chunk_slices.insert(
+            SliceId(1),
+            SliceRecord::new(
+                SliceId(1),
+                SliceOrder(1),
+                SliceRange::new(0, 4096).expect("first slice"),
+                BlockRef::new_partial(1001, 4096),
+            ),
+        );
+        chunk_slices.insert(
+            SliceId(2),
+            SliceRecord::new(
+                SliceId(2),
+                SliceOrder(2),
+                SliceRange::new(0, 4096).expect("shadowed slice"),
+                BlockRef::new_partial(1002, 4096),
+            ),
+        );
+        let mut overlay_state = RegularFileOverlayState::default();
+        overlay_state.chunks.insert(
+            ChunkId(4),
+            RegularFileChunkState {
+                next_slice_id: SliceId(3),
+                next_slice_order: SliceOrder(3),
+                slices: chunk_slices,
+                fragmentation: ChunkFragmentationCounters {
+                    live_slices: 2,
+                    tombstone_slices: 0,
+                    overlapping_slices: 1,
+                    fragmented_bytes: 4096,
+                },
+            },
+        );
+
+        let txn = source.db.begin_write().unwrap();
+        {
+            let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+            let key = encode_regular_file_chunk_key(ino, ChunkId(4));
+            let bytes = encode(&overlay_state.chunks[&ChunkId(4)]).unwrap();
+            overlay.insert(key.as_slice(), bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let snapshot = source.export_snapshot().unwrap();
+
+        let target = temp_engine();
+        set_regular_file_pending_compaction_rows(&target, ino, &[ChunkId(99)]);
+
+        target.import_snapshot(&snapshot).unwrap();
+
+        let txn = target.db.begin_read().unwrap();
+        let pending = txn
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .unwrap();
+        assert!(
+            pending
+                .get(encode_regular_file_chunk_key(ino, ChunkId(99)).as_slice())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pending
+                .get(encode_regular_file_chunk_key(ino, ChunkId(4)).as_slice())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
