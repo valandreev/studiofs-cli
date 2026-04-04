@@ -1,15 +1,16 @@
 # Cache System
 
-The cache subsystem (`studiofs-cache`) implements block caching for high-throughput
-NVMe-backed storage with crash-safe writeback to S3.
+The cache subsystem (`studiofs-cache`) implements the BlockStore-backed local
+data plane plus the narrow compatibility shim that still fronts upload queueing
+and observability.
 
 There are two generations of the cache implementation:
 
 | Generation | Module | Status |
 |------------|--------|--------|
 | **v3 (legacy stack)** | `l1_mem`, `l2_disk`, `lru_tracker`, `runtime`, direct-I/O helpers | **Retired in SFS-143** |
-| **v2 (active path)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Canonical cache path for foreground reads, local durability, and startup dirty replay |
-| **compat shim** | `block_cache`, `upload_queue` | Thin wrapper retained for queue/observability compatibility while callers finish migrating |
+| **v2 (active path)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Canonical local data store for foreground reads, local durability, and startup dirty replay |
+| **compat shim** | `block_cache`, `upload_queue` | Narrow wrapper retained for queue/observability compatibility while callers finish migrating |
 
 ---
 
@@ -20,8 +21,9 @@ There are two generations of the cache implementation:
 > eviction gating, auto-eviction, mmap reads with generation remapping, snapshot/WAL
 > persistence, and startup recovery are implemented.
 
-Replaces the L1/L2 split with a single `blocks.data` file managed by a native
-free-space allocator.  The OS page cache acts as L1; no explicit RAM tier.
+Replaces the old L1/L2 split with a single `blocks.data` file managed by a native
+free-space allocator.  The OS page cache backs the file, but the canonical model
+is the BlockStore plus the compatibility shim rather than a multi-tier cache.
 
 ### Cache directory layout
 
@@ -358,7 +360,7 @@ File-per-block on local NVMe storage at `{cache_dir}/blocks/`.
 ### BlockCache Compatibility Shim (`block_cache.rs`)
 
 Cache v2 removed the legacy L2 commit scheduler and global LRU tracker.
-`BlockCache` now acts as a compatibility shim used by VFS for:
+`BlockCache` now acts as a narrow compatibility shim used by VFS for:
 
 - bounded in-memory L1 staging (`stage_l1`, `get`, `get_with_trace`)
 - upload queue orchestration (`submit_upload*`, `complete_upload`, `cancel_upload`)
@@ -387,6 +389,8 @@ Cache v2 removed the legacy L2 commit scheduler and global LRU tracker.
 Notes:
 - legacy `STUDIOFS_L2_COMMIT_*` and L2 timeout knobs were removed;
 - `BlockCacheStats` now reports only active L1 staging bytes.
+- direct-shim benchmark mode measures this shim, not the mounted end-to-end
+  publication path.
 
 ## Write Pipeline Integration
 
@@ -413,9 +417,10 @@ staging misses, and contracts again when foreground pressure drops.
 
 ## Performance Characteristics
 
-The compatibility shim still exposes benchmark-facing L1 staging and upload
-orchestration timing, but the old `shim_read` / `shim_write` counter names are
-gone.
+The compatibility shim still exposes benchmark-facing staging and upload
+orchestration timing. Those numbers belong to `direct-shim` mode; they measure
+the compatibility path, not the final mounted chunk/slice/block publication
+path. The old `shim_read` / `shim_write` counter names are gone.
 
 | Operation | Expected Throughput | Notes |
 |-----------|-------------------|-------|
@@ -454,11 +459,13 @@ benchmarks:
   - blocking execution timing (avg/max + histogram buckets in snapshot)
 
 Runtime logs (`upload pipeline counters`) include these metrics continuously
-while the pipeline is active. `studiofs test-cache <cache-dir>` also emits
-the cache pipeline snapshot in its saved JSON report under `cache_pipeline`,
-while the terminal keeps a human-readable summary focused on the benchmark
-results. Each `test-cache` report now also includes a `run_id` for correlation
-with profile/tracing events, and optional on-demand Pyroscope profiling when
+while the pipeline is active. `studiofs test-cache <cache-dir>` also emits the
+cache pipeline snapshot in its saved JSON report under `cache_pipeline`, while
+the terminal keeps a human-readable summary focused on the benchmark results.
+In `direct-shim` mode, the report describes the compatibility path. In `e2e`
+mode, it describes the mounted end-to-end path through the final data model.
+Each `test-cache` report now also includes a `run_id` for correlation with
+profile/tracing events, and optional on-demand Pyroscope profiling when
 running `studiofs test-cache ... --profile=pyroscope`.
 
 `test-cache` reports now also include an `advanced_metrics` section:
@@ -467,8 +474,9 @@ running `studiofs test-cache ... --profile=pyroscope`.
   (`small_max_bytes`, `medium_max_bytes`)
 - `size_class_stats`: write/read throughput and latency percentiles (p50/p95/p99)
   for `small`, `medium`, and `large`
-- `cache_levels` (direct-shim mode): L1 hit and miss counters, bytes served
-  from L1, and L1 lookup latency percentiles + histogram
+- `cache_levels` (direct-shim mode): compatibility hit and miss counters,
+  bytes served from the shim, and compatibility lookup latency percentiles +
+  histogram
 - `upload_queue`: depth and lifecycle counters
 
 ## Pyroscope Profiling
@@ -545,9 +553,10 @@ results and for each size class.
 
 On startup:
 
-1. Load LRU checkpoint (`cache.meta`) if present
-2. Scan L2 directory to rebuild actual block inventory
-3. Reconcile: remove LRU entries for missing L2 files, add L2 entries not in checkpoint
-4. Read dirty object ids from `BlockStore` and re-queue upload ops using metadata mapping
-5. Remove orphan dirty object ids that are no longer referenced by metadata
-6. Resume normal operation
+1. Load the `blocks.idx` snapshot if present
+2. Replay the `blocks.wal` tail
+3. Validate recovered entries against `blocks.data`
+4. Fall back to a `blocks.data` scan if the metadata files are missing or corrupt
+5. Read dirty object ids from `BlockStore` and re-queue upload ops using metadata mapping
+6. Remove orphan dirty object ids that are no longer referenced by metadata
+7. Resume normal operation

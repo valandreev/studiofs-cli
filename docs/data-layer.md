@@ -2,41 +2,43 @@
 
 `studiofs-data` handles object I/O against S3-compatible storage and object encoding/decoding.
 
-> Warning: this document still uses legacy `logical block` / `fragment` wording for the current storage path. For the frozen redesign vocabulary, see [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
+This document follows the frozen chunk/slice/block vocabulary. Historical helper
+APIs still use the older `chunks/...` compatibility keys for tests, but the
+active data-path descriptions below use the final model.
 
 ## Responsibilities
 
 - PUT/GET/DELETE/HEAD object operations via `opendal`.
-- Object key generation and sharding based on block IDs.
+- Object key generation and sharding based on chunk/object IDs.
 - Object payload validation (xxh64 checksums).
 - Read/write connection profile separation (`IoProfile`).
-- Hybrid cloud layout for logical blocks: one 16 MiB logical block is stored as four 4 MiB fragment objects.
+- Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB block objects.
 
 ## S3 Key Layout
 
-Files in StudioFS are split into fixed-size logical blocks (default 16 MiB). Each logical block is assigned a globally unique, sequential 64-bit object ID.
+Files in StudioFS are split into fixed-size chunks (default 16 MiB). Each chunk is assigned a globally unique, sequential 64-bit object ID.
 
 Remote storage uses a 4x4 hybrid scheme:
 
-### Logical Object Base Key
+### Chunk Object Base Key
 ```
 <volume>/objects/<ab>/<cd>/<object_id>
 ```
 - `<ab>/<cd>`: First 4 hex characters of object ID for S3 partition distribution.
 
-### Cloud Fragment Keys (4 fragments per logical object)
+### Block Keys (4 blocks per chunk)
 ```
-<volume>/objects/<ab>/<cd>/<object_id>/<fragment_index>
+<volume>/objects/<ab>/<cd>/<object_id>/<block_index>
 ```
-- `fragment_index`: `0..3`
-- Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
-- Fragment writes/retries are independent, so network failures only retry the affected piece.
+- `block_index`: `0..3`
+- Each block stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
+- Block writes/retries are independent, so network failures only retry the affected piece.
 
 Legacy `DataStore::put_block/get_block/...` APIs still use the historical:
 ```
 <volume>/data/chunks/<hash>/<slice_id>_<block_index>_<block_size>
 ```
-These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<fragment_index>`.
+These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<block_index>`.
 
 ## Object Format (Version 2)
 
@@ -66,7 +68,7 @@ Little-endian encoding is used for all multi-byte fields.
 +------------------+
 ```
 
-On write, object upload paths use `opendal::Buffer` (`header` + payload chunks) to avoid copying full fragment payload buffers when prepending the fixed header.
+On write, object upload paths use `opendal::Buffer` (`header` + payload chunks) to avoid copying full block payload buffers when prepending the fixed header.
 
 On read, object decode accepts `opendal::Buffer` directly, parses the fixed header from a small stack buffer, and validates checksum incrementally across buffer chunks. Payload is returned as zero-copy `Bytes` when the payload is a single contiguous chunk, with contiguous materialization only as a fallback for fragmented payloads.
 

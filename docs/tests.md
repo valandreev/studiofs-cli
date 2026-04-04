@@ -130,87 +130,44 @@ host — cross-compilation or a Linux-only CI pass does not count.
 Each step is separate from the workspace run so a failure directly identifies
 the failing backend in the CI job log.
 
-## Important Current Regressions
+## Final Architecture Invariants
 
-The current architecture relies on these focused regressions:
-- PG delta/checkpoint model:
-  - `test_pg_remote_client_reads_committed_blocks_without_local_staged_mirror`
-  - `test_pg_overlay_allows_unrelated_remote_batches_to_apply`
-  - `test_pg_conflicting_batch_does_not_block_later_foreign_batch`
-  - `test_pg_peer_can_rename_foreign_visible_base_entry`
-  - `test_pg_peer_can_unlink_foreign_visible_base_entry`
-  - `test_pg_peer_can_update_foreign_visible_symlink_target`
-  - `test_pg_local_xattr_overlay_masks_foreign_update_until_flush`
-  - `test_pg_checkpoint_excludes_uncommitted_local_blocks`
+The final chunk/slice/block model is directly covered by these focused
+regressions:
+
+- Read/write resolution
+  - `test_resolve_chunk_slice_spans_overlay_over_base_with_hole`
+  - `test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk`
+  - `offline_s3_does_not_break_local_read_after_write`
+
+- Publication and visibility
+  - `redb_partial_update_does_not_expose_new_blocks_before_publish`
+  - `test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows`
+  - `test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size`
+  - `background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads` *(requires S3 env)*
+
+- Recovery and replay
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
-  - `test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
-  - `test_pg_reopen_after_claimed_batch_crash_flushes_without_discover`
-  - `test_pg_reopen_after_claimed_multi_event_batch_preserves_sequence_without_discover`
-- local write-path correctness:
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
-  - `test_truncate_to_zero_then_rewrite`
   - `test_write_at_exact_block_boundary_transition`
-  - `open_unlink_keeps_data_readable_while_canceling_pending_uploads`
-  - `large_file_unlink_cancels_pending_uploads`
-  - `test_crash_recovery_replays_ingress_spill_before_metadata_flush`
-  - `test_ingress_prefers_spill_before_backpressure`
-  - `test_ingress_pressure_reports_backpressure_when_spill_is_full`
-  - `test_ingress_backpressure_wait_time_accumulates_until_drain`
-  - `test_ingress_multi_writer_pressure_prefers_spill_without_wait`
-  - `test_ingress_multi_writer_spill_recovers_after_crash`
-  - `test_crash_recovery_replays_from_segments_when_spill_files_are_missing`
-  - `test_ingress_backpressure_wait_time_accumulates_until_drain`
-- metadata undo-log / orphan recovery:
-  - `test_recover_undo_logs_replays_deferred_delete`
-  - `test_recover_undo_logs_replays_pending_and_deferred_mixed`
-  - `test_recover_undo_logs_replays_deferred_from_replaying_phase`
-  - `test_recover_undo_logs_replays_pending_from_replaying_phase`
-  - `test_remove_undo_logs_for_marks_completed_until_cleanup`
-  - `test_remove_deferred_delete_performs_post_cleanup_of_completed_undo`
-  - `test_remove_pending_create_performs_post_cleanup_of_completed_undo`
-  - `test_cleanup_stale_undo_logs_removes_completed_even_if_live_rows_exist`
-  - `test_repeated_pending_and_deferred_cycles_do_not_accumulate_undo_logs`
-- janitor runtime recovery:
-  - `test_background_janitor_recovers_pending_create_intent_runtime`
-  - `test_background_janitor_does_not_recover_deferred_delete_undo_runtime`
-  - `test_background_janitor_recovers_only_pending_create_in_mixed_runtime`
-- namespace resolver parity:
+
+- Namespace and metadata stability
   - `namespace_resolver_full_path_matches_component_lookup_for_ignored_and_blocked_paths`
-  - `namespace_resolver_windows_and_posix_match_on_same_namespace_entry`
-  - `namespace_resolver_windows_parent_normalization_matches_winfsp_semantics`
-- path shortcut cache:
   - `path_shortcut_cache_is_bounded_and_supports_negative_entries`
-  - `path_shortcut_cache_rejects_stale_parent_generations`
-  - `path_shortcut_cache_tracks_hotset_occupancy_and_hits`
-  - `namespace_resolver_path_shortcut_hits_and_renames_invalidate`
-  - `namespace_resolver_path_shortcut_invalidation_on_delete_subtree`
-- namespace cache invalidation tokens:
   - `dentry_cache_rejects_stale_namespace_tokens_lazily`
-  - `setattr_does_not_bump_namespace_generations`
-- metadata hotset promotion:
-  - `dentry_cache_tracks_hotset_occupancy_and_hits`
   - `attr_read_cache_is_bounded_and_tracks_hotset_hits`
-- Buffered-first correctness and performance (manual S3 tests; not covered by the `sfs121_`-filtered SFS-121 suite):
-  - `local_reads_through_upload_with_partial_tail_block` *(requires S3)*
-  - `concurrent_reads_through_upload_finalization` *(requires S3)*
-- SFS-121 buffered-first regression suite (tests prefixed `sfs121_`, covered by the “Buffered-first” commands):
-  - `sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle` *(requires S3)*
-  - `sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum` *(requires S3)*
-  - `sfs121_foreground_read_baseline_during_and_post_upload_are_comparable` *(requires S3; compares read-alone vs during-upload vs post-upload in one run)*
-  - `sfs121_warm_cache_sequential_read_bounded_latency_after_write`
-  - `sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors`
-  - `sfs121_file_session_flush_ordering_is_deterministic`
-- SFS-121 CLI surface enforcement (regression gate against re-introducing `--direct-io`):
-  - `no_direct_io_flag_in_any_subcommand`
-  - `mount_subcommand_has_no_direct_io_flag`
 
 Run a single focused regression:
 
+Each command below is copy-paste ready and includes the full crate and test
+binary prefix where applicable.
+
 ```bash
-cargo test -p studiofs-meta test_pg_checkpoint_excludes_uncommitted_local_blocks -- --ignored --nocapture
-cargo test -p studiofs-vfs --test vfs_test test_truncate_shrink_then_extend_zero_fills_old_tail -- --ignored --nocapture
-cargo test -p studiofs-vfs --test vfs_test sfs121_foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-meta test_resolve_chunk_slice_spans_overlay_over_base_with_hole -- --nocapture
+cargo test -p studiofs-meta redb_partial_update_does_not_expose_new_blocks_before_publish -- --nocapture
+cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture
+cargo test -p studiofs-vfs --test vfs_test background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads -- --nocapture --test-threads=1
 ```
 
 ## Recommended Local Flow
