@@ -1036,10 +1036,8 @@ impl StudioVfs {
             return Ok(Some(cached));
         }
 
-        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
         let data = self
-            .fetch_scheduler
-            .fetch_block(block_ref.object_id, &keys)
+            .fetch_block_for_ref(&block_ref, false)
             .await
             .map_err(|e| VfsError::Other(e.to_string()))?;
 

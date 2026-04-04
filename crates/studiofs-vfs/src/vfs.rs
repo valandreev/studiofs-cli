@@ -43,7 +43,7 @@ use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -4626,7 +4626,8 @@ impl StudioVfs {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> VfsResult<()> {
                 self.block_cache.spawn_background_tasks();
 
-                // Spawn prefetch worker — holds Arc<Self> so it can call read_block()
+                // Spawn prefetch worker — holds Arc<Self> so it can run the
+                // resolver-backed prefetch helper.
                 let vfs_for_prefetch = self.clone();
                 let prefetch_limit = self.prefetch_concurrency.max(1);
                 self.track_background_task(tokio::spawn(async move {
@@ -9298,11 +9299,8 @@ impl StudioVfs {
         unresolved
     }
 
-    async fn prefetch_remote_blocks_for_plan(
-        &self,
-        plan: &[ReadPlanSpan],
-    ) -> VfsResult<HashSet<u64>> {
-        let mut missing = BTreeSet::new();
+    fn collect_data_block_refs(plan: &[ReadPlanSpan]) -> BTreeMap<u64, BlockRef> {
+        let mut block_refs = BTreeMap::new();
         for span in plan {
             let block = match &span.source {
                 ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
@@ -9310,18 +9308,51 @@ impl StudioVfs {
                 | ReadPlanSource::PendingOverlay { .. }
                 | ReadPlanSource::Zero => continue,
             };
-            if !self.block_store.contains(block.object_id)
-                && self.block_cache.get_sync(block.object_id).is_none()
-            {
-                missing.insert(block.object_id);
+            block_refs
+                .entry(block.object_id)
+                .or_insert_with(|| block.clone());
+        }
+        block_refs
+    }
+
+    async fn fetch_block_for_ref(
+        &self,
+        block: &BlockRef,
+        prefetch: bool,
+    ) -> Result<Bytes, crate::fetch::FetchError> {
+        let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
+        if prefetch {
+            self.fetch_scheduler
+                .fetch_block_prefetch(block.object_id, &keys)
+                .await
+        } else {
+            self.fetch_scheduler
+                .fetch_block(block.object_id, &keys)
+                .await
+        }
+    }
+
+    async fn prefetch_remote_blocks_for_plan(
+        &self,
+        plan: &[ReadPlanSpan],
+    ) -> VfsResult<HashSet<u64>> {
+        let mut cached = BTreeSet::new();
+        let mut missing = BTreeMap::new();
+        for (object_id, block) in Self::collect_data_block_refs(plan) {
+            if self.block_store.contains(object_id) {
+                cached.insert(object_id);
+            } else if self.block_cache.get_sync(object_id).is_none() {
+                missing.insert(object_id, block);
             }
+        }
+        for object_id in cached {
+            self.block_store.advise_will_need(object_id);
         }
         if missing.is_empty() {
             return Ok(HashSet::new());
         }
-        let fetches = missing.into_iter().map(|object_id| async move {
-            let keys = format_object_fragment_keys(&self.data_prefix, object_id);
-            match self.fetch_scheduler.fetch_block(object_id, &keys).await {
+        let fetches = missing.into_iter().map(|(object_id, block)| async move {
+            match self.fetch_block_for_ref(&block, true).await {
                 Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
                 Err(crate::fetch::FetchError::NotFound { .. }) => {
                     Ok::<(u64, bool), VfsError>((object_id, true))
@@ -9391,12 +9422,7 @@ impl StudioVfs {
                     } else if let Some(data) = self.block_cache.get(block.object_id).await {
                         self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
                     } else {
-                        let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
-                        match self
-                            .fetch_scheduler
-                            .fetch_block(block.object_id, &keys)
-                            .await
-                        {
+                        match self.fetch_block_for_ref(block, false).await {
                             Ok(data) => {
                                 self.copy_block_payload_into_range(
                                     data.as_ref(),
@@ -9748,8 +9774,8 @@ impl StudioVfs {
 
     /// Prefetch a block into cache (called from spawned prefetch tasks).
     ///
-    /// Like `read_block()` but silently ignores errors and always marks the
-    /// readahead inflight state as done when finished.
+    /// Like the foreground read planner, but silently ignores errors and
+    /// always marks the readahead inflight state as done when finished.
     async fn read_block_for_prefetch(&self, ino: Ino, block_index: u32) {
         if self.shutdown_requested() {
             self.readahead.finish_prefetch(ino, block_index);
@@ -9760,32 +9786,37 @@ impl StudioVfs {
             return;
         }
 
-        let block_ref = match self.get_file_block_async(ino, block_index).await {
-            Ok(Some(block_ref)) => block_ref,
-            _ => {
-                self.readahead.finish_prefetch(ino, block_index);
-                return;
+        let result = async {
+            let attr = self.getattr_async(ino).await?;
+            if self.remote_upload_placeholder_visible(ino, &attr) {
+                return Ok::<(), VfsError>(());
             }
-        };
-
-        // Skip if the block is already cached and emit an advisory hint so the
-        // OS can start faulting pages in ahead of demand.
-        if self.block_store.contains(block_ref.object_id) {
-            self.block_store.advise_will_need(block_ref.object_id);
-            self.readahead.finish_prefetch(ino, block_index);
-            return;
+            let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+            let pending_content_epoch = incarnation_state
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch);
+            let block_start = (block_index as u64).saturating_mul(self.block_size as u64);
+            if block_start >= attr.size {
+                return Ok(());
+            }
+            let block_len = (attr.size - block_start).min(self.block_size as u64);
+            let mut plan = self
+                .build_read_plan(ino, block_start, block_len, pending_content_epoch)
+                .await?;
+            plan.sort_by_key(|span| span.range.start);
+            let _ = self.prefetch_remote_blocks_for_plan(&plan).await?;
+            Ok::<(), VfsError>(())
         }
-        if self.shutdown_requested() {
-            self.readahead.finish_prefetch(ino, block_index);
-            return;
+        .await;
+        if let Err(error) = result {
+            debug!(
+                ino,
+                block_index,
+                error = %error,
+                "prefetch worker resolver path failed"
+            );
         }
-
-        // Best-effort prefetch: keep reserved AIMD headroom for foreground reads.
-        let keys = format_object_fragment_keys(&self.data_prefix, block_ref.object_id);
-        let _ = self
-            .fetch_scheduler
-            .fetch_block_prefetch(block_ref.object_id, &keys)
-            .await;
         self.readahead.finish_prefetch(ino, block_index);
     }
 
@@ -11768,6 +11799,45 @@ mod tests {
     #[test]
     fn foreground_speedometer_p90_handles_empty_input() {
         assert_eq!(StudioVfs::p90_ns(vec![]), None);
+    }
+
+    #[test]
+    fn collect_data_block_refs_deduplicates_by_object_id() {
+        let first = BlockRef {
+            object_id: 42,
+            offset: 0,
+            length: 16,
+            flags: MetaBlockFlags::empty(),
+        };
+        let second = BlockRef {
+            object_id: 42,
+            offset: 8,
+            length: 8,
+            flags: MetaBlockFlags::PARTIAL_BLOCK,
+        };
+        let plan = vec![
+            ReadPlanSpan {
+                range: ReadRange { start: 0, end: 16 },
+                source: ReadPlanSource::Base {
+                    block: first.clone(),
+                },
+            },
+            ReadPlanSpan {
+                range: ReadRange { start: 16, end: 24 },
+                source: ReadPlanSource::Overlay {
+                    block: second.clone(),
+                },
+            },
+            ReadPlanSpan {
+                range: ReadRange { start: 24, end: 32 },
+                source: ReadPlanSource::Zero,
+            },
+        ];
+
+        let refs = StudioVfs::collect_data_block_refs(&plan);
+        assert_eq!(refs.len(), 1);
+        let block = refs.get(&42).expect("collected block ref");
+        assert_eq!(block, &first, "first ref should win when object ids match");
     }
 
     #[test]
