@@ -7435,6 +7435,14 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    fn clear_stale_read_state_for_inode(&self, ino: Ino) {
+        self.clear_pending_blocks_for_inode(ino);
+        self.clear_inode_incarnation(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.state.namespace.attr_read_cache.lock().remove(ino);
+        let _ = self.handle_table.take_orphan(ino);
+    }
+
     async fn lookup_regular_file_slices_async(
         &self,
         ino: Ino,
@@ -7449,11 +7457,7 @@ impl StudioVfs {
         {
             Ok(resolved) => Ok(resolved),
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.clear_pending_blocks_for_inode(ino);
-                self.clear_inode_incarnation(ino);
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                let _ = self.handle_table.take_orphan(ino);
+                self.clear_stale_read_state_for_inode(ino);
                 Err(VfsError::Meta(MetaError::InodeNotFound(ino)))
             }
             Err(err) => Err(err),
@@ -7515,11 +7519,7 @@ impl StudioVfs {
         {
             Ok(result) => result,
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.clear_pending_blocks_for_inode(ino);
-                self.clear_inode_incarnation(ino);
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                let _ = self.handle_table.take_orphan(ino);
+                self.clear_stale_read_state_for_inode(ino);
                 return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
             }
             Err(err) => return Err(err),
