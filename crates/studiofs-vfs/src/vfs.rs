@@ -4799,12 +4799,18 @@ impl StudioVfs {
             };
 
             match commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch).await {
-                Ok(commit::EpochFinalizeStatus::Published)
-                | Ok(commit::EpochFinalizeStatus::Skipped) => {
+                Ok(commit::EpochFinalizeStatus::Published) => {
                     self.note_file_session_background_transition(
                         ino,
                         FileSessionOperation::Finalize,
                         "published",
+                    );
+                }
+                Ok(commit::EpochFinalizeStatus::Skipped) => {
+                    self.note_file_session_background_transition(
+                        ino,
+                        FileSessionOperation::Finalize,
+                        "skipped",
                     );
                 }
                 Ok(commit::EpochFinalizeStatus::Deferred) => {
@@ -6042,7 +6048,7 @@ impl StudioVfs {
         self.state.file_session.counters.note_transition();
         self.file_session_for_inode(ino)
             .record_transition(op, phase);
-        if matches!(phase, "complete" | "published" | "recovered") {
+        if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
             self.maybe_gc_file_session(ino);
         }
     }
@@ -6083,7 +6089,7 @@ impl StudioVfs {
         );
     }
 
-    fn consume_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
+    fn ensure_no_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
         if let Some(message) = self
             .state
             .upload
@@ -7676,82 +7682,99 @@ impl StudioVfs {
         self.note_file_session_close_handle(ino, remaining);
         self.clear_access_tracking_for_stream(ino, stream_id);
         if remaining > 0 {
-            self.maybe_gc_file_session(ino);
             return Ok(());
         }
 
-        let _session = self
+        let session = self
             .enter_file_session_op(ino, FileSessionOperation::Release)
             .await;
-
-        if self.release_ignored_entry(ino) {
-            let _ = self.handle_table.take_orphan(ino);
-            self.maybe_gc_file_session(ino);
-            return Ok(());
-        }
-
-        if self.handle_table.take_orphan(ino) {
+        let result: VfsResult<()> = async {
             if self.release_ignored_entry(ino) {
-                self.maybe_gc_file_session(ino);
+                let _ = self.handle_table.take_orphan(ino);
                 return Ok(());
             }
-            // Last handle closed on an unlinked file — final cleanup
-            debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
-            self.mark_inode_deleted_for_uploads(ino);
-
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let meta = self.meta_async.clone();
-            let (removed_ids, total_bytes) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                let blocks = match engine.get_file_blocks(ino) {
-                    Ok(blocks) => blocks,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-
-                let removed_ids = match engine.remove_file_blocks(ino) {
-                    Ok(ids) => ids,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                for &object_id in &removed_ids {
-                    engine.add_pending_deletion(object_id, timestamp)?;
+            if self.handle_table.take_orphan(ino) {
+                if self.release_ignored_entry(ino) {
+                    return Ok(());
                 }
+                // Last handle closed on an unlinked file — final cleanup
+                debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
-                if total_bytes > 0 {
-                    engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
+                self.mark_inode_deleted_for_uploads(ino);
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let meta = self.meta_async.clone();
+                let (removed_ids, total_bytes) =
+                    run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        let blocks = match engine.get_file_blocks(ino) {
+                            Ok(blocks) => blocks,
+                            Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                            Err(err) => return Err(err),
+                        };
+                        let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+
+                        let removed_ids = match engine.remove_file_blocks(ino) {
+                            Ok(ids) => ids,
+                            Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                            Err(err) => return Err(err),
+                        };
+                        for &object_id in &removed_ids {
+                            engine.add_pending_deletion(object_id, timestamp)?;
+                        }
+
+                        if total_bytes > 0 {
+                            engine.decr_counter(
+                                studiofs_meta::types::counters::USED_SPACE,
+                                total_bytes,
+                            )?;
+                        }
+
+                        match engine.remove_attr(ino) {
+                            Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
+                            Err(err) => return Err(err),
+                        }
+                        let _ = engine.remove_deferred_delete(ino);
+                        Ok((removed_ids, total_bytes))
+                    })
+                    .await?;
+
+                if !removed_ids.is_empty() {
+                    self.clear_pending_blocks_for_inode(ino);
+                    self.evict_inode_from_caches(ino, &removed_ids).await;
                 }
-
-                match engine.remove_attr(ino) {
-                    Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
-                    Err(err) => return Err(err),
-                }
-                let _ = engine.remove_deferred_delete(ino);
-                Ok((removed_ids, total_bytes))
-            })
-            .await?;
-
-            if !removed_ids.is_empty() {
-                self.clear_pending_blocks_for_inode(ino);
-                self.evict_inode_from_caches(ino, &removed_ids).await;
+                debug!(
+                    "orphan cleanup complete: ino={} removed_blocks={} freed_bytes={}",
+                    ino,
+                    removed_ids.len(),
+                    total_bytes
+                );
+                self.clear_inode_incarnation(ino);
+                self.state.namespace.dirty_attrs.lock().remove(&ino);
+                self.state.namespace.attr_read_cache.lock().remove(ino);
+                self.maybe_clear_deleted_inode_marker(ino);
+                return Ok(());
             }
-            debug!(
-                "orphan cleanup complete: ino={} removed_blocks={} freed_bytes={}",
-                ino,
-                removed_ids.len(),
-                total_bytes
-            );
-            self.clear_inode_incarnation(ino);
-            self.state.namespace.dirty_attrs.lock().remove(&ino);
-            self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.maybe_clear_deleted_inode_marker(ino);
+
+            let writable_handle = open_file.flags.contains(OpenFlags::WRONLY)
+                || open_file.flags.contains(OpenFlags::RDWR);
+            let has_local_dirty_state = self.has_pending_write_buffer_blocks_for_inode(ino)
+                || self.state.namespace.dirty_attrs.lock().contains_key(&ino);
+            if has_local_dirty_state {
+                self.flush_ordered(ino).await?;
+            }
+            if writable_handle || has_local_dirty_state {
+                self.ensure_no_upload_sticky_error(ino)?;
+            }
+            Ok(())
         }
+        .await;
+        drop(session);
         self.maybe_gc_file_session(ino);
-        Ok(())
+        result
     }
 
     /// Flush data for a file handle (per-fd close in POSIX).
@@ -7765,7 +7788,7 @@ impl StudioVfs {
                 .await;
             let result: VfsResult<()> = async {
                 self.flush_ordered(ino).await?;
-                self.consume_upload_sticky_error(ino)?;
+                self.ensure_no_upload_sticky_error(ino)?;
                 Ok(())
             }
             .await;
@@ -7809,7 +7832,7 @@ impl StudioVfs {
                 .await?;
                 self.state.namespace.attr_read_cache.lock().remove(ino);
             }
-            self.consume_upload_sticky_error(ino)?;
+            self.ensure_no_upload_sticky_error(ino)?;
             Ok(())
         }
         .await;
@@ -11516,6 +11539,40 @@ mod tests {
             );
             vfs.clear_upload_sticky_error(ino);
             vfs.fsync(ino, false).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-release-order");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"sticky-release.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let payload = b"persist-before-release-sticky-report";
+
+            vfs.write(ino, 0, payload).await.unwrap();
+            vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+
+            let release_err = vfs.release_fh(fh).await.unwrap_err();
+            assert!(
+                release_err.to_string().contains("sticky upload error"),
+                "release_fh should surface sticky upload errors"
+            );
+            assert_eq!(
+                vfs.open_count(ino),
+                0,
+                "release_fh should still close the handle"
+            );
+
+            let after = vfs.getattr(ino).unwrap();
+            assert_eq!(
+                after.size,
+                payload.len() as u64,
+                "release_fh must persist local dirty state before reporting sticky EIO"
+            );
         });
     }
 

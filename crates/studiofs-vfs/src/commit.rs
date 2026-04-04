@@ -78,26 +78,6 @@ impl CommitCoordinator {
             }
         }
 
-        let current_attr = match run_meta(
-            vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
-        )
-        .await
-        {
-            Ok(attr) => attr,
-            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                vfs.clear_inode_incarnation(ino);
-                return Ok(EpochFinalizeStatus::Skipped);
-            }
-            Err(err) => return Err(err),
-        };
-        if current_attr.content_epoch != content_epoch
-            || current_attr.upload_state == MetaUploadState::Ready
-            || !StudioVfs::needs_epoch_finalization(&current_attr)
-        {
-            return Ok(EpochFinalizeStatus::Skipped);
-        }
-
         let expected_manifest = required_blocks.clone();
         let published = run_meta(
             vfs.meta_async.clone(),
@@ -111,6 +91,32 @@ impl CommitCoordinator {
         )
         .await?;
         if !published {
+            let latest_attr = match run_meta(
+                vfs.meta_async.clone(),
+                move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
+            )
+            .await
+            {
+                Ok(attr) => attr,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                    vfs.clear_inode_incarnation(ino);
+                    return Ok(EpochFinalizeStatus::Skipped);
+                }
+                Err(err) => return Err(err),
+            };
+            if latest_attr.content_epoch != content_epoch
+                || latest_attr.upload_state == MetaUploadState::Ready
+                || !StudioVfs::needs_epoch_finalization(&latest_attr)
+            {
+                tracing::debug!(
+                    ino,
+                    queued_content_epoch = content_epoch,
+                    latest_content_epoch = latest_attr.content_epoch,
+                    upload_state = ?latest_attr.upload_state,
+                    "skipping stale epoch publication attempt"
+                );
+                return Ok(EpochFinalizeStatus::Skipped);
+            }
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
