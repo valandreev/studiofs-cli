@@ -204,8 +204,8 @@ Useful test/runtime variables include:
 
 Recent notes:
 - Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md](docs/vfs.md).
-  This documents the 4-stage local overlay model, the bounded async retry for
-  the L1→L2 handover window, and the new observability counters.
+  This documents the buffered-first local overlay model, the foreground-vs-background
+  fetch priority split, and the current observability counters.
 - Finalized the BlockStore-backed committed read path (SFS-139): foreground reads,
   readahead, and upload cache rereads now use `studiofs-cache` v2 as the primary
   committed cache, while async VFS workers route blocking local cache mutations

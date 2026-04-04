@@ -11250,9 +11250,8 @@ fn concurrent_reads_through_upload_finalization() {
         //
         // The reader uses an adaptive sleep: normal reads sleep 5 ms, but once
         // `pending_uploads_for_inode` starts shrinking (uploads are completing) it
-        // switches to yield-only polling to maximize the probability of hitting the
-        // narrow "complete_upload unpinned L1 but commit_l2_batch not done" window that
-        // the bounded retry in `read_pending_overlay_block_async` is designed to cover.
+        // switches to yield-only polling to maximize the chance of overlapping the
+        // finalization window while the background upload pipeline is still settling.
         let vfs_reader = vfs.clone();
         let payload_reader = payload.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -11285,7 +11284,7 @@ fn concurrent_reads_through_upload_finalization() {
                     }
                 }
                 // Switch to aggressive (yield-only) polling once uploads start completing
-                // so the reader is likely to interleave with L1 unpin / L2 commit.
+                // so the reader is likely to interleave with upload finalization.
                 let current_pending = vfs_reader.pending_uploads_for_inode(attr.ino).len();
                 if current_pending < *initial_uploads_for_reader && current_pending > 0 {
                     tokio::task::yield_now().await;

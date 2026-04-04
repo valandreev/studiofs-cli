@@ -306,6 +306,8 @@ Notes:
   later flush persists them.
 - Upload progress and remote publication do not affect local read-after-write for
   the mounted client.
+- Foreground reads request high-priority fetches, while background prefetch keeps
+  using best-effort low-priority warming.
 - Synchronous cache-only probes may still fall back to the async read path on miss.
 
 

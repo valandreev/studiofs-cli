@@ -194,14 +194,6 @@ pub struct VfsIngressStats {
     /// Total bytes drained from legacy spill accepted state into committed
     /// local metadata / cache state.
     pub drained_spill_bytes: u64,
-    /// Retry attempts made when a locally-accepted block was found in
-    /// `live_extent_records` but was transiently absent from the block cache
-    /// (bounded local-stage recovery between L1 unpin and L2 commit).
-    pub local_overlay_cache_miss_retries: u64,
-    /// Number of times the bounded retry loop was exhausted without finding
-    /// the block in cache.  Non-zero values indicate the retry budget may be
-    /// too tight for the current hardware / I/O pressure profile.
-    pub local_overlay_cache_miss_retry_exhaustions: u64,
     /// Current depth of the prefetch worker's pending queue.
     pub prefetch_queue_depth: u64,
     /// Successful ingress checkpoint persists since startup.
@@ -3148,15 +3140,6 @@ struct MetricsState {
     materialize_batch_stats: MaterializeBatchStats,
     ignored_entries: Mutex<IgnoredEntryRegistry>,
     next_ignored_ino: AtomicU64,
-    /// Retry attempts made when a locally-accepted block was present in
-    /// `live_extent_records` but transiently absent from the block cache
-    /// (bounded recovery between L1 unpin and L2 commit).
-    local_overlay_cache_miss_retries: AtomicU64,
-    /// Number of times the bounded retry loop was exhausted and a locally-accepted
-    /// block was still absent from cache after all attempts.  A non-zero value
-    /// indicates the 50 ms retry budget may be too tight under the observed
-    /// L2 commit latency profile.
-    local_overlay_cache_miss_retry_exhaustions: AtomicU64,
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
@@ -3168,8 +3151,6 @@ impl MetricsState {
             materialize_batch_stats: MaterializeBatchStats::default(),
             ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
-            local_overlay_cache_miss_retries: AtomicU64::new(0),
-            local_overlay_cache_miss_retry_exhaustions: AtomicU64::new(0),
             prefetch_queue_depth: AtomicU64::new(0),
         }
     }
@@ -7266,16 +7247,6 @@ impl StudioVfs {
             drained_mem_bytes: 0,
             drained_spill_blocks: 0,
             drained_spill_bytes: 0,
-            local_overlay_cache_miss_retries: self
-                .state
-                .metrics
-                .local_overlay_cache_miss_retries
-                .load(Ordering::Relaxed),
-            local_overlay_cache_miss_retry_exhaustions: self
-                .state
-                .metrics
-                .local_overlay_cache_miss_retry_exhaustions
-                .load(Ordering::Relaxed),
             prefetch_queue_depth: self
                 .state
                 .metrics
@@ -9151,7 +9122,9 @@ impl StudioVfs {
             )
             .await?;
         read_plan.sort_by_key(|span| span.range.start);
-        let missing_remote = self.prefetch_remote_blocks_for_plan(&read_plan).await?;
+        let missing_remote = self
+            .prefetch_remote_blocks_for_plan(&read_plan, false)
+            .await?;
         let written = self
             .assemble_read_plan(offset, &read_plan, &missing_remote, buffer)
             .await?;
@@ -9475,6 +9448,7 @@ impl StudioVfs {
     async fn prefetch_remote_blocks_for_plan(
         &self,
         plan: &[ReadPlanSpan],
+        prefetch: bool,
     ) -> VfsResult<HashSet<u64>> {
         let mut cached = BTreeSet::new();
         let mut missing = BTreeMap::new();
@@ -9494,7 +9468,7 @@ impl StudioVfs {
         // Prefetch is best-effort warming, so NotFound is recorded for the
         // caller but otherwise ignored here.
         let fetches = missing.into_iter().map(|(object_id, block)| async move {
-            match self.fetch_block_for_ref(&block, true).await {
+            match self.fetch_block_for_ref(&block, prefetch).await {
                 Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
                 Err(crate::fetch::FetchError::NotFound { .. }) => {
                     Ok::<(u64, bool), VfsError>((object_id, true))
@@ -9809,7 +9783,7 @@ impl StudioVfs {
                     .await?;
                 // Prefetch is best-effort warming, so we intentionally drop the
                 // NotFound set here; foreground reads still resolve the final path.
-                let _ = self.prefetch_remote_blocks_for_plan(&plan).await?;
+                let _ = self.prefetch_remote_blocks_for_plan(&plan, true).await?;
             }
             Ok::<(), VfsError>(())
         }
