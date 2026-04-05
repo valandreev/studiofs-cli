@@ -2556,6 +2556,14 @@ mod tests {
         let path = dir.path().join("meta.redb");
         let local = Arc::new(RedbMetaEngine::open(&path).expect("open local redb"));
         local.init_root(0, 0).expect("init root");
+        local
+            .set_format_info(&format_info(
+                "unit-local",
+                "unit-local-uuid",
+                "postgres://127.0.0.1:1/studiofs",
+                1,
+            ))
+            .expect("set local format info");
         let flushed_event_seq = local.get_counter("nextEventSeq").expect("nextEventSeq");
 
         let engine = PgMetaEngine {
@@ -2956,6 +2964,7 @@ mod tests {
     fn unit_remote_projection_updates_nested_file_after_temp_rename_then_publish() {
         let (_writer_dir, writer) = temp_pg_engine_for_unit();
         let (_remote_dir, remote) = temp_pg_engine_for_unit();
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
 
         let batch1_start = writer
             .local
@@ -2991,8 +3000,8 @@ mod tests {
         assert_eq!(remote_attr_before.committed_size, 0);
 
         let batch2_start = batch1_end;
-        set_file_state(&writer, file.ino, 8192, 1);
-        let block0 = BlockRef::new_partial(801, 4096);
+        set_file_state(&writer, file.ino, block_size + 4096, 1);
+        let block0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
         let block1 = BlockRef::new_partial(802, 4096);
         writer
             .set_file_block(file.ino, 0, &block0)
@@ -3020,8 +3029,8 @@ mod tests {
         let remote_attr_after = remote
             .get_attr(remote_file_after.ino)
             .expect("attr after publish");
-        assert_eq!(remote_attr_after.size, 8192);
-        assert_eq!(remote_attr_after.committed_size, 8192);
+        assert_eq!(remote_attr_after.size, block_size + 4096);
+        assert_eq!(remote_attr_after.committed_size, block_size + 4096);
         assert_eq!(remote_attr_after.upload_state, UploadState::Ready);
         let remote_blocks = remote
             .get_file_blocks(remote_file_after.ino)
@@ -3033,6 +3042,7 @@ mod tests {
     fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
         let (_writer_dir, writer) = temp_pg_engine_for_unit();
         let (_remote_dir, remote) = temp_pg_engine_for_unit();
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
 
         let seed_start = writer
             .local
@@ -3069,8 +3079,8 @@ mod tests {
         let temp = writer
             .create_file(dir.ino, b"temp.bin", 0, 0, 0o644)
             .expect("create replacement temp");
-        set_file_state(&writer, temp.ino, 8192, 2);
-        let new_block0 = BlockRef::new_partial(902, 4096);
+        set_file_state(&writer, temp.ino, block_size + 4096, 2);
+        let new_block0 = BlockRef::new_full(902, DEFAULT_BLOCK_SIZE);
         let new_block1 = BlockRef::new_partial(903, 4096);
         writer
             .set_file_block(temp.ino, 0, &new_block0)
@@ -3105,8 +3115,8 @@ mod tests {
         let remote_attr = remote
             .get_attr(remote_final.ino)
             .expect("get replaced attr");
-        assert_eq!(remote_attr.size, 8192);
-        assert_eq!(remote_attr.committed_size, 8192);
+        assert_eq!(remote_attr.size, block_size + 4096);
+        assert_eq!(remote_attr.committed_size, block_size + 4096);
         assert_eq!(remote_attr.committed_content_epoch, 2);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
         let remote_blocks = remote
@@ -3530,8 +3540,9 @@ mod tests {
             }
         }));
 
-        set_file_state(&a, file.ino, 8192, 1);
-        let block0 = BlockRef::new_partial(611, 4096);
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
+        set_file_state(&a, file.ino, block_size + 4096, 1);
+        let block0 = BlockRef::new_full(611, DEFAULT_BLOCK_SIZE);
         let block1 = BlockRef::new_partial(612, 4096);
         a.set_file_block(file.ino, 0, &block0).expect("set block 0");
         a.set_file_block(file.ino, 1, &block1).expect("set block 1");
@@ -3549,8 +3560,8 @@ mod tests {
                         let attr_ready = b
                             .get_attr(remote_file.ino)
                             .map(|attr| {
-                                attr.size == 8192
-                                    && attr.committed_size == 8192
+                                attr.size == block_size + 4096
+                                    && attr.committed_size == block_size + 4096
                                     && attr.upload_state == UploadState::Ready
                             })
                             .unwrap_or(false);

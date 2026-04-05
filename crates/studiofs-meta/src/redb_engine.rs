@@ -2977,7 +2977,11 @@ impl RedbMetaEngine {
     fn regular_file_graph_block_size_from_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<u32> {
-        Ok(Self::format_info_from_write_txn(txn)?.block_size)
+        match Self::format_info_from_write_txn(txn) {
+            Ok(info) => Ok(info.block_size),
+            Err(MetaError::NotFormatted) => Ok(DEFAULT_BLOCK_SIZE),
+            Err(err) => Err(err),
+        }
     }
 
     fn transition_upload_state_for_local_mutation(
@@ -3909,6 +3913,12 @@ impl RedbMetaEngine {
                         .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
+                    drop(committed);
+                    Self::clear_regular_file_chunk_rows_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                    )?;
                 }
                 crate::events::MetaEvent::AddEntry { .. } => {}
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
@@ -3933,6 +3943,18 @@ impl RedbMetaEngine {
                         .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = committed.remove(key.as_slice());
+                    let committed_manifest = Self::committed_manifest_in_txn(&committed, *ino)?;
+                    drop(committed);
+                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        committed_manifest.as_slice(),
+                        block_size,
+                        true,
+                        false,
+                    )?;
                 }
                 crate::events::MetaEvent::RemoveFileBlocks { ino } => {
                     let mut blocks = txn
@@ -3944,6 +3966,12 @@ impl RedbMetaEngine {
                         .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
+                    drop(committed);
+                    Self::clear_regular_file_chunk_rows_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                    )?;
                 }
                 crate::events::MetaEvent::SetFileBlocksBatch { .. } => {}
                 crate::events::MetaEvent::CommitFileBlock {
@@ -3960,6 +3988,18 @@ impl RedbMetaEngine {
                     committed
                         .insert(key.as_slice(), data.as_slice())
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let committed_manifest = Self::committed_manifest_in_txn(&committed, *ino)?;
+                    drop(committed);
+                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        committed_manifest.as_slice(),
+                        block_size,
+                        true,
+                        false,
+                    )?;
                 }
                 crate::events::MetaEvent::PublishFileManifest { ino, blocks } => {
                     let mut committed = txn
@@ -3973,6 +4013,17 @@ impl RedbMetaEngine {
                             .insert(key.as_slice(), data.as_slice())
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
+                    drop(committed);
+                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        blocks.as_slice(),
+                        block_size,
+                        true,
+                        false,
+                    )?;
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
                     let mut table = txn
@@ -8141,11 +8192,30 @@ mod tests {
     use super::*;
     use crate::events::MetaEvent;
 
+    fn test_format_info(name: &str) -> FormatInfo {
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: name.to_string(),
+            uuid: format!("{name}-uuid"),
+            endpoint: "http://localhost:9000".into(),
+            bucket: "testbucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: "".into(),
+            data_prefix: format!("{name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: DEFAULT_BLOCK_SIZE,
+        }
+    }
+
     fn temp_engine() -> RedbMetaEngine {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let engine = RedbMetaEngine::open(&path).unwrap();
         engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("test-vol"))
+            .unwrap();
         // Leak dir so it isn't dropped
         std::mem::forget(dir);
         engine
@@ -11426,16 +11496,17 @@ mod tests {
     #[test]
     fn redb_manifest_publish_sets_committed_head() {
         let engine = temp_engine();
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
 
         let file = engine
             .create_file(ROOT_INO, b"publish-head.bin", 1000, 1000, 0o644)
             .unwrap();
         let mut attr = engine.get_attr(file.ino).unwrap();
-        attr.size = 8192;
+        attr.size = block_size + 4096;
         attr.content_epoch = 1;
         engine.set_attr(&attr).unwrap();
 
-        let block0 = BlockRef::new_partial(101, 4096);
+        let block0 = BlockRef::new_full(101, DEFAULT_BLOCK_SIZE);
         let block1 = BlockRef::new_partial(102, 4096);
         engine.set_file_block(file.ino, 0, &block0).unwrap();
         engine.set_file_block(file.ino, 1, &block1).unwrap();
@@ -11443,7 +11514,7 @@ mod tests {
         assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
 
         let published_attr = engine.get_attr(file.ino).unwrap();
-        assert_eq!(published_attr.committed_size, 8192);
+        assert_eq!(published_attr.committed_size, block_size + 4096);
         assert_eq!(published_attr.committed_content_epoch, 1);
         assert_eq!(published_attr.upload_state, UploadState::Ready);
 
@@ -11451,8 +11522,8 @@ mod tests {
         let remote = temp_engine();
         remote.import_snapshot(&snapshot).unwrap();
         let remote_attr = remote.get_attr(file.ino).unwrap();
-        assert_eq!(remote_attr.size, 8192);
-        assert_eq!(remote_attr.committed_size, 8192);
+        assert_eq!(remote_attr.size, block_size + 4096);
+        assert_eq!(remote_attr.committed_size, block_size + 4096);
         assert_eq!(remote_attr.committed_content_epoch, 1);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
 
@@ -11552,16 +11623,17 @@ mod tests {
     #[test]
     fn redb_publish_file_manifest_if_matches_rejects_manifest_changes() {
         let engine = temp_engine();
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
 
         let file = engine
             .create_file(ROOT_INO, b"publish-race.bin", 1000, 1000, 0o644)
             .unwrap();
         let mut attr = engine.get_attr(file.ino).unwrap();
-        attr.size = 8192;
+        attr.size = block_size + 4096;
         attr.content_epoch = 1;
         engine.set_attr(&attr).unwrap();
 
-        let block0 = BlockRef::new_partial(501, 4096);
+        let block0 = BlockRef::new_full(501, DEFAULT_BLOCK_SIZE);
         engine.set_file_block(file.ino, 0, &block0).unwrap();
         let verified_manifest = engine.get_file_blocks(file.ino).unwrap();
 
