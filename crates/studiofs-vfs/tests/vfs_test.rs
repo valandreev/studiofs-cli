@@ -2165,6 +2165,7 @@ fn test_crash_recovery_replays_pending_journal() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
     // Keep S3 settings stable for this long-running crash/restart scenario.
     // Other tests intentionally toggle endpoint reachability; pinning online
@@ -2737,6 +2738,7 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -2847,6 +2849,7 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn remote_clients_keep_previous_committed_version_during_update() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -2946,6 +2949,7 @@ fn remote_clients_keep_previous_committed_version_during_update() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn atomic_switch_to_new_incarnation_after_full_commit() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -3086,6 +3090,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn remote_snapshot_reads_nested_file_after_temp_rename_publish() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -3180,6 +3185,7 @@ fn remote_snapshot_reads_nested_file_after_temp_rename_publish() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn remote_snapshot_switches_nested_overwrite_to_replacement_inode() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -3431,6 +3437,7 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
     let _env = ScopedTestEnv::new();
 
@@ -3790,6 +3797,7 @@ fn new_empty_file_stays_idle_without_pending_incarnation() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn committed_file_mutation_enters_updating_state() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -3905,6 +3913,7 @@ fn committed_file_mutation_enters_updating_state() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately() {
     let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -4008,6 +4017,7 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn local_reads_prefer_pending_overlay_over_committed_base() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -4114,6 +4124,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen() {
     fn assert_range_matches(phase: &str, offset: usize, expected: &[u8], actual: &[u8]) {
         if actual.len() != expected.len() {
@@ -4465,6 +4476,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn single_inode_never_has_two_pending_incarnations() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -4749,6 +4761,7 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn large_file_partial_overwrite_reuploads_only_touched_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -4864,6 +4877,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     let _env = ScopedTestEnv::new();
     apply_test_online_s3_env();
@@ -5166,6 +5180,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn update_manifest_reuses_untouched_committed_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -5388,6 +5403,7 @@ fn restart_replays_only_live_pending_extents() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn recovered_pending_uploads_publish_new_file_after_restart() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -5512,6 +5528,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn published_file_remains_readable_after_cache_wipe_and_restart() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -5637,6 +5654,7 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
@@ -5966,6 +5984,7 @@ fn offline_s3_does_not_break_local_read_after_write() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn upload_completion_batching_does_not_change_visibility_contract() {
     let _env = ScopedTestEnv::new();
     apply_test_online_s3_env();
@@ -6414,6 +6433,7 @@ fn backpressure_only_on_local_budget_exhaustion() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn single_large_file_upload_does_not_starve_small_foreground_io() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -6510,6 +6530,7 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn recovery_after_offline_s3_preserves_local_accepted_view() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -6937,6 +6958,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn test_write_fast_mode_no_spill_artifacts() {
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
@@ -7109,6 +7131,7 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
     let _env = ScopedTestEnv::new();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -7195,6 +7218,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -11594,6 +11618,7 @@ async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
 /// Covers the transient window in which a block is present in `live_extent_records`
 /// while upload completion and local block-backend cleanup are interleaving.
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn local_reads_through_upload_with_partial_tail_block() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -11717,6 +11742,7 @@ fn local_reads_through_upload_with_partial_tail_block() {
 ///
 /// This is part of the SFS-121 / SFS-123 buffered-first coverage suite.
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn concurrent_reads_through_upload_finalization() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
