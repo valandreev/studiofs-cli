@@ -131,7 +131,7 @@ pub struct FetchScheduler {
     /// S3 data store (read-optimised operator).
     data_store: Arc<DataStore>,
     /// Shared local block backend used by the foreground read path.
-    block_store: Arc<dyn LocalBlockBackend>,
+    local_block_backend: Arc<dyn LocalBlockBackend>,
     /// Maximum attempts per fetch operation.
     max_fetch_attempts: u32,
     /// Maximum attempts for best-effort prefetch fetches.
@@ -201,7 +201,7 @@ impl FetchScheduler {
             aimd: AimdController::new(aimd_config),
             inflight: DashMap::new(),
             data_store,
-            block_store,
+            local_block_backend: block_store,
             max_fetch_attempts,
             prefetch_max_fetch_attempts,
             request_timeout: Duration::from_secs(request_timeout_s),
@@ -522,7 +522,7 @@ impl FetchScheduler {
     }
 
     async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         tokio::task::spawn_blocking(move || block_store.get(object_id))
             .await
             .map_err(|error| {
@@ -536,7 +536,7 @@ impl FetchScheduler {
         payload: Bytes,
         evictable: bool,
     ) -> Result<(), FetchError> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         tokio::task::spawn_blocking(move || block_store.put(object_id, payload.as_ref(), evictable))
             .await
             .map_err(|error| {

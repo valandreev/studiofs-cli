@@ -3314,7 +3314,7 @@ pub struct StudioVfs {
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
     /// Shared local block backend used by the foreground read path.
-    block_store: Arc<dyn LocalBlockBackend>,
+    local_block_backend: Arc<dyn LocalBlockBackend>,
     /// Upload queue and pending-upload pinning for the write path.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
@@ -4026,7 +4026,7 @@ impl StudioVfs {
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
     ) {
-        let dirty_object_ids = self.block_store.dirty_object_ids();
+        let dirty_object_ids = self.local_block_backend.dirty_object_ids();
         let mut dirty_set: HashSet<u64> = dirty_object_ids.into_iter().collect();
         let mut quarantined_inodes = HashSet::new();
         let mut quarantined_object_ids = HashSet::new();
@@ -4189,7 +4189,7 @@ impl StudioVfs {
                             object_id,
                             "removing orphan dirty block without metadata reference"
                         );
-                        self.block_store.remove(*object_id);
+                        self.local_block_backend.remove(*object_id);
                         self.state.upload.pending_evictions.lock().remove(object_id);
                     }
                     self.state
@@ -4580,7 +4580,7 @@ impl StudioVfs {
             let vfs = Arc::new(Self {
                 meta_async,
                 data_write,
-                block_store,
+                local_block_backend: block_store,
                 block_cache,
                 block_size,
                 data_prefix,
@@ -5813,7 +5813,7 @@ impl StudioVfs {
         };
         Ok(match source {
             PendingOverlayBlockSource::Pending(data) => Some(data),
-            PendingOverlayBlockSource::Extent(object_id) => self.block_store.get(object_id),
+            PendingOverlayBlockSource::Extent(object_id) => self.local_block_backend.get(object_id),
         })
     }
 
@@ -6615,21 +6615,21 @@ impl StudioVfs {
     }
 
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
-        self.block_store.get(object_id)
+        self.local_block_backend.get(object_id)
     }
 
     async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || Ok(block_store.get(object_id))).await
     }
 
     async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || Ok(block_store.get_for_upload(object_id))).await
     }
 
     async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || {
             block_store.run_pressure_maintenance().map_err(|error| {
                 VfsError::Other(format!("block backend maintenance failed: {error}"))
@@ -6644,7 +6644,7 @@ impl StudioVfs {
         data: Bytes,
         evictable: bool,
     ) -> VfsResult<()> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || {
             block_store
                 .put(object_id, data.as_ref(), evictable)
@@ -6654,7 +6654,7 @@ impl StudioVfs {
     }
 
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || {
             block_store.sync_data().map_err(|error| {
                 VfsError::Other(format!("block backend sync_data failed: {error}"))
@@ -6664,7 +6664,7 @@ impl StudioVfs {
     }
 
     async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || {
             block_store.mark_uploaded(object_id);
             Ok(())
@@ -6673,7 +6673,7 @@ impl StudioVfs {
     }
 
     async fn block_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || {
             block_store.remove(object_id);
             Ok(())
@@ -6682,7 +6682,7 @@ impl StudioVfs {
     }
 
     async fn block_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
-        let block_store = self.block_store.clone();
+        let block_store = self.local_block_backend.clone();
         run_blocking(move || {
             block_store.remove_batch(&object_ids);
             Ok(())
@@ -7269,7 +7269,7 @@ impl StudioVfs {
 
     /// Shared reference to the local block backend contract.
     pub fn local_block_backend(&self) -> &(dyn LocalBlockBackend + 'static) {
-        self.block_store.as_ref()
+        self.local_block_backend.as_ref()
     }
 
     /// Shared reference to the fetch scheduler.
@@ -9133,7 +9133,7 @@ impl StudioVfs {
             );
         } else {
             self.block_cache.remove_sync(object_id);
-            self.block_store.remove(object_id);
+            self.local_block_backend.remove(object_id);
         }
     }
 
@@ -9584,14 +9584,14 @@ impl StudioVfs {
         let mut cached = BTreeSet::new();
         let mut missing = BTreeMap::new();
         for (object_id, block) in Self::collect_data_block_refs(plan) {
-            if self.block_store.contains(object_id) {
+            if self.local_block_backend.contains(object_id) {
                 cached.insert(object_id);
             } else {
                 missing.insert(object_id, block);
             }
         }
         for object_id in cached {
-            self.block_store.advise_will_need(object_id);
+            self.local_block_backend.advise_will_need(object_id);
         }
         if missing.is_empty() {
             return Ok(HashSet::new());
@@ -10040,7 +10040,7 @@ impl StudioVfs {
                                     error = %e,
                                     "upload failed due invalid regular-file graph, quarantining inode"
                                 );
-                                vfs.block_store.mark_upload_failed(op.object_id);
+                                vfs.local_block_backend.mark_upload_failed(op.object_id);
                                 vfs.quarantine_invalid_regular_file_graph(
                                     op.ino, attr_size, &e,
                                 );
@@ -10067,7 +10067,7 @@ impl StudioVfs {
                                     .fetch_add(1, Ordering::Relaxed);
                                 vfs.maybe_clear_deleted_inode_marker(op.ino);
                             } else {
-                                vfs.block_store.mark_upload_failed(op.object_id);
+                                vfs.local_block_backend.mark_upload_failed(op.object_id);
                                 vfs.mark_upload_sticky_error(op.ino, &e);
                                 let mut retry_op = op;
                                 retry_op.retry_count = retry_op.retry_count.saturating_add(1);
@@ -10373,7 +10373,7 @@ impl StudioVfs {
         }
 
         let t0 = Instant::now();
-        self.block_store.mark_uploading(op.object_id);
+        self.local_block_backend.mark_uploading(op.object_id);
         let fragment_keys = format_object_fragment_keys(&self.data_prefix, op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
@@ -10873,7 +10873,7 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
-            let local_backend_dirty_count = self.block_store.dirty_object_ids().len();
+            let local_backend_dirty_count = self.local_block_backend.dirty_object_ids().len();
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
 
@@ -11517,7 +11517,7 @@ impl StudioVfs {
     /// Called at shutdown so the LRU state survives across remounts.
     pub async fn persist_cache(&self) {
         self.block_cache.shutdown().await;
-        if let Err(error) = self.block_store.sync_data() {
+        if let Err(error) = self.local_block_backend.sync_data() {
             warn!(error = %error, "raw backend sync failed during shutdown");
         } else {
             tracing::info!("raw backend sync persisted");

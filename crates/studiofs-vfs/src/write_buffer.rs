@@ -979,7 +979,7 @@ impl StudioVfs {
         )? {
             return Ok(Some(data));
         }
-        Ok(self.block_store.get(object_id))
+        Ok(self.local_block_backend.get(object_id))
     }
 
     pub(super) fn install_truncated_pending_block(

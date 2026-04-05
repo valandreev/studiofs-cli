@@ -17,7 +17,7 @@ rejection criteria for future implementation work.
 - `studiofs-cache::l2_disk`
 - `studiofs-cache::lru_tracker`
 - `studiofs-cache::runtime`
-- `studiofs-cache::platform_direct_io` (its functionality is absorbed by the redesign model's BlockStore-backed data plane and bridge adapters)
+- `studiofs-cache::platform_direct_io` (its functionality is absorbed by the redesign model's local block backend data plane and bridge adapters)
 - the legacy v3 cache/runtime split as a first-class execution path, superseded by the data plane redesign model
 
 These layers may remain in the tree only as temporary migration scaffolding.

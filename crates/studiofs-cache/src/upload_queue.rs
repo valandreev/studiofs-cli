@@ -1,8 +1,8 @@
 //! Upload Queue — in-memory scheduler for pending S3 uploads.
 //!
-//! Cache v2 persists upload intent in `BlockStore` flags (`DIRTY` /
+//! Cache v2 persists upload intent in local backend lifecycle flags (`DIRTY` /
 //! transient `UPLOADING`). The queue itself is intentionally in-memory:
-//! startup replay is reconstructed from BlockStore + metadata mapping.
+//! startup replay is reconstructed from the local backend + metadata mapping.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;

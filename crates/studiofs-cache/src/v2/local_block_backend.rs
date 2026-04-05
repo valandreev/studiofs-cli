@@ -1,8 +1,8 @@
 //! Local block backend contract used by the redesigned data path.
 //!
-//! The goal is to keep VFS/data-path code independent of `BlockStore`
-//! internals while still exposing the block lifecycle states required for
-//! upload replay and transition handling.
+//! The goal is to keep VFS/data-path code independent of backend internals
+//! while still exposing the block lifecycle states required for upload replay
+//! and transition handling.
 
 use bytes::Bytes;
 use std::any::Any;

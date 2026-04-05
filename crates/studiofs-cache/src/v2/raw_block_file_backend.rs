@@ -1,10 +1,10 @@
-//! Prototype raw block file backend.
+//! Active raw block file backend.
 //!
-//! This backend keeps the `LocalBlockBackend` contract but intentionally drops
-//! the allocator, free-list, LRU, and corruption-repair machinery from
-//! [`super::block_store::BlockStore`].
+//! This backend keeps the `LocalBlockBackend` contract while using a simple
+//! append-only record file instead of the allocator/free-list/LRU machinery
+//! used by the retired cache backend.
 //!
-//! Trade-offs versus `BlockStore`:
+//! Trade-offs:
 //! - append-only log writes are simpler, and periodic maintenance can compact
 //!   dead records, but there is still no in-place allocator or free-list reuse;
 //! - the implementation is easier to reason about, but it does not provide

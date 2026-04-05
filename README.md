@@ -32,7 +32,7 @@ It is built around a local-first runtime model:
 studiofs (CLI)
   ├── studiofs-meta       local metadata + PostgreSQL delta sync
   ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      L1/L2 cache + upload queue
+  ├── studiofs-cache      local block backend + upload queue
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   └── studiofs-winfsp     Windows bridge
@@ -48,7 +48,7 @@ Key points:
 
 - S3-compatible data path via OpenDAL
 - Local-first metadata path with eventual multi-client convergence
-- Two-level cache: RAM + NVMe/disk
+- Local block backend + upload queue
 - Append-only ingress and crash recovery for accepted local writes
 - Cross-platform mounts: WinFSP on Windows, FUSE on Linux/macOS
 - Background upload, janitor, and metadata sync workers
@@ -206,8 +206,8 @@ Recent notes:
 - Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md](docs/vfs.md).
   This documents the buffered-first local overlay model, the foreground-vs-background
   fetch priority split, and the current observability counters.
-- Finalized the BlockStore-backed committed read path (SFS-139): foreground reads,
-  readahead, and upload cache rereads now use `studiofs-cache` v2 as the primary
+- Finalized the committed read path (SFS-139): foreground reads, readahead,
+  and upload cache rereads now use the raw local block backend as the primary
   committed cache, while async VFS workers route blocking local cache mutations
   through Tokio's blocking pool.
 - Reduced Windows cache-v2 growth stalls (SFS-146): the data file is marked
