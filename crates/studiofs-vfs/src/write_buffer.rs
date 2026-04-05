@@ -448,7 +448,7 @@ impl StudioVfs {
             assign_reserved_object_ids(&mut pending, ino, &mut persisted_blocks, &fresh_object_ids);
         }
 
-        // Data hits BlockStore before metadata so a successful flush/fsync only
+        // Data hits the local backend before metadata so a successful flush/fsync only
         // returns after local bytes are durable. If any pre-metadata step fails,
         // remove the cache entries again: the canonical retry source remains the
         // WriteBuffer snapshot guarded by `reserved_object_id`.

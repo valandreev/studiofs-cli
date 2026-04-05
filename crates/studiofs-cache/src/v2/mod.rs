@@ -15,7 +15,7 @@
 //! | `metrics`      | Implemented | Runtime counters, rates, throughput, pressure stats |
 
 pub mod allocator;
-pub mod block_store;
+pub(crate) mod block_store;
 pub mod evictor;
 pub mod format;
 pub mod index;
@@ -25,19 +25,22 @@ pub mod metrics;
 pub mod mmap_reader;
 mod persistence;
 pub mod platform;
+pub mod raw_block_file_backend;
 
-pub use block_store::{BlockStore, BlockStoreConfig, BlockStoreError};
 pub use index::BlockFlags;
 pub use local_block_backend::{
     LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState,
 };
+pub use raw_block_file_backend::{
+    RawBlockFileBackend, RawBlockFileBackendConfig, RawBlockFileBackendError,
+};
 use uuid::Uuid;
 
-/// Derive stable 16-byte BlockStore volume UUID from format UUID string.
+/// Derive a stable 16-byte local backend volume UUID from a format UUID string.
 ///
 /// Accepts plain UUID strings and falls back to deterministic UUIDv5 over the
 /// provided bytes so legacy/non-UUID values still map consistently.
-pub fn derive_block_store_volume_uuid(volume_uuid: &str) -> [u8; 16] {
+pub fn derive_local_backend_volume_uuid(volume_uuid: &str) -> [u8; 16] {
     Uuid::parse_str(volume_uuid)
         .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
         .into_bytes()

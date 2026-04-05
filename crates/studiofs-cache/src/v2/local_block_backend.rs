@@ -5,6 +5,7 @@
 //! upload replay and transition handling.
 
 use bytes::Bytes;
+use std::any::Any;
 
 /// Lifecycle state of a single locally persisted block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub enum LocalBlockBackendError {
 
 /// Minimal local block API required by read/write/upload paths.
 pub trait LocalBlockBackend: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
     fn get(&self, object_id: u64) -> Option<Bytes>;
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;
@@ -49,6 +51,7 @@ pub trait LocalBlockBackend: Send + Sync {
         evictable: bool,
     ) -> Result<(), LocalBlockBackendError>;
     fn sync_data(&self) -> Result<(), LocalBlockBackendError>;
+    fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError>;
 
     fn mark_uploading(&self, object_id: u64);
     fn mark_upload_failed(&self, object_id: u64);

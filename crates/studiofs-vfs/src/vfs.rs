@@ -10,13 +10,13 @@
 //! Write Path:
 //! 1. Split data into blocks
 //! 2. Merge dirty bytes into the per-file `WriteBuffer`
-//! 3. Persist full dirty blocks locally via `BlockStore::put(...)`
+//! 3. Persist full dirty blocks locally via the raw backend `put(...)`
 //! 4. `sync_data()` and persist extent metadata / attrs
 //! 5. Queue committed extents for async upload + remote publish
 //!
 //! Read Path:
 //! 1. Check the `WriteBuffer` overlay for newer local bytes
-//! 2. Resolve local metadata refs to committed local extents in `BlockStore`
+//! 2. Resolve local metadata refs to committed local extents in the local backend
 //! 3. Fall back to remote fetch
 //! 4. Validate object payload + checksum and assemble response
 
@@ -51,9 +51,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::MaterializeBatchStats;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v2::metrics::CacheMetrics;
 use studiofs_cache::v2::{
-    BlockStore, BlockStoreConfig, LocalBlockBackend, derive_block_store_volume_uuid,
+    LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig,
+    derive_local_backend_volume_uuid,
 };
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -3313,8 +3313,8 @@ pub struct StudioVfs {
     meta_async: Arc<dyn AsyncMetaEngine>,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
-    /// Cache v2 single-file store used by the foreground read path.
-    block_store: Arc<BlockStore>,
+    /// Shared local block backend used by the foreground read path.
+    block_store: Arc<dyn LocalBlockBackend>,
     /// Upload queue and pending-upload pinning for the write path.
     block_cache: Arc<BlockCache>,
     /// Block size in bytes.
@@ -4021,7 +4021,7 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().metrics()
     }
 
-    fn replay_dirty_uploads_from_block_store(
+    fn replay_dirty_uploads_from_local_backend(
         &self,
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
@@ -4149,7 +4149,7 @@ impl StudioVfs {
             self.block_cache.submit_uploads_batch(&replay_ops);
             info!(
                 replayed_dirty_blocks = replay_ops.len(),
-                restored_live_extents, "replayed dirty BlockStore blocks into upload queue"
+                restored_live_extents, "replayed dirty local backend blocks into upload queue"
             );
         }
 
@@ -4198,14 +4198,14 @@ impl StudioVfs {
                         .fetch_add(orphan_count, Ordering::Relaxed);
                     info!(
                         orphan_dirty_blocks = dirty_set.len(),
-                        "startup cleanup removed orphan dirty BlockStore entries"
+                        "startup cleanup removed orphan dirty local backend entries"
                     );
                 }
             } else {
                 warn!(
                     quarantined_inodes = quarantined_inodes.len(),
                     orphan_dirty_blocks = dirty_set.len(),
-                    "startup recovery preserved dirty BlockStore entries because invalid graphs were quarantined"
+                    "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
                 );
             }
         }
@@ -4235,12 +4235,30 @@ impl StudioVfs {
         self.record_live_extents(&live_extents);
     }
 
-    /// Create a new VFS instance.
+    /// Create a new VFS instance using the raw local block backend.
     pub fn new(
         meta: Arc<dyn MetaEngine>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: VfsConfigValidated,
+    ) -> VfsResult<Arc<Self>> {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            block_cache_l1_limit,
+            config,
+        )
+    }
+
+    fn new_impl(
+        meta: Arc<dyn MetaEngine>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        _cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>> {
@@ -4351,13 +4369,13 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let block_store = Arc::new(
-                BlockStore::open(BlockStoreConfig {
+            let volume_uuid = derive_local_backend_volume_uuid(&format_info.uuid);
+            let block_store: Arc<dyn LocalBlockBackend> = Arc::new(
+                RawBlockFileBackend::open(RawBlockFileBackendConfig {
                     cache_dir: PathBuf::from(cache_dir),
-                    max_size: cache_size,
-                    volume_uuid: derive_block_store_volume_uuid(&format_info.uuid),
+                    volume_uuid,
                 })
-                .map_err(|e| VfsError::Other(format!("failed to open block store: {e}")))?,
+                .map_err(|e| VfsError::Other(format!("failed to open raw block backend: {e}")))?,
             );
 
             // Init BlockCache upload queue state for pending write replay.
@@ -4633,7 +4651,10 @@ impl StudioVfs {
 
             let pending_uploads = vfs.block_cache.snapshot_pending_uploads();
             let attrs = vfs.sync_meta().list_inode_attrs()?;
-            vfs.replay_dirty_uploads_from_block_store(pending_uploads.as_slice(), attrs.as_slice());
+            vfs.replay_dirty_uploads_from_local_backend(
+                pending_uploads.as_slice(),
+                attrs.as_slice(),
+            );
 
             Ok(vfs)
         }
@@ -5753,7 +5774,7 @@ impl StudioVfs {
         pending_upload_index: Option<&PendingUploadIndex>,
     ) -> Option<PendingOverlayBlockSource> {
         // Stage 1 — WriteBuffer: newest local bytes not yet represented by
-        // committed BlockStore-backed metadata.
+        // committed local-backend metadata.
         if let Some(pending_block) = self
             .state
             .write_buffer
@@ -6610,8 +6631,9 @@ impl StudioVfs {
     async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
         let block_store = self.block_store.clone();
         run_blocking(move || {
-            let _ = block_store.run_pressure_maintenance();
-            Ok(())
+            block_store.run_pressure_maintenance().map_err(|error| {
+                VfsError::Other(format!("block backend maintenance failed: {error}"))
+            })
         })
         .await
     }
@@ -6634,17 +6656,17 @@ impl StudioVfs {
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {
         let block_store = self.block_store.clone();
         run_blocking(move || {
-            block_store
-                .sync_data()
-                .map_err(|error| VfsError::Other(format!("block store sync_data failed: {error}")))
+            block_store.sync_data().map_err(|error| {
+                VfsError::Other(format!("block backend sync_data failed: {error}"))
+            })
         })
         .await
     }
 
-    async fn block_store_mark_evictable_async(&self, object_id: u64) -> VfsResult<()> {
+    async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
         let block_store = self.block_store.clone();
         run_blocking(move || {
-            block_store.mark_evictable(object_id);
+            block_store.mark_uploaded(object_id);
             Ok(())
         })
         .await
@@ -7243,11 +7265,6 @@ impl StudioVfs {
     /// Shared reference to the block cache.
     pub fn block_cache(&self) -> &Arc<BlockCache> {
         &self.block_cache
-    }
-
-    /// Shared reference to the BlockStore used by foreground reads.
-    pub fn block_store(&self) -> &Arc<BlockStore> {
-        &self.block_store
     }
 
     /// Shared reference to the local block backend contract.
@@ -8982,7 +8999,7 @@ impl StudioVfs {
                     ino,
                     error = %error,
                     evicted_blocks = evicted.len(),
-                    "evict_inode: BlockStore batch removal failed"
+                        "evict_inode: local backend batch removal failed"
                 );
             }
         }
@@ -10432,7 +10449,7 @@ impl StudioVfs {
         let raw_payload: Option<Bytes> = if remote_object_visible {
             None
         } else {
-            // Hold local upload I/O slots strictly around the BlockStore reread
+            // Hold local upload I/O slots strictly around the backend reread
             // phase. This path must continue making progress during foreground
             // activity because startup replay reconstructs pending uploads from
             // metadata + persisted local blocks.
@@ -10670,7 +10687,7 @@ impl StudioVfs {
             // Treat cancellation as an intentional shutdown path:
             // do not mark sticky errors and do not trigger in-memory requeue.
             // Because `complete_upload` is not called, DIRTY state remains in
-            // BlockStore for safe startup replay on next mount.
+            // local backend for safe startup replay on next mount.
             if saw_cancel {
                 self.cancel_upload_if_inode_deleted(&op).await?;
                 return Ok(());
@@ -10778,7 +10795,7 @@ impl StudioVfs {
                 .await;
             self.block_store_remove_async(op.object_id).await?;
         } else {
-            self.block_store_mark_evictable_async(op.object_id).await?;
+            self.block_store_mark_uploaded_async(op.object_id).await?;
         }
 
         debug!(
@@ -10809,7 +10826,7 @@ impl StudioVfs {
                 break;
             }
             if let Err(error) = self.block_store_run_pressure_maintenance_async().await {
-                warn!(error = %error, "background BlockStore pressure maintenance failed");
+                warn!(error = %error, "background local backend pressure maintenance failed");
             }
             let pending = self.block_cache.pending_upload_count();
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
@@ -10856,7 +10873,7 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
-            let block_store_metrics = CacheMetrics::snapshot(self.block_store.as_ref());
+            let local_backend_dirty_count = self.block_store.dirty_object_ids().len();
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
 
@@ -11014,43 +11031,13 @@ impl StudioVfs {
                     "upload pipeline transit memory"
                 );
                 debug!(
-                    block_store_allocated_bytes = block_store_metrics.allocated_bytes,
-                    block_store_block_count = block_store_metrics.block_count,
-                    block_store_dirty_count = block_store_metrics.dirty_count,
-                    block_store_hit_count = block_store_metrics.hit_count,
-                    block_store_miss_count = block_store_metrics.miss_count,
-                    block_store_hit_rate = block_store_metrics.hit_ratio(),
-                    block_store_miss_rate = block_store_metrics.miss_ratio(),
-                    block_store_eviction_count = block_store_metrics.eviction_count,
-                    block_store_eviction_bytes = block_store_metrics.eviction_bytes,
-                    block_store_background_eviction_count =
-                        block_store_metrics.background_eviction_count,
-                    block_store_background_eviction_bytes =
-                        block_store_metrics.background_eviction_bytes,
-                    block_store_emergency_eviction_count =
-                        block_store_metrics.emergency_eviction_count,
-                    block_store_emergency_eviction_bytes =
-                        block_store_metrics.emergency_eviction_bytes,
-                    block_store_corruption_count = block_store_metrics.corruption_count,
-                    block_store_read_ops = block_store_metrics.read_ops,
-                    block_store_read_bytes = block_store_metrics.read_bytes,
-                    block_store_read_latency_max_ns = block_store_metrics.read_latency_max_ns,
-                    block_store_read_throughput_bps =
-                        block_store_metrics.read_throughput_bytes_per_sec(),
-                    block_store_read_throughput_scope = "lifetime_avg",
-                    block_store_write_ops = block_store_metrics.write_ops,
-                    block_store_write_bytes = block_store_metrics.write_bytes,
-                    block_store_write_latency_max_ns = block_store_metrics.write_latency_max_ns,
-                    block_store_write_throughput_bps =
-                        block_store_metrics.write_throughput_bytes_per_sec(),
-                    block_store_write_throughput_scope = "lifetime_avg",
-                    block_store_upload_drop_hints = block_store_metrics.advisory_dont_need_count,
+                    local_backend_dirty_count,
                     prefetch_skips = self
                         .fetch_scheduler
                         .metrics
                         .prefetch_skips
                         .load(Ordering::Relaxed),
-                    "block store and fetch counters"
+                    "local backend and fetch counters"
                 );
                 debug!(
                     upload_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,
@@ -11530,10 +11517,10 @@ impl StudioVfs {
     /// Called at shutdown so the LRU state survives across remounts.
     pub async fn persist_cache(&self) {
         self.block_cache.shutdown().await;
-        if let Err(error) = self.block_store.persist_checkpoint() {
-            warn!(error = %error, "block store checkpoint failed during shutdown");
+        if let Err(error) = self.block_store.sync_data() {
+            warn!(error = %error, "raw backend sync failed during shutdown");
         } else {
-            tracing::info!("block store checkpoint persisted");
+            tracing::info!("raw backend sync persisted");
         }
         tracing::info!("block cache checkpoint persisted");
     }
@@ -11585,7 +11572,7 @@ impl StudioVfs {
             self.decrement_active_access_class(class);
         }
 
-        // Phase 1: flush pending WriteBuffer state inline into BlockStore +
+        // Phase 1: flush pending WriteBuffer state inline into the local backend +
         // metadata so local durability is established before shutdown.
         let dirty_before = self.total_pending_write_buffer_bytes();
         info!(

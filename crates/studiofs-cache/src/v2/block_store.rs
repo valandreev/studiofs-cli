@@ -1878,6 +1878,10 @@ impl From<BlockStoreError> for LocalBlockBackendError {
 }
 
 impl LocalBlockBackend for BlockStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn get(&self, object_id: u64) -> Option<Bytes> {
         BlockStore::get(self, object_id)
     }
@@ -1909,6 +1913,11 @@ impl LocalBlockBackend for BlockStore {
 
     fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
         BlockStore::sync_data(self).map_err(Into::into)
+    }
+
+    fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+        let _ = BlockStore::run_pressure_maintenance(self);
+        Ok(())
     }
 
     fn mark_uploading(&self, object_id: u64) {
