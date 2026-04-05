@@ -67,6 +67,11 @@ The full-lifecycle tests (`*_write_read_unmount_smoke`) are the primary smoke
 tests for SFS-133. They exercise file I/O through the real OS filesystem layer,
 not just session creation.
 
+The WinFSP suite also contains post-upload/finalization cases. Those require a
+reachable S3 backend and return early when the resolved test endpoint is not
+available, which keeps the hosted Windows smoke job aligned with the documented
+dummy-endpoint contract.
+
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the
 complete smoke-test strategy, CI integration, and self-hosted runner contract.
 

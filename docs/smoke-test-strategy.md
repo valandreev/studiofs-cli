@@ -161,8 +161,13 @@ If self-hosted runners are provisioned:
   named Win32 event for external shutdown.
 - **Unmount**: the main thread signals the named event after I/O completes,
   which causes `mount_and_serve` to return cleanly.
-- **Cleanup**: the WinFSP host `stop()` + `unmount()` sequence handles driver
-  cleanup.
+- **Cleanup**: the test harness now always signals the named event and joins
+  the mount thread even if the test body panics, so one failure does not leave
+  the drive letter mounted for later cases.
+- **Online-only coverage**: the post-upload WinFSP cases run only when the
+  resolved S3 endpoint is reachable. On hosted CI without a live backend they
+  self-skip and the job still validates the basic mount/unmount and I/O smoke
+  path.
 
 ### VFS setup (shared)
 
@@ -175,8 +180,10 @@ Both platforms use the `make_test_vfs` helper:
 5. Call `vfs.start()` to spawn background workers
 
 The dummy S3 endpoint means background upload workers will fail — this is
-expected. Smoke test I/O hits the dirty buffer (memory-backed) which serves
-reads for recently written data without a live data store.
+expected for the baseline smoke path. Smoke test I/O hits the dirty buffer
+(memory-backed) which serves reads for recently written data without a live
+data store. WinFSP post-upload/finalization cases automatically upgrade to
+online coverage when a reachable S3 endpoint is configured.
 
 ---
 
