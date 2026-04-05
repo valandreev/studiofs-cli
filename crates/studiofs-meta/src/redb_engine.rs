@@ -1591,7 +1591,7 @@ impl RedbMetaEngine {
     fn publish_regular_file_overlay_to_base_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
-    ) -> MetaResult<u64> {
+    ) -> MetaResult<(u64, Vec<u64>)> {
         // Publication semantics are "overlay becomes the new remote-visible
         // base" for the inode, so base rows are reconciled to exactly match the
         // normalized overlay graph.
@@ -1609,6 +1609,24 @@ impl RedbMetaEngine {
         let mut desired_base = BTreeMap::new();
         for (chunk_id, chunk_state) in &overlay_chunks {
             desired_base.insert(*chunk_id, Self::chunk_for_published_base(chunk_state));
+        }
+
+        let mut existing_object_ids = BTreeSet::new();
+        for chunk_state in existing_base.values() {
+            for slice in chunk_state.slices.values() {
+                if let Some(block) = slice.block.as_ref() {
+                    existing_object_ids.insert(block.object_id);
+                }
+            }
+        }
+
+        let mut desired_object_ids = BTreeSet::new();
+        for chunk_state in desired_base.values() {
+            for slice in chunk_state.slices.values() {
+                if let Some(block) = slice.block.as_ref() {
+                    desired_object_ids.insert(block.object_id);
+                }
+            }
         }
 
         let mut stale_chunk_ids: BTreeSet<ChunkId> = existing_base.keys().copied().collect();
@@ -1640,8 +1658,12 @@ impl RedbMetaEngine {
         // Overlay rows are local/staging state. Once promoted to committed base,
         // clear them to avoid unbounded growth and stale finalize gates.
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
-        Ok(Self::regular_file_committed_size_from_chunks(
-            &overlay_chunks,
+        Ok((
+            Self::regular_file_committed_size_from_chunks(&overlay_chunks),
+            existing_object_ids
+                .difference(&desired_object_ids)
+                .copied()
+                .collect(),
         ))
     }
 
@@ -2703,7 +2725,11 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn clear_inode_overlay_aux_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    fn clear_inode_overlay_aux_in_txn_with_options(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        clear_regular_file_graph: bool,
+    ) -> MetaResult<()> {
         Self::remove_symlink_overlay_in_txn(txn, ino)?;
 
         let current_keys = {
@@ -2730,7 +2756,9 @@ impl RedbMetaEngine {
             Self::remove_xattr_overlay_in_txn(txn, ino, &name)?;
         }
 
-        Self::clear_regular_file_graph_in_txn(txn, ino)?;
+        if clear_regular_file_graph {
+            Self::clear_regular_file_graph_in_txn(txn, ino)?;
+        }
 
         let base_keys = {
             let txn_read = txn
@@ -2820,6 +2848,10 @@ impl RedbMetaEngine {
         }
 
         Ok(())
+    }
+
+    fn clear_inode_overlay_aux_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        Self::clear_inode_overlay_aux_in_txn_with_options(txn, ino, true)
     }
 
     #[cfg(test)]
@@ -2961,6 +2993,98 @@ impl RedbMetaEngine {
             merged.entry(block_index).or_insert(decode(value.value())?);
         }
         Ok(merged.into_iter().collect())
+    }
+
+    fn current_manifest_from_graph_rows_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        if overlay_chunks.is_empty() && base_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut size = 0u64;
+        let mut chunk_ids = BTreeSet::new();
+        chunk_ids.extend(overlay_chunks.keys().copied());
+        chunk_ids.extend(base_chunks.keys().copied());
+        for chunk_id in chunk_ids {
+            let query = SliceRange::new(0, DEFAULT_CHUNK_SIZE)
+                .ok_or_else(|| MetaError::Storage("invalid full-chunk range".to_string()))?;
+            for span in resolve_chunk_slice_spans(
+                chunk_id,
+                query,
+                overlay_chunks.get(&chunk_id),
+                base_chunks.get(&chunk_id),
+            ) {
+                if span.block.is_some() {
+                    let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+                    size = size.max(chunk_start.saturating_add(span.range.end as u64));
+                }
+            }
+        }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let spans = Self::lookup_regular_file_slices_in_write_txn(txn, ino, 0, size)?;
+        if spans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
+        let block_count = ((size.saturating_sub(1)) / block_size as u64).saturating_add(1);
+        let mut synthesized = Vec::new();
+        for idx in 0..block_count {
+            let block_index = idx as u32;
+            if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
+                ino,
+                spans.as_slice(),
+                block_index,
+                block_size,
+            )? {
+                synthesized.push((block_index, block));
+            }
+        }
+        Ok(synthesized)
+    }
+
+    fn current_or_legacy_manifest_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        match Self::current_manifest_in_txn(txn, ino) {
+            Ok(manifest) if !manifest.is_empty() => Ok(manifest),
+            Ok(_) | Err(MetaError::InodeNotFound(_)) => {
+                let graph_manifest = Self::current_manifest_from_graph_rows_in_txn(txn, ino)?;
+                if !graph_manifest.is_empty() {
+                    return Ok(graph_manifest);
+                }
+                let mut merged = std::collections::BTreeMap::new();
+                for (block_index, block) in
+                    Self::get_file_blocks_from_txn_internal(txn, FILE_BLOCKS_TABLE, ino)?
+                {
+                    merged.insert(block_index, block);
+                }
+                let committed = txn
+                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for (block_index, block) in Self::committed_manifest_in_txn(&committed, ino)? {
+                    merged.entry(block_index).or_insert(block);
+                }
+                Ok(merged.into_iter().collect())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn format_info_from_write_txn(txn: &redb::WriteTransaction) -> MetaResult<FormatInfo> {
@@ -3914,11 +4038,7 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
                     drop(committed);
-                    Self::clear_regular_file_chunk_rows_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                    )?;
+                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry { .. } => {}
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
@@ -3967,11 +4087,7 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
                     drop(committed);
-                    Self::clear_regular_file_chunk_rows_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                    )?;
+                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::SetFileBlocksBatch { .. } => {}
                 crate::events::MetaEvent::CommitFileBlock {
@@ -4689,7 +4805,11 @@ impl MetaFsOps for RedbMetaEngine {
                         attr.nlink = attr.nlink.saturating_sub(1);
                         if attr.nlink == 0 {
                             Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
-                            Self::clear_inode_overlay_aux_in_txn(&txn, dst_entry.ino)?;
+                            Self::clear_inode_overlay_aux_in_txn_with_options(
+                                &txn,
+                                dst_entry.ino,
+                                attr.kind != FileType::RegularFile,
+                            )?;
                             displaced_attr_event =
                                 Some(crate::events::MetaEvent::RemoveAttr { ino: dst_entry.ino });
                         } else {
@@ -6315,12 +6435,14 @@ impl MetaBlocks for RedbMetaEngine {
     fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
         let block_size = self.regular_file_graph_block_size()?;
         let file_size = match self.get_attr(ino) {
-            Ok(attr) => attr.size,
-            Err(MetaError::InodeNotFound(_)) => return Ok(Vec::new()),
+            Ok(attr) => Some(attr.size),
+            Err(MetaError::InodeNotFound(_)) => None,
             Err(err) => return Err(err),
         };
 
-        if file_size > 0 {
+        if let Some(file_size) = file_size
+            && file_size > 0
+        {
             let spans = self.lookup_regular_file_slices(ino, 0, file_size)?;
             if !spans.is_empty() {
                 let block_count =
@@ -6489,6 +6611,7 @@ impl MetaBlocks for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let removed_ids;
         {
+            let current_manifest = Self::current_or_legacy_manifest_in_txn(&txn, ino)?;
             let mut table = txn
                 .open_table(FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -6500,7 +6623,6 @@ impl MetaBlocks for RedbMetaEngine {
             let mut range_end = prefix.to_vec();
             *range_end.last_mut().unwrap() += 1;
 
-            // First pass: collect all block IDs
             let blocks_to_remove: Vec<(Vec<u8>, u64)> = {
                 let iter = table
                     .range(prefix.as_slice()..range_end.as_slice())
@@ -6513,16 +6635,22 @@ impl MetaBlocks for RedbMetaEngine {
                     .collect()
             };
 
-            // Extract just the IDs for return
-            removed_ids = blocks_to_remove.iter().map(|(_, id)| *id).collect();
+            let mut removed_object_ids = std::collections::BTreeSet::new();
+            for (_, block) in &current_manifest {
+                removed_object_ids.insert(block.object_id);
+            }
+            for (_, object_id) in &blocks_to_remove {
+                removed_object_ids.insert(*object_id);
+            }
+            removed_ids = removed_object_ids.into_iter().collect();
 
             // Remove all entries
             for (key, _) in &blocks_to_remove {
                 table
                     .remove(key.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let _ = committed.remove(key.as_slice());
             }
+            let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, ino)?;
 
             Self::clear_regular_file_graph_in_txn(&txn, ino)?;
 
@@ -6543,21 +6671,34 @@ impl MetaBlocks for RedbMetaEngine {
         let removed_id;
         let mut updated_attr: Option<InodeAttr> = None;
         let mut committed_manifest: Option<Vec<(u32, BlockRef)>> = None;
+        let mut updated_manifest: Option<Vec<(u32, BlockRef)>> = None;
         {
+            let mut current_manifest = Self::current_or_legacy_manifest_in_txn(&txn, ino)?;
             let mut table = txn
                 .open_table(FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut committed = txn
                 .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            removed_id = current_manifest
+                .iter()
+                .find(|(idx, _)| *idx == block_index)
+                .map(|(_, block)| block.object_id);
 
-            if let Some(entry) = table
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let block: BlockRef = decode(entry.value())?;
-                removed_id = Some(block.object_id);
-                let _ = committed.remove(key.as_slice());
+            let _ = table.remove(key.as_slice());
+            let _ = committed.remove(key.as_slice());
+
+            if removed_id.is_some() {
+                current_manifest.retain(|(idx, _)| *idx != block_index);
+                let _ = Self::remove_all_file_blocks_in_txn(&mut table, ino)?;
+                for (idx, block) in &current_manifest {
+                    let row_key = encode_file_block_key(ino, *idx);
+                    let data = encode(block)?;
+                    table
+                        .insert(row_key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                updated_manifest = Some(current_manifest.clone());
 
                 let current_committed = Self::committed_manifest_in_txn(&committed, ino)?;
                 let new_committed_size =
@@ -6595,19 +6736,15 @@ impl MetaBlocks for RedbMetaEngine {
                         &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
                     )?;
                 }
-            } else {
-                removed_id = None;
             }
         }
 
         if removed_id.is_some() {
-            let current_blocks =
-                Self::get_file_blocks_from_txn_internal(&txn, FILE_BLOCKS_TABLE, ino)?;
             Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
                 &txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 ino,
-                current_blocks.as_slice(),
+                updated_manifest.as_deref().unwrap_or(&[]),
                 block_size,
                 false,
                 true,
@@ -6918,9 +7055,7 @@ impl MetaBlocks for RedbMetaEngine {
                 ino,
             )?;
             let regular_graph_committed_size = if publish_regular_graph {
-                Some(Self::publish_regular_file_overlay_to_base_in_txn(
-                    &txn, ino,
-                )?)
+                Some(Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?.0)
             } else {
                 None
             };
@@ -7021,7 +7156,29 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let committed_size = Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+            let (committed_size, removed_object_ids) =
+                Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+            if !removed_object_ids.is_empty() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let mut pending_del_table = txn
+                    .open_table(PENDING_DELETIONS_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for object_id in removed_object_ids {
+                    pending_del_table
+                        .insert(object_id, timestamp)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::AddPendingDeletion {
+                            object_id,
+                            timestamp,
+                        },
+                    )?;
+                }
+            }
             attr.committed_size = committed_size.min(attr.size);
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;

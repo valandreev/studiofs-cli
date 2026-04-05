@@ -5714,6 +5714,7 @@ mod tests {
         let file = a
             .create_file(ROOT_INO, b"snap-peer.txt", 0, 0, 0o644)
             .expect("create file on a");
+        set_file_state(&a, file.ino, 64, 1);
         a.set_file_block(file.ino, 0, &BlockRef::new_partial(44_001, 64))
             .expect("set block");
 
@@ -5817,6 +5818,7 @@ mod tests {
         let file = a
             .create_file(ROOT_INO, b"snap-gc.txt", 0, 0, 0o644)
             .expect("create file");
+        set_file_state(&a, file.ino, 64, 1);
         a.set_file_block(file.ino, 0, &BlockRef::new_partial(55_001, 64))
             .expect("set block");
         let _snapshot = a.create_snapshot(ROOT_INO).expect("create snapshot");
