@@ -1,7 +1,9 @@
 //! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
 use std::path::Path;
-use studiofs_meta::{FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database};
+use studiofs_meta::{
+    FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database, redb_engine::RedbSnapshot,
+};
 
 fn extract_format_info_from_snapshot(snapshot_bytes: &[u8]) -> anyhow::Result<FormatInfo> {
     let value: serde_json::Value = serde_json::from_slice(snapshot_bytes)
@@ -85,6 +87,8 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> anyhow::Result<()> {
     })?;
 
     let mut format_info = extract_format_info_from_snapshot(&snapshot)?;
+    let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot)
+        .map_err(|e| anyhow::anyhow!("invalid metadata snapshot payload: {e}"))?;
     let pg = format_info
         .metadata
         .postgres
@@ -103,6 +107,7 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> anyhow::Result<()> {
     }
 
     let engine = RedbMetaEngine::open(&db_path)?;
+    engine.import_snapshot(&snapshot_state)?;
     engine.set_format_info(&format_info)?;
     let (uid, gid) = {
         #[cfg(unix)]

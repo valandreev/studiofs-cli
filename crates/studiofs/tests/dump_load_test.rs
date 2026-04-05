@@ -12,8 +12,8 @@ use studiofs_data::object::{
 };
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    BlockRef, MetaOpenOptions, ROOT_INO, ensure_studiofs_database, open_meta_engine,
-    open_meta_engine_with_options,
+    BlockRef, DEFAULT_CHUNK_SIZE, MetaOpenOptions, ROOT_INO, ensure_studiofs_database,
+    open_meta_engine, open_meta_engine_with_options,
 };
 use uuid::Uuid;
 
@@ -262,17 +262,66 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
         let attr = meta.get_attr(entry.ino).expect("get payload attr");
         assert_eq!(attr.committed_size, expected.len() as u64);
 
-        let block = meta
-            .get_file_block(entry.ino, 0)
-            .expect("get file block")
-            .expect("block 0 exists");
+        let mut spans = meta
+            .lookup_regular_file_slices(entry.ino, 0, attr.committed_size)
+            .expect("lookup committed slices");
+        spans.sort_by_key(|span| (span.chunk_id.0, span.range.start, span.range.end));
+
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let decoded = rt
-            .block_on(async {
-                get_fragmented_object(&store, &format_info.data_prefix, block.object_id).await
-            })
-            .expect("get object");
+        let mut object_cache: HashMap<u64, Bytes> = HashMap::new();
+        let mut decoded = vec![0_u8; expected.len()];
+        let mut covered = vec![false; expected.len()];
+
+        for span in spans {
+            let block = span.block.expect("committed slice must reference data");
+            let file_start = span
+                .chunk_id
+                .0
+                .saturating_mul(u64::from(DEFAULT_CHUNK_SIZE))
+                .saturating_add(u64::from(span.range.start));
+            let file_end = span
+                .chunk_id
+                .0
+                .saturating_mul(u64::from(DEFAULT_CHUNK_SIZE))
+                .saturating_add(u64::from(span.range.end));
+            let file_start = usize::try_from(file_start).expect("file start fits usize");
+            let file_end = usize::try_from(file_end).expect("file end fits usize");
+            let block_start = usize::try_from(block.offset).expect("block offset fits usize");
+            let block_len = usize::try_from(block.length).expect("block length fits usize");
+            let block_end = block_start + block_len;
+
+            assert!(
+                file_end <= expected.len(),
+                "resolved span stays within file"
+            );
+            assert_eq!(
+                file_end - file_start,
+                block_len,
+                "span length matches block length"
+            );
+
+            let object = if let Some(cached) = object_cache.get(&block.object_id) {
+                cached.clone()
+            } else {
+                let fetched = rt
+                    .block_on(async {
+                        get_fragmented_object(&store, &format_info.data_prefix, block.object_id)
+                            .await
+                    })
+                    .expect("get object");
+                object_cache.insert(block.object_id, fetched.clone());
+                fetched
+            };
+
+            decoded[file_start..file_end].copy_from_slice(&object[block_start..block_end]);
+            covered[file_start..file_end].fill(true);
+        }
+
+        assert!(
+            covered.into_iter().all(|covered| covered),
+            "committed payload spans must cover the entire file"
+        );
         assert_eq!(decoded, expected);
         drop(meta);
     }
