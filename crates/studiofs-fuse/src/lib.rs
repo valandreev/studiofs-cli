@@ -186,7 +186,55 @@ pub fn mount_and_serve(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, OnceLock};
+
     use super::{MountOptionError, build_mount_options, validate_volume_name};
+
+    fn mount_options_include_allow_other(options: &[fuser::MountOption]) -> bool {
+        options
+            .iter()
+            .any(|opt| matches!(opt, fuser::MountOption::AllowOther))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
 
     #[test]
     fn volume_name_validation_rejects_empty_or_nul() {
@@ -212,16 +260,24 @@ mod tests {
         assert!(
             options
                 .iter()
-                .any(|opt| matches!(opt, fuser::MountOption::AllowOther))
-        );
-        assert!(
-            options
-                .iter()
                 .any(|opt| matches!(opt, fuser::MountOption::AutoUnmount))
         );
+        #[cfg(target_os = "macos")]
+        assert!(mount_options_include_allow_other(&options));
+        #[cfg(target_os = "linux")]
+        assert!(!mount_options_include_allow_other(&options));
         assert!(!options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_mount_options_adds_allow_other_when_opted_in_on_linux() {
+        let _env_lock = env_lock().lock().expect("env lock");
+        let _guard = EnvVarGuard::set("STUDIOFS_FUSE_ALLOW_OTHER", "1");
+        let options = build_mount_options("studiofs", false, false).expect("options");
+        assert!(mount_options_include_allow_other(&options));
     }
 
     #[cfg(target_os = "macos")]
