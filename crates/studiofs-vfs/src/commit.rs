@@ -159,6 +159,33 @@ impl CommitCoordinator {
         }
 
         vfs.remove_live_extents_for_inode_epoch(ino, content_epoch);
+
+        // Clear any stale dirty_attr that was snapshotted before this epoch was
+        // published. dirty_attrs entries captured at write time carry
+        // committed_content_epoch=0 / committed_size=0 because the file had not
+        // been published yet. After publication those values are stale: if a
+        // subsequent flush_ordered finds this dirty_attr and the write buffer is
+        // empty it will call engine.set_attr with committed_epoch=0, reverting
+        // INODES_TABLE back to {Uploading}. That triggers a second spurious
+        // finalize_inode_epoch which (a) emits a garbage
+        // PublishFileManifest{blocks:[]} event to PG — corrupting remote nodes'
+        // COMMITTED_FILE_BLOCKS_TABLE — and (b) fires invalidate_kernel_inodes a
+        // second time, sending a file-change notification that can cause readers
+        // (e.g. media players) to abort an in-progress read.
+        //
+        // Only remove the entry when content_epoch matches to avoid dropping a
+        // dirty_attr that was written by a concurrent new write or setattr after
+        // this publication completed (those will carry a different epoch).
+        {
+            let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
+            if dirty_attrs
+                .get(&ino)
+                .is_some_and(|a| a.content_epoch == content_epoch)
+            {
+                dirty_attrs.remove(&ino);
+            }
+        }
+
         if let Ok(attr) = run_meta(
             vfs.meta_async.clone(),
             move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
@@ -169,6 +196,8 @@ impl CommitCoordinator {
         } else {
             vfs.clear_inode_incarnation(ino);
         }
+        vfs.invalidate_attr_read_cache([ino]);
+        vfs.invalidate_kernel_inodes([ino]);
 
         Ok(EpochFinalizeStatus::Published)
     }

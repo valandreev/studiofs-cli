@@ -3800,6 +3800,7 @@ dependencies = [
 name = "studiofs-winfsp"
 version = "0.1.1"
 dependencies = [
+ "dotenvy",
  "parking_lot",
  "studiofs-cache",
  "studiofs-data",

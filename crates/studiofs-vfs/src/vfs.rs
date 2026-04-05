@@ -6000,13 +6000,17 @@ impl StudioVfs {
                 upload_state: VfsUploadState::Idle,
             });
 
-        let needs_pending = previous.pending_incarnation.is_some()
+        let should_queue_finalization = Self::needs_epoch_finalization(attr);
+        let retain_previous_pending =
+            previous.pending_incarnation.is_some() && should_queue_finalization;
+
+        let needs_pending = retain_previous_pending
             || has_local_overlay
             || has_pending_uploads
             || attr.size != attr.committed_size;
 
         let next_state = if needs_pending {
-            let keep_previous_committed = previous.pending_incarnation.is_some()
+            let keep_previous_committed = retain_previous_pending
                 || (previous.committed_incarnation.is_some()
                     && previous.upload_state != VfsUploadState::Idle);
             let committed = if keep_previous_committed {
@@ -6061,7 +6065,6 @@ impl StudioVfs {
             }
         };
 
-        let should_queue_finalization = Self::needs_epoch_finalization(attr);
         states.insert(ino, next_state.clone());
         drop(states);
         if should_queue_finalization {

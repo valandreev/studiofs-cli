@@ -16,6 +16,7 @@
   "chat.tools.terminal.autoApprove": {
     "cargo clippy": true,
     "cargo test": true,
-    "git commit": true
+    "git commit": true,
+    "cargo fmt": true
   }
 }

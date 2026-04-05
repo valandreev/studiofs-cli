@@ -14,6 +14,8 @@ const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
+const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
+const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 const _: () = {
@@ -33,6 +35,8 @@ struct WinfspMountOptions {
     volume_info_timeout_ms: u32,
     sector_size: u16,
     sectors_per_allocation_unit: u16,
+    allow_open_in_kernel_mode: bool,
+    flush_and_purge_on_cleanup: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -67,6 +71,14 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         DEFAULT_VOLUME_INFO_TIMEOUT_MS,
     );
     let (sector_size, sectors_per_allocation_unit) = parse_geometry_env();
+    let allow_open_in_kernel_mode = parse_bool_env(
+        "STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE",
+        DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
+    );
+    let flush_and_purge_on_cleanup = parse_bool_env(
+        "STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP",
+        DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP,
+    );
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
@@ -75,6 +87,8 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         volume_info_timeout_ms,
         sector_size,
         sectors_per_allocation_unit,
+        allow_open_in_kernel_mode,
+        flush_and_purge_on_cleanup,
     })
 }
 
@@ -190,6 +204,36 @@ fn parse_timeout_env(key: &str, default: u32) -> u32 {
     }
 }
 
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.eq_ignore_ascii_case("1")
+                || trimmed.eq_ignore_ascii_case("true")
+                || trimmed.eq_ignore_ascii_case("yes")
+                || trimmed.eq_ignore_ascii_case("on")
+            {
+                return true;
+            }
+            if trimmed.eq_ignore_ascii_case("0")
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("no")
+                || trimmed.eq_ignore_ascii_case("off")
+            {
+                return false;
+            }
+            tracing::warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = default,
+                "invalid WinFSP boolean override; using default"
+            );
+            default
+        }
+        Err(_) => default,
+    }
+}
+
 fn apply_volume_params(
     volume_params: &mut winfsp::host::VolumeParams,
     options: &WinfspMountOptions,
@@ -205,6 +249,7 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
+    volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
 
@@ -285,8 +330,7 @@ pub fn mount_and_serve(
     volume_params.named_streams(false);
     volume_params.read_only_volume(read_only);
     volume_params.post_cleanup_when_modified_only(true);
-    // Allow kernel-mode opens — required for shell extensions (7-zip, etc.)
-    volume_params.allow_open_in_kernel_mode(true);
+    volume_params.allow_open_in_kernel_mode(options.allow_open_in_kernel_mode);
     volume_params.max_component_length(255);
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
     // WinFSP layer tuning:
@@ -427,10 +471,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
-        DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS,
-        MountOptionError, canonical_drive_mount_point, is_drive_root_mount_point,
-        mount_manager_mount_point, parse_mount_options,
+        DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
+        DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
+        DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_SECTOR_SIZE,
+        DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
+        canonical_drive_mount_point, is_drive_root_mount_point, mount_manager_mount_point,
+        parse_mount_options,
     };
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -462,6 +508,14 @@ mod tests {
         assert_eq!(
             opts.sectors_per_allocation_unit,
             DEFAULT_SECTORS_PER_ALLOCATION_UNIT
+        );
+        assert_eq!(
+            opts.allow_open_in_kernel_mode,
+            DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE
+        );
+        assert_eq!(
+            opts.flush_and_purge_on_cleanup,
+            DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
         );
     }
 
@@ -498,6 +552,48 @@ mod tests {
 
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        }
+    }
+
+    #[test]
+    fn parse_mount_options_allows_bool_overrides() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "0");
+            std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "true");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert!(!opts.allow_open_in_kernel_mode);
+        assert!(opts.flush_and_purge_on_cleanup);
+
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
+            std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
+        }
+    }
+
+    #[test]
+    fn parse_mount_options_invalid_bool_falls_back_to_default() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "maybe");
+            std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "maybe");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert_eq!(
+            opts.allow_open_in_kernel_mode,
+            DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE
+        );
+        assert_eq!(
+            opts.flush_and_purge_on_cleanup,
+            DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
+        );
+
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
+            std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
         }
     }
 

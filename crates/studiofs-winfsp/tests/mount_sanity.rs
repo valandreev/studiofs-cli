@@ -1,14 +1,67 @@
 #![cfg(windows)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use studiofs_data::store::DataStoreConfig;
+use studiofs_meta::UploadState;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
 use studiofs_vfs::{StudioVfs, VfsConfig};
 use studiofs_winfsp::mount_and_serve;
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn workspace_env_path() -> std::path::PathBuf {
+    workspace_root().join(".env")
+}
+
+fn load_test_env() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    let _ = ONCE.get_or_init(|| {
+        let env_path = workspace_env_path();
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
+    });
+}
+
+fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
+    static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    VARS.get_or_init(|| {
+        let mut vars = std::collections::HashMap::new();
+        let env_path = workspace_env_path();
+        if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
+            for item in iter.flatten() {
+                vars.insert(item.0, item.1);
+            }
+        }
+        vars
+    })
+}
+
+fn workspace_dotenv_var(key: &str) -> Option<String> {
+    workspace_dotenv_vars().get(key).cloned()
+}
+
+fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
+    load_test_env();
+    std::env::var(primary)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| workspace_dotenv_var(primary))
+        .or_else(|| workspace_dotenv_var(legacy))
+        .unwrap_or_else(|| default.to_string())
+}
 
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("winfsp-mount-test-{volume_suffix}-{}", std::process::id());
@@ -16,10 +69,26 @@ fn test_format_info(volume_suffix: &str) -> FormatInfo {
         format_version: CURRENT_FORMAT_VERSION,
         name: volume_name.clone(),
         uuid: format!("winfsp-mount-test-uuid-{volume_suffix}"),
-        endpoint: "http://127.0.0.1:9000".into(),
-        bucket: "studiofs-test".into(),
-        access_key: "test".into(),
-        secret_key: "test".into(),
+        endpoint: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            "STUDIOFS_S3_ENDPOINT",
+            "http://127.0.0.1:9000",
+        ),
+        bucket: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+            "STUDIOFS_S3_BUCKET",
+            "studiofs-test",
+        ),
+        access_key: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            "STUDIOFS_S3_ACCESS_KEY",
+            "studiofs",
+        ),
+        secret_key: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+            "STUDIOFS_S3_SECRET_KEY",
+            "studiofs123",
+        ),
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig::default(),
@@ -200,6 +269,732 @@ fn winfsp_mount_write_read_unmount_smoke() {
     std::fs::remove_file(&test_file).expect("delete through WinFSP mount");
 
     // ── Clean unmount ───────────────────────────────────────────────
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_reopen_read_after_upload_finalize_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP post-upload read smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "post_upload_read", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!("Local\\StudioFsPostUploadReadSmoke-{}", std::process::id());
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let test_file = std::path::PathBuf::from(&drive_root).join("post-upload.bin");
+    let payload = vec![0xA7u8; 12 * 1024 * 1024];
+    std::fs::write(&test_file, &payload).expect("write through WinFSP mount");
+
+    let attr = vfs_observer
+        .lookup(1, b"post-upload.bin")
+        .expect("lookup written file");
+    let upload_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr written file");
+        if vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            && current_attr.upload_state == UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < upload_deadline,
+            "WinFSP file did not reach published Ready state within 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let reopened = std::fs::read(&test_file).expect("re-open read through WinFSP mount");
+    assert_eq!(
+        reopened, payload,
+        "post-upload read-back must match written data"
+    );
+
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_copy_read_after_upload_finalize_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP post-upload copy-read smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_file = tmp.path().join("copy-source.bin");
+    let source_payload: Vec<u8> = (0..(20 * 1024 * 1024))
+        .map(|index| ((index as u64).wrapping_mul(11400714819323198485) >> 33) as u8)
+        .collect();
+    std::fs::write(&source_file, &source_payload).expect("write local source file");
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "post_upload_copy_read", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsPostUploadCopyReadSmoke-{}",
+        std::process::id()
+    );
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let target_file = std::path::PathBuf::from(&drive_root).join("copied-post-upload.bin");
+    std::fs::copy(&source_file, &target_file).expect("copy through WinFSP mount");
+
+    let attr = vfs_observer
+        .lookup(1, b"copied-post-upload.bin")
+        .expect("lookup copied file");
+    let upload_deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let current_attr = vfs_observer.getattr(attr.ino).expect("getattr copied file");
+        if vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            && current_attr.upload_state == UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < upload_deadline,
+            "copied WinFSP file did not reach published Ready state within 45 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let reopened =
+        std::fs::read(&target_file).expect("re-open read copied file through WinFSP mount");
+    assert_eq!(
+        reopened, source_payload,
+        "copied file post-upload read-back must match source payload"
+    );
+
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_set_len_chunked_write_read_after_upload_finalize_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP set-len chunked-write smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload: Vec<u8> = (0..(17 * 1024 * 1024 + 37_777))
+        .map(|index| (index as u8).wrapping_mul(19).wrapping_add(0x5D))
+        .collect();
+    let chunk_pattern = [65_553usize, 131_069, 33_791, 1_048_581, 524_311, 262_147];
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "post_upload_chunked_write", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsPostUploadChunkedWriteSmoke-{}",
+        std::process::id()
+    );
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let target_file = std::path::PathBuf::from(&drive_root).join("set-len-chunked.bin");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(true)
+        .open(&target_file)
+        .expect("open chunked target file through WinFSP mount");
+    file.set_len(payload.len() as u64)
+        .expect("pre-extend chunked target file through WinFSP mount");
+
+    let mut offset = 0usize;
+    let mut chunk_index = 0usize;
+    while offset < payload.len() {
+        let chunk_len =
+            chunk_pattern[chunk_index % chunk_pattern.len()].min(payload.len() - offset);
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(offset as u64))
+            .expect("seek chunked target file");
+        file.write_all(&payload[offset..offset + chunk_len])
+            .expect("write chunk through WinFSP mount");
+        offset += chunk_len;
+        chunk_index += 1;
+    }
+    file.sync_all()
+        .expect("sync chunked target file through WinFSP mount");
+    drop(file);
+
+    let attr = vfs_observer
+        .lookup(1, b"set-len-chunked.bin")
+        .expect("lookup chunked target file");
+    let upload_deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr chunked target file");
+        if vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            && current_attr.upload_state == UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < upload_deadline,
+            "chunked WinFSP file did not reach published Ready state within 45 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let reopened = std::fs::read(&target_file)
+        .expect("re-open read chunked file through WinFSP mount after publish");
+    assert_eq!(
+        reopened, payload,
+        "chunked file post-upload read-back must match written payload"
+    );
+
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_same_handle_read_after_upload_finalize_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP same-handle post-upload read smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload: Vec<u8> = (0..(14 * 1024 * 1024 + 8191))
+        .map(|index| (index as u8).wrapping_mul(7).wrapping_add(0x33))
+        .collect();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "post_upload_same_handle", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsPostUploadSameHandleSmoke-{}",
+        std::process::id()
+    );
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let target_file = std::path::PathBuf::from(&drive_root).join("same-handle.bin");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&target_file)
+        .expect("open same-handle file through WinFSP mount");
+    use std::io::{Read, Seek, SeekFrom, Write};
+    file.write_all(&payload)
+        .expect("write same-handle payload through WinFSP mount");
+    file.sync_all()
+        .expect("sync same-handle file through WinFSP mount");
+
+    let attr = vfs_observer
+        .lookup(1, b"same-handle.bin")
+        .expect("lookup same-handle file");
+    let upload_deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr same-handle file");
+        if vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            && current_attr.upload_state == UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < upload_deadline,
+            "same-handle WinFSP file did not reach published Ready state within 45 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .expect("seek same-handle file back to start");
+    let mut same_handle_read = Vec::new();
+    file.read_to_end(&mut same_handle_read)
+        .expect("read same-handle file after publish");
+    assert_eq!(
+        same_handle_read, payload,
+        "same-handle post-upload read-back must match written payload"
+    );
+    drop(file);
+
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_reader_open_during_upload_stays_readable_after_finalize_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP reader-open-during-upload smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload: Vec<u8> = (0..(24 * 1024 * 1024 + 123_457))
+        .map(|index| (index as u8).wrapping_mul(23).wrapping_add(0x41))
+        .collect();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "reader_open_during_upload", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsReaderOpenDuringUploadSmoke-{}",
+        std::process::id()
+    );
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let target_file = std::path::PathBuf::from(&drive_root).join("reader-open-during-upload.bin");
+    let mut writer = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&target_file)
+        .expect("open writer file through WinFSP mount");
+    use std::io::{Read, Seek, SeekFrom, Write};
+    writer
+        .write_all(&payload)
+        .expect("write payload through WinFSP mount");
+    writer
+        .sync_all()
+        .expect("sync writer file through WinFSP mount");
+
+    let attr = vfs_observer
+        .lookup(1, b"reader-open-during-upload.bin")
+        .expect("lookup reader-open-during-upload file");
+    let pending_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr reader-open-during-upload file");
+        if !vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            || current_attr.upload_state != UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pending_deadline,
+            "reader-open-during-upload file reached Ready before pending upload state was observable"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut reader = std::fs::File::open(&target_file)
+        .expect("open reader handle during pending upload through WinFSP mount");
+    let mut prefix = vec![0u8; 256 * 1024];
+    reader
+        .read_exact(&mut prefix)
+        .expect("read prefix through reader handle during pending upload");
+    assert_eq!(
+        prefix,
+        payload[..prefix.len()],
+        "reader handle must observe correct prefix while upload is still pending"
+    );
+
+    let upload_deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr reader-open-during-upload file");
+        if vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            && current_attr.upload_state == UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < upload_deadline,
+            "reader-open-during-upload file did not reach published Ready state within 45 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .expect("seek reader handle back to start after publish");
+    let mut reopened_from_existing_reader = Vec::new();
+    reader
+        .read_to_end(&mut reopened_from_existing_reader)
+        .expect("read through reader handle after publish");
+    assert_eq!(
+        reopened_from_existing_reader, payload,
+        "reader handle opened during pending upload must remain readable after publish"
+    );
+
+    drop(reader);
+    drop(writer);
+
+    signal_named_event(&event_name);
+    let result = handle.join().expect("mount thread panicked");
+    result.expect("WinFSP mount/unmount should complete");
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP mmap-reader-during-upload smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload: Vec<u8> = (0..(18 * 1024 * 1024 + 65_537))
+        .map(|index| (index as u8).wrapping_mul(29).wrapping_add(0x17))
+        .collect();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "mmap_reader_during_upload", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsMmapReaderDuringUploadSmoke-{}",
+        std::process::id()
+    );
+    let event_for_thread = event_name.clone();
+    let mp_for_thread = mount_point.clone();
+
+    let handle = std::thread::spawn(move || {
+        mount_and_serve(
+            vfs,
+            rt,
+            &mp_for_thread,
+            "StudioFS-Test",
+            true,
+            false,
+            Some(&event_for_thread),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    let drive_root = if mount_point.ends_with('\\') || mount_point.ends_with('/') {
+        mount_point.clone()
+    } else {
+        format!("{mount_point}\\")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&drive_root).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WinFSP mount at {drive_root} did not become available within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let target_file = std::path::PathBuf::from(&drive_root).join("mmap-reader-during-upload.bin");
+    std::fs::write(&target_file, &payload).expect("write mmap target through WinFSP mount");
+
+    let attr = vfs_observer
+        .lookup(1, b"mmap-reader-during-upload.bin")
+        .expect("lookup mmap-reader-during-upload file");
+    let pending_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr mmap-reader-during-upload file");
+        if !vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            || current_attr.upload_state != UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pending_deadline,
+            "mmap-reader-during-upload file reached Ready before pending upload state was observable"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
+    };
+
+    let reader = std::fs::File::open(&target_file)
+        .expect("open mmap reader handle during pending upload through WinFSP mount");
+    let mapping = unsafe {
+        CreateFileMappingW(
+            HANDLE(reader.as_raw_handle()),
+            None,
+            PAGE_READONLY,
+            0,
+            0,
+            None,
+        )
+    }
+    .expect("create read-only file mapping through WinFSP mount");
+    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, payload.len()) };
+    assert!(
+        !view.Value.is_null(),
+        "MapViewOfFile returned a null view for WinFSP mmap smoke"
+    );
+
+    let mapped = unsafe { std::slice::from_raw_parts(view.Value as *const u8, payload.len()) };
+    assert_eq!(
+        &mapped[..256 * 1024],
+        &payload[..256 * 1024],
+        "memory-mapped reader must observe correct prefix while upload is still pending"
+    );
+
+    let upload_deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let current_attr = vfs_observer
+            .getattr(attr.ino)
+            .expect("getattr mmap-reader-during-upload file");
+        if vfs_observer.pending_uploads_for_inode(attr.ino).is_empty()
+            && current_attr.upload_state == UploadState::Ready
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < upload_deadline,
+            "mmap-reader-during-upload file did not reach published Ready state within 45 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    assert_eq!(
+        mapped, payload,
+        "memory-mapped reader opened during pending upload must remain readable after publish"
+    );
+
+    unsafe {
+        UnmapViewOfFile(view).expect("unmap WinFSP mmap view");
+        CloseHandle(mapping).expect("close WinFSP mmap mapping handle");
+    }
+    drop(reader);
+
     signal_named_event(&event_name);
     let result = handle.join().expect("mount thread panicked");
     result.expect("WinFSP mount/unmount should complete");

@@ -3886,6 +3886,109 @@ fn committed_file_mutation_enters_updating_state() {
 }
 
 #[test]
+fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately() {
+    let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "60000");
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-post-publish-idle-{}", std::process::id());
+    let mut format_info = make_format_info(&volume_suffix);
+    format_info.block_size = 512 * 1024;
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x5Au8; format_info.block_size as usize * 2];
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = make_vfs_with_meta(meta.clone(), &format_info, &cache_dir_str);
+        let spy = Arc::new(SpyInvalidator::default());
+        vfs.set_kernel_invalidator(spy.clone());
+
+        let attr = vfs
+            .create(1, b"post-publish-idle.bin", 0, 0, 0o644)
+            .unwrap();
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+            })
+            .await,
+            "upload queue must populate before caching the uploading attr"
+        );
+
+        let cached = vfs.getattr(attr.ino).unwrap();
+        assert_ne!(cached.upload_state, UploadState::Ready);
+        assert!(
+            cached.committed_size < cached.size,
+            "seeded attr cache must still reflect a pending publish"
+        );
+        spy.clear();
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                meta.get_attr(attr.ino)
+                    .map(|current| current.upload_state == UploadState::Ready)
+                    .unwrap_or(false)
+            })
+            .await,
+            "metadata must publish the inode before validation"
+        );
+
+        assert!(
+            spy.snapshot().contains(&attr.ino),
+            "epoch finalization must invalidate the inode immediately"
+        );
+
+        let refreshed = vfs.getattr(attr.ino).unwrap();
+        assert_eq!(refreshed.upload_state, UploadState::Ready);
+        assert_eq!(refreshed.size, payload.len() as u64);
+        assert_eq!(refreshed.committed_size, payload.len() as u64);
+
+        let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
+        assert_eq!(state.upload_state, VfsUploadState::Idle);
+        assert!(
+            state.pending_incarnation.is_none(),
+            "published inode must not retain a pending incarnation"
+        );
+        let committed = state
+            .committed_incarnation
+            .expect("published inode must retain a committed incarnation");
+        assert_eq!(committed.size, payload.len() as u64);
+
+        vfs.shutdown(Duration::from_secs(15)).await;
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn local_reads_prefer_pending_overlay_over_committed_base() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -5187,6 +5290,137 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
             .open_file(ino, OpenFlags::RDONLY, false)
             .expect("published file should no longer look locked after restart");
         vfs.release_fh(fh).await.unwrap();
+
+        let read = vfs
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("published file should remain readable after restart");
+        assert_eq!(read.as_ref(), payload.as_slice());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn published_file_remains_readable_after_cache_wipe_and_restart() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("restart-cache-wipe-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload: Vec<u8> = (0..(format_info.block_size as usize * 3 + 12345))
+        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(17))
+        .collect();
+    let mut ino = 0u64;
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            let attr = vfs
+                .create(1, b"restart-cache-wipe.bin", 0, 0, 0o644)
+                .unwrap();
+            ino = attr.ino;
+            vfs.write(ino, 0, &payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(20), || {
+                    vfs.pending_uploads_for_inode(ino).is_empty()
+                        && meta
+                            .get_attr(ino)
+                            .map(|attr| {
+                                attr.upload_state == UploadState::Ready
+                                    && attr.committed_content_epoch == attr.content_epoch
+                            })
+                            .unwrap_or(false)
+                })
+                .await,
+                "file should fully publish before wiping local cache"
+            );
+
+            let warm_read = vfs
+                .read(ino, 0, payload.len() as u32)
+                .await
+                .expect("warm published read should succeed before cache wipe");
+            assert_eq!(warm_read.as_ref(), payload.as_slice());
+
+            vfs.shutdown(Duration::from_secs(15)).await;
+        });
+        rt.shutdown_background();
+    }
+
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir).expect("remove cache dir before cold reopen");
+    }
+    std::fs::create_dir_all(&cache_dir).expect("recreate empty cache dir before cold reopen");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let reopened = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        reopened
+            .start()
+            .expect("failed to start reopened StudioVfs background workers");
+
+        let cold_read = reopened
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("cold reopened read should fetch published remote content");
+        assert_eq!(cold_read.as_ref(), payload.as_slice());
+
+        reopened.shutdown(Duration::from_secs(15)).await;
     });
     rt.shutdown_background();
 }
