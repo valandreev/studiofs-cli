@@ -772,7 +772,7 @@ pub struct ResolvedSliceSpan {
     /// Winning slice order when the span comes from a slice.
     #[serde(default)]
     pub slice_order: Option<SliceOrder>,
-    /// Block ref backing the span, when data-bearing.
+    /// Block ref backing the span, clipped to `range` when data-bearing.
     #[serde(default)]
     pub block: Option<BlockRef>,
 }
@@ -823,12 +823,12 @@ fn push_candidate_set(
         return;
     };
     for slice in chunk.slices.values() {
-        if let Some(range) = slice.range.intersection(query) {
+        if slice.range.intersection(query).is_some() {
             out.push(ResolveCandidate {
                 tier,
                 slice_id: slice.slice_id,
                 slice_order: slice.order,
-                range,
+                range: slice.range,
                 block: slice.block.clone(),
             });
         }
@@ -906,13 +906,22 @@ pub fn resolve_chunk_slice_spans(
         for pending in unresolved {
             if let Some(overlap) = pending.intersection(candidate.range) {
                 subtract_range(pending, overlap, &mut next_unresolved);
+                let block = candidate.block.as_ref().map(|block| {
+                    let delta = overlap.start.saturating_sub(candidate.range.start);
+                    BlockRef {
+                        object_id: block.object_id,
+                        offset: block.offset.saturating_add(delta),
+                        length: overlap.len(),
+                        flags: block.flags,
+                    }
+                });
                 resolved.push(ResolvedSliceSpan {
                     chunk_id,
                     range: overlap,
                     source: candidate.source(),
                     slice_id: Some(candidate.slice_id),
                     slice_order: Some(candidate.slice_order),
-                    block: candidate.block.clone(),
+                    block,
                 });
             } else {
                 next_unresolved.push(pending);

@@ -4095,6 +4095,198 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
 }
 
 #[test]
+fn committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen() {
+    fn assert_range_matches(phase: &str, offset: usize, expected: &[u8], actual: &[u8]) {
+        if actual.len() != expected.len() {
+            panic!(
+                "{phase} length mismatch at offset={} expected_len={} actual_len={}",
+                offset,
+                expected.len(),
+                actual.len()
+            );
+        }
+
+        if let Some(relative) = expected
+            .iter()
+            .zip(actual.iter())
+            .position(|(expected_byte, actual_byte)| expected_byte != actual_byte)
+        {
+            let window_start = relative.saturating_sub(16);
+            let window_end = (relative + 16).min(expected.len());
+            panic!(
+                "{phase} first mismatch at absolute_offset={} relative_offset={} expected_byte={} actual_byte={} expected_window={:?} actual_window={:?}",
+                offset + relative,
+                relative,
+                expected[relative],
+                actual[relative],
+                &expected[window_start..window_end],
+                &actual[window_start..window_end],
+            );
+        }
+    }
+
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
+        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    }
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cold_cache_dir = tmp.path().join("cache-cold");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let cold_cache_dir_str = cold_cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("pr04-committed-random-read-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload: Vec<u8> = (0..(18 * 1024 * 1024 + 97_531))
+        .map(|index| (index as u8).wrapping_mul(17).wrapping_add(0x5B))
+        .collect();
+    let block_size = format_info.block_size as usize;
+    let read_patterns = vec![
+        (0usize, 64 * 1024usize),
+        (1024usize, 16 * 1024usize),
+        (4096usize, 32 * 1024usize),
+        (block_size - 4096, 8192usize),
+        (block_size + 513, 32 * 1024usize),
+        ((block_size * 2) - 1024, 8192usize),
+        (payload.len() - 65_536, 65_536usize),
+    ];
+
+    let ino = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let ino = rt.block_on(async {
+            let vfs = make_vfs_with_meta(meta.clone(), &format_info, &cache_dir_str);
+            let attr = vfs
+                .create(1, b"committed-random-read.bin", 0, 0, 0o644)
+                .unwrap();
+            vfs.write(attr.ino, 0, &payload).await.unwrap();
+            vfs.flush(attr.ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(30), || {
+                    meta.get_attr(attr.ino)
+                        .map(|current| {
+                            current.upload_state == UploadState::Ready
+                                && current.committed_size == payload.len() as u64
+                        })
+                        .unwrap_or(false)
+                })
+                .await,
+                "committed-random-read file must reach published Ready state"
+            );
+
+            for (offset, len) in &read_patterns {
+                let read = vfs
+                    .read(attr.ino, *offset as u64, *len as u32)
+                    .await
+                    .unwrap();
+                assert_range_matches(
+                    &format!("warm committed read mismatch len={}", len),
+                    *offset,
+                    &payload[*offset..*offset + *len],
+                    read.as_ref(),
+                );
+            }
+
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+            for (offset, len) in &read_patterns {
+                let mut buf = vec![0u8; *len];
+                let written = vfs
+                    .read_into_fh(fh, attr.ino, *offset as u64, &mut buf)
+                    .await
+                    .unwrap();
+                assert_eq!(written as usize, *len);
+                assert_range_matches(
+                    &format!("warm handle read mismatch len={}", len),
+                    *offset,
+                    &payload[*offset..*offset + *len],
+                    buf.as_slice(),
+                );
+            }
+            vfs.release_fh(fh).await.unwrap();
+            vfs.shutdown(Duration::from_secs(15)).await;
+            attr.ino
+        });
+        rt.shutdown_background();
+        ino
+    };
+
+    drop(meta);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = reopen_vfs(&db_path, &std::path::PathBuf::from(&cold_cache_dir_str));
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                vfs.getattr(ino)
+                    .map(|current| {
+                        current.upload_state == UploadState::Ready
+                            && current.committed_size == payload.len() as u64
+                    })
+                    .unwrap_or(false)
+            })
+            .await,
+            "cold reopen must observe published attr state"
+        );
+
+        for (offset, len) in &read_patterns {
+            let read = vfs.read(ino, *offset as u64, *len as u32).await.unwrap();
+            assert_range_matches(
+                &format!("cold committed read mismatch len={}", len),
+                *offset,
+                &payload[*offset..*offset + *len],
+                read.as_ref(),
+            );
+        }
+
+        let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        for (offset, len) in &read_patterns {
+            let mut buf = vec![0u8; *len];
+            let written = vfs
+                .read_into_fh(fh, ino, *offset as u64, &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(written as usize, *len);
+            assert_range_matches(
+                &format!("cold handle read mismatch len={}", len),
+                *offset,
+                &payload[*offset..*offset + *len],
+                buf.as_slice(),
+            );
+        }
+        vfs.release_fh(fh).await.unwrap();
+        vfs.shutdown(Duration::from_secs(15)).await;
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
