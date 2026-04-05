@@ -9169,6 +9169,17 @@ impl StudioVfs {
         self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         let end = (offset + size as u64).min(attr.size);
         if offset >= end {
+            if size > 0 && offset > 0 {
+                debug!(
+                    ino,
+                    offset,
+                    size,
+                    attr_size = attr.size,
+                    attr_upload_state = ?attr.upload_state,
+                    attr_committed_size = attr.committed_size,
+                    "read_ordered: early EOF (offset >= attr.size) — possible stale attr"
+                );
+            }
             return Ok(Bytes::new());
         }
         let effective_size = (end - offset) as usize;
@@ -9241,6 +9252,25 @@ impl StudioVfs {
         let read_end = (offset + buffer.len() as u64).min(attr.size);
         let read_len = read_end.saturating_sub(offset) as usize;
         if read_len == 0 {
+            if offset < (offset + buffer.len() as u64) && !buffer.is_empty() {
+                // Requested range is beyond attr.size — this is a legitimate
+                // EOF response, but warn when the request was not trivially at
+                // or past EOF so we can detect attr.size mismatches in logs.
+                let req_end = offset.saturating_add(buffer.len() as u64);
+                if req_end > 0 && attr.size < req_end {
+                    debug!(
+                        ino,
+                        offset,
+                        requested_end = req_end,
+                        attr_size = attr.size,
+                        attr_upload_state = ?attr.upload_state,
+                        attr_committed_size = attr.committed_size,
+                        attr_content_epoch = attr.content_epoch,
+                        attr_committed_content_epoch = attr.committed_content_epoch,
+                        "read_into_impl: returning 0 bytes because attr.size < requested end (possible stale attr.size)"
+                    );
+                }
+            }
             return Ok(0);
         }
         let blocks_needed = self.calculate_blocks_needed(offset, read_len, attr.size);
@@ -9604,7 +9634,14 @@ impl StudioVfs {
         let fetches = missing.into_iter().map(|(object_id, block)| async move {
             match self.fetch_block_for_ref(&block, prefetch).await {
                 Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
-                Err(crate::fetch::FetchError::NotFound { .. }) => {
+                Err(crate::fetch::FetchError::NotFound { ref key }) => {
+                    warn!(
+                        object_id,
+                        key,
+                        block_offset = block.offset,
+                        block_length = block.length,
+                        "prefetch_remote_blocks_for_plan: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
+                    );
                     Ok::<(u64, bool), VfsError>((object_id, true))
                 }
                 Err(error) => {
@@ -9630,6 +9667,12 @@ impl StudioVfs {
     fn copy_block_payload_into_range(&self, data: &[u8], block_offset: u32, dst: &mut [u8]) {
         let src_start = block_offset as usize;
         if src_start >= data.len() {
+            warn!(
+                block_offset,
+                data_len = data.len(),
+                dst_len = dst.len(),
+                "copy_block_payload_into_range: block_offset >= data.len(), zeroing dst (possible partial-block read bug)"
+            );
             dst.fill(0);
             return;
         }
@@ -9638,6 +9681,13 @@ impl StudioVfs {
             dst[..copy_len].copy_from_slice(&data[src_start..src_start + copy_len]);
         }
         if copy_len < dst.len() {
+            debug!(
+                block_offset,
+                data_len = data.len(),
+                dst_len = dst.len(),
+                copy_len,
+                "copy_block_payload_into_range: padding with zeros (partial block or short read)"
+            );
             dst[copy_len..].fill(0);
         }
     }
@@ -9666,6 +9716,11 @@ impl StudioVfs {
                 }
                 ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
                     if remote_not_found.contains(&block.object_id) {
+                        warn!(
+                            object_id = block.object_id,
+                            file_offset = span.range.start,
+                            "assemble_read_plan: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
+                        );
                         dst.fill(0);
                     } else if let Some(data) = self.block_store_get_async(block.object_id).await? {
                         self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
@@ -9678,7 +9733,17 @@ impl StudioVfs {
                                     dst,
                                 );
                             }
-                            Err(crate::fetch::FetchError::NotFound { .. }) => dst.fill(0),
+                            Err(crate::fetch::FetchError::NotFound { key }) => {
+                                warn!(
+                                    object_id = block.object_id,
+                                    key,
+                                    file_offset = span.range.start,
+                                    block_offset = block.offset,
+                                    block_length = block.length,
+                                    "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                );
+                                dst.fill(0);
+                            }
                             Err(error) => {
                                 return Err(VfsError::Fetch(error));
                             }

@@ -472,10 +472,6 @@ impl StudioVfs {
 
             let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
                 std::collections::BTreeMap::new();
-            let object_ids_by_block_index: std::collections::HashMap<u32, u64> = persisted_blocks
-                .iter()
-                .map(|persisted| (persisted.block_index, persisted.object_id))
-                .collect();
             let block_lengths_by_block_index: std::collections::HashMap<u32, usize> = persisted_blocks
                 .iter()
                 .map(|persisted| (persisted.block_index, persisted.data.len()))
@@ -514,13 +510,31 @@ impl StudioVfs {
                     });
                 }
             } else {
-                let mut covered_blocks = std::collections::HashSet::new();
-                for (chunk_id, mut slices) in dirty_chunk_slices {
+                // Dirty-chunk-slices path: validate per-write-slice invariants but
+                // emit ONE full-block SliceRecord per persisted block.
+                //
+                // Previously this path emitted per-write-slice records with partial
+                // BlockRef.offset/length pointing into the new S3 object.  That left
+                // stale slices from *earlier* objects (with different object_ids) in
+                // the overlay because the "fully_covered" pruning in
+                // flush_regular_file_overlay_slices_with_attr_txn only removes a
+                // prior slice when the incoming slice completely covers its chunk
+                // range.  A partial write slice (e.g. 1MB..1.5MB) never fully covers
+                // an old full-block slice (0..1MB), so both survive in the overlay.
+                // synthesize_block_ref_from_resolved_spans then sees two spans with
+                // different object_ids for block_index=0 and returns
+                // FragmentedBlock, quarantining the inode and making all reads
+                // return zeros.
+                //
+                // The fix: always write a single full-block SliceRecord whose
+                // BlockRef references the NEW object from offset=0 with the full
+                // persisted data length.  This guarantees the incoming slice fully
+                // covers any previous slice for the same block and the overlay
+                // stays consistent.
+                let mut validated_blocks = std::collections::HashSet::new();
+                for (_chunk_id, mut slices) in dirty_chunk_slices {
                     slices.sort_by_key(|slice| slice.seq);
                     for slice in slices {
-                        let Some(&object_id) = object_ids_by_block_index.get(&slice.block_index) else {
-                            continue;
-                        };
                         let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index) else {
                             continue;
                         };
@@ -536,29 +550,15 @@ impl StudioVfs {
                                 ),
                             )));
                         }
-                        covered_blocks.insert(slice.block_index);
-                        let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                        if block_len < self.block_size as usize {
-                            flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-                        }
-                        chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
-                            slice_id: studiofs_meta::schema::SliceId::default(),
-                            order: studiofs_meta::schema::SliceOrder::default(),
-                            range: slice.range,
-                            block: Some(studiofs_meta::schema::BlockRef {
-                                object_id,
-                                offset: block_offset,
-                                length: slice_len,
-                                flags,
-                            }),
-                            block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                        });
+                        validated_blocks.insert(slice.block_index);
                     }
                 }
+                // Write one full-block SliceRecord for every persisted block,
+                // whether or not it had dirty-chunk-slice tracking entries.
+                // The S3 object always contains the complete block payload from
+                // offset 0, so BlockRef.offset=0 and BlockRef.length=data.len()
+                // is the canonical (non-fragmented) representation.
                 for persisted in &persisted_blocks {
-                    if covered_blocks.contains(&persisted.block_index) {
-                        continue;
-                    }
                     let block_start = (persisted.block_index as u64) * (self.block_size as u64);
                     let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
                     let chunk_id = block_start / chunk_size;
