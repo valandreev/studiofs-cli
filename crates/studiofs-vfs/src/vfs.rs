@@ -2906,6 +2906,8 @@ struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
     upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    deferred_deleted_local_blocks:
+        Mutex<std::collections::HashMap<Ino, std::collections::HashSet<u64>>>,
     pending_epoch_finalizations: Mutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
     upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
@@ -2946,6 +2948,7 @@ impl UploadState {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
             upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
             pending_evictions: Mutex::new(std::collections::HashSet::new()),
+            deferred_deleted_local_blocks: Mutex::new(std::collections::HashMap::new()),
             pending_epoch_finalizations: Mutex::new(BTreeSet::new()),
             pending_epoch_finalizations_notify: tokio::sync::Notify::new(),
             upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
@@ -5237,10 +5240,34 @@ impl StudioVfs {
         }
     }
 
+    fn record_deferred_deleted_local_block(&self, ino: Ino, object_id: u64) {
+        self.state
+            .upload
+            .deferred_deleted_local_blocks
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(object_id);
+    }
+
+    fn take_deferred_deleted_local_blocks(&self, ino: Ino) -> Vec<u64> {
+        self.state
+            .upload
+            .deferred_deleted_local_blocks
+            .lock()
+            .remove(&ino)
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_default()
+    }
+
     async fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) -> VfsResult<()> {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
         self.block_cache.cancel_upload(op, !has_open_handles);
-        self.block_store_remove_async(op.object_id).await?;
+        if has_open_handles {
+            self.record_deferred_deleted_local_block(op.ino, op.object_id);
+        } else {
+            self.block_store_remove_async(op.object_id).await?;
+        }
         self.state
             .upload
             .pending_evictions
@@ -8173,10 +8200,17 @@ impl StudioVfs {
                     self.clear_pending_blocks_for_inode(ino);
                     self.evict_inode_from_caches(ino, &removed_ids).await;
                 }
+                let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
+                if !deferred_local_blocks.is_empty() {
+                    self.clear_pending_blocks_for_inode(ino);
+                    self.evict_inode_from_caches(ino, &deferred_local_blocks)
+                        .await;
+                }
                 debug!(
-                    "orphan cleanup complete: ino={} removed_blocks={} freed_bytes={}",
+                    "orphan cleanup complete: ino={} removed_blocks={} deferred_local_blocks={} freed_bytes={}",
                     ino,
                     removed_ids.len(),
+                    deferred_local_blocks.len(),
                     total_bytes
                 );
                 self.clear_inode_incarnation(ino);

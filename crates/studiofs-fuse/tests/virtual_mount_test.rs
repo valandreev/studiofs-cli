@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use studiofs_data::store::DataStoreConfig;
 use studiofs_fuse::StudioFuseFs;
 use studiofs_meta::{
@@ -9,6 +9,58 @@ use studiofs_meta::{
 use studiofs_vfs::{StudioVfs, VfsConfig};
 use tempfile::tempdir;
 
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn workspace_env_path() -> std::path::PathBuf {
+    workspace_root().join(".env")
+}
+
+fn load_test_env() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    let _ = ONCE.get_or_init(|| {
+        let env_path = workspace_env_path();
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
+    });
+}
+
+fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
+    static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    VARS.get_or_init(|| {
+        let mut vars = std::collections::HashMap::new();
+        let env_path = workspace_env_path();
+        if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
+            for item in iter.flatten() {
+                vars.insert(item.0, item.1);
+            }
+        }
+        vars
+    })
+}
+
+fn workspace_dotenv_var(key: &str) -> Option<String> {
+    workspace_dotenv_vars().get(key).cloned()
+}
+
+fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
+    load_test_env();
+    std::env::var(primary)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| workspace_dotenv_var(primary))
+        .or_else(|| workspace_dotenv_var(legacy))
+        .unwrap_or_else(|| default.to_string())
+}
+
 // NOTE: Testing StudioFuseFs directly is hard because fuser::Request is not public.
 // We test the VFS logic directly to ensure platform-specific code paths pass.
 
@@ -16,6 +68,7 @@ use tempfile::tempdir;
 fn test_macos_logic_smoke_virtual() {
     let tmp = tempdir().expect("tempdir");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    load_test_env();
 
     // 1. Setup VFS and the Bridge (StudioFuseFs)
     let db_path = tmp.path().join("meta.redb");
@@ -27,10 +80,26 @@ fn test_macos_logic_smoke_virtual() {
         format_version: CURRENT_FORMAT_VERSION,
         name: volume_name.into(),
         uuid: "virtual-smoke-uuid".into(),
-        endpoint: "http://127.0.0.1:9000".into(),
-        bucket: "studiofs-test".into(),
-        access_key: "test".into(),
-        secret_key: "test".into(),
+        endpoint: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            "STUDIOFS_S3_ENDPOINT",
+            "http://127.0.0.1:9000",
+        ),
+        bucket: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+            "STUDIOFS_S3_BUCKET",
+            "studiofs-test",
+        ),
+        access_key: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            "STUDIOFS_S3_ACCESS_KEY",
+            "studiofs",
+        ),
+        secret_key: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+            "STUDIOFS_S3_SECRET_KEY",
+            "studiofs123",
+        ),
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig::default(),

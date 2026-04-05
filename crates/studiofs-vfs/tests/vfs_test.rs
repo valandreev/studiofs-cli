@@ -815,10 +815,26 @@ fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatIn
         format_version: CURRENT_FORMAT_VERSION,
         name: name.to_string(),
         uuid: uuid.to_string(),
-        endpoint: "http://127.0.0.1:9000".to_string(),
-        bucket: "studiofs-test".to_string(),
-        access_key: "test".to_string(),
-        secret_key: "test".to_string(),
+        endpoint: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            "STUDIOFS_S3_ENDPOINT",
+            "http://127.0.0.1:9000",
+        ),
+        bucket: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+            "STUDIOFS_S3_BUCKET",
+            "studiofs-test",
+        ),
+        access_key: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            "STUDIOFS_S3_ACCESS_KEY",
+            "studiofs",
+        ),
+        secret_key: test_online_env_var(
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+            "STUDIOFS_S3_SECRET_KEY",
+            "studiofs123",
+        ),
         region: "us-east-1".to_string(),
         data_prefix: format!("{name}/objects/"),
         metadata: MetadataConfig {
@@ -3720,7 +3736,7 @@ impl ScopedTestEnv {
 }
 
 #[test]
-fn new_file_enters_uploading_state() {
+fn new_empty_file_stays_idle_without_pending_incarnation() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
@@ -3756,16 +3772,19 @@ fn new_file_enters_uploading_state() {
 
         let attr = vfs.create(1, b"pending-new.bin", 0, 0, 0o644).unwrap();
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
-        assert_eq!(state.upload_state, VfsUploadState::Uploading);
+        assert_eq!(state.upload_state, VfsUploadState::Idle);
+        let committed = state
+            .committed_incarnation
+            .expect("brand-new empty file should expose the zero-size committed base");
+        assert_eq!(committed.size, 0);
         assert!(
-            state.committed_incarnation.is_none(),
-            "brand-new file must not expose a committed incarnation yet"
+            state.pending_incarnation.is_none(),
+            "brand-new empty file must stay idle until it has local data or queued uploads"
         );
-        let pending = state
-            .pending_incarnation
-            .expect("brand-new file must enter a pending incarnation");
-        assert_eq!(pending.size, 0);
-        assert_eq!(pending.base_size, 0);
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "brand-new empty file must not enqueue uploads before any write"
+        );
     });
     rt.shutdown_background();
 }
@@ -5095,7 +5114,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn rename_into_trashes_evicts_local_cache_blocks() {
+async fn rename_into_trashes_evicts_local_block_payloads() {
     apply_test_online_s3_env();
     ensure_bucket().await;
 
@@ -5127,7 +5146,7 @@ async fn rename_into_trashes_evicts_local_cache_blocks() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_some())
         })
         .await,
-        "seeded file should be present in the local cache before trash rename"
+        "seeded file should be present in the local block backend before trash rename"
     );
 
     vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin")
@@ -5140,7 +5159,7 @@ async fn rename_into_trashes_evicts_local_cache_blocks() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_none())
         })
         .await,
-        "moving into .Trashes should evict committed cache entries promptly"
+        "moving into .Trashes should evict committed local block payloads promptly"
     );
     assert!(vfs.lookup(trash_user.ino, b"trash-me.bin").is_ok());
     assert!(vfs.lookup(1, b"trash-me.bin").is_err());
@@ -8615,7 +8634,7 @@ async fn test_write_at_exact_block_boundary_transition() {
 }
 
 #[test]
-fn flush_failure_keeps_pending_write_buffer_data() {
+fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     unsafe {
@@ -8658,36 +8677,40 @@ fn flush_failure_keeps_pending_write_buffer_data() {
         let payload = vec![0xABu8; 1024];
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
-        let err = vfs.flush(attr.ino).await.unwrap_err();
-        assert!(
-            err.to_string().contains("block store put failed"),
-            "expected block store persistence error, got: {err}"
-        );
+        vfs.flush(attr.ino).await.unwrap();
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(
             read.as_ref(),
             payload.as_slice(),
-            "flush failure must leave data readable from the pending write buffer"
+            "offline S3 must still leave flushed data readable from the local block backend"
         );
         assert!(
-            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
-            "failed flush must not publish committed live extents"
+            !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "flush should still materialize local live extents before remote upload completes"
         );
         assert!(
-            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "failed flush must not enqueue uploads"
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "offline S3 should leave the flush queued for later upload replay"
         );
-        assert!(
-            vfs.ingress_stats().dirty_mem_bytes >= payload.len(),
-            "failed flush must keep bytes accounted in the write buffer"
+        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
+        assert_eq!(state.upload_state, VfsUploadState::Updating);
+        let committed = state
+            .committed_incarnation
+            .expect("offline flush should retain the zero-size committed base incarnation");
+        assert_eq!(committed.size, 0);
+        let pending = state.pending_incarnation.expect(
+            "flushed offline file must retain a pending incarnation until upload completes",
         );
+        assert_eq!(pending.size, payload.len() as u64);
+        assert_eq!(pending.base_size, 0);
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
+fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queued() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_eager = ScopedEnvVar::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
@@ -8732,30 +8755,35 @@ fn eager_full_block_flush_failure_keeps_pending_write_buffer_data() {
         let attr = vfs.create(1, b"write-failure.bin", 0, 0, 0o644).unwrap();
         let payload = vec![0xCDu8; block_size];
 
-        let err = vfs.write(attr.ino, 0, &payload).await.unwrap_err();
-        assert!(
-            err.to_string().contains("block store put failed"),
-            "expected block store persistence error, got: {err}"
-        );
+        let written = vfs.write(attr.ino, 0, &payload).await.unwrap();
+        assert_eq!(written as usize, payload.len());
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(
             read.as_ref(),
             payload.as_slice(),
-            "failed eager flush must keep data readable from the pending write buffer"
+            "eager local persistence must keep data readable while S3 is offline"
         );
         assert!(
-            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
-            "failed eager flush must not publish committed live extents"
+            !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "eager local persistence should materialize live extents immediately"
         );
         assert!(
-            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "failed eager flush must not enqueue uploads"
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "eager local persistence should still queue remote upload work"
         );
-        assert!(
-            vfs.ingress_stats().dirty_mem_bytes >= payload.len(),
-            "failed eager flush must keep bytes accounted in the write buffer"
+        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
+        assert_eq!(state.upload_state, VfsUploadState::Updating);
+        let committed = state.committed_incarnation.expect(
+            "eager local persistence should retain the zero-size committed base incarnation",
         );
+        assert_eq!(committed.size, 0);
+        let pending = state.pending_incarnation.expect(
+            "eager local persistence must retain a pending incarnation until upload completes",
+        );
+        assert_eq!(pending.size, payload.len() as u64);
+        assert_eq!(pending.base_size, 0);
     });
     rt.shutdown_background();
 }
@@ -9895,15 +9923,15 @@ async fn test_xattr_on_directory() {
 
 /// Verify that a large file with multiple full-size blocks plus a partial tail
 /// can be read back correctly at every point in the upload lifecycle —
-/// including the window between `complete_upload` releasing the L1 pin and
-/// `commit_l2_batch` finishing the NVMe write.
+/// including the window between upload completion and the remaining local
+/// block-backend cleanup/finalization work.
 ///
-/// This extends `local_reads_through_upload_with_partial_tail_block` (SFS-123)
-/// to a larger file and validates sustained sequential reads across the
-/// complete write→flush→upload→finalize path (SFS-121).
+/// This extends `local_reads_through_upload_with_partial_tail_block` to a
+/// larger file and validates sustained sequential reads across the complete
+/// write→flush→upload→finalize path.
 #[test]
 #[ignore = "requires S3 backend and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 or valid .env"]
-fn sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
+fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
     let _env = setup_online_sfs121_env();
     unsafe {
         // Force immediate materialization and keep the upload window open.
@@ -10021,7 +10049,7 @@ fn sfs121_buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
 /// **4 MiB/s** hardens this expectation and matches the `assert!` below.
 #[test]
 #[ignore = "requires S3 backend; validates foreground throughput during background upload"]
-fn sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum() {
+fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
     let _env = setup_online_sfs121_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
@@ -10119,7 +10147,7 @@ fn sfs121_sequential_foreground_read_throughput_during_upload_meets_minimum() {
 /// exact QoS path users hit after an overwrite on Windows/macOS.
 #[test]
 #[ignore = "requires S3 backend; compares buffered foreground read baseline/during/post upload"]
-fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
+fn foreground_read_baseline_during_and_post_upload_are_comparable() {
     let _env = setup_online_sfs121_env();
     unsafe {
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
@@ -10281,7 +10309,7 @@ fn sfs121_foreground_read_baseline_during_and_post_upload_are_comparable() {
 /// Force an upload backlog and verify the uploader progresses via persisted
 /// local-block rereads instead of depending on transient staged payload state.
 #[test]
-fn sfs124_upload_backlog_progresses_via_persisted_local_block_rereads() {
+fn upload_backlog_progresses_via_persisted_local_block_rereads() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -10345,16 +10373,14 @@ fn sfs124_upload_backlog_progresses_via_persisted_local_block_rereads() {
 
 /// Validate warm-cache vs cold-cache buffered read behavior.
 ///
-/// After a write + flush, data lives in the dirty buffer (pending overlay).
-/// A first sequential read populates the L1 cache.  Subsequent reads
-/// (warm cache) must complete within a consistent bounded latency that
-/// does not regress relative to the first cold-ish read.
+/// After a write + flush, data is committed into the local block backend while
+/// remote upload remains pending. A first sequential read exercises the colder
+/// local path; subsequent reads must stay within a consistent bounded latency.
 ///
 /// This test uses an unreachable S3 endpoint so no actual upload completes;
-/// all reads are served from local buffers (pending overlay → dirty buffer →
-/// L1 memory cache).
+/// all reads are served from local state without requiring remote fetch.
 #[test]
-fn sfs121_warm_cache_sequential_read_bounded_latency_after_write() {
+fn warm_cache_sequential_read_bounded_latency_after_write() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
 
@@ -10379,7 +10405,7 @@ fn sfs121_warm_cache_sequential_read_bounded_latency_after_write() {
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
-        // First read: cold path — data served from pending overlay / dirty buffer.
+        // First read: colder local path before repeated reads warm the hot path.
         let t_cold_start = Instant::now();
         let bytes = tokio::time::timeout(
             MAX_SINGLE_READ_DURATION,
@@ -10439,7 +10465,7 @@ fn sfs121_warm_cache_sequential_read_bounded_latency_after_write() {
 /// Uses an unreachable S3 endpoint so local buffered reads must succeed
 /// independently of the upload outcome.
 #[test]
-fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
+fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
 
@@ -10592,7 +10618,7 @@ fn sfs121_mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
 }
 
 #[test]
-fn sfs125_handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
+fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
 
@@ -10677,7 +10703,7 @@ fn sfs125_handle_aware_read_policy_keeps_sequential_and_random_streams_separate(
 ///
 /// Does not require a real S3 backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sfs121_file_session_flush_ordering_is_deterministic() {
+async fn file_session_flush_ordering_is_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
     // Use a modest block size so the test runs quickly on any machine.
@@ -10954,7 +10980,7 @@ async fn test_flock_shared_then_exclusive_conflict() {
 
 // ─── 9.11 Shutdown & Drain Tests ────────────────────────────────────────────
 
-/// Shutdown after writes should drain dirty buffers and persist metadata.
+/// Shutdown after writes should drain local write buffers and persist metadata.
 /// After shutdown, blocks should be uploaded to S3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_with_pending_uploads_completes_within_bound() {
@@ -11566,9 +11592,7 @@ async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
 /// when the last block is a partial (non–block-size-aligned) tail.
 ///
 /// Covers the transient window in which a block is present in `live_extent_records`
-/// (materialized stage) but may be temporarily absent from the block cache
-/// between `complete_upload` releasing the L1 pin and `commit_l2_batch`
-/// finishing the NVMe write.
+/// while upload completion and local block-backend cleanup are interleaving.
 #[test]
 fn local_reads_through_upload_with_partial_tail_block() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");

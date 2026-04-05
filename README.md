@@ -183,7 +183,7 @@ cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 Focused buffered-first regression:
 
 ```bash
-cargo test -p studiofs-vfs --test vfs_test sfs121_foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
 ```
 
 Local development and infra-backed tests use RustFS as the default

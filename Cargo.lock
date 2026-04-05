@@ -3723,6 +3723,7 @@ name = "studiofs-fuse"
 version = "0.1.1"
 dependencies = [
  "bytes",
+ "dotenvy",
  "fuser",
  "libc",
  "parking_lot",
