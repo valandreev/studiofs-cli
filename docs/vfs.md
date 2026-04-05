@@ -7,7 +7,7 @@ path. Where the compatibility shim still exposes historical names, those are
 called out explicitly.
 
 
-- `flush()`/`fsync()` and the local `WriteBuffer -> BlockStore -> sync_data() -> metadata`
+- `flush()`/`fsync()` and the local `WriteBuffer -> local block backend -> sync_data() -> metadata`
   commit path guarantee immediate read-after-write for the same mounted client.
 - remote readers see only coarse `upload_state` (`uploading`, `updating`, `ready`).
 - remote visibility is file-version atomic via incarnation publish.
@@ -20,8 +20,8 @@ Holds all runtime state:
 |-------|------|---------|
 | `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
-| `block_store` | `Arc<BlockStore>` | Cache-v2 local data store for committed extents and upload rereads |
-| `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides BlockStore-specific internals |
+| `block_store` | `Arc<dyn LocalBlockBackend>` | Cache-v2 local data store for committed extents and upload rereads |
+| `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides backend-specific internals |
 | `block_cache` | `Arc<BlockCache>` | Narrow compatibility shim for upload-queue orchestration and pending-upload pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
@@ -65,8 +65,8 @@ the capacity limit is reached.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `meta_path` | — | Path to redb database |
-| `cache_dir` | — | Root for `BlockStore` plus compatibility cache/ingress artifacts |
-| `cache_size` | 100 GiB | `BlockStore` size budget |
+| `cache_dir` | — | Root for the local block backend plus compatibility cache/ingress artifacts |
+| `cache_size` | 100 GiB | Local block backend size budget |
 | `block_size` | 16 MiB | Chunk size (from format info); cloud transfer uses 4x4 MiB blocks |
 | `max_concurrent_uploads` | 4 | Legacy static upload knob (superseded by adaptive uploader) |
 | `readahead_width` | 128 | Base prefetch depth (dynamic readahead can ramp above this for high-velocity sequential reads) |
@@ -105,7 +105,7 @@ data arrives
   ├─ Store/merge in the per-file `WriteBuffer`
   ├─ Update local inode size and pending incarnation overlay
   └─ If enough full aligned chunks accumulate, VFS may eagerly persist the
-     coalesced batch through `BlockStore -> sync_data() -> metadata`
+    coalesced batch through the local block backend -> sync_data() -> metadata
 ```
 
 Handle-aware write path:
@@ -124,9 +124,9 @@ dirty `WriteBuffer` blocks for this inode
   │
   ├─ Take a point-in-time snapshot of dirty blocks
   ├─ Reserve/reuse per-block object IDs
-  ├─ `BlockStore::put(...)` committed payloads locally
+  ├─ local backend `put(...)` committed payloads locally
   │   using bounded chunked pipelining (not strict 1-by-1 await)
-  ├─ `BlockStore::sync_data()`
+  ├─ local backend `sync_data()`
   ├─ Persist extent metadata + attrs in local metadata
   ├─ Commit `WriteBuffer` state only for bytes that actually persisted
   └─ Enqueue uploads for the committed extents
@@ -136,7 +136,7 @@ dirty `WriteBuffer` blocks for this inode
 or environment variable `STUDIOFS_CACHE_SAFETY_MODE=fast|durable`.
 
 Local durability notes:
-- Dirty bytes stay in `WriteBuffer` until the `BlockStore -> sync_data() -> metadata` sequence succeeds; failed persists do not drain RAM ownership.
+- Dirty bytes stay in `WriteBuffer` until the local backend -> sync_data() -> metadata sequence succeeds; failed persists do not drain RAM ownership.
 - `write()` only pays that persist boundary after enough completed full-block data accumulates (`STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES`, default `32MB`) or when `flush()` / backpressure / shutdown forces the batch out.
 - Reserved object IDs make retrying the same dirty block idempotent across metadata failures.
 - `cache_safety_mode` no longer changes the foreground persistence path. Both modes use the same local durability flow.
@@ -175,7 +175,7 @@ Consumes from upload queue channel:
 Persisted extent queued
   │
   ├─ Acquire local-data I/O permits only for the local reread phase
-  ├─ Reread the committed payload from `BlockStore::get_for_upload` as the primary source
+  ├─ Reread the committed payload from `get_for_upload()` on the local backend as the primary source
   ├─ Run blocking local I/O on Tokio's blocking pool
   ├─ Reject stale op if inode/incarnation no longer match
   ├─ Split each chunk into 4 cloud blocks (up to 4 MiB each)
@@ -245,20 +245,20 @@ Adaptive upload control:
 - workers use cooperative scheduler yielding (`tokio::task::yield_now()`) periodically to avoid starving foreground tasks.
 - upload backpressure uses a foreground-read P90 speedometer on each control tick.
 - foreground-read latency pressure increases local upload I/O slot cost (AIMD-like) and adds a decaying scheduler sleep penalty.
-- adaptive sleep is applied in `process_upload` before local-data I/O permit acquisition, so disk quiet windows happen before BlockStore reads.
+- adaptive sleep is applied in `process_upload` before local-data I/O permit acquisition, so disk quiet windows happen before local backend reads.
 - when `upload_delay_ms` already slept for the current op, the pre-read adaptive sleep uses the remaining budget only:
   `effective_penalty_ms = max(adaptive_penalty_ms - waited_upload_delay_ms, 0)`.
 - upload retries inside `UploadScheduler` keep retry/backoff behavior unchanged; adaptive pre-read throttling is owned by VFS worker flow.
-- upload workers read from persisted local blocks (`BlockStore::get_for_upload`) under upload local-I/O slot gating; transient queue-side staging is not the correctness path.
+- upload workers read from persisted local blocks (`get_for_upload()` on the local backend) under upload local-I/O slot gating; transient queue-side staging is not the correctness path.
 - upload rereads emit a best-effort `DONT_NEED` advisory after successful local reread; on Linux this hint is issued for the full block span from block-aligned offset.
 - upload rereads intentionally do not update LRU recency, so upload churn does not pollute foreground read hotness.
-- recovered dirty uploads replayed from `BlockStore` flags use the same persisted-block reread flow after restart.
+- recovered dirty uploads replayed from local backend lifecycle state use the same persisted-block reread flow after restart.
 - local upload I/O slots are intentionally scoped to the local read only; they are never held during S3 waits/retries.
 - QoS acquisition failures are surfaced as a dedicated VFS error variant (`QosFailure`) that includes stage and object id context.
 - shutdown path suppresses noisy requeue/warn loops for QoS failures triggered by uploader cancellation.
 
-BlockStore pressure maintenance:
-- background maintenance applies high/low watermarks (90% / 80%) and can reclaim in bounded eviction batches for large reclaim targets.
+Local backend pressure maintenance:
+- background maintenance applies high/low watermarks (90% / 80%) and can reclaim in bounded compaction batches for large reclaim targets.
 - emergency maintenance protects local disk free space using both ratio target and absolute floor (`STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES`).
 
 Remote-visible regular-file size advances only when a full incarnation is committed
@@ -274,7 +274,7 @@ local metadata view ──┬─ dirty `WriteBuffer`
          │
          ▼
   resolve block data ─── ┌─ `WriteBuffer`
-  (first match wins)     ├─ committed local extents in `BlockStore`
+  (first match wins)     ├─ committed local extents in the local block backend
                          ├─ compatibility cache shim
   └─ FetchScheduler → S3 block fetch (parallel, per-block retry)
          │
@@ -298,7 +298,7 @@ StudioFS now uses a two-level local-data availability model for foreground reads
 
 - Stage 1 — `WriteBuffer`: dirty bytes that have not yet been committed locally,
   including newer writes that may have arrived after a point-in-time persist snapshot was taken.
-- Stage 2 — committed local storage state: extents already written to `BlockStore`
+- Stage 2 — committed local storage state: extents already written to the local block backend
   and referenced by local metadata / pending incarnation state.
 
 Notes:
@@ -338,7 +338,7 @@ Adaptive S3 block fetcher with deduplication and congestion control.
 | `AimdController` | TCP-cwnd–style concurrency limiter |
 | `DashMap<u64, broadcast::Sender>` | Singleflight dedup |
 | `DataStore` | S3 connection (read-optimized pool) |
-| `BlockStore` | Populate on fetch |
+| local block backend | Populate on fetch |
 
 ### Fetch Flow
 
@@ -480,7 +480,7 @@ TCP congestion-window–inspired adaptive concurrency limiter.
 
 When accepted local staging exceeds configured budget:
 
-1. StudioFS first tries to persist full dirty `WriteBuffer` blocks into local `BlockStore`
+1. StudioFS first tries to persist full dirty `WriteBuffer` blocks into the local block backend
 2. foreground `write()` / `flush()` can assist the local drain path when pressure remains
 3. only exhaustion of the local `WriteBuffer` budget stalls foreground writers; upload backlog alone does not trigger backpressure
 

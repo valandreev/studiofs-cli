@@ -1,7 +1,7 @@
 //! `studiofs test-cache` — benchmark the StudioFS data path.
 //!
 //! Supports:
-//! - compatibility-shim benchmark mode (`direct-shim`) for the BlockStore-backed local path
+//! - compatibility-shim benchmark mode (`direct-shim`) for the raw local path
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
 use crate::cli::test_cache_profile::TestCacheProfileSession;

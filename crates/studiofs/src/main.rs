@@ -380,6 +380,9 @@ EXAMPLES:
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
 
+  Select the raw backend explicitly:
+    studiofs mount myvolume Z: --block-backend raw-file
+
 PYROSCOPE PROFILING:
   studiofs mount myvolume /mnt/studio --profile
   studiofs mount myvolume /mnt/studio --profile=off
@@ -422,6 +425,10 @@ ACL PRINCIPAL:
         /// Principal identity used for ACL checks in this mount instance.
         #[arg(long)]
         principal: Option<String>,
+
+        /// Select the local block backend for this mount (only `raw-file` is supported).
+        #[arg(long, value_enum)]
+        block_backend: Option<cli::mount_block_backend_types::MountBlockBackendMode>,
 
         /// Run in foreground (keep terminal attached, default behavior)
         #[arg(long, conflicts_with = "detach")]
@@ -719,6 +726,7 @@ fn main() -> anyhow::Result<()> {
             cache_dir,
             cache_size,
             principal,
+            block_backend,
             foreground,
             detach,
             profile,
@@ -736,6 +744,7 @@ fn main() -> anyhow::Result<()> {
                 cache_dir.as_deref(),
                 cache_size.as_deref(),
                 principal.as_deref(),
+                block_backend,
                 foreground,
                 detach,
                 profile,
@@ -946,6 +955,28 @@ mod tests {
             }
             other => panic!("expected Mount, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mount_block_backend_parses_raw_file() {
+        let cli = parse(&["mount", "vol", "Z:", "--block-backend", "raw-file"]).unwrap();
+        match cli.command {
+            Commands::Mount { block_backend, .. } => assert!(matches!(
+                block_backend,
+                Some(cli::mount_block_backend_types::MountBlockBackendMode::RawFile)
+            )),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_block_cache_alias_is_rejected() {
+        let err = match parse(&["mount", "vol", "Z:", "--block-cache", "raw-file"]) {
+            Ok(_) => panic!("expected alias to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--block-cache"));
     }
 
     #[test]

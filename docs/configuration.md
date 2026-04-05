@@ -413,9 +413,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_WINFSP_SECTOR_SIZE` | `4096` | WinFSP exposed sector size in bytes (must be positive and fit `u16`) |
 | `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` | `1048576` | WinFSP exposed allocation unit size in bytes (must be a positive multiple of sector size) |
-| `STUDIOFS_CACHE_EMERGENCY_DISK_FREE_FLOOR_BYTES` | `1073741824` | Minimum free-space floor (bytes) enforced by Cache v2 emergency eviction (`BlockStore`) |
-| `STUDIOFS_CACHE_VERIFY_READ_CHECKSUMS` | `true` | Cache v2 read-side payload CRC32 verification. Set to `false` to skip the full-block checksum on `get()` / `read_into()` hot reads; BlockStore samples it on open, so restart the service after changing it |
-| `STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES` | `32MB` | Minimum completed full-block batch that `write()` coalesces before it pays the local `WriteBuffer -> BlockStore -> sync_data() -> metadata` durability boundary |
+| `STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES` | `32MB` | Minimum completed full-block batch that `write()` coalesces before it pays the local `WriteBuffer -> local block backend -> sync_data() -> metadata` durability boundary |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
 | `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Startup recovery policy for legacy ingress artifacts: `fast` discards them during self-heal, `durable` preserves checkpoint/state metadata. Both modes keep the same data-before-metadata persist order for each coalesced local write batch |
@@ -480,13 +478,13 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
-`block_store_read_throughput_bps` and `block_store_write_throughput_bps` are lifetime averages since the current `BlockStore` instance was opened (not short-window/EMA samples).
+Local backend read/write throughput metrics are lifetime averages since the current backend instance was opened (not short-window/EMA samples).
 
 Upload local-I/O tuning notes:
-- upload workers source payload bytes from persisted local blocks (`BlockStore::get_for_upload`) after dequeue; upload correctness does not depend on transient staged buffers.
+- upload workers source payload bytes from persisted local blocks (`get_for_upload()` on the local backend) after dequeue; upload correctness does not depend on transient staged buffers.
 - upload local-cache I/O slots are held only around that persisted reread phase and then released before remote upload work continues.
 - upload workers do not short-circuit through L1/staged payload probes; the persisted-source path is kept uniform so live uploads and startup replay share the same correctness model.
-- upload local rereads use `BlockStore::get_for_upload`, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
+- upload local rereads use `get_for_upload()` on the local backend, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.

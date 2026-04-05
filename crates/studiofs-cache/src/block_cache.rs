@@ -4,8 +4,8 @@
 //! pending-upload pinning, queue orchestration, and the small in-memory helper
 //! surface still used by benchmark and compatibility call sites. The L1 state
 //! in this shim is intentionally retained only for `test-cache` performance
-//! benchmarks and legacy compatibility; the VFS main data path uses
-//! `BlockStore` directly.
+//! benchmarks and legacy compatibility; the VFS main data path uses the local
+//! block backend directly.
 
 use bytes::Bytes;
 use parking_lot::Mutex;

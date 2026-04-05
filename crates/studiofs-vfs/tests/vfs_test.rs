@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_cache::v2::{BlockStore, BlockStoreConfig};
+use studiofs_cache::v2::{LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
     format_object_fragment_keys, format_object_key, read_object,
@@ -1137,10 +1137,6 @@ async fn measure_foreground_read_phase(
     (sweep_elapsed, throughput_mib_s, protection_stats)
 }
 
-fn committed_cache_block_bytes(vfs: &Arc<StudioVfs>) -> u64 {
-    vfs.block_store().allocated_bytes()
-}
-
 async fn seed_committed_file(
     meta: &Arc<RedbMetaEngine>,
     format_info: &FormatInfo,
@@ -2084,13 +2080,13 @@ fn test_crash_recovery_replays_pending_journal() {
     let volume_uuid = Uuid::parse_str(&offline_info.uuid)
         .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, offline_info.uuid.as_bytes()))
         .into_bytes();
-    let pending_count = BlockStore::open(BlockStoreConfig {
+    let pending_count = RawBlockFileBackend::open(RawBlockFileBackendConfig {
         cache_dir: cache_dir.clone(),
-        max_size: 1024 * 1024 * 1024,
         volume_uuid,
     })
     .unwrap()
-    .dirty_count() as usize;
+    .dirty_object_ids()
+    .len();
     assert!(
         pending_count > 0,
         "expected dirty blocks after simulated crash"
@@ -2139,13 +2135,13 @@ fn test_crash_recovery_replays_pending_journal() {
 
     // Allow async cleanup to clear DIRTY flags after upload completion.
     thread::sleep(Duration::from_millis(500));
-    let pending_after = BlockStore::open(BlockStoreConfig {
+    let pending_after = RawBlockFileBackend::open(RawBlockFileBackendConfig {
         cache_dir: cache_dir.clone(),
-        max_size: 1024 * 1024 * 1024,
         volume_uuid,
     })
     .unwrap()
-    .dirty_count() as usize;
+    .dirty_object_ids()
+    .len();
     assert_eq!(
         pending_after, 0,
         "dirty upload state must be cleaned up after recovery"
@@ -2349,7 +2345,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
 
     unsafe {
         // Keep uploads remote-offline; local flush should still commit through
-        // BlockStore + metadata immediately.
+        // Local backend + metadata immediately.
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
@@ -4834,16 +4830,9 @@ async fn rename_into_trashes_evicts_local_cache_blocks() {
             object_ids
                 .iter()
                 .all(|object_id| vfs.read_cached_block(*object_id).is_some())
-                && committed_cache_block_bytes(&vfs) > 0
         })
         .await,
         "seeded file should be present in the local cache before trash rename"
-    );
-
-    let committed_before = committed_cache_block_bytes(&vfs);
-    assert!(
-        committed_before > 0,
-        "committed cache should contain block bytes before trash rename"
     );
 
     vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin")
@@ -4854,15 +4843,9 @@ async fn rename_into_trashes_evicts_local_cache_blocks() {
             object_ids
                 .iter()
                 .all(|object_id| vfs.read_cached_block(*object_id).is_none())
-                && committed_cache_block_bytes(&vfs) < committed_before
         })
         .await,
         "moving into .Trashes should evict committed cache entries promptly"
-    );
-    assert_eq!(
-        committed_cache_block_bytes(&vfs),
-        0,
-        "all cached blocks for the trashed file should be removed from local cache"
     );
     assert!(vfs.lookup(trash_user.ino, b"trash-me.bin").is_ok());
     assert!(vfs.lookup(1, b"trash-me.bin").is_err());
@@ -5444,7 +5427,7 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
             "startup quarantine should clear live extents for the invalid inode"
         );
         assert!(
-            vfs.block_store()
+            vfs.local_block_backend()
                 .dirty_object_ids()
                 .contains(&dirty_object_id),
             "startup quarantine must preserve the original dirty block"

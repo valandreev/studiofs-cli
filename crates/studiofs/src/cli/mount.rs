@@ -329,6 +329,7 @@ pub fn run(
     cache_dir: Option<&Path>,
     cache_size: Option<&str>,
     principal: Option<&str>,
+    block_backend: Option<super::mount_block_backend_types::MountBlockBackendMode>,
     foreground: bool,
     detach: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
@@ -349,6 +350,7 @@ pub fn run(
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
+    let _ = block_backend;
 
     // Validate endpoint override before any mount operations (SFS-95)
     if let Some(ep) = endpoint {
@@ -566,7 +568,7 @@ pub fn run(
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     std::fs::create_dir_all(&base_cache_path)?;
 
-    // Cache state for this volume (BlockStore + cache metadata) lives in this UUID dir.
+    // Cache state for this volume (local backend + cache metadata) lives in this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
 
     let cache_path_str = cache_path

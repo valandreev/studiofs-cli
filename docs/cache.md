@@ -1,221 +1,22 @@
 # Cache System
 
-The cache subsystem (`studiofs-cache`) implements the BlockStore-backed local
-data plane plus the narrow compatibility shim that still fronts upload queueing
-and observability.
+The cache subsystem (`studiofs-cache`) implements the RawBlockFileBackend-backed
+local data plane plus the narrow compatibility shim that still fronts upload
+queueing and observability.
 
 There are two generations of the cache implementation:
 
 | Generation | Module | Status |
 |------------|--------|--------|
 | **v3 (legacy stack)** | `l1_mem`, `l2_disk`, `lru_tracker`, `runtime`, direct-I/O helpers | **Retired in SFS-143** |
-| **v2 (active path)** | `v2::block_store`, `v2::allocator`, `v2::format`, `v2::index`, `v2::lru` | Canonical local data store for foreground reads, local durability, and startup dirty replay |
-| **compat shim** | `block_cache`, `upload_queue` | Narrow wrapper retained for queue/observability compatibility while callers finish migrating |
-
----
-
-## Cache v2 — Single-file BlockStore
-
-> **Status:** Active and authoritative implementation.
-> Core BlockStore, allocator, intrusive LRU, in-memory BlockIndex, dirty/uploading
-> eviction gating, auto-eviction, mmap reads with generation remapping, snapshot/WAL
-> persistence, and startup recovery are implemented.
-
-Replaces the old L1/L2 split with a single `blocks.data` file managed by a native
-free-space allocator.  The OS page cache backs the file, but the canonical model
-is the BlockStore plus the compatibility shim rather than a multi-tier cache.
-
-### Cache directory layout
-
-```
-{cache_dir}/
-├── blocks.data     # single data file (all blocks)
-├── blocks.idx      # index snapshot — binary
-├── blocks.wal      # index WAL — append-only since last snapshot
-└── pins.json       # pin config — future
-```
-
-### `blocks.data` format
-
-**Superblock** (first 4 096 bytes, offset 0):
-
-| Offset | Size | Field        | Description                      |
-|--------|------|--------------|----------------------------------|
-| 0      | 8    | `magic`      | `b"STFSCA\x01\x00"`              |
-| 8      | 4    | `version`    | `1u32` (little-endian)           |
-| 12     | 4    | `page_size`  | `4096u32`                        |
-| 16     | 8    | `max_size`   | user-configured limit (bytes)    |
-| 24     | 8    | `created_at` | Unix timestamp                   |
-| 32     | 16   | `volume_uuid`| ties cache to a specific volume  |
-| 48     | 4048 | `_reserved`  | zero-filled                      |
-
-**Block record** (offset 4096+, each 4 KiB-aligned):
-
-```
-┌──────────────────────────────────────────────┐
-│ Block Header (32 bytes)                       │
-│  magic: [u8; 4]    = b"SBLK"                │
-│  flags: u8          (DIRTY=0x01, PINNED=0x02)│
-│  _reserved: [u8; 3]                          │
-│  object_id: u64                              │
-│  data_size: u32    (actual payload bytes)    │
-│  checksum: u32     (crc32fast of payload)    │
-│  _padding: [u8; 8]                           │
-├──────────────────────────────────────────────┤
-│ Payload  (data_size bytes)                    │
-├──────────────────────────────────────────────┤
-│ Padding  (to next 4 KiB boundary)            │
-└──────────────────────────────────────────────┘
-```
-
-Allocation size = `ceil((32 + data_size) / 4096) * 4096`.
-
-### FreeList allocator
-
-`v2::allocator::FreeList` — best-fit with dual BTreeMap indexes:
-
-- `by_offset: BTreeMap<u64, u64>` — O(log n) neighbour lookup for coalescing
-- `by_size: BTreeMap<(u64, u64), ()>` — O(log n) best-fit search
-
-Key behaviours:
-
-| Operation | Description |
-|-----------|-------------|
-| `allocate(size)` | Best-fit from free list; grows file by `max(size, 256 MiB)` if no fit |
-| `free(offset, size)` | Returns region, coalesces left+right neighbours, and shrinks logical file end |
-| `recover(max_size, file_end, occupied)` | Rebuilds free list from live block offsets (used by future index recovery) |
-
-File extension (`set_len`) happens under a dedicated file-growth mutex to
-prevent concurrent threads from observing an inconsistent file end.
-
-### `BlockStore` API
-
-```rust
-BlockStore::open(config)            // create or open (validates magic, version, UUID, max_size)
-BlockStore::put(id, data, evictable)// allocate + pwrite header + payload; replace if exists
-BlockStore::get(id)                 // zero-copy mmap + pread fallback + optional crc32 verify → Option<Bytes>
-BlockStore::contains(id)            // index lookup only
-BlockStore::remove(id)              // free allocation, update index
-BlockStore::remove_batch(ids)       // batched remove under single allocator lock
-BlockStore::mark_evictable(id)      // clear DIRTY + UPLOADING after S3 upload
-BlockStore::mark_uploading(id)      // set transient UPLOADING flag
-BlockStore::mark_upload_failed(id)  // clear UPLOADING, preserve DIRTY
-BlockStore::advise_will_need(id)    // best-effort read-ahead hint for a cached block
-BlockStore::sync_data()             // fdatasync
-BlockStore::close(self)             // fdatasync + snapshot + WAL clear
-// Drop impl: best-effort fdatasync on implicit drop
-```
-
-### `LocalBlockBackend` contract (SFS-159)
-
-`BlockStore` now implements a backend boundary used by the redesigned data
-path:
-
-```rust
-pub trait LocalBlockBackend: Send + Sync {
-  // read path
-  fn get(&self, object_id: u64) -> Option<Bytes>;
-  fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
-  fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;
-  fn contains(&self, object_id: u64) -> bool;
-  fn advise_will_need(&self, object_id: u64);
-
-  // write + lifecycle
-  fn put(
-    &self,
-    object_id: u64,
-    data: &[u8],
-    evictable: bool,
-  ) -> Result<(), LocalBlockBackendError>;
-  fn sync_data(&self) -> Result<(), LocalBlockBackendError>;
-
-  fn mark_uploading(&self, object_id: u64);
-  fn mark_upload_failed(&self, object_id: u64);
-  fn mark_uploaded(&self, object_id: u64); // clears DIRTY/UPLOADING in BlockStore
-
-  fn remove(&self, object_id: u64);
-  fn remove_batch(&self, object_ids: &[u64]);
-
-  fn dirty_object_ids(&self) -> Vec<u64>;
-  fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
-  fn is_evictable(&self, object_id: u64) -> bool;
-}
-```
-
-Lifecycle semantics:
-
-- `Missing` = no local block entry.
-- `Dirty` = persisted locally, needs upload.
-- `Uploading` = in-flight upload.
-- `Uploaded` = not dirty/uploading anymore.
-  This does **not** imply evictable in all backends; use `is_evictable(...)`
-  when eviction eligibility matters.
-
-Implementation notes:
-
-- `BlockIndex` is guarded by `Mutex<BlockIndex>` rather than `RwLock`: a cache
-  hit updates LRU state, so `get()` is logically mutating.
-- `MmapReader` uses atomic generation swaps so readers stay lock-free while
-  remaps publish a larger mapping after file growth, and mmap hits return
-  zero-copy `Bytes` backed by the live generation.
-- Read-side checksum verification is enabled by default and can be disabled
-  with `STUDIOFS_CACHE_VERIFY_READ_CHECKSUMS=false` when throughput matters
-  more than payload integrity checks. `BlockStore` reads the value at open, so
-  change the setting with a service restart.
-- `put()` uses a pending-allocation guard so allocation is rolled back if a
-  post-write error or unwind happens before the new index entry is published.
-- `mark_evictable()` keeps the index lock across the tiny header `pwrite` to
-  prevent disk-offset ABA reuse from corrupting a different block's header.
-- destructive mutations invalidate superseded block headers in `blocks.data`
-  so fallback recovery scans only pick up live blocks.
-- free paths issue best-effort hole-punch and `dont-need` hints, while file
-  growth issues best-effort preallocation before `set_len()`.
-- on Windows, `blocks.data` is marked sparse when possible so NTFS can extend
-  the file without synchronous zero-fill; physical growth is serialized under
-  a dedicated file-growth mutex rather than the allocator lock.
-- Windows keeps the same best-effort contract for advisory/storage hints by
-  treating common unsupported or denied Win32 responses as benign rather than
-  surfacing them as cache read/write failures.
-- emergency disk-headroom checks use a short refresh interval cache rather than
-  issuing `get_free_disk_space()` on every `put`; concurrent refreshes are
-  guarded so only one thread performs the syscall while others reuse cached
-  values.
-- physical `blocks.data` length is tracked in-memory and updated after
-  successful growth, avoiding per-allocation metadata length syscalls.
-- `get_for_upload()` intentionally avoids LRU `touch()`: upload rereads should
-  not refresh recency and displace foreground-hot entries.
-
-Error variants include `CacheFull { needed, max_size, allocated, free }` for
-fragmentation debugging and `MaxSizeShrunk` to prevent narrowing the cache
-limit on an existing file.
-
-### Index persistence
-
-`BlockStore::open()` restores metadata in three stages:
-
-1. **Fast path** — load `blocks.idx` snapshot and replay `blocks.wal`
-2. **Validation pass** — re-read each recovered block header from
-  `blocks.data` so stale snapshot entries or lost WAL tails are discarded
-3. **Crash fallback** — if the metadata files are missing or corrupt, scan
-  `blocks.data` page-by-page, validate block headers, and verify payload CRCs
-
-Snapshot and WAL records are versioned binary formats.  WAL replay ignores a
-partial trailing record so abrupt termination does not poison the whole log.
-Clean shutdown writes a fresh snapshot and truncates `blocks.wal`.
-
-WAL appends intentionally do not call `flush`/`sync_data()` on every mutation.
-That keeps `put()`/`remove()` on the sequential append fast path, but it also
-means an OS crash can lose the newest unsynced WAL tail.  Recovery treats that
-as acceptable best-effort metadata loss and repairs it via snapshot replay or
-`blocks.data` scan fallback.
-
+| **v2 (active path)** | `v2::raw_block_file_backend`, `v2::local_block_backend`, `v2::platform` | Active local block backend and shared helpers |
 ---
 
 ## Cache v2 Compatibility Shim
 
 > **Status:** Active. Legacy `l1_mem`, `l2_disk`, `lru_tracker`, and commit
 > scheduler modules were removed in SFS-143.
-> `BlockStore` (Cache v2) is the primary local-cache data plane.
+> `RawBlockFileBackend` (Cache v2) is the primary local-cache data plane.
 
 ## Architecture
 
@@ -403,7 +204,7 @@ dirty_mem + ingress_spill (12 GiB RAM + 64 GiB spill by default)
   ├─ stage_l1() for each block          ← immediate L1 insert
   ├─ stage upload payload window        ← retry-friendly transient RAM source for uploader
   ├─ Batch metadata commit (local staged refs only)
-  ├─ Persist to BlockStore              ← cache-v2 local object store
+  ├─ Persist to local block backend     ← cache-v2 local object store
   └─ submit_upload(..., content_epoch)  ← in-memory queue + S3 queue
 ```
 
@@ -411,7 +212,7 @@ The background flusher runs every 10ms and drains continuously (keeps processing
 Freshly materialized blocks seed a bounded transient upload-payload stage in RAM.
 Upload workers clone payloads from that stage first and only fall back to local
 cache rereads when the stage entry was evicted or the upload was replayed from
-`BlockStore` DIRTY state after restart. The stage budget is adaptive rather than
+local backend dirty state after restart. The stage budget is adaptive rather than
 fixed: it tracks the upload dispatch window, expands under queue pressure or
 staging misses, and contracts again when foreground pressure drops.
 
@@ -553,10 +354,10 @@ results and for each size class.
 
 On startup:
 
-1. Load the `blocks.idx` snapshot if present
-2. Replay the `blocks.wal` tail
-3. Validate recovered entries against `blocks.data`
-4. Fall back to a `blocks.data` scan if the metadata files are missing or corrupt
-5. Read dirty object ids from `BlockStore` and re-queue upload ops using metadata mapping
-6. Remove orphan dirty object ids that are no longer referenced by metadata
-7. Resume normal operation
+1. Open `blocks.raw`, creating it with a fresh header when missing.
+2. Validate the file header and replay append-only records until the first invalid or truncated tail record.
+3. Rebuild object lifecycle state from the recovered records.
+4. Resume local reads and writes from the reconstructed backend state.
+5. Run best-effort compaction when dead records accumulate.
+6. Re-queue dirty object ids from the reconstructed lifecycle state through metadata mapping.
+7. Resume normal operation.

@@ -4,9 +4,10 @@ use crate::cli::utils::format_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-use studiofs_cache::v2::format::{SUPERBLOCK_SIZE, Superblock};
-use studiofs_cache::v2::platform;
-use studiofs_cache::v2::{BlockStore, BlockStoreConfig, derive_block_store_volume_uuid};
+use studiofs_cache::v2::{
+    LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig,
+    derive_local_backend_volume_uuid,
+};
 use studiofs_meta::counters;
 #[cfg(test)]
 use uuid::Uuid;
@@ -156,34 +157,17 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
     Ok(stats)
 }
 
-fn read_block_store_max_size(cache_dir: &Path) -> anyhow::Result<Option<u64>> {
-    let data_path = cache_dir.join("blocks.data");
-    if !data_path.exists() {
-        return Ok(None);
-    }
-
-    let file = std::fs::OpenOptions::new().read(true).open(data_path)?;
-    if file.metadata()?.len() < SUPERBLOCK_SIZE {
-        return Ok(None);
-    }
-
-    let mut sb_buf = [0u8; SUPERBLOCK_SIZE as usize];
-    platform::pread(&file, &mut sb_buf, 0)?;
-    let sb = Superblock::from_bytes(&sb_buf)?;
-    Ok(Some(sb.max_size))
-}
-
 fn scan_pending_uploads(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<usize> {
-    let Some(max_size) = read_block_store_max_size(cache_dir)? else {
+    let data_path = cache_dir.join("blocks.raw");
+    if !data_path.exists() {
         return Ok(0);
     };
 
-    let store = BlockStore::open(BlockStoreConfig {
+    let store = RawBlockFileBackend::open(RawBlockFileBackendConfig {
         cache_dir: cache_dir.to_path_buf(),
-        max_size,
-        volume_uuid: derive_block_store_volume_uuid(volume_uuid),
+        volume_uuid: derive_local_backend_volume_uuid(volume_uuid),
     })?;
-    Ok(store.dirty_count() as usize)
+    Ok(store.dirty_object_ids().len())
 }
 
 pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Result<()> {
@@ -313,12 +297,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_pending_uploads_uses_block_store_dirty_flags() {
+    fn scan_pending_uploads_uses_raw_backend_dirty_flags() {
         let tmp = tempfile::tempdir().unwrap();
         let volume_uuid = Uuid::new_v4();
-        let store = BlockStore::open(BlockStoreConfig {
+        let store = RawBlockFileBackend::open(RawBlockFileBackendConfig {
             cache_dir: tmp.path().to_path_buf(),
-            max_size: 4 * 1024 * 1024,
             volume_uuid: volume_uuid.into_bytes(),
         })
         .unwrap();

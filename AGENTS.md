@@ -234,14 +234,14 @@ test: add destroy tests fixes
 
 ### Data Flow
 
-1. **Write Path**: Application → per-file `WriteBuffer` → `BlockStore::put` → `sync_data()` → local extent metadata → upload queue
+1. **Write Path**: Application → per-file `WriteBuffer` → local block backend → `sync_data()` → local extent metadata → upload queue
 2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
 3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
 
 ### Cache v2 Note
 
 - The legacy `L2DiskCache` stack has been retired.
-- `BlockStore` is the canonical local cache implementation.
+- `RawBlockFileBackend` is the active local block backend implementation.
 - `BlockCache` is now a compatibility shim (upload queue + lightweight hot payload staging).
 
 ### Environment Variables
@@ -347,7 +347,7 @@ fn new(
 ### Key Patterns
 
 1. **State access**: Use `self.state.subsystem.field` instead of direct fields on `VfsState`
-2. **Lock release before IO**: Always release mutex locks before performing BlockStore writes, metadata flushes, file deletions, or ingress artifact cleanup
-3. **Batch operations**: Prefer batch BlockStore / metadata operations when draining `WriteBuffer`; avoid per-block IO while holding hot locks
+2. **Lock release before IO**: Always release mutex locks before performing local block backend writes, metadata flushes, file deletions, or ingress artifact cleanup
+3. **Batch operations**: Prefer batch local block backend / metadata operations when draining `WriteBuffer`; avoid per-block IO while holding hot locks
 4. **Atomic ordering**: Use `Release`/`Acquire` for critical data (throttling metrics), `Relaxed` for non-critical counters
 5. **notify_waiters outside lock**: Always call `notify_waiters()` after releasing the mutex to avoid lock contention

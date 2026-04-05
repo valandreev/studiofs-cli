@@ -6,12 +6,12 @@ StudioFS mounts S3-compatible object storage as a local filesystem with a
 local-first chunk/slice/block data plane and eventual multi-client convergence.
 
 Core principles:
-- Foreground metadata operations read and write local `redb`; foreground payload durability flows through the local `BlockStore`.
+- Foreground metadata operations read and write local `redb`; foreground payload durability flows through the local block backend.
 - PostgreSQL is the shared replication bus and checkpoint store, not the hot read path.
 - File payloads live in immutable blocks addressed by chunk-relative slices; each 16 MiB chunk currently fans out into four 4 MiB block objects.
 - Runtime file visibility is split into local-visible overlay state and remote-visible base state.
 - Regular files now use chunk-local overlay/base slice graphs in metadata, not a flat block table.
-- Local `BlockStore` is the canonical local data store; the remaining cache helpers are only a narrow compatibility shim around upload orchestration.
+- `RawBlockFileBackend` is the active local data store; the remaining cache helpers are only a narrow compatibility shim around upload orchestration.
 - The canonical chunk/slice/block vocabulary for follow-up work is frozen in
   [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
 - The execution guardrails and implementation order for the data plane redesign are
@@ -28,7 +28,7 @@ Core principles:
 studiofs (CLI)
   ├── studiofs-meta       local metadata + PostgreSQL delta sync
   ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      BlockStore + upload queue compatibility shim
+  ├── studiofs-cache      local block backend + upload queue compatibility shim
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   └── studiofs-winfsp     Windows bridge
@@ -61,8 +61,8 @@ Core invariants:
 
 1. App calls a VFS mutation.
 2. StudioFS updates local metadata in `redb`.
-3. File payload lands in the per-file `WriteBuffer`; full chunk-aligned writes may be eagerly persisted to local `BlockStore` and extent metadata.
-4. `flush(ino)` / `fsync(ino)` / `close(ino)` drain dirty `WriteBuffer` chunks through coalesced `BlockStore::put(...) -> sync_data() -> metadata` batches, then enqueue uploads.
+3. File payload lands in the per-file `WriteBuffer`; full chunk-aligned writes may be eagerly persisted to the local block backend and extent metadata.
+4. `flush(ino)` / `fsync(ino)` / `close(ino)` drain dirty `WriteBuffer` chunks through coalesced local backend `put(...) -> sync_data() -> metadata` batches, then enqueue uploads.
 5. Background workers upload each committed chunk as four independent block objects.
 6. Upload completion advances pending incarnations; remote visibility is updated only on successful incarnation publish.
 7. Metadata background flush projects committed incarnation and `upload_state` to PostgreSQL `event_log`.
@@ -73,8 +73,8 @@ Core invariants:
 
 1. Split incoming data into chunks.
 2. Merge bytes into the per-file `WriteBuffer`.
-3. Full chunk-aligned writes may be eagerly committed locally through `BlockStore` + metadata, while partial tails stay in RAM.
-4. `flush()` / `fsync()` / `close()` transactionally persist remaining dirty chunks and attrs via coalesced `BlockStore::put(...) -> sync_data() -> metadata -> upload queue` batches.
+3. Full chunk-aligned writes may be eagerly committed locally through the local block backend + metadata, while partial tails stay in RAM.
+4. `flush()` / `fsync()` / `close()` transactionally persist remaining dirty chunks and attrs via coalesced local backend `put(...) -> sync_data() -> metadata -> upload queue` batches.
 5. On publish, update the remote committed incarnation and `committed_size`.
 
 This lets the local client read accepted data immediately, while remote clients
@@ -84,13 +84,13 @@ still observe committed incarnations as they become published.
 
 Reads prefer local state in this order:
 1. `WriteBuffer`
-2. committed local extents / committed file blocks backed by `BlockStore`
+2. committed local extents / committed file blocks backed by the local block backend
 3. compatibility cache shim
 4. S3 fetch
 
 Historical ingress artifacts note:
 - `cache_safety_mode=durable` still preserves ingress checkpoint/state metadata
-  for startup recovery of pre-BlockStore artifacts.
+  for startup recovery of legacy ingress artifacts.
 - `cache_safety_mode=fast` discards those artifacts during startup self-heal.
 
 Metadata lookups are served from local `redb`, where local staged blocks
