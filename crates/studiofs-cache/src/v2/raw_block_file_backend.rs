@@ -16,9 +16,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tracing::warn;
 
 use super::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
@@ -72,14 +76,18 @@ struct RawBlockEntry {
 
 #[derive(Debug)]
 struct RawBlockFileState {
+    file: Arc<File>,
+    reserved_len: Arc<AtomicU64>,
     file_len: u64,
     entries: HashMap<u64, RawBlockEntry>,
     dirty_order: VecDeque<u64>,
 }
 
 impl RawBlockFileState {
-    fn new(file_len: u64) -> Self {
+    fn new(file: Arc<File>, file_len: u64) -> Self {
         Self {
+            file,
+            reserved_len: Arc::new(AtomicU64::new(file_len)),
             file_len,
             entries: HashMap::new(),
             dirty_order: VecDeque::new(),
@@ -148,8 +156,7 @@ impl RawBlockFileState {
 pub struct RawBlockFileBackend {
     path: PathBuf,
     volume_uuid: [u8; 16],
-    file: Mutex<File>,
-    state: Mutex<RawBlockFileState>,
+    state: RwLock<RawBlockFileState>,
 }
 
 impl RawBlockFileBackend {
@@ -157,23 +164,24 @@ impl RawBlockFileBackend {
     pub fn open(config: RawBlockFileBackendConfig) -> Result<Self, RawBlockFileBackendError> {
         std::fs::create_dir_all(&config.cache_dir)?;
         let path = config.cache_dir.join(DATA_FILE_NAME);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?,
+        );
 
         let file_len = file.metadata()?.len();
         if file_len == 0 {
             write_file_header(&file, config.volume_uuid)?;
             platform::fdatasync(&file)?;
-            let state = RawBlockFileState::new(FILE_HEADER_SIZE as u64);
+            let state = RawBlockFileState::new(file.clone(), FILE_HEADER_SIZE as u64);
             return Ok(Self {
                 path,
                 volume_uuid: config.volume_uuid,
-                file: Mutex::new(file),
-                state: Mutex::new(state),
+                state: RwLock::new(state),
             });
         }
 
@@ -182,39 +190,38 @@ impl RawBlockFileBackend {
             return Err(RawBlockFileBackendError::VolumeUuidMismatch);
         }
 
-        let state = load_state(&file, file_len)?;
+        let state = load_state(file.clone(), file_len)?;
         Ok(Self {
             path,
             volume_uuid: config.volume_uuid,
-            file: Mutex::new(file),
-            state: Mutex::new(state),
+            state: RwLock::new(state),
         })
     }
 
     fn append_record(
         &self,
-        state: &mut RawBlockFileState,
+        file: Arc<File>,
+        reserved_len: Arc<AtomicU64>,
         header: [u8; RECORD_HEADER_SIZE],
         body: Option<&[u8]>,
     ) -> Result<u64, LocalBlockBackendError> {
-        let offset = state.file_len;
-        let file = self.file.lock();
+        let body_len = body.map_or(0_u64, |bytes| bytes.len() as u64);
+        let record_len = RECORD_HEADER_SIZE as u64 + body_len;
+        let offset = reserved_len.fetch_add(record_len, Ordering::SeqCst);
+
+        let _ = platform::preallocate(&file, offset, record_len);
         if let Some(body) = body {
             platform::pwrite(&file, body, offset + RECORD_HEADER_SIZE as u64)?;
-            platform::fdatasync(&file)?;
         }
         platform::pwrite(&file, &header, offset)?;
-        let body_len = body.map_or(0_u64, |bytes| bytes.len() as u64);
-        let new_len = offset + RECORD_HEADER_SIZE as u64 + body_len;
-        file.set_len(new_len)?;
-        platform::fdatasync(&file)?;
-        state.file_len = new_len;
         Ok(offset)
     }
 
     fn read_payload(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
-        let state = self.state.lock();
-        let entry = *state.entries.get(&object_id)?;
+        let (file, entry) = {
+            let state = self.state.read();
+            (state.file.clone(), *state.entries.get(&object_id)?)
+        };
         let start = u64::try_from(data_offset).ok()?;
         if start >= entry.data_len {
             return Some(0);
@@ -225,7 +232,6 @@ impl RawBlockFileBackend {
             return Some(0);
         }
         let offset = entry.data_offset + start;
-        let file = self.file.lock();
         if let Err(error) = platform::pread(&file, &mut out[..to_read], offset) {
             warn!(
                 object_id,
@@ -286,17 +292,19 @@ impl RawBlockFileBackend {
         ordered_object_ids.extend(remaining);
 
         let temp_path = self.compact_path();
-        let temp_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
+        let temp_file = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?,
+        );
         write_file_header(&temp_file, self.volume_uuid)
             .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
 
-        let file = self.file.lock();
-        let mut new_state = RawBlockFileState::new(FILE_HEADER_SIZE as u64);
+        let current_file = state.file.clone();
+        let mut new_state = RawBlockFileState::new(temp_file.clone(), FILE_HEADER_SIZE as u64);
         for object_id in ordered_object_ids {
             let entry = *state.entries.get(&object_id).ok_or_else(|| {
                 LocalBlockBackendError::Io(io::Error::new(
@@ -312,7 +320,7 @@ impl RawBlockFileBackend {
             })?;
             let mut payload = vec![0_u8; payload_len];
             if !payload.is_empty() {
-                platform::pread(&file, &mut payload, entry.data_offset)?;
+                platform::pread(&current_file, &mut payload, entry.data_offset)?;
             }
 
             let offset = new_state.file_len;
@@ -345,22 +353,27 @@ impl RawBlockFileBackend {
                 new_state.dirty_order.push_back(object_id);
             }
         }
-        drop(file);
+        drop(current_file);
 
-        temp_file.set_len(new_state.file_len)?;
         platform::fdatasync(&temp_file)?;
 
-        let mut current_file = self.file.lock();
-        let old_file = std::mem::replace(&mut *current_file, temp_file);
-        drop(current_file);
+        while Arc::strong_count(&state.file) > 1 {
+            std::thread::yield_now();
+        }
+
+        let old_file = std::mem::replace(&mut state.file, temp_file.clone());
+        state
+            .reserved_len
+            .store(new_state.file_len, Ordering::Release);
+        state.file_len = new_state.file_len;
+        state.entries = new_state.entries;
+        state.dirty_order = new_state.dirty_order;
         drop(old_file);
 
         if self.path.exists() {
             std::fs::remove_file(&self.path)?;
         }
         std::fs::rename(&temp_path, &self.path)?;
-
-        *state = new_state;
         Ok(())
     }
 }
@@ -371,12 +384,13 @@ impl LocalBlockBackend for RawBlockFileBackend {
     }
 
     fn get(&self, object_id: u64) -> Option<Bytes> {
-        let state = self.state.lock();
-        let entry = *state.entries.get(&object_id)?;
+        let (file, entry) = {
+            let state = self.state.read();
+            (state.file.clone(), *state.entries.get(&object_id)?)
+        };
         let len = usize::try_from(entry.data_len).ok()?;
         let mut buf = vec![0_u8; len];
         if len > 0 {
-            let file = self.file.lock();
             if let Err(error) = platform::pread(&file, &mut buf, entry.data_offset) {
                 warn!(object_id, error = ?error, "raw backend get failed");
                 return None;
@@ -394,7 +408,7 @@ impl LocalBlockBackend for RawBlockFileBackend {
     }
 
     fn contains(&self, object_id: u64) -> bool {
-        self.state.lock().entries.contains_key(&object_id)
+        self.state.read().entries.contains_key(&object_id)
     }
 
     fn advise_will_need(&self, _object_id: u64) {}
@@ -411,9 +425,6 @@ impl LocalBlockBackend for RawBlockFileBackend {
                 "block too large for raw backend format",
             )
         })?;
-        let mut state = self.state.lock();
-        let offset = state.file_len;
-        let data_offset = offset + RECORD_HEADER_SIZE as u64;
         let lifecycle = if evictable {
             LocalBlockLifecycleState::Uploaded
         } else {
@@ -421,7 +432,13 @@ impl LocalBlockBackend for RawBlockFileBackend {
         };
         let header =
             encode_record_header(RECORD_KIND_PUT, lifecycle, evictable, object_id, data_len);
-        self.append_record(&mut state, header, Some(data))?;
+        let (file, reserved_len) = {
+            let state = self.state.read();
+            (state.file.clone(), state.reserved_len.clone())
+        };
+        let offset = self.append_record(file, reserved_len, header, Some(data))?;
+        let data_offset = offset + RECORD_HEADER_SIZE as u64;
+        let end_offset = data_offset + data_len;
 
         let entry = RawBlockEntry {
             data_offset,
@@ -429,6 +446,7 @@ impl LocalBlockBackend for RawBlockFileBackend {
             lifecycle,
             evictable,
         };
+        let mut state = self.state.write();
         state.entries.insert(object_id, entry);
         match lifecycle {
             LocalBlockLifecycleState::Dirty => state.enter_dirty(object_id),
@@ -436,17 +454,28 @@ impl LocalBlockBackend for RawBlockFileBackend {
             LocalBlockLifecycleState::Uploaded => state.enter_uploaded(object_id),
             LocalBlockLifecycleState::Missing => {}
         }
+        if end_offset > state.file_len {
+            state.file_len = end_offset;
+        }
         Ok(())
     }
 
     fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
-        self.file.lock().sync_all()?;
+        let file = {
+            let state = self.state.read();
+            state.file.clone()
+        };
+        platform::fdatasync(&file)?;
         Ok(())
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
-        let mut state = self.state.lock();
-        if state.should_compact() {
+        let should_compact = {
+            let state = self.state.read();
+            state.should_compact()
+        };
+        let mut state = self.state.write();
+        if should_compact && state.should_compact() {
             self.compact_locked(&mut state)?;
         } else {
             self.prune_dirty_order(&mut state);
@@ -455,7 +484,7 @@ impl LocalBlockBackend for RawBlockFileBackend {
     }
 
     fn mark_uploading(&self, object_id: u64) {
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
         let should_mark = state
             .entries
             .get(&object_id)
@@ -466,7 +495,7 @@ impl LocalBlockBackend for RawBlockFileBackend {
     }
 
     fn mark_upload_failed(&self, object_id: u64) {
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
         let should_requeue = {
             let Some(entry) = state.entries.get_mut(&object_id) else {
                 return;
@@ -485,10 +514,6 @@ impl LocalBlockBackend for RawBlockFileBackend {
     }
 
     fn mark_uploaded(&self, object_id: u64) {
-        let mut state = self.state.lock();
-        if !state.entries.contains_key(&object_id) {
-            return;
-        }
         let header = encode_record_header(
             RECORD_KIND_STATE,
             LocalBlockLifecycleState::Uploaded,
@@ -496,18 +521,36 @@ impl LocalBlockBackend for RawBlockFileBackend {
             object_id,
             0,
         );
-        if let Err(error) = self.append_record(&mut state, header, None) {
-            warn!(object_id, error = ?error, "raw backend mark_uploaded write failed");
+
+        let (file, reserved_len) = {
+            let state = self.state.write();
+            if !state.entries.contains_key(&object_id) {
+                return;
+            }
+            (state.file.clone(), state.reserved_len.clone())
+        };
+
+        let offset_res = self.append_record(file, reserved_len, header, None);
+
+        let mut state = self.state.write();
+        if !state.entries.contains_key(&object_id) {
             return;
+        }
+        let offset = match offset_res {
+            Ok(offset) => offset,
+            Err(error) => {
+                warn!(object_id, error = ?error, "raw backend mark_uploaded write failed");
+                return;
+            }
+        };
+        let end_offset = offset + RECORD_HEADER_SIZE as u64;
+        if end_offset > state.file_len {
+            state.file_len = end_offset;
         }
         state.enter_uploaded(object_id);
     }
 
     fn remove(&self, object_id: u64) {
-        let mut state = self.state.lock();
-        if !state.entries.contains_key(&object_id) {
-            return;
-        }
         let header = encode_record_header(
             RECORD_KIND_REMOVE,
             LocalBlockLifecycleState::Missing,
@@ -515,36 +558,43 @@ impl LocalBlockBackend for RawBlockFileBackend {
             object_id,
             0,
         );
-        if let Err(error) = self.append_record(&mut state, header, None) {
-            warn!(object_id, error = ?error, "raw backend remove write failed");
+
+        let (file, reserved_len) = {
+            let state = self.state.write();
+            if !state.entries.contains_key(&object_id) {
+                return;
+            }
+            (state.file.clone(), state.reserved_len.clone())
+        };
+
+        let offset_res = self.append_record(file, reserved_len, header, None);
+
+        let mut state = self.state.write();
+        if !state.entries.contains_key(&object_id) {
             return;
+        }
+        let offset = match offset_res {
+            Ok(offset) => offset,
+            Err(error) => {
+                warn!(object_id, error = ?error, "raw backend remove write failed");
+                return;
+            }
+        };
+        let end_offset = offset + RECORD_HEADER_SIZE as u64;
+        if end_offset > state.file_len {
+            state.file_len = end_offset;
         }
         state.remove_entry(object_id);
     }
 
     fn remove_batch(&self, object_ids: &[u64]) {
-        let mut state = self.state.lock();
         for object_id in object_ids {
-            if !state.entries.contains_key(object_id) {
-                continue;
-            }
-            let header = encode_record_header(
-                RECORD_KIND_REMOVE,
-                LocalBlockLifecycleState::Missing,
-                false,
-                *object_id,
-                0,
-            );
-            if let Err(error) = self.append_record(&mut state, header, None) {
-                warn!(object_id, error = ?error, "raw backend remove_batch write failed");
-                continue;
-            }
-            state.remove_entry(*object_id);
+            self.remove(*object_id);
         }
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
-        let state = self.state.lock();
+        let state = self.state.read();
         let mut dirty_ids = Vec::new();
         for object_id in &state.dirty_order {
             if matches!(
@@ -559,7 +609,7 @@ impl LocalBlockBackend for RawBlockFileBackend {
 
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
         self.state
-            .lock()
+            .read()
             .entries
             .get(&object_id)
             .map(|entry| entry.lifecycle)
@@ -568,7 +618,7 @@ impl LocalBlockBackend for RawBlockFileBackend {
 
     fn is_evictable(&self, object_id: u64) -> bool {
         self.state
-            .lock()
+            .read()
             .entries
             .get(&object_id)
             .is_some_and(|entry| {
@@ -579,19 +629,26 @@ impl LocalBlockBackend for RawBlockFileBackend {
 
 impl Drop for RawBlockFileBackend {
     fn drop(&mut self) {
-        if let Err(error) = self.file.lock().sync_all() {
-            warn!(error = ?error, "raw backend drop: sync_all failed");
+        let file = {
+            let state = self.state.read();
+            state.file.clone()
+        };
+        if let Err(error) = platform::fdatasync(&file) {
+            warn!(error = ?error, "raw backend drop: fdatasync failed");
         }
     }
 }
 
-fn load_state(file: &File, file_len: u64) -> Result<RawBlockFileState, RawBlockFileBackendError> {
-    let mut state = RawBlockFileState::new(file_len);
+fn load_state(
+    file: Arc<File>,
+    file_len: u64,
+) -> Result<RawBlockFileState, RawBlockFileBackendError> {
+    let mut state = RawBlockFileState::new(file.clone(), file_len);
     let mut cursor = FILE_HEADER_SIZE as u64;
     let mut header = [0_u8; RECORD_HEADER_SIZE];
 
     while cursor + RECORD_HEADER_SIZE as u64 <= file_len {
-        if let Err(error) = platform::pread(file, &mut header, cursor) {
+        if let Err(error) = platform::pread(&file, &mut header, cursor) {
             if error.kind() == io::ErrorKind::UnexpectedEof {
                 break;
             }
@@ -780,6 +837,8 @@ fn decode_state(state: u8) -> Option<LocalBlockLifecycleState> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -831,6 +890,33 @@ mod tests {
         backend.put(1, b"one-again", false).unwrap();
 
         assert_eq!(backend.dirty_object_ids(), vec![2, 1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts() {
+        let dir = TempDir::new().unwrap();
+        let backend = Arc::new(RawBlockFileBackend::open(test_config(&dir)).unwrap());
+
+        let mut handles = Vec::new();
+        for i in 0..100_u64 {
+            let backend = backend.clone();
+            handles.push(tokio::spawn(async move {
+                let data = format!("data-{i}").into_bytes();
+                backend.put(i, &data, false).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        backend.sync_data().unwrap();
+
+        for i in 0..100_u64 {
+            let expected = format!("data-{i}");
+            let data = backend.get(i).unwrap();
+            assert_eq!(data.as_ref(), expected.as_bytes());
+        }
     }
 
     #[test]
