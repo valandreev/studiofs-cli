@@ -107,6 +107,8 @@ impl CacheIndex {
             std::fs::create_dir_all(parent)?;
         }
 
+        // redb::Database::create() creates a new DB for missing/empty files and
+        // opens an existing valid redb file, so this is safe for reopen paths.
         let db = Database::create(&path).map_err(storage_error)?;
         let index = Self {
             db_path: path,
