@@ -2942,7 +2942,7 @@ struct UploadState {
     upload_cache_io_foreground_cost: AtomicU32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CacheRuntimeTuning {
     max_dirty_bytes: usize,
     write_eager_flush_batch_bytes: usize,
@@ -3051,6 +3051,81 @@ fn derive_cache_runtime_tuning(
         ingress_checkpoint_max_live_segments,
         upload_cache_io_slots,
         transit_memory_budget_bytes,
+    }
+}
+
+fn resolve_cache_runtime_tuning_overrides(
+    derived: CacheRuntimeTuning,
+    config: &VfsConfig,
+) -> CacheRuntimeTuning {
+    let defaults = VfsConfig::default();
+    CacheRuntimeTuning {
+        max_dirty_bytes: if config.max_dirty_bytes == defaults.max_dirty_bytes {
+            derived.max_dirty_bytes
+        } else {
+            config.max_dirty_bytes
+        },
+        write_eager_flush_batch_bytes: if config.write_eager_flush_batch_bytes
+            == defaults.write_eager_flush_batch_bytes
+        {
+            derived.write_eager_flush_batch_bytes
+        } else {
+            config.write_eager_flush_batch_bytes
+        },
+        max_ingress_segment_bytes: if config.max_ingress_segment_bytes
+            == defaults.max_ingress_segment_bytes
+        {
+            derived.max_ingress_segment_bytes
+        } else {
+            config.max_ingress_segment_bytes
+        },
+        ingress_checkpoint_interval_secs: if config.ingress_checkpoint_interval_secs
+            == defaults.ingress_checkpoint_interval_secs
+        {
+            derived.ingress_checkpoint_interval_secs
+        } else {
+            config.ingress_checkpoint_interval_secs
+        },
+        ingress_checkpoint_min_append_bytes: if config.ingress_checkpoint_min_append_bytes
+            == defaults.ingress_checkpoint_min_append_bytes
+        {
+            derived.ingress_checkpoint_min_append_bytes
+        } else {
+            config.ingress_checkpoint_min_append_bytes
+        },
+        ingress_checkpoint_min_mutations: if config.ingress_checkpoint_min_mutations
+            == defaults.ingress_checkpoint_min_mutations
+        {
+            derived.ingress_checkpoint_min_mutations
+        } else {
+            config.ingress_checkpoint_min_mutations
+        },
+        ingress_checkpoint_max_segment_lag: if config.ingress_checkpoint_max_segment_lag
+            == defaults.ingress_checkpoint_max_segment_lag
+        {
+            derived.ingress_checkpoint_max_segment_lag
+        } else {
+            config.ingress_checkpoint_max_segment_lag
+        },
+        ingress_checkpoint_max_live_segments: if config.ingress_checkpoint_max_live_segments
+            == defaults.ingress_checkpoint_max_live_segments
+        {
+            derived.ingress_checkpoint_max_live_segments
+        } else {
+            config.ingress_checkpoint_max_live_segments
+        },
+        upload_cache_io_slots: if config.upload_cache_io_slots == defaults.upload_cache_io_slots {
+            derived.upload_cache_io_slots
+        } else {
+            config.upload_cache_io_slots
+        },
+        transit_memory_budget_bytes: if config.transit_memory_budget_bytes
+            == defaults.transit_memory_budget_bytes
+        {
+            derived.transit_memory_budget_bytes
+        } else {
+            config.transit_memory_budget_bytes
+        },
     }
 }
 
@@ -4430,8 +4505,10 @@ impl StudioVfs {
                 format!("{}/", format_info.data_prefix)
             };
             let block_size = format_info.block_size;
-            let cache_runtime_tuning =
+            let derived_cache_runtime_tuning =
                 derive_cache_runtime_tuning(cache_size, block_size, block_cache_l1_limit);
+            let cache_runtime_tuning =
+                resolve_cache_runtime_tuning_overrides(derived_cache_runtime_tuning, &config);
             let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
             if (block_size as usize) > cloud_logical_block_capacity {
                 return Err(VfsError::Other(format!(
@@ -12207,6 +12284,26 @@ mod tests {
         assert!(tiny.upload_cache_io_slots > 0);
         assert!(huge.max_dirty_bytes >= tiny.max_dirty_bytes);
         assert!(huge.upload_cache_io_slots >= tiny.upload_cache_io_slots);
+    }
+
+    #[test]
+    fn cache_runtime_tuning_uses_internal_config_overrides_when_non_default() {
+        let derived = derive_cache_runtime_tuning(16 * 1024 * 1024, 512 * 1024, 16 * 1024 * 1024);
+        let defaults = VfsConfig::default();
+        let mut config = defaults.clone();
+        config.max_dirty_bytes = 1024 * 1024;
+        config.write_eager_flush_batch_bytes = 1024 * 1024;
+        config.upload_cache_io_slots = 7;
+
+        let resolved = resolve_cache_runtime_tuning_overrides(derived, &config);
+
+        assert_eq!(resolved.max_dirty_bytes, 1024 * 1024);
+        assert_eq!(resolved.write_eager_flush_batch_bytes, 1024 * 1024);
+        assert_eq!(resolved.upload_cache_io_slots, 7);
+        assert_eq!(
+            resolved.ingress_checkpoint_interval_secs,
+            derived.ingress_checkpoint_interval_secs
+        );
     }
 
     #[test]
