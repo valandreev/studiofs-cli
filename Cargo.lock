@@ -3686,7 +3686,9 @@ version = "0.1.1"
 dependencies = [
  "bytes",
  "libc",
+ "lru",
  "parking_lot",
+ "redb",
  "studiofs-data",
  "studiofs-meta",
  "tempfile",
