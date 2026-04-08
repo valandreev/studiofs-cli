@@ -53,7 +53,7 @@ use studiofs_cache::metrics::MaterializeBatchStats;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::LocalBlockBackend;
 use studiofs_cache::v3::CacheBackendKind;
-use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
+use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend_with_budget};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -4291,7 +4291,7 @@ impl StudioVfs {
         meta: Arc<dyn MetaEngine>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
-        _cache_size: u64,
+        cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>> {
@@ -4402,9 +4402,12 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let opened_local_backend =
-                open_local_block_backend(Path::new(cache_dir), &format_info.uuid)
-                    .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
+            let opened_local_backend = open_local_block_backend_with_budget(
+                Path::new(cache_dir),
+                &format_info.uuid,
+                cache_size,
+            )
+            .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
             let cache_backend_detection = opened_local_backend.detection;
             if cache_backend_detection.has_dual_layout() {
                 info!(

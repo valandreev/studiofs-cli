@@ -10,24 +10,26 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
 pub mod cache_index;
+pub mod eviction;
 pub mod file_payload_store;
 pub mod layout;
 pub mod platform;
 
 pub use cache_index::{
     CacheIndex, CacheIndexEntry, CacheIndexError, CacheIndexStats, CacheIndexUpsert,
-    DirtyReplayEntry,
+    DirtyReplayEntry, EvictionCandidateEntry,
 };
+use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError};
 pub use layout::{
     CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
@@ -155,6 +157,9 @@ pub struct CacheV3LocalBlockBackend {
     volume_uuid: [u8; 16],
     index: CacheIndex,
     payload_store: FilePayloadStore,
+    budget_governor: CacheBudgetGovernor,
+    eviction_pass_lock: Mutex<()>,
+    eviction_scan_skipped_non_evictable: AtomicU64,
     last_dirty_orphan_prune_at: Mutex<Instant>,
     dirty_validation_in_progress: AtomicBool,
 }
@@ -174,6 +179,13 @@ impl Drop for DirtyValidationGuard<'_> {
 impl CacheV3LocalBlockBackend {
     pub fn open(
         config: CacheV3LocalBlockBackendConfig,
+    ) -> Result<Self, CacheV3LocalBlockBackendError> {
+        Self::open_with_budget(config, None)
+    }
+
+    pub fn open_with_budget(
+        config: CacheV3LocalBlockBackendConfig,
+        cache_budget_bytes: Option<u64>,
     ) -> Result<Self, CacheV3LocalBlockBackendError> {
         let layout = CacheV3Layout::from_cache_root(&config.cache_root);
         if !layout.layout_marker.try_exists()? {
@@ -201,6 +213,11 @@ impl CacheV3LocalBlockBackend {
             volume_uuid: config.volume_uuid,
             index,
             payload_store,
+            budget_governor: cache_budget_bytes
+                .map(CacheBudgetGovernor::bounded)
+                .unwrap_or_else(CacheBudgetGovernor::unbounded),
+            eviction_pass_lock: Mutex::new(()),
+            eviction_scan_skipped_non_evictable: AtomicU64::new(0),
             last_dirty_orphan_prune_at: Mutex::new(
                 Instant::now()
                     .checked_sub(DIRTY_ORPHAN_PRUNE_MIN_INTERVAL)
@@ -308,6 +325,153 @@ impl CacheV3LocalBlockBackend {
             );
         }
     }
+
+    fn remove_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
+        self.index.remove_batch(object_ids)?;
+        self.payload_store.remove_batch(object_ids);
+        Ok(())
+    }
+
+    fn evict_to_target_bytes_locked(
+        &self,
+        target_bytes: u64,
+        operation: &'static str,
+    ) -> Result<u64, LocalBlockBackendError> {
+        let stats = self
+            .index
+            .stats()
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+        if stats.current_bytes <= target_bytes {
+            return Ok(stats.current_bytes);
+        }
+
+        let mut cursor = None;
+        let mut batch = Vec::with_capacity(EVICTION_DELETE_BATCH_SIZE);
+        let mut estimated_current = stats.current_bytes;
+        loop {
+            if estimated_current <= target_bytes {
+                break;
+            }
+
+            let page = self
+                .index
+                .eviction_candidates_page_with_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)
+                .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+            if page.entries.is_empty() {
+                break;
+            }
+            cursor = page.entries.last().map(|entry| entry.access_order);
+            if page.skipped_non_evictable > 0 {
+                let skipped_total = self
+                    .eviction_scan_skipped_non_evictable
+                    .fetch_add(page.skipped_non_evictable, Ordering::Relaxed)
+                    .saturating_add(page.skipped_non_evictable);
+                debug!(
+                    operation,
+                    scanned_rows = page.scanned_rows,
+                    skipped_non_evictable = page.skipped_non_evictable,
+                    skipped_non_evictable_total = skipped_total,
+                    "cache-v3 eviction candidate scan skipped non-evictable rows"
+                );
+            }
+
+            for candidate in page.entries {
+                if estimated_current <= target_bytes {
+                    break;
+                }
+                batch.push(candidate.object_id);
+                estimated_current = estimated_current.saturating_sub(candidate.payload_len);
+                if batch.len() >= EVICTION_DELETE_BATCH_SIZE {
+                    self.remove_batch_internal(&batch)
+                        .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                self.remove_batch_internal(&batch)
+                    .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+                batch.clear();
+            }
+        }
+
+        let final_current = self
+            .index
+            .stats()
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?
+            .current_bytes;
+        if final_current > target_bytes {
+            warn!(
+                operation,
+                current_bytes = final_current,
+                target_bytes,
+                "cache-v3 budget pressure remained above target after deterministic eviction pass"
+            );
+        }
+        Ok(final_current)
+    }
+
+    fn evict_to_target_bytes(
+        &self,
+        target_bytes: u64,
+        operation: &'static str,
+    ) -> Result<u64, LocalBlockBackendError> {
+        let _eviction_guard = self.eviction_pass_lock.lock();
+        self.evict_to_target_bytes_locked(target_bytes, operation)
+    }
+
+    fn try_evict_to_target_bytes(
+        &self,
+        target_bytes: u64,
+        operation: &'static str,
+    ) -> Result<Option<u64>, LocalBlockBackendError> {
+        let Some(_eviction_guard) = self.eviction_pass_lock.try_lock() else {
+            return Ok(None);
+        };
+        self.evict_to_target_bytes_locked(target_bytes, operation)
+            .map(Some)
+    }
+
+    fn enforce_budget_before_put(
+        &self,
+        object_id: u64,
+        payload_len: u64,
+        evictable: bool,
+    ) -> Result<bool, LocalBlockBackendError> {
+        let stats = self
+            .index
+            .stats()
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+        let Some(target_bytes) = self
+            .budget_governor
+            .target_before_insert(stats.current_bytes, payload_len)
+        else {
+            return Ok(false);
+        };
+
+        let current_after_evict = self.evict_to_target_bytes(target_bytes, "put")?;
+        if !self
+            .budget_governor
+            .exceeds_budget_after_insert(current_after_evict, payload_len)
+        {
+            return Ok(false);
+        }
+
+        if evictable {
+            warn!(
+                object_id,
+                payload_len,
+                current_bytes = current_after_evict,
+                budget_bytes = ?self.budget_governor.budget_bytes(),
+                "cache-v3 skipped evictable put because budget remained under hard pressure"
+            );
+            return Ok(true);
+        }
+
+        Err(LocalBlockBackendError::CapacityExhausted {
+            needed: payload_len,
+            free: self.budget_governor.free_bytes(current_after_evict),
+        })
+    }
 }
 
 impl LocalBlockBackend for CacheV3LocalBlockBackend {
@@ -377,6 +541,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         data: &[u8],
         evictable: bool,
     ) -> Result<(), LocalBlockBackendError> {
+        let payload_len = u64::try_from(data.len()).map_err(|_| {
+            LocalBlockBackendError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload length exceeds u64",
+            ))
+        })?;
+        if self.enforce_budget_before_put(object_id, payload_len, evictable)? {
+            return Ok(());
+        }
+
         self.payload_store
             .put(object_id, data)
             .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
@@ -386,12 +560,6 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         } else {
             LocalBlockLifecycleState::Dirty
         };
-        let payload_len = u64::try_from(data.len()).map_err(|_| {
-            LocalBlockBackendError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "payload length exceeds u64",
-            ))
-        })?;
         let payload_key = self
             .layout
             .payload_block_relative_path(object_id)
@@ -425,6 +593,13 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+        let stats = self
+            .index
+            .stats()
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+        if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
+            let _ = self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")?;
+        }
         Ok(())
     }
 
@@ -462,15 +637,13 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         if object_ids.is_empty() {
             return;
         }
-        if let Err(error) = self.index.remove_batch(object_ids) {
+        if let Err(error) = self.remove_batch_internal(object_ids) {
             warn!(
                 count = object_ids.len(),
                 error = ?error,
                 "cache-v3 index remove_batch failed"
             );
-            return;
         }
-        self.payload_store.remove_batch(object_ids);
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
@@ -553,7 +726,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::{LocalBlockBackend, LocalBlockLifecycleState};
+    use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
     fn create_v3_marker(layout: &CacheV3Layout) {
         std::fs::create_dir_all(&layout.v3_root).unwrap();
@@ -821,6 +994,122 @@ mod tests {
             LocalBlockLifecycleState::Missing
         );
         assert!(!backend.contains(10));
+    }
+
+    #[test]
+    fn cache_v3_backend_enforces_budget_with_deterministic_eviction_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open_with_budget(
+            CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x71; 16],
+            },
+            Some(64),
+        )
+        .unwrap();
+        backend.put(1, &[1_u8; 32], true).unwrap();
+        backend.put(2, &[2_u8; 32], true).unwrap();
+        backend.put(3, &[3_u8; 32], true).unwrap();
+
+        let stats = backend.index.stats().unwrap();
+        assert_eq!(stats.current_bytes, 64);
+        assert!(
+            !backend.contains(1),
+            "oldest uploaded block should be reclaimed first"
+        );
+        assert!(backend.contains(2));
+        assert!(backend.contains(3));
+    }
+
+    #[test]
+    fn cache_v3_backend_returns_capacity_exhausted_for_non_evictable_pressure() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open_with_budget(
+            CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x72; 16],
+            },
+            Some(32),
+        )
+        .unwrap();
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        let err = backend.put(11, &[0xBB; 16], false).unwrap_err();
+        assert!(matches!(
+            err,
+            LocalBlockBackendError::CapacityExhausted { .. }
+        ));
+        assert_eq!(
+            backend.lifecycle_state(11),
+            LocalBlockLifecycleState::Missing
+        );
+    }
+
+    #[test]
+    fn cache_v3_background_pressure_reclaims_to_low_watermark() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open_with_budget(
+            CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x73; 16],
+            },
+            Some(100),
+        )
+        .unwrap();
+        backend.put(20, &[0x01; 30], true).unwrap();
+        backend.put(21, &[0x02; 30], true).unwrap();
+        backend.put(22, &[0x03; 30], true).unwrap();
+        backend.put(23, &[0x04; 5], true).unwrap();
+        assert_eq!(backend.index.stats().unwrap().current_bytes, 95);
+
+        backend.run_pressure_maintenance().unwrap();
+
+        let stats = backend.index.stats().unwrap();
+        assert!(
+            stats.current_bytes <= 80,
+            "maintenance should reclaim to low watermark when above high watermark"
+        );
+        assert!(
+            !backend.contains(20),
+            "oldest uploaded block should be reclaimed during pressure maintenance"
+        );
+        assert!(backend.contains(21));
+    }
+
+    #[test]
+    fn cache_v3_eviction_tracks_skipped_non_evictable_scan_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open_with_budget(
+            CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x74; 16],
+            },
+            Some(96),
+        )
+        .unwrap();
+        backend.put(30, &[0xAA; 32], false).unwrap();
+        backend.put(31, &[0xBB; 32], true).unwrap();
+        backend.put(32, &[0xCC; 32], true).unwrap();
+
+        backend.run_pressure_maintenance().unwrap();
+
+        assert!(
+            backend
+                .eviction_scan_skipped_non_evictable
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
     }
 
     #[test]
