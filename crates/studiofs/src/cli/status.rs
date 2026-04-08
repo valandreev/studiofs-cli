@@ -280,6 +280,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     println!("───────────");
     println!("  Root:                {}", cache_path.display());
     if let Some(cache_backend_detection) = cache_backend_detection.as_ref() {
+        let selected_backend = cache_backend_detection.selected_mount_backend();
         println!(
             "  Legacy raw path:     {}",
             cache_backend_detection.legacy_raw_data_path.display()
@@ -296,16 +297,24 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
             "  Cache v3 present:    {}",
             cache_backend_detection.has_cache_v3_contract()
         );
-        println!(
-            "  Contract selection:  {}",
-            cache_backend_detection.selected_mount_backend()
-        );
+        println!("  Contract selection:  {}", selected_backend);
+        match selected_backend {
+            CacheBackendKind::LegacyRawV2 => {
+                println!("  Backend mode:        legacy raw backend");
+            }
+            CacheBackendKind::CacheV3 => {
+                println!(
+                    "  Backend mode:        bootstrap placeholder (compat local backend under v3 subtree)"
+                );
+            }
+        }
     } else {
         println!("  Legacy raw path:     unavailable");
         println!("  Legacy raw present:  unknown");
         println!("  Cache v3 marker:     unavailable");
         println!("  Cache v3 present:    unknown");
         println!("  Contract selection:  unknown");
+        println!("  Backend mode:        unknown");
     }
     println!(
         "  Cache v3 default:    {}",

@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
-use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
+use crate::v2::{
+    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, RawBlockFileBackend,
+    RawBlockFileBackendConfig, RawBlockFileBackendError,
+};
 
 pub mod layout;
 
@@ -120,6 +123,12 @@ pub enum CacheV3LocalBlockBackendError {
     Io(#[from] io::Error),
     #[error("cache-v3 layout marker is missing at '{path}'")]
     MissingLayoutMarker { path: PathBuf },
+    #[error("failed to open cache-v3 compatibility raw backend at '{cache_root}': {source}")]
+    OpenCompatibilityRawBackend {
+        cache_root: PathBuf,
+        #[source]
+        source: RawBlockFileBackendError,
+    },
 }
 
 /// Cache 3.0 local backend placeholder.
@@ -129,7 +138,7 @@ pub enum CacheV3LocalBlockBackendError {
 #[derive(Debug)]
 pub struct CacheV3LocalBlockBackend {
     _layout: CacheV3Layout,
-    _volume_uuid: [u8; 16],
+    inner: RawBlockFileBackend,
 }
 
 impl CacheV3LocalBlockBackend {
@@ -143,17 +152,22 @@ impl CacheV3LocalBlockBackend {
             });
         }
 
+        std::fs::create_dir_all(&layout.v3_root)?;
+        let inner = RawBlockFileBackend::open(RawBlockFileBackendConfig {
+            cache_dir: layout.v3_root.clone(),
+            volume_uuid: config.volume_uuid,
+        })
+        .map_err(
+            |source| CacheV3LocalBlockBackendError::OpenCompatibilityRawBackend {
+                cache_root: layout.v3_root.clone(),
+                source,
+            },
+        )?;
+
         Ok(Self {
             _layout: layout,
-            _volume_uuid: config.volume_uuid,
+            inner,
         })
-    }
-
-    fn unsupported_data_path() -> LocalBlockBackendError {
-        LocalBlockBackendError::Other(Box::new(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "cache-v3 local backend data path is not implemented yet",
-        )))
     }
 }
 
@@ -162,68 +176,80 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         self
     }
 
-    fn get(&self, _object_id: u64) -> Option<Bytes> {
-        None
+    fn get(&self, object_id: u64) -> Option<Bytes> {
+        self.inner.get(object_id)
     }
 
-    fn read_into(&self, _object_id: u64, _data_offset: usize, _out: &mut [u8]) -> Option<usize> {
-        None
+    fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+        self.inner.read_into(object_id, data_offset, out)
     }
 
-    fn get_for_upload(&self, _object_id: u64) -> Option<Bytes> {
-        None
+    fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+        self.inner.get_for_upload(object_id)
     }
 
-    fn contains(&self, _object_id: u64) -> bool {
-        false
+    fn contains(&self, object_id: u64) -> bool {
+        self.inner.contains(object_id)
     }
 
-    fn advise_will_need(&self, _object_id: u64) {}
+    fn advise_will_need(&self, object_id: u64) {
+        self.inner.advise_will_need(object_id);
+    }
 
     fn put(
         &self,
-        _object_id: u64,
-        _data: &[u8],
-        _evictable: bool,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
     ) -> Result<(), LocalBlockBackendError> {
-        Err(Self::unsupported_data_path())
+        self.inner.put(object_id, data, evictable)
     }
 
     fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
-        Ok(())
+        self.inner.sync_data()
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
-        Ok(())
+        self.inner.run_pressure_maintenance()
     }
 
-    fn mark_uploading(&self, _object_id: u64) {}
+    fn mark_uploading(&self, object_id: u64) {
+        self.inner.mark_uploading(object_id);
+    }
 
-    fn mark_upload_failed(&self, _object_id: u64) {}
+    fn mark_upload_failed(&self, object_id: u64) {
+        self.inner.mark_upload_failed(object_id);
+    }
 
-    fn mark_uploaded(&self, _object_id: u64) {}
+    fn mark_uploaded(&self, object_id: u64) {
+        self.inner.mark_uploaded(object_id);
+    }
 
-    fn remove(&self, _object_id: u64) {}
+    fn remove(&self, object_id: u64) {
+        self.inner.remove(object_id);
+    }
 
-    fn remove_batch(&self, _object_ids: &[u64]) {}
+    fn remove_batch(&self, object_ids: &[u64]) {
+        self.inner.remove_batch(object_ids);
+    }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
-        Vec::new()
+        self.inner.dirty_object_ids()
     }
 
-    fn lifecycle_state(&self, _object_id: u64) -> LocalBlockLifecycleState {
-        LocalBlockLifecycleState::Missing
+    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        self.inner.lifecycle_state(object_id)
     }
 
-    fn is_evictable(&self, _object_id: u64) -> bool {
-        false
+    fn is_evictable(&self, object_id: u64) -> bool {
+        self.inner.is_evictable(object_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::{LocalBlockBackend, LocalBlockBackendError};
+    use crate::v2::{LocalBlockBackend, LocalBlockLifecycleState};
 
     fn create_v3_marker(layout: &CacheV3Layout) {
         std::fs::create_dir_all(&layout.v3_root).unwrap();
@@ -304,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_v3_backend_bootstraps_and_reports_unimplemented_data_path() {
+    fn cache_v3_backend_bootstraps_via_compatibility_raw_backend() {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
@@ -314,13 +340,10 @@ mod tests {
             volume_uuid: [0xCD; 16],
         })
         .unwrap();
-        assert!(backend.dirty_object_ids().is_empty());
-        assert_eq!(
-            backend.lifecycle_state(42),
-            LocalBlockLifecycleState::Missing
-        );
-
-        let err = backend.put(42, b"payload", false).unwrap_err();
-        assert!(matches!(err, LocalBlockBackendError::Other(_)));
+        backend.put(42, b"payload", false).unwrap();
+        backend.sync_data().unwrap();
+        assert_eq!(backend.get_for_upload(42).unwrap().as_ref(), b"payload");
+        assert_eq!(backend.lifecycle_state(42), LocalBlockLifecycleState::Dirty);
+        assert_eq!(backend.dirty_object_ids(), vec![42]);
     }
 }

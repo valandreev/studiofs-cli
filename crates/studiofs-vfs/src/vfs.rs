@@ -4416,10 +4416,11 @@ impl StudioVfs {
             }
             let selected_backend = opened_local_backend.backend_kind;
             if matches!(selected_backend, CacheBackendKind::CacheV3) {
-                info!(
+                warn!(
                     cache_root = %cache_backend_detection.layout.cache_root.display(),
                     layout_marker = %cache_backend_detection.layout.layout_marker.display(),
-                    "cache-v3 contract selected for local backend bootstrap; write-path behavior remains staged"
+                    cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                    "cache-v3 contract selected in bootstrap placeholder mode; using compatibility local backend path under the v3 subtree"
                 );
             }
             let block_store = opened_local_backend.backend;
