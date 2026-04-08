@@ -10,6 +10,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -155,6 +156,19 @@ pub struct CacheV3LocalBlockBackend {
     index: CacheIndex,
     payload_store: FilePayloadStore,
     last_dirty_orphan_prune_at: Mutex<Instant>,
+    dirty_validation_in_progress: AtomicBool,
+}
+
+struct DirtyValidationGuard<'a> {
+    backend: &'a CacheV3LocalBlockBackend,
+}
+
+impl Drop for DirtyValidationGuard<'_> {
+    fn drop(&mut self) {
+        self.backend
+            .dirty_validation_in_progress
+            .store(false, Ordering::Release);
+    }
 }
 
 impl CacheV3LocalBlockBackend {
@@ -192,6 +206,7 @@ impl CacheV3LocalBlockBackend {
                     .checked_sub(DIRTY_ORPHAN_PRUNE_MIN_INTERVAL)
                     .unwrap_or_else(Instant::now),
             ),
+            dirty_validation_in_progress: AtomicBool::new(false),
         })
     }
 
@@ -257,14 +272,22 @@ impl CacheV3LocalBlockBackend {
         }
     }
 
-    fn should_validate_dirty_entries(&self) -> bool {
+    fn begin_dirty_validation(&self) -> Option<DirtyValidationGuard<'_>> {
+        if self
+            .dirty_validation_in_progress
+            .swap(true, Ordering::AcqRel)
+        {
+            return None;
+        }
         let now = Instant::now();
         let mut last_prune = self.last_dirty_orphan_prune_at.lock();
         if now.duration_since(*last_prune) < DIRTY_ORPHAN_PRUNE_MIN_INTERVAL {
-            return false;
+            self.dirty_validation_in_progress
+                .store(false, Ordering::Release);
+            return None;
         }
         *last_prune = now;
-        true
+        Some(DirtyValidationGuard { backend: self })
     }
 
     fn remove_orphaned_index_entries_batch(&self, object_ids: &[u64], operation: &'static str) {
@@ -453,7 +476,11 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     fn dirty_object_ids(&self) -> Vec<u64> {
         match self.index.dirty_uploading_entries() {
             Ok(entries) => {
-                if !self.should_validate_dirty_entries() {
+                let _validation_guard = match self.begin_dirty_validation() {
+                    Some(guard) => guard,
+                    None => return entries.into_iter().map(|entry| entry.object_id).collect(),
+                };
+                if entries.is_empty() {
                     return entries.into_iter().map(|entry| entry.object_id).collect();
                 }
                 let mut object_ids = Vec::with_capacity(entries.len());
@@ -794,5 +821,37 @@ mod tests {
             LocalBlockLifecycleState::Missing
         );
         assert!(!backend.contains(10));
+    }
+
+    #[test]
+    fn dirty_validation_gate_allows_single_runner_per_interval() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x77; 16],
+        })
+        .unwrap();
+
+        let first = backend.begin_dirty_validation();
+        assert!(first.is_some());
+        assert!(
+            backend.begin_dirty_validation().is_none(),
+            "concurrent callers should not start another validation pass"
+        );
+
+        drop(first);
+        assert!(
+            !backend
+                .dirty_validation_in_progress
+                .load(std::sync::atomic::Ordering::Acquire),
+            "validation guard drop should clear in-progress marker"
+        );
+        assert!(
+            backend.begin_dirty_validation().is_none(),
+            "interval throttle should prevent immediate re-validation"
+        );
     }
 }
