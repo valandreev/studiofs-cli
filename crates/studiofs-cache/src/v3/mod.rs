@@ -7,6 +7,7 @@
 //! - the active Cache 3.0 local block backend backed by a file-per-block
 //!   payload store plus redb lifecycle index.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,13 @@ pub use layout::{
 
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
+#[cfg(not(test))]
+const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::ZERO;
+const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
+const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Final validation issue that must pass before Cache 3.0 is allowed as default.
@@ -160,6 +168,7 @@ pub struct CacheV3LocalBlockBackend {
     budget_governor: CacheBudgetGovernor,
     eviction_pass_lock: Mutex<()>,
     eviction_scan_skipped_non_evictable: AtomicU64,
+    pending_access_touches: Mutex<PendingAccessTouches>,
     last_dirty_orphan_prune_at: Mutex<Instant>,
     dirty_validation_in_progress: AtomicBool,
 }
@@ -173,6 +182,12 @@ impl Drop for DirtyValidationGuard<'_> {
         self.backend
             .dirty_validation_in_progress
             .store(false, Ordering::Release);
+    }
+}
+
+impl Drop for CacheV3LocalBlockBackend {
+    fn drop(&mut self) {
+        self.flush_access_touches(true, "drop");
     }
 }
 
@@ -218,6 +233,7 @@ impl CacheV3LocalBlockBackend {
                 .unwrap_or_else(CacheBudgetGovernor::unbounded),
             eviction_pass_lock: Mutex::new(()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
+            pending_access_touches: Mutex::new(PendingAccessTouches::new()),
             last_dirty_orphan_prune_at: Mutex::new(
                 Instant::now()
                     .checked_sub(DIRTY_ORPHAN_PRUNE_MIN_INTERVAL)
@@ -246,16 +262,13 @@ impl CacheV3LocalBlockBackend {
         if read_len == 0 {
             return;
         }
-        if let Err(error) = self
-            .index
-            .touch_access_if_stale(object_id, ACCESS_TOUCH_MIN_INTERVAL)
-        {
-            warn!(
-                object_id,
-                operation = op,
-                error = ?error,
-                "cache-v3 index access touch failed"
-            );
+        let pending_ids = {
+            let mut pending = self.pending_access_touches.lock();
+            pending.enqueue(object_id);
+            pending.take_ready_for_flush(false, Instant::now())
+        };
+        if let Some(pending_ids) = pending_ids {
+            self.flush_access_touch_ids(pending_ids, op);
         }
     }
 
@@ -323,13 +336,53 @@ impl CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 batch prune of stale index entries failed"
             );
+        } else {
+            self.forget_access_touches(object_ids);
         }
     }
 
     fn remove_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
         self.index.remove_batch(object_ids)?;
+        self.forget_access_touches(object_ids);
         self.payload_store.remove_batch(object_ids);
         Ok(())
+    }
+
+    fn flush_access_touches(&self, force: bool, operation: &'static str) {
+        let pending_ids = {
+            let mut pending = self.pending_access_touches.lock();
+            let Some(pending_ids) = pending.take_ready_for_flush(force, Instant::now()) else {
+                return;
+            };
+            pending_ids
+        };
+        self.flush_access_touch_ids(pending_ids, operation);
+    }
+
+    fn flush_access_touch_ids(&self, pending_ids: Vec<u64>, operation: &'static str) {
+        if let Err(error) = self
+            .index
+            .touch_access_if_stale_many_unique(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
+        {
+            warn!(
+                operation,
+                count = pending_ids.len(),
+                error = ?error,
+                "cache-v3 batched access touch failed"
+            );
+            let mut pending = self.pending_access_touches.lock();
+            pending.requeue_after_failure(pending_ids);
+        } else {
+            self.pending_access_touches.lock().record_flush_success();
+        }
+    }
+
+    fn forget_access_touches(&self, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let mut pending = self.pending_access_touches.lock();
+        pending.forget_many(object_ids);
     }
 
     fn evict_to_target_bytes_locked(
@@ -337,6 +390,7 @@ impl CacheV3LocalBlockBackend {
         target_bytes: u64,
         operation: &'static str,
     ) -> Result<u64, LocalBlockBackendError> {
+        self.flush_access_touches(true, operation);
         let stats = self
             .index
             .stats()
@@ -587,12 +641,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+        self.flush_access_touches(true, "sync_data");
         self.payload_store
             .sync_data()
             .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+        self.flush_access_touches(true, "run_pressure_maintenance");
         let stats = self
             .index
             .stats()
@@ -644,6 +700,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             warn!(object_id, error = ?error, "cache-v3 index remove failed");
             return;
         }
+        self.forget_access_touches(&[object_id]);
         self.payload_store.remove(object_id);
     }
 
@@ -734,6 +791,89 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 false
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct PendingAccessTouches {
+    object_ids: Vec<u64>,
+    object_set: HashSet<u64>,
+    last_flush_at: Instant,
+    failed_flushes: u8,
+    next_retry_at: Option<Instant>,
+}
+
+impl PendingAccessTouches {
+    fn new() -> Self {
+        Self {
+            object_ids: Vec::new(),
+            object_set: HashSet::new(),
+            last_flush_at: Instant::now(),
+            failed_flushes: 0,
+            next_retry_at: None,
+        }
+    }
+
+    fn enqueue(&mut self, object_id: u64) {
+        if self.object_set.insert(object_id) {
+            self.object_ids.push(object_id);
+        }
+    }
+
+    fn forget_many(&mut self, object_ids: &[u64]) {
+        let mut removed_any = false;
+        for object_id in object_ids {
+            removed_any |= self.object_set.remove(object_id);
+        }
+        if !removed_any {
+            return;
+        }
+        self.object_ids
+            .retain(|candidate| self.object_set.contains(candidate));
+    }
+
+    fn take_all(&mut self) -> Vec<u64> {
+        self.object_set.clear();
+        std::mem::take(&mut self.object_ids)
+    }
+
+    fn take_ready_for_flush(&mut self, force: bool, now: Instant) -> Option<Vec<u64>> {
+        if self.object_ids.is_empty() {
+            return None;
+        }
+        if !force {
+            if let Some(next_retry) = self.next_retry_at
+                && now < next_retry
+            {
+                return None;
+            }
+            let should_flush = self.object_ids.len() >= ACCESS_TOUCH_BATCH_SIZE
+                || now.duration_since(self.last_flush_at) >= ACCESS_TOUCH_FLUSH_INTERVAL;
+            if !should_flush {
+                return None;
+            }
+        }
+        self.last_flush_at = now;
+        Some(self.take_all())
+    }
+
+    fn requeue_after_failure(&mut self, object_ids: Vec<u64>) {
+        for object_id in object_ids {
+            self.enqueue(object_id);
+        }
+        self.failed_flushes = self.failed_flushes.saturating_add(1);
+        let exp = self
+            .failed_flushes
+            .saturating_sub(1)
+            .min(ACCESS_TOUCH_RETRY_MAX_EXPONENT);
+        let delay_ms = ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS.saturating_mul(1_u64 << exp);
+        self.next_retry_at = Some(Instant::now() + Duration::from_millis(delay_ms));
+        self.last_flush_at = Instant::now();
+    }
+
+    fn record_flush_success(&mut self) {
+        self.failed_flushes = 0;
+        self.next_retry_at = None;
     }
 }
 
@@ -890,6 +1030,28 @@ mod tests {
         backend.put(10, b"ten", true).unwrap();
         backend.put(11, b"eleven", true).unwrap();
         assert_eq!(backend.get(10).unwrap().as_ref(), b"ten");
+        drop(backend);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![11, 10]);
+    }
+
+    #[test]
+    fn cache_v3_backend_read_into_refreshes_access_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x23; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", true).unwrap();
+        backend.put(11, b"eleven", true).unwrap();
+        let mut out = [0_u8; 2];
+        assert_eq!(backend.read_into(10, 0, &mut out), Some(2));
+        assert_eq!(&out, b"te");
         drop(backend);
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
@@ -1155,6 +1317,38 @@ mod tests {
         assert!(
             backend.begin_dirty_validation().is_none(),
             "interval throttle should prevent immediate re-validation"
+        );
+    }
+
+    #[test]
+    fn pending_access_touches_forget_many_prunes_in_single_pass() {
+        let mut pending = PendingAccessTouches::new();
+        pending.enqueue(1);
+        pending.enqueue(2);
+        pending.enqueue(3);
+        pending.enqueue(4);
+
+        pending.forget_many(&[2, 4, 99]);
+        let drained = pending.take_all();
+        assert_eq!(drained, vec![1, 3]);
+    }
+
+    #[test]
+    fn pending_access_touches_failure_backoff_delays_retry() {
+        let mut pending = PendingAccessTouches::new();
+        pending.enqueue(42);
+        let now = Instant::now();
+        let drained = pending.take_ready_for_flush(true, now).unwrap();
+        pending.requeue_after_failure(drained);
+
+        let retry_at = pending.next_retry_at.expect("backoff is set");
+        assert!(
+            pending.take_ready_for_flush(false, now).is_none(),
+            "retry should be deferred until backoff elapses"
+        );
+        assert!(
+            pending.take_ready_for_flush(false, retry_at).is_some(),
+            "retry should resume once backoff elapses"
         );
     }
 }

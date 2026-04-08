@@ -1,12 +1,17 @@
 //! Cache 3.0 file-per-block payload storage.
 
+use std::array;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use lru::LruCache;
+use parking_lot::Mutex;
 use tracing::warn;
 
 use super::layout::CacheV3Layout;
@@ -14,6 +19,12 @@ use super::platform;
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
+#[cfg(not(test))]
+const READ_FD_CACHE_CAPACITY: usize = 2_048;
+#[cfg(test)]
+const READ_FD_CACHE_CAPACITY: usize = 16;
+const READ_FD_CACHE_SHARDS: usize = 16;
+const READ_HINT_MIN_LEN: usize = 512 * 1024;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -29,18 +40,29 @@ pub enum FilePayloadStoreError {
 #[derive(Debug, Clone)]
 pub struct FilePayloadStore {
     layout: CacheV3Layout,
+    read_handles: Arc<ReadHandleCache>,
 }
 
 impl FilePayloadStore {
     pub fn open(layout: CacheV3Layout) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_blocks_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
-        Ok(Self { layout })
+        Ok(Self {
+            layout,
+            read_handles: Arc::new(ReadHandleCache {
+                shards: array::from_fn(|_| {
+                    Mutex::new(LruCache::new(read_fd_cache_shard_capacity()))
+                }),
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                evictions: AtomicU64::new(0),
+            }),
+        })
     }
 
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.layout.payload_block_path(object_id);
-        let file = Self::open_for_read(&path).ok()?;
+        let file = self.cached_read_handle(object_id, &path).ok()?;
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -67,7 +89,7 @@ impl FilePayloadStore {
         };
         let mut payload = vec![0_u8; len];
         if len > 0 {
-            if let Err(error) = platform::pread_exact(&file, &mut payload, 0) {
+            if let Err(error) = platform::pread_exact(file.as_ref(), &mut payload, 0) {
                 warn!(
                     object_id,
                     path = %path.display(),
@@ -84,34 +106,24 @@ impl FilePayloadStore {
         if out.is_empty() {
             return Some(0);
         }
+        let start = u64::try_from(data_offset).ok()?;
 
         let path = self.layout.payload_block_path(object_id);
-        let file = Self::open_for_read(&path).ok()?;
-        let file_len = match file.metadata() {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
+        let file = self.cached_read_handle(object_id, &path).ok()?;
+        if out.len() >= READ_HINT_MIN_LEN {
+            let hint_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
+            if let Err(error) = platform::advise_will_need(file.as_ref(), start, hint_len) {
                 warn!(
                     object_id,
                     data_offset,
                     path = %path.display(),
                     error = ?error,
-                    "cache-v3 payload read_into metadata failed"
+                    "cache-v3 payload read_into advise_will_need failed"
                 );
-                return None;
             }
-        };
-        let start = u64::try_from(data_offset).ok()?;
-        if start >= file_len {
-            return Some(0);
         }
 
-        let available = usize::try_from(file_len - start).unwrap_or(usize::MAX);
-        let to_read = out.len().min(available);
-        if to_read == 0 {
-            return Some(0);
-        }
-
-        match platform::pread(&file, &mut out[..to_read], start) {
+        match platform::pread(file.as_ref(), out, start) {
             Ok(read) => Some(read),
             Err(error) => {
                 warn!(
@@ -163,11 +175,13 @@ impl FilePayloadStore {
             let _ = std::fs::remove_file(&temp_path);
             return Err(FilePayloadStoreError::Io(error));
         }
+        self.invalidate_cached_read_handle(object_id);
         platform::sync_directory(payload_dir)?;
         Ok(())
     }
 
     pub fn remove(&self, object_id: u64) {
+        self.invalidate_cached_read_handle(object_id);
         let payload_path = self.layout.payload_block_path(object_id);
         if let Err(error) = std::fs::remove_file(&payload_path)
             && error.kind() != io::ErrorKind::NotFound
@@ -235,12 +249,94 @@ impl FilePayloadStore {
     }
 
     fn open_for_read(path: &Path) -> io::Result<File> {
-        match OpenOptions::new().read(true).open(path) {
+        match platform::open_read_only(path) {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
             Err(error) => Err(error),
         }
     }
+
+    fn cached_read_handle(&self, object_id: u64, path: &Path) -> io::Result<Arc<File>> {
+        let shard = read_fd_shard(object_id);
+        if let Some(file) = self.read_handles.shards[shard]
+            .lock()
+            .get(&object_id)
+            .cloned()
+        {
+            self.read_handles.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(file);
+        }
+
+        self.read_handles.misses.fetch_add(1, Ordering::Relaxed);
+        let file = Arc::new(Self::open_for_read(path)?);
+        if let Err(error) = platform::advise_random(file.as_ref()) {
+            warn!(
+                object_id,
+                path = %path.display(),
+                error = ?error,
+                "cache-v3 payload open advise_random failed"
+            );
+        }
+
+        let mut handles = self.read_handles.shards[shard].lock();
+        if let Some(existing) = handles.get(&object_id).cloned() {
+            self.read_handles.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing);
+        }
+        let evicted_lru = handles.len() == handles.cap().get() && !handles.contains(&object_id);
+        let _ = handles.put(object_id, Arc::clone(&file));
+        if evicted_lru {
+            self.read_handles.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(file)
+    }
+
+    fn invalidate_cached_read_handle(&self, object_id: u64) {
+        self.read_handles.shards[read_fd_shard(object_id)]
+            .lock()
+            .pop(&object_id);
+    }
+
+    #[cfg(test)]
+    fn read_handle_stats(&self) -> ReadHandleStats {
+        ReadHandleStats {
+            hits: self.read_handles.hits.load(Ordering::Relaxed),
+            misses: self.read_handles.misses.load(Ordering::Relaxed),
+            evictions: self.read_handles.evictions.load(Ordering::Relaxed),
+            cached: self
+                .read_handles
+                .shards
+                .iter()
+                .map(|shard| shard.lock().len())
+                .sum(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadHandleCache {
+    shards: [Mutex<LruCache<u64, Arc<File>>>; READ_FD_CACHE_SHARDS],
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadHandleStats {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    cached: usize,
+}
+
+fn read_fd_cache_shard_capacity() -> NonZeroUsize {
+    let capacity = READ_FD_CACHE_CAPACITY.div_ceil(READ_FD_CACHE_SHARDS);
+    NonZeroUsize::new(capacity).expect("READ_FD_CACHE_CAPACITY must be non-zero")
+}
+
+fn read_fd_shard(object_id: u64) -> usize {
+    (object_id as usize) & (READ_FD_CACHE_SHARDS - 1)
 }
 
 fn next_temp_token() -> String {
@@ -298,5 +394,59 @@ mod tests {
         let reopened = FilePayloadStore::open(layout).unwrap();
         assert_eq!(reopened.get(9001).unwrap().as_ref(), b"committed");
         assert!(temp_path.exists());
+    }
+
+    #[test]
+    fn hot_read_into_reuses_cached_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        store.put(700, b"abcdef").unwrap();
+
+        let mut out = [0_u8; 3];
+        assert_eq!(store.read_into(700, 0, &mut out), Some(3));
+        assert_eq!(store.read_into(700, 1, &mut out), Some(3));
+        assert_eq!(store.read_into(700, 2, &mut out), Some(3));
+
+        let stats = store.read_handle_stats();
+        assert_eq!(stats.misses, 1);
+        assert!(
+            stats.hits >= 2,
+            "expected repeated reads to hit descriptor cache"
+        );
+        assert_eq!(stats.cached, 1);
+    }
+
+    #[test]
+    fn overwrite_invalidates_cached_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        store.put(1337, b"old").unwrap();
+
+        let mut out = [0_u8; 3];
+        assert_eq!(store.read_into(1337, 0, &mut out), Some(3));
+        assert_eq!(&out, b"old");
+
+        store.put(1337, b"new").unwrap();
+        assert_eq!(store.read_into(1337, 0, &mut out), Some(3));
+        assert_eq!(&out, b"new");
+    }
+
+    #[test]
+    fn descriptor_cache_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+
+        for object_id in 0..(READ_FD_CACHE_CAPACITY + 4) as u64 {
+            store.put(object_id, b"x").unwrap();
+            let mut out = [0_u8; 1];
+            assert_eq!(store.read_into(object_id, 0, &mut out), Some(1));
+        }
+
+        let stats = store.read_handle_stats();
+        assert_eq!(stats.cached, READ_FD_CACHE_CAPACITY);
+        assert!(stats.evictions >= 1);
     }
 }
