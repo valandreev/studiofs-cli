@@ -51,13 +51,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::MaterializeBatchStats;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v2::{
-    LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig,
-    derive_local_backend_volume_uuid,
-};
-use studiofs_cache::v3::{
-    CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CacheBackendKind, detect_cache_backends,
-};
+use studiofs_cache::v2::LocalBlockBackend;
+use studiofs_cache::v3::CacheBackendKind;
+use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -132,15 +128,6 @@ pub enum VfsError {
         cache_root: String,
         #[source]
         source: std::io::Error,
-    },
-
-    #[error(
-        "cache rollout blocked for root '{cache_root}' (detected contract '{backend}'): {reason}"
-    )]
-    CacheRolloutBlocked {
-        cache_root: String,
-        backend: CacheBackendKind,
-        reason: String,
     },
 
     #[error("{0}")]
@@ -3508,6 +3495,23 @@ fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) ->
     }
 }
 
+fn map_open_local_block_backend_error(
+    cache_dir: &str,
+    source: OpenLocalBlockBackendError,
+) -> VfsError {
+    match source {
+        OpenLocalBlockBackendError::DetectCacheBackend { source, .. } => {
+            map_cache_backend_detection_error(cache_dir, source)
+        }
+        OpenLocalBlockBackendError::OpenLegacyRawBackend { source, .. } => {
+            VfsError::Other(format!("failed to open raw block backend: {source}"))
+        }
+        OpenLocalBlockBackendError::OpenCacheV3Backend { source, .. } => {
+            VfsError::Other(format!("failed to open cache-v3 backend: {source}"))
+        }
+    }
+}
+
 impl StudioVfs {
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
@@ -4398,8 +4402,10 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let cache_backend_detection = detect_cache_backends(Path::new(cache_dir))
-                .map_err(|source| map_cache_backend_detection_error(cache_dir, source))?;
+            let opened_local_backend =
+                open_local_block_backend(Path::new(cache_dir), &format_info.uuid)
+                    .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
+            let cache_backend_detection = opened_local_backend.detection;
             if cache_backend_detection.has_dual_layout() {
                 info!(
                     cache_root = %cache_backend_detection.layout.cache_root.display(),
@@ -4408,34 +4414,15 @@ impl StudioVfs {
                     "cache root contains legacy raw and cache-v3 contract state; mounting with legacy raw backend during rollout"
                 );
             }
-
-            if matches!(
-                cache_backend_detection.selected_mount_backend(),
-                CacheBackendKind::CacheV3
-            ) {
-                let layout_marker = cache_backend_detection.layout.layout_marker.display();
-                let default_state = if CACHE_V3_DEFAULT_ALLOWED {
-                    "enabled"
-                } else {
-                    "blocked"
-                };
-                return Err(VfsError::CacheRolloutBlocked {
-                    cache_root: cache_dir.to_string(),
-                    backend: CacheBackendKind::CacheV3,
-                    reason: format!(
-                        "cache root is provisioned for Cache 3.0 at '{layout_marker}', but this mount path is still raw-backend only; default gate is {default_state}. {CACHE_V3_DEFAULT_GUARDRAIL}"
-                    ),
-                });
+            let selected_backend = opened_local_backend.backend_kind;
+            if matches!(selected_backend, CacheBackendKind::CacheV3) {
+                info!(
+                    cache_root = %cache_backend_detection.layout.cache_root.display(),
+                    layout_marker = %cache_backend_detection.layout.layout_marker.display(),
+                    "cache-v3 contract selected for local backend bootstrap; write-path behavior remains staged"
+                );
             }
-
-            let volume_uuid = derive_local_backend_volume_uuid(&format_info.uuid);
-            let block_store: Arc<dyn LocalBlockBackend> = Arc::new(
-                RawBlockFileBackend::open(RawBlockFileBackendConfig {
-                    cache_dir: PathBuf::from(cache_dir),
-                    volume_uuid,
-                })
-                .map_err(|e| VfsError::Other(format!("failed to open raw block backend: {e}")))?,
-            );
+            let block_store = opened_local_backend.backend;
 
             // Init BlockCache upload queue state for pending write replay.
             // Compatibility-only L1 limit for the BlockCache shim path.
@@ -11903,6 +11890,62 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other}"),
         }
+    }
+
+    #[test]
+    fn open_local_block_backend_detection_errors_map_to_structured_vfs_error() {
+        let source = OpenLocalBlockBackendError::DetectCacheBackend {
+            cache_root: "ignored".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated permission error",
+            ),
+        };
+        let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
+        match mapped {
+            VfsError::CacheBackendDetection { cache_root, source } => {
+                assert_eq!(cache_root, "E:\\cache-root");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn studio_vfs_new_selects_cache_v3_placeholder_backend_for_v3_only_layout() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info("cache-v3-bootstrap");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(&cache_dir);
+        std::fs::create_dir_all(&layout.v3_root).expect("create v3 root");
+        std::fs::write(&layout.layout_marker, b"v1").expect("create v3 marker");
+
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+
+        assert!(
+            vfs.local_block_backend()
+                .as_any()
+                .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
+            "v3-only layout should select the cache-v3 placeholder backend"
+        );
     }
 
     #[test]

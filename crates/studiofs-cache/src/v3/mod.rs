@@ -4,10 +4,16 @@
 //! - the non-mutating detection contract for legacy vs v3 cache layouts;
 //! - rollout guardrails that block making Cache 3.0 the default backend
 //!   until final validation is complete.
+//! - a bootstrap-only `LocalBlockBackend` placeholder to wire mount/status
+//!   selection while the full data path is still in migration.
 
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+
+use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
 pub mod layout;
 
@@ -100,9 +106,124 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetect
     })
 }
 
+/// Configuration for opening the Cache 3.0 local backend placeholder.
+#[derive(Debug, Clone)]
+pub struct CacheV3LocalBlockBackendConfig {
+    pub cache_root: PathBuf,
+    pub volume_uuid: [u8; 16],
+}
+
+/// Errors returned while opening the Cache 3.0 local backend placeholder.
+#[derive(Debug, thiserror::Error)]
+pub enum CacheV3LocalBlockBackendError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("cache-v3 layout marker is missing at '{path}'")]
+    MissingLayoutMarker { path: PathBuf },
+}
+
+/// Cache 3.0 local backend placeholder.
+///
+/// This struct intentionally wires mount/status bootstrap to a backend choice
+/// while the full Cache 3.0 data path is implemented in follow-up issues.
+#[derive(Debug)]
+pub struct CacheV3LocalBlockBackend {
+    _layout: CacheV3Layout,
+    _volume_uuid: [u8; 16],
+}
+
+impl CacheV3LocalBlockBackend {
+    pub fn open(
+        config: CacheV3LocalBlockBackendConfig,
+    ) -> Result<Self, CacheV3LocalBlockBackendError> {
+        let layout = CacheV3Layout::from_cache_root(&config.cache_root);
+        if !layout.layout_marker.try_exists()? {
+            return Err(CacheV3LocalBlockBackendError::MissingLayoutMarker {
+                path: layout.layout_marker.clone(),
+            });
+        }
+
+        Ok(Self {
+            _layout: layout,
+            _volume_uuid: config.volume_uuid,
+        })
+    }
+
+    fn unsupported_data_path() -> LocalBlockBackendError {
+        LocalBlockBackendError::Other(Box::new(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cache-v3 local backend data path is not implemented yet",
+        )))
+    }
+}
+
+impl LocalBlockBackend for CacheV3LocalBlockBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn get(&self, _object_id: u64) -> Option<Bytes> {
+        None
+    }
+
+    fn read_into(&self, _object_id: u64, _data_offset: usize, _out: &mut [u8]) -> Option<usize> {
+        None
+    }
+
+    fn get_for_upload(&self, _object_id: u64) -> Option<Bytes> {
+        None
+    }
+
+    fn contains(&self, _object_id: u64) -> bool {
+        false
+    }
+
+    fn advise_will_need(&self, _object_id: u64) {}
+
+    fn put(
+        &self,
+        _object_id: u64,
+        _data: &[u8],
+        _evictable: bool,
+    ) -> Result<(), LocalBlockBackendError> {
+        Err(Self::unsupported_data_path())
+    }
+
+    fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+        Ok(())
+    }
+
+    fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+        Ok(())
+    }
+
+    fn mark_uploading(&self, _object_id: u64) {}
+
+    fn mark_upload_failed(&self, _object_id: u64) {}
+
+    fn mark_uploaded(&self, _object_id: u64) {}
+
+    fn remove(&self, _object_id: u64) {}
+
+    fn remove_batch(&self, _object_ids: &[u64]) {}
+
+    fn dirty_object_ids(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    fn lifecycle_state(&self, _object_id: u64) -> LocalBlockLifecycleState {
+        LocalBlockLifecycleState::Missing
+    }
+
+    fn is_evictable(&self, _object_id: u64) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::{LocalBlockBackend, LocalBlockBackendError};
 
     fn create_v3_marker(layout: &CacheV3Layout) {
         std::fs::create_dir_all(&layout.v3_root).unwrap();
@@ -166,5 +287,40 @@ mod tests {
             detection.selected_mount_backend(),
             CacheBackendKind::LegacyRawV2
         );
+    }
+
+    #[test]
+    fn cache_v3_backend_requires_layout_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xAB; 16],
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CacheV3LocalBlockBackendError::MissingLayoutMarker { .. }
+        ));
+    }
+
+    #[test]
+    fn cache_v3_backend_bootstraps_and_reports_unimplemented_data_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xCD; 16],
+        })
+        .unwrap();
+        assert!(backend.dirty_object_ids().is_empty());
+        assert_eq!(
+            backend.lifecycle_state(42),
+            LocalBlockLifecycleState::Missing
+        );
+
+        let err = backend.put(42, b"payload", false).unwrap_err();
+        assert!(matches!(err, LocalBlockBackendError::Other(_)));
     }
 }

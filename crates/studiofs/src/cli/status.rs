@@ -3,15 +3,14 @@
 use crate::cli::utils::format_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
-use studiofs_cache::v2::{
-    LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig,
-    derive_local_backend_volume_uuid,
-};
+use studiofs_cache::v2::{LocalBlockBackend, open_legacy_local_block_backend};
 use studiofs_cache::v3::{
     CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE,
-    CacheBackendDetection, detect_cache_backends,
+    CacheBackendDetection, CacheBackendKind, detect_cache_backends,
 };
+use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_meta::counters;
 #[cfg(test)]
 use uuid::Uuid;
@@ -64,6 +63,16 @@ fn detect_cache_backends_with_fallback(
 
 fn detect_cache_backends_for_status(cache_path: &Path) -> Option<CacheBackendDetection> {
     detect_cache_backends_with_fallback(cache_path, detect_cache_backends)
+}
+
+fn map_status_open_local_backend_error(
+    cache_dir: &Path,
+    source: OpenLocalBlockBackendError,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "failed to open local cache backend at '{}': {source}",
+        cache_dir.display()
+    )
 }
 
 fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
@@ -181,16 +190,30 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
     Ok(stats)
 }
 
-fn scan_pending_uploads(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<usize> {
+fn scan_pending_uploads(
+    cache_dir: &Path,
+    volume_uuid: &str,
+    cache_backend_detection: Option<&CacheBackendDetection>,
+) -> anyhow::Result<usize> {
     let data_path = cache_dir.join("blocks.raw");
-    if !data_path.exists() {
+    let selected_backend = cache_backend_detection
+        .map(CacheBackendDetection::selected_mount_backend)
+        .unwrap_or(CacheBackendKind::LegacyRawV2);
+
+    if matches!(selected_backend, CacheBackendKind::LegacyRawV2) && !data_path.exists() {
         return Ok(0);
     };
 
-    let store = RawBlockFileBackend::open(RawBlockFileBackendConfig {
-        cache_dir: cache_dir.to_path_buf(),
-        volume_uuid: derive_local_backend_volume_uuid(volume_uuid),
-    })?;
+    let store: Arc<dyn LocalBlockBackend> = match cache_backend_detection {
+        Some(_) => {
+            open_local_block_backend(cache_dir, volume_uuid)
+                .map_err(|source| map_status_open_local_backend_error(cache_dir, source))?
+                .backend
+        }
+        None => Arc::new(
+            open_legacy_local_block_backend(cache_dir, volume_uuid).map_err(anyhow::Error::from)?,
+        ),
+    };
     Ok(store.dirty_object_ids().len())
 }
 
@@ -214,7 +237,11 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_cache_backends_for_status(&cache_path);
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
-    let pending_uploads = scan_pending_uploads(&cache_path, &format_info.uuid)?;
+    let pending_uploads = scan_pending_uploads(
+        &cache_path,
+        &format_info.uuid,
+        cache_backend_detection.as_ref(),
+    )?;
 
     let remote_size = engine.remote_metadata_size()?.unwrap_or(0);
     let local_db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -368,17 +395,32 @@ mod tests {
     fn scan_pending_uploads_uses_raw_backend_dirty_flags() {
         let tmp = tempfile::tempdir().unwrap();
         let volume_uuid = Uuid::new_v4();
-        let store = RawBlockFileBackend::open(RawBlockFileBackendConfig {
-            cache_dir: tmp.path().to_path_buf(),
-            volume_uuid: volume_uuid.into_bytes(),
-        })
-        .unwrap();
+        let store = open_legacy_local_block_backend(tmp.path(), &volume_uuid.to_string()).unwrap();
         store.put(1, b"dirty", false).unwrap();
         store.put(2, b"clean", true).unwrap();
 
         assert_eq!(
-            scan_pending_uploads(tmp.path(), &volume_uuid.to_string()).unwrap(),
+            scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), None).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn scan_pending_uploads_supports_cache_v3_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(tmp.path());
+        std::fs::create_dir_all(&layout.v3_root).unwrap();
+        std::fs::write(&layout.layout_marker, b"v1").unwrap();
+        let volume_uuid = Uuid::new_v4();
+
+        let detection = detect_cache_backends_for_status(tmp.path()).unwrap();
+        assert_eq!(
+            detection.selected_mount_backend(),
+            CacheBackendKind::CacheV3
+        );
+        assert_eq!(
+            scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
+            0
         );
     }
 
