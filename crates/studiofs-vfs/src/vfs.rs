@@ -44,7 +44,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -54,6 +54,9 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::{
     LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig,
     derive_local_backend_volume_uuid,
+};
+use studiofs_cache::v3::{
+    CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CacheBackendKind, detect_cache_backends,
 };
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -123,6 +126,22 @@ pub enum VfsError {
 
     #[error("fetch error: {0}")]
     Fetch(#[from] crate::fetch::FetchError),
+
+    #[error("cache backend detection failed for root '{cache_root}': {source}")]
+    CacheBackendDetection {
+        cache_root: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "cache rollout blocked for root '{cache_root}' (detected contract '{backend}'): {reason}"
+    )]
+    CacheRolloutBlocked {
+        cache_root: String,
+        backend: CacheBackendKind,
+        reason: String,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -3482,6 +3501,13 @@ macro_rules! with_sync_meta {
     }};
 }
 
+fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {
+    VfsError::CacheBackendDetection {
+        cache_root: cache_dir.to_string(),
+        source,
+    }
+}
+
 impl StudioVfs {
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
@@ -4238,7 +4264,7 @@ impl StudioVfs {
         self.record_live_extents(&live_extents);
     }
 
-    /// Create a new VFS instance using the raw local block backend.
+    /// Create a new VFS instance using the current local block backend contract.
     pub fn new(
         meta: Arc<dyn MetaEngine>,
         data_config: &DataStoreConfig,
@@ -4371,6 +4397,36 @@ impl StudioVfs {
             let acl_principal = config.principal.clone();
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
+
+            let cache_backend_detection = detect_cache_backends(Path::new(cache_dir))
+                .map_err(|source| map_cache_backend_detection_error(cache_dir, source))?;
+            if cache_backend_detection.has_dual_layout() {
+                info!(
+                    cache_root = %cache_backend_detection.layout.cache_root.display(),
+                    legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
+                    cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                    "cache root contains legacy raw and cache-v3 contract state; mounting with legacy raw backend during rollout"
+                );
+            }
+
+            if matches!(
+                cache_backend_detection.selected_mount_backend(),
+                CacheBackendKind::CacheV3
+            ) {
+                let layout_marker = cache_backend_detection.layout.layout_marker.display();
+                let default_state = if CACHE_V3_DEFAULT_ALLOWED {
+                    "enabled"
+                } else {
+                    "blocked"
+                };
+                return Err(VfsError::CacheRolloutBlocked {
+                    cache_root: cache_dir.to_string(),
+                    backend: CacheBackendKind::CacheV3,
+                    reason: format!(
+                        "cache root is provisioned for Cache 3.0 at '{layout_marker}', but this mount path is still raw-backend only; default gate is {default_state}. {CACHE_V3_DEFAULT_GUARDRAIL}"
+                    ),
+                });
+            }
 
             let volume_uuid = derive_local_backend_volume_uuid(&format_info.uuid);
             let block_store: Arc<dyn LocalBlockBackend> = Arc::new(
@@ -11831,6 +11887,22 @@ mod tests {
         .expect("create vfs");
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn cache_backend_detection_errors_are_structured() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "simulated permission error",
+        );
+        let mapped = map_cache_backend_detection_error("E:\\cache-root", error);
+        match mapped {
+            VfsError::CacheBackendDetection { cache_root, source } => {
+                assert_eq!(cache_root, "E:\\cache-root");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[test]

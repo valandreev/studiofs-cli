@@ -8,6 +8,10 @@
 
 **Tech Stack:** Rust, `std::sync::{Arc, RwLock, atomic::AtomicU64}`, `tokio` (for testing context).
 
+> **Audit update (2026-04-08):** The refactor shipped in `crates/studiofs-cache/src/v2/raw_block_file_backend.rs` (see commits `013e0dd` and `2110d07`). Tasks 1, 2, the core of Task 3, the corrected design in Task 4 Step 2, and Task 5 are present in the code. Two plan items did not ship exactly as originally written:
+> - The preallocation sketch in Task 3 Step 1 was removed in `2110d07` after a concurrent append race was found, so the final write path uses atomic reservation + direct `pwrite` without `platform::preallocate`.
+> - Task 4 Step 1 is a superseded first draft of compaction. The code implements the corrected lock/file-handle strategy from Task 4 Step 2 instead.
+
 ---
 
 ### Task 1: Update State Structures and Locks
@@ -15,10 +19,10 @@
 **Files:**
 - Modify: `crates/studiofs-cache/src/v2/raw_block_file_backend.rs`
 
-- [ ] **Step 1: Write failing compilation test (Mental check)**
+- [x] **Step 1: Write failing compilation test (Mental check)**
 The goal is to change the core struct definitions. If we change them, existing code using `file.lock()` or `state.lock()` will fail to compile. This is a structural refactoring step.
 
-- [ ] **Step 2: Update struct definitions**
+- [x] **Step 2: Update struct definitions**
 Change `RawBlockFileBackend` fields to use `Arc`, `RwLock`, and `AtomicU64`.
 
 ```rust
@@ -36,7 +40,7 @@ pub struct RawBlockFileBackend {
 }
 ```
 
-- [ ] **Step 3: Update `open` method**
+- [x] **Step 3: Update `open` method**
 Initialize the new fields in `open`.
 
 ```rust
@@ -69,7 +73,7 @@ Initialize the new fields in `open`.
         })
 ```
 
-- [ ] **Step 4: Fix compilation errors for read-only methods**
+- [x] **Step 4: Fix compilation errors for read-only methods**
 Update methods like `contains`, `lifecycle_state`, `is_evictable`, and `dirty_object_ids` to use `state.read()`.
 
 ```rust
@@ -111,10 +115,10 @@ Update methods like `contains`, `lifecycle_state`, `is_evictable`, and `dirty_ob
     }
 ```
 
-- [ ] **Step 5: Verify compilation (partial)**
+- [x] **Step 5: Verify compilation (partial)**
 Run `cargo check -p studiofs-cache` to ensure the struct and read-only methods compile (errors in `put`, `get`, etc., are expected and will be fixed in subsequent tasks).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add crates/studiofs-cache/src/v2/raw_block_file_backend.rs
 git commit -m "refactor(cache): change RawBlockFileBackend locks to RwLock and Arc"
@@ -127,7 +131,7 @@ git commit -m "refactor(cache): change RawBlockFileBackend locks to RwLock and A
 **Files:**
 - Modify: `crates/studiofs-cache/src/v2/raw_block_file_backend.rs`
 
-- [ ] **Step 1: Update `get` and `read_payload`**
+- [x] **Step 1: Update `get` and `read_payload`**
 Take a read lock to get the entry, then drop it and read from the `Arc<File>`.
 
 ```rust
@@ -175,10 +179,10 @@ Take a read lock to get the entry, then drop it and read from the `Arc<File>`.
     }
 ```
 
-- [ ] **Step 2: Run `cargo check`**
+- [x] **Step 2: Run `cargo check`**
 Verify the read path compiles.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 ```bash
 git add crates/studiofs-cache/src/v2/raw_block_file_backend.rs
 git commit -m "refactor(cache): make raw backend read path lock-free"
@@ -191,8 +195,10 @@ git commit -m "refactor(cache): make raw backend read path lock-free"
 **Files:**
 - Modify: `crates/studiofs-cache/src/v2/raw_block_file_backend.rs`
 
-- [ ] **Step 1: Rewrite `put` for parallel coordination**
+- [x] **Step 1: Rewrite `put` for parallel coordination**
 Reserve space using `AtomicU64`, perform the write without locks, then take the write lock to update the index.
+
+Final code note: the `platform::preallocate` sketch shown below was intentionally removed after it raced under concurrent append; the shipped path still reserves offsets atomically and writes in parallel.
 
 ```rust
     fn put(
@@ -256,7 +262,7 @@ Reserve space using `AtomicU64`, perform the write without locks, then take the 
     }
 ```
 
-- [ ] **Step 2: Update `append_record` and state mutators**
+- [x] **Step 2: Update `append_record` and state mutators**
 Update `mark_uploaded`, `remove`, `remove_batch`, etc. to use `state.write()` and write directly via `Arc<File>`. `append_record` should reserve space, write, and not call `fdatasync`.
 
 ```rust
@@ -358,7 +364,7 @@ Update `mark_uploaded`, `remove`, `remove_batch`, etc. to use `state.write()` an
     }
 ```
 
-- [ ] **Step 3: Update `sync_data`**
+- [x] **Step 3: Update `sync_data`**
 ```rust
     fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
         platform::fdatasync(&self.file)?;
@@ -366,7 +372,7 @@ Update `mark_uploaded`, `remove`, `remove_batch`, etc. to use `state.write()` an
     }
 ```
 
-- [ ] **Step 4: Fix `Drop` implementation**
+- [x] **Step 4: Fix `Drop` implementation**
 ```rust
 impl Drop for RawBlockFileBackend {
     fn drop(&mut self) {
@@ -377,10 +383,10 @@ impl Drop for RawBlockFileBackend {
 }
 ```
 
-- [ ] **Step 5: Ensure compilation**
+- [x] **Step 5: Ensure compilation**
 Run `cargo test -p studiofs-cache` to verify contract tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add crates/studiofs-cache/src/v2/raw_block_file_backend.rs
 git commit -m "feat(cache): parallelize raw backend put operations"
@@ -395,6 +401,8 @@ git commit -m "feat(cache): parallelize raw backend put operations"
 
 - [ ] **Step 1: Update `compact_locked` and `run_pressure_maintenance`**
 Compaction needs exclusive access. Since it writes a new file and swaps it, we need to block other operations during the swap.
+
+Audit note: this exact draft was not shipped. It exposed the file-handle swap problem and was replaced by the corrected design in Step 2.
 
 ```rust
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
@@ -514,7 +522,7 @@ Update `compact_locked` to use `&self.file` instead of `self.file.lock()`. Updat
         // readers use the correct file handle without acquiring multiple locks.
 ```
 
-- [ ] **Step 2: Rethink Lock Strategy (Correction)**
+- [x] **Step 2: Rethink Lock Strategy (Correction)**
 Let's modify `RawBlockFileState` to hold the `Arc<File>` and `reserved_len` so they are swapped together during compaction.
 
 Modify `RawBlockFileBackend` definition:
@@ -568,10 +576,10 @@ Update `put` and `read`:
     }
 ```
 
-- [ ] **Step 3: Apply the corrected state struct and run tests**
+- [x] **Step 3: Apply the corrected state struct and run tests**
 Refactor the file to match this corrected architecture, ensuring all tests pass (`cargo test -p studiofs-cache`).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 ```bash
 git add crates/studiofs-cache/src/v2/raw_block_file_backend.rs
 git commit -m "fix(cache): place file handle in RwLock state for safe compaction swap"
@@ -584,7 +592,7 @@ git commit -m "fix(cache): place file handle in RwLock state for safe compaction
 **Files:**
 - Modify: `crates/studiofs-cache/src/v2/raw_block_file_backend.rs`
 
-- [ ] **Step 1: Write concurrent test**
+- [x] **Step 1: Write concurrent test**
 Add a test in the `tests` module to verify parallel puts.
 
 ```rust
@@ -617,10 +625,10 @@ Add a test in the `tests` module to verify parallel puts.
     }
 ```
 
-- [ ] **Step 2: Run the test**
+- [x] **Step 2: Run the test**
 Run `cargo test -p studiofs-cache concurrent_puts`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 ```bash
 git add crates/studiofs-cache/src/v2/raw_block_file_backend.rs
 git commit -m "test(cache): add concurrency test for raw backend"
