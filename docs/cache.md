@@ -8,8 +8,12 @@ There are two generations of the cache implementation:
 
 | Generation | Module | Status |
 |------------|--------|--------|
-| **v3 (legacy stack)** | `l1_mem`, `l2_disk`, `lru_tracker`, `runtime`, direct-I/O helpers | **Retired in SFS-143** |
+| **Legacy pre-SFS-143 stack** | `l1_mem`, `l2_disk`, `lru_tracker`, `runtime`, direct-I/O helpers | **Retired in SFS-143** |
 | **v2 (active path)** | `v2::raw_block_file_backend`, `v2::local_block_backend`, `v2::platform` | Active local block backend and shared helpers |
+| **v3 (contract freeze)** | `v3::layout`, `v3::detect_cache_backends` | Contract-only in SFS-173; runtime backend not enabled |
+
+Cache 3.0 rollout contract, acceptance gates, and guardrails are documented in
+[Cache 3.0 Contract Freeze](./cache-v3-contract.md).
 ---
 
 ## Cache v2 Compatibility Shim

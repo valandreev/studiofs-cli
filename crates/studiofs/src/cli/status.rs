@@ -8,6 +8,10 @@ use studiofs_cache::v2::{
     LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig,
     derive_local_backend_volume_uuid,
 };
+use studiofs_cache::v3::{
+    CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE,
+    detect_cache_backends,
+};
 use studiofs_meta::counters;
 #[cfg(test)]
 use uuid::Uuid;
@@ -188,6 +192,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
+    let cache_backend_detection = detect_cache_backends(&cache_path);
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(&cache_path, &format_info.uuid)?;
 
@@ -223,6 +228,40 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
 
     println!("\n  Metadata:   {:?}", db_path);
     println!("  Meta size:   {}", format_bytes(local_db_size));
+
+    println!("\nLocal Cache");
+    println!("───────────");
+    println!("  Root:                {}", cache_path.display());
+    println!(
+        "  Legacy raw path:     {}",
+        cache_backend_detection.legacy_raw_data_path.display()
+    );
+    println!(
+        "  Legacy raw present:  {}",
+        cache_backend_detection.has_legacy_raw_backend()
+    );
+    println!(
+        "  Cache v3 marker:     {}",
+        cache_backend_detection.layout.layout_marker.display()
+    );
+    println!(
+        "  Cache v3 present:    {}",
+        cache_backend_detection.has_cache_v3_contract()
+    );
+    println!(
+        "  Contract selection:  {}",
+        cache_backend_detection.selected_mount_backend()
+    );
+    println!(
+        "  Cache v3 default:    {}",
+        if CACHE_V3_DEFAULT_ALLOWED {
+            "enabled"
+        } else {
+            "blocked"
+        }
+    );
+    println!("  Final validation:    {}", CACHE_V3_FINAL_VALIDATION_ISSUE);
+    println!("  Guardrail:           {}", CACHE_V3_DEFAULT_GUARDRAIL);
 
     println!("\nLocal Ingress");
     println!("─────────────");
