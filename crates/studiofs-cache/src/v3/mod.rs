@@ -297,14 +297,12 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn remove_batch(&self, object_ids: &[u64]) {
         self.inner.remove_batch(object_ids);
-        for object_id in object_ids {
-            if let Err(error) = self.index.remove(*object_id) {
-                warn!(
-                    object_id = *object_id,
-                    error = ?error,
-                    "cache-v3 index remove_batch entry failed"
-                );
-            }
+        if let Err(error) = self.index.remove_batch(object_ids) {
+            warn!(
+                count = object_ids.len(),
+                error = ?error,
+                "cache-v3 index remove_batch failed"
+            );
         }
     }
 
