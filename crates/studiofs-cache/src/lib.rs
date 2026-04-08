@@ -53,29 +53,29 @@ pub enum OpenLocalBlockBackendError {
 
 fn open_legacy_backend(
     cache_root: &Path,
+    cache_root_display: &str,
     volume_uuid: &str,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    let cache_root_display = cache_root.display().to_string();
     v2::open_legacy_local_block_backend(cache_root, volume_uuid)
         .map(|backend| Arc::new(backend) as Arc<dyn v2::LocalBlockBackend>)
         .map_err(|source| OpenLocalBlockBackendError::OpenLegacyRawBackend {
-            cache_root: cache_root_display,
+            cache_root: cache_root_display.to_owned(),
             source,
         })
 }
 
 fn open_cache_v3_backend(
     cache_root: &Path,
+    cache_root_display: &str,
     volume_uuid: &str,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    let cache_root_display = cache_root.display().to_string();
     v3::CacheV3LocalBlockBackend::open(v3::CacheV3LocalBlockBackendConfig {
         cache_root: cache_root.to_path_buf(),
         volume_uuid: v2::derive_local_backend_volume_uuid(volume_uuid),
     })
     .map(|backend| Arc::new(backend) as Arc<dyn v2::LocalBlockBackend>)
     .map_err(|source| OpenLocalBlockBackendError::OpenCacheV3Backend {
-        cache_root: cache_root_display,
+        cache_root: cache_root_display.to_owned(),
         source,
     })
 }
@@ -90,17 +90,22 @@ pub fn open_local_block_backend(
     volume_uuid: &str,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     let cache_root = cache_root.as_ref();
+    let cache_root_display = cache_root.display().to_string();
 
     let detection = v3::detect_cache_backends(cache_root).map_err(|source| {
         OpenLocalBlockBackendError::DetectCacheBackend {
-            cache_root: cache_root.display().to_string(),
+            cache_root: cache_root_display.clone(),
             source,
         }
     })?;
     let backend_kind = detection.selected_mount_backend();
     let backend: Arc<dyn v2::LocalBlockBackend> = match backend_kind {
-        v3::CacheBackendKind::LegacyRawV2 => open_legacy_backend(cache_root, volume_uuid)?,
-        v3::CacheBackendKind::CacheV3 => open_cache_v3_backend(cache_root, volume_uuid)?,
+        v3::CacheBackendKind::LegacyRawV2 => {
+            open_legacy_backend(cache_root, &cache_root_display, volume_uuid)?
+        }
+        v3::CacheBackendKind::CacheV3 => {
+            open_cache_v3_backend(cache_root, &cache_root_display, volume_uuid)?
+        }
     };
 
     Ok(OpenedLocalBlockBackend {

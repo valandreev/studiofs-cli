@@ -152,7 +152,6 @@ impl CacheV3LocalBlockBackend {
             });
         }
 
-        std::fs::create_dir_all(&layout.v3_root)?;
         let inner = RawBlockFileBackend::open(RawBlockFileBackendConfig {
             cache_dir: layout.v3_root.clone(),
             volume_uuid: config.volume_uuid,
