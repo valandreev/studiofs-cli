@@ -243,7 +243,7 @@ fn advise_will_need_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
     if value > libc::off_t::MAX as u64 {
         return Err(io::Error::new(
