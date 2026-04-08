@@ -33,6 +33,7 @@ const RAW_RECORD_KIND_REMOVE: u8 = 3;
 const RAW_STATE_DIRTY: u8 = 1;
 const RAW_STATE_UPLOADING: u8 = 2;
 const RAW_STATE_UPLOADED: u8 = 3;
+const LEGACY_STATUS_SCAN_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct SpillDirStats {
@@ -265,6 +266,18 @@ fn scan_cache_usage(
     }
 }
 
+fn warn_large_legacy_status_scan(raw_data_path: &Path) {
+    if let Ok(metadata) = std::fs::metadata(raw_data_path)
+        && metadata.len() >= LEGACY_STATUS_SCAN_WARN_BYTES
+    {
+        eprintln!(
+            "warning: legacy cache usage scan will read '{}' ({}); this can take time",
+            raw_data_path.display(),
+            format_bytes(metadata.len())
+        );
+    }
+}
+
 fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
     let mut stats = SpillDirStats::default();
     let now = std::time::SystemTime::now();
@@ -426,6 +439,13 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_cache_backends_for_status(&cache_path);
+    let selected_mount_backend = cache_backend_detection
+        .as_ref()
+        .map(CacheBackendDetection::selected_mount_backend)
+        .unwrap_or(CacheBackendKind::LegacyRawV2);
+    if matches!(selected_mount_backend, CacheBackendKind::LegacyRawV2) {
+        warn_large_legacy_status_scan(&cache_path.join("blocks.raw"));
+    }
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(
         &cache_path,
@@ -498,11 +518,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     } else {
         "unknown"
     };
-    let migration_needed = if let Some(detection) = cache_backend_detection.as_ref() {
-        detection.selected_mount_backend() == CacheBackendKind::LegacyRawV2
-    } else {
-        true
-    };
+    let migration_needed = selected_mount_backend == CacheBackendKind::LegacyRawV2;
     let reconcile_needed = pending_uploads > 0
         || spill_stats.records > 0
         || cache_usage
