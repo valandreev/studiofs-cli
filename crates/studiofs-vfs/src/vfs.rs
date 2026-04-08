@@ -3501,6 +3501,13 @@ macro_rules! with_sync_meta {
     }};
 }
 
+fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {
+    VfsError::CacheBackendDetection {
+        cache_root: cache_dir.to_string(),
+        source,
+    }
+}
+
 impl StudioVfs {
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
@@ -4391,13 +4398,8 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let cache_backend_detection =
-                detect_cache_backends(Path::new(cache_dir)).map_err(|source| {
-                    VfsError::CacheBackendDetection {
-                        cache_root: cache_dir.to_string(),
-                        source,
-                    }
-                })?;
+            let cache_backend_detection = detect_cache_backends(Path::new(cache_dir))
+                .map_err(|source| map_cache_backend_detection_error(cache_dir, source))?;
             if cache_backend_detection.has_dual_layout() {
                 info!(
                     cache_root = %cache_backend_detection.layout.cache_root.display(),
@@ -11885,6 +11887,22 @@ mod tests {
         .expect("create vfs");
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn cache_backend_detection_errors_are_structured() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "simulated permission error",
+        );
+        let mapped = map_cache_backend_detection_error("E:\\cache-root", error);
+        match mapped {
+            VfsError::CacheBackendDetection { cache_root, source } => {
+                assert_eq!(cache_root, "E:\\cache-root");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[test]

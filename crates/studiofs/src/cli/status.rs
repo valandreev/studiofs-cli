@@ -10,7 +10,7 @@ use studiofs_cache::v2::{
 };
 use studiofs_cache::v3::{
     CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE,
-    detect_cache_backends,
+    CacheBackendDetection, detect_cache_backends,
 };
 use studiofs_meta::counters;
 #[cfg(test)]
@@ -44,6 +44,26 @@ fn local_cache_path(meta_dir: &Path, cache_dir: Option<&Path>, volume_uuid: &str
         .map(Path::to_path_buf)
         .unwrap_or_else(|| meta_dir.join("cache"));
     base.join(volume_uuid)
+}
+
+fn detect_cache_backends_with_fallback(
+    cache_path: &Path,
+    detector: impl FnOnce(&Path) -> std::io::Result<CacheBackendDetection>,
+) -> Option<CacheBackendDetection> {
+    match detector(cache_path) {
+        Ok(detection) => Some(detection),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to inspect cache backend contract at '{}': {error}",
+                cache_path.display()
+            );
+            None
+        }
+    }
+}
+
+fn detect_cache_backends_for_status(cache_path: &Path) -> Option<CacheBackendDetection> {
+    detect_cache_backends_with_fallback(cache_path, detect_cache_backends)
 }
 
 fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
@@ -192,7 +212,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
-    let cache_backend_detection = detect_cache_backends(&cache_path)?;
+    let cache_backend_detection = detect_cache_backends_for_status(&cache_path);
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(&cache_path, &format_info.uuid)?;
 
@@ -232,26 +252,34 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     println!("\nLocal Cache");
     println!("───────────");
     println!("  Root:                {}", cache_path.display());
-    println!(
-        "  Legacy raw path:     {}",
-        cache_backend_detection.legacy_raw_data_path.display()
-    );
-    println!(
-        "  Legacy raw present:  {}",
-        cache_backend_detection.has_legacy_raw_backend()
-    );
-    println!(
-        "  Cache v3 marker:     {}",
-        cache_backend_detection.layout.layout_marker.display()
-    );
-    println!(
-        "  Cache v3 present:    {}",
-        cache_backend_detection.has_cache_v3_contract()
-    );
-    println!(
-        "  Contract selection:  {}",
-        cache_backend_detection.selected_mount_backend()
-    );
+    if let Some(cache_backend_detection) = cache_backend_detection.as_ref() {
+        println!(
+            "  Legacy raw path:     {}",
+            cache_backend_detection.legacy_raw_data_path.display()
+        );
+        println!(
+            "  Legacy raw present:  {}",
+            cache_backend_detection.has_legacy_raw_backend()
+        );
+        println!(
+            "  Cache v3 marker:     {}",
+            cache_backend_detection.layout.layout_marker.display()
+        );
+        println!(
+            "  Cache v3 present:    {}",
+            cache_backend_detection.has_cache_v3_contract()
+        );
+        println!(
+            "  Contract selection:  {}",
+            cache_backend_detection.selected_mount_backend()
+        );
+    } else {
+        println!("  Legacy raw path:     unavailable");
+        println!("  Legacy raw present:  unknown");
+        println!("  Cache v3 marker:     unavailable");
+        println!("  Cache v3 present:    unknown");
+        println!("  Contract selection:  unknown");
+    }
     println!(
         "  Cache v3 default:    {}",
         if CACHE_V3_DEFAULT_ALLOWED {
@@ -352,5 +380,24 @@ mod tests {
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string()).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn detect_cache_backends_with_fallback_returns_none_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let detection = detect_cache_backends_with_fallback(tmp.path(), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated permission error",
+            ))
+        });
+        assert!(detection.is_none());
+    }
+
+    #[test]
+    fn detect_cache_backends_for_status_returns_detection_when_probe_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let detection = detect_cache_backends_for_status(tmp.path());
+        assert!(detection.is_some());
     }
 }
