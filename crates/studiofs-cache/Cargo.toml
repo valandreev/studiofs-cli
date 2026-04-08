@@ -12,6 +12,7 @@ bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+lru.workspace = true
 libc.workspace = true
 uuid.workspace = true
 redb.workspace = true

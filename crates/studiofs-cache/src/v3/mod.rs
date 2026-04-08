@@ -10,6 +10,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tracing::warn;
@@ -32,6 +33,7 @@ pub use layout::{
 };
 
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
+const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Final validation issue that must pass before Cache 3.0 is allowed as default.
 ///
@@ -197,11 +199,33 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn get(&self, object_id: u64) -> Option<Bytes> {
-        self.inner.get(object_id)
+        let payload = self.inner.get(object_id);
+        if payload.is_some() {
+            if let Err(error) = self
+                .index
+                .touch_access_if_stale(object_id, ACCESS_TOUCH_MIN_INTERVAL)
+            {
+                warn!(object_id, error = ?error, "cache-v3 index access touch failed after get");
+            }
+        }
+        payload
     }
 
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
-        self.inner.read_into(object_id, data_offset, out)
+        let read = self.inner.read_into(object_id, data_offset, out);
+        if read.is_some_and(|bytes| bytes > 0) {
+            if let Err(error) = self
+                .index
+                .touch_access_if_stale(object_id, ACCESS_TOUCH_MIN_INTERVAL)
+            {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 index access touch failed after read_into"
+                );
+            }
+        }
+        read
     }
 
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
@@ -487,5 +511,25 @@ mod tests {
             LocalBlockLifecycleState::Uploading
         );
         assert_eq!(reopened.dirty_object_ids(), vec![2]);
+    }
+
+    #[test]
+    fn cache_v3_backend_get_refreshes_access_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x22; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", true).unwrap();
+        backend.put(11, b"eleven", true).unwrap();
+        assert_eq!(backend.get(10).unwrap().as_ref(), b"ten");
+        drop(backend);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![11, 10]);
     }
 }

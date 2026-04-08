@@ -4,10 +4,12 @@
 //! and space accounting. Accounting counters are updated atomically with row
 //! mutations so budget checks never require payload scans.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -29,6 +31,10 @@ const COUNTER_EVICTABLE_BYTES: &str = "evictable_bytes";
 const COUNTER_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 const COUNTER_NEXT_ACCESS_SEQ: &str = "next_access_seq";
 const LIST_PAGE_SIZE: usize = 4_096;
+#[cfg(not(test))]
+const TOUCH_ACCESS_LRU_CAPACITY: usize = 200_000;
+#[cfg(test)]
+const TOUCH_ACCESS_LRU_CAPACITY: usize = 128;
 
 const ENTRY_OFFSET_VERSION: usize = 0;
 const ENTRY_OFFSET_LIFECYCLE: usize = 1;
@@ -91,7 +97,7 @@ pub struct DirtyReplayEntry {
 pub struct CacheIndex {
     db_path: PathBuf,
     db: Arc<Database>,
-    last_touch_access: Mutex<std::collections::HashMap<u64, Instant>>,
+    last_touch_access: Mutex<LruCache<u64, Instant>>,
 }
 
 impl CacheIndex {
@@ -105,7 +111,7 @@ impl CacheIndex {
         let index = Self {
             db_path: path,
             db: Arc::new(db),
-            last_touch_access: Mutex::new(std::collections::HashMap::new()),
+            last_touch_access: Mutex::new(LruCache::new(touch_access_lru_capacity())),
         };
         index.initialize_schema()?;
         Ok(index)
@@ -330,7 +336,7 @@ impl CacheIndex {
         }
 
         txn.commit().map_err(storage_error)?;
-        self.last_touch_access.lock().remove(&object_id);
+        self.last_touch_access.lock().pop(&object_id);
         Ok(())
     }
 
@@ -346,27 +352,32 @@ impl CacheIndex {
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
+            let mut batch_delta = AccountingDelta::default();
 
             for object_id in object_ids {
                 let Some(old) = read_entry_from_blocks_write(&blocks, *object_id)? else {
                     continue;
                 };
-                apply_entry_change(
-                    *object_id,
-                    Some(&old),
-                    None,
-                    &mut blocks,
-                    &mut dirty_order,
+                remove_order_link(&mut dirty_order, old.dirty_order, *object_id, "dirty")?;
+                remove_order_link(
                     &mut access_order,
-                    &mut counters,
+                    Some(old.access_order),
+                    *object_id,
+                    "access",
                 )?;
+                let _ = blocks.remove(object_id).map_err(storage_error)?;
+                batch_delta.subtract_entry(&old)?;
+            }
+
+            if !batch_delta.is_zero() {
+                apply_accounting_delta_values(&mut counters, batch_delta)?;
             }
         }
 
         txn.commit().map_err(storage_error)?;
         let mut last_touch = self.last_touch_access.lock();
         for object_id in object_ids {
-            last_touch.remove(object_id);
+            last_touch.pop(object_id);
         }
         Ok(())
     }
@@ -506,6 +517,7 @@ impl CacheIndex {
         object_id: u64,
         min_interval: Duration,
     ) -> Result<bool, CacheIndexError> {
+        let now = Instant::now();
         {
             let mut gate = self.last_touch_access.lock();
             if let Some(last) = gate.get(&object_id) {
@@ -513,9 +525,12 @@ impl CacheIndex {
                     return Ok(false);
                 }
             }
-            gate.insert(object_id, Instant::now());
+            gate.put(object_id, now);
         }
-        self.touch_access(object_id)?;
+        if let Err(error) = self.touch_access(object_id) {
+            self.last_touch_access.lock().pop(&object_id);
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -630,25 +645,30 @@ fn apply_entry_change(
     access_order: &mut redb::Table<'_, u64, u64>,
     counters: &mut redb::Table<'_, &str, u64>,
 ) -> Result<(), CacheIndexError> {
-    if let Some(old_entry) = old {
-        remove_order_link(dirty_order, old_entry.dirty_order, object_id, "dirty")?;
-        remove_order_link(
-            access_order,
-            Some(old_entry.access_order),
-            object_id,
-            "access",
-        )?;
-    }
-
-    if let Some(new_entry) = new {
-        if let Some(dirty_seq) = new_entry.dirty_order {
+    let old_dirty_order = old.and_then(|entry| entry.dirty_order);
+    let new_dirty_order = new.and_then(|entry| entry.dirty_order);
+    if old_dirty_order != new_dirty_order {
+        if let Some(old_dirty) = old_dirty_order {
+            remove_order_link(dirty_order, Some(old_dirty), object_id, "dirty")?;
+        }
+        if let Some(dirty_seq) = new_dirty_order {
             dirty_order
                 .insert(&dirty_seq, &object_id)
                 .map_err(storage_error)?;
         }
-        access_order
-            .insert(&new_entry.access_order, &object_id)
-            .map_err(storage_error)?;
+    }
+
+    let old_access_order = old.map(|entry| entry.access_order);
+    let new_access_order = new.map(|entry| entry.access_order);
+    if old_access_order != new_access_order {
+        if let Some(old_access) = old_access_order {
+            remove_order_link(access_order, Some(old_access), object_id, "access")?;
+        }
+        if let Some(new_access) = new_access_order {
+            access_order
+                .insert(&new_access, &object_id)
+                .map_err(storage_error)?;
+        }
     }
 
     apply_accounting_delta(counters, old, new)?;
@@ -696,22 +716,23 @@ fn apply_accounting_delta(
 ) -> Result<(), CacheIndexError> {
     let (old_current, old_dirty, old_evictable) = contribution(old);
     let (new_current, new_dirty, new_evictable) = contribution(new);
+    apply_accounting_delta_values(
+        counters,
+        AccountingDelta {
+            current_delta: i128::from(new_current) - i128::from(old_current),
+            dirty_delta: i128::from(new_dirty) - i128::from(old_dirty),
+            evictable_delta: i128::from(new_evictable) - i128::from(old_evictable),
+        },
+    )
+}
 
-    adjust_counter(
-        counters,
-        COUNTER_CURRENT_BYTES,
-        i128::from(new_current) - i128::from(old_current),
-    )?;
-    adjust_counter(
-        counters,
-        COUNTER_DIRTY_BYTES,
-        i128::from(new_dirty) - i128::from(old_dirty),
-    )?;
-    adjust_counter(
-        counters,
-        COUNTER_EVICTABLE_BYTES,
-        i128::from(new_evictable) - i128::from(old_evictable),
-    )?;
+fn apply_accounting_delta_values(
+    counters: &mut redb::Table<'_, &str, u64>,
+    delta: AccountingDelta,
+) -> Result<(), CacheIndexError> {
+    adjust_counter(counters, COUNTER_CURRENT_BYTES, delta.current_delta)?;
+    adjust_counter(counters, COUNTER_DIRTY_BYTES, delta.dirty_delta)?;
+    adjust_counter(counters, COUNTER_EVICTABLE_BYTES, delta.evictable_delta)?;
     Ok(())
 }
 
@@ -730,6 +751,39 @@ fn contribution(entry: Option<&StoredEntry>) -> (u64, u64, u64) {
         0
     };
     (entry.payload_len, dirty, evictable)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AccountingDelta {
+    current_delta: i128,
+    dirty_delta: i128,
+    evictable_delta: i128,
+}
+
+impl AccountingDelta {
+    fn is_zero(self) -> bool {
+        self.current_delta == 0 && self.dirty_delta == 0 && self.evictable_delta == 0
+    }
+
+    fn subtract_entry(&mut self, entry: &StoredEntry) -> Result<(), CacheIndexError> {
+        let payload = i128::from(entry.payload_len);
+        self.current_delta = self
+            .current_delta
+            .checked_sub(payload)
+            .ok_or_else(|| CacheIndexError::Corruption("current_delta underflow".to_string()))?;
+        if is_dirty_like(entry.lifecycle) {
+            self.dirty_delta = self
+                .dirty_delta
+                .checked_sub(payload)
+                .ok_or_else(|| CacheIndexError::Corruption("dirty_delta underflow".to_string()))?;
+        }
+        if entry.evictable {
+            self.evictable_delta = self.evictable_delta.checked_sub(payload).ok_or_else(|| {
+                CacheIndexError::Corruption("evictable_delta underflow".to_string())
+            })?;
+        }
+        Ok(())
+    }
 }
 
 fn adjust_counter(
@@ -929,6 +983,11 @@ fn decode_lifecycle(raw: u8) -> Option<LocalBlockLifecycleState> {
 
 fn storage_error<E: std::fmt::Display>(error: E) -> CacheIndexError {
     CacheIndexError::Storage(error.to_string())
+}
+
+fn touch_access_lru_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(TOUCH_ACCESS_LRU_CAPACITY)
+        .expect("TOUCH_ACCESS_LRU_CAPACITY must be non-zero")
 }
 
 #[cfg(test)]
@@ -1146,5 +1205,26 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(index.access_order_object_ids().unwrap(), vec![11, 10]);
+    }
+
+    #[test]
+    fn touch_tracking_lru_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        let count = TOUCH_ACCESS_LRU_CAPACITY + 32;
+        for object_id in 0..count {
+            assert!(
+                index
+                    .touch_access_if_stale(object_id as u64, Duration::ZERO)
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(
+            index.last_touch_access.lock().len(),
+            TOUCH_ACCESS_LRU_CAPACITY
+        );
     }
 }
