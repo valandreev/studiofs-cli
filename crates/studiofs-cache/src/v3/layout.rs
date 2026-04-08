@@ -19,7 +19,7 @@ pub const CACHE_V3_PAYLOAD_DIR: &str = "payload";
 /// Nested tree under `payload/` holding block files.
 pub const CACHE_V3_PAYLOAD_BLOCKS_DIR: &str = "blocks";
 /// Number of shard directories in the payload block tree.
-pub const CACHE_V3_PAYLOAD_SHARD_COUNT: usize = 256;
+pub const CACHE_V3_PAYLOAD_SHARD_COUNT: usize = 256 * 256;
 /// Root directory for metadata/index files.
 pub const CACHE_V3_INDEX_DIR: &str = "index";
 /// redb index file location inside the v3 subtree.
@@ -59,12 +59,13 @@ impl CacheV3Layout {
         }
     }
 
-    /// Determine the payload shard id for a block object id.
+    /// Determine the two-level payload shard for a block object id.
     ///
-    /// Object ids are currently allocated as a sequential counter, so using the
-    /// least-significant byte keeps shard usage balanced for realistic volumes.
-    pub fn payload_shard(object_id: u64) -> u8 {
-        (object_id & 0xFF) as u8
+    /// We hash object ids before slicing shard bytes so early sequential ids do
+    /// not concentrate into a single top-level shard directory.
+    pub fn payload_shard(object_id: u64) -> [u8; 2] {
+        let hash = splitmix64(object_id);
+        [(hash >> 56) as u8, (hash >> 48) as u8]
     }
 
     /// Resolve the canonical payload block path for an object id.
@@ -76,12 +77,20 @@ impl CacheV3Layout {
     /// Resolve the canonical payload block path relative to `v3_root`.
     pub fn payload_block_relative_path(&self, object_id: u64) -> PathBuf {
         let hex = format!("{object_id:016x}");
-        let shard = format!("{:02x}", Self::payload_shard(object_id));
+        let [shard_0, shard_1] = Self::payload_shard(object_id);
         PathBuf::from(CACHE_V3_PAYLOAD_DIR)
             .join(CACHE_V3_PAYLOAD_BLOCKS_DIR)
-            .join(shard)
+            .join(format!("{shard_0:02x}"))
+            .join(format!("{shard_1:02x}"))
             .join(format!("{hex}.block"))
     }
+}
+
+fn splitmix64(input: u64) -> u64 {
+    let mut z = input.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -113,24 +122,36 @@ mod tests {
     #[test]
     fn payload_block_path_uses_two_hex_shards() {
         let layout = CacheV3Layout::from_cache_root("/cache/vol-a");
-        let path = layout.payload_block_path(0xAB00_0000_0000_0042);
+        let object_id = 0xAB00_0000_0000_0042;
+        let hex = format!("{object_id:016x}");
+        let [shard_0, shard_1] = CacheV3Layout::payload_shard(object_id);
+        let path = layout.payload_block_path(object_id);
 
         assert_eq!(
             path,
-            PathBuf::from("/cache/vol-a/v3/payload/blocks/42/ab00000000000042.block")
+            PathBuf::from(format!(
+                "/cache/vol-a/v3/payload/blocks/{shard_0:02x}/{shard_1:02x}/{hex}.block"
+            ))
         );
 
         assert_eq!(
-            layout.payload_block_relative_path(0xAB00_0000_0000_0042),
-            PathBuf::from("payload/blocks/42/ab00000000000042.block")
+            layout.payload_block_relative_path(object_id),
+            PathBuf::from(format!(
+                "payload/blocks/{shard_0:02x}/{shard_1:02x}/{hex}.block"
+            ))
         );
     }
 
     #[test]
     fn payload_shard_spreads_sequential_ids() {
-        assert_eq!(CacheV3Layout::payload_shard(1), 0x01);
-        assert_eq!(CacheV3Layout::payload_shard(255), 0xFF);
-        assert_eq!(CacheV3Layout::payload_shard(256), 0x00);
-        assert_eq!(CacheV3Layout::payload_shard(257), 0x01);
+        let shard_1 = CacheV3Layout::payload_shard(1);
+        let shard_2 = CacheV3Layout::payload_shard(2);
+        let shard_257 = CacheV3Layout::payload_shard(257);
+
+        assert_ne!(shard_1, shard_2);
+        assert_ne!(shard_1, shard_257);
+        assert_eq!(shard_1, CacheV3Layout::payload_shard(1));
+        assert_eq!(shard_2, CacheV3Layout::payload_shard(2));
+        assert_eq!(shard_257, CacheV3Layout::payload_shard(257));
     }
 }

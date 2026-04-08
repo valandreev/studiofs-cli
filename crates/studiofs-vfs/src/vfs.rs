@@ -4420,7 +4420,7 @@ impl StudioVfs {
                     cache_root = %cache_backend_detection.layout.cache_root.display(),
                     layout_marker = %cache_backend_detection.layout.layout_marker.display(),
                     cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                    "cache-v3 contract selected in bootstrap placeholder mode; using compatibility local backend path under the v3 subtree"
+                    "cache-v3 contract selected; using file-per-block local backend under the v3 subtree"
                 );
             }
             let block_store = opened_local_backend.backend;
