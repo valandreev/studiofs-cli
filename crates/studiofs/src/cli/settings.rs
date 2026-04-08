@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde::{Deserialize, Serialize};
-use studiofs_vfs::{CacheSafetyMode, VfsConfigRaw};
+use studiofs_vfs::VfsConfigRaw;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_CACHE_SIZE: &str = "100GB";
@@ -31,30 +31,6 @@ pub struct SettingsArgs {
     /// Default max disk cache size used by `studiofs mount` when omitted.
     #[arg(long)]
     pub cache_size: Option<String>,
-
-    /// Default slab flush interval used by `studiofs mount`.
-    #[arg(long = "slab-flush-interval")]
-    pub slab_flush_interval_ms: Option<u64>,
-
-    /// Cache safety mode for mount write-path durability.
-    #[arg(long = "cache-safety-mode", value_enum)]
-    pub cache_safety_mode: Option<SettingsCacheSafetyMode>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum SettingsCacheSafetyMode {
-    Fast,
-    Durable,
-}
-
-impl From<SettingsCacheSafetyMode> for CacheSafetyMode {
-    fn from(value: SettingsCacheSafetyMode) -> Self {
-        match value {
-            SettingsCacheSafetyMode::Fast => CacheSafetyMode::Fast,
-            SettingsCacheSafetyMode::Durable => CacheSafetyMode::Durable,
-        }
-    }
 }
 
 fn config_file_path() -> anyhow::Result<PathBuf> {
@@ -220,24 +196,6 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(interval_ms) = args.slab_flush_interval_ms {
-        if interval_ms > 0 {
-            config.vfs.slab_flush_interval_ms = Some(interval_ms);
-            changed = true;
-        }
-    }
-
-    if let Some(mode) = args.cache_safety_mode {
-        config.vfs.cache_safety_mode = Some(mode.into());
-        changed = true;
-    }
-
-    let resolved_vfs = config
-        .vfs
-        .clone()
-        .validate()
-        .map_err(|e| anyhow::anyhow!("invalid VFS settings: {e}"))?;
-
     if changed {
         save_studiofs_config(&config)?;
         println!("✓ Updated studiofs settings");
@@ -261,17 +219,7 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
             .cache_size
             .unwrap_or_else(|| DEFAULT_CACHE_SIZE.to_string())
     );
-    println!(
-        "  slab-flush-interval-ms: {}",
-        resolved_vfs.slab_flush_interval_ms
-    );
-    println!(
-        "  cache-safety-mode: {}",
-        match resolved_vfs.cache_safety_mode {
-            CacheSafetyMode::Fast => "fast",
-            CacheSafetyMode::Durable => "durable",
-        }
-    );
+    println!("  cache-policy: auto (derived from cache-size at mount time)");
 
     if !changed {
         println!("  (no changes requested)");

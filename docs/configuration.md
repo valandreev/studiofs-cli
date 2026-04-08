@@ -13,21 +13,9 @@ StudioFS stores global defaults for mount in the OS-standard config path under:
 - Windows: `%APPDATA%\studiofs\config.toml`
 
 Values in the config file are used by `studiofs mount` when the corresponding CLI flags are omitted.
-Advanced VFS tuning lives under the `[vfs]` table in `config.toml`. CLI flags
-from `studiofs settings` and `STUDIOFS_*` environment variables override that
-file when `studiofs mount` starts.
-
-The `[vfs]` section currently covers:
-
-- write-buffer budgets and legacy ingress-artifact compatibility sizing
-- janitor cadence and lease settings
-- read-ahead, prefetch, and directory hydration tuning
-- xattr limits and cache capacities
-- upload/fetch retry and timeout tuning
-- QoS semaphore slot counts
-- local write-buffer drain behavior and shutdown flush timeout
-- write-buffer persist batch sizing
-- publish visibility timeout before manifest commit
+Cache 3.0 intentionally exposes only two cache knobs to operators:
+`cache_dir` and `cache_size`. Internal cache thresholds are derived
+automatically at mount time.
 
 Priority for each setting:
 
@@ -104,7 +92,7 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
-- Memory management is intentionally bounded and local: `STUDIOFS_MAX_DIRTY_BYTES` caps write-buffer pressure, `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` caps upload-side local I/O, and `STUDIOFS_TRANSIT_MEMORY_BUDGET` caps in-flight fetch/upload transit buffers. There is no adaptive envelope controller in the runtime path.
+- Cache 3.0 runtime thresholds (dirty headroom, ingress checkpoint pacing, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
 - Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
@@ -156,7 +144,6 @@ Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD
 
 ```bash
 studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>]
-studiofs settings [--slab-flush-interval <ms>] [--disable-bg-slab-flush] [--enable-bg-slab-flush]
 ```
 
 Stores global defaults in `config.toml` for future `studiofs mount` runs.
@@ -168,11 +155,7 @@ Notes:
 - `studiofs settings --mount-point` creates the mount directory if needed on non-Windows systems.
 - `studiofs settings --cache-dir` creates the cache directory if needed.
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
-- `studiofs settings --slab-flush-interval` stores the background slab flusher wake interval in the `[vfs]` section.
-- `studiofs settings --disable-bg-slab-flush` disables the background slab flusher in the `[vfs]` section.
-- `studiofs settings --enable-bg-slab-flush` re-enables the background slab flusher in the `[vfs]` section.
-- `studiofs settings --slab-flush-interval 0` disables the background slab flusher (for environments where zero is a preferred explicit override).
-- The `[vfs]` section also stores advanced runtime knobs such as upload/fetch retry windows, QoS slot counts, write-buffer persist batch size, and publish visibility timeout.
+- Internal cache thresholds are derived from cache budget and are not configurable through `studiofs settings`.
 
 ### `umount`
 
@@ -394,7 +377,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_PG_FLUSH_OPS_THRESHOLD` | `500` | Client-side PG metadata flush op batch threshold |
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
 | `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
-| `STUDIOFS_MAX_DIRTY_BYTES` | `12GB` | RAM budget for accepted dirty blocks before backpressure |
+| `--cache-size` (CLI/config) | `100GB` | Cache 3.0 budget input; internal dirty/ingress/upload/transit thresholds are derived automatically |
 | `STUDIOFS_XATTR_MAX_BYTES` | `4MB` | Maximum bytes per xattr value when writing metadata (enforced in VFS before metadata persistence) |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
 | `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
@@ -413,16 +396,8 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_WINFSP_SECTOR_SIZE` | `4096` | WinFSP exposed sector size in bytes (must be positive and fit `u16`) |
 | `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` | `1048576` | WinFSP exposed allocation unit size in bytes (must be a positive multiple of sector size) |
-| `STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES` | `32MB` | Minimum completed full-block batch that `write()` coalesces before it pays the local `WriteBuffer -> local block backend -> sync_data() -> metadata` durability boundary |
 | `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
 | `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
-| `STUDIOFS_CACHE_SAFETY_MODE` | `fast` | Startup recovery policy for legacy ingress artifacts: `fast` discards them during self-heal, `durable` preserves checkpoint/state metadata. Both modes keep the same data-before-metadata persist order for each coalesced local write batch |
-| `STUDIOFS_INGRESS_SEGMENT_MAX_BYTES` | `256MB` | Legacy durable-ingress segment rotation size retained for startup recovery compatibility |
-| `STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS` | `30` | Legacy durable-ingress checkpoint cadence retained for startup recovery compatibility |
-| `STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES` | `64MB` | Legacy durable-ingress checkpoint trigger on uncheckpointed append churn |
-| `STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS` | `128` | Legacy durable-ingress checkpoint trigger on mutation count |
-| `STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG` | `2` | Legacy durable-ingress checkpoint trigger when the active head outruns the last checkpoint |
-| `STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS` | `4` | Legacy durable-ingress checkpoint trigger when retained live refs span too many segments |
 | `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Max attempts for upload retries |
 | `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-upload request timeout |
 | `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base delay |
@@ -454,9 +429,6 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
 | `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
-| `STUDIOFS_SLAB_FLUSH_INTERVAL_MS` | `10` | Background local write-buffer drain wake interval (`0` is ignored) |
-| `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` | `32` | Upload local-cache I/O slots used only for the local read phase in upload workers |
-| `STUDIOFS_TRANSIT_MEMORY_BUDGET` | `Derived from mount-time cache budget` | Global transit-memory credit budget for active in-flight fetch/upload buffers |
 | `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `35` | Foreground-read P90 latency target for upload throttling |
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `1500` | Foreground-read speedometer window |
@@ -486,10 +458,10 @@ Upload local-I/O tuning notes:
 - upload workers do not short-circuit through L1/staged payload probes; the persisted-source path is kept uniform so live uploads and startup replay share the same correctness model.
 - upload local rereads use `get_for_upload()` on the local backend, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
-- per-upload foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS`; there is no separate user-tuned penalty knob anymore.
+- per-upload foreground cache cost is derived internally from cache budget; there is no separate user-tuned penalty knob.
 - if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
 - fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
-- if a single fetch request exceeds `STUDIOFS_TRANSIT_MEMORY_BUDGET`, StudioFS returns a fetch error instead of silently clamping the credit request.
+- if a single fetch request exceeds the derived transit-memory budget, StudioFS returns a fetch error instead of silently clamping the credit request.
 - speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.
 - upload throttling uses the same foreground-read speedometer plus the dominant access policy's `upload_pressure_boost`, so sequential media reads raise upload penalty faster than random interactive probes without adding a separate scheduler loop.
 - background/emergency pressure-maintenance eviction can switch to bounded batch mode for large reclaim targets to reduce per-block lock/scheduler overhead while preserving lock release between batches.
