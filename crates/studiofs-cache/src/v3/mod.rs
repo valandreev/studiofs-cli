@@ -598,7 +598,21 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             .stats()
             .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
         if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
-            let _ = self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")?;
+            match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
+                Some(current_bytes) => {
+                    debug!(
+                        current_bytes,
+                        target_bytes,
+                        "cache-v3 background pressure maintenance eviction pass completed"
+                    );
+                }
+                None => {
+                    debug!(
+                        target_bytes,
+                        "cache-v3 background pressure maintenance skipped because another eviction pass is in progress"
+                    );
+                }
+            }
         }
         Ok(())
     }

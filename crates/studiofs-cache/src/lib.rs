@@ -69,32 +69,21 @@ fn open_cache_v3_backend(
     cache_root_display: &str,
     volume_uuid: &str,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    v3::CacheV3LocalBlockBackend::open_with_budget(
-        v3::CacheV3LocalBlockBackendConfig {
-            cache_root: cache_root.to_path_buf(),
-            volume_uuid: v2::derive_local_backend_volume_uuid(volume_uuid),
-        },
-        None,
-    )
-    .map(|backend| Arc::new(backend) as Arc<dyn v2::LocalBlockBackend>)
-    .map_err(|source| OpenLocalBlockBackendError::OpenCacheV3Backend {
-        cache_root: cache_root_display.to_owned(),
-        source,
-    })
+    open_cache_v3_backend_with_budget(cache_root, cache_root_display, volume_uuid, None)
 }
 
 fn open_cache_v3_backend_with_budget(
     cache_root: &Path,
     cache_root_display: &str,
     volume_uuid: &str,
-    cache_budget_bytes: u64,
+    cache_budget_bytes: Option<u64>,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
     v3::CacheV3LocalBlockBackend::open_with_budget(
         v3::CacheV3LocalBlockBackendConfig {
             cache_root: cache_root.to_path_buf(),
             volume_uuid: v2::derive_local_backend_volume_uuid(volume_uuid),
         },
-        Some(cache_budget_bytes),
+        cache_budget_bytes,
     )
     .map(|backend| Arc::new(backend) as Arc<dyn v2::LocalBlockBackend>)
     .map_err(|source| OpenLocalBlockBackendError::OpenCacheV3Backend {
@@ -164,7 +153,7 @@ pub fn open_local_block_backend_with_budget(
             cache_root,
             &cache_root_display,
             volume_uuid,
-            cache_budget_bytes,
+            Some(cache_budget_bytes),
         )?,
     };
 
