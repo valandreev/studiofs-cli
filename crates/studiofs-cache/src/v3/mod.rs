@@ -10,9 +10,10 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tracing::warn;
 
 use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
@@ -34,6 +35,7 @@ pub use layout::{
 
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Final validation issue that must pass before Cache 3.0 is allowed as default.
 ///
@@ -152,6 +154,7 @@ pub struct CacheV3LocalBlockBackend {
     volume_uuid: [u8; 16],
     index: CacheIndex,
     payload_store: FilePayloadStore,
+    last_dirty_orphan_prune_at: Mutex<Instant>,
 }
 
 impl CacheV3LocalBlockBackend {
@@ -184,6 +187,11 @@ impl CacheV3LocalBlockBackend {
             volume_uuid: config.volume_uuid,
             index,
             payload_store,
+            last_dirty_orphan_prune_at: Mutex::new(
+                Instant::now()
+                    .checked_sub(DIRTY_ORPHAN_PRUNE_MIN_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+            ),
         })
     }
 
@@ -246,6 +254,35 @@ impl CacheV3LocalBlockBackend {
                 );
                 false
             }
+        }
+    }
+
+    fn should_validate_dirty_entries(&self) -> bool {
+        let now = Instant::now();
+        let mut last_prune = self.last_dirty_orphan_prune_at.lock();
+        if now.duration_since(*last_prune) < DIRTY_ORPHAN_PRUNE_MIN_INTERVAL {
+            return false;
+        }
+        *last_prune = now;
+        true
+    }
+
+    fn remove_orphaned_index_entries_batch(&self, object_ids: &[u64], operation: &'static str) {
+        if object_ids.is_empty() {
+            return;
+        }
+        warn!(
+            operation,
+            orphan_count = object_ids.len(),
+            "cache-v3 pruning stale index entries that no longer have payload files"
+        );
+        if let Err(error) = self.index.remove_batch(object_ids) {
+            warn!(
+                operation,
+                orphan_count = object_ids.len(),
+                error = ?error,
+                "cache-v3 batch prune of stale index entries failed"
+            );
         }
     }
 }
@@ -416,14 +453,19 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     fn dirty_object_ids(&self) -> Vec<u64> {
         match self.index.dirty_uploading_entries() {
             Ok(entries) => {
+                if !self.should_validate_dirty_entries() {
+                    return entries.into_iter().map(|entry| entry.object_id).collect();
+                }
                 let mut object_ids = Vec::with_capacity(entries.len());
+                let mut orphaned_ids = Vec::new();
                 for entry in entries {
                     if self.payload_missing(entry.object_id, "dirty_object_ids") {
-                        self.remove_orphaned_index_entry(entry.object_id, "dirty_object_ids");
+                        orphaned_ids.push(entry.object_id);
                     } else {
                         object_ids.push(entry.object_id);
                     }
                 }
+                self.remove_orphaned_index_entries_batch(&orphaned_ids, "dirty_object_ids");
                 object_ids
             }
             Err(error) => {

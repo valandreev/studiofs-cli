@@ -1194,6 +1194,30 @@ mod tests {
     }
 
     #[test]
+    fn remove_while_uploading_clears_entry_and_prevents_requeue() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_dirty(&index, 42, 16);
+        index.mark_uploading(42).unwrap();
+        index.remove(42).unwrap();
+
+        // A stale upload-failed callback after removal must be a no-op.
+        index.mark_upload_failed(42).unwrap();
+
+        assert!(index.get_entry(42).unwrap().is_none());
+        assert!(
+            index.dirty_uploading_entries().unwrap().is_empty(),
+            "removed uploading entry should not remain in replay queue"
+        );
+        let stats = index.stats().unwrap();
+        assert_eq!(stats.current_bytes, 0);
+        assert_eq!(stats.dirty_bytes, 0);
+        assert_eq!(stats.evictable_bytes, 0);
+    }
+
+    #[test]
     fn dirty_and_access_page_apis_allow_chunked_iteration() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("cache.redb");
