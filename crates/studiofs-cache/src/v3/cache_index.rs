@@ -4,6 +4,7 @@
 //! and space accounting. Accounting counters are updated atomically with row
 //! mutations so budget checks never require payload scans.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -197,6 +198,64 @@ impl CacheIndex {
     }
 
     pub fn touch_access(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.touch_access_batch(&[object_id])
+    }
+
+    /// Batch access-order updates in a single transaction.
+    pub fn touch_access_if_stale_many(
+        &self,
+        object_ids: &[u64],
+        min_interval: Duration,
+    ) -> Result<usize, CacheIndexError> {
+        if object_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Instant::now();
+        let mut due = Vec::with_capacity(object_ids.len().min(256));
+        let mut seen = HashSet::with_capacity(object_ids.len().min(256));
+        {
+            let mut gate = self.last_touch_access.lock();
+            for object_id in object_ids {
+                if !seen.insert(*object_id) {
+                    continue;
+                }
+                if let Some(last) = gate.get(object_id)
+                    && last.elapsed() < min_interval
+                {
+                    continue;
+                }
+                gate.put(*object_id, now);
+                due.push(*object_id);
+            }
+        }
+
+        if due.is_empty() {
+            return Ok(0);
+        }
+        if let Err(error) = self.touch_access_batch(&due) {
+            let mut gate = self.last_touch_access.lock();
+            for object_id in &due {
+                gate.pop(object_id);
+            }
+            return Err(error);
+        }
+        Ok(due.len())
+    }
+
+    pub fn touch_access_if_stale(
+        &self,
+        object_id: u64,
+        min_interval: Duration,
+    ) -> Result<bool, CacheIndexError> {
+        Ok(self.touch_access_if_stale_many(&[object_id], min_interval)? == 1)
+    }
+
+    fn touch_access_batch(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
+
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
             let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
@@ -204,21 +263,23 @@ impl CacheIndex {
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_from_blocks_write(&blocks, object_id)? else {
-                return Ok(());
-            };
-            let mut new = old.clone();
-            new.access_order = allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?;
+            for object_id in object_ids {
+                let Some(old) = read_entry_from_blocks_write(&blocks, *object_id)? else {
+                    continue;
+                };
+                let mut new = old.clone();
+                new.access_order = allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?;
 
-            apply_entry_change(
-                object_id,
-                Some(&old),
-                Some(&new),
-                &mut blocks,
-                &mut dirty_order,
-                &mut access_order,
-                &mut counters,
-            )?;
+                apply_entry_change(
+                    *object_id,
+                    Some(&old),
+                    Some(&new),
+                    &mut blocks,
+                    &mut dirty_order,
+                    &mut access_order,
+                    &mut counters,
+                )?;
+            }
         }
 
         txn.commit().map_err(storage_error)?;
@@ -594,32 +655,6 @@ impl CacheIndex {
             scanned_rows,
             skipped_non_evictable,
         })
-    }
-
-    /// Best-effort atime-like throttling helper for hot paths.
-    ///
-    /// Returns `true` when touch is persisted, `false` when skipped because
-    /// `min_interval` has not elapsed yet for this object id.
-    pub fn touch_access_if_stale(
-        &self,
-        object_id: u64,
-        min_interval: Duration,
-    ) -> Result<bool, CacheIndexError> {
-        let now = Instant::now();
-        {
-            let mut gate = self.last_touch_access.lock();
-            if let Some(last) = gate.get(&object_id) {
-                if last.elapsed() < min_interval {
-                    return Ok(false);
-                }
-            }
-            gate.put(object_id, now);
-        }
-        if let Err(error) = self.touch_access(object_id) {
-            self.last_touch_access.lock().pop(&object_id);
-            return Err(error);
-        }
-        Ok(true)
     }
 
     fn initialize_schema(&self) -> Result<(), CacheIndexError> {
@@ -1369,6 +1404,34 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(index.access_order_object_ids().unwrap(), vec![11, 10]);
+    }
+
+    #[test]
+    fn touch_access_if_stale_many_batches_unique_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_uploaded(&index, 1, 5);
+        upsert_uploaded(&index, 2, 5);
+        upsert_uploaded(&index, 3, 5);
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![1, 2, 3]);
+
+        assert_eq!(
+            index
+                .touch_access_if_stale_many(&[3, 3, 1], Duration::ZERO)
+                .unwrap(),
+            2
+        );
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![2, 3, 1]);
+
+        assert_eq!(
+            index
+                .touch_access_if_stale_many(&[3, 1], Duration::from_secs(60))
+                .unwrap(),
+            0
+        );
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![2, 3, 1]);
     }
 
     #[test]

@@ -4,6 +4,11 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+/// Open a payload file for read-only access using platform-specific flags.
+pub fn open_read_only(path: &Path) -> io::Result<File> {
+    open_read_only_impl(path)
+}
+
 /// Read up to `buf.len()` bytes from `file` starting at `offset`.
 ///
 /// Returns the number of bytes read, or `0` at EOF.
@@ -66,6 +71,19 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     sync_directory_impl(path)
 }
 
+/// Best-effort advisory hint for random reads on a file handle.
+pub fn advise_random(file: &File) -> io::Result<()> {
+    best_effort(advise_random_impl(file))
+}
+
+/// Best-effort advisory hint that a range will likely be read soon.
+pub fn advise_will_need(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    best_effort(advise_will_need_impl(file, offset, len))
+}
+
 #[cfg(unix)]
 fn sync_directory_impl(path: &Path) -> io::Result<()> {
     let dir = File::open(path)?;
@@ -112,6 +130,24 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn open_read_only_impl(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(windows)]
+fn open_read_only_impl(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_RANDOM_ACCESS)
+        .open(path)
+}
+
+#[cfg(unix)]
 fn pread_raw(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buf, offset)
@@ -121,4 +157,99 @@ fn pread_raw(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 fn pread_raw(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_read(buf, offset)
+}
+
+fn best_effort(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_benign_best_effort_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn is_benign_best_effort_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EOPNOTSUPP
+                | libc::ENOSYS
+                | libc::EINVAL
+                | libc::EPERM
+                | libc::EACCES
+                | libc::ENODEV
+        )
+    )
+}
+
+#[cfg(windows)]
+fn is_benign_best_effort_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            1 // ERROR_INVALID_FUNCTION
+                | 5 // ERROR_ACCESS_DENIED
+                | 50 // ERROR_NOT_SUPPORTED
+                | 87 // ERROR_INVALID_PARAMETER
+                | 120 // ERROR_CALL_NOT_IMPLEMENTED
+        )
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn advise_random_impl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn advise_random_impl(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn advise_random_impl(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn advise_will_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = u64_to_off_t(offset)?;
+    let len = u64_to_off_t(len)?;
+    let rc =
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn advise_will_need_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn advise_will_need_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
+    if value > libc::off_t::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("offset/length exceeds off_t range: {value}"),
+        ));
+    }
+    Ok(value as libc::off_t)
 }
