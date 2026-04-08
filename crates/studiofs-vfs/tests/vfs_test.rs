@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use studiofs_cache::v2::{LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig};
+use studiofs_cache::v3::{CacheV3Layout, CacheV3LocalBlockBackend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
     format_object_fragment_keys, format_object_key, read_object,
@@ -88,6 +89,12 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         metadata: MetadataConfig::default(),
         block_size: 4 * 1024 * 1024, // 4 MiB
     }
+}
+
+fn create_cache_v3_layout_marker(cache_root: &std::path::Path) {
+    let layout = CacheV3Layout::from_cache_root(cache_root);
+    std::fs::create_dir_all(&layout.v3_root).unwrap();
+    std::fs::write(&layout.layout_marker, b"v1").unwrap();
 }
 
 fn workspace_root() -> &'static std::path::Path {
@@ -5981,6 +5988,149 @@ fn offline_s3_does_not_break_local_read_after_write() {
         assert_eq!(read_again.as_ref(), payload.as_slice());
     });
     rt.shutdown_background();
+}
+
+#[test]
+fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    create_cache_v3_layout_marker(&cache_dir);
+    assert!(
+        !cache_dir.join("blocks.raw").exists(),
+        "cache-v3 replay test must not depend on legacy raw log state"
+    );
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("cache-v3-replay-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let mut payload = vec![0x3Au8; block_size * 2];
+    payload[block_size..].fill(0x7Fu8);
+    let mut ino = 0u64;
+    let mut dirty_before = Vec::new();
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+            assert!(
+                vfs.local_block_backend()
+                    .as_any()
+                    .is::<CacheV3LocalBlockBackend>(),
+                "cache-v3 marker should select cache-v3 backend"
+            );
+
+            let attr = vfs.create(1, b"cache-v3-replay.bin", 0, 0, 0o644).unwrap();
+            ino = attr.ino;
+            vfs.write(attr.ino, 0, &payload).await.unwrap();
+            vfs.flush(attr.ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(attr.ino).len() == 2
+                })
+                .await,
+                "offline cache-v3 run should queue dirty uploads before restart"
+            );
+            dirty_before = vfs.local_block_backend().dirty_object_ids();
+            assert!(
+                !dirty_before.is_empty(),
+                "offline cache-v3 run should retain dirty replay candidates in local backend"
+            );
+
+            let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(read.as_ref(), payload.as_slice());
+            vfs.shutdown(Duration::from_secs(10)).await;
+        });
+        rt.shutdown_background();
+    }
+
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+            assert!(
+                vfs.local_block_backend()
+                    .as_any()
+                    .is::<CacheV3LocalBlockBackend>(),
+                "restart must keep using cache-v3 backend contract"
+            );
+
+            let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(read.as_ref(), payload.as_slice());
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(ino).is_empty()
+                })
+                .await,
+                "cache-v3 restart should replay pending uploads from persisted dirty index state"
+            );
+            let dirty_after = vfs.local_block_backend().dirty_object_ids();
+            assert!(
+                !dirty_after.is_empty(),
+                "cache-v3 restart should expose dirty replay candidates from index"
+            );
+            for object_id in &dirty_before {
+                assert!(
+                    dirty_after.contains(object_id),
+                    "cache-v3 replay lost dirty object {object_id}"
+                );
+            }
+            vfs.shutdown(Duration::from_secs(10)).await;
+        });
+        rt.shutdown_background();
+    }
 }
 
 #[test]

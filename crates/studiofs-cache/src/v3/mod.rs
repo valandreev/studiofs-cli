@@ -10,9 +10,11 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tracing::warn;
 
 use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
@@ -34,6 +36,7 @@ pub use layout::{
 
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Final validation issue that must pass before Cache 3.0 is allowed as default.
 ///
@@ -152,6 +155,20 @@ pub struct CacheV3LocalBlockBackend {
     volume_uuid: [u8; 16],
     index: CacheIndex,
     payload_store: FilePayloadStore,
+    last_dirty_orphan_prune_at: Mutex<Instant>,
+    dirty_validation_in_progress: AtomicBool,
+}
+
+struct DirtyValidationGuard<'a> {
+    backend: &'a CacheV3LocalBlockBackend,
+}
+
+impl Drop for DirtyValidationGuard<'_> {
+    fn drop(&mut self) {
+        self.backend
+            .dirty_validation_in_progress
+            .store(false, Ordering::Release);
+    }
 }
 
 impl CacheV3LocalBlockBackend {
@@ -184,6 +201,12 @@ impl CacheV3LocalBlockBackend {
             volume_uuid: config.volume_uuid,
             index,
             payload_store,
+            last_dirty_orphan_prune_at: Mutex::new(
+                Instant::now()
+                    .checked_sub(DIRTY_ORPHAN_PRUNE_MIN_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+            ),
+            dirty_validation_in_progress: AtomicBool::new(false),
         })
     }
 
@@ -218,6 +241,73 @@ impl CacheV3LocalBlockBackend {
             );
         }
     }
+
+    fn remove_orphaned_index_entry(&self, object_id: u64, operation: &'static str) {
+        warn!(
+            object_id,
+            operation, "cache-v3 detected index entry without payload; pruning stale index entry"
+        );
+        if let Err(error) = self.index.remove(object_id) {
+            warn!(
+                object_id,
+                operation,
+                error = ?error,
+                "cache-v3 failed to prune stale index entry"
+            );
+        }
+    }
+
+    fn payload_missing(&self, object_id: u64, operation: &'static str) -> bool {
+        match self.payload_store.payload_exists(object_id) {
+            Ok(exists) => !exists,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    operation,
+                    error = ?error,
+                    "cache-v3 payload existence probe failed"
+                );
+                false
+            }
+        }
+    }
+
+    fn begin_dirty_validation(&self) -> Option<DirtyValidationGuard<'_>> {
+        if self
+            .dirty_validation_in_progress
+            .swap(true, Ordering::AcqRel)
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let mut last_prune = self.last_dirty_orphan_prune_at.lock();
+        if now.duration_since(*last_prune) < DIRTY_ORPHAN_PRUNE_MIN_INTERVAL {
+            self.dirty_validation_in_progress
+                .store(false, Ordering::Release);
+            return None;
+        }
+        *last_prune = now;
+        Some(DirtyValidationGuard { backend: self })
+    }
+
+    fn remove_orphaned_index_entries_batch(&self, object_ids: &[u64], operation: &'static str) {
+        if object_ids.is_empty() {
+            return;
+        }
+        warn!(
+            operation,
+            orphan_count = object_ids.len(),
+            "cache-v3 pruning stale index entries that no longer have payload files"
+        );
+        if let Err(error) = self.index.remove_batch(object_ids) {
+            warn!(
+                operation,
+                orphan_count = object_ids.len(),
+                error = ?error,
+                "cache-v3 batch prune of stale index entries failed"
+            );
+        }
+    }
 }
 
 impl LocalBlockBackend for CacheV3LocalBlockBackend {
@@ -230,10 +320,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             return None;
         }
         let payload = self.payload_store.get(object_id);
-        if payload.is_some() {
+        if let Some(payload) = payload {
             self.touch_access_if_read(object_id, 1, "get");
+            return Some(payload);
         }
-        payload
+        if self.payload_missing(object_id, "get") {
+            self.remove_orphaned_index_entry(object_id, "get");
+        }
+        None
     }
 
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
@@ -243,15 +337,32 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         let read = self.payload_store.read_into(object_id, data_offset, out);
         if let Some(bytes) = read {
             self.touch_access_if_read(object_id, bytes, "read_into");
+            return Some(bytes);
         }
-        read
+        if self.payload_missing(object_id, "read_into") {
+            self.remove_orphaned_index_entry(object_id, "read_into");
+        }
+        None
     }
 
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
-        if !self.has_index_entry(object_id) {
-            return None;
+        match self.index.get_entry(object_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 index get_for_upload lookup failed"
+                );
+                return None;
+            }
         }
-        self.payload_store.get(object_id)
+        let payload = self.payload_store.get(object_id);
+        if payload.is_none() && self.payload_missing(object_id, "get_for_upload") {
+            self.remove_orphaned_index_entry(object_id, "get_for_upload");
+        }
+        payload
     }
 
     fn contains(&self, object_id: u64) -> bool {
@@ -340,15 +451,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn remove(&self, object_id: u64) {
-        self.payload_store.remove(object_id);
         if let Err(error) = self.index.remove(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index remove failed");
+            return;
         }
+        self.payload_store.remove(object_id);
     }
 
     fn remove_batch(&self, object_ids: &[u64]) {
-        for object_id in object_ids {
-            self.payload_store.remove(*object_id);
+        if object_ids.is_empty() {
+            return;
         }
         if let Err(error) = self.index.remove_batch(object_ids) {
             warn!(
@@ -356,12 +468,33 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 index remove_batch failed"
             );
+            return;
         }
+        self.payload_store.remove_batch(object_ids);
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
         match self.index.dirty_uploading_entries() {
-            Ok(entries) => entries.into_iter().map(|entry| entry.object_id).collect(),
+            Ok(entries) => {
+                let _validation_guard = match self.begin_dirty_validation() {
+                    Some(guard) => guard,
+                    None => return entries.into_iter().map(|entry| entry.object_id).collect(),
+                };
+                if entries.is_empty() {
+                    return entries.into_iter().map(|entry| entry.object_id).collect();
+                }
+                let mut object_ids = Vec::with_capacity(entries.len());
+                let mut orphaned_ids = Vec::new();
+                for entry in entries {
+                    if self.payload_missing(entry.object_id, "dirty_object_ids") {
+                        orphaned_ids.push(entry.object_id);
+                    } else {
+                        object_ids.push(entry.object_id);
+                    }
+                }
+                self.remove_orphaned_index_entries_batch(&orphaned_ids, "dirty_object_ids");
+                object_ids
+            }
             Err(error) => {
                 warn!(
                     error = ?error,
@@ -374,7 +507,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
         match self.index.get_entry(object_id) {
-            Ok(Some(entry)) => entry.lifecycle,
+            Ok(Some(entry)) => {
+                if self.payload_missing(object_id, "lifecycle_state") {
+                    self.remove_orphaned_index_entry(object_id, "lifecycle_state");
+                    LocalBlockLifecycleState::Missing
+                } else {
+                    entry.lifecycle
+                }
+            }
             Ok(None) => LocalBlockLifecycleState::Missing,
             Err(error) => {
                 warn!(
@@ -389,7 +529,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn is_evictable(&self, object_id: u64) -> bool {
         match self.index.get_entry(object_id) {
-            Ok(Some(entry)) => entry.evictable,
+            Ok(Some(entry)) => {
+                if self.payload_missing(object_id, "is_evictable") {
+                    self.remove_orphaned_index_entry(object_id, "is_evictable");
+                    false
+                } else {
+                    entry.evictable
+                }
+            }
             Ok(None) => false,
             Err(error) => {
                 warn!(
@@ -612,5 +759,99 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reopened.get(77).unwrap().as_ref(), b"reopen-payload");
+    }
+
+    #[test]
+    fn cache_v3_backend_failed_upload_requeues_without_losing_payload_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x55; 16],
+        })
+        .unwrap();
+        backend.put(1, b"one", false).unwrap();
+        backend.put(2, b"two", false).unwrap();
+
+        assert_eq!(backend.dirty_object_ids(), vec![1, 2]);
+        backend.mark_uploading(1);
+        assert_eq!(
+            backend.lifecycle_state(1),
+            LocalBlockLifecycleState::Uploading
+        );
+        backend.mark_upload_failed(1);
+
+        assert_eq!(backend.lifecycle_state(1), LocalBlockLifecycleState::Dirty);
+        assert_eq!(
+            backend.get_for_upload(1).unwrap().as_ref(),
+            b"one",
+            "failed upload must keep payload bytes for replay"
+        );
+        assert_eq!(
+            backend.dirty_object_ids(),
+            vec![2, 1],
+            "failed uploads should be requeued to the back of dirty order"
+        );
+    }
+
+    #[test]
+    fn cache_v3_backend_prunes_missing_payload_entries_from_dirty_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x66; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", false).unwrap();
+        backend.put(11, b"eleven", false).unwrap();
+        std::fs::remove_file(layout.payload_block_path(10)).unwrap();
+
+        assert_eq!(
+            backend.dirty_object_ids(),
+            vec![11],
+            "dirty replay should skip and prune index entries whose payload vanished"
+        );
+        assert_eq!(
+            backend.lifecycle_state(10),
+            LocalBlockLifecycleState::Missing
+        );
+        assert!(!backend.contains(10));
+    }
+
+    #[test]
+    fn dirty_validation_gate_allows_single_runner_per_interval() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x77; 16],
+        })
+        .unwrap();
+
+        let first = backend.begin_dirty_validation();
+        assert!(first.is_some());
+        assert!(
+            backend.begin_dirty_validation().is_none(),
+            "concurrent callers should not start another validation pass"
+        );
+
+        drop(first);
+        assert!(
+            !backend
+                .dirty_validation_in_progress
+                .load(std::sync::atomic::Ordering::Acquire),
+            "validation guard drop should clear in-progress marker"
+        );
+        assert!(
+            backend.begin_dirty_validation().is_none(),
+            "interval throttle should prevent immediate re-validation"
+        );
     }
 }
