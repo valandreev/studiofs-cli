@@ -1,5 +1,6 @@
 //! Cache 3.0 file-per-block payload storage.
 
+use std::array;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::num::NonZeroUsize;
@@ -22,7 +23,8 @@ const TEMP_FILE_SUFFIX: &str = ".tmp";
 const READ_FD_CACHE_CAPACITY: usize = 2_048;
 #[cfg(test)]
 const READ_FD_CACHE_CAPACITY: usize = 16;
-const READ_HINT_MIN_LEN: usize = 128 * 1024;
+const READ_FD_CACHE_SHARDS: usize = 16;
+const READ_HINT_MIN_LEN: usize = 512 * 1024;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -48,7 +50,9 @@ impl FilePayloadStore {
         Ok(Self {
             layout,
             read_handles: Arc::new(ReadHandleCache {
-                handles: Mutex::new(LruCache::new(read_fd_cache_capacity())),
+                shards: array::from_fn(|_| {
+                    Mutex::new(LruCache::new(read_fd_cache_shard_capacity()))
+                }),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 evictions: AtomicU64::new(0),
@@ -253,7 +257,12 @@ impl FilePayloadStore {
     }
 
     fn cached_read_handle(&self, object_id: u64, path: &Path) -> io::Result<Arc<File>> {
-        if let Some(file) = self.read_handles.handles.lock().get(&object_id).cloned() {
+        let shard = read_fd_shard(object_id);
+        if let Some(file) = self.read_handles.shards[shard]
+            .lock()
+            .get(&object_id)
+            .cloned()
+        {
             self.read_handles.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(file);
         }
@@ -269,7 +278,7 @@ impl FilePayloadStore {
             );
         }
 
-        let mut handles = self.read_handles.handles.lock();
+        let mut handles = self.read_handles.shards[shard].lock();
         if let Some(existing) = handles.get(&object_id).cloned() {
             self.read_handles.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
@@ -283,7 +292,9 @@ impl FilePayloadStore {
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
-        self.read_handles.handles.lock().pop(&object_id);
+        self.read_handles.shards[read_fd_shard(object_id)]
+            .lock()
+            .pop(&object_id);
     }
 
     #[cfg(test)]
@@ -292,14 +303,19 @@ impl FilePayloadStore {
             hits: self.read_handles.hits.load(Ordering::Relaxed),
             misses: self.read_handles.misses.load(Ordering::Relaxed),
             evictions: self.read_handles.evictions.load(Ordering::Relaxed),
-            cached: self.read_handles.handles.lock().len(),
+            cached: self
+                .read_handles
+                .shards
+                .iter()
+                .map(|shard| shard.lock().len())
+                .sum(),
         }
     }
 }
 
 #[derive(Debug)]
 struct ReadHandleCache {
-    handles: Mutex<LruCache<u64, Arc<File>>>,
+    shards: [Mutex<LruCache<u64, Arc<File>>>; READ_FD_CACHE_SHARDS],
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -314,8 +330,13 @@ struct ReadHandleStats {
     cached: usize,
 }
 
-fn read_fd_cache_capacity() -> NonZeroUsize {
-    NonZeroUsize::new(READ_FD_CACHE_CAPACITY).expect("READ_FD_CACHE_CAPACITY must be non-zero")
+fn read_fd_cache_shard_capacity() -> NonZeroUsize {
+    let capacity = READ_FD_CACHE_CAPACITY.div_ceil(READ_FD_CACHE_SHARDS);
+    NonZeroUsize::new(capacity).expect("READ_FD_CACHE_CAPACITY must be non-zero")
+}
+
+fn read_fd_shard(object_id: u64) -> usize {
+    (object_id as usize) & (READ_FD_CACHE_SHARDS - 1)
 }
 
 fn next_temp_token() -> String {

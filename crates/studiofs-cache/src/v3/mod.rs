@@ -44,6 +44,8 @@ const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
 const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::ZERO;
+const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
+const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Final validation issue that must pass before Cache 3.0 is allowed as default.
@@ -260,11 +262,14 @@ impl CacheV3LocalBlockBackend {
         if read_len == 0 {
             return;
         }
-        {
+        let pending_ids = {
             let mut pending = self.pending_access_touches.lock();
             pending.enqueue(object_id);
+            pending.take_ready_for_flush(false, Instant::now())
+        };
+        if let Some(pending_ids) = pending_ids {
+            self.flush_access_touch_ids(pending_ids, op);
         }
-        self.flush_access_touches(false, op);
     }
 
     fn remove_orphaned_index_entry(&self, object_id: u64, operation: &'static str) {
@@ -331,6 +336,8 @@ impl CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 batch prune of stale index entries failed"
             );
+        } else {
+            self.forget_access_touches(object_ids);
         }
     }
 
@@ -344,23 +351,18 @@ impl CacheV3LocalBlockBackend {
     fn flush_access_touches(&self, force: bool, operation: &'static str) {
         let pending_ids = {
             let mut pending = self.pending_access_touches.lock();
-            if pending.object_ids.is_empty() {
+            let Some(pending_ids) = pending.take_ready_for_flush(force, Instant::now()) else {
                 return;
-            }
-            let now = Instant::now();
-            let should_flush = force
-                || pending.object_ids.len() >= ACCESS_TOUCH_BATCH_SIZE
-                || now.duration_since(pending.last_flush_at) >= ACCESS_TOUCH_FLUSH_INTERVAL;
-            if !should_flush {
-                return;
-            }
-            pending.last_flush_at = now;
-            pending.take_all()
+            };
+            pending_ids
         };
+        self.flush_access_touch_ids(pending_ids, operation);
+    }
 
+    fn flush_access_touch_ids(&self, pending_ids: Vec<u64>, operation: &'static str) {
         if let Err(error) = self
             .index
-            .touch_access_if_stale_many(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
+            .touch_access_if_stale_many_unique(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
         {
             warn!(
                 operation,
@@ -369,12 +371,9 @@ impl CacheV3LocalBlockBackend {
                 "cache-v3 batched access touch failed"
             );
             let mut pending = self.pending_access_touches.lock();
-            for object_id in pending_ids {
-                pending.enqueue(object_id);
-            }
-            pending.last_flush_at = Instant::now()
-                .checked_sub(ACCESS_TOUCH_FLUSH_INTERVAL)
-                .unwrap_or_else(Instant::now);
+            pending.requeue_after_failure(pending_ids);
+        } else {
+            self.pending_access_touches.lock().record_flush_success();
         }
     }
 
@@ -383,9 +382,7 @@ impl CacheV3LocalBlockBackend {
             return;
         }
         let mut pending = self.pending_access_touches.lock();
-        for object_id in object_ids {
-            pending.forget(*object_id);
-        }
+        pending.forget_many(object_ids);
     }
 
     fn evict_to_target_bytes_locked(
@@ -802,6 +799,8 @@ struct PendingAccessTouches {
     object_ids: Vec<u64>,
     object_set: HashSet<u64>,
     last_flush_at: Instant,
+    failed_flushes: u8,
+    next_retry_at: Option<Instant>,
 }
 
 impl PendingAccessTouches {
@@ -810,6 +809,8 @@ impl PendingAccessTouches {
             object_ids: Vec::new(),
             object_set: HashSet::new(),
             last_flush_at: Instant::now(),
+            failed_flushes: 0,
+            next_retry_at: None,
         }
     }
 
@@ -819,16 +820,60 @@ impl PendingAccessTouches {
         }
     }
 
-    fn forget(&mut self, object_id: u64) {
-        if !self.object_set.remove(&object_id) {
+    fn forget_many(&mut self, object_ids: &[u64]) {
+        let mut removed_any = false;
+        for object_id in object_ids {
+            removed_any |= self.object_set.remove(object_id);
+        }
+        if !removed_any {
             return;
         }
-        self.object_ids.retain(|candidate| *candidate != object_id);
+        self.object_ids
+            .retain(|candidate| self.object_set.contains(candidate));
     }
 
     fn take_all(&mut self) -> Vec<u64> {
         self.object_set.clear();
         std::mem::take(&mut self.object_ids)
+    }
+
+    fn take_ready_for_flush(&mut self, force: bool, now: Instant) -> Option<Vec<u64>> {
+        if self.object_ids.is_empty() {
+            return None;
+        }
+        if !force {
+            if let Some(next_retry) = self.next_retry_at
+                && now < next_retry
+            {
+                return None;
+            }
+            let should_flush = self.object_ids.len() >= ACCESS_TOUCH_BATCH_SIZE
+                || now.duration_since(self.last_flush_at) >= ACCESS_TOUCH_FLUSH_INTERVAL;
+            if !should_flush {
+                return None;
+            }
+        }
+        self.last_flush_at = now;
+        Some(self.take_all())
+    }
+
+    fn requeue_after_failure(&mut self, object_ids: Vec<u64>) {
+        for object_id in object_ids {
+            self.enqueue(object_id);
+        }
+        self.failed_flushes = self.failed_flushes.saturating_add(1);
+        let exp = self
+            .failed_flushes
+            .saturating_sub(1)
+            .min(ACCESS_TOUCH_RETRY_MAX_EXPONENT);
+        let delay_ms = ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS.saturating_mul(1_u64 << exp);
+        self.next_retry_at = Some(Instant::now() + Duration::from_millis(delay_ms));
+        self.last_flush_at = Instant::now();
+    }
+
+    fn record_flush_success(&mut self) {
+        self.failed_flushes = 0;
+        self.next_retry_at = None;
     }
 }
 
@@ -1272,6 +1317,38 @@ mod tests {
         assert!(
             backend.begin_dirty_validation().is_none(),
             "interval throttle should prevent immediate re-validation"
+        );
+    }
+
+    #[test]
+    fn pending_access_touches_forget_many_prunes_in_single_pass() {
+        let mut pending = PendingAccessTouches::new();
+        pending.enqueue(1);
+        pending.enqueue(2);
+        pending.enqueue(3);
+        pending.enqueue(4);
+
+        pending.forget_many(&[2, 4, 99]);
+        let drained = pending.take_all();
+        assert_eq!(drained, vec![1, 3]);
+    }
+
+    #[test]
+    fn pending_access_touches_failure_backoff_delays_retry() {
+        let mut pending = PendingAccessTouches::new();
+        pending.enqueue(42);
+        let now = Instant::now();
+        let drained = pending.take_ready_for_flush(true, now).unwrap();
+        pending.requeue_after_failure(drained);
+
+        let retry_at = pending.next_retry_at.expect("backoff is set");
+        assert!(
+            pending.take_ready_for_flush(false, now).is_none(),
+            "retry should be deferred until backoff elapses"
+        );
+        assert!(
+            pending.take_ready_for_flush(false, retry_at).is_some(),
+            "retry should resume once backoff elapses"
         );
     }
 }

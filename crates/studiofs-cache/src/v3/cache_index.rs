@@ -4,6 +4,7 @@
 //! and space accounting. Accounting counters are updated atomically with row
 //! mutations so budget checks never require payload scans.
 
+use std::array;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,7 @@ const LIST_PAGE_SIZE: usize = 4_096;
 const TOUCH_ACCESS_LRU_CAPACITY: usize = 200_000;
 #[cfg(test)]
 const TOUCH_ACCESS_LRU_CAPACITY: usize = 128;
+const TOUCH_ACCESS_LRU_SHARDS: usize = 16;
 
 const ENTRY_OFFSET_VERSION: usize = 0;
 const ENTRY_OFFSET_LIFECYCLE: usize = 1;
@@ -112,7 +114,7 @@ pub struct EvictionCandidatePage {
 pub struct CacheIndex {
     db_path: PathBuf,
     db: Arc<Database>,
-    last_touch_access: Mutex<LruCache<u64, Instant>>,
+    last_touch_access_shards: [Mutex<LruCache<u64, Instant>>; TOUCH_ACCESS_LRU_SHARDS],
 }
 
 impl CacheIndex {
@@ -128,7 +130,9 @@ impl CacheIndex {
         let index = Self {
             db_path: path,
             db: Arc::new(db),
-            last_touch_access: Mutex::new(LruCache::new(touch_access_lru_capacity())),
+            last_touch_access_shards: array::from_fn(|_| {
+                Mutex::new(LruCache::new(touch_access_lru_capacity()))
+            }),
         };
         index.initialize_schema()?;
         Ok(index)
@@ -207,26 +211,45 @@ impl CacheIndex {
         object_ids: &[u64],
         min_interval: Duration,
     ) -> Result<usize, CacheIndexError> {
+        self.touch_access_if_stale_many_impl(object_ids, min_interval, false)
+    }
+
+    /// Variant for callers that already guarantee uniqueness.
+    pub fn touch_access_if_stale_many_unique(
+        &self,
+        object_ids: &[u64],
+        min_interval: Duration,
+    ) -> Result<usize, CacheIndexError> {
+        self.touch_access_if_stale_many_impl(object_ids, min_interval, true)
+    }
+
+    fn touch_access_if_stale_many_impl(
+        &self,
+        object_ids: &[u64],
+        min_interval: Duration,
+        assume_unique: bool,
+    ) -> Result<usize, CacheIndexError> {
         if object_ids.is_empty() {
             return Ok(0);
         }
 
         let now = Instant::now();
         let mut due = Vec::with_capacity(object_ids.len().min(256));
-        let mut seen = HashSet::with_capacity(object_ids.len().min(256));
-        {
-            let mut gate = self.last_touch_access.lock();
+        if assume_unique {
+            for object_id in object_ids {
+                if self.mark_touch_due(*object_id, now, min_interval) {
+                    due.push(*object_id);
+                }
+            }
+        } else {
+            let mut seen = HashSet::with_capacity(object_ids.len().min(256));
             for object_id in object_ids {
                 if !seen.insert(*object_id) {
                     continue;
                 }
-                if let Some(last) = gate.get(object_id)
-                    && last.elapsed() < min_interval
-                {
-                    continue;
+                if self.mark_touch_due(*object_id, now, min_interval) {
+                    due.push(*object_id);
                 }
-                gate.put(*object_id, now);
-                due.push(*object_id);
             }
         }
 
@@ -234,10 +257,7 @@ impl CacheIndex {
             return Ok(0);
         }
         if let Err(error) = self.touch_access_batch(&due) {
-            let mut gate = self.last_touch_access.lock();
-            for object_id in &due {
-                gate.pop(object_id);
-            }
+            self.rollback_touch_due(&due);
             return Err(error);
         }
         Ok(due.len())
@@ -413,7 +433,7 @@ impl CacheIndex {
         }
 
         txn.commit().map_err(storage_error)?;
-        self.last_touch_access.lock().pop(&object_id);
+        self.rollback_touch_due(&[object_id]);
         Ok(())
     }
 
@@ -452,10 +472,7 @@ impl CacheIndex {
         }
 
         txn.commit().map_err(storage_error)?;
-        let mut last_touch = self.last_touch_access.lock();
-        for object_id in object_ids {
-            last_touch.pop(object_id);
-        }
+        self.rollback_touch_due(object_ids);
         Ok(())
     }
 
@@ -710,6 +727,35 @@ impl CacheIndex {
 
         txn.commit().map_err(storage_error)?;
         Ok(())
+    }
+}
+
+impl CacheIndex {
+    fn mark_touch_due(&self, object_id: u64, now: Instant, min_interval: Duration) -> bool {
+        let mut gate = self.last_touch_access_shards[touch_access_lru_shard(object_id)].lock();
+        if let Some(last) = gate.get(&object_id)
+            && last.elapsed() < min_interval
+        {
+            return false;
+        }
+        gate.put(object_id, now);
+        true
+    }
+
+    fn rollback_touch_due(&self, object_ids: &[u64]) {
+        for object_id in object_ids {
+            self.last_touch_access_shards[touch_access_lru_shard(*object_id)]
+                .lock()
+                .pop(object_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn touch_lru_len(&self) -> usize {
+        self.last_touch_access_shards
+            .iter()
+            .map(|shard| shard.lock().len())
+            .sum()
     }
 }
 
@@ -1109,8 +1155,12 @@ fn storage_error<E: std::fmt::Display>(error: E) -> CacheIndexError {
 }
 
 fn touch_access_lru_capacity() -> NonZeroUsize {
-    NonZeroUsize::new(TOUCH_ACCESS_LRU_CAPACITY)
-        .expect("TOUCH_ACCESS_LRU_CAPACITY must be non-zero")
+    let cap = TOUCH_ACCESS_LRU_CAPACITY.div_ceil(TOUCH_ACCESS_LRU_SHARDS);
+    NonZeroUsize::new(cap).expect("TOUCH_ACCESS_LRU_CAPACITY must be non-zero")
+}
+
+fn touch_access_lru_shard(object_id: u64) -> usize {
+    (object_id as usize) & (TOUCH_ACCESS_LRU_SHARDS - 1)
 }
 
 #[cfg(test)]
@@ -1449,10 +1499,7 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            index.last_touch_access.lock().len(),
-            TOUCH_ACCESS_LRU_CAPACITY
-        );
+        assert_eq!(index.touch_lru_len(), TOUCH_ACCESS_LRU_CAPACITY);
     }
 
     #[test]
