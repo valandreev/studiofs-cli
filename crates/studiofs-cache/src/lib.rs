@@ -3,7 +3,7 @@
 //! `v2::RawBlockFileBackend` is the active local block backend.
 //! `block_cache` remains as a compatibility shim for upload-queue and
 //! pending-upload tracking at the write-path boundary.
-//! `v3` provides contract detection plus a bootstrap-only placeholder backend.
+//! `v3` provides contract detection plus the file-per-block local backend.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ pub mod upload_queue;
 
 // --- Cache v2: single-file local block backend ---
 pub mod v2;
-// --- Cache v3: contract detection + bootstrap placeholder backend ---
+// --- Cache v3: contract detection + file-per-block backend ---
 pub mod v3;
 
 // --- Re-exports ---

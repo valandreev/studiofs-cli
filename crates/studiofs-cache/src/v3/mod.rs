@@ -4,8 +4,8 @@
 //! - the non-mutating detection contract for legacy vs v3 cache layouts;
 //! - rollout guardrails that block making Cache 3.0 the default backend
 //!   until final validation is complete.
-//! - a bootstrap-only `LocalBlockBackend` placeholder to wire mount/status
-//!   selection while the full data path is still in migration.
+//! - the active Cache 3.0 local block backend backed by a file-per-block
+//!   payload store plus redb lifecycle index.
 
 use std::fmt;
 use std::io;
@@ -15,18 +15,18 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::warn;
 
-use crate::v2::{
-    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, RawBlockFileBackend,
-    RawBlockFileBackendConfig, RawBlockFileBackendError,
-};
+use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
 pub mod cache_index;
+pub mod file_payload_store;
 pub mod layout;
+pub mod platform;
 
 pub use cache_index::{
     CacheIndex, CacheIndexEntry, CacheIndexError, CacheIndexStats, CacheIndexUpsert,
     DirtyReplayEntry,
 };
+pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError};
 pub use layout::{
     CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
     CACHE_V3_REDB_INDEX_FILE, CACHE_V3_SUBTREE, CacheV3Layout,
@@ -117,14 +117,14 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetect
     })
 }
 
-/// Configuration for opening the Cache 3.0 local backend placeholder.
+/// Configuration for opening the Cache 3.0 local backend.
 #[derive(Debug, Clone)]
 pub struct CacheV3LocalBlockBackendConfig {
     pub cache_root: PathBuf,
     pub volume_uuid: [u8; 16],
 }
 
-/// Errors returned while opening the Cache 3.0 local backend placeholder.
+/// Errors returned while opening the Cache 3.0 local backend.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheV3LocalBlockBackendError {
     #[error("I/O error: {0}")]
@@ -137,29 +137,27 @@ pub enum CacheV3LocalBlockBackendError {
         #[source]
         source: CacheIndexError,
     },
-    #[error("failed to open cache-v3 compatibility raw backend at '{cache_root}': {source}")]
-    OpenCompatibilityRawBackend {
+    #[error("failed to open cache-v3 payload store at '{cache_root}': {source}")]
+    OpenPayloadStore {
         cache_root: PathBuf,
         #[source]
-        source: RawBlockFileBackendError,
+        source: FilePayloadStoreError,
     },
 }
 
-/// Cache 3.0 local backend placeholder.
-///
-/// This struct intentionally wires mount/status bootstrap to a backend choice
-/// while the full Cache 3.0 data path is implemented in follow-up issues.
+/// Cache 3.0 local backend backed by file-per-block payload files and redb index.
 #[derive(Debug)]
 pub struct CacheV3LocalBlockBackend {
     layout: CacheV3Layout,
     index: CacheIndex,
-    inner: RawBlockFileBackend,
+    payload_store: FilePayloadStore,
 }
 
 impl CacheV3LocalBlockBackend {
     pub fn open(
         config: CacheV3LocalBlockBackendConfig,
     ) -> Result<Self, CacheV3LocalBlockBackendError> {
+        let _volume_uuid = config.volume_uuid;
         let layout = CacheV3Layout::from_cache_root(&config.cache_root);
         if !layout.layout_marker.try_exists()? {
             return Err(CacheV3LocalBlockBackendError::MissingLayoutMarker {
@@ -174,22 +172,50 @@ impl CacheV3LocalBlockBackend {
             }
         })?;
 
-        let inner = RawBlockFileBackend::open(RawBlockFileBackendConfig {
-            cache_dir: layout.v3_root.clone(),
-            volume_uuid: config.volume_uuid,
-        })
-        .map_err(
-            |source| CacheV3LocalBlockBackendError::OpenCompatibilityRawBackend {
+        let payload_store = FilePayloadStore::open(layout.clone()).map_err(|source| {
+            CacheV3LocalBlockBackendError::OpenPayloadStore {
                 cache_root: layout.v3_root.clone(),
                 source,
-            },
-        )?;
+            }
+        })?;
 
         Ok(Self {
             layout,
             index,
-            inner,
+            payload_store,
         })
+    }
+
+    fn has_index_entry(&self, object_id: u64) -> bool {
+        match self.index.get_entry(object_id) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 index lookup failed while checking payload presence"
+                );
+                false
+            }
+        }
+    }
+
+    fn touch_access_if_read(&self, object_id: u64, read_len: usize, op: &'static str) {
+        if read_len == 0 {
+            return;
+        }
+        if let Err(error) = self
+            .index
+            .touch_access_if_stale(object_id, ACCESS_TOUCH_MIN_INTERVAL)
+        {
+            warn!(
+                object_id,
+                operation = op,
+                error = ?error,
+                "cache-v3 index access touch failed"
+            );
+        }
     }
 }
 
@@ -199,46 +225,39 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn get(&self, object_id: u64) -> Option<Bytes> {
-        let payload = self.inner.get(object_id);
+        if !self.has_index_entry(object_id) {
+            return None;
+        }
+        let payload = self.payload_store.get(object_id);
         if payload.is_some() {
-            if let Err(error) = self
-                .index
-                .touch_access_if_stale(object_id, ACCESS_TOUCH_MIN_INTERVAL)
-            {
-                warn!(object_id, error = ?error, "cache-v3 index access touch failed after get");
-            }
+            self.touch_access_if_read(object_id, 1, "get");
         }
         payload
     }
 
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
-        let read = self.inner.read_into(object_id, data_offset, out);
-        if read.is_some_and(|bytes| bytes > 0) {
-            if let Err(error) = self
-                .index
-                .touch_access_if_stale(object_id, ACCESS_TOUCH_MIN_INTERVAL)
-            {
-                warn!(
-                    object_id,
-                    error = ?error,
-                    "cache-v3 index access touch failed after read_into"
-                );
-            }
+        if !self.has_index_entry(object_id) {
+            return None;
+        }
+        let read = self.payload_store.read_into(object_id, data_offset, out);
+        if let Some(bytes) = read {
+            self.touch_access_if_read(object_id, bytes, "read_into");
         }
         read
     }
 
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
-        self.inner.get_for_upload(object_id)
+        if !self.has_index_entry(object_id) {
+            return None;
+        }
+        self.payload_store.get(object_id)
     }
 
     fn contains(&self, object_id: u64) -> bool {
-        self.inner.contains(object_id)
+        self.has_index_entry(object_id) && self.payload_store.contains(object_id)
     }
 
-    fn advise_will_need(&self, object_id: u64) {
-        self.inner.advise_will_need(object_id);
-    }
+    fn advise_will_need(&self, _object_id: u64) {}
 
     fn put(
         &self,
@@ -246,7 +265,9 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         data: &[u8],
         evictable: bool,
     ) -> Result<(), LocalBlockBackendError> {
-        self.inner.put(object_id, data, evictable)?;
+        self.payload_store
+            .put(object_id, data)
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
 
         let lifecycle = if evictable {
             LocalBlockLifecycleState::Uploaded
@@ -272,7 +293,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             lifecycle,
             evictable,
         }) {
-            self.inner.remove(object_id);
+            self.payload_store.remove(object_id);
             return Err(LocalBlockBackendError::Other(Box::new(error)));
         }
 
@@ -280,22 +301,22 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
-        self.inner.sync_data()
+        self.payload_store
+            .sync_data()
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
-        self.inner.run_pressure_maintenance()
+        Ok(())
     }
 
     fn mark_uploading(&self, object_id: u64) {
-        self.inner.mark_uploading(object_id);
         if let Err(error) = self.index.mark_uploading(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index mark_uploading failed");
         }
     }
 
     fn mark_upload_failed(&self, object_id: u64) {
-        self.inner.mark_upload_failed(object_id);
         if let Err(error) = self.index.mark_upload_failed(object_id) {
             warn!(
                 object_id,
@@ -306,21 +327,22 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn mark_uploaded(&self, object_id: u64) {
-        self.inner.mark_uploaded(object_id);
         if let Err(error) = self.index.mark_uploaded(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index mark_uploaded failed");
         }
     }
 
     fn remove(&self, object_id: u64) {
-        self.inner.remove(object_id);
+        self.payload_store.remove(object_id);
         if let Err(error) = self.index.remove(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index remove failed");
         }
     }
 
     fn remove_batch(&self, object_ids: &[u64]) {
-        self.inner.remove_batch(object_ids);
+        for object_id in object_ids {
+            self.payload_store.remove(*object_id);
+        }
         if let Err(error) = self.index.remove_batch(object_ids) {
             warn!(
                 count = object_ids.len(),
@@ -336,9 +358,9 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             Err(error) => {
                 warn!(
                     error = ?error,
-                    "cache-v3 index dirty snapshot failed, falling back to compatibility backend"
+                    "cache-v3 index dirty snapshot failed"
                 );
-                self.inner.dirty_object_ids()
+                Vec::new()
             }
         }
     }
@@ -351,9 +373,9 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index lifecycle lookup failed, falling back to compatibility backend"
+                    "cache-v3 index lifecycle lookup failed"
                 );
-                self.inner.lifecycle_state(object_id)
+                LocalBlockLifecycleState::Missing
             }
         }
     }
@@ -366,9 +388,9 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index evictable lookup failed, falling back to compatibility backend"
+                    "cache-v3 index evictable lookup failed"
                 );
-                self.inner.is_evictable(object_id)
+                false
             }
         }
     }
@@ -458,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_v3_backend_bootstraps_via_compatibility_raw_backend() {
+    fn cache_v3_backend_roundtrips_payload_and_index_state() {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
@@ -531,5 +553,57 @@ mod tests {
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
         assert_eq!(index.access_order_object_ids().unwrap(), vec![11, 10]);
+    }
+
+    #[test]
+    fn cache_v3_backend_persists_blocks_in_file_per_block_payload_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x33; 16],
+        })
+        .unwrap();
+        backend.put(0xABCD, b"payload", false).unwrap();
+        backend.sync_data().unwrap();
+
+        assert!(
+            layout.payload_block_path(0xABCD).exists(),
+            "cache-v3 must persist each block as an individual payload file"
+        );
+        assert!(
+            !layout.v3_root.join(LEGACY_RAW_DATA_FILE_NAME).exists(),
+            "cache-v3 data path must not rely on legacy single-file blocks.raw storage"
+        );
+    }
+
+    #[test]
+    fn cache_v3_backend_reopens_without_legacy_raw_payload_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x44; 16],
+        })
+        .unwrap();
+        backend.put(77, b"reopen-payload", false).unwrap();
+        backend.sync_data().unwrap();
+        drop(backend);
+
+        let legacy_raw = layout.v3_root.join(LEGACY_RAW_DATA_FILE_NAME);
+        if legacy_raw.exists() {
+            std::fs::remove_file(&legacy_raw).unwrap();
+        }
+
+        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x44; 16],
+        })
+        .unwrap();
+        assert_eq!(reopened.get(77).unwrap().as_ref(), b"reopen-payload");
     }
 }
