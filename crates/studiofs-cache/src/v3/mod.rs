@@ -149,6 +149,7 @@ pub enum CacheV3LocalBlockBackendError {
 #[derive(Debug)]
 pub struct CacheV3LocalBlockBackend {
     layout: CacheV3Layout,
+    volume_uuid: [u8; 16],
     index: CacheIndex,
     payload_store: FilePayloadStore,
 }
@@ -157,7 +158,6 @@ impl CacheV3LocalBlockBackend {
     pub fn open(
         config: CacheV3LocalBlockBackendConfig,
     ) -> Result<Self, CacheV3LocalBlockBackendError> {
-        let _volume_uuid = config.volume_uuid;
         let layout = CacheV3Layout::from_cache_root(&config.cache_root);
         if !layout.layout_marker.try_exists()? {
             return Err(CacheV3LocalBlockBackendError::MissingLayoutMarker {
@@ -181,6 +181,7 @@ impl CacheV3LocalBlockBackend {
 
         Ok(Self {
             layout,
+            volume_uuid: config.volume_uuid,
             index,
             payload_store,
         })
@@ -294,6 +295,12 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             evictable,
         }) {
             self.payload_store.remove(object_id);
+            warn!(
+                object_id,
+                volume_uuid = ?self.volume_uuid,
+                error = ?error,
+                "cache-v3 index upsert failed after payload write; removed payload for rollback"
+            );
             return Err(LocalBlockBackendError::Other(Box::new(error)));
         }
 

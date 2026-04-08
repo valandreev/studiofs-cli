@@ -41,7 +41,30 @@ impl FilePayloadStore {
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.layout.payload_block_path(object_id);
         let file = Self::open_for_read(&path).ok()?;
-        let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    path = %path.display(),
+                    error = ?error,
+                    "cache-v3 payload get metadata failed"
+                );
+                return None;
+            }
+        };
+        let len = match usize::try_from(metadata.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                warn!(
+                    object_id,
+                    path = %path.display(),
+                    payload_len = metadata.len(),
+                    "cache-v3 payload get length exceeds addressable usize"
+                );
+                return None;
+            }
+        };
         let mut payload = vec![0_u8; len];
         if len > 0 {
             if let Err(error) = platform::pread_exact(&file, &mut payload, 0) {
@@ -64,7 +87,19 @@ impl FilePayloadStore {
 
         let path = self.layout.payload_block_path(object_id);
         let file = Self::open_for_read(&path).ok()?;
-        let file_len = file.metadata().ok()?.len();
+        let file_len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                warn!(
+                    object_id,
+                    data_offset,
+                    path = %path.display(),
+                    error = ?error,
+                    "cache-v3 payload read_into metadata failed"
+                );
+                return None;
+            }
+        };
         let start = u64::try_from(data_offset).ok()?;
         if start >= file_len {
             return Some(0);
