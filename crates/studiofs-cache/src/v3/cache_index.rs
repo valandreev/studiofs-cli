@@ -1142,6 +1142,58 @@ mod tests {
     }
 
     #[test]
+    fn failed_upload_requeues_to_dirty_tail_with_expected_state_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_dirty(&index, 1, 10);
+        upsert_dirty(&index, 2, 20);
+
+        index.mark_uploading(1).unwrap();
+        index.mark_upload_failed(1).unwrap();
+        let dirty_after_failure = index.dirty_uploading_entries().unwrap();
+        assert_eq!(
+            dirty_after_failure
+                .iter()
+                .map(|entry| (entry.object_id, entry.lifecycle))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, LocalBlockLifecycleState::Dirty),
+                (1, LocalBlockLifecycleState::Dirty)
+            ]
+        );
+
+        index.mark_uploading(2).unwrap();
+        let dirty_with_inflight = index.dirty_uploading_entries().unwrap();
+        assert_eq!(
+            dirty_with_inflight
+                .iter()
+                .map(|entry| (entry.object_id, entry.lifecycle))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, LocalBlockLifecycleState::Uploading),
+                (1, LocalBlockLifecycleState::Dirty)
+            ]
+        );
+
+        index.mark_uploaded(2).unwrap();
+        let dirty_after_upload = index.dirty_uploading_entries().unwrap();
+        assert_eq!(
+            dirty_after_upload
+                .iter()
+                .map(|entry| (entry.object_id, entry.lifecycle))
+                .collect::<Vec<_>>(),
+            vec![(1, LocalBlockLifecycleState::Dirty)]
+        );
+
+        let stats = index.stats().unwrap();
+        assert_eq!(stats.current_bytes, 30);
+        assert_eq!(stats.dirty_bytes, 10);
+        assert_eq!(stats.evictable_bytes, 20);
+    }
+
+    #[test]
     fn dirty_and_access_page_apis_allow_chunked_iteration() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("cache.redb");

@@ -127,10 +127,21 @@ impl FilePayloadStore {
     }
 
     pub fn contains(&self, object_id: u64) -> bool {
-        self.layout
-            .payload_block_path(object_id)
-            .try_exists()
-            .unwrap_or(false)
+        match self.payload_exists(object_id) {
+            Ok(exists) => exists,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 payload contains check failed"
+                );
+                false
+            }
+        }
+    }
+
+    pub fn payload_exists(&self, object_id: u64) -> io::Result<bool> {
+        self.layout.payload_block_path(object_id).try_exists()
     }
 
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
@@ -167,6 +178,12 @@ impl FilePayloadStore {
                 error = ?error,
                 "cache-v3 payload remove failed"
             );
+        }
+    }
+
+    pub fn remove_batch(&self, object_ids: &[u64]) {
+        for object_id in object_ids {
+            self.remove(*object_id);
         }
     }
 

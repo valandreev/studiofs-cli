@@ -218,6 +218,36 @@ impl CacheV3LocalBlockBackend {
             );
         }
     }
+
+    fn remove_orphaned_index_entry(&self, object_id: u64, operation: &'static str) {
+        warn!(
+            object_id,
+            operation, "cache-v3 detected index entry without payload; pruning stale index entry"
+        );
+        if let Err(error) = self.index.remove(object_id) {
+            warn!(
+                object_id,
+                operation,
+                error = ?error,
+                "cache-v3 failed to prune stale index entry"
+            );
+        }
+    }
+
+    fn payload_missing(&self, object_id: u64, operation: &'static str) -> bool {
+        match self.payload_store.payload_exists(object_id) {
+            Ok(exists) => !exists,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    operation,
+                    error = ?error,
+                    "cache-v3 payload existence probe failed"
+                );
+                false
+            }
+        }
+    }
 }
 
 impl LocalBlockBackend for CacheV3LocalBlockBackend {
@@ -230,10 +260,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             return None;
         }
         let payload = self.payload_store.get(object_id);
-        if payload.is_some() {
+        if let Some(payload) = payload {
             self.touch_access_if_read(object_id, 1, "get");
+            return Some(payload);
         }
-        payload
+        if self.payload_missing(object_id, "get") {
+            self.remove_orphaned_index_entry(object_id, "get");
+        }
+        None
     }
 
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
@@ -243,15 +277,32 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         let read = self.payload_store.read_into(object_id, data_offset, out);
         if let Some(bytes) = read {
             self.touch_access_if_read(object_id, bytes, "read_into");
+            return Some(bytes);
         }
-        read
+        if self.payload_missing(object_id, "read_into") {
+            self.remove_orphaned_index_entry(object_id, "read_into");
+        }
+        None
     }
 
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
-        if !self.has_index_entry(object_id) {
-            return None;
+        match self.index.get_entry(object_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 index get_for_upload lookup failed"
+                );
+                return None;
+            }
         }
-        self.payload_store.get(object_id)
+        let payload = self.payload_store.get(object_id);
+        if payload.is_none() && self.payload_missing(object_id, "get_for_upload") {
+            self.remove_orphaned_index_entry(object_id, "get_for_upload");
+        }
+        payload
     }
 
     fn contains(&self, object_id: u64) -> bool {
@@ -340,15 +391,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn remove(&self, object_id: u64) {
-        self.payload_store.remove(object_id);
         if let Err(error) = self.index.remove(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index remove failed");
+            return;
         }
+        self.payload_store.remove(object_id);
     }
 
     fn remove_batch(&self, object_ids: &[u64]) {
-        for object_id in object_ids {
-            self.payload_store.remove(*object_id);
+        if object_ids.is_empty() {
+            return;
         }
         if let Err(error) = self.index.remove_batch(object_ids) {
             warn!(
@@ -356,12 +408,24 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 index remove_batch failed"
             );
+            return;
         }
+        self.payload_store.remove_batch(object_ids);
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
         match self.index.dirty_uploading_entries() {
-            Ok(entries) => entries.into_iter().map(|entry| entry.object_id).collect(),
+            Ok(entries) => {
+                let mut object_ids = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if self.payload_missing(entry.object_id, "dirty_object_ids") {
+                        self.remove_orphaned_index_entry(entry.object_id, "dirty_object_ids");
+                    } else {
+                        object_ids.push(entry.object_id);
+                    }
+                }
+                object_ids
+            }
             Err(error) => {
                 warn!(
                     error = ?error,
@@ -374,7 +438,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
         match self.index.get_entry(object_id) {
-            Ok(Some(entry)) => entry.lifecycle,
+            Ok(Some(entry)) => {
+                if self.payload_missing(object_id, "lifecycle_state") {
+                    self.remove_orphaned_index_entry(object_id, "lifecycle_state");
+                    LocalBlockLifecycleState::Missing
+                } else {
+                    entry.lifecycle
+                }
+            }
             Ok(None) => LocalBlockLifecycleState::Missing,
             Err(error) => {
                 warn!(
@@ -389,7 +460,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn is_evictable(&self, object_id: u64) -> bool {
         match self.index.get_entry(object_id) {
-            Ok(Some(entry)) => entry.evictable,
+            Ok(Some(entry)) => {
+                if self.payload_missing(object_id, "is_evictable") {
+                    self.remove_orphaned_index_entry(object_id, "is_evictable");
+                    false
+                } else {
+                    entry.evictable
+                }
+            }
             Ok(None) => false,
             Err(error) => {
                 warn!(
@@ -612,5 +690,67 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reopened.get(77).unwrap().as_ref(), b"reopen-payload");
+    }
+
+    #[test]
+    fn cache_v3_backend_failed_upload_requeues_without_losing_payload_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x55; 16],
+        })
+        .unwrap();
+        backend.put(1, b"one", false).unwrap();
+        backend.put(2, b"two", false).unwrap();
+
+        assert_eq!(backend.dirty_object_ids(), vec![1, 2]);
+        backend.mark_uploading(1);
+        assert_eq!(
+            backend.lifecycle_state(1),
+            LocalBlockLifecycleState::Uploading
+        );
+        backend.mark_upload_failed(1);
+
+        assert_eq!(backend.lifecycle_state(1), LocalBlockLifecycleState::Dirty);
+        assert_eq!(
+            backend.get_for_upload(1).unwrap().as_ref(),
+            b"one",
+            "failed upload must keep payload bytes for replay"
+        );
+        assert_eq!(
+            backend.dirty_object_ids(),
+            vec![2, 1],
+            "failed uploads should be requeued to the back of dirty order"
+        );
+    }
+
+    #[test]
+    fn cache_v3_backend_prunes_missing_payload_entries_from_dirty_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x66; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", false).unwrap();
+        backend.put(11, b"eleven", false).unwrap();
+        std::fs::remove_file(layout.payload_block_path(10)).unwrap();
+
+        assert_eq!(
+            backend.dirty_object_ids(),
+            vec![11],
+            "dirty replay should skip and prune index entries whose payload vanished"
+        );
+        assert_eq!(
+            backend.lifecycle_state(10),
+            LocalBlockLifecycleState::Missing
+        );
+        assert!(!backend.contains(10));
     }
 }
