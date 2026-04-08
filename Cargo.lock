@@ -3687,6 +3687,7 @@ dependencies = [
  "bytes",
  "libc",
  "parking_lot",
+ "redb",
  "studiofs-data",
  "studiofs-meta",
  "tempfile",

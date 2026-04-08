@@ -34,6 +34,7 @@ pub struct CacheV3Layout {
     pub tmp_dir: PathBuf,
     pub payload_root: PathBuf,
     pub payload_blocks_dir: PathBuf,
+    pub index_dir: PathBuf,
     pub redb_index_path: PathBuf,
 }
 
@@ -44,6 +45,7 @@ impl CacheV3Layout {
         let v3_root = cache_root.join(CACHE_V3_SUBTREE);
         let payload_root = v3_root.join(CACHE_V3_PAYLOAD_DIR);
         let payload_blocks_dir = payload_root.join(CACHE_V3_PAYLOAD_BLOCKS_DIR);
+        let index_dir = v3_root.join(CACHE_V3_INDEX_DIR);
 
         Self {
             cache_root,
@@ -52,9 +54,8 @@ impl CacheV3Layout {
             tmp_dir: v3_root.join(CACHE_V3_TMP_DIR),
             payload_root,
             payload_blocks_dir: payload_blocks_dir.clone(),
-            redb_index_path: v3_root
-                .join(CACHE_V3_INDEX_DIR)
-                .join(CACHE_V3_REDB_INDEX_FILE),
+            index_dir: index_dir.clone(),
+            redb_index_path: index_dir.join(CACHE_V3_REDB_INDEX_FILE),
         }
     }
 
@@ -68,9 +69,16 @@ impl CacheV3Layout {
 
     /// Resolve the canonical payload block path for an object id.
     pub fn payload_block_path(&self, object_id: u64) -> PathBuf {
+        self.v3_root
+            .join(self.payload_block_relative_path(object_id))
+    }
+
+    /// Resolve the canonical payload block path relative to `v3_root`.
+    pub fn payload_block_relative_path(&self, object_id: u64) -> PathBuf {
         let hex = format!("{object_id:016x}");
         let shard = format!("{:02x}", Self::payload_shard(object_id));
-        self.payload_blocks_dir
+        PathBuf::from(CACHE_V3_PAYLOAD_DIR)
+            .join(CACHE_V3_PAYLOAD_BLOCKS_DIR)
             .join(shard)
             .join(format!("{hex}.block"))
     }
@@ -95,6 +103,7 @@ mod tests {
             layout.payload_blocks_dir,
             PathBuf::from("/cache/vol-a/v3/payload/blocks")
         );
+        assert_eq!(layout.index_dir, PathBuf::from("/cache/vol-a/v3/index"));
         assert_eq!(
             layout.redb_index_path,
             PathBuf::from("/cache/vol-a/v3/index/cache.redb")
@@ -109,6 +118,11 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from("/cache/vol-a/v3/payload/blocks/42/ab00000000000042.block")
+        );
+
+        assert_eq!(
+            layout.payload_block_relative_path(0xAB00_0000_0000_0042),
+            PathBuf::from("payload/blocks/42/ab00000000000042.block")
         );
     }
 
