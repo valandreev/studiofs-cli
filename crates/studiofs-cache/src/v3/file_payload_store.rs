@@ -136,6 +136,18 @@ impl FilePayloadStore {
     }
 
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
+        for dir in [
+            self.layout.payload_blocks_dir.as_path(),
+            self.layout.payload_root.as_path(),
+            self.layout.v3_root.as_path(),
+        ] {
+            if let Err(error) = platform::sync_directory(dir) {
+                if error.kind() == io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(error.into());
+            }
+        }
         Ok(())
     }
 

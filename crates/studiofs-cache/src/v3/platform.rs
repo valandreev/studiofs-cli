@@ -73,10 +73,42 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory_impl(_path: &Path) -> io::Result<()> {
-    // Opening a directory for fsync requires native Win32 flags that are not
-    // available through stable std APIs. Treat as best-effort on Windows.
-    Ok(())
+fn sync_directory_impl(path: &Path) -> io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    // FILE_FLAG_BACKUP_SEMANTICS is required to open directory handles on
+    // Windows through OpenOptions/File APIs.
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(
+                    1 // ERROR_INVALID_FUNCTION
+                    | 5 // ERROR_ACCESS_DENIED
+                    | 50 // ERROR_NOT_SUPPORTED
+                    | 87 // ERROR_INVALID_PARAMETER
+                    | 120 // ERROR_CALL_NOT_IMPLEMENTED
+                )
+            ) =>
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = ?error,
+                "cache-v3 directory sync is unsupported on this Windows filesystem"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
