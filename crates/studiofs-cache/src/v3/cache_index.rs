@@ -93,6 +93,20 @@ pub struct DirtyReplayEntry {
     pub dirty_order: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictionCandidateEntry {
+    pub object_id: u64,
+    pub payload_len: u64,
+    pub access_order: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EvictionCandidatePage {
+    pub entries: Vec<EvictionCandidateEntry>,
+    pub scanned_rows: u64,
+    pub skipped_non_evictable: u64,
+}
+
 #[derive(Debug)]
 pub struct CacheIndex {
     db_path: PathBuf,
@@ -508,6 +522,78 @@ impl CacheIndex {
             }
         }
         Ok(ordered)
+    }
+
+    /// Page uploaded+evictable candidates in deterministic access order.
+    pub fn eviction_candidates_page(
+        &self,
+        start_after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<EvictionCandidateEntry>, CacheIndexError> {
+        Ok(self
+            .eviction_candidates_page_with_stats(start_after, limit)?
+            .entries)
+    }
+
+    /// Page uploaded+evictable candidates and include scan stats.
+    pub fn eviction_candidates_page_with_stats(
+        &self,
+        start_after: Option<u64>,
+        limit: usize,
+    ) -> Result<EvictionCandidatePage, CacheIndexError> {
+        if limit == 0 {
+            return Ok(EvictionCandidatePage::default());
+        }
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
+
+        let start = match start_after {
+            Some(last_seen) => match last_seen.checked_add(1) {
+                Some(next) => next,
+                None => return Ok(EvictionCandidatePage::default()),
+            },
+            None => 0,
+        };
+
+        let mut ordered = Vec::with_capacity(limit);
+        let mut scanned_rows = 0_u64;
+        let mut skipped_non_evictable = 0_u64;
+        let iter = access_order.range::<u64>(start..).map_err(storage_error)?;
+        for pair in iter {
+            if ordered.len() >= limit {
+                break;
+            }
+            let (order, object_id) = pair.map_err(storage_error)?;
+            let order = order.value();
+            let object_id = object_id.value();
+            scanned_rows = scanned_rows.saturating_add(1);
+
+            let Some(entry) = read_entry_from_blocks(&blocks, object_id)? else {
+                continue;
+            };
+            if entry.access_order != order {
+                return Err(CacheIndexError::Corruption(format!(
+                    "access order mismatch for object_id={object_id}: table={order}, row={}",
+                    entry.access_order
+                )));
+            }
+            if entry.lifecycle == LocalBlockLifecycleState::Uploaded && entry.evictable {
+                ordered.push(EvictionCandidateEntry {
+                    object_id,
+                    payload_len: entry.payload_len,
+                    access_order: order,
+                });
+            } else {
+                skipped_non_evictable = skipped_non_evictable.saturating_add(1);
+            }
+        }
+
+        Ok(EvictionCandidatePage {
+            entries: ordered,
+            scanned_rows,
+            skipped_non_evictable,
+        })
     }
 
     /// Best-effort atime-like throttling helper for hot paths.
@@ -1303,6 +1389,64 @@ mod tests {
         assert_eq!(
             index.last_touch_access.lock().len(),
             TOUCH_ACCESS_LRU_CAPACITY
+        );
+    }
+
+    #[test]
+    fn eviction_candidates_filter_to_uploaded_evictable_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_uploaded(&index, 1, 10);
+        upsert_dirty(&index, 2, 20);
+        upsert_uploaded(&index, 3, 30);
+        index.mark_uploading(2).unwrap();
+
+        let ids = index
+            .eviction_candidates_page(None, 16)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 3]);
+
+        index.touch_access(1).unwrap();
+        let ids_after_touch = index
+            .eviction_candidates_page(None, 16)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids_after_touch, vec![3, 1]);
+
+        let page = index.eviction_candidates_page_with_stats(None, 16).unwrap();
+        assert_eq!(page.skipped_non_evictable, 1);
+        assert_eq!(page.scanned_rows, 3);
+    }
+
+    #[test]
+    fn eviction_candidates_support_cursor_paging() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_uploaded(&index, 10, 1);
+        upsert_uploaded(&index, 11, 1);
+        upsert_uploaded(&index, 12, 1);
+
+        let page1 = index.eviction_candidates_page(None, 2).unwrap();
+        assert_eq!(page1.len(), 2);
+        let cursor = page1.last().map(|entry| entry.access_order);
+        let page2 = index.eviction_candidates_page(cursor, 2).unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(
+            page1
+                .iter()
+                .chain(page2.iter())
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
         );
     }
 }
