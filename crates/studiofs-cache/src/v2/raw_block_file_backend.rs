@@ -209,7 +209,6 @@ impl RawBlockFileBackend {
         let record_len = RECORD_HEADER_SIZE as u64 + body_len;
         let offset = reserved_len.fetch_add(record_len, Ordering::SeqCst);
 
-        let _ = platform::preallocate(&file, offset, record_len);
         if let Some(body) = body {
             platform::pwrite(&file, body, offset + RECORD_HEADER_SIZE as u64)?;
         }
@@ -355,6 +354,7 @@ impl RawBlockFileBackend {
         }
         drop(current_file);
 
+        temp_file.set_len(new_state.file_len)?;
         platform::fdatasync(&temp_file)?;
 
         while Arc::strong_count(&state.file) > 1 {
