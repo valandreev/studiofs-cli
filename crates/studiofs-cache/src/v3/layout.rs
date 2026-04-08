@@ -59,14 +59,17 @@ impl CacheV3Layout {
     }
 
     /// Determine the payload shard id for a block object id.
+    ///
+    /// Object ids are currently allocated as a sequential counter, so using the
+    /// least-significant byte keeps shard usage balanced for realistic volumes.
     pub fn payload_shard(object_id: u64) -> u8 {
-        (object_id >> 56) as u8
+        (object_id & 0xFF) as u8
     }
 
     /// Resolve the canonical payload block path for an object id.
     pub fn payload_block_path(&self, object_id: u64) -> PathBuf {
         let hex = format!("{object_id:016x}");
-        let shard = &hex[..2];
+        let shard = format!("{:02x}", Self::payload_shard(object_id));
         self.payload_blocks_dir
             .join(shard)
             .join(format!("{hex}.block"))
@@ -105,7 +108,15 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("/cache/vol-a/v3/payload/blocks/ab/ab00000000000042.block")
+            PathBuf::from("/cache/vol-a/v3/payload/blocks/42/ab00000000000042.block")
         );
+    }
+
+    #[test]
+    fn payload_shard_spreads_sequential_ids() {
+        assert_eq!(CacheV3Layout::payload_shard(1), 0x01);
+        assert_eq!(CacheV3Layout::payload_shard(255), 0xFF);
+        assert_eq!(CacheV3Layout::payload_shard(256), 0x00);
+        assert_eq!(CacheV3Layout::payload_shard(257), 0x01);
     }
 }

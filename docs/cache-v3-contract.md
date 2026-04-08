@@ -33,6 +33,8 @@ Notes:
 - `v3/LAYOUT_V1` is the explicit marker that the cache root is provisioned for
   Cache 3.0 layout version 1.
 - `v3/index/cache.redb` is the fixed redb index location.
+- payload blocks are sharded by the low byte of `object_id` (`object_id & 0xFF`)
+  into `00`..`ff` to keep distribution balanced for sequential object ids.
 - `blocks.raw` is not converted in place in this phase.
 - Legacy and v3 data are allowed to coexist in the same cache root.
 

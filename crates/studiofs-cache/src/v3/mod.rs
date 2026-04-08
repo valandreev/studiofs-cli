@@ -6,6 +6,7 @@
 //!   until final validation is complete.
 
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod layout;
@@ -18,7 +19,9 @@ pub use layout::{
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 
 /// Final validation issue that must pass before Cache 3.0 is allowed as default.
-pub const CACHE_V3_FINAL_VALIDATION_ISSUE: &str = "SFS-TBD";
+///
+/// This must be set before flipping `CACHE_V3_DEFAULT_ALLOWED` to `true`.
+pub const CACHE_V3_FINAL_VALIDATION_ISSUE: Option<&str> = None;
 /// Explicit rollout gate. Remains false until final validation passes.
 pub const CACHE_V3_DEFAULT_ALLOWED: bool = false;
 /// Human-readable rollout rule surfaced by status and mount errors.
@@ -85,16 +88,16 @@ impl CacheBackendDetection {
 /// Detect backend contracts for a per-volume cache root using read-only probes.
 ///
 /// This function never creates, removes, or mutates filesystem entries.
-pub fn detect_cache_backends(cache_root: &Path) -> CacheBackendDetection {
+pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetection> {
     let layout = CacheV3Layout::from_cache_root(cache_root);
     let legacy_raw_data_path = cache_root.join(LEGACY_RAW_DATA_FILE_NAME);
-    let v3_layout_marker_exists = layout.layout_marker.exists();
-    CacheBackendDetection {
+    let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
+    Ok(CacheBackendDetection {
         layout,
-        legacy_raw_data_exists: legacy_raw_data_path.exists(),
+        legacy_raw_data_exists: legacy_raw_data_path.try_exists()?,
         v3_layout_marker_exists,
         legacy_raw_data_path,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -109,7 +112,7 @@ mod tests {
     #[test]
     fn empty_root_defaults_to_legacy_contract() {
         let temp = tempfile::tempdir().unwrap();
-        let detection = detect_cache_backends(temp.path());
+        let detection = detect_cache_backends(temp.path()).unwrap();
 
         assert!(!detection.has_legacy_raw_backend());
         assert!(!detection.has_cache_v3_contract());
@@ -125,7 +128,7 @@ mod tests {
         let raw_path = temp.path().join(LEGACY_RAW_DATA_FILE_NAME);
         std::fs::write(&raw_path, b"raw").unwrap();
 
-        let detection = detect_cache_backends(temp.path());
+        let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(detection.has_legacy_raw_backend());
         assert!(!detection.has_cache_v3_contract());
         assert_eq!(
@@ -140,7 +143,7 @@ mod tests {
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let detection = detect_cache_backends(temp.path());
+        let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(!detection.has_legacy_raw_backend());
         assert!(detection.has_cache_v3_contract());
         assert_eq!(
@@ -157,7 +160,7 @@ mod tests {
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let detection = detect_cache_backends(temp.path());
+        let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(detection.has_dual_layout());
         assert_eq!(
             detection.selected_mount_backend(),

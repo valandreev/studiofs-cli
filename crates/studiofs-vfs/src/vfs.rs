@@ -127,6 +127,22 @@ pub enum VfsError {
     #[error("fetch error: {0}")]
     Fetch(#[from] crate::fetch::FetchError),
 
+    #[error("cache backend detection failed for root '{cache_root}': {source}")]
+    CacheBackendDetection {
+        cache_root: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "cache rollout blocked for root '{cache_root}' (detected contract '{backend}'): {reason}"
+    )]
+    CacheRolloutBlocked {
+        cache_root: String,
+        backend: CacheBackendKind,
+        reason: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -4375,7 +4391,13 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let cache_backend_detection = detect_cache_backends(Path::new(cache_dir));
+            let cache_backend_detection =
+                detect_cache_backends(Path::new(cache_dir)).map_err(|source| {
+                    VfsError::CacheBackendDetection {
+                        cache_root: cache_dir.to_string(),
+                        source,
+                    }
+                })?;
             if cache_backend_detection.has_dual_layout() {
                 info!(
                     cache_root = %cache_backend_detection.layout.cache_root.display(),
@@ -4395,9 +4417,13 @@ impl StudioVfs {
                 } else {
                     "blocked"
                 };
-                return Err(VfsError::Other(format!(
-                    "cache root '{cache_dir}' is provisioned for Cache 3.0 at '{layout_marker}', but this mount path is still raw-backend only; default gate is {default_state}. {CACHE_V3_DEFAULT_GUARDRAIL}"
-                )));
+                return Err(VfsError::CacheRolloutBlocked {
+                    cache_root: cache_dir.to_string(),
+                    backend: CacheBackendKind::CacheV3,
+                    reason: format!(
+                        "cache root is provisioned for Cache 3.0 at '{layout_marker}', but this mount path is still raw-backend only; default gate is {default_state}. {CACHE_V3_DEFAULT_GUARDRAIL}"
+                    ),
+                });
             }
 
             let volume_uuid = derive_local_backend_volume_uuid(&format_info.uuid);

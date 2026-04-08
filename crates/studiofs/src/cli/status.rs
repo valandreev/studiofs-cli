@@ -192,7 +192,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
-    let cache_backend_detection = detect_cache_backends(&cache_path);
+    let cache_backend_detection = detect_cache_backends(&cache_path)?;
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(&cache_path, &format_info.uuid)?;
 
@@ -260,7 +260,8 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
             "blocked"
         }
     );
-    println!("  Final validation:    {}", CACHE_V3_FINAL_VALIDATION_ISSUE);
+    let final_validation_issue = CACHE_V3_FINAL_VALIDATION_ISSUE.unwrap_or("UNASSIGNED");
+    println!("  Final validation:    {}", final_validation_issue);
     println!("  Guardrail:           {}", CACHE_V3_DEFAULT_GUARDRAIL);
 
     println!("\nLocal Ingress");
