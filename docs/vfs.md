@@ -91,8 +91,8 @@ Adaptive upload throttling overrides:
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` sets the foreground P90 target.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` sets the speedometer sampling window.
 - `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` controls how long last P90 is retained.
-- upload worker foreground cache cost is derived internally from `STUDIOFS_UPLOAD_CACHE_IO_SLOTS` and current congestion instead of being user-configured separately.
-- `STUDIOFS_TRANSIT_MEMORY_BUDGET` sets the global credit budget for in-flight fetch/upload transit buffers.
+- upload worker foreground cache cost is derived internally from cache budget and current congestion instead of being user-configured separately.
+- transit-memory budget for in-flight fetch/upload buffers is derived internally from cache budget.
 
 ## Write Path
 
@@ -132,8 +132,8 @@ dirty `WriteBuffer` blocks for this inode
   └─ Enqueue uploads for the committed extents
 ```
 
-`cache_safety_mode` is configurable via VFS config / `studiofs settings --cache-safety-mode`
-or environment variable `STUDIOFS_CACHE_SAFETY_MODE=fast|durable`.
+`cache_safety_mode` is internal runtime policy and is no longer exposed through
+the user-facing `studiofs settings` surface.
 
 Local durability notes:
 - Dirty bytes stay in `WriteBuffer` until the local backend -> sync_data() -> metadata sequence succeeds; failed persists do not drain RAM ownership.

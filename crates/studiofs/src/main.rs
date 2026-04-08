@@ -176,7 +176,7 @@ EXAMPLES:
     studiofs mount myvolume Z: -d
 
   Mount on Linux/macOS (directory):
-    studiofs mount myvolume /mnt/studio --memory-limit 4GB
+    studiofs mount myvolume /mnt/studio --cache-size 500GB
 
   Unmount:
     studiofs umount Z:
@@ -197,43 +197,19 @@ ENV TUNING:
   STUDIOFS_JANITOR_SKIP_NEWER_SECS  Grace window for orphan deletion (default: 900).
   STUDIOFS_JANITOR_MAX_DELETES      Max janitor deletes per cycle (default: 500).
   STUDIOFS_JANITOR_LEASE_TTL_SECS   Janitor lease TTL in metadata store (default: 2700).
-  STUDIOFS_UPLOAD_DELAY_MS          Delay uploads for overwrite/delete coalescing (default: 2000).
-  STUDIOFS_UPLOAD_REQUEUE_BASE_MS   Base backoff for exhausted upload requeue (default: 5000).
-  STUDIOFS_UPLOAD_REQUEUE_MAX_MS    Max backoff for exhausted upload requeue (default: 120000).
-  STUDIOFS_UPLOAD_STATS_INTERVAL_SECS  Upload metrics log interval (default: 10).
-  STUDIOFS_SLAB_FLUSH_INTERVAL_MS   Background local write-buffer drain wake interval (default: 10).
-  STUDIOFS_FOREGROUND_DRAIN_ASSIST  Allow foreground backpressure path to assist drain (default: 1).
-  STUDIOFS_MAX_DRAIN_BATCH          Max dirty WriteBuffer blocks persisted per drain cycle (default: 1024).
-  STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES  Minimum completed full-block batch `write()` coalesces before local persist (default: 32MiB).
-  STUDIOFS_INGRESS_SEGMENT_MAX_BYTES  Legacy durable-ingress segment rotation size (default: 256MiB).
-  STUDIOFS_CACHE_SAFETY_MODE         Startup recovery policy for legacy ingress artifacts: fast|durable (default: fast).
-  STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS  Legacy durable-ingress checkpoint interval (default: 30).
-  STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES  Legacy durable-ingress checkpoint trigger on append churn (default: 64MiB).
-  STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS  Legacy durable-ingress checkpoint trigger on mutation count (default: 128).
-  STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG  Legacy durable-ingress checkpoint trigger on segment lag (default: 2).
-  STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS  Legacy durable-ingress checkpoint trigger on live-segment span (default: 4).
-  STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS  Max time to wait for uploaded objects to become visible before publishing manifests (default: 30).
-  STUDIOFS_UPLOAD_CACHE_IO_SLOTS    Upload local-cache I/O slots (default: 32).
-  STUDIOFS_TRANSIT_MEMORY_BUDGET    Max active read/upload transit buffers (default: 80% of --memory-limit).
-  STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS Keep read priority briefly after read burst (default: 500).
-  STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS  Foreground read P90 target for upload throttling (default: 35).
-  STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS  Foreground read speedometer window (default: 1500).
-  STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS  Keep last P90 for this many windows when samples pause (default: 2).
   STUDIOFS_UPLOAD_MAX_ATTEMPTS      Max upload retries (default: 10).
   STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS  Per-upload request timeout (default: 120).
   STUDIOFS_FETCH_MAX_ATTEMPTS       Max fetch retries (default: 8).
   STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS  Per-fetch request timeout (default: 45).
-  STUDIOFS_DENTRY_CACHE_CAPACITY    VFS dentry cache entry budget (default: 65536).
-  STUDIOFS_DENTRY_CACHE_BYTES       VFS dentry cache byte budget (default: 64MB).
-  STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY  VFS full-path shortcut cache entry budget (default: 16384).
-  STUDIOFS_PATH_SHORTCUT_CACHE_BYTES     VFS full-path shortcut cache byte budget (default: 16MB).
-  STUDIOFS_QOS_ACCEPT_SLOTS         QoS slots for accept operations (default: 64).
-  STUDIOFS_QOS_MATERIALIZE_SLOTS    QoS slots for materialization (default: 2).
-  STUDIOFS_QOS_UPLOAD_SLOTS         QoS slots for uploads (default: 4).
-  STUDIOFS_QOS_COMMIT_SLOTS         QoS slots for commits (default: 4).
-  STUDIOFS_QOS_FETCH_SLOTS          QoS slots for fetches (default: 128).
-  STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS  Wait uploads on unmount (default: 0, resume next mount).
-  STUDIOFS_XATTR_MAX_BYTES             Max bytes allowed per xattr value (default: 4MB).
+  STUDIOFS_XATTR_MAX_BYTES          Max bytes allowed per xattr value (default: 4MB).
+
+CACHE 3.0 OPERATOR MODEL:
+  Cache behavior is intentionally two-knob:
+    --cache-dir
+    --cache-size
+  Internal cache thresholds are derived automatically at mount time.
+  Use `studiofs status <name>` to inspect runtime usage/dirty/evictable bytes
+  and migration/reconciliation signals.
 
   Enable debug logging:
     studiofs --log-level debug mount myvolume Z:
@@ -373,9 +349,8 @@ EXAMPLES:
   Basic mount (Linux/macOS):
     studiofs mount myvolume /mnt/studio
 
-  High-performance mount (4 GB memory cache, 500 GB disk cache):
-    studiofs mount myvolume Z: --memory-limit 4GB --cache-size 500GB \\
-      --cache-dir D:\\cache\\studiofs
+  Cache 3.0 two-knob mount (location + size):
+    studiofs mount myvolume Z: --cache-dir D:\\cache\\studiofs --cache-size 500GB
 
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
@@ -393,7 +368,7 @@ PYROSCOPE PROFILING:
   STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable
 
 SIZE FORMATS:
-  --memory-limit and --cache-size accept: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
+  --cache-size accepts: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
 
 RUNTIME PG POLICY:
   PG batching / sync cadence is client-side and can be tuned per mount via:
@@ -488,7 +463,7 @@ EXAMPLES:
 Examples:
   Persist default mount + cache settings for quick mount commands:
     studiofs settings --mount-point /mnt/studio
-    studiofs settings --cache-dir ~/.cache/studiofs --memory-limit 4GB --cache-size 1TB")]
+    studiofs settings --cache-dir ~/.cache/studiofs --cache-size 1TB")]
     Settings {
         #[command(flatten)]
         settings: cli::settings::SettingsArgs,
@@ -1034,6 +1009,26 @@ mod tests {
             }
             other => panic!("expected Settings, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_rejects_cache_safety_mode_flag() {
+        let err = match parse(&["settings", "--cache-safety-mode", "durable"]) {
+            Ok(_) => panic!("expected unknown argument for removed cache-safety-mode flag"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--cache-safety-mode"));
+    }
+
+    #[test]
+    fn settings_rejects_slab_flush_interval_flag() {
+        let err = match parse(&["settings", "--slab-flush-interval", "100"]) {
+            Ok(_) => panic!("expected unknown argument for removed slab-flush-interval flag"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--slab-flush-interval"));
     }
 
     #[test]

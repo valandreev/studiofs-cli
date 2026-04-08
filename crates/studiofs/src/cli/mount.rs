@@ -7,7 +7,7 @@ use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
-use studiofs_vfs::{CacheSafetyMode, StudioVfs, VfsConfigRaw, parse_size_bytes};
+use studiofs_vfs::{StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info};
 
@@ -76,16 +76,6 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .filter(|v| *v > 0.0)
 }
 
-fn parse_env_cache_safety_mode(key: &str) -> Option<CacheSafetyMode> {
-    let value = std::env::var(key).ok()?;
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "fast" => Some(CacheSafetyMode::Fast),
-        "durable" => Some(CacheSafetyMode::Durable),
-        _ => None,
-    }
-}
-
 fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     macro_rules! set_usize {
         ($key:literal, $field:ident) => {
@@ -119,19 +109,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
         };
     }
 
-    set_size!("STUDIOFS_MAX_DIRTY_BYTES", max_dirty_bytes);
-    set_size!(
-        "STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES",
-        write_eager_flush_batch_bytes
-    );
-    if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
-        && let Ok(bytes) = parse_positive_size_arg(&v)
-    {
-        config.max_ingress_segment_bytes = Some(bytes);
-    }
-    if let Some(mode) = parse_env_cache_safety_mode("STUDIOFS_CACHE_SAFETY_MODE") {
-        config.cache_safety_mode = Some(mode);
-    }
     set_u64!(
         "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS",
         metadata_invalidation_sync_interval_ms
@@ -194,11 +171,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     }
     set_u64!("STUDIOFS_JANITOR_MAX_DELETES", janitor_max_deletes);
     set_u64!("STUDIOFS_JANITOR_LEASE_TTL_SECS", janitor_lease_ttl_secs);
-    set_usize!("STUDIOFS_UPLOAD_CACHE_IO_SLOTS", upload_cache_io_slots);
-    set_size!(
-        "STUDIOFS_TRANSIT_MEMORY_BUDGET",
-        transit_memory_budget_bytes
-    );
     set_u64!(
         "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
         upload_user_idle_grace_ms
@@ -233,11 +205,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     );
     set_u64!("STUDIOFS_UPLOAD_RETRY_BASE_MS", upload_retry_base_ms);
     set_u64!("STUDIOFS_UPLOAD_RETRY_MAX_MS", upload_retry_max_ms);
-    if let Some(interval_ms) = parse_env_u64_any("STUDIOFS_SLAB_FLUSH_INTERVAL_MS")
-        && interval_ms > 0
-    {
-        config.slab_flush_interval_ms = Some(interval_ms);
-    }
     set_u64!(
         "STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS",
         shutdown_metadata_flush_timeout_secs
@@ -286,26 +253,6 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     set_usize!("STUDIOFS_QOS_UPLOAD_SLOTS", qos_upload_slots);
     set_usize!("STUDIOFS_QOS_COMMIT_SLOTS", qos_commit_slots);
     set_usize!("STUDIOFS_QOS_FETCH_SLOTS", qos_fetch_slots);
-    set_u64!(
-        "STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS",
-        ingress_checkpoint_interval_secs
-    );
-    set_u64!(
-        "STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES",
-        ingress_checkpoint_min_append_bytes
-    );
-    set_u64!(
-        "STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS",
-        ingress_checkpoint_min_mutations
-    );
-    set_u64!(
-        "STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG",
-        ingress_checkpoint_max_segment_lag
-    );
-    set_u64!(
-        "STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS",
-        ingress_checkpoint_max_live_segments
-    );
     if let Ok(principal) = std::env::var("STUDIOFS_PRINCIPAL") {
         let principal = principal.trim();
         if !principal.is_empty() {
