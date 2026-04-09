@@ -370,9 +370,11 @@ On startup:
 
 When Cache 3.0 is selected, startup reconciliation runs before serving reads:
 
-1. Remove orphan temp files in `v3/tmp/**` and `v3/payload/blocks/**`.
-2. Remove stale redb index rows pointing to missing payload files.
-3. Remove orphan payload files with no index row.
+1. Default (`lightweight`) startup mode removes orphan temp files in `v3/tmp/**`
+   and prunes stale dirty/uploading index rows pointing to missing payload files.
+2. Optional full startup sweep (`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`)
+   additionally scans all index rows and payload files to remove global
+   index/payload orphans.
 
 This recovery path never mutates legacy `blocks.raw`. Dual-layout coexistence is
 supported for migration and fallback.

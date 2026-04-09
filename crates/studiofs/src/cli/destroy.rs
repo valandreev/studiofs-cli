@@ -25,11 +25,11 @@ fn describe_cache_generation_state(detection: Option<&CacheBackendDetection>) ->
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
         if detection.has_dual_layout() {
-            "metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under the default cache root"
+            "if default cache path is in use, metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under that default root"
         } else if detection.has_cache_v3_contract() {
-            "metadata cleanup removes the cache-v3 subtree under the default cache root"
+            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
         } else if detection.has_legacy_raw_backend() {
-            "metadata cleanup removes legacy blocks.raw under the default cache root"
+            "if default cache path is in use, metadata cleanup removes legacy blocks.raw under that default root"
         } else {
             "no default cache generation detected under metadata dir"
         }
@@ -150,6 +150,7 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     println!(
         "NOTE: Custom local data cache directories are not auto-detected and will NOT be removed."
     );
+    println!("WARNING: If this volume used a non-default cache_dir, remove that path manually.");
     println!(
         "After destroy, remove local cache manually for volume UUID '{}'.",
         format_info.uuid
@@ -303,15 +304,15 @@ mod tests {
     fn destroy_cleanup_scope_is_generation_aware() {
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true, true))),
-            "metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under the default cache root"
+            "if default cache path is in use, metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under that default root"
         );
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true, false))),
-            "metadata cleanup removes legacy blocks.raw under the default cache root"
+            "if default cache path is in use, metadata cleanup removes legacy blocks.raw under that default root"
         );
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(false, true))),
-            "metadata cleanup removes the cache-v3 subtree under the default cache root"
+            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
         );
     }
 }

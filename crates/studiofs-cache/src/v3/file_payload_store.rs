@@ -176,6 +176,7 @@ impl FilePayloadStore {
             return Err(FilePayloadStoreError::Io(error));
         }
         self.invalidate_cached_read_handle(object_id);
+        platform::sync_directory(&self.layout.tmp_dir)?;
         platform::sync_directory(payload_dir)?;
         Ok(())
     }
@@ -218,18 +219,14 @@ impl FilePayloadStore {
     }
 
     fn create_temp_file(&self, object_id: u64) -> Result<(File, PathBuf), FilePayloadStoreError> {
-        let payload_path = self.layout.payload_block_path(object_id);
-        let payload_dir = payload_path.parent().ok_or_else(|| {
-            io::Error::other(format!(
-                "payload path has no parent directory: {}",
-                payload_path.display()
-            ))
-        })?;
-
+        std::fs::create_dir_all(&self.layout.tmp_dir)?;
         let hex = format!("{object_id:016x}");
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
-            let candidate =
-                payload_dir.join(format!("{hex}-{}{}", next_temp_token(), TEMP_FILE_SUFFIX));
+            let candidate = self.layout.tmp_dir.join(format!(
+                "{hex}-{}{}",
+                next_temp_token(),
+                TEMP_FILE_SUFFIX
+            ));
             match OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -244,7 +241,7 @@ impl FilePayloadStore {
 
         Err(FilePayloadStoreError::TempFileCreateExhausted {
             object_id,
-            dir: payload_dir.to_path_buf(),
+            dir: self.layout.tmp_dir.clone(),
         })
     }
 

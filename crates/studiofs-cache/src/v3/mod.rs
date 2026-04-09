@@ -37,8 +37,8 @@ pub use layout::{
     CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
     CACHE_V3_REDB_INDEX_FILE, CACHE_V3_SUBTREE, CacheV3Layout,
 };
-use reconcile::reconcile_startup_state;
 pub use reconcile::{CacheV3StartupReconcileError, CacheV3StartupReconcileReport};
+use reconcile::{CacheV3StartupReconcileMode, reconcile_startup_state};
 
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
@@ -127,8 +127,8 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetect
     let layout = CacheV3Layout::from_cache_root(cache_root);
     let legacy_raw_data_path = cache_root.join(LEGACY_RAW_DATA_FILE_NAME);
     let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
-    let v3_index_exists = layout.redb_index_path.try_exists().unwrap_or(false);
-    let v3_payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists().unwrap_or(false);
+    let v3_index_exists = layout.redb_index_path.try_exists()?;
+    let v3_payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
     Ok(CacheBackendDetection {
         layout,
         legacy_raw_data_exists: legacy_raw_data_path.try_exists()?,
@@ -238,13 +238,16 @@ impl CacheV3LocalBlockBackend {
             }
         })?;
 
-        let startup_reconcile_report = reconcile_startup_state(&layout, &index, &payload_store)
-            .map_err(|source| CacheV3LocalBlockBackendError::StartupReconcile {
-                cache_root: layout.v3_root.clone(),
-                source,
-            })?;
+        let startup_reconcile_mode = CacheV3StartupReconcileMode::from_env();
+        let startup_reconcile_report =
+            reconcile_startup_state(&layout, &index, &payload_store, startup_reconcile_mode)
+                .map_err(|source| CacheV3LocalBlockBackendError::StartupReconcile {
+                    cache_root: layout.v3_root.clone(),
+                    source,
+                })?;
         if !startup_reconcile_report.is_clean() {
             warn!(
+                mode = ?startup_reconcile_mode,
                 temp_files_removed = startup_reconcile_report.temp_files_removed,
                 stale_index_entries_removed = startup_reconcile_report.stale_index_entries_removed,
                 orphan_payload_files_removed =
@@ -1185,12 +1188,6 @@ mod tests {
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let staged_payload_tmp = layout
-            .payload_block_path(9001)
-            .with_file_name("0000000000002329-leftover.tmp");
-        std::fs::create_dir_all(staged_payload_tmp.parent().unwrap()).unwrap();
-        std::fs::write(&staged_payload_tmp, b"staged").unwrap();
-
         let staged_tmp_dir_file = layout.tmp_dir.join("pending").join("write.tmp");
         std::fs::create_dir_all(staged_tmp_dir_file.parent().unwrap()).unwrap();
         std::fs::write(&staged_tmp_dir_file, b"staged").unwrap();
@@ -1202,7 +1199,6 @@ mod tests {
         .unwrap();
         drop(backend);
 
-        assert!(!staged_payload_tmp.exists());
         assert!(!staged_tmp_dir_file.exists());
     }
 

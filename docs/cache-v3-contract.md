@@ -91,11 +91,18 @@ same workload. Internal direct-shim benchmarks are not acceptance gates.
 
 ## 5. Startup Reconciliation and Repair Behavior
 
-On Cache 3.0 backend startup, reconciliation runs before normal reads/writes:
+On Cache 3.0 backend startup, reconciliation runs before normal reads/writes.
 
-1. Remove orphan temp files from `v3/tmp/**` and `v3/payload/blocks/**` (`*.tmp`).
-2. Scan index object ids and prune stale rows whose payload files are missing.
-3. Scan payload files and delete orphan payload files with no index row.
+Default startup mode (`lightweight`):
+
+1. Remove orphan temp files from `v3/tmp/**`.
+2. Scan dirty/uploading index rows and prune rows whose payload files are missing.
+
+Optional full sweep mode (`full`), enabled via
+`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`:
+
+1. Scan all index object ids and prune stale rows whose payload files are missing.
+2. Scan payload files and delete orphan payload files with no index row.
 
 Safety rules:
 - Reconciliation is scoped to `<cache-root>/v3/**` only.
