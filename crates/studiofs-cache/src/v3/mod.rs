@@ -25,6 +25,7 @@ pub mod eviction;
 pub mod file_payload_store;
 pub mod layout;
 pub mod platform;
+pub mod reconcile;
 
 pub use cache_index::{
     CacheIndex, CacheIndexEntry, CacheIndexError, CacheIndexStats, CacheIndexUpsert,
@@ -36,6 +37,8 @@ pub use layout::{
     CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
     CACHE_V3_REDB_INDEX_FILE, CACHE_V3_SUBTREE, CacheV3Layout,
 };
+pub use reconcile::{CacheV3StartupReconcileError, CacheV3StartupReconcileReport};
+use reconcile::{CacheV3StartupReconcileMode, reconcile_startup_state};
 
 const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
@@ -87,6 +90,8 @@ pub struct CacheBackendDetection {
     pub legacy_raw_data_path: PathBuf,
     pub legacy_raw_data_exists: bool,
     pub v3_layout_marker_exists: bool,
+    pub v3_index_exists: bool,
+    pub v3_payload_blocks_dir_exists: bool,
 }
 
 impl CacheBackendDetection {
@@ -122,10 +127,14 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetect
     let layout = CacheV3Layout::from_cache_root(cache_root);
     let legacy_raw_data_path = cache_root.join(LEGACY_RAW_DATA_FILE_NAME);
     let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
+    let v3_index_exists = layout.redb_index_path.try_exists()?;
+    let v3_payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
     Ok(CacheBackendDetection {
         layout,
         legacy_raw_data_exists: legacy_raw_data_path.try_exists()?,
         v3_layout_marker_exists,
+        v3_index_exists,
+        v3_payload_blocks_dir_exists,
         legacy_raw_data_path,
     })
 }
@@ -155,6 +164,12 @@ pub enum CacheV3LocalBlockBackendError {
         cache_root: PathBuf,
         #[source]
         source: FilePayloadStoreError,
+    },
+    #[error("failed to reconcile cache-v3 startup state under '{cache_root}': {source}")]
+    StartupReconcile {
+        cache_root: PathBuf,
+        #[source]
+        source: CacheV3StartupReconcileError,
     },
 }
 
@@ -222,6 +237,25 @@ impl CacheV3LocalBlockBackend {
                 source,
             }
         })?;
+
+        let startup_reconcile_mode = CacheV3StartupReconcileMode::from_env();
+        let startup_reconcile_report =
+            reconcile_startup_state(&layout, &index, startup_reconcile_mode).map_err(|source| {
+                CacheV3LocalBlockBackendError::StartupReconcile {
+                    cache_root: layout.v3_root.clone(),
+                    source,
+                }
+            })?;
+        if !startup_reconcile_report.is_clean() {
+            warn!(
+                mode = ?startup_reconcile_mode,
+                temp_files_removed = startup_reconcile_report.temp_files_removed,
+                stale_index_entries_removed = startup_reconcile_report.stale_index_entries_removed,
+                orphan_payload_files_removed =
+                    startup_reconcile_report.orphan_payload_files_removed,
+                "cache-v3 startup reconciliation repaired cache artifacts"
+            );
+        }
 
         Ok(Self {
             layout,
@@ -894,6 +928,8 @@ mod tests {
 
         assert!(!detection.has_legacy_raw_backend());
         assert!(!detection.has_cache_v3_contract());
+        assert!(!detection.v3_index_exists);
+        assert!(!detection.v3_payload_blocks_dir_exists);
         assert_eq!(
             detection.selected_mount_backend(),
             CacheBackendKind::LegacyRawV2
@@ -909,6 +945,8 @@ mod tests {
         let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(detection.has_legacy_raw_backend());
         assert!(!detection.has_cache_v3_contract());
+        assert!(!detection.v3_index_exists);
+        assert!(!detection.v3_payload_blocks_dir_exists);
         assert_eq!(
             detection.selected_mount_backend(),
             CacheBackendKind::LegacyRawV2
@@ -924,6 +962,8 @@ mod tests {
         let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(!detection.has_legacy_raw_backend());
         assert!(detection.has_cache_v3_contract());
+        assert!(!detection.v3_index_exists);
+        assert!(!detection.v3_payload_blocks_dir_exists);
         assert_eq!(
             detection.selected_mount_backend(),
             CacheBackendKind::CacheV3
@@ -940,6 +980,8 @@ mod tests {
 
         let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(detection.has_dual_layout());
+        assert!(!detection.v3_index_exists);
+        assert!(!detection.v3_payload_blocks_dir_exists);
         assert_eq!(
             detection.selected_mount_backend(),
             CacheBackendKind::LegacyRawV2
@@ -1108,6 +1150,57 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reopened.get(77).unwrap().as_ref(), b"reopen-payload");
+    }
+
+    #[test]
+    fn cache_v3_backend_open_reconciles_stale_index_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x45; 16],
+        })
+        .unwrap();
+        backend.put(501, b"stale-index", false).unwrap();
+        backend.sync_data().unwrap();
+        std::fs::remove_file(layout.payload_block_path(501)).unwrap();
+        drop(backend);
+
+        let index_before = CacheIndex::open(&layout.redb_index_path).unwrap();
+        assert!(index_before.get_entry(501).unwrap().is_some());
+        drop(index_before);
+
+        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x45; 16],
+        })
+        .unwrap();
+        drop(reopened);
+
+        let index_after = CacheIndex::open(&layout.redb_index_path).unwrap();
+        assert!(index_after.get_entry(501).unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_v3_backend_open_removes_orphan_temp_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let staged_tmp_dir_file = layout.tmp_dir.join("pending").join("write.tmp");
+        std::fs::create_dir_all(staged_tmp_dir_file.parent().unwrap()).unwrap();
+        std::fs::write(&staged_tmp_dir_file, b"staged").unwrap();
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x46; 16],
+        })
+        .unwrap();
+        drop(backend);
+
+        assert!(!staged_tmp_dir_file.exists());
     }
 
     #[test]

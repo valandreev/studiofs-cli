@@ -1,12 +1,12 @@
-# Cache 3.0 Contract Freeze (SFS-173)
+# Cache 3.0 Contract and Migration Safety (SFS-173, SFS-181)
 
 ## Purpose
 
-Freeze the Cache 3.0 disk layout, backend-detection rules, acceptance gates,
-and rollout guardrails before implementation work starts.
+Define the Cache 3.0 disk layout, backend-detection rules, startup safety
+reconciliation, and migration guardrails.
 
-This document is the source of truth for follow-up tasks (starting with
-SFS-174) and is intentionally implementation-agnostic.
+This document is the source of truth for rollout behavior and operator-facing
+safety expectations.
 
 ## 1. Versioned Disk Layout (v1)
 
@@ -33,8 +33,8 @@ Notes:
 - `v3/LAYOUT_V1` is the explicit marker that the cache root is provisioned for
   Cache 3.0 layout version 1.
 - `v3/index/cache.redb` is the fixed redb index location.
-- payload blocks are sharded by the low byte of `object_id` (`object_id & 0xFF`)
-  into `00`..`ff` to keep distribution balanced for sequential object ids.
+- payload blocks are sharded into two levels (`00/00`..`ff/ff`) using a stable
+  hash of `object_id`, which avoids hot spots for sequential ids.
 - `blocks.raw` is not converted in place in this phase.
 - Legacy and v3 data are allowed to coexist in the same cache root.
 
@@ -70,7 +70,7 @@ same workload. Internal direct-shim benchmarks are not acceptance gates.
 
 1. Contract-only phase (this issue): layout + detection + guardrails.
 2. Opt-in implementation phase: Cache 3.0 mount/bootstrap behind explicit
-   non-default activation.
+   non-default activation, with startup reconciliation enabled.
 3. Validation phase: run full acceptance matrix on production-representative
    hardware and workloads.
 4. Default-switch phase: allowed only after final validation issue is closed.
@@ -88,3 +88,43 @@ same workload. Internal direct-shim benchmarks are not acceptance gates.
 - The code gate in `studiofs-cache/src/v3/mod.rs` (`CACHE_V3_DEFAULT_ALLOWED`)
   must remain `false` until that issue is complete.
 - The default flip and issue closure evidence must land together in one change.
+
+## 5. Startup Reconciliation and Repair Behavior
+
+On Cache 3.0 backend startup, reconciliation runs before normal reads/writes.
+
+Default startup mode (`lightweight`):
+
+1. Remove orphan temp files from `v3/tmp/**`.
+2. Scan dirty/uploading index rows and prune rows whose payload files are missing.
+
+Optional full sweep mode (`full`), enabled via
+`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`:
+
+1. Scan all index object ids and prune stale rows whose payload files are missing.
+2. Scan payload files and delete orphan payload files with no index row.
+
+Safety rules:
+- Reconciliation is scoped to `<cache-root>/v3/**` only.
+- Legacy `<cache-root>/blocks.raw` is never mutated by Cache 3.0 reconciliation.
+- Any unrecoverable reconciliation failure aborts Cache 3.0 backend startup
+  rather than proceeding with ambiguous state.
+
+## 6. Migration and Fallback Flow (Existing Cache Roots)
+
+When enabling Cache 3.0 on a cache root that already has legacy `blocks.raw`:
+
+1. Keep legacy data in place; do **not** convert or rewrite `blocks.raw`.
+2. Provision `v3/` side-by-side (`LAYOUT_V1`, `payload/`, `index/`, `tmp/`).
+3. During dual-layout coexistence, mount contract remains **legacy raw**.
+4. Cache 3.0 can be validated safely without destructive conversion.
+5. Cutover to Cache 3.0 uses a v3-only cache root contract decision.
+
+Fallback path:
+- Roll back by selecting legacy mount contract; no in-place conversion rollback
+  is required.
+- Keep `v3/` data intact for investigation and future retries.
+
+Operational note:
+- Dual layout can temporarily increase disk usage because legacy and v3 data
+  coexist during migration.

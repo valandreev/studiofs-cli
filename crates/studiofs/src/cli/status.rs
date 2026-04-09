@@ -266,6 +266,33 @@ fn scan_cache_usage(
     }
 }
 
+fn scan_cache_usage_by_generation(
+    cache_path: &Path,
+    cache_backend_detection: Option<&CacheBackendDetection>,
+) -> anyhow::Result<(Option<CacheUsageStats>, Option<CacheUsageStats>)> {
+    match cache_backend_detection {
+        Some(detection) => {
+            let legacy_usage = if detection.has_legacy_raw_backend() {
+                Some(scan_legacy_raw_cache_usage(
+                    &detection.legacy_raw_data_path,
+                )?)
+            } else {
+                None
+            };
+            let v3_usage = if detection.has_cache_v3_contract() && detection.v3_index_exists {
+                Some(scan_cache_v3_usage(detection)?)
+            } else {
+                None
+            };
+            Ok((legacy_usage, v3_usage))
+        }
+        None => Ok((
+            Some(scan_legacy_raw_cache_usage(&cache_path.join("blocks.raw"))?),
+            None,
+        )),
+    }
+}
+
 fn warn_large_legacy_status_scan(raw_data_path: &Path) {
     if let Ok(metadata) = std::fs::metadata(raw_data_path)
         && metadata.len() >= LEGACY_STATUS_SCAN_WARN_BYTES
@@ -452,6 +479,17 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         &format_info.uuid,
         cache_backend_detection.as_ref(),
     )?;
+    let (legacy_cache_usage, cache_v3_usage) =
+        match scan_cache_usage_by_generation(&cache_path, cache_backend_detection.as_ref()) {
+            Ok(stats) => stats,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to compute cache generation usage at '{}': {error}",
+                    cache_path.display()
+                );
+                (None, None)
+            }
+        };
     let cache_usage = match scan_cache_usage(&cache_path, cache_backend_detection.as_ref()) {
         Ok(stats) => Some(stats),
         Err(error) => {
@@ -518,7 +556,10 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     } else {
         "unknown"
     };
-    let migration_needed = selected_mount_backend == CacheBackendKind::LegacyRawV2;
+    let migration_needed = cache_backend_detection
+        .as_ref()
+        .map(CacheBackendDetection::selected_mount_backend)
+        .map(|backend| backend == CacheBackendKind::LegacyRawV2);
     let reconcile_needed = pending_uploads > 0
         || spill_stats.records > 0
         || cache_usage
@@ -526,14 +567,68 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
             .unwrap_or(false);
     println!("  Backend version:     {}", backend_version);
     println!("  Contract state:      {}", contract_state);
+    if let Some(detection) = cache_backend_detection.as_ref() {
+        println!(
+            "  Legacy raw path:     {} ({})",
+            detection.legacy_raw_data_path.display(),
+            if detection.has_legacy_raw_backend() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Cache-v3 marker:     {} ({})",
+            detection.layout.layout_marker.display(),
+            if detection.has_cache_v3_contract() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Cache-v3 index:      {} ({})",
+            detection.layout.redb_index_path.display(),
+            if detection.v3_index_exists {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Cache-v3 payload:    {} ({})",
+            detection.layout.payload_blocks_dir.display(),
+            if detection.v3_payload_blocks_dir_exists {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+    }
     println!(
         "  Migration needed:    {}",
-        if migration_needed { "yes" } else { "no" }
+        match migration_needed {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        }
     );
     println!(
         "  Reconcile needed:    {}",
         if reconcile_needed { "yes" } else { "no" }
     );
+    if let Some(detection) = cache_backend_detection.as_ref() {
+        let rollout_behavior = if detection.has_dual_layout() {
+            "dual layout keeps legacy-raw-v2 selected; cache-v3 data can coexist safely until cutover"
+        } else if detection.has_cache_v3_contract() {
+            "cache-v3 only layout selects cache-v3 backend; rollback path is to keep v3 and remount with legacy contract elsewhere"
+        } else if detection.has_legacy_raw_backend() {
+            "legacy-only layout; enabling cache-v3 is additive and does not mutate blocks.raw"
+        } else {
+            "no cache files detected yet"
+        };
+        println!("  Rollout behavior:    {}", rollout_behavior);
+    }
     if let Some(stats) = cache_usage {
         println!("  Usage bytes:         {}", format_bytes(stats.usage_bytes));
         println!("  Dirty bytes:         {}", format_bytes(stats.dirty_bytes));
@@ -545,6 +640,15 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         println!("  Usage bytes:         unknown");
         println!("  Dirty bytes:         unknown");
         println!("  Evictable bytes:     unknown");
+    }
+    if let Some(stats) = legacy_cache_usage {
+        println!("  Legacy usage bytes:  {}", format_bytes(stats.usage_bytes));
+    }
+    if let Some(stats) = cache_v3_usage {
+        println!(
+            "  Cache-v3 usage bytes: {}",
+            format_bytes(stats.usage_bytes)
+        );
     }
     println!(
         "  Cache v3 default:    {}",

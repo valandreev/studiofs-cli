@@ -66,6 +66,27 @@ pub fn rename_atomic(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Returns true when a rename failed because source and destination live on
+/// different filesystems/devices.
+pub fn is_cross_device_link_error(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EXDEV))
+    }
+
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        matches!(error.raw_os_error(), Some(17))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Best-effort sync for directory metadata after rename.
 pub fn sync_directory(path: &Path) -> io::Result<()> {
     sync_directory_impl(path)
@@ -252,4 +273,29 @@ fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
         ));
     }
     Ok(value as libc::off_t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_detection_matches_exdev() {
+        let exdev = io::Error::from_raw_os_error(libc::EXDEV);
+        assert!(is_cross_device_link_error(&exdev));
+
+        let not_exdev = io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!is_cross_device_link_error(&not_exdev));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cross_device_detection_matches_windows_error() {
+        let exdev = io::Error::from_raw_os_error(17);
+        assert!(is_cross_device_link_error(&exdev));
+
+        let other = io::Error::from_raw_os_error(87);
+        assert!(!is_cross_device_link_error(&other));
+    }
 }

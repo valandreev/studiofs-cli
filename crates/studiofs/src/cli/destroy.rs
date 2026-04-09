@@ -2,8 +2,41 @@
 
 use std::io::Write;
 use std::path::Path;
+use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig};
 use tracing::warn;
+
+fn describe_cache_generation_state(detection: Option<&CacheBackendDetection>) -> &'static str {
+    if let Some(detection) = detection {
+        if detection.has_dual_layout() {
+            "dual-layout (legacy + cache-v3)"
+        } else if detection.has_cache_v3_contract() {
+            "cache-v3 only"
+        } else if detection.has_legacy_raw_backend() {
+            "legacy raw only"
+        } else {
+            "empty/undetected"
+        }
+    } else {
+        "unknown"
+    }
+}
+
+fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
+    if let Some(detection) = detection {
+        if detection.has_dual_layout() {
+            "if default cache path is in use, metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under that default root"
+        } else if detection.has_cache_v3_contract() {
+            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
+        } else if detection.has_legacy_raw_backend() {
+            "if default cache path is in use, metadata cleanup removes legacy blocks.raw under that default root"
+        } else {
+            "no default cache generation detected under metadata dir"
+        }
+    } else {
+        "default cache generation is unknown; inspect cache paths before manual cleanup"
+    }
+}
 
 pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> {
     // 1. Check if volume exists (metadata DB)
@@ -20,6 +53,17 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     // We only need read access to format info
     let live_meta = studiofs_meta::open_meta_engine(&db_path)?;
     let format_info = live_meta.get_format_info()?;
+    let default_cache_root = meta_dir.join("cache").join(&format_info.uuid);
+    let cache_backend_detection = match detect_cache_backends(&default_cache_root) {
+        Ok(detection) => Some(detection),
+        Err(error) => {
+            println!(
+                "Warning: Failed to inspect default cache generations at '{}': {error}",
+                default_cache_root.display()
+            );
+            None
+        }
+    };
 
     // 2.1 Validate UUID against remote store if applicable (SFS-95)
     if !local_only && let Err(e) = live_meta.check_consistency() {
@@ -65,9 +109,48 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
         );
         println!("  2. Local metadata files at {:?}", meta_dir);
     }
+    println!("  Default cache root: {}", default_cache_root.display());
+    println!(
+        "  Cache generation state: {}",
+        describe_cache_generation_state(cache_backend_detection.as_ref())
+    );
+    if let Some(detection) = cache_backend_detection.as_ref() {
+        println!(
+            "  Legacy raw path: {} ({})",
+            detection.legacy_raw_data_path.display(),
+            if detection.has_legacy_raw_backend() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Cache-v3 marker: {} ({})",
+            detection.layout.layout_marker.display(),
+            if detection.has_cache_v3_contract() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Cache-v3 index: {} ({})",
+            detection.layout.redb_index_path.display(),
+            if detection.v3_index_exists {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+    }
+    println!(
+        "  Cleanup scope: {}.",
+        describe_destroy_cache_scope(cache_backend_detection.as_ref())
+    );
     println!(
         "NOTE: Custom local data cache directories are not auto-detected and will NOT be removed."
     );
+    println!("WARNING: If this volume used a non-default cache_dir, remove that path manually.");
     println!(
         "After destroy, remove local cache manually for volume UUID '{}'.",
         format_info.uuid
@@ -176,4 +259,60 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_cache::v3::CacheV3Layout;
+
+    fn detection(legacy: bool, marker: bool) -> CacheBackendDetection {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        CacheBackendDetection {
+            layout,
+            legacy_raw_data_path: temp.path().join("blocks.raw"),
+            legacy_raw_data_exists: legacy,
+            v3_layout_marker_exists: marker,
+            v3_index_exists: false,
+            v3_payload_blocks_dir_exists: false,
+        }
+    }
+
+    #[test]
+    fn destroy_generation_state_labels_cover_layouts() {
+        assert_eq!(describe_cache_generation_state(None), "unknown");
+        assert_eq!(
+            describe_cache_generation_state(Some(&detection(false, false))),
+            "empty/undetected"
+        );
+        assert_eq!(
+            describe_cache_generation_state(Some(&detection(true, false))),
+            "legacy raw only"
+        );
+        assert_eq!(
+            describe_cache_generation_state(Some(&detection(false, true))),
+            "cache-v3 only"
+        );
+        assert_eq!(
+            describe_cache_generation_state(Some(&detection(true, true))),
+            "dual-layout (legacy + cache-v3)"
+        );
+    }
+
+    #[test]
+    fn destroy_cleanup_scope_is_generation_aware() {
+        assert_eq!(
+            describe_destroy_cache_scope(Some(&detection(true, true))),
+            "if default cache path is in use, metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under that default root"
+        );
+        assert_eq!(
+            describe_destroy_cache_scope(Some(&detection(true, false))),
+            "if default cache path is in use, metadata cleanup removes legacy blocks.raw under that default root"
+        );
+        assert_eq!(
+            describe_destroy_cache_scope(Some(&detection(false, true))),
+            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
+        );
+    }
 }
