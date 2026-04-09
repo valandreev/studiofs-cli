@@ -52,7 +52,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Volume serial | `0x5354_4644` ("STFD") |
 | Filesystem name | "StudioFS" |
 
-`STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for Cache v2 block I/O.
+`STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local block I/O.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -149,7 +149,7 @@ Current signature includes additional policy controls:
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 
-`STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for Cache v2 block I/O.
+`STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local block I/O.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata

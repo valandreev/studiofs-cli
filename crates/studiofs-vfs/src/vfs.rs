@@ -3918,11 +3918,6 @@ fn map_open_local_block_backend_error(
         OpenLocalBlockBackendError::ProvisionCacheV3Layout { cache_root, source } => {
             map_cache_backend_provision_error(&cache_root, source)
         }
-        OpenLocalBlockBackendError::UnsupportedLegacyCacheRoot {
-            legacy_raw_path, ..
-        } => VfsError::Other(format!(
-            "legacy raw cache data is not supported for mounts; remove or migrate '{legacy_raw_path}' before retrying"
-        )),
         OpenLocalBlockBackendError::OpenCacheV3Backend { source, .. } => {
             VfsError::Other(format!("failed to open cache-v3 backend: {source}"))
         }
@@ -12707,46 +12702,6 @@ mod tests {
                 .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
             "v3-only layout should select the cache-v3 placeholder backend"
         );
-    }
-
-    #[test]
-    fn studio_vfs_new_rejects_legacy_raw_cache_root() {
-        let tmp = TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("meta.redb");
-        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
-        meta.init_root(0, 0).expect("init root");
-
-        let format_info = test_format_info("cache-v3-reject-legacy");
-        meta.set_format_info(&format_info).expect("set format info");
-        let data_config = DataStoreConfig::from(&format_info);
-        let cache_dir = tmp.path().join("cache");
-        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(&cache_dir);
-        std::fs::create_dir_all(&layout.v3_root).expect("create v3 root");
-        std::fs::write(&layout.layout_marker, b"v1").expect("create v3 marker");
-        std::fs::write(cache_dir.join("blocks.raw"), b"legacy").expect("create legacy raw");
-
-        let rt = Runtime::new().expect("runtime");
-        let _guard = rt.enter();
-        let error = match StudioVfs::new(
-            meta,
-            &data_config,
-            cache_dir.to_str().expect("cache dir str"),
-            64 * 1024 * 1024,
-            32 * 1024 * 1024,
-            VfsConfig::default()
-                .try_into()
-                .expect("default VFS config should validate"),
-        ) {
-            Ok(_) => panic!("legacy raw cache roots must fail"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .to_string()
-                .contains("legacy raw cache data is not supported")
-        );
-        assert!(error.to_string().contains("blocks.raw"));
     }
 
     #[test]

@@ -439,7 +439,7 @@ multipliers (`1KB = 1024B`).
 Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
-- legacy ingress artifact counters/checkpoint stats (expected to remain at zero on the Cache v2 foreground path unless recovering older artifacts)
+- ingress artifact counters/checkpoint stats (expected to remain at zero on normal Cache 3.0 foreground operation unless recovering older artifacts)
 - local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
@@ -483,4 +483,3 @@ S3-compatible backend.
 | `STUDIOFS_S3_SECRET_KEY` | `studiofs123` | Test secret key |
 | `STUDIOFS_S3_BUCKET` | `studiofs-test` | Test bucket |
 | `STUDIOFS_TEST_PG_DSN` | none | PostgreSQL server DSN for ignored PG tests; StudioFS uses DB `studiofs` |
-

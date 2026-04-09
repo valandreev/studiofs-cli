@@ -8,12 +8,8 @@ use tracing::warn;
 
 fn describe_cache_generation_state(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
-        if detection.has_dual_layout() {
-            "dual-layout (legacy + cache-v3)"
-        } else if detection.has_cache_v3_contract() {
+        if detection.has_cache_v3_contract() {
             "cache-v3 only"
-        } else if detection.has_legacy_raw_backend() {
-            "legacy raw only"
         } else {
             "empty/undetected"
         }
@@ -24,17 +20,13 @@ fn describe_cache_generation_state(detection: Option<&CacheBackendDetection>) ->
 
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
-        if detection.has_dual_layout() {
-            "if default cache path is in use, metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under that default root"
-        } else if detection.has_cache_v3_contract() {
-            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
-        } else if detection.has_legacy_raw_backend() {
-            "if default cache path is in use, metadata cleanup removes legacy blocks.raw under that default root"
+        if detection.has_cache_v3_contract() {
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its cache-v3 subtree"
         } else {
-            "no default cache generation detected under metadata dir"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         }
     } else {
-        "default cache generation is unknown; inspect cache paths before manual cleanup"
+        "local cleanup removes the entire metadata directory (`meta_dir`); default cache generation could not be inspected"
     }
 }
 
@@ -115,15 +107,6 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
         describe_cache_generation_state(cache_backend_detection.as_ref())
     );
     if let Some(detection) = cache_backend_detection.as_ref() {
-        println!(
-            "  Legacy raw path: {} ({})",
-            detection.legacy_raw_data_path.display(),
-            if detection.has_legacy_raw_backend() {
-                "present"
-            } else {
-                "absent"
-            }
-        );
         println!(
             "  Cache-v3 marker: {} ({})",
             detection.layout.layout_marker.display(),
@@ -266,13 +249,11 @@ mod tests {
     use super::*;
     use studiofs_cache::v3::CacheV3Layout;
 
-    fn detection(legacy: bool, marker: bool) -> CacheBackendDetection {
+    fn detection(marker: bool) -> CacheBackendDetection {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
         CacheBackendDetection {
             layout,
-            legacy_raw_data_path: temp.path().join("blocks.raw"),
-            legacy_raw_data_exists: legacy,
             v3_layout_marker_exists: marker,
             v3_index_exists: false,
             v3_payload_blocks_dir_exists: false,
@@ -283,36 +264,28 @@ mod tests {
     fn destroy_generation_state_labels_cover_layouts() {
         assert_eq!(describe_cache_generation_state(None), "unknown");
         assert_eq!(
-            describe_cache_generation_state(Some(&detection(false, false))),
+            describe_cache_generation_state(Some(&detection(false))),
             "empty/undetected"
         );
         assert_eq!(
-            describe_cache_generation_state(Some(&detection(true, false))),
-            "legacy raw only"
-        );
-        assert_eq!(
-            describe_cache_generation_state(Some(&detection(false, true))),
+            describe_cache_generation_state(Some(&detection(true))),
             "cache-v3 only"
-        );
-        assert_eq!(
-            describe_cache_generation_state(Some(&detection(true, true))),
-            "dual-layout (legacy + cache-v3)"
         );
     }
 
     #[test]
     fn destroy_cleanup_scope_is_generation_aware() {
         assert_eq!(
-            describe_destroy_cache_scope(Some(&detection(true, true))),
-            "if default cache path is in use, metadata cleanup removes both legacy blocks.raw and cache-v3 subtree under that default root"
+            describe_destroy_cache_scope(Some(&detection(true))),
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its cache-v3 subtree"
         );
         assert_eq!(
-            describe_destroy_cache_scope(Some(&detection(true, false))),
-            "if default cache path is in use, metadata cleanup removes legacy blocks.raw under that default root"
+            describe_destroy_cache_scope(Some(&detection(false))),
+            "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         );
         assert_eq!(
-            describe_destroy_cache_scope(Some(&detection(false, true))),
-            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
+            describe_destroy_cache_scope(None),
+            "local cleanup removes the entire metadata directory (`meta_dir`); default cache generation could not be inspected"
         );
     }
 }

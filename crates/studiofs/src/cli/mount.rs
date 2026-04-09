@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
-use studiofs_cache::v3::{CacheV3Layout, detect_cache_backends};
+use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
@@ -178,14 +178,6 @@ fn ensure_cache3_layout(cache_root: &Path) -> anyhow::Result<()> {
 }
 
 fn prepare_cache3_runtime(cache_root: &Path) -> anyhow::Result<()> {
-    let detection = detect_cache_backends(cache_root)?;
-    if detection.has_legacy_raw_backend() {
-        anyhow::bail!(
-            "legacy raw cache data is not supported for mounts at '{}'. Found '{}'. Remove or archive that file before mounting with Cache 3.0.",
-            cache_root.display(),
-            detection.legacy_raw_data_path.display(),
-        );
-    }
     ensure_cache3_layout(cache_root)
 }
 
@@ -857,17 +849,6 @@ mod tests {
         assert!(layout.tmp_dir.exists());
         assert!(layout.payload_blocks_dir.exists());
         assert!(layout.index_dir.exists());
-    }
-
-    #[test]
-    fn prepare_cache3_runtime_rejects_legacy_raw_state() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("blocks.raw"), b"legacy").expect("write legacy raw");
-
-        let error = prepare_cache3_runtime(temp.path()).expect_err("legacy raw must fail");
-        let rendered = error.to_string();
-        assert!(rendered.contains("legacy raw cache data is not supported"));
-        assert!(rendered.contains("blocks.raw"));
     }
 
     #[test]

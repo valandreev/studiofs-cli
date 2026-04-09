@@ -238,11 +238,11 @@ test: add destroy tests fixes
 2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
 3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
 
-### Cache v2 Note
+### Cache Note
 
-- The legacy `L2DiskCache` stack has been retired.
-- `RawBlockFileBackend` is the active local block backend implementation.
-- `BlockCache` is now a compatibility shim (upload queue + lightweight hot payload staging).
+- Legacy cache-v2 storage code has been removed from the workspace.
+- Cache 3.0 (`v3`) is the only local backend implementation.
+- `BlockCache` remains a compatibility shim (upload queue + lightweight hot payload staging).
 
 ### Environment Variables
 

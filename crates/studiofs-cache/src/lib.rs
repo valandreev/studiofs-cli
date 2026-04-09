@@ -46,14 +46,6 @@ pub enum OpenLocalBlockBackendError {
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "legacy raw cache data is not supported at '{cache_root}' because '{legacy_raw_path}' is present; \
-         remove or migrate the legacy cache root before mounting with Cache 3.0"
-    )]
-    UnsupportedLegacyCacheRoot {
-        cache_root: String,
-        legacy_raw_path: String,
-    },
     #[error("failed to open cache-v3 backend at '{cache_root}': {source}")]
     OpenCacheV3Backend {
         cache_root: String,
@@ -100,19 +92,6 @@ fn open_cache_v3_backend_with_budget(
     }
 
     unreachable!("retry loop must return or error before exhausting attempts")
-}
-
-fn reject_legacy_raw_cache_root(
-    cache_root_display: &str,
-    detection: &v3::CacheBackendDetection,
-) -> Result<(), OpenLocalBlockBackendError> {
-    if detection.has_legacy_raw_backend() {
-        return Err(OpenLocalBlockBackendError::UnsupportedLegacyCacheRoot {
-            cache_root: cache_root_display.to_owned(),
-            legacy_raw_path: detection.legacy_raw_data_path.display().to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn provision_cache_v3_layout(layout: &v3::CacheV3Layout) -> std::io::Result<()> {
@@ -168,7 +147,6 @@ fn open_local_block_backend_with_budget_impl(
             source,
         }
     })?;
-    reject_legacy_raw_cache_root(&cache_root_display, &detection)?;
     if cache_v3_layout_needs_provisioning(&detection).map_err(|source| {
         OpenLocalBlockBackendError::DetectCacheBackend {
             cache_root: cache_root_display.clone(),
@@ -223,29 +201,5 @@ mod tests {
             .expect("open cache-v3 backend");
 
         assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
-    }
-
-    #[test]
-    fn legacy_raw_cache_root_is_rejected() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let cache_root = temp.path();
-        std::fs::write(cache_root.join("blocks.raw"), b"legacy").expect("write legacy raw");
-
-        let error =
-            match open_local_block_backend(cache_root, "00000000-0000-0000-0000-000000000001") {
-                Ok(_) => panic!("legacy raw cache roots must be rejected"),
-                Err(error) => error,
-            };
-
-        match error {
-            OpenLocalBlockBackendError::UnsupportedLegacyCacheRoot {
-                cache_root,
-                legacy_raw_path,
-            } => {
-                assert!(cache_root.contains(temp.path().to_string_lossy().as_ref()));
-                assert!(legacy_raw_path.ends_with("blocks.raw"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
     }
 }

@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_cache::v2::{LocalBlockBackend, RawBlockFileBackend, RawBlockFileBackendConfig};
+use studiofs_cache::open_local_block_backend;
 use studiofs_cache::v3::{CacheV3Layout, CacheV3LocalBlockBackend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
@@ -2100,16 +2100,11 @@ fn test_crash_recovery_replays_pending_journal() {
         rt.shutdown_background();
     }
 
-    let volume_uuid = Uuid::parse_str(&offline_info.uuid)
-        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, offline_info.uuid.as_bytes()))
-        .into_bytes();
-    let pending_count = RawBlockFileBackend::open(RawBlockFileBackendConfig {
-        cache_dir: cache_dir.clone(),
-        volume_uuid,
-    })
-    .unwrap()
-    .dirty_object_ids()
-    .len();
+    let pending_count = open_local_block_backend(&cache_dir, &offline_info.uuid)
+        .unwrap()
+        .backend
+        .dirty_object_ids()
+        .len();
     assert!(
         pending_count > 0,
         "expected dirty blocks after simulated crash"
@@ -2158,13 +2153,11 @@ fn test_crash_recovery_replays_pending_journal() {
 
     // Allow async cleanup to clear DIRTY flags after upload completion.
     thread::sleep(Duration::from_millis(500));
-    let pending_after = RawBlockFileBackend::open(RawBlockFileBackendConfig {
-        cache_dir: cache_dir.clone(),
-        volume_uuid,
-    })
-    .unwrap()
-    .dirty_object_ids()
-    .len();
+    let pending_after = open_local_block_backend(&cache_dir, &offline_info.uuid)
+        .unwrap()
+        .backend
+        .dirty_object_ids()
+        .len();
     assert_eq!(
         pending_after, 0,
         "dirty upload state must be cleaned up after recovery"
@@ -6011,10 +6004,6 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     create_cache_v3_layout_marker(&cache_dir);
-    assert!(
-        !cache_dir.join("blocks.raw").exists(),
-        "cache-v3 replay test must not depend on legacy raw log state"
-    );
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
     let mut format_info = make_format_info_with_endpoint(
         &format!("cache-v3-replay-{}", std::process::id()),

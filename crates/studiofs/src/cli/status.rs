@@ -2,12 +2,8 @@
 
 use crate::cli::utils::format_bytes;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-#[cfg(test)]
-use studiofs_cache::v2::{LocalBlockBackend, open_legacy_local_block_backend};
 use studiofs_cache::v3::{
     CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
 };
@@ -22,18 +18,6 @@ const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
 const INGRESS_RECORD_PUT: u8 = 1;
 const INGRESS_RECORD_INVALIDATE: u8 = 2;
 const INGRESS_RECORD_HEADER_LEN: usize = 37;
-const RAW_FILE_MAGIC: [u8; 8] = *b"STFSRAWF";
-const RAW_RECORD_MAGIC: [u8; 8] = *b"STFSRAWR";
-const RAW_FILE_VERSION: u32 = 1;
-const RAW_FILE_HEADER_LEN: u64 = 32;
-const RAW_RECORD_HEADER_LEN: u64 = 32;
-const RAW_RECORD_KIND_PUT: u8 = 1;
-const RAW_RECORD_KIND_STATE: u8 = 2;
-const RAW_RECORD_KIND_REMOVE: u8 = 3;
-const RAW_STATE_DIRTY: u8 = 1;
-const RAW_STATE_UPLOADING: u8 = 2;
-const RAW_STATE_UPLOADED: u8 = 3;
-const LEGACY_STATUS_SCAN_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
 
@@ -59,20 +43,6 @@ struct CacheUsageStats {
     usage_bytes: u64,
     dirty_bytes: u64,
     evictable_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LegacyRawLifecycle {
-    Dirty,
-    Uploading,
-    Uploaded,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LegacyRawEntry {
-    data_len: u64,
-    lifecycle: LegacyRawLifecycle,
-    evictable: bool,
 }
 
 fn local_cache_path(meta_dir: &Path, cache_dir: Option<&Path>, volume_uuid: &str) -> PathBuf {
@@ -151,15 +121,6 @@ fn map_status_open_local_backend_error(
     )
 }
 
-fn decode_legacy_raw_lifecycle(state: u8) -> Option<LegacyRawLifecycle> {
-    match state {
-        RAW_STATE_DIRTY => Some(LegacyRawLifecycle::Dirty),
-        RAW_STATE_UPLOADING => Some(LegacyRawLifecycle::Uploading),
-        RAW_STATE_UPLOADED => Some(LegacyRawLifecycle::Uploaded),
-        _ => None,
-    }
-}
-
 fn scan_cache_v3_usage(
     cache_backend_detection: &CacheBackendDetection,
 ) -> anyhow::Result<CacheUsageStats> {
@@ -173,119 +134,6 @@ fn scan_cache_v3_usage(
     })
 }
 
-fn scan_legacy_raw_cache_usage(raw_data_path: &Path) -> anyhow::Result<CacheUsageStats> {
-    if !raw_data_path.exists() {
-        return Ok(CacheUsageStats::default());
-    }
-
-    let mut file = std::fs::File::open(raw_data_path)?;
-    let file_len = file.metadata()?.len();
-    if file_len < RAW_FILE_HEADER_LEN {
-        anyhow::bail!(
-            "legacy raw cache file '{}' is shorter than the header",
-            raw_data_path.display()
-        );
-    }
-
-    let mut header = [0_u8; RAW_FILE_HEADER_LEN as usize];
-    file.read_exact(&mut header)?;
-    if header[0..8] != RAW_FILE_MAGIC {
-        anyhow::bail!(
-            "legacy raw cache file '{}' has an invalid magic",
-            raw_data_path.display()
-        );
-    }
-    let version = u32::from_le_bytes(header[8..12].try_into().expect("version bytes"));
-    if version != RAW_FILE_VERSION {
-        anyhow::bail!(
-            "legacy raw cache file '{}' has unsupported version {}",
-            raw_data_path.display(),
-            version
-        );
-    }
-
-    let mut entries: HashMap<u64, LegacyRawEntry> = HashMap::new();
-    let mut cursor = RAW_FILE_HEADER_LEN;
-
-    while cursor + RAW_RECORD_HEADER_LEN <= file_len {
-        file.seek(std::io::SeekFrom::Start(cursor))?;
-        let mut record = [0_u8; RAW_RECORD_HEADER_LEN as usize];
-        if let Err(error) = file.read_exact(&mut record) {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                break;
-            }
-            return Err(error.into());
-        }
-        if record[0..8] != RAW_RECORD_MAGIC {
-            break;
-        }
-        let record_version =
-            u32::from_le_bytes(record[8..12].try_into().expect("record version bytes"));
-        if record_version != RAW_FILE_VERSION {
-            break;
-        }
-
-        let kind = record[12];
-        let state = record[13];
-        let evictable = record[14] != 0;
-        let object_id = u64::from_le_bytes(record[16..24].try_into().expect("object id bytes"));
-        let data_len = u64::from_le_bytes(record[24..32].try_into().expect("data len bytes"));
-
-        match kind {
-            RAW_RECORD_KIND_PUT => {
-                let data_end = cursor
-                    .saturating_add(RAW_RECORD_HEADER_LEN)
-                    .saturating_add(data_len);
-                if data_end > file_len {
-                    break;
-                }
-                let lifecycle =
-                    decode_legacy_raw_lifecycle(state).unwrap_or(LegacyRawLifecycle::Dirty);
-                let evictable = matches!(lifecycle, LegacyRawLifecycle::Uploaded) && evictable;
-                entries.insert(
-                    object_id,
-                    LegacyRawEntry {
-                        data_len,
-                        lifecycle,
-                        evictable,
-                    },
-                );
-                cursor = data_end;
-            }
-            RAW_RECORD_KIND_STATE => {
-                if let Some(entry) = entries.get_mut(&object_id)
-                    && let Some(lifecycle) = decode_legacy_raw_lifecycle(state)
-                {
-                    entry.lifecycle = lifecycle;
-                    entry.evictable = matches!(lifecycle, LegacyRawLifecycle::Uploaded);
-                }
-                cursor = cursor.saturating_add(RAW_RECORD_HEADER_LEN);
-            }
-            RAW_RECORD_KIND_REMOVE => {
-                entries.remove(&object_id);
-                cursor = cursor.saturating_add(RAW_RECORD_HEADER_LEN);
-            }
-            _ => break,
-        }
-    }
-
-    let mut stats = CacheUsageStats::default();
-    for entry in entries.values() {
-        stats.usage_bytes = stats.usage_bytes.saturating_add(entry.data_len);
-        if matches!(
-            entry.lifecycle,
-            LegacyRawLifecycle::Dirty | LegacyRawLifecycle::Uploading
-        ) {
-            stats.dirty_bytes = stats.dirty_bytes.saturating_add(entry.data_len);
-        }
-        if matches!(entry.lifecycle, LegacyRawLifecycle::Uploaded) && entry.evictable {
-            stats.evictable_bytes = stats.evictable_bytes.saturating_add(entry.data_len);
-        }
-    }
-
-    Ok(stats)
-}
-
 fn scan_cache_usage(
     cache_backend_detection: Option<&CacheBackendDetection>,
 ) -> anyhow::Result<Option<CacheUsageStats>> {
@@ -294,45 +142,6 @@ fn scan_cache_usage(
             scan_cache_v3_usage(detection).map(Some)
         }
         _ => Ok(None),
-    }
-}
-
-fn scan_cache_usage_by_generation(
-    cache_path: &Path,
-    cache_backend_detection: Option<&CacheBackendDetection>,
-) -> anyhow::Result<(Option<CacheUsageStats>, Option<CacheUsageStats>)> {
-    match cache_backend_detection {
-        Some(detection) => {
-            let legacy_usage = if detection.has_legacy_raw_backend() {
-                Some(scan_legacy_raw_cache_usage(
-                    &detection.legacy_raw_data_path,
-                )?)
-            } else {
-                None
-            };
-            let v3_usage = if detection.has_cache_v3_contract() && detection.v3_index_exists {
-                Some(scan_cache_v3_usage(detection)?)
-            } else {
-                None
-            };
-            Ok((legacy_usage, v3_usage))
-        }
-        None => Ok((
-            Some(scan_legacy_raw_cache_usage(&cache_path.join("blocks.raw"))?),
-            None,
-        )),
-    }
-}
-
-fn warn_large_legacy_status_scan(raw_data_path: &Path) {
-    if let Ok(metadata) = std::fs::metadata(raw_data_path)
-        && metadata.len() >= LEGACY_STATUS_SCAN_WARN_BYTES
-    {
-        eprintln!(
-            "warning: legacy cache usage scan will read '{}' ({}); this can take time",
-            raw_data_path.display(),
-            format_bytes(metadata.len())
-        );
     }
 }
 
@@ -493,29 +302,12 @@ pub fn run(
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_cache_backends_for_status(&cache_path);
-    if cache_backend_detection
-        .as_ref()
-        .is_some_and(CacheBackendDetection::has_legacy_raw_backend)
-    {
-        warn_large_legacy_status_scan(&cache_path.join("blocks.raw"));
-    }
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(
         &cache_path,
         &format_info.uuid,
         cache_backend_detection.as_ref(),
     )?;
-    let (legacy_cache_usage, cache_v3_usage) =
-        match scan_cache_usage_by_generation(&cache_path, cache_backend_detection.as_ref()) {
-            Ok(stats) => stats,
-            Err(error) => {
-                eprintln!(
-                    "warning: failed to compute cache generation usage at '{}': {error}",
-                    cache_path.display()
-                );
-                (None, None)
-            }
-        };
     let cache_usage = match scan_cache_usage(cache_backend_detection.as_ref()) {
         Ok(stats) => Some(stats),
         Err(error) => {
@@ -573,12 +365,8 @@ pub fn run(
         .and_then(CacheBackendDetection::runtime_backend)
         == Some(CacheBackendKind::CacheV3);
     let contract_state = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.has_dual_layout() {
-            "dual-layout (legacy + cache-v3)"
-        } else if detection.has_cache_v3_contract() {
+        if detection.has_cache_v3_contract() {
             "cache-v3 only"
-        } else if detection.has_legacy_raw_backend() {
-            "legacy raw only"
         } else {
             "no local cache layout detected"
         }
@@ -586,9 +374,7 @@ pub fn run(
         "unknown"
     };
     let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.has_legacy_raw_backend() {
-            "remove or archive blocks.raw before mounting with Cache 3.0"
-        } else if detection.has_cache_v3_contract() {
+        if detection.has_cache_v3_contract() {
             "none"
         } else {
             "mount will provision the Cache 3.0 layout on first use"
@@ -608,15 +394,6 @@ pub fn run(
     );
     println!("  Contract state:      {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
-        println!(
-            "  Legacy raw path:     {} ({})",
-            detection.legacy_raw_data_path.display(),
-            if detection.has_legacy_raw_backend() {
-                "present"
-            } else {
-                "absent"
-            }
-        );
         println!(
             "  Cache-v3 marker:     {} ({})",
             detection.layout.layout_marker.display(),
@@ -661,15 +438,6 @@ pub fn run(
         println!("  Usage bytes:         unknown");
         println!("  Dirty bytes:         unknown");
         println!("  Evictable bytes:     unknown");
-    }
-    if let Some(stats) = legacy_cache_usage {
-        println!("  Legacy usage bytes:  {}", format_bytes(stats.usage_bytes));
-    }
-    if let Some(stats) = cache_v3_usage {
-        println!(
-            "  Cache-v3 usage bytes: {}",
-            format_bytes(stats.usage_bytes)
-        );
     }
 
     println!("\nLocal Ingress");
@@ -834,20 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_pending_uploads_returns_zero_for_legacy_raw_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let volume_uuid = Uuid::new_v4();
-        let store = open_legacy_local_block_backend(tmp.path(), &volume_uuid.to_string()).unwrap();
-        store.put(1, b"dirty", false).unwrap();
-        store.put(2, b"clean", true).unwrap();
-
-        assert_eq!(
-            scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), None).unwrap(),
-            0
-        );
-    }
-
-    #[test]
     fn scan_pending_uploads_supports_cache_v3_selection() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(tmp.path());
@@ -861,20 +615,6 @@ mod tests {
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
             0
         );
-    }
-
-    #[test]
-    fn scan_legacy_raw_cache_usage_reports_usage_dirty_and_evictable_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let volume_uuid = Uuid::new_v4();
-        let store = open_legacy_local_block_backend(tmp.path(), &volume_uuid.to_string()).unwrap();
-        store.put(1, b"dirty", false).unwrap();
-        store.put(2, b"uploaded", true).unwrap();
-
-        let stats = scan_legacy_raw_cache_usage(&tmp.path().join("blocks.raw")).unwrap();
-        assert_eq!(stats.usage_bytes, 13);
-        assert_eq!(stats.dirty_bytes, 5);
-        assert_eq!(stats.evictable_bytes, 8);
     }
 
     #[test]

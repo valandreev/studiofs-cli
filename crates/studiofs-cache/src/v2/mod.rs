@@ -1,16 +1,10 @@
 //! Cache v2 — local block backend implementations and supporting helpers.
 
 pub mod local_block_backend;
-pub mod platform;
-pub mod raw_block_file_backend;
 
 pub use local_block_backend::{
     LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState,
 };
-pub use raw_block_file_backend::{
-    RawBlockFileBackend, RawBlockFileBackendConfig, RawBlockFileBackendError,
-};
-use std::path::Path;
 use uuid::Uuid;
 
 /// Derive a stable 16-byte local backend volume UUID from a format UUID string.
@@ -21,15 +15,4 @@ pub fn derive_local_backend_volume_uuid(volume_uuid: &str) -> [u8; 16] {
     Uuid::parse_str(volume_uuid)
         .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
         .into_bytes()
-}
-
-/// Open the legacy raw local backend using a format UUID string.
-pub fn open_legacy_local_block_backend(
-    cache_root: impl AsRef<Path>,
-    volume_uuid: &str,
-) -> Result<RawBlockFileBackend, RawBlockFileBackendError> {
-    RawBlockFileBackend::open(RawBlockFileBackendConfig {
-        cache_dir: cache_root.as_ref().to_path_buf(),
-        volume_uuid: derive_local_backend_volume_uuid(volume_uuid),
-    })
 }
