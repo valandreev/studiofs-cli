@@ -5,14 +5,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+#[cfg(test)]
 use studiofs_cache::v2::{LocalBlockBackend, open_legacy_local_block_backend};
 use studiofs_cache::v3::{
-    CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE, CACHE_V3_MIN_TARGET_RATIO,
-    CACHE_V3_STRETCH_TARGET_RATIO, CACHE_V3_VALIDATION_EVIDENCE, CacheBackendDetection,
-    CacheBackendKind, CacheIndex, CacheV3DefaultGateBlocker, cache_v3_default_gate_status,
-    detect_cache_backends,
+    CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_meta::counters;
@@ -105,14 +102,6 @@ fn detect_cache_backends_for_status(cache_path: &Path) -> Option<CacheBackendDet
     detect_cache_backends_with_fallback(cache_path, detect_cache_backends)
 }
 
-fn format_ratio(value: f64) -> String {
-    format!("{value:.2}x")
-}
-
-fn format_optional_ratio(value: Option<f64>) -> String {
-    value.map(format_ratio).unwrap_or_else(|| "n/a".to_string())
-}
-
 fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
 }
@@ -150,20 +139,6 @@ fn read_write_path_observability(
             None
         }
     }
-}
-
-fn format_validation_blockers(blockers: &[&str]) -> String {
-    if blockers.is_empty() {
-        "none".to_string()
-    } else {
-        blockers.join("; ")
-    }
-}
-
-fn describe_gate_blocker(blocker: Option<CacheV3DefaultGateBlocker>) -> &'static str {
-    blocker
-        .map(CacheV3DefaultGateBlocker::as_str)
-        .unwrap_or("none")
 }
 
 fn map_status_open_local_backend_error(
@@ -312,23 +287,13 @@ fn scan_legacy_raw_cache_usage(raw_data_path: &Path) -> anyhow::Result<CacheUsag
 }
 
 fn scan_cache_usage(
-    cache_path: &Path,
     cache_backend_detection: Option<&CacheBackendDetection>,
-) -> anyhow::Result<CacheUsageStats> {
-    let selected_backend = cache_backend_detection
-        .map(CacheBackendDetection::selected_mount_backend)
-        .unwrap_or(CacheBackendKind::LegacyRawV2);
-
-    match selected_backend {
-        CacheBackendKind::LegacyRawV2 => {
-            scan_legacy_raw_cache_usage(&cache_path.join("blocks.raw"))
+) -> anyhow::Result<Option<CacheUsageStats>> {
+    match cache_backend_detection {
+        Some(detection) if detection.runtime_backend() == Some(CacheBackendKind::CacheV3) => {
+            scan_cache_v3_usage(detection).map(Some)
         }
-        CacheBackendKind::CacheV3 => {
-            let detection = cache_backend_detection.ok_or_else(|| {
-                anyhow::anyhow!("cache-v3 backend selected but backend detection is unavailable")
-            })?;
-            scan_cache_v3_usage(detection)
-        }
+        _ => Ok(None),
     }
 }
 
@@ -491,25 +456,16 @@ fn scan_pending_uploads(
     volume_uuid: &str,
     cache_backend_detection: Option<&CacheBackendDetection>,
 ) -> anyhow::Result<usize> {
-    let data_path = cache_dir.join("blocks.raw");
-    let selected_backend = cache_backend_detection
-        .map(CacheBackendDetection::selected_mount_backend)
-        .unwrap_or(CacheBackendKind::LegacyRawV2);
-
-    if matches!(selected_backend, CacheBackendKind::LegacyRawV2) && !data_path.exists() {
+    let Some(detection) = cache_backend_detection else {
         return Ok(0);
     };
+    if detection.runtime_backend() != Some(CacheBackendKind::CacheV3) {
+        return Ok(0);
+    }
 
-    let store: Arc<dyn LocalBlockBackend> = match cache_backend_detection {
-        Some(_) => {
-            open_local_block_backend(cache_dir, volume_uuid)
-                .map_err(|source| map_status_open_local_backend_error(cache_dir, source))?
-                .backend
-        }
-        None => Arc::new(
-            open_legacy_local_block_backend(cache_dir, volume_uuid).map_err(anyhow::Error::from)?,
-        ),
-    };
+    let store = open_local_block_backend(cache_dir, volume_uuid)
+        .map_err(|source| map_status_open_local_backend_error(cache_dir, source))?
+        .backend;
     Ok(store.dirty_object_ids().len())
 }
 
@@ -537,12 +493,10 @@ pub fn run(
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_cache_backends_for_status(&cache_path);
-    let selected_mount_backend = cache_backend_detection
+    if cache_backend_detection
         .as_ref()
-        .map(CacheBackendDetection::selected_mount_backend)
-        .unwrap_or(CacheBackendKind::LegacyRawV2);
-    let default_gate = cache_v3_default_gate_status();
-    if matches!(selected_mount_backend, CacheBackendKind::LegacyRawV2) {
+        .is_some_and(CacheBackendDetection::has_legacy_raw_backend)
+    {
         warn_large_legacy_status_scan(&cache_path.join("blocks.raw"));
     }
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
@@ -562,7 +516,7 @@ pub fn run(
                 (None, None)
             }
         };
-    let cache_usage = match scan_cache_usage(&cache_path, cache_backend_detection.as_ref()) {
+    let cache_usage = match scan_cache_usage(cache_backend_detection.as_ref()) {
         Ok(stats) => Some(stats),
         Err(error) => {
             eprintln!(
@@ -614,12 +568,10 @@ pub fn run(
     println!("\nLocal Cache");
     println!("───────────");
     println!("  Root:                {}", cache_path.display());
-    let selected_backend = cache_backend_detection
+    let runtime_ready = cache_backend_detection
         .as_ref()
-        .map(CacheBackendDetection::selected_mount_backend);
-    let backend_version = selected_backend
-        .map(|backend| backend.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .and_then(CacheBackendDetection::runtime_backend)
+        == Some(CacheBackendKind::CacheV3);
     let contract_state = if let Some(detection) = cache_backend_detection.as_ref() {
         if detection.has_dual_layout() {
             "dual-layout (legacy + cache-v3)"
@@ -633,16 +585,27 @@ pub fn run(
     } else {
         "unknown"
     };
-    let migration_needed = cache_backend_detection
-        .as_ref()
-        .map(CacheBackendDetection::selected_mount_backend)
-        .map(|backend| backend == CacheBackendKind::LegacyRawV2);
+    let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
+        if detection.has_legacy_raw_backend() {
+            "remove or archive blocks.raw before mounting with Cache 3.0"
+        } else if detection.has_cache_v3_contract() {
+            "none"
+        } else {
+            "mount will provision the Cache 3.0 layout on first use"
+        }
+    } else {
+        "inspect the cache root manually"
+    };
     let reconcile_needed = pending_uploads > 0
         || spill_stats.records > 0
         || cache_usage
-            .map(|stats| stats.dirty_bytes > 0)
+            .and_then(|stats| stats.map(|stats| stats.dirty_bytes > 0))
             .unwrap_or(false);
-    println!("  Backend version:     {}", backend_version);
+    println!("  Backend version:     {}", CacheBackendKind::CacheV3);
+    println!(
+        "  Runtime readiness:   {}",
+        if runtime_ready { "ready" } else { "blocked" }
+    );
     println!("  Contract state:      {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
@@ -682,31 +645,12 @@ pub fn run(
             }
         );
     }
-    println!(
-        "  Migration needed:    {}",
-        match migration_needed {
-            Some(true) => "yes",
-            Some(false) => "no",
-            None => "unknown",
-        }
-    );
+    println!("  Remediation:         {}", remediation);
     println!(
         "  Reconcile needed:    {}",
         if reconcile_needed { "yes" } else { "no" }
     );
-    if let Some(detection) = cache_backend_detection.as_ref() {
-        let rollout_behavior = if detection.has_dual_layout() {
-            "dual layout keeps legacy-raw-v2 selected; cache-v3 data can coexist safely until cutover"
-        } else if detection.has_cache_v3_contract() {
-            "cache-v3 only layout selects cache-v3 backend; rollback path is to keep v3 and remount with legacy contract elsewhere"
-        } else if detection.has_legacy_raw_backend() {
-            "legacy-only layout; enabling cache-v3 is additive and does not mutate blocks.raw"
-        } else {
-            "no cache files detected yet"
-        };
-        println!("  Rollout behavior:    {}", rollout_behavior);
-    }
-    if let Some(stats) = cache_usage {
+    if let Some(stats) = cache_usage.flatten() {
         println!("  Usage bytes:         {}", format_bytes(stats.usage_bytes));
         println!("  Dirty bytes:         {}", format_bytes(stats.dirty_bytes));
         println!(
@@ -727,91 +671,6 @@ pub fn run(
             format_bytes(stats.usage_bytes)
         );
     }
-    println!(
-        "  Cache v3 default:    {}",
-        if default_gate.ready {
-            "enabled"
-        } else {
-            "blocked"
-        }
-    );
-    let final_validation_issue = CACHE_V3_FINAL_VALIDATION_ISSUE.unwrap_or("UNASSIGNED");
-    println!("  Final validation:    {}", final_validation_issue);
-    println!(
-        "  Gate status:         {}",
-        if default_gate.ready {
-            "passed"
-        } else {
-            "blocked"
-        }
-    );
-    println!(
-        "  Gate blocker:        {}",
-        describe_gate_blocker(default_gate.blocker)
-    );
-    println!(
-        "  Validation target:   min {} / stretch {}",
-        format_ratio(CACHE_V3_MIN_TARGET_RATIO),
-        format_ratio(CACHE_V3_STRETCH_TARGET_RATIO)
-    );
-    if let Some(evidence) = CACHE_V3_VALIDATION_EVIDENCE {
-        println!("  Evidence issue:      {}", evidence.issue);
-        println!(
-            "  Matrix complete:     {}",
-            if evidence.matrix_executed {
-                "yes"
-            } else {
-                "no"
-            }
-        );
-        println!(
-            "  Real-path baseline:  {}",
-            if evidence.compared_against_current_backend {
-                "yes"
-            } else {
-                "no"
-            }
-        );
-        println!(
-            "  NVMe read ratio:     {}",
-            format_ratio(evidence.local_nvme_read_ratio)
-        );
-        println!(
-            "  NVMe write ratio:    {}",
-            format_ratio(evidence.local_nvme_write_ratio)
-        );
-        println!(
-            "  USB NVMe available:  {}",
-            if evidence.usb_nvme_available {
-                "yes"
-            } else {
-                "no"
-            }
-        );
-        println!(
-            "  USB read ratio:      {}",
-            format_optional_ratio(evidence.usb_nvme_read_ratio)
-        );
-        println!(
-            "  USB write ratio:     {}",
-            format_optional_ratio(evidence.usb_nvme_write_ratio)
-        );
-        println!(
-            "  Stretch realistic:   {}",
-            if evidence.stretch_target_realistic {
-                "yes"
-            } else {
-                "no"
-            }
-        );
-        println!(
-            "  Validation blockers: {}",
-            format_validation_blockers(evidence.blockers)
-        );
-    } else {
-        println!("  Validation evidence: missing");
-    }
-    println!("  Guardrail:           {}", CACHE_V3_DEFAULT_GUARDRAIL);
 
     println!("\nLocal Ingress");
     println!("─────────────");
@@ -975,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_pending_uploads_uses_raw_backend_dirty_flags() {
+    fn scan_pending_uploads_returns_zero_for_legacy_raw_state() {
         let tmp = tempfile::tempdir().unwrap();
         let volume_uuid = Uuid::new_v4();
         let store = open_legacy_local_block_backend(tmp.path(), &volume_uuid.to_string()).unwrap();
@@ -984,7 +843,7 @@ mod tests {
 
         assert_eq!(
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), None).unwrap(),
-            1
+            0
         );
     }
 
@@ -997,10 +856,7 @@ mod tests {
         let volume_uuid = Uuid::new_v4();
 
         let detection = detect_cache_backends_for_status(tmp.path()).unwrap();
-        assert_eq!(
-            detection.selected_mount_backend(),
-            CacheBackendKind::CacheV3
-        );
+        assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
         assert_eq!(
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
             0
@@ -1038,30 +894,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let detection = detect_cache_backends_for_status(tmp.path());
         assert!(detection.is_some());
-    }
-
-    #[test]
-    fn format_optional_ratio_handles_missing_values() {
-        assert_eq!(format_optional_ratio(None), "n/a");
-        assert_eq!(format_optional_ratio(Some(3.125)), "3.12x");
-    }
-
-    #[test]
-    fn format_validation_blockers_joins_items() {
-        assert_eq!(format_validation_blockers(&[]), "none");
-        assert_eq!(
-            format_validation_blockers(&["missing usb evidence", "p95 regression"]),
-            "missing usb evidence; p95 regression"
-        );
-    }
-
-    #[test]
-    fn describe_gate_blocker_defaults_to_none() {
-        assert_eq!(describe_gate_blocker(None), "none");
-        assert_eq!(
-            describe_gate_blocker(Some(CacheV3DefaultGateBlocker::MatrixIncomplete)),
-            "comparison matrix is not marked complete"
-        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 ## Purpose
 
 Define the Cache 3.0 disk layout, backend-detection rules, startup safety
-reconciliation, and migration guardrails.
+reconciliation, and operator remediation for legacy local cache state.
 
 This document is the source of truth for rollout behavior and operator-facing
 safety expectations.
@@ -35,8 +35,10 @@ Notes:
 - `v3/index/cache.redb` is the fixed redb index location.
 - payload blocks are sharded into two levels (`00/00`..`ff/ff`) using a stable
   hash of `object_id`, which avoids hot spots for sequential ids.
-- `blocks.raw` is not converted in place in this phase.
-- Legacy and v3 data are allowed to coexist in the same cache root.
+- `blocks.raw` is not converted in place.
+- A cache root may still contain legacy `blocks.raw`, but mounted runtime no
+  longer opens that state. Legacy presence is treated as an operator-remediation
+  condition, not a supported fallback path.
 
 ## 2. Mount/Status Detection Contract
 
@@ -44,10 +46,10 @@ Detection is read-only and must not mutate cache state.
 
 - Legacy raw backend detected when `<cache-root>/blocks.raw` exists.
 - Cache 3.0 detected when `<cache-root>/v3/LAYOUT_V1` exists.
-- Dual layout is valid when both exist.
-- During rollout, dual layout still selects legacy raw as the mount contract.
-- A v3-only root is treated as Cache 3.0 contract state, but mount remains
-  blocked until the backend implementation and final validation gates complete.
+- If `blocks.raw` exists, mounted runtime is blocked and must fail fast with
+  explicit remediation.
+- If no local contract exists yet, the Cache 3.0 bootstrap path provisions the
+  `v3/` subtree before opening the backend.
 
 ## 3. Acceptance Matrix (Real Mount Path Only)
 
@@ -64,42 +66,15 @@ same workload. Internal direct-shim benchmarks are not acceptance gates.
 | Disk footprint stability | Same object set over repeated runs | No unbounded growth; steady-state usage must be explainable and within configured limits |
 | Status/inspection safety | `studiofs status` against legacy, v3-only, and dual-layout roots | No mutations, no destructive side effects, consistent detection output |
 
-Throughput cutover targets:
-- Minimum gate: Cache 3.0 must meet at least **3.0x** throughput ratio for both
-  reads and writes versus the current real cache path.
-- Stretch target: Track whether **4.0x** is realistic on measured workloads, but
-  do not require it to pass the default-cutover gate.
-- When USB-attached NVMe is available, run the same comparison on that medium
-  and include those ratios in the validation record.
+Performance follow-up work should continue to compare Cache 3.0 against the
+previous legacy backend on representative mounted workloads.
 
-### 3.1 Required Validation Record Before Default Cutover
+### 3.1 Real-Path Comparison Command Pattern
 
-Default cutover is controlled by code-level gate evaluation:
-- `CACHE_V3_DEFAULT_ALLOWED` must be `true`.
-- `CACHE_V3_FINAL_VALIDATION_ISSUE` must match the validation evidence issue id.
-- `CACHE_V3_VALIDATION_EVIDENCE` must be populated and pass:
-  - matrix executed;
-  - compared against current real cache path;
-  - local NVMe read/write ratios >= `CACHE_V3_MIN_TARGET_RATIO` (`3.0x`);
-  - USB NVMe ratios present and >= `3.0x` when USB NVMe was available;
-  - no open blockers.
-
-If any gate check fails, dual-layout mounts remain on legacy raw backend.
-
-### 3.2 Real-Path Comparison Command Pattern
-
-Run these on the same machine and same workload inputs for each backend:
+Run these on the same machine and same workload inputs:
 
 ```powershell
-# Legacy baseline (mounted path inside active StudioFS mount)
-studiofs test-cache <mounted-workload-path> `
-  --access-pattern mixed `
-  --concurrency 4 `
-  --io-depth 64 `
-  --warmup-runs 1 `
-  --json-output .\reports\legacy-e2e.json
-
-# Cache 3.0 candidate on the same mounted path/workload profile
+# Cache 3.0 mounted path/workload profile
 studiofs test-cache <mounted-workload-path> `
   --access-pattern mixed `
   --concurrency 4 `
@@ -108,37 +83,17 @@ studiofs test-cache <mounted-workload-path> `
   --json-output .\reports\cache-v3-e2e.json
 ```
 
-Record read/write throughput ratios (candidate/baseline) for:
-- local NVMe;
-- USB-attached NVMe (when available).
+Keep comparison data against legacy-baseline runs in external reports or issue
+attachments; the runtime no longer uses code-level cutover gates.
 
-If the 3.0x target is missed, keep `CACHE_V3_DEFAULT_ALLOWED=false` and list
-exact bottlenecks in `CACHE_V3_VALIDATION_EVIDENCE.blockers` before retrying.
+## 4. Runtime Rules
 
-## 4. Rollout, Rollback, and Default Rules
-
-### Rollout stages
-
-1. Contract-only phase (this issue): layout + detection + guardrails.
-2. Opt-in implementation phase: Cache 3.0 mount/bootstrap behind explicit
-   non-default activation, with startup reconciliation enabled.
-3. Validation phase: run full acceptance matrix on production-representative
-   hardware and workloads.
-4. Default-switch phase: allowed only after final validation issue is closed.
-
-### Rollback rules
-
-- Rollback is always mount-level selection, not in-place conversion.
-- No migration of `blocks.raw` contents is required to roll back.
-- If Cache 3.0 rollback is needed, keep `v3/` data intact for investigation and
-  remount with legacy raw contract.
-
-### Default backend guardrail
-
-- Cache 3.0 is explicitly non-default until the final validation issue passes.
-- The code gate in `studiofs-cache/src/v3/mod.rs` (`CACHE_V3_DEFAULT_ALLOWED`)
-  must remain `false` until that issue is complete.
-- The default flip and issue closure evidence must land together in one change.
+- Cache 3.0 is the only mounted local backend.
+- Cache roots containing `blocks.raw` are never opened silently.
+- Cache roots with no existing local contract bootstrap the `v3/` subtree on
+  first open.
+- Status may inspect legacy `blocks.raw` for operator context, but runtime
+  open/mount paths do not use it as a backend.
 
 ## 5. Startup Reconciliation and Repair Behavior
 
@@ -161,18 +116,19 @@ Safety rules:
 - Any unrecoverable reconciliation failure aborts Cache 3.0 backend startup
   rather than proceeding with ambiguous state.
 
-## 6. Migration and Fallback Flow (Existing Cache Roots)
+## 6. Legacy Remediation Flow
 
-When enabling Cache 3.0 on a cache root that already has legacy `blocks.raw`:
+When a cache root still contains legacy `blocks.raw`:
 
-1. Keep legacy data in place; do **not** convert or rewrite `blocks.raw`.
-2. Provision `v3/` side-by-side (`LAYOUT_V1`, `payload/`, `index/`, `tmp/`).
-3. During dual-layout coexistence, mount contract remains **legacy raw**.
-4. Cache 3.0 can be validated safely without destructive conversion.
-5. Cutover to Cache 3.0 uses a v3-only cache root contract decision.
+1. Do **not** expect StudioFS mount/runtime to open that cache root.
+2. Inspect the root with `studiofs status` to confirm whether `blocks.raw`,
+   `v3/`, or both are present.
+3. Remove or archive `blocks.raw` when the old local cache state is no longer
+   needed.
+4. Re-run mount; the Cache 3.0 bootstrap path will provision or reuse the
+   `v3/` subtree.
 
-Fallback path:
-- Roll back by selecting legacy mount contract; no in-place conversion rollback
+There is no runtime fallback that re-selects the legacy raw backend.
   is required.
 - Keep `v3/` data intact for investigation and future retries.
 

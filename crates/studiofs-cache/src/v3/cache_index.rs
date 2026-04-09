@@ -60,6 +60,17 @@ pub enum CacheIndexError {
     UnsupportedFormat { expected: u64, found: u64 },
 }
 
+impl CacheIndexError {
+    pub fn is_database_lock_conflict(&self) -> bool {
+        match self {
+            Self::Storage(message) => {
+                message.contains("Database already open") || message.contains("Cannot acquire lock")
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheIndexStats {
     pub current_bytes: u64,
@@ -1170,6 +1181,16 @@ mod tests {
 
     fn open_index(path: &Path) -> CacheIndex {
         CacheIndex::open(path).expect("open cache index")
+    }
+
+    #[test]
+    fn storage_error_detects_redb_lock_conflict_messages() {
+        let error =
+            CacheIndexError::Storage("Database already open. Cannot acquire lock.".to_string());
+        assert!(error.is_database_lock_conflict());
+
+        let other = CacheIndexError::Storage("some other storage error".to_string());
+        assert!(!other.is_database_lock_conflict());
     }
 
     fn upsert_dirty(index: &CacheIndex, object_id: u64, payload_len: u64) {

@@ -1,9 +1,7 @@
-//! Cache 3.0 contract and rollout guardrails.
+//! Cache 3.0 contract and local backend.
 //!
 //! This module defines:
-//! - the non-mutating detection contract for legacy vs v3 cache layouts;
-//! - rollout guardrails that block making Cache 3.0 the default backend
-//!   until final validation is complete.
+//! - the non-mutating detection contract for legacy raw state vs Cache 3.0;
 //! - the active Cache 3.0 local block backend backed by a file-per-block
 //!   payload store plus redb lifecycle index.
 
@@ -51,169 +49,15 @@ const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
 const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Final validation issue that must pass before Cache 3.0 is allowed as default.
-///
-/// This must be set before flipping `CACHE_V3_DEFAULT_ALLOWED` to `true`.
-pub const CACHE_V3_FINAL_VALIDATION_ISSUE: Option<&str> = None;
-/// Explicit rollout gate. Remains false until final validation passes.
-pub const CACHE_V3_DEFAULT_ALLOWED: bool = false;
-/// Minimum throughput target versus the current real cache path.
-pub const CACHE_V3_MIN_TARGET_RATIO: f64 = 3.0;
-/// Stretch throughput target versus the current real cache path.
-pub const CACHE_V3_STRETCH_TARGET_RATIO: f64 = 4.0;
-/// Human-readable rollout rule surfaced by status and mount errors.
-pub const CACHE_V3_DEFAULT_GUARDRAIL: &str = "Cache 3.0 cannot become the default backend until the final validation \
-     issue closes and this gate is explicitly switched to true.";
-
-/// Recorded validation evidence for default-cutover decisions.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CacheV3ValidationEvidence {
-    /// Linear issue that tracks final validation sign-off (for example `SFS-182`).
-    pub issue: &'static str,
-    /// True when the agreed comparison matrix has been executed end-to-end.
-    pub matrix_executed: bool,
-    /// True when comparisons were run against the current real cache path.
-    pub compared_against_current_backend: bool,
-    /// Throughput ratio (Cache 3.0 / current backend) for local NVMe reads.
-    pub local_nvme_read_ratio: f64,
-    /// Throughput ratio (Cache 3.0 / current backend) for local NVMe writes.
-    pub local_nvme_write_ratio: f64,
-    /// Whether USB-attached NVMe was available and included in validation.
-    pub usb_nvme_available: bool,
-    /// Throughput ratio for USB-attached NVMe reads (if available).
-    pub usb_nvme_read_ratio: Option<f64>,
-    /// Throughput ratio for USB-attached NVMe writes (if available).
-    pub usb_nvme_write_ratio: Option<f64>,
-    /// Whether the 4x stretch target looks realistic on measured workloads.
-    pub stretch_target_realistic: bool,
-    /// Open blockers that must be resolved before default cutover.
-    pub blockers: &'static [&'static str],
-}
-
-/// Validation record for the default-cutover gate.
-///
-/// Keep this as `None` until real mounted-workload results are captured.
-pub const CACHE_V3_VALIDATION_EVIDENCE: Option<CacheV3ValidationEvidence> = None;
-
-/// Why the default-cutover gate is currently blocked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheV3DefaultGateBlocker {
-    Disabled,
-    FinalIssueUnset,
-    MissingEvidence,
-    IssueMismatch,
-    MatrixIncomplete,
-    BaselineMismatch,
-    LocalNvmeTargetMiss,
-    UsbEvidenceMissing,
-    UsbTargetMiss,
-    OpenBlockers,
-}
-
-impl CacheV3DefaultGateBlocker {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "explicit default gate flag is disabled",
-            Self::FinalIssueUnset => "final validation issue is not assigned",
-            Self::MissingEvidence => "real-workload validation evidence is missing",
-            Self::IssueMismatch => "validation evidence references a different final issue",
-            Self::MatrixIncomplete => "comparison matrix is not marked complete",
-            Self::BaselineMismatch => "results are not marked against current real cache path",
-            Self::LocalNvmeTargetMiss => "local NVMe minimum 3x target is not met",
-            Self::UsbEvidenceMissing => {
-                "USB-attached NVMe is marked available but ratios are missing"
-            }
-            Self::UsbTargetMiss => "USB-attached NVMe minimum 3x target is not met",
-            Self::OpenBlockers => "validation blockers are still open",
-        }
-    }
-}
-
-/// Evaluated status of the Cache 3.0 default-cutover gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheV3DefaultGateStatus {
-    pub ready: bool,
-    pub blocker: Option<CacheV3DefaultGateBlocker>,
-}
-
-fn gate_blocked(blocker: CacheV3DefaultGateBlocker) -> CacheV3DefaultGateStatus {
-    CacheV3DefaultGateStatus {
-        ready: false,
-        blocker: Some(blocker),
-    }
-}
-
-fn evaluate_cache_v3_default_gate(
-    default_allowed: bool,
-    final_validation_issue: Option<&str>,
-    validation_evidence: Option<CacheV3ValidationEvidence>,
-) -> CacheV3DefaultGateStatus {
-    if !default_allowed {
-        return gate_blocked(CacheV3DefaultGateBlocker::Disabled);
-    }
-
-    let Some(final_issue) = final_validation_issue.filter(|issue| !issue.trim().is_empty()) else {
-        return gate_blocked(CacheV3DefaultGateBlocker::FinalIssueUnset);
-    };
-
-    let Some(evidence) = validation_evidence else {
-        return gate_blocked(CacheV3DefaultGateBlocker::MissingEvidence);
-    };
-
-    if evidence.issue.trim().is_empty() || evidence.issue != final_issue {
-        return gate_blocked(CacheV3DefaultGateBlocker::IssueMismatch);
-    }
-    if !evidence.matrix_executed {
-        return gate_blocked(CacheV3DefaultGateBlocker::MatrixIncomplete);
-    }
-    if !evidence.compared_against_current_backend {
-        return gate_blocked(CacheV3DefaultGateBlocker::BaselineMismatch);
-    }
-    if evidence.local_nvme_read_ratio < CACHE_V3_MIN_TARGET_RATIO
-        || evidence.local_nvme_write_ratio < CACHE_V3_MIN_TARGET_RATIO
-    {
-        return gate_blocked(CacheV3DefaultGateBlocker::LocalNvmeTargetMiss);
-    }
-    if evidence.usb_nvme_available {
-        let (Some(read_ratio), Some(write_ratio)) =
-            (evidence.usb_nvme_read_ratio, evidence.usb_nvme_write_ratio)
-        else {
-            return gate_blocked(CacheV3DefaultGateBlocker::UsbEvidenceMissing);
-        };
-        if read_ratio < CACHE_V3_MIN_TARGET_RATIO || write_ratio < CACHE_V3_MIN_TARGET_RATIO {
-            return gate_blocked(CacheV3DefaultGateBlocker::UsbTargetMiss);
-        }
-    }
-    if !evidence.blockers.is_empty() {
-        return gate_blocked(CacheV3DefaultGateBlocker::OpenBlockers);
-    }
-
-    CacheV3DefaultGateStatus {
-        ready: true,
-        blocker: None,
-    }
-}
-
-/// Evaluate whether Cache 3.0 is allowed to become the default backend.
-pub fn cache_v3_default_gate_status() -> CacheV3DefaultGateStatus {
-    evaluate_cache_v3_default_gate(
-        CACHE_V3_DEFAULT_ALLOWED,
-        CACHE_V3_FINAL_VALIDATION_ISSUE,
-        CACHE_V3_VALIDATION_EVIDENCE,
-    )
-}
-
-/// Backend kind selected by the current on-disk contract.
+/// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheBackendKind {
-    LegacyRawV2,
     CacheV3,
 }
 
 impl CacheBackendKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LegacyRawV2 => "legacy-raw-v2",
             Self::CacheV3 => "cache-v3",
         }
     }
@@ -249,26 +93,11 @@ impl CacheBackendDetection {
         self.has_legacy_raw_backend() && self.has_cache_v3_contract()
     }
 
-    /// Mount backend contract selection for the current rollout phase.
-    ///
-    /// During rollout we keep legacy raw as the selected backend whenever it
-    /// exists, even if a v3 subtree is present. A v3-only root selects Cache 3.0.
-    /// Once the final validation gate is truly passed, dual-layout roots cut over
-    /// to Cache 3.0 by default.
-    pub fn selected_mount_backend(&self) -> CacheBackendKind {
-        self.selected_mount_backend_with_gate(cache_v3_default_gate_status())
-    }
-
-    fn selected_mount_backend_with_gate(
-        &self,
-        gate_status: CacheV3DefaultGateStatus,
-    ) -> CacheBackendKind {
-        if self.has_cache_v3_contract()
-            && (!self.has_legacy_raw_backend() || (self.has_dual_layout() && gate_status.ready))
-        {
-            CacheBackendKind::CacheV3
+    pub fn runtime_backend(&self) -> Option<CacheBackendKind> {
+        if self.has_legacy_raw_backend() || !self.has_cache_v3_contract() {
+            None
         } else {
-            CacheBackendKind::LegacyRawV2
+            Some(CacheBackendKind::CacheV3)
         }
     }
 }
@@ -324,6 +153,15 @@ pub enum CacheV3LocalBlockBackendError {
         #[source]
         source: CacheV3StartupReconcileError,
     },
+}
+
+impl CacheV3LocalBlockBackendError {
+    pub fn is_transient_open_lock_conflict(&self) -> bool {
+        match self {
+            Self::OpenCacheIndex { source, .. } => source.is_database_lock_conflict(),
+            _ => false,
+        }
+    }
 }
 
 /// Cache 3.0 local backend backed by file-per-block payload files and redb index.
@@ -1075,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_root_defaults_to_legacy_contract() {
+    fn empty_root_has_no_runtime_backend() {
         let temp = tempfile::tempdir().unwrap();
         let detection = detect_cache_backends(temp.path()).unwrap();
 
@@ -1083,10 +921,7 @@ mod tests {
         assert!(!detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
-        assert_eq!(
-            detection.selected_mount_backend(),
-            CacheBackendKind::LegacyRawV2
-        );
+        assert_eq!(detection.runtime_backend(), None);
     }
 
     #[test]
@@ -1100,10 +935,7 @@ mod tests {
         assert!(!detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
-        assert_eq!(
-            detection.selected_mount_backend(),
-            CacheBackendKind::LegacyRawV2
-        );
+        assert_eq!(detection.runtime_backend(), None);
     }
 
     #[test]
@@ -1117,14 +949,11 @@ mod tests {
         assert!(detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
-        assert_eq!(
-            detection.selected_mount_backend(),
-            CacheBackendKind::CacheV3
-        );
+        assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
     }
 
     #[test]
-    fn detects_dual_layout_and_prefers_legacy_contract_during_rollout() {
+    fn detects_dual_layout_as_runtime_blocked() {
         let temp = tempfile::tempdir().unwrap();
         let raw_path = temp.path().join(LEGACY_RAW_DATA_FILE_NAME);
         std::fs::write(&raw_path, b"raw").unwrap();
@@ -1135,77 +964,7 @@ mod tests {
         assert!(detection.has_dual_layout());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
-        assert_eq!(
-            detection.selected_mount_backend(),
-            CacheBackendKind::LegacyRawV2
-        );
-    }
-
-    #[test]
-    fn dual_layout_can_cut_over_when_gate_is_ready() {
-        let temp = tempfile::tempdir().unwrap();
-        let raw_path = temp.path().join(LEGACY_RAW_DATA_FILE_NAME);
-        std::fs::write(&raw_path, b"raw").unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
-        create_v3_marker(&layout);
-
-        let detection = detect_cache_backends(temp.path()).unwrap();
-        assert!(detection.has_dual_layout());
-        assert_eq!(
-            detection.selected_mount_backend_with_gate(CacheV3DefaultGateStatus {
-                ready: true,
-                blocker: None,
-            }),
-            CacheBackendKind::CacheV3
-        );
-    }
-
-    #[test]
-    fn default_gate_reports_disabled_until_explicitly_enabled() {
-        let status = cache_v3_default_gate_status();
-        assert!(!status.ready);
-        assert_eq!(status.blocker, Some(CacheV3DefaultGateBlocker::Disabled));
-    }
-
-    #[test]
-    fn default_gate_requires_real_workload_target_on_local_nvme() {
-        let evidence = CacheV3ValidationEvidence {
-            issue: "SFS-182",
-            matrix_executed: true,
-            compared_against_current_backend: true,
-            local_nvme_read_ratio: 2.8,
-            local_nvme_write_ratio: 3.2,
-            usb_nvme_available: false,
-            usb_nvme_read_ratio: None,
-            usb_nvme_write_ratio: None,
-            stretch_target_realistic: false,
-            blockers: &[],
-        };
-        let status = evaluate_cache_v3_default_gate(true, Some("SFS-182"), Some(evidence));
-        assert!(!status.ready);
-        assert_eq!(
-            status.blocker,
-            Some(CacheV3DefaultGateBlocker::LocalNvmeTargetMiss)
-        );
-    }
-
-    #[test]
-    fn default_gate_passes_when_matrix_targets_and_blockers_are_clear() {
-        let evidence = CacheV3ValidationEvidence {
-            issue: "SFS-182",
-            matrix_executed: true,
-            compared_against_current_backend: true,
-            local_nvme_read_ratio: 3.4,
-            local_nvme_write_ratio: 3.1,
-            usb_nvme_available: true,
-            usb_nvme_read_ratio: Some(3.2),
-            usb_nvme_write_ratio: Some(3.0),
-            stretch_target_realistic: false,
-            blockers: &[],
-        };
-        let status = evaluate_cache_v3_default_gate(true, Some("SFS-182"), Some(evidence));
-        assert!(status.ready);
-        assert_eq!(status.blocker, None);
+        assert_eq!(detection.runtime_backend(), None);
     }
 
     #[test]

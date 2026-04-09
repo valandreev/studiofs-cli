@@ -7,7 +7,6 @@ pub mod fsck;
 pub mod init;
 pub mod janitor;
 pub mod mount;
-pub mod mount_block_backend_types;
 #[cfg(unix)]
 pub mod mount_profile;
 #[cfg(not(unix))]

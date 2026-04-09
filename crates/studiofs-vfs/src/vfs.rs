@@ -49,15 +49,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
+use studiofs_cache::open_local_block_backend_with_budget;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::LocalBlockBackend;
-use studiofs_cache::v3::{CacheBackendKind, cache_v3_default_gate_status};
-use studiofs_cache::{
-    LocalBackendSelectionMode, OpenLocalBlockBackendError,
-    open_local_block_backend_with_budget_and_mode,
-};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -3226,6 +3223,18 @@ fn derive_cache_runtime_tuning(
     }
 }
 
+fn derive_local_backend_budget_bytes(
+    cache_size: u64,
+    block_size: u32,
+    cache_runtime_tuning: CacheRuntimeTuning,
+) -> u64 {
+    let block_size = u64::from(block_size.max(1));
+    cache_size
+        .max(block_size)
+        .max(cache_runtime_tuning.max_dirty_bytes as u64)
+        .max(cache_runtime_tuning.write_eager_flush_batch_bytes as u64)
+}
+
 fn resolve_cache_runtime_tuning_overrides(
     derived: CacheRuntimeTuning,
     config: &VfsConfig,
@@ -3892,9 +3901,11 @@ fn map_open_local_block_backend_error(
         OpenLocalBlockBackendError::DetectCacheBackend { source, .. } => {
             map_cache_backend_detection_error(cache_dir, source)
         }
-        OpenLocalBlockBackendError::OpenLegacyRawBackend { source, .. } => {
-            VfsError::Other(format!("failed to open raw block backend: {source}"))
-        }
+        OpenLocalBlockBackendError::UnsupportedLegacyCacheRoot {
+            legacy_raw_path, ..
+        } => VfsError::Other(format!(
+            "legacy raw cache data is not supported for mounts; remove or migrate '{legacy_raw_path}' before retrying"
+        )),
         OpenLocalBlockBackendError::OpenCacheV3Backend { source, .. } => {
             VfsError::Other(format!("failed to open cache-v3 backend: {source}"))
         }
@@ -4666,27 +4677,6 @@ impl StudioVfs {
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>> {
-        Self::new_with_backend_selection(
-            meta,
-            data_config,
-            cache_dir,
-            cache_size,
-            block_cache_l1_limit,
-            config,
-            LocalBackendSelectionMode::Auto,
-        )
-    }
-
-    /// Create a new VFS instance with explicit local backend selection mode.
-    pub fn new_with_backend_selection(
-        meta: Arc<dyn MetaEngine>,
-        data_config: &DataStoreConfig,
-        cache_dir: &str,
-        cache_size: u64,
-        block_cache_l1_limit: u64,
-        config: VfsConfigValidated,
-        local_backend_selection_mode: LocalBackendSelectionMode,
-    ) -> VfsResult<Arc<Self>> {
         Self::new_impl(
             meta,
             data_config,
@@ -4694,7 +4684,6 @@ impl StudioVfs {
             cache_size,
             block_cache_l1_limit,
             config,
-            local_backend_selection_mode,
         )
     }
 
@@ -4705,7 +4694,6 @@ impl StudioVfs {
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
-        local_backend_selection_mode: LocalBackendSelectionMode,
     ) -> VfsResult<Arc<Self>> {
         {
             let meta_async: Arc<dyn AsyncMetaEngine> =
@@ -4727,6 +4715,8 @@ impl StudioVfs {
                 &config,
                 config.cache_runtime_overrides(),
             );
+            let local_backend_budget_bytes =
+                derive_local_backend_budget_bytes(cache_size, block_size, cache_runtime_tuning);
             let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
             if (block_size as usize) > cloud_logical_block_capacity {
                 return Err(VfsError::Other(format!(
@@ -4824,54 +4814,20 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let opened_local_backend = open_local_block_backend_with_budget_and_mode(
+            let opened_local_backend = open_local_block_backend_with_budget(
                 Path::new(cache_dir),
                 &format_info.uuid,
-                cache_size,
-                local_backend_selection_mode,
+                local_backend_budget_bytes,
             )
             .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
             let cache_backend_detection = opened_local_backend.detection;
-            let default_gate = cache_v3_default_gate_status();
-            if cache_backend_detection.has_dual_layout() {
-                if default_gate.ready {
-                    info!(
-                        cache_root = %cache_backend_detection.layout.cache_root.display(),
-                        legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
-                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                        "cache root contains legacy raw and cache-v3 contract state; default cutover gate passed so cache-v3 is selected"
-                    );
-                } else {
-                    let gate_blocker = default_gate
-                        .blocker
-                        .map(|blocker| blocker.as_str())
-                        .unwrap_or("unknown blocker");
-                    info!(
-                        cache_root = %cache_backend_detection.layout.cache_root.display(),
-                        legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
-                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                        gate_blocker,
-                        "cache root contains legacy raw and cache-v3 contract state; mounting with legacy raw backend while default cutover gate is blocked"
-                    );
-                }
-            }
-            let selected_backend = opened_local_backend.backend_kind;
-            if matches!(selected_backend, CacheBackendKind::CacheV3) {
-                if cache_backend_detection.has_dual_layout() {
-                    info!(
-                        cache_root = %cache_backend_detection.layout.cache_root.display(),
-                        legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
-                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                        "cache-v3 selected as the dual-layout default after validation gate pass"
-                    );
-                } else {
-                    warn!(
-                        cache_root = %cache_backend_detection.layout.cache_root.display(),
-                        layout_marker = %cache_backend_detection.layout.layout_marker.display(),
-                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                        "cache-v3 contract selected; using file-per-block local backend under the v3 subtree"
-                    );
-                }
+            if cache_backend_detection.has_cache_v3_contract() {
+                info!(
+                    cache_root = %cache_backend_detection.layout.cache_root.display(),
+                    layout_marker = %cache_backend_detection.layout.layout_marker.display(),
+                    cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                    "using Cache 3.0 file-per-block local backend under the v3 subtree"
+                );
             }
             let block_store = opened_local_backend.backend;
 
@@ -5040,6 +4996,7 @@ impl StudioVfs {
             debug!(
                 writeback = true,
                 cache_size_bytes = cache_size,
+                local_backend_budget_bytes,
                 upload_delay_ms = upload_delay.as_millis() as u64,
                 requeue_base_ms = upload_requeue_base.as_millis() as u64,
                 requeue_max_ms = upload_requeue_max.as_millis() as u64,
@@ -5146,7 +5103,7 @@ impl StudioVfs {
                 fetch_scheduler: fetch_scheduler.clone(),
                 distributed_flock,
                 kernel_invalidator: RwLock::new(None),
-                write_path_backend_tag: selected_backend.as_str().to_string(),
+                write_path_backend_tag: "cache-v3".to_string(),
                 write_path_started_at: Instant::now(),
             });
 
@@ -12703,13 +12660,13 @@ mod tests {
     }
 
     #[test]
-    fn studio_vfs_new_with_force_cache3_selects_cache_v3_on_dual_layout() {
+    fn studio_vfs_new_rejects_legacy_raw_cache_root() {
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
 
-        let format_info = test_format_info("cache-v3-force");
+        let format_info = test_format_info("cache-v3-reject-legacy");
         meta.set_format_info(&format_info).expect("set format info");
         let data_config = DataStoreConfig::from(&format_info);
         let cache_dir = tmp.path().join("cache");
@@ -12720,7 +12677,7 @@ mod tests {
 
         let rt = Runtime::new().expect("runtime");
         let _guard = rt.enter();
-        let vfs = StudioVfs::new_with_backend_selection(
+        let error = match StudioVfs::new(
             meta,
             &data_config,
             cache_dir.to_str().expect("cache dir str"),
@@ -12729,16 +12686,17 @@ mod tests {
             VfsConfig::default()
                 .try_into()
                 .expect("default VFS config should validate"),
-            LocalBackendSelectionMode::ForceCacheV3,
-        )
-        .expect("create vfs");
+        ) {
+            Ok(_) => panic!("legacy raw cache roots must fail"),
+            Err(error) => error,
+        };
 
         assert!(
-            vfs.local_block_backend()
-                .as_any()
-                .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
-            "forced cache-v3 mode should select cache-v3 backend on dual layout"
+            error
+                .to_string()
+                .contains("legacy raw cache data is not supported")
         );
+        assert!(error.to_string().contains("blocks.raw"));
     }
 
     #[test]
@@ -12879,6 +12837,48 @@ mod tests {
         assert_eq!(huge.max_dirty_bytes, CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE);
         assert!(huge.max_dirty_bytes >= tiny.max_dirty_bytes);
         assert!(huge.upload_cache_io_slots >= tiny.upload_cache_io_slots);
+    }
+
+    #[test]
+    fn local_backend_budget_honors_runtime_dirty_window() {
+        let runtime_tuning = CacheRuntimeTuning {
+            max_dirty_bytes: 1024 * 1024,
+            write_eager_flush_batch_bytes: 512 * 1024,
+            max_ingress_segment_bytes: 16 * 1024 * 1024,
+            ingress_checkpoint_interval_secs: 15,
+            ingress_checkpoint_min_append_bytes: 16 * 1024 * 1024,
+            ingress_checkpoint_min_mutations: 64,
+            ingress_checkpoint_max_segment_lag: 2,
+            ingress_checkpoint_max_live_segments: 4,
+            upload_cache_io_slots: 16,
+            transit_memory_budget_bytes: 1024 * 1024,
+        };
+
+        assert_eq!(
+            derive_local_backend_budget_bytes(4096, 512 * 1024, runtime_tuning),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn local_backend_budget_never_drops_below_block_size() {
+        let runtime_tuning = CacheRuntimeTuning {
+            max_dirty_bytes: 128 * 1024,
+            write_eager_flush_batch_bytes: 128 * 1024,
+            max_ingress_segment_bytes: 16 * 1024 * 1024,
+            ingress_checkpoint_interval_secs: 15,
+            ingress_checkpoint_min_append_bytes: 16 * 1024 * 1024,
+            ingress_checkpoint_min_mutations: 64,
+            ingress_checkpoint_max_segment_lag: 2,
+            ingress_checkpoint_max_live_segments: 4,
+            upload_cache_io_slots: 16,
+            transit_memory_budget_bytes: 1024 * 1024,
+        };
+
+        assert_eq!(
+            derive_local_backend_budget_bytes(64 * 1024, 512 * 1024, runtime_tuning),
+            512 * 1024
+        );
     }
 
     #[test]

@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use studiofs_cache::LocalBackendSelectionMode;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
-use studiofs_cache::v3::CacheV3Layout;
+use studiofs_cache::v3::{CacheV3Layout, detect_cache_backends};
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
@@ -176,6 +175,18 @@ fn ensure_cache3_layout(cache_root: &Path) -> anyhow::Result<()> {
         std::fs::write(&layout.layout_marker, b"v1")?;
     }
     Ok(())
+}
+
+fn prepare_cache3_runtime(cache_root: &Path) -> anyhow::Result<()> {
+    let detection = detect_cache_backends(cache_root)?;
+    if detection.has_legacy_raw_backend() {
+        anyhow::bail!(
+            "legacy raw cache data is not supported for mounts at '{}'. Found '{}'. Remove or archive that file before mounting with Cache 3.0.",
+            cache_root.display(),
+            detection.legacy_raw_data_path.display(),
+        );
+    }
+    ensure_cache3_layout(cache_root)
 }
 
 fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
@@ -378,8 +389,6 @@ pub fn run(
     cache_dir: Option<&Path>,
     cache_size: Option<&str>,
     principal: Option<&str>,
-    block_backend: Option<super::mount_block_backend_types::MountBlockBackendMode>,
-    cache3: bool,
     foreground: bool,
     detach: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
@@ -400,16 +409,6 @@ pub fn run(
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
-    let local_backend_selection_mode = if cache3 {
-        LocalBackendSelectionMode::ForceCacheV3
-    } else if matches!(
-        block_backend,
-        Some(super::mount_block_backend_types::MountBlockBackendMode::RawFile)
-    ) {
-        LocalBackendSelectionMode::ForceLegacyRawV2
-    } else {
-        LocalBackendSelectionMode::Auto
-    };
 
     // Validate endpoint override before any mount operations (SFS-95)
     if let Some(ep) = endpoint {
@@ -629,12 +628,7 @@ pub fn run(
 
     // Cache state for this volume (local backend + cache metadata) lives in this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
-    if matches!(
-        local_backend_selection_mode,
-        LocalBackendSelectionMode::ForceCacheV3
-    ) {
-        ensure_cache3_layout(&cache_path)?;
-    }
+    prepare_cache3_runtime(&cache_path)?;
 
     let cache_path_str = cache_path
         .to_str()
@@ -666,14 +660,13 @@ pub fn run(
     let _guard = rt.enter();
 
     // Create VFS.
-    let vfs = StudioVfs::new_with_backend_selection(
+    let vfs = StudioVfs::new(
         meta.clone(),
         &data_config,
         cache_path_str,
         cache_size_bytes,
         block_cache_l1_limit,
         vfs_config,
-        local_backend_selection_mode,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
     vfs.start()
@@ -856,14 +849,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_cache3_layout_creates_contract_paths() {
+    fn prepare_cache3_runtime_creates_contract_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
-        ensure_cache3_layout(temp.path()).expect("create cache3 layout");
+        prepare_cache3_runtime(temp.path()).expect("create cache3 layout");
         let layout = CacheV3Layout::from_cache_root(temp.path());
         assert!(layout.layout_marker.exists());
         assert!(layout.tmp_dir.exists());
         assert!(layout.payload_blocks_dir.exists());
         assert!(layout.index_dir.exists());
+    }
+
+    #[test]
+    fn prepare_cache3_runtime_rejects_legacy_raw_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("blocks.raw"), b"legacy").expect("write legacy raw");
+
+        let error = prepare_cache3_runtime(temp.path()).expect_err("legacy raw must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("legacy raw cache data is not supported"));
+        assert!(rendered.contains("blocks.raw"));
     }
 
     #[test]
