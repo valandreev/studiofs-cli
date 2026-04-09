@@ -91,7 +91,7 @@ fn persist_write_path_observability_snapshot(
     }
 
     let snapshot = vfs.write_path_observability_snapshot();
-    let payload = serde_json::to_vec_pretty(&snapshot)
+    let payload = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::other(format!("serialize metrics failed: {error}")))?;
     let tmp_path = output_path.with_extension("json.tmp");
     std::fs::write(&tmp_path, payload)?;

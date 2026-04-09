@@ -233,6 +233,13 @@ pub struct VfsWritePathLatencyQuantilesMs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathLatencyQuantilesSaturated {
+    pub p50: bool,
+    pub p95: bool,
+    pub p99: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsLatencyHistogramSnapshot {
     pub bucket_upper_bounds_ns: Vec<u64>,
     pub bucket_counts: Vec<u64>,
@@ -246,6 +253,8 @@ pub struct VfsWritePathSyncDataStats {
     pub avg_ms: f64,
     pub max_ms: f64,
     pub latency_quantiles_ms: VfsWritePathLatencyQuantilesMs,
+    #[serde(default)]
+    pub latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated,
     pub latency_histogram: VfsLatencyHistogramSnapshot,
 }
 
@@ -7885,30 +7894,38 @@ impl StudioVfs {
         }
     }
 
-    fn histogram_percentile_ns(snapshot: &LatencyHistogramSnapshot, percentile: f64) -> u64 {
+    fn histogram_percentile_ns(
+        snapshot: &LatencyHistogramSnapshot,
+        percentile: f64,
+    ) -> (u64, bool) {
         if snapshot.bucket_counts.is_empty() {
-            return 0;
+            return (0, false);
         }
         let total: u64 = snapshot.bucket_counts.iter().sum();
         if total == 0 {
-            return 0;
+            return (0, false);
         }
+        let overflow_bucket_idx = snapshot.bucket_counts.len().saturating_sub(1);
         let clamped = percentile.clamp(0.0, 1.0);
         let target = ((total as f64) * clamped).ceil() as u64;
         let mut cumulative = 0u64;
         for (idx, count) in snapshot.bucket_counts.iter().copied().enumerate() {
             cumulative = cumulative.saturating_add(count);
             if cumulative >= target.max(1) {
-                return snapshot
+                let value_ns = snapshot
                     .bucket_upper_bounds_ns
                     .get(idx)
                     .copied()
                     .unwrap_or_else(|| {
                         snapshot.bucket_upper_bounds_ns.last().copied().unwrap_or(0)
                     });
+                return (value_ns, idx == overflow_bucket_idx);
             }
         }
-        snapshot.bucket_upper_bounds_ns.last().copied().unwrap_or(0)
+        (
+            snapshot.bucket_upper_bounds_ns.last().copied().unwrap_or(0),
+            snapshot.bucket_counts[overflow_bucket_idx] > 0,
+        )
     }
 
     pub fn note_winfsp_write_callback(&self) {
@@ -7960,9 +7977,9 @@ impl StudioVfs {
             .block_store_sync_data_histogram
             .snapshot();
 
-        let p50_ns = Self::histogram_percentile_ns(&sync_histogram, 0.50);
-        let p95_ns = Self::histogram_percentile_ns(&sync_histogram, 0.95);
-        let p99_ns = Self::histogram_percentile_ns(&sync_histogram, 0.99);
+        let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.50);
+        let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.95);
+        let (p99_ns, p99_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.99);
 
         VfsWritePathObservabilitySnapshot {
             generated_unix_ms: Self::now_unix_millis(),
@@ -7984,6 +8001,11 @@ impl StudioVfs {
                     p50: p50_ns as f64 / 1_000_000.0,
                     p95: p95_ns as f64 / 1_000_000.0,
                     p99: p99_ns as f64 / 1_000_000.0,
+                },
+                latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated {
+                    p50: p50_saturated,
+                    p95: p95_saturated,
+                    p99: p99_saturated,
                 },
                 latency_histogram: VfsLatencyHistogramSnapshot {
                     bucket_upper_bounds_ns: sync_histogram.bucket_upper_bounds_ns.clone(),
@@ -14049,5 +14071,27 @@ mod tests {
         assert!(ingress_checkpoint_due_with_policy(
             1024, 1, 4096, 8, 0, 2, 4, 4, false
         ));
+    }
+
+    #[test]
+    fn histogram_percentile_marks_overflow_bucket_as_saturated() {
+        let snapshot = studiofs_cache::metrics::LatencyHistogramSnapshot {
+            bucket_upper_bounds_ns: vec![1_000_000, 2_000_000],
+            bucket_counts: vec![1, 1, 3],
+        };
+        let (value_ns, saturated) = StudioVfs::histogram_percentile_ns(&snapshot, 0.99);
+        assert_eq!(value_ns, 2_000_000);
+        assert!(saturated);
+    }
+
+    #[test]
+    fn histogram_percentile_non_overflow_bucket_is_not_saturated() {
+        let snapshot = studiofs_cache::metrics::LatencyHistogramSnapshot {
+            bucket_upper_bounds_ns: vec![1_000_000, 2_000_000],
+            bucket_counts: vec![1, 2, 0],
+        };
+        let (value_ns, saturated) = StudioVfs::histogram_percentile_ns(&snapshot, 0.95);
+        assert_eq!(value_ns, 2_000_000);
+        assert!(!saturated);
     }
 }

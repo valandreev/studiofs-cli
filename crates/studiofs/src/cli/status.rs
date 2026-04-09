@@ -38,6 +38,7 @@ const RAW_STATE_UPLOADING: u8 = 2;
 const RAW_STATE_UPLOADED: u8 = 3;
 const LEGACY_STATUS_SCAN_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
+const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
 
 #[derive(Debug, Default)]
 struct SpillDirStats {
@@ -114,6 +115,14 @@ fn format_optional_ratio(value: Option<f64>) -> String {
 
 fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
+}
+
+fn format_quantile_ms(value: f64, saturated: bool) -> String {
+    if saturated {
+        format!("{}+ (saturated)", format_ms(value))
+    } else {
+        format_ms(value)
+    }
 }
 
 fn read_write_path_observability(
@@ -820,14 +829,27 @@ pub fn run(
         println!("\nMounted Write Path");
         println!("──────────────────");
         if let Some((metrics_path, snapshot)) = mounted_write_path {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            let snapshot_age_ms = now_ms.saturating_sub(snapshot.generated_unix_ms);
+
             println!("  Metrics file:              {}", metrics_path.display());
-            println!("  Snapshot age:              {}ms", {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
-                    .unwrap_or(0);
-                now_ms.saturating_sub(snapshot.generated_unix_ms)
-            });
+            println!("  Snapshot age:              {}ms", snapshot_age_ms);
+            println!(
+                "  Snapshot freshness:        {}",
+                if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
+                    "stale"
+                } else {
+                    "fresh"
+                }
+            );
+            if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
+                println!(
+                    "  Warning:                   mounted metrics are stale; publisher may be stopped"
+                );
+            }
             println!("  Backend tag:               {}", snapshot.backend_tag);
             println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
             println!(
@@ -852,9 +874,27 @@ pub fn run(
             );
             println!(
                 "  block_store_sync_data p50/p95/p99: {}/{}/{}",
-                format_ms(snapshot.block_store_sync_data.latency_quantiles_ms.p50),
-                format_ms(snapshot.block_store_sync_data.latency_quantiles_ms.p95),
-                format_ms(snapshot.block_store_sync_data.latency_quantiles_ms.p99)
+                format_quantile_ms(
+                    snapshot.block_store_sync_data.latency_quantiles_ms.p50,
+                    snapshot
+                        .block_store_sync_data
+                        .latency_quantiles_saturated
+                        .p50
+                ),
+                format_quantile_ms(
+                    snapshot.block_store_sync_data.latency_quantiles_ms.p95,
+                    snapshot
+                        .block_store_sync_data
+                        .latency_quantiles_saturated
+                        .p95
+                ),
+                format_quantile_ms(
+                    snapshot.block_store_sync_data.latency_quantiles_ms.p99,
+                    snapshot
+                        .block_store_sync_data
+                        .latency_quantiles_saturated
+                        .p99
+                )
             );
             println!(
                 "  WinFSP callbacks write/flush/cleanup->flush_fh: {}/{}/{}",
@@ -1050,5 +1090,11 @@ mod tests {
         assert_eq!(loaded.0, metrics_path);
         assert_eq!(loaded.1.backend_tag, "cache-v3");
         assert_eq!(loaded.1.flush_ordered_calls, 11);
+    }
+
+    #[test]
+    fn format_quantile_ms_marks_saturated_values() {
+        assert_eq!(format_quantile_ms(5000.0, true), "5000.000ms+ (saturated)");
+        assert_eq!(format_quantile_ms(120.5, false), "120.500ms");
     }
 }

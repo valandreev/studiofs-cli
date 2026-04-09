@@ -33,5 +33,6 @@ pub use vfs::{
     VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsResult, VfsUploadStats,
     VfsWritePathBackpressureStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathObservabilitySnapshot, VfsWritePathSyncDataStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathObservabilitySnapshot,
+    VfsWritePathSyncDataStats, VfsWritePathWinfspCallbackStats,
 };
