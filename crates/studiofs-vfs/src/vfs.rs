@@ -7186,44 +7186,83 @@ impl StudioVfs {
         persisted_bytes: u64,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
-        let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
-        let pending_before = local_sync_group.pending_bytes;
-        if pending_before == 0 && persisted_bytes > 0 {
-            local_sync_group.last_sync_at = Instant::now();
-        }
-        local_sync_group.pending_bytes = local_sync_group
-            .pending_bytes
-            .saturating_add(persisted_bytes);
+        {
+            let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+            let pending_before = local_sync_group.pending_bytes;
+            if pending_before == 0 && persisted_bytes > 0 {
+                local_sync_group.last_sync_at = Instant::now();
+            }
+            local_sync_group.pending_bytes = local_sync_group
+                .pending_bytes
+                .saturating_add(persisted_bytes);
 
-        let trigger = local_sync_trigger_for_write_path(
-            self.cache_safety_mode,
-            local_sync_policy,
-            local_sync_group.pending_bytes,
-            local_sync_group.last_sync_at.elapsed(),
-            self.local_sync_group_min_bytes,
-            self.local_sync_group_max_delay,
-        );
-        let Some(_trigger) = trigger else {
-            self.state
-                .metrics
-                .block_store_sync_data_deferred_calls
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            let trigger = local_sync_trigger_for_write_path(
+                self.cache_safety_mode,
+                local_sync_policy,
+                local_sync_group.pending_bytes,
+                local_sync_group.last_sync_at.elapsed(),
+                self.local_sync_group_min_bytes,
+                self.local_sync_group_max_delay,
+            );
+            if trigger.is_none() {
+                if local_sync_group.pending_bytes > 0 {
+                    self.state
+                        .metrics
+                        .block_store_sync_data_deferred_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+        }
+
+        let _sync_gate = self.state.write_buffer.local_sync_gate.lock().await;
+        let bytes_to_sync = {
+            let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+            let trigger = local_sync_trigger_for_write_path(
+                self.cache_safety_mode,
+                local_sync_policy,
+                local_sync_group.pending_bytes,
+                local_sync_group.last_sync_at.elapsed(),
+                self.local_sync_group_min_bytes,
+                self.local_sync_group_max_delay,
+            );
+            if trigger.is_none() {
+                if local_sync_group.pending_bytes > 0 {
+                    self.state
+                        .metrics
+                        .block_store_sync_data_deferred_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+
+            let bytes_to_sync = local_sync_group.pending_bytes;
+            if bytes_to_sync == 0 {
+                return Ok(());
+            }
+
+            local_sync_group.pending_bytes = 0;
+            bytes_to_sync
         };
 
-        let bytes_to_sync = local_sync_group.pending_bytes;
-        if bytes_to_sync == 0 {
-            return Ok(());
+        match self.block_store_sync_data_async().await {
+            Ok(()) => {
+                let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+                local_sync_group.last_sync_at = Instant::now();
+                drop(local_sync_group);
+                self.state
+                    .metrics
+                    .block_store_sync_data_synced_bytes
+                    .fetch_add(bytes_to_sync, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+                local_sync_group.pending_bytes =
+                    local_sync_group.pending_bytes.saturating_add(bytes_to_sync);
+                Err(error)
+            }
         }
-
-        self.block_store_sync_data_async().await?;
-        local_sync_group.pending_bytes = 0;
-        local_sync_group.last_sync_at = Instant::now();
-        self.state
-            .metrics
-            .block_store_sync_data_synced_bytes
-            .fetch_add(bytes_to_sync, Ordering::Relaxed);
-        Ok(())
     }
 
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {

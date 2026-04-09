@@ -59,6 +59,7 @@ pub(super) struct WriteBufferState {
     pub(super) fast_backpressure_events: AtomicU64,
     pub(super) fast_backpressure_stall_max_ms: AtomicU64,
     pub(super) local_sync_group: tokio::sync::Mutex<LocalSyncGroupState>,
+    pub(super) local_sync_gate: tokio::sync::Mutex<()>,
 }
 
 impl WriteBufferState {
@@ -78,6 +79,7 @@ impl WriteBufferState {
                 pending_bytes: 0,
                 last_sync_at: Instant::now(),
             }),
+            local_sync_gate: tokio::sync::Mutex::new(()),
         }
     }
 }
