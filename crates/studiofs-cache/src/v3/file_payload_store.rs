@@ -166,14 +166,26 @@ impl FilePayloadStore {
         })?;
         std::fs::create_dir_all(payload_dir)?;
 
-        let (mut temp_file, temp_path) = self.create_temp_file(object_id)?;
-        platform::write_all(&mut temp_file, data)?;
-        platform::sync_data(&temp_file)?;
-        drop(temp_file);
-
-        if let Err(error) = platform::rename_atomic(&temp_path, &payload_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(FilePayloadStoreError::Io(error));
+        let temp_path = self.write_temp_payload_file(&self.layout.tmp_dir, object_id, data)?;
+        match platform::rename_atomic(&temp_path, &payload_path) {
+            Ok(()) => {}
+            Err(error) if platform::is_cross_device_link_error(&error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                // Keep rename atomic even with unusual split-mount layouts by
+                // staging in the destination directory.
+                let payload_local_temp =
+                    self.write_temp_payload_file(payload_dir, object_id, data)?;
+                if let Err(rename_error) =
+                    platform::rename_atomic(&payload_local_temp, &payload_path)
+                {
+                    let _ = std::fs::remove_file(&payload_local_temp);
+                    return Err(FilePayloadStoreError::Io(rename_error));
+                }
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(FilePayloadStoreError::Io(error));
+            }
         }
         self.invalidate_cached_read_handle(object_id);
         platform::sync_directory(&self.layout.tmp_dir)?;
@@ -218,15 +230,28 @@ impl FilePayloadStore {
         Ok(())
     }
 
-    fn create_temp_file(&self, object_id: u64) -> Result<(File, PathBuf), FilePayloadStoreError> {
-        std::fs::create_dir_all(&self.layout.tmp_dir)?;
+    fn write_temp_payload_file(
+        &self,
+        temp_dir: &Path,
+        object_id: u64,
+        data: &[u8],
+    ) -> Result<PathBuf, FilePayloadStoreError> {
+        let (mut temp_file, temp_path) = self.create_temp_file(temp_dir, object_id)?;
+        platform::write_all(&mut temp_file, data)?;
+        platform::sync_data(&temp_file)?;
+        drop(temp_file);
+        Ok(temp_path)
+    }
+
+    fn create_temp_file(
+        &self,
+        temp_dir: &Path,
+        object_id: u64,
+    ) -> Result<(File, PathBuf), FilePayloadStoreError> {
         let hex = format!("{object_id:016x}");
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
-            let candidate = self.layout.tmp_dir.join(format!(
-                "{hex}-{}{}",
-                next_temp_token(),
-                TEMP_FILE_SUFFIX
-            ));
+            let candidate =
+                temp_dir.join(format!("{hex}-{}{}", next_temp_token(), TEMP_FILE_SUFFIX));
             match OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -241,7 +266,7 @@ impl FilePayloadStore {
 
         Err(FilePayloadStoreError::TempFileCreateExhausted {
             object_id,
-            dir: self.layout.tmp_dir.clone(),
+            dir: temp_dir.to_path_buf(),
         })
     }
 
@@ -382,7 +407,7 @@ mod tests {
         store.put(9001, b"committed").unwrap();
 
         // Simulate a crash after temp-file fsync but before atomic rename.
-        let (mut temp_file, temp_path) = store.create_temp_file(9001).unwrap();
+        let (mut temp_file, temp_path) = store.create_temp_file(&layout.tmp_dir, 9001).unwrap();
         platform::write_all(&mut temp_file, b"staged-new-value").unwrap();
         platform::sync_data(&temp_file).unwrap();
         drop(temp_file);

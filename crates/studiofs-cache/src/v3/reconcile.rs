@@ -3,9 +3,8 @@
 //! Startup reconciliation is intentionally scoped to the Cache 3.0 subtree.
 //! It never touches legacy `blocks.raw` data under the cache root.
 
-use std::collections::HashSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{CacheIndex, CacheIndexError, CacheV3Layout, FilePayloadStore};
 
@@ -83,13 +82,15 @@ pub fn reconcile_startup_state(
             prune_missing_payload_for_all_entries(index, payload_store)?
         }
     };
-    let orphan_payload_files_removed = match mode {
-        CacheV3StartupReconcileMode::Lightweight => 0,
-        CacheV3StartupReconcileMode::Full => remove_orphan_payload_files(layout, index)?,
+    let (additional_temp_files_removed, orphan_payload_files_removed) = match mode {
+        CacheV3StartupReconcileMode::Lightweight => (0, 0),
+        CacheV3StartupReconcileMode::Full => {
+            remove_orphan_payload_and_legacy_temp_files(layout, index)?
+        }
     };
 
     Ok(CacheV3StartupReconcileReport {
-        temp_files_removed,
+        temp_files_removed: temp_files_removed.saturating_add(additional_temp_files_removed),
         stale_index_entries_removed,
         orphan_payload_files_removed,
     })
@@ -131,76 +132,89 @@ fn prune_missing_payload_for_all_entries(
     index: &CacheIndex,
     payload_store: &FilePayloadStore,
 ) -> Result<u64, CacheV3StartupReconcileError> {
-    let index_object_ids = collect_index_object_ids(index)?;
-    let mut stale_ids = Vec::new();
-    for object_id in index_object_ids {
-        if !payload_store.payload_exists(object_id)? {
-            stale_ids.push(object_id);
-        }
-    }
-
-    stale_ids.sort_unstable();
-    stale_ids.dedup();
-    for chunk in stale_ids.chunks(INDEX_REMOVE_BATCH_SIZE) {
-        index.remove_batch(chunk)?;
-    }
-    Ok(stale_ids.len() as u64)
-}
-
-fn remove_temp_files(layout: &CacheV3Layout) -> Result<u64, io::Error> {
-    let mut removed = 0_u64;
-    for file in list_files_recursive(&layout.tmp_dir)? {
-        if remove_file_if_present(&file)? {
-            removed = removed.saturating_add(1);
-        }
-    }
-    Ok(removed)
-}
-
-fn remove_orphan_payload_files(
-    layout: &CacheV3Layout,
-    index: &CacheIndex,
-) -> Result<u64, CacheV3StartupReconcileError> {
-    let index_object_ids = collect_index_object_ids(index)?;
-    let mut removed = 0_u64;
-    for file in list_files_recursive(&layout.payload_blocks_dir)? {
-        let Some(file_name) = file.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(object_id) = CacheV3Layout::parse_payload_block_file_name(file_name) else {
-            continue;
-        };
-        if !index_object_ids.contains(&object_id) && remove_file_if_present(&file)? {
-            removed = removed.saturating_add(1);
-        }
-    }
-    Ok(removed)
-}
-
-fn collect_index_object_ids(index: &CacheIndex) -> Result<HashSet<u64>, CacheIndexError> {
-    let mut object_ids = HashSet::new();
     let mut cursor = None;
+    let mut removed_total = 0_u64;
     loop {
         let page = index.access_order_object_ids_page(cursor, LIST_PAGE_SIZE)?;
         if page.is_empty() {
             break;
         }
-        for (object_id, access_order) in page {
-            object_ids.insert(object_id);
-            cursor = Some(access_order);
+        cursor = page.last().map(|(_, access_order)| *access_order);
+
+        let mut stale_ids = Vec::new();
+        for (object_id, _) in page {
+            if !payload_store.payload_exists(object_id)? {
+                stale_ids.push(object_id);
+            }
         }
+
+        stale_ids.sort_unstable();
+        stale_ids.dedup();
+        for chunk in stale_ids.chunks(INDEX_REMOVE_BATCH_SIZE) {
+            index.remove_batch(chunk)?;
+        }
+        removed_total = removed_total.saturating_add(stale_ids.len() as u64);
     }
-    Ok(object_ids)
+    Ok(removed_total)
 }
 
-fn list_files_recursive(root: &Path) -> Result<Vec<PathBuf>, io::Error> {
-    let mut files = Vec::new();
+fn remove_temp_files(layout: &CacheV3Layout) -> Result<u64, io::Error> {
+    let mut removed = 0_u64;
+    visit_files_recursive(&layout.tmp_dir, &mut |file| {
+        if remove_file_if_present(file)? {
+            removed = removed.saturating_add(1);
+        }
+        Ok(())
+    })
+    .map_err(|error| match error {
+        CacheV3StartupReconcileError::Io(io_error) => io_error,
+        CacheV3StartupReconcileError::Index(_) => {
+            io::Error::other("unexpected index error while cleaning startup temp files")
+        }
+    })?;
+    Ok(removed)
+}
+
+fn remove_orphan_payload_and_legacy_temp_files(
+    layout: &CacheV3Layout,
+    index: &CacheIndex,
+) -> Result<(u64, u64), CacheV3StartupReconcileError> {
+    let mut temp_files_removed = 0_u64;
+    let mut orphan_payload_files_removed = 0_u64;
+    visit_files_recursive(&layout.payload_blocks_dir, &mut |file| {
+        let Some(file_name) = file.file_name().and_then(|name| name.to_str()) else {
+            return Ok(());
+        };
+        if file_name.ends_with(".tmp") {
+            if remove_file_if_present(file)? {
+                temp_files_removed = temp_files_removed.saturating_add(1);
+            }
+            return Ok(());
+        };
+        let Some(object_id) = CacheV3Layout::parse_payload_block_file_name(file_name) else {
+            return Ok(());
+        };
+        if index.get_entry(object_id)?.is_none() && remove_file_if_present(file)? {
+            orphan_payload_files_removed = orphan_payload_files_removed.saturating_add(1);
+        }
+        Ok(())
+    })?;
+    Ok((temp_files_removed, orphan_payload_files_removed))
+}
+
+fn visit_files_recursive<F>(
+    root: &Path,
+    visitor: &mut F,
+) -> Result<(), CacheV3StartupReconcileError>
+where
+    F: FnMut(&Path) -> Result<(), CacheV3StartupReconcileError>,
+{
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         for entry in entries {
             let entry = entry?;
@@ -209,11 +223,11 @@ fn list_files_recursive(root: &Path) -> Result<Vec<PathBuf>, io::Error> {
             if file_type.is_dir() {
                 dirs.push(path);
             } else if file_type.is_file() {
-                files.push(path);
+                visitor(&path)?;
             }
         }
     }
-    Ok(files)
+    Ok(())
 }
 
 fn remove_file_if_present(path: &Path) -> Result<bool, io::Error> {
@@ -318,6 +332,11 @@ mod tests {
         let orphan_payload_path = layout.payload_block_path(8);
         std::fs::create_dir_all(orphan_payload_path.parent().unwrap()).unwrap();
         std::fs::write(&orphan_payload_path, b"orphan").unwrap();
+        let legacy_tmp_path = layout
+            .payload_block_path(9)
+            .with_file_name("0000000000000009-legacy.tmp");
+        std::fs::create_dir_all(legacy_tmp_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_tmp_path, b"legacy-tmp").unwrap();
 
         let report = reconcile_startup_state(
             &layout,
@@ -327,8 +346,10 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(report.temp_files_removed, 1);
         assert_eq!(report.orphan_payload_files_removed, 1);
         assert!(!payload_store.payload_exists(8).unwrap());
+        assert!(!legacy_tmp_path.exists());
         assert!(payload_store.payload_exists(7).unwrap());
     }
 

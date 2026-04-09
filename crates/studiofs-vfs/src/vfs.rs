@@ -12783,12 +12783,22 @@ mod tests {
                     .await;
             });
 
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            let mid = vfs.file_session_stats();
+            let mid = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let stats = vfs.file_session_stats();
+                    if stats.queued_ops >= 1 {
+                        break stats;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("expected at least one queued file-session operation");
             assert!(
                 mid.queued_ops >= 1,
                 "expected at least one queued file-session operation"
             );
+            tokio::time::sleep(Duration::from_millis(10)).await;
 
             drop(session_guard);
             waiter.await.unwrap();
