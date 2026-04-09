@@ -1,6 +1,7 @@
 #![cfg(windows)]
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -496,6 +497,9 @@ pub struct StudioFsContext {
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    /// Per-inode gates used to collapse concurrent callback-driven flush
+    /// barriers into one effective in-flight flush.
+    flush_gates: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl StudioFsContext {
@@ -510,7 +514,50 @@ impl StudioFsContext {
             rt,
             default_sd,
             invalidation_queue,
+            flush_gates: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn flush_gate_for_inode(&self, ino: Ino) -> Arc<tokio::sync::Mutex<()>> {
+        self.flush_gates
+            .lock()
+            .entry(ino)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn maybe_release_flush_gate(&self, ino: Ino, gate: &Arc<tokio::sync::Mutex<()>>) {
+        let mut gates = self.flush_gates.lock();
+        let should_remove = gates
+            .get(&ino)
+            .is_some_and(|current| Arc::ptr_eq(current, gate) && Arc::strong_count(current) == 2);
+        if should_remove {
+            gates.remove(&ino);
+        }
+    }
+
+    fn flush_callback_path_if_dirty(
+        &self,
+        ino: Ino,
+        fh: Option<u64>,
+    ) -> studiofs_vfs::VfsResult<bool> {
+        let gate = self.flush_gate_for_inode(ino);
+        let gate_task = gate.clone();
+        let vfs = self.vfs.clone();
+        let result = self.spawn_wait(async move {
+            let _flush_guard = gate_task.lock().await;
+            if !vfs.inode_has_local_dirty_state(ino) {
+                return Ok(false);
+            }
+            if let Some(handle) = fh.filter(|candidate| *candidate != 0) {
+                vfs.flush_fh(handle).await?;
+            } else {
+                vfs.flush(ino).await?;
+            }
+            Ok(true)
+        });
+        self.maybe_release_flush_gate(ino, &gate);
+        result
     }
 
     /// Copy the cached security descriptor into the provided buffer.
@@ -965,16 +1012,15 @@ impl FileSystemContext for StudioFsContext {
             // calls release_fh() and drops the handle from the table. A background
             // flush_fh task that races past release_fh will find the handle already
             // gone and silently skip the flush body.
-            let vfs = self.vfs.clone();
             let ino = context.ino;
             let fh = context.fh;
             if fh != 0 {
                 self.vfs.note_winfsp_cleanup_flush_fh_callback();
-                if let Err(e) = self.spawn_wait(async move { vfs.flush_fh(fh).await }) {
+                if let Err(e) = self.flush_callback_path_if_dirty(ino, Some(fh)) {
                     error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
                 }
             } else {
-                if let Err(e) = self.spawn_wait(async move { vfs.flush(ino).await }) {
+                if let Err(e) = self.flush_callback_path_if_dirty(ino, None) {
                     error!(ino, "cleanup flush failed: {:?}", e);
                 }
             }
@@ -1126,10 +1172,7 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<()> {
         self.vfs.note_winfsp_flush_callback();
         if let Some(ctx) = context {
-            // Flush pending writes to S3
-            let vfs = self.vfs.clone();
-            let ino = ctx.ino;
-            self.spawn_wait(async move { vfs.flush(ino).await })
+            self.flush_callback_path_if_dirty(ctx.ino, None)
                 .map_err(vfs_to_winfsp_err)?;
 
             let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
@@ -1263,6 +1306,7 @@ mod tests {
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::MetaError;
     use studiofs_meta::{
@@ -1330,6 +1374,10 @@ mod tests {
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
         let ctx = StudioFsContext::new(vfs.clone(), rt, queue.clone());
         (tmp, vfs, ctx, queue)
+    }
+
+    fn flush_ordered_calls(vfs: &StudioVfs) -> u64 {
+        vfs.write_path_observability_snapshot().flush_ordered_calls
     }
 
     #[test]
@@ -1407,6 +1455,156 @@ mod tests {
         let dir_delete = VfsError::Meta(MetaError::NotADirectory(42));
         assert!(is_benign_cleanup_delete_error(&dir_delete, true));
         assert!(!is_benign_cleanup_delete_error(&dir_delete, false));
+    }
+
+    #[test]
+    fn cleanup_non_delete_skips_sync_flush_for_clean_inode() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_skip_clean");
+        let attr = vfs
+            .create(ROOT_INO, b"clean-callback.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("pre-clean flush");
+
+        let before = flush_ordered_calls(&vfs);
+        let flushed = ctx
+            .flush_callback_path_if_dirty(attr.ino, Some(fh))
+            .expect("callback flush guard");
+        let after = flush_ordered_calls(&vfs);
+        assert!(
+            !flushed,
+            "clean inode should skip callback-driven synchronous flush"
+        );
+        assert_eq!(
+            after, before,
+            "cleanup should skip redundant synchronous flush when inode is clean"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn cleanup_non_delete_flushes_when_inode_is_dirty() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_flush_dirty");
+        let attr = vfs
+            .create(ROOT_INO, b"dirty-callback.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        let before = flush_ordered_calls(&vfs);
+        let flushed = ctx
+            .flush_callback_path_if_dirty(attr.ino, Some(fh))
+            .expect("callback flush");
+        let after = flush_ordered_calls(&vfs);
+        assert!(flushed, "dirty inode must perform callback-driven flush");
+        assert_eq!(
+            after,
+            before + 1,
+            "cleanup should run a synchronous flush barrier for dirty inodes"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn flush_callback_skips_sync_flush_for_clean_inode() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("flush_skip_clean");
+        let attr = vfs
+            .create(ROOT_INO, b"clean-flush-callback.txt", 0, 0, 0o644)
+            .expect("create");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("pre-clean flush");
+
+        let before = flush_ordered_calls(&vfs);
+        let flushed = ctx
+            .flush_callback_path_if_dirty(attr.ino, None)
+            .expect("callback flush guard");
+        let after = flush_ordered_calls(&vfs);
+        assert!(!flushed, "clean inode should skip flush callback barrier");
+        assert_eq!(
+            after, before,
+            "flush callback should skip redundant synchronous flush when inode is clean"
+        );
+    }
+
+    #[test]
+    fn cleanup_callbacks_coalesce_concurrent_flushes_per_inode() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_coalesce");
+        let attr = vfs
+            .create(ROOT_INO, b"coalesce.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move {
+                for i in 0..16u64 {
+                    let offset = i * (4 * 1024 * 1024);
+                    vfs.write(attr.ino, offset, b"x").await?;
+                }
+                Ok::<(), VfsError>(())
+            }
+        })
+        .expect("seed dirty blocks");
+
+        let before = flush_ordered_calls(&vfs);
+        let ctx = Arc::new(ctx);
+        let start = Arc::new(Barrier::new(4));
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let ctx = Arc::clone(&ctx);
+            let start = Arc::clone(&start);
+            let ino = attr.ino;
+            joins.push(std::thread::spawn(move || {
+                start.wait();
+                ctx.flush_callback_path_if_dirty(ino, Some(fh))
+                    .expect("concurrent callback flush");
+            }));
+        }
+        for join in joins {
+            join.join().expect("cleanup thread join");
+        }
+        let after = flush_ordered_calls(&vfs);
+        assert_eq!(
+            after,
+            before + 1,
+            "concurrent cleanup callbacks should collapse into one effective flush barrier"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
     }
 
     #[test]
