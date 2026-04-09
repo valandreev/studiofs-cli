@@ -1,4 +1,4 @@
-# Cache 3.0 Contract and Migration Safety (SFS-173, SFS-181)
+# Cache 3.0 Contract and Migration Safety (SFS-173, SFS-181, SFS-182)
 
 ## Purpose
 
@@ -63,6 +63,57 @@ same workload. Internal direct-shim benchmarks are not acceptance gates.
 | Crash/restart recovery | Forced restart with dirty local state | Recovery correctness must match current backend; recovery time must be <= current backend |
 | Disk footprint stability | Same object set over repeated runs | No unbounded growth; steady-state usage must be explainable and within configured limits |
 | Status/inspection safety | `studiofs status` against legacy, v3-only, and dual-layout roots | No mutations, no destructive side effects, consistent detection output |
+
+Throughput cutover targets:
+- Minimum gate: Cache 3.0 must meet at least **3.0x** throughput ratio for both
+  reads and writes versus the current real cache path.
+- Stretch target: Track whether **4.0x** is realistic on measured workloads, but
+  do not require it to pass the default-cutover gate.
+- When USB-attached NVMe is available, run the same comparison on that medium
+  and include those ratios in the validation record.
+
+### 3.1 Required Validation Record Before Default Cutover
+
+Default cutover is controlled by code-level gate evaluation:
+- `CACHE_V3_DEFAULT_ALLOWED` must be `true`.
+- `CACHE_V3_FINAL_VALIDATION_ISSUE` must match the validation evidence issue id.
+- `CACHE_V3_VALIDATION_EVIDENCE` must be populated and pass:
+  - matrix executed;
+  - compared against current real cache path;
+  - local NVMe read/write ratios >= `CACHE_V3_MIN_TARGET_RATIO` (`3.0x`);
+  - USB NVMe ratios present and >= `3.0x` when USB NVMe was available;
+  - no open blockers.
+
+If any gate check fails, dual-layout mounts remain on legacy raw backend.
+
+### 3.2 Real-Path Comparison Command Pattern
+
+Run these on the same machine and same workload inputs for each backend:
+
+```powershell
+# Legacy baseline (mounted path inside active StudioFS mount)
+studiofs test-cache <mounted-workload-path> `
+  --access-pattern mixed `
+  --concurrency 4 `
+  --io-depth 64 `
+  --warmup-runs 1 `
+  --json-output .\reports\legacy-e2e.json
+
+# Cache 3.0 candidate on the same mounted path/workload profile
+studiofs test-cache <mounted-workload-path> `
+  --access-pattern mixed `
+  --concurrency 4 `
+  --io-depth 64 `
+  --warmup-runs 1 `
+  --json-output .\reports\cache-v3-e2e.json
+```
+
+Record read/write throughput ratios (candidate/baseline) for:
+- local NVMe;
+- USB-attached NVMe (when available).
+
+If the 3.0x target is missed, keep `CACHE_V3_DEFAULT_ALLOWED=false` and list
+exact bottlenecks in `CACHE_V3_VALIDATION_EVIDENCE.blockers` before retrying.
 
 ## 4. Rollout, Rollback, and Default Rules
 

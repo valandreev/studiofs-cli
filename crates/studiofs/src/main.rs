@@ -358,6 +358,9 @@ EXAMPLES:
   Select the raw backend explicitly:
     studiofs mount myvolume Z: --block-backend raw-file
 
+  Force Cache 3.0 backend (1 block = 1 file):
+    studiofs mount myvolume Z: --cache3
+
 PYROSCOPE PROFILING:
   studiofs mount myvolume /mnt/studio --profile
   studiofs mount myvolume /mnt/studio --profile=off
@@ -405,6 +408,13 @@ ACL PRINCIPAL:
         #[arg(long, value_enum)]
         block_backend: Option<cli::mount_block_backend_types::MountBlockBackendMode>,
 
+        /// Force Cache 3.0 local backend (file-per-block payload store).
+        ///
+        /// This creates/uses the `v3/` contract under the cache root and selects
+        /// cache-v3 for this mount even when legacy `blocks.raw` is present.
+        #[arg(long, conflicts_with = "block_backend")]
+        cache3: bool,
+
         /// Run in foreground (keep terminal attached, default behavior)
         #[arg(long, conflicts_with = "detach")]
         foreground: bool,
@@ -447,6 +457,7 @@ EXAMPLES:
     #[command(after_help = "\
 EXAMPLES:
   studiofs status myvolume
+  studiofs status myvolume --verbose
   studiofs status myvolume --cache-dir D:\\cache\\studiofs
 ")]
     Status {
@@ -456,6 +467,10 @@ EXAMPLES:
         /// Override local cache base directory (defaults to `<meta-dir>/cache`)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+
+        /// Include mounted write-path bottleneck metrics when available
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Manage defaults for `studiofs mount`.
@@ -702,6 +717,7 @@ fn main() -> anyhow::Result<()> {
             cache_size,
             principal,
             block_backend,
+            cache3,
             foreground,
             detach,
             profile,
@@ -720,6 +736,7 @@ fn main() -> anyhow::Result<()> {
                 cache_size.as_deref(),
                 principal.as_deref(),
                 block_backend,
+                cache3,
                 foreground,
                 detach,
                 profile,
@@ -733,9 +750,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Umount { mount_point } => {
             cli::umount::run(&mount_point)?;
         }
-        Commands::Status { name, cache_dir } => {
+        Commands::Status {
+            name,
+            cache_dir,
+            verbose,
+        } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::status::run(&name, &meta_dir, cache_dir.as_deref())?;
+            cli::status::run(&name, &meta_dir, cache_dir.as_deref(), verbose)?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -955,6 +976,34 @@ mod tests {
     }
 
     #[test]
+    fn mount_cache3_flag_parses() {
+        let cli = parse(&["mount", "vol", "Z:", "--cache3"]).unwrap();
+        match cli.command {
+            Commands::Mount { cache3, .. } => assert!(cache3),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_cache3_conflicts_with_block_backend() {
+        let err = match parse(&[
+            "mount",
+            "vol",
+            "Z:",
+            "--cache3",
+            "--block-backend",
+            "raw-file",
+        ]) {
+            Ok(_) => panic!("expected clap conflict error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        let rendered = err.to_string();
+        assert!(rendered.contains("--cache3"));
+        assert!(rendered.contains("--block-backend"));
+    }
+
+    #[test]
     fn mount_parses_profile_shorthand() {
         let cli = parse(&["mount", "vol", "Z:", "--profile"]).unwrap();
         match cli.command {
@@ -1129,9 +1178,31 @@ mod tests {
     fn status_parses_cache_dir() {
         let cli = parse(&["status", "vol", "--cache-dir", "D:\\cache\\studiofs"]).unwrap();
         match cli.command {
-            Commands::Status { name, cache_dir } => {
+            Commands::Status {
+                name,
+                cache_dir,
+                verbose,
+            } => {
                 assert_eq!(name, "vol");
                 assert_eq!(cache_dir.unwrap(), PathBuf::from("D:\\cache\\studiofs"));
+                assert!(!verbose);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_parses_verbose_flag() {
+        let cli = parse(&["status", "vol", "--verbose"]).unwrap();
+        match cli.command {
+            Commands::Status {
+                name,
+                cache_dir,
+                verbose,
+            } => {
+                assert_eq!(name, "vol");
+                assert!(cache_dir.is_none());
+                assert!(verbose);
             }
             other => panic!("expected Status, got {other:?}"),
         }

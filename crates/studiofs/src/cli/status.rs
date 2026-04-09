@@ -9,11 +9,14 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use studiofs_cache::v2::{LocalBlockBackend, open_legacy_local_block_backend};
 use studiofs_cache::v3::{
-    CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE,
-    CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
+    CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE, CACHE_V3_MIN_TARGET_RATIO,
+    CACHE_V3_STRETCH_TARGET_RATIO, CACHE_V3_VALIDATION_EVIDENCE, CacheBackendDetection,
+    CacheBackendKind, CacheIndex, CacheV3DefaultGateBlocker, cache_v3_default_gate_status,
+    detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_meta::counters;
+use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -34,6 +37,8 @@ const RAW_STATE_DIRTY: u8 = 1;
 const RAW_STATE_UPLOADING: u8 = 2;
 const RAW_STATE_UPLOADED: u8 = 3;
 const LEGACY_STATUS_SCAN_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
+const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
 
 #[derive(Debug, Default)]
 struct SpillDirStats {
@@ -98,6 +103,67 @@ fn detect_cache_backends_with_fallback(
 
 fn detect_cache_backends_for_status(cache_path: &Path) -> Option<CacheBackendDetection> {
     detect_cache_backends_with_fallback(cache_path, detect_cache_backends)
+}
+
+fn format_ratio(value: f64) -> String {
+    format!("{value:.2}x")
+}
+
+fn format_optional_ratio(value: Option<f64>) -> String {
+    value.map(format_ratio).unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_ms(value: f64) -> String {
+    format!("{value:.3}ms")
+}
+
+fn format_quantile_ms(value: f64, saturated: bool) -> String {
+    if saturated {
+        format!("{}+ (saturated)", format_ms(value))
+    } else {
+        format_ms(value)
+    }
+}
+
+fn read_write_path_observability(
+    cache_path: &Path,
+) -> Option<(PathBuf, VfsWritePathObservabilitySnapshot)> {
+    let metrics_path = cache_path.join(WRITE_PATH_OBSERVABILITY_FILE);
+    let bytes = match std::fs::read(&metrics_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to read mounted write-path metrics '{}': {error}",
+                metrics_path.display()
+            );
+            return None;
+        }
+    };
+    match serde_json::from_slice::<VfsWritePathObservabilitySnapshot>(&bytes) {
+        Ok(snapshot) => Some((metrics_path, snapshot)),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to parse mounted write-path metrics '{}': {error}",
+                metrics_path.display()
+            );
+            None
+        }
+    }
+}
+
+fn format_validation_blockers(blockers: &[&str]) -> String {
+    if blockers.is_empty() {
+        "none".to_string()
+    } else {
+        blockers.join("; ")
+    }
+}
+
+fn describe_gate_blocker(blocker: Option<CacheV3DefaultGateBlocker>) -> &'static str {
+    blocker
+        .map(CacheV3DefaultGateBlocker::as_str)
+        .unwrap_or("none")
 }
 
 fn map_status_open_local_backend_error(
@@ -447,7 +513,12 @@ fn scan_pending_uploads(
     Ok(store.dirty_object_ids().len())
 }
 
-pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Result<()> {
+pub fn run(
+    name: &str,
+    meta_dir: &Path,
+    cache_dir: Option<&Path>,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
 
     if !db_path.exists() {
@@ -470,6 +541,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         .as_ref()
         .map(CacheBackendDetection::selected_mount_backend)
         .unwrap_or(CacheBackendKind::LegacyRawV2);
+    let default_gate = cache_v3_default_gate_status();
     if matches!(selected_mount_backend, CacheBackendKind::LegacyRawV2) {
         warn_large_legacy_status_scan(&cache_path.join("blocks.raw"));
     }
@@ -499,6 +571,11 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
             );
             None
         }
+    };
+    let mounted_write_path = if verbose {
+        read_write_path_observability(&cache_path)
+    } else {
+        None
     };
 
     let remote_size = engine.remote_metadata_size()?.unwrap_or(0);
@@ -652,7 +729,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     }
     println!(
         "  Cache v3 default:    {}",
-        if CACHE_V3_DEFAULT_ALLOWED {
+        if default_gate.ready {
             "enabled"
         } else {
             "blocked"
@@ -660,6 +737,80 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     );
     let final_validation_issue = CACHE_V3_FINAL_VALIDATION_ISSUE.unwrap_or("UNASSIGNED");
     println!("  Final validation:    {}", final_validation_issue);
+    println!(
+        "  Gate status:         {}",
+        if default_gate.ready {
+            "passed"
+        } else {
+            "blocked"
+        }
+    );
+    println!(
+        "  Gate blocker:        {}",
+        describe_gate_blocker(default_gate.blocker)
+    );
+    println!(
+        "  Validation target:   min {} / stretch {}",
+        format_ratio(CACHE_V3_MIN_TARGET_RATIO),
+        format_ratio(CACHE_V3_STRETCH_TARGET_RATIO)
+    );
+    if let Some(evidence) = CACHE_V3_VALIDATION_EVIDENCE {
+        println!("  Evidence issue:      {}", evidence.issue);
+        println!(
+            "  Matrix complete:     {}",
+            if evidence.matrix_executed {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  Real-path baseline:  {}",
+            if evidence.compared_against_current_backend {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  NVMe read ratio:     {}",
+            format_ratio(evidence.local_nvme_read_ratio)
+        );
+        println!(
+            "  NVMe write ratio:    {}",
+            format_ratio(evidence.local_nvme_write_ratio)
+        );
+        println!(
+            "  USB NVMe available:  {}",
+            if evidence.usb_nvme_available {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  USB read ratio:      {}",
+            format_optional_ratio(evidence.usb_nvme_read_ratio)
+        );
+        println!(
+            "  USB write ratio:     {}",
+            format_optional_ratio(evidence.usb_nvme_write_ratio)
+        );
+        println!(
+            "  Stretch realistic:   {}",
+            if evidence.stretch_target_realistic {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  Validation blockers: {}",
+            format_validation_blockers(evidence.blockers)
+        );
+    } else {
+        println!("  Validation evidence: missing");
+    }
     println!("  Guardrail:           {}", CACHE_V3_DEFAULT_GUARDRAIL);
 
     println!("\nLocal Ingress");
@@ -673,6 +824,95 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         spill_stats.checkpoint_segment_id, spill_stats.checkpoint_offset
     );
     println!("  Pending uploads:    {}", pending_uploads);
+
+    if verbose {
+        println!("\nMounted Write Path");
+        println!("──────────────────");
+        if let Some((metrics_path, snapshot)) = mounted_write_path {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            let snapshot_age_ms = now_ms.saturating_sub(snapshot.generated_unix_ms);
+
+            println!("  Metrics file:              {}", metrics_path.display());
+            println!("  Snapshot age:              {}ms", snapshot_age_ms);
+            println!(
+                "  Snapshot freshness:        {}",
+                if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
+                    "stale"
+                } else {
+                    "fresh"
+                }
+            );
+            if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
+                println!(
+                    "  Warning:                   mounted metrics are stale; publisher may be stopped"
+                );
+            }
+            println!("  Backend tag:               {}", snapshot.backend_tag);
+            println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
+            println!(
+                "  flush_ordered calls:       {} ({:.2}/s)",
+                snapshot.flush_ordered_calls, snapshot.flush_ordered_calls_per_sec
+            );
+            println!(
+                "  block_store_sync_data calls: {} ({:.2}/s)",
+                snapshot.block_store_sync_data.calls, snapshot.block_store_sync_data.calls_per_sec
+            );
+            println!(
+                "  block_store_sync_data total: {}",
+                format_ms(snapshot.block_store_sync_data.total_ms)
+            );
+            println!(
+                "  block_store_sync_data avg:   {}",
+                format_ms(snapshot.block_store_sync_data.avg_ms)
+            );
+            println!(
+                "  block_store_sync_data max:   {}",
+                format_ms(snapshot.block_store_sync_data.max_ms)
+            );
+            println!(
+                "  block_store_sync_data p50/p95/p99: {}/{}/{}",
+                format_quantile_ms(
+                    snapshot.block_store_sync_data.latency_quantiles_ms.p50,
+                    snapshot
+                        .block_store_sync_data
+                        .latency_quantiles_saturated
+                        .p50
+                ),
+                format_quantile_ms(
+                    snapshot.block_store_sync_data.latency_quantiles_ms.p95,
+                    snapshot
+                        .block_store_sync_data
+                        .latency_quantiles_saturated
+                        .p95
+                ),
+                format_quantile_ms(
+                    snapshot.block_store_sync_data.latency_quantiles_ms.p99,
+                    snapshot
+                        .block_store_sync_data
+                        .latency_quantiles_saturated
+                        .p99
+                )
+            );
+            println!(
+                "  WinFSP callbacks write/flush/cleanup->flush_fh: {}/{}/{}",
+                snapshot.winfsp_callbacks.write,
+                snapshot.winfsp_callbacks.flush,
+                snapshot.winfsp_callbacks.cleanup_flush_fh
+            );
+            println!(
+                "  Write backpressure events/wait/max: {}/{}/{}ms",
+                snapshot.write_backpressure.events,
+                snapshot.write_backpressure.wait_total_ms,
+                snapshot.write_backpressure.stall_max_ms
+            );
+        } else {
+            println!("  Metrics file:              unavailable");
+            println!("  Hint:                      mount the volume and rerun with --verbose");
+        }
+    }
 
     Ok(())
 }
@@ -798,5 +1038,63 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let detection = detect_cache_backends_for_status(tmp.path());
         assert!(detection.is_some());
+    }
+
+    #[test]
+    fn format_optional_ratio_handles_missing_values() {
+        assert_eq!(format_optional_ratio(None), "n/a");
+        assert_eq!(format_optional_ratio(Some(3.125)), "3.12x");
+    }
+
+    #[test]
+    fn format_validation_blockers_joins_items() {
+        assert_eq!(format_validation_blockers(&[]), "none");
+        assert_eq!(
+            format_validation_blockers(&["missing usb evidence", "p95 regression"]),
+            "missing usb evidence; p95 regression"
+        );
+    }
+
+    #[test]
+    fn describe_gate_blocker_defaults_to_none() {
+        assert_eq!(describe_gate_blocker(None), "none");
+        assert_eq!(
+            describe_gate_blocker(Some(CacheV3DefaultGateBlocker::MatrixIncomplete)),
+            "comparison matrix is not marked complete"
+        );
+    }
+
+    #[test]
+    fn read_write_path_observability_returns_none_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_write_path_observability(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn read_write_path_observability_reads_snapshot_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metrics_path = tmp.path().join(WRITE_PATH_OBSERVABILITY_FILE);
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            generated_unix_ms: 123,
+            uptime_secs: 4.0,
+            backend_tag: "cache-v3".to_string(),
+            flush_ordered_calls: 11,
+            flush_ordered_calls_per_sec: 2.5,
+            block_store_sync_data: Default::default(),
+            winfsp_callbacks: Default::default(),
+            write_backpressure: Default::default(),
+        };
+        std::fs::write(&metrics_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let loaded = read_write_path_observability(tmp.path()).expect("metrics");
+        assert_eq!(loaded.0, metrics_path);
+        assert_eq!(loaded.1.backend_tag, "cache-v3");
+        assert_eq!(loaded.1.flush_ordered_calls, 11);
+    }
+
+    #[test]
+    fn format_quantile_ms_marks_saturated_values() {
+        assert_eq!(format_quantile_ms(5000.0, true), "5000.000ms+ (saturated)");
+        assert_eq!(format_quantile_ms(120.5, false), "120.500ms");
     }
 }

@@ -3,13 +3,104 @@
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+use studiofs_cache::LocalBackendSelectionMode;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
+use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::{StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
+const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
+
+struct WritePathObservabilityPublisher {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl WritePathObservabilityPublisher {
+    fn new(vfs: Arc<StudioVfs>, output_path: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let output_path_for_thread = output_path.clone();
+        let handle = std::thread::Builder::new()
+            .name("studiofs-write-path-observability".to_string())
+            .spawn(move || {
+                loop {
+                    if let Err(error) =
+                        persist_write_path_observability_snapshot(&vfs, &output_path_for_thread)
+                    {
+                        warn!(
+                            path = %output_path_for_thread.display(),
+                            error = %error,
+                            "failed to persist write-path observability snapshot"
+                        );
+                    }
+
+                    if stop_for_thread.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(WRITE_PATH_OBSERVABILITY_INTERVAL);
+                }
+            });
+
+        match handle {
+            Ok(handle) => Self {
+                stop,
+                handle: Some(handle),
+            },
+            Err(error) => {
+                warn!(
+                    path = %output_path.display(),
+                    error = %error,
+                    "failed to spawn write-path observability publisher thread"
+                );
+                Self { stop, handle: None }
+            }
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            warn!("write-path observability publisher thread panicked");
+        }
+    }
+}
+
+impl Drop for WritePathObservabilityPublisher {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn persist_write_path_observability_snapshot(
+    vfs: &StudioVfs,
+    output_path: &Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    let payload = serde_json::to_vec(&snapshot)
+        .map_err(|error| std::io::Error::other(format!("serialize metrics failed: {error}")))?;
+    let tmp_path = output_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, payload)?;
+    if output_path.exists() {
+        let _ = std::fs::remove_file(output_path);
+    }
+    std::fs::rename(tmp_path, output_path)?;
+    Ok(())
+}
 
 /// Initial local-cache budget used to size the mount-time cache directory.
 /// Capped at 25 % of total RAM so low-memory machines don't overshoot.
@@ -74,6 +165,17 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+}
+
+fn ensure_cache3_layout(cache_root: &Path) -> anyhow::Result<()> {
+    let layout = CacheV3Layout::from_cache_root(cache_root);
+    std::fs::create_dir_all(&layout.tmp_dir)?;
+    std::fs::create_dir_all(&layout.payload_blocks_dir)?;
+    std::fs::create_dir_all(&layout.index_dir)?;
+    if !layout.layout_marker.exists() {
+        std::fs::write(&layout.layout_marker, b"v1")?;
+    }
+    Ok(())
 }
 
 fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
@@ -277,6 +379,7 @@ pub fn run(
     cache_size: Option<&str>,
     principal: Option<&str>,
     block_backend: Option<super::mount_block_backend_types::MountBlockBackendMode>,
+    cache3: bool,
     foreground: bool,
     detach: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
@@ -297,7 +400,16 @@ pub fn run(
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
-    let _ = block_backend;
+    let local_backend_selection_mode = if cache3 {
+        LocalBackendSelectionMode::ForceCacheV3
+    } else if matches!(
+        block_backend,
+        Some(super::mount_block_backend_types::MountBlockBackendMode::RawFile)
+    ) {
+        LocalBackendSelectionMode::ForceLegacyRawV2
+    } else {
+        LocalBackendSelectionMode::Auto
+    };
 
     // Validate endpoint override before any mount operations (SFS-95)
     if let Some(ep) = endpoint {
@@ -517,6 +629,12 @@ pub fn run(
 
     // Cache state for this volume (local backend + cache metadata) lives in this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
+    if matches!(
+        local_backend_selection_mode,
+        LocalBackendSelectionMode::ForceCacheV3
+    ) {
+        ensure_cache3_layout(&cache_path)?;
+    }
 
     let cache_path_str = cache_path
         .to_str()
@@ -548,17 +666,22 @@ pub fn run(
     let _guard = rt.enter();
 
     // Create VFS.
-    let vfs = StudioVfs::new(
+    let vfs = StudioVfs::new_with_backend_selection(
         meta.clone(),
         &data_config,
         cache_path_str,
         cache_size_bytes,
         block_cache_l1_limit,
         vfs_config,
+        local_backend_selection_mode,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
     vfs.start()
         .map_err(|e| anyhow::anyhow!("failed to start vfs background workers: {e}"))?;
+    let mut write_path_observability_publisher = WritePathObservabilityPublisher::new(
+        vfs.clone(),
+        cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
+    );
 
     println!(
         "✓ Volume '{}' ready to mount at '{}'",
@@ -591,7 +714,7 @@ pub fn run(
         // Named event for external graceful shutdown (used by `studiofs umount`).
         let event_name = super::utils::shutdown_event_name(&actual_mount_path);
         info!("starting WinFSP mount at {actual_mount_path}");
-        studiofs_winfsp::mount_and_serve(
+        let mount_result = studiofs_winfsp::mount_and_serve(
             vfs,
             rt,
             &actual_mount_path,
@@ -600,8 +723,9 @@ pub fn run(
             read_only_mount,
             Some(&event_name),
             profiling,
-        )
-        .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
+        );
+        write_path_observability_publisher.stop_and_join();
+        mount_result.map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
 
         // WinFSP returns normally — clean up PID file
         let _ = super::utils::remove_pid_file(&actual_mount_path);
@@ -610,7 +734,7 @@ pub fn run(
     #[cfg(unix)]
     {
         info!("starting FUSE mount at {actual_mount_path}");
-        studiofs_fuse::mount_and_serve(
+        let mount_result = studiofs_fuse::mount_and_serve(
             vfs,
             rt,
             &actual_mount_path,
@@ -618,8 +742,9 @@ pub fn run(
             run_in_foreground,
             read_only_mount,
             profiling,
-        )
-        .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
+        );
+        write_path_observability_publisher.stop_and_join();
+        mount_result.map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
         // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
         // PID file is cleaned up by the umount command or overwritten on next mount.
     }
@@ -729,6 +854,17 @@ fn sanitize_log_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_cache3_layout_creates_contract_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_cache3_layout(temp.path()).expect("create cache3 layout");
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        assert!(layout.layout_marker.exists());
+        assert!(layout.tmp_dir.exists());
+        assert!(layout.payload_blocks_dir.exists());
+        assert!(layout.index_dir.exists());
+    }
 
     #[test]
     fn test_parse_positive_size_arg() {

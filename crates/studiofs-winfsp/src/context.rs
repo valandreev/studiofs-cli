@@ -761,6 +761,7 @@ impl FileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        self.vfs.note_winfsp_write_callback();
         // Resolve actual write offset
         let actual_offset = if write_to_eof {
             let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -968,6 +969,7 @@ impl FileSystemContext for StudioFsContext {
             let ino = context.ino;
             let fh = context.fh;
             if fh != 0 {
+                self.vfs.note_winfsp_cleanup_flush_fh_callback();
                 if let Err(e) = self.spawn_wait(async move { vfs.flush_fh(fh).await }) {
                     error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
                 }
@@ -1122,6 +1124,7 @@ impl FileSystemContext for StudioFsContext {
         context: Option<&Self::FileContext>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        self.vfs.note_winfsp_flush_callback();
         if let Some(ctx) = context {
             // Flush pending writes to S3
             let vfs = self.vfs.clone();

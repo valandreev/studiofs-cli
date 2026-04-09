@@ -115,8 +115,10 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
 fn sync_directory_impl(path: &Path) -> io::Result<()> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    static LOGGED_UNSUPPORTED_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
 
     // FILE_FLAG_BACKUP_SEMANTICS is required to open directory handles on
     // Windows through OpenOptions/File APIs.
@@ -127,23 +129,14 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
 
     match dir.sync_all() {
         Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(
-                    1 // ERROR_INVALID_FUNCTION
-                    | 5 // ERROR_ACCESS_DENIED
-                    | 50 // ERROR_NOT_SUPPORTED
-                    | 87 // ERROR_INVALID_PARAMETER
-                    | 120 // ERROR_CALL_NOT_IMPLEMENTED
-                )
-            ) =>
-        {
-            tracing::warn!(
-                path = %path.display(),
-                error = ?error,
-                "cache-v3 directory sync is unsupported on this Windows filesystem"
-            );
+        Err(error) if is_windows_unsupported_sync_error(&error) => {
+            if !LOGGED_UNSUPPORTED_DIRECTORY_SYNC.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = ?error,
+                    "cache-v3 directory sync is unsupported on this Windows filesystem (warning will be logged once)"
+                );
+            }
             Ok(())
         }
         Err(error) => Err(error),
@@ -205,6 +198,11 @@ fn is_benign_best_effort_error(error: &io::Error) -> bool {
 
 #[cfg(windows)]
 fn is_benign_best_effort_error(error: &io::Error) -> bool {
+    is_windows_unsupported_sync_error(error)
+}
+
+#[cfg(windows)]
+fn is_windows_unsupported_sync_error(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(
@@ -297,5 +295,18 @@ mod tests {
 
         let other = io::Error::from_raw_os_error(87);
         assert!(!is_cross_device_link_error(&other));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unsupported_directory_sync_errors_are_classified_as_benign() {
+        for code in [1, 5, 50, 87, 120] {
+            assert!(is_windows_unsupported_sync_error(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!is_windows_unsupported_sync_error(
+            &io::Error::from_raw_os_error(32)
+        ));
     }
 }
