@@ -40,6 +40,12 @@ pub enum OpenLocalBlockBackendError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to provision cache-v3 layout under '{cache_root}': {source}")]
+    ProvisionCacheV3Layout {
+        cache_root: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
         "legacy raw cache data is not supported at '{cache_root}' because '{legacy_raw_path}' is present; \
          remove or migrate the legacy cache root before mounting with Cache 3.0"
@@ -52,7 +58,7 @@ pub enum OpenLocalBlockBackendError {
     OpenCacheV3Backend {
         cache_root: String,
         #[source]
-        source: v3::CacheV3LocalBlockBackendError,
+        source: Box<v3::CacheV3LocalBlockBackendError>,
     },
 }
 
@@ -87,7 +93,7 @@ fn open_cache_v3_backend_with_budget(
             Err(source) => {
                 return Err(OpenLocalBlockBackendError::OpenCacheV3Backend {
                     cache_root: cache_root_display.to_owned(),
-                    source,
+                    source: Box::new(source),
                 });
             }
         }
@@ -119,6 +125,15 @@ fn provision_cache_v3_layout(layout: &v3::CacheV3Layout) -> std::io::Result<()> 
     Ok(())
 }
 
+fn cache_v3_layout_needs_provisioning(
+    detection: &v3::CacheBackendDetection,
+) -> Result<bool, std::io::Error> {
+    Ok(!detection.v3_layout_marker_exists
+        || !detection.v3_payload_blocks_dir_exists
+        || !detection.layout.tmp_dir.try_exists()?
+        || !detection.layout.index_dir.try_exists()?)
+}
+
 /// Open the Cache 3.0 local backend for a cache root.
 pub fn open_local_block_backend(
     cache_root: impl AsRef<Path>,
@@ -147,25 +162,32 @@ fn open_local_block_backend_with_budget_impl(
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     let cache_root_display = cache_root.display().to_string();
 
-    let detection = v3::detect_cache_backends(cache_root).map_err(|source| {
+    let mut detection = v3::detect_cache_backends(cache_root).map_err(|source| {
         OpenLocalBlockBackendError::DetectCacheBackend {
             cache_root: cache_root_display.clone(),
             source,
         }
     })?;
     reject_legacy_raw_cache_root(&cache_root_display, &detection)?;
-    provision_cache_v3_layout(&detection.layout).map_err(|source| {
+    if cache_v3_layout_needs_provisioning(&detection).map_err(|source| {
         OpenLocalBlockBackendError::DetectCacheBackend {
             cache_root: cache_root_display.clone(),
             source,
         }
-    })?;
-    let detection = v3::detect_cache_backends(cache_root).map_err(|source| {
-        OpenLocalBlockBackendError::DetectCacheBackend {
-            cache_root: cache_root_display.clone(),
-            source,
-        }
-    })?;
+    })? {
+        provision_cache_v3_layout(&detection.layout).map_err(|source| {
+            OpenLocalBlockBackendError::ProvisionCacheV3Layout {
+                cache_root: detection.layout.v3_root.display().to_string(),
+                source,
+            }
+        })?;
+        detection = v3::detect_cache_backends(cache_root).map_err(|source| {
+            OpenLocalBlockBackendError::DetectCacheBackend {
+                cache_root: cache_root_display.clone(),
+                source,
+            }
+        })?;
+    }
     let backend_kind = v3::CacheBackendKind::CacheV3;
     let backend = match cache_budget_bytes {
         Some(cache_budget_bytes) => open_cache_v3_backend_with_budget(

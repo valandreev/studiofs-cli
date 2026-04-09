@@ -3228,9 +3228,17 @@ fn derive_local_backend_budget_bytes(
     block_size: u32,
     cache_runtime_tuning: CacheRuntimeTuning,
 ) -> u64 {
-    let block_size = u64::from(block_size.max(1));
-    cache_size
-        .max(block_size)
+    cache_size.max(minimum_local_backend_budget_bytes(
+        block_size,
+        cache_runtime_tuning,
+    ))
+}
+
+fn minimum_local_backend_budget_bytes(
+    block_size: u32,
+    cache_runtime_tuning: CacheRuntimeTuning,
+) -> u64 {
+    u64::from(block_size.max(1))
         .max(cache_runtime_tuning.max_dirty_bytes as u64)
         .max(cache_runtime_tuning.write_eager_flush_batch_bytes as u64)
 }
@@ -3893,6 +3901,12 @@ fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) ->
     }
 }
 
+fn map_cache_backend_provision_error(cache_root: &str, source: std::io::Error) -> VfsError {
+    VfsError::Other(format!(
+        "failed to provision cache-v3 layout under '{cache_root}': {source}"
+    ))
+}
+
 fn map_open_local_block_backend_error(
     cache_dir: &str,
     source: OpenLocalBlockBackendError,
@@ -3900,6 +3914,9 @@ fn map_open_local_block_backend_error(
     match source {
         OpenLocalBlockBackendError::DetectCacheBackend { source, .. } => {
             map_cache_backend_detection_error(cache_dir, source)
+        }
+        OpenLocalBlockBackendError::ProvisionCacheV3Layout { cache_root, source } => {
+            map_cache_backend_provision_error(&cache_root, source)
         }
         OpenLocalBlockBackendError::UnsupportedLegacyCacheRoot {
             legacy_raw_path, ..
@@ -4715,8 +4732,22 @@ impl StudioVfs {
                 &config,
                 config.cache_runtime_overrides(),
             );
+            let minimum_local_backend_budget_bytes =
+                minimum_local_backend_budget_bytes(block_size, cache_runtime_tuning);
             let local_backend_budget_bytes =
                 derive_local_backend_budget_bytes(cache_size, block_size, cache_runtime_tuning);
+            if local_backend_budget_bytes > cache_size {
+                warn!(
+                    configured_cache_size_bytes = cache_size,
+                    minimum_required_cache_v3_budget_bytes = minimum_local_backend_budget_bytes,
+                    effective_cache_v3_budget_bytes = local_backend_budget_bytes,
+                    block_size,
+                    max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes,
+                    write_eager_flush_batch_bytes =
+                        cache_runtime_tuning.write_eager_flush_batch_bytes,
+                    "configured cache_size is below Cache 3.0 local durability requirements; clamping local backend budget upward"
+                );
+            }
             let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
             if (block_size as usize) > cloud_logical_block_capacity {
                 return Err(VfsError::Other(format!(
@@ -12617,6 +12648,25 @@ mod tests {
             VfsError::CacheBackendDetection { cache_root, source } => {
                 assert_eq!(cache_root, "E:\\cache-root");
                 assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn open_local_block_backend_provision_errors_surface_clear_runtime_message() {
+        let source = OpenLocalBlockBackendError::ProvisionCacheV3Layout {
+            cache_root: "E:\\cache-root\\v3".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated permission error",
+            ),
+        };
+        let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
+        match mapped {
+            VfsError::Other(message) => {
+                assert!(message.contains("failed to provision cache-v3 layout"));
+                assert!(message.contains("E:\\cache-root\\v3"));
             }
             other => panic!("unexpected error variant: {other}"),
         }
