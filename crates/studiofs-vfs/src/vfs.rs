@@ -11,7 +11,8 @@
 //! 1. Split data into blocks
 //! 2. Merge dirty bytes into the per-file `WriteBuffer`
 //! 3. Persist full dirty blocks locally via the raw backend `put(...)`
-//! 4. `sync_data()` and persist extent metadata / attrs
+//! 4. Apply local `sync_data()` barriers (strict for fsync / durable mode,
+//!    grouped in fast mode) and persist extent metadata / attrs
 //! 5. Queue committed extents for async upload + remote publish
 //!
 //! Read Path:
@@ -249,6 +250,10 @@ pub struct VfsLatencyHistogramSnapshot {
 pub struct VfsWritePathSyncDataStats {
     pub calls: u64,
     pub calls_per_sec: f64,
+    pub deferred_calls: u64,
+    pub synced_bytes: u64,
+    pub synced_gib: f64,
+    pub calls_per_gib: f64,
     pub total_ms: f64,
     pub avg_ms: f64,
     pub max_ms: f64,
@@ -733,6 +738,9 @@ const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 4 * 1024 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 8 * 1024 * 1024 * 1024;
 const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 128 * 1024 * 1024;
+const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
+const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
+const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 25;
 const CACHE_RUNTIME_MIN_INGRESS_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_INGRESS_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
@@ -769,6 +777,43 @@ pub enum CacheSafetyMode {
     /// Keep a durable local accept path via append-only ingress WAL +
     /// checkpoint recovery state.
     Durable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LocalSyncPolicy {
+    Opportunistic,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSyncTrigger {
+    Explicit,
+    DurableMode,
+    BytesThreshold,
+    TimeWindow,
+}
+
+fn local_sync_trigger_for_write_path(
+    cache_safety_mode: CacheSafetyMode,
+    local_sync_policy: LocalSyncPolicy,
+    pending_bytes: u64,
+    elapsed_since_last_sync: Duration,
+    group_min_bytes: u64,
+    group_max_delay: Duration,
+) -> Option<LocalSyncTrigger> {
+    if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+        return Some(LocalSyncTrigger::Explicit);
+    }
+    if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
+        return Some(LocalSyncTrigger::DurableMode);
+    }
+    if pending_bytes >= group_min_bytes {
+        return Some(LocalSyncTrigger::BytesThreshold);
+    }
+    if elapsed_since_last_sync >= group_max_delay {
+        return Some(LocalSyncTrigger::TimeWindow);
+    }
+    None
 }
 
 // =============================================================================
@@ -3248,6 +3293,14 @@ fn derive_upload_cache_io_foreground_cost_base(upload_cache_io_slots: usize) -> 
         .min(slots)
 }
 
+fn derive_fast_mode_sync_group_min_bytes(write_eager_flush_batch_bytes: usize) -> u64 {
+    let target = (write_eager_flush_batch_bytes as u64).saturating_mul(4);
+    target.clamp(
+        FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR,
+        FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
+    )
+}
+
 fn derive_upload_cache_io_foreground_cost_step(upload_cache_io_slots: usize) -> u32 {
     let slots = upload_cache_io_slots.clamp(1, u32::MAX as usize) as u32;
     slots
@@ -3448,6 +3501,8 @@ struct MetricsState {
     prefetch_queue_depth: AtomicU64,
     flush_ordered_calls: AtomicU64,
     block_store_sync_data_calls: AtomicU64,
+    block_store_sync_data_deferred_calls: AtomicU64,
+    block_store_sync_data_synced_bytes: AtomicU64,
     block_store_sync_data_total_ns: AtomicU64,
     block_store_sync_data_max_ns: AtomicU64,
     block_store_sync_data_histogram: LatencyHistogram,
@@ -3465,6 +3520,8 @@ impl MetricsState {
             prefetch_queue_depth: AtomicU64::new(0),
             flush_ordered_calls: AtomicU64::new(0),
             block_store_sync_data_calls: AtomicU64::new(0),
+            block_store_sync_data_deferred_calls: AtomicU64::new(0),
+            block_store_sync_data_synced_bytes: AtomicU64::new(0),
             block_store_sync_data_total_ns: AtomicU64::new(0),
             block_store_sync_data_max_ns: AtomicU64::new(0),
             block_store_sync_data_histogram: LatencyHistogram::default(),
@@ -3706,6 +3763,12 @@ pub struct StudioVfs {
     /// Minimum dirty full-block batch size before `write()` pays the local
     /// persist boundary for eager block flushes.
     write_eager_flush_batch_bytes: usize,
+    /// Configured local cache safety mode for write-path durability behavior.
+    cache_safety_mode: CacheSafetyMode,
+    /// Fast-mode group-commit minimum bytes before forcing local sync.
+    local_sync_group_min_bytes: u64,
+    /// Fast-mode group-commit maximum delay before forcing local sync.
+    local_sync_group_max_delay: Duration,
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
     ingress_wal: IngressWal,
@@ -4738,6 +4801,10 @@ impl StudioVfs {
             let distributed_flock = None;
             let max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes;
             let write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes;
+            let local_sync_group_min_bytes =
+                derive_fast_mode_sync_group_min_bytes(write_eager_flush_batch_bytes);
+            let local_sync_group_max_delay =
+                Duration::from_millis(FAST_MODE_SYNC_GROUP_MAX_DELAY_MS);
             let max_xattr_bytes = config.max_xattr_bytes;
             let dentry_cache_capacity = config.dentry_cache_capacity;
             let dentry_cache_bytes = config.dentry_cache_bytes;
@@ -4969,6 +5036,7 @@ impl StudioVfs {
             let upload_worker_count = config.upload_worker_count;
             let publish_visibility_timeout =
                 Duration::from_secs(config.publish_visibility_timeout_secs);
+            let local_sync_group_max_delay_ms = local_sync_group_max_delay.as_millis() as u64;
             debug!(
                 writeback = true,
                 cache_size_bytes = cache_size,
@@ -4991,6 +5059,8 @@ impl StudioVfs {
                 upload_fg_read_latency_sticky_windows,
                 max_dirty_bytes,
                 write_eager_flush_batch_bytes,
+                local_sync_group_min_bytes,
+                local_sync_group_max_delay_ms,
                 max_xattr_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
@@ -5055,6 +5125,9 @@ impl StudioVfs {
                 ),
                 max_dirty_bytes: AtomicUsize::new(max_dirty_bytes),
                 write_eager_flush_batch_bytes,
+                cache_safety_mode,
+                local_sync_group_min_bytes,
+                local_sync_group_max_delay,
                 max_xattr_bytes,
                 ingress_wal,
                 handle_table: HandleTable::new(),
@@ -7108,6 +7181,51 @@ impl StudioVfs {
         .await
     }
 
+    async fn maybe_block_store_sync_data_async(
+        &self,
+        persisted_bytes: u64,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+        let pending_before = local_sync_group.pending_bytes;
+        if pending_before == 0 && persisted_bytes > 0 {
+            local_sync_group.last_sync_at = Instant::now();
+        }
+        local_sync_group.pending_bytes = local_sync_group
+            .pending_bytes
+            .saturating_add(persisted_bytes);
+
+        let trigger = local_sync_trigger_for_write_path(
+            self.cache_safety_mode,
+            local_sync_policy,
+            local_sync_group.pending_bytes,
+            local_sync_group.last_sync_at.elapsed(),
+            self.local_sync_group_min_bytes,
+            self.local_sync_group_max_delay,
+        );
+        let Some(_trigger) = trigger else {
+            self.state
+                .metrics
+                .block_store_sync_data_deferred_calls
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
+
+        let bytes_to_sync = local_sync_group.pending_bytes;
+        if bytes_to_sync == 0 {
+            return Ok(());
+        }
+
+        self.block_store_sync_data_async().await?;
+        local_sync_group.pending_bytes = 0;
+        local_sync_group.last_sync_at = Instant::now();
+        self.state
+            .metrics
+            .block_store_sync_data_synced_bytes
+            .fetch_add(bytes_to_sync, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
         let started = Instant::now();
@@ -7968,6 +8086,16 @@ impl StudioVfs {
             .metrics
             .block_store_sync_data_calls
             .load(Ordering::Relaxed);
+        let sync_deferred_calls = self
+            .state
+            .metrics
+            .block_store_sync_data_deferred_calls
+            .load(Ordering::Relaxed);
+        let sync_bytes = self
+            .state
+            .metrics
+            .block_store_sync_data_synced_bytes
+            .load(Ordering::Relaxed);
         let sync_total_ns = self
             .state
             .metrics
@@ -7987,6 +8115,12 @@ impl StudioVfs {
         let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.50);
         let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.95);
         let (p99_ns, p99_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.99);
+        let synced_gib = sync_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let calls_per_gib = if synced_gib > 0.0 {
+            sync_calls as f64 / synced_gib
+        } else {
+            0.0
+        };
 
         VfsWritePathObservabilitySnapshot {
             generated_unix_ms: Self::now_unix_millis(),
@@ -7997,6 +8131,10 @@ impl StudioVfs {
             block_store_sync_data: VfsWritePathSyncDataStats {
                 calls: sync_calls,
                 calls_per_sec: Self::per_second(sync_calls, elapsed),
+                deferred_calls: sync_deferred_calls,
+                synced_bytes: sync_bytes,
+                synced_gib,
+                calls_per_gib,
                 total_ms: sync_total_ns as f64 / 1_000_000.0,
                 avg_ms: if sync_calls == 0 {
                     0.0
@@ -8839,7 +8977,8 @@ impl StudioVfs {
                 || open_file.flags.contains(OpenFlags::RDWR);
             let has_local_dirty_state = self.inode_has_local_dirty_state(ino);
             if has_local_dirty_state {
-                self.flush_ordered(ino).await?;
+                self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
+                    .await?;
             }
             if writable_handle || has_local_dirty_state {
                 self.ensure_no_upload_sticky_error(ino)?;
@@ -8862,7 +9001,8 @@ impl StudioVfs {
                 .enter_file_session_op(ino, FileSessionOperation::Flush)
                 .await;
             let result: VfsResult<()> = async {
-                self.flush_ordered(ino).await?;
+                self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
+                    .await?;
                 self.ensure_no_upload_sticky_error(ino)?;
                 Ok(())
             }
@@ -8891,7 +9031,9 @@ impl StudioVfs {
             }
 
             // Flush pending write buffer
-            self.flush_ordered(ino).await?;
+            self.flush_ordered(ino, LocalSyncPolicy::Strict).await?;
+            self.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+                .await?;
 
             // If full fsync (not datasync), also persist dirty attributes to redb
             let dirty_attr = if datasync {
@@ -10678,7 +10820,9 @@ impl StudioVfs {
         let session = self
             .enter_file_session_op(ino, FileSessionOperation::Flush)
             .await;
-        let result = self.flush_ordered(ino).await;
+        let result = self
+            .flush_ordered(ino, LocalSyncPolicy::Opportunistic)
+            .await;
         drop(session);
         self.maybe_gc_file_session(ino);
         result
@@ -14043,6 +14187,163 @@ mod tests {
         assert_eq!(
             VfsConfig::default().cache_safety_mode,
             CacheSafetyMode::Fast
+        );
+    }
+
+    #[test]
+    fn local_sync_policy_strict_always_triggers_sync() {
+        let trigger = local_sync_trigger_for_write_path(
+            CacheSafetyMode::Fast,
+            LocalSyncPolicy::Strict,
+            1,
+            Duration::from_millis(1),
+            64 * 1024 * 1024,
+            Duration::from_millis(25),
+        );
+        assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
+    }
+
+    #[test]
+    fn local_sync_policy_durable_mode_always_triggers_sync() {
+        let trigger = local_sync_trigger_for_write_path(
+            CacheSafetyMode::Durable,
+            LocalSyncPolicy::Opportunistic,
+            1,
+            Duration::from_millis(1),
+            64 * 1024 * 1024,
+            Duration::from_millis(25),
+        );
+        assert_eq!(trigger, Some(LocalSyncTrigger::DurableMode));
+    }
+
+    #[test]
+    fn local_sync_policy_fast_mode_waits_until_threshold_or_window() {
+        let bytes_trigger = local_sync_trigger_for_write_path(
+            CacheSafetyMode::Fast,
+            LocalSyncPolicy::Opportunistic,
+            64 * 1024 * 1024,
+            Duration::from_millis(1),
+            64 * 1024 * 1024,
+            Duration::from_millis(25),
+        );
+        assert_eq!(bytes_trigger, Some(LocalSyncTrigger::BytesThreshold));
+
+        let window_trigger = local_sync_trigger_for_write_path(
+            CacheSafetyMode::Fast,
+            LocalSyncPolicy::Opportunistic,
+            1024,
+            Duration::from_millis(30),
+            64 * 1024 * 1024,
+            Duration::from_millis(25),
+        );
+        assert_eq!(window_trigger, Some(LocalSyncTrigger::TimeWindow));
+
+        let deferred = local_sync_trigger_for_write_path(
+            CacheSafetyMode::Fast,
+            LocalSyncPolicy::Opportunistic,
+            1024,
+            Duration::from_millis(1),
+            64 * 1024 * 1024,
+            Duration::from_millis(25),
+        );
+        assert_eq!(deferred, None);
+    }
+
+    #[test]
+    fn strict_local_sync_flushes_pending_group_commit_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "strict-local-sync-group");
+        rt.block_on(async {
+            let mut group = vfs.state.write_buffer.local_sync_group.lock().await;
+            group.pending_bytes = 4096;
+            group.last_sync_at = Instant::now();
+        });
+
+        let calls_before = vfs
+            .state
+            .metrics
+            .block_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let synced_before = vfs
+            .state
+            .metrics
+            .block_store_sync_data_synced_bytes
+            .load(Ordering::Relaxed);
+
+        rt.block_on(async {
+            vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+                .await
+                .expect("strict local sync");
+        });
+
+        let calls_after = vfs
+            .state
+            .metrics
+            .block_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let synced_after = vfs
+            .state
+            .metrics
+            .block_store_sync_data_synced_bytes
+            .load(Ordering::Relaxed);
+        assert!(
+            calls_after > calls_before,
+            "strict sync should force backend sync_data"
+        );
+        assert!(
+            synced_after >= synced_before + 4096,
+            "strict sync should account for pending group-commit bytes"
+        );
+        rt.block_on(async {
+            let group = vfs.state.write_buffer.local_sync_group.lock().await;
+            assert_eq!(group.pending_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn opportunistic_local_sync_defers_when_threshold_not_reached() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-group");
+        rt.block_on(async {
+            let mut group = vfs.state.write_buffer.local_sync_group.lock().await;
+            group.pending_bytes = 1024;
+            group.last_sync_at = Instant::now();
+        });
+
+        let calls_before = vfs
+            .state
+            .metrics
+            .block_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let deferred_before = vfs
+            .state
+            .metrics
+            .block_store_sync_data_deferred_calls
+            .load(Ordering::Relaxed);
+
+        rt.block_on(async {
+            vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
+                .await
+                .expect("opportunistic local sync");
+        });
+
+        let calls_after = vfs
+            .state
+            .metrics
+            .block_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let deferred_after = vfs
+            .state
+            .metrics
+            .block_store_sync_data_deferred_calls
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            calls_after, calls_before,
+            "opportunistic sync should not force sync_data under threshold/window"
+        );
+        assert!(
+            deferred_after > deferred_before,
+            "opportunistic defer should be tracked"
         );
     }
 
