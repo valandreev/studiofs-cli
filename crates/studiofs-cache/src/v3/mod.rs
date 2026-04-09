@@ -1,7 +1,7 @@
 //! Cache 3.0 contract and local backend.
 //!
 //! This module defines:
-//! - the non-mutating detection contract for legacy raw state vs Cache 3.0;
+//! - the non-mutating detection contract for Cache 3.0 layout state;
 //! - the active Cache 3.0 local block backend backed by a file-per-block
 //!   payload store plus redb lifecycle index.
 
@@ -38,7 +38,6 @@ pub use layout::{
 pub use reconcile::{CacheV3StartupReconcileError, CacheV3StartupReconcileReport};
 use reconcile::{CacheV3StartupReconcileMode, reconcile_startup_state};
 
-const LEGACY_RAW_DATA_FILE_NAME: &str = "blocks.raw";
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
 #[cfg(not(test))]
@@ -73,28 +72,18 @@ impl fmt::Display for CacheBackendKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheBackendDetection {
     pub layout: CacheV3Layout,
-    pub legacy_raw_data_path: PathBuf,
-    pub legacy_raw_data_exists: bool,
     pub v3_layout_marker_exists: bool,
     pub v3_index_exists: bool,
     pub v3_payload_blocks_dir_exists: bool,
 }
 
 impl CacheBackendDetection {
-    pub fn has_legacy_raw_backend(&self) -> bool {
-        self.legacy_raw_data_exists
-    }
-
     pub fn has_cache_v3_contract(&self) -> bool {
         self.v3_layout_marker_exists
     }
 
-    pub fn has_dual_layout(&self) -> bool {
-        self.has_legacy_raw_backend() && self.has_cache_v3_contract()
-    }
-
     pub fn runtime_backend(&self) -> Option<CacheBackendKind> {
-        if self.has_legacy_raw_backend() || !self.has_cache_v3_contract() {
+        if !self.has_cache_v3_contract() {
             None
         } else {
             Some(CacheBackendKind::CacheV3)
@@ -107,17 +96,14 @@ impl CacheBackendDetection {
 /// This function never creates, removes, or mutates filesystem entries.
 pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetection> {
     let layout = CacheV3Layout::from_cache_root(cache_root);
-    let legacy_raw_data_path = cache_root.join(LEGACY_RAW_DATA_FILE_NAME);
     let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
     let v3_index_exists = layout.redb_index_path.try_exists()?;
     let v3_payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
     Ok(CacheBackendDetection {
         layout,
-        legacy_raw_data_exists: legacy_raw_data_path.try_exists()?,
         v3_layout_marker_exists,
         v3_index_exists,
         v3_payload_blocks_dir_exists,
-        legacy_raw_data_path,
     })
 }
 
@@ -905,6 +891,7 @@ impl PendingAccessTouches {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::local_block_backend::contract_tests::assert_local_block_backend_contract;
     use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
     fn create_v3_marker(layout: &CacheV3Layout) {
@@ -917,21 +904,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let detection = detect_cache_backends(temp.path()).unwrap();
 
-        assert!(!detection.has_legacy_raw_backend());
-        assert!(!detection.has_cache_v3_contract());
-        assert!(!detection.v3_index_exists);
-        assert!(!detection.v3_payload_blocks_dir_exists);
-        assert_eq!(detection.runtime_backend(), None);
-    }
-
-    #[test]
-    fn detects_legacy_raw_layout() {
-        let temp = tempfile::tempdir().unwrap();
-        let raw_path = temp.path().join(LEGACY_RAW_DATA_FILE_NAME);
-        std::fs::write(&raw_path, b"raw").unwrap();
-
-        let detection = detect_cache_backends(temp.path()).unwrap();
-        assert!(detection.has_legacy_raw_backend());
         assert!(!detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
@@ -945,26 +917,10 @@ mod tests {
         create_v3_marker(&layout);
 
         let detection = detect_cache_backends(temp.path()).unwrap();
-        assert!(!detection.has_legacy_raw_backend());
         assert!(detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
         assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
-    }
-
-    #[test]
-    fn detects_dual_layout_as_runtime_blocked() {
-        let temp = tempfile::tempdir().unwrap();
-        let raw_path = temp.path().join(LEGACY_RAW_DATA_FILE_NAME);
-        std::fs::write(&raw_path, b"raw").unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
-        create_v3_marker(&layout);
-
-        let detection = detect_cache_backends(temp.path()).unwrap();
-        assert!(detection.has_dual_layout());
-        assert!(!detection.v3_index_exists);
-        assert!(!detection.v3_payload_blocks_dir_exists);
-        assert_eq!(detection.runtime_backend(), None);
     }
 
     #[test]
@@ -979,6 +935,21 @@ mod tests {
             err,
             CacheV3LocalBlockBackendError::MissingLayoutMarker { .. }
         ));
+    }
+
+    #[test]
+    fn cache_v3_backend_satisfies_local_block_backend_contract() {
+        assert_local_block_backend_contract(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let layout = CacheV3Layout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0xCA; 16],
+            })
+            .unwrap();
+            (backend, temp)
+        });
     }
 
     #[test]
@@ -1097,14 +1068,10 @@ mod tests {
             layout.payload_block_path(0xABCD).exists(),
             "cache-v3 must persist each block as an individual payload file"
         );
-        assert!(
-            !layout.v3_root.join(LEGACY_RAW_DATA_FILE_NAME).exists(),
-            "cache-v3 data path must not rely on legacy single-file blocks.raw storage"
-        );
     }
 
     #[test]
-    fn cache_v3_backend_reopens_without_legacy_raw_payload_file() {
+    fn cache_v3_backend_reopens_with_existing_payload_file() {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
@@ -1117,11 +1084,6 @@ mod tests {
         backend.put(77, b"reopen-payload", false).unwrap();
         backend.sync_data().unwrap();
         drop(backend);
-
-        let legacy_raw = layout.v3_root.join(LEGACY_RAW_DATA_FILE_NAME);
-        if legacy_raw.exists() {
-            std::fs::remove_file(&legacy_raw).unwrap();
-        }
 
         let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),

@@ -1,7 +1,7 @@
 //! Cache 3.0 startup reconciliation.
 //!
 //! Startup reconciliation is intentionally scoped to the Cache 3.0 subtree.
-//! It never touches legacy `blocks.raw` data under the cache root.
+//! It never mutates unrelated files under the cache root.
 
 use std::io;
 use std::path::Path;
@@ -342,14 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconcile_never_touches_legacy_raw_data() {
+    fn startup_reconcile_never_touches_unrelated_cache_root_files() {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
         create_v3_marker(&layout);
         std::fs::create_dir_all(&layout.payload_blocks_dir).unwrap();
 
-        let legacy_raw_path = layout.cache_root.join("blocks.raw");
-        std::fs::write(&legacy_raw_path, b"legacy").unwrap();
+        let unrelated_path = layout.cache_root.join("unrelated.cache-artifact");
+        std::fs::write(&unrelated_path, b"keep-me").unwrap();
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
         let report =
@@ -357,6 +357,6 @@ mod tests {
                 .unwrap();
 
         assert!(report.is_clean());
-        assert_eq!(std::fs::read(&legacy_raw_path).unwrap(), b"legacy");
+        assert_eq!(std::fs::read(&unrelated_path).unwrap(), b"keep-me");
     }
 }
