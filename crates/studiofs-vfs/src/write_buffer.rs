@@ -39,6 +39,11 @@ struct PersistedWriteBlock {
     data: Bytes,
 }
 
+pub(super) struct LocalSyncGroupState {
+    pub(super) pending_bytes: u64,
+    pub(super) last_sync_at: Instant,
+}
+
 pub(super) struct WriteBufferState {
     pub(super) pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
     pub(super) pending_block_indexes:
@@ -53,6 +58,7 @@ pub(super) struct WriteBufferState {
     pub(super) fast_backpressure_wait_ms: AtomicU64,
     pub(super) fast_backpressure_events: AtomicU64,
     pub(super) fast_backpressure_stall_max_ms: AtomicU64,
+    pub(super) local_sync_group: tokio::sync::Mutex<LocalSyncGroupState>,
 }
 
 impl WriteBufferState {
@@ -68,6 +74,10 @@ impl WriteBufferState {
             fast_backpressure_wait_ms: AtomicU64::new(0),
             fast_backpressure_events: AtomicU64::new(0),
             fast_backpressure_stall_max_ms: AtomicU64::new(0),
+            local_sync_group: tokio::sync::Mutex::new(LocalSyncGroupState {
+                pending_bytes: 0,
+                last_sync_at: Instant::now(),
+            }),
         }
     }
 }
@@ -397,6 +407,7 @@ impl StudioVfs {
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
+        local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<Vec<PersistedWriteBlock>> {
         if blocks.is_empty() {
             if let Some(mut attr) = attr_to_persist {
@@ -468,7 +479,12 @@ impl StudioVfs {
                     result?;
                 }
             }
-            self.block_store_sync_data_async().await?;
+            let persisted_bytes: u64 = persisted_blocks
+                .iter()
+                .map(|block| block.data.len() as u64)
+                .sum();
+            self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
+                .await?;
 
             let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
                 std::collections::BTreeMap::new();
@@ -670,10 +686,11 @@ impl StudioVfs {
     async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
         let started = Instant::now();
         let _ = self
-            .flush_dirty_full_write_buffer_blocks(ino, 1, None)
+            .flush_dirty_full_write_buffer_blocks(ino, 1, None, LocalSyncPolicy::Opportunistic)
             .await?;
         if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
-            self.flush_ordered(ino).await?;
+            self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
+                .await?;
         }
         let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if waited_ms > 0 {
@@ -909,6 +926,7 @@ impl StudioVfs {
         ino: Ino,
         minimum_batch_bytes: usize,
         fallback_content_epoch: Option<u64>,
+        local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
         let (full_blocks, full_block_batch_bytes) =
             self.snapshot_dirty_full_write_buffer_blocks(ino);
@@ -927,7 +945,14 @@ impl StudioVfs {
         let chunk_slices = self.snapshot_dirty_write_buffer_chunk_slices(ino, &full_blocks);
         let attr_to_clear = dirty_attr.clone();
         let persisted_blocks = self
-            .persist_write_buffer_blocks(ino, full_blocks, chunk_slices, content_epoch, dirty_attr)
+            .persist_write_buffer_blocks(
+                ino,
+                full_blocks,
+                chunk_slices,
+                content_epoch,
+                dirty_attr,
+                local_sync_policy,
+            )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
@@ -1235,6 +1260,7 @@ impl StudioVfs {
                     ino,
                     self.write_eager_flush_batch_bytes,
                     Some(base_attr.content_epoch),
+                    LocalSyncPolicy::Opportunistic,
                 )
                 .await?
         {
@@ -1257,7 +1283,11 @@ impl StudioVfs {
         Ok(written as u32)
     }
 
-    pub(super) async fn flush_ordered(&self, ino: Ino) -> VfsResult<()> {
+    pub(super) async fn flush_ordered(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
         self.state
             .metrics
             .flush_ordered_calls
@@ -1283,6 +1313,7 @@ impl StudioVfs {
                 chunk_slices,
                 content_epoch,
                 dirty_attr,
+                local_sync_policy,
             )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
