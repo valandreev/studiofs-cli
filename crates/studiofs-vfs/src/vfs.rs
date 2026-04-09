@@ -7949,6 +7949,13 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Returns true when the inode still has local dirty state that requires a
+    /// flush barrier before close/flush callback completion.
+    pub fn inode_has_local_dirty_state(&self, ino: Ino) -> bool {
+        self.has_pending_write_buffer_blocks_for_inode(ino)
+            || self.state.namespace.dirty_attrs.lock().contains_key(&ino)
+    }
+
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
         let flush_ordered_calls = self
@@ -8830,8 +8837,7 @@ impl StudioVfs {
 
             let writable_handle = open_file.flags.contains(OpenFlags::WRONLY)
                 || open_file.flags.contains(OpenFlags::RDWR);
-            let has_local_dirty_state = self.has_pending_write_buffer_blocks_for_inode(ino)
-                || self.state.namespace.dirty_attrs.lock().contains_key(&ino);
+            let has_local_dirty_state = self.inode_has_local_dirty_state(ino);
             if has_local_dirty_state {
                 self.flush_ordered(ino).await?;
             }
