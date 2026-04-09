@@ -6,7 +6,7 @@
 use std::io;
 use std::path::Path;
 
-use super::{CacheIndex, CacheIndexError, CacheV3Layout, FilePayloadStore};
+use super::{CacheIndex, CacheIndexError, CacheV3Layout};
 
 const LIST_PAGE_SIZE: usize = 4_096;
 const INDEX_REMOVE_BATCH_SIZE: usize = 1_024;
@@ -70,17 +70,14 @@ pub enum CacheV3StartupReconcileError {
 pub fn reconcile_startup_state(
     layout: &CacheV3Layout,
     index: &CacheIndex,
-    payload_store: &FilePayloadStore,
     mode: CacheV3StartupReconcileMode,
 ) -> Result<CacheV3StartupReconcileReport, CacheV3StartupReconcileError> {
     let temp_files_removed = remove_temp_files(layout)?;
     let stale_index_entries_removed = match mode {
         CacheV3StartupReconcileMode::Lightweight => {
-            prune_missing_payload_for_dirty_entries(index, payload_store)?
+            prune_missing_payload_for_dirty_entries(layout, index)?
         }
-        CacheV3StartupReconcileMode::Full => {
-            prune_missing_payload_for_all_entries(index, payload_store)?
-        }
+        CacheV3StartupReconcileMode::Full => prune_missing_payload_for_all_entries(layout, index)?,
     };
     let (additional_temp_files_removed, orphan_payload_files_removed) = match mode {
         CacheV3StartupReconcileMode::Lightweight => (0, 0),
@@ -97,8 +94,8 @@ pub fn reconcile_startup_state(
 }
 
 fn prune_missing_payload_for_dirty_entries(
+    layout: &CacheV3Layout,
     index: &CacheIndex,
-    payload_store: &FilePayloadStore,
 ) -> Result<u64, CacheV3StartupReconcileError> {
     let mut cursor = None;
     let mut removed_total = 0_u64;
@@ -112,7 +109,7 @@ fn prune_missing_payload_for_dirty_entries(
 
         let mut stale_ids = Vec::new();
         for entry in page {
-            if !payload_store.payload_exists(entry.object_id)? {
+            if !payload_exists(layout, entry.object_id)? {
                 stale_ids.push(entry.object_id);
             }
         }
@@ -129,8 +126,8 @@ fn prune_missing_payload_for_dirty_entries(
 }
 
 fn prune_missing_payload_for_all_entries(
+    layout: &CacheV3Layout,
     index: &CacheIndex,
-    payload_store: &FilePayloadStore,
 ) -> Result<u64, CacheV3StartupReconcileError> {
     let mut cursor = None;
     let mut removed_total = 0_u64;
@@ -143,7 +140,7 @@ fn prune_missing_payload_for_all_entries(
 
         let mut stale_ids = Vec::new();
         for (object_id, _) in page {
-            if !payload_store.payload_exists(object_id)? {
+            if !payload_exists(layout, object_id)? {
                 stale_ids.push(object_id);
             }
         }
@@ -160,17 +157,11 @@ fn prune_missing_payload_for_all_entries(
 
 fn remove_temp_files(layout: &CacheV3Layout) -> Result<u64, io::Error> {
     let mut removed = 0_u64;
-    visit_files_recursive(&layout.tmp_dir, &mut |file| {
+    visit_files_recursive(&layout.tmp_dir, &mut |file| -> io::Result<()> {
         if remove_file_if_present(file)? {
             removed = removed.saturating_add(1);
         }
         Ok(())
-    })
-    .map_err(|error| match error {
-        CacheV3StartupReconcileError::Io(io_error) => io_error,
-        CacheV3StartupReconcileError::Index(_) => {
-            io::Error::other("unexpected index error while cleaning startup temp files")
-        }
     })?;
     Ok(removed)
 }
@@ -181,7 +172,10 @@ fn remove_orphan_payload_and_legacy_temp_files(
 ) -> Result<(u64, u64), CacheV3StartupReconcileError> {
     let mut temp_files_removed = 0_u64;
     let mut orphan_payload_files_removed = 0_u64;
-    visit_files_recursive(&layout.payload_blocks_dir, &mut |file| {
+    visit_files_recursive(&layout.payload_blocks_dir, &mut |file| -> Result<
+        (),
+        CacheV3StartupReconcileError,
+    > {
         let Some(file_name) = file.file_name().and_then(|name| name.to_str()) else {
             return Ok(());
         };
@@ -202,12 +196,10 @@ fn remove_orphan_payload_and_legacy_temp_files(
     Ok((temp_files_removed, orphan_payload_files_removed))
 }
 
-fn visit_files_recursive<F>(
-    root: &Path,
-    visitor: &mut F,
-) -> Result<(), CacheV3StartupReconcileError>
+fn visit_files_recursive<F, E>(root: &Path, visitor: &mut F) -> Result<(), E>
 where
-    F: FnMut(&Path) -> Result<(), CacheV3StartupReconcileError>,
+    F: FnMut(&Path) -> Result<(), E>,
+    E: From<io::Error>,
 {
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -230,6 +222,10 @@ where
     Ok(())
 }
 
+fn payload_exists(layout: &CacheV3Layout, object_id: u64) -> io::Result<bool> {
+    layout.payload_block_path(object_id).try_exists()
+}
+
 fn remove_file_if_present(path: &Path) -> Result<bool, io::Error> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -242,6 +238,7 @@ fn remove_file_if_present(path: &Path) -> Result<bool, io::Error> {
 mod tests {
     use super::*;
     use crate::v2::LocalBlockLifecycleState;
+    use crate::v3::FilePayloadStore;
 
     fn create_v3_marker(layout: &CacheV3Layout) {
         std::fs::create_dir_all(&layout.v3_root).unwrap();
@@ -293,13 +290,9 @@ mod tests {
         std::fs::create_dir_all(tmp_in_tmp_dir.parent().unwrap()).unwrap();
         std::fs::write(&tmp_in_tmp_dir, b"staged").unwrap();
 
-        let report = reconcile_startup_state(
-            &layout,
-            &index,
-            &payload_store,
-            CacheV3StartupReconcileMode::Lightweight,
-        )
-        .unwrap();
+        let report =
+            reconcile_startup_state(&layout, &index, CacheV3StartupReconcileMode::Lightweight)
+                .unwrap();
         assert_eq!(report.temp_files_removed, 1);
         assert_eq!(report.stale_index_entries_removed, 1);
         assert_eq!(report.orphan_payload_files_removed, 0);
@@ -338,13 +331,8 @@ mod tests {
         std::fs::create_dir_all(legacy_tmp_path.parent().unwrap()).unwrap();
         std::fs::write(&legacy_tmp_path, b"legacy-tmp").unwrap();
 
-        let report = reconcile_startup_state(
-            &layout,
-            &index,
-            &payload_store,
-            CacheV3StartupReconcileMode::Full,
-        )
-        .unwrap();
+        let report =
+            reconcile_startup_state(&layout, &index, CacheV3StartupReconcileMode::Full).unwrap();
 
         assert_eq!(report.temp_files_removed, 1);
         assert_eq!(report.orphan_payload_files_removed, 1);
@@ -364,14 +352,9 @@ mod tests {
         std::fs::write(&legacy_raw_path, b"legacy").unwrap();
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
-        let payload_store = FilePayloadStore::open(layout.clone()).unwrap();
-        let report = reconcile_startup_state(
-            &layout,
-            &index,
-            &payload_store,
-            CacheV3StartupReconcileMode::Lightweight,
-        )
-        .unwrap();
+        let report =
+            reconcile_startup_state(&layout, &index, CacheV3StartupReconcileMode::Lightweight)
+                .unwrap();
 
         assert!(report.is_clean());
         assert_eq!(std::fs::read(&legacy_raw_path).unwrap(), b"legacy");

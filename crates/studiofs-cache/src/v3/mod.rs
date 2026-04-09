@@ -240,11 +240,12 @@ impl CacheV3LocalBlockBackend {
 
         let startup_reconcile_mode = CacheV3StartupReconcileMode::from_env();
         let startup_reconcile_report =
-            reconcile_startup_state(&layout, &index, &payload_store, startup_reconcile_mode)
-                .map_err(|source| CacheV3LocalBlockBackendError::StartupReconcile {
+            reconcile_startup_state(&layout, &index, startup_reconcile_mode).map_err(|source| {
+                CacheV3LocalBlockBackendError::StartupReconcile {
                     cache_root: layout.v3_root.clone(),
                     source,
-                })?;
+                }
+            })?;
         if !startup_reconcile_report.is_clean() {
             warn!(
                 mode = ?startup_reconcile_mode,
