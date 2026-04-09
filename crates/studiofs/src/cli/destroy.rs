@@ -21,12 +21,12 @@ fn describe_cache_generation_state(detection: Option<&CacheBackendDetection>) ->
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
         if detection.has_cache_v3_contract() {
-            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its cache-v3 subtree"
         } else {
-            "no default cache generation detected under metadata dir"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         }
     } else {
-        "default cache generation is unknown; inspect cache paths before manual cleanup"
+        "local cleanup removes the entire metadata directory (`meta_dir`); default cache generation could not be inspected"
     }
 }
 
@@ -277,7 +277,15 @@ mod tests {
     fn destroy_cleanup_scope_is_generation_aware() {
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true))),
-            "if default cache path is in use, metadata cleanup removes the cache-v3 subtree under that default root"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its cache-v3 subtree"
+        );
+        assert_eq!(
+            describe_destroy_cache_scope(Some(&detection(false))),
+            "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
+        );
+        assert_eq!(
+            describe_destroy_cache_scope(None),
+            "local cleanup removes the entire metadata directory (`meta_dir`); default cache generation could not be inspected"
         );
     }
 }
