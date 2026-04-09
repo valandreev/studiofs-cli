@@ -457,6 +457,7 @@ EXAMPLES:
     #[command(after_help = "\
 EXAMPLES:
   studiofs status myvolume
+  studiofs status myvolume --verbose
   studiofs status myvolume --cache-dir D:\\cache\\studiofs
 ")]
     Status {
@@ -466,6 +467,10 @@ EXAMPLES:
         /// Override local cache base directory (defaults to `<meta-dir>/cache`)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+
+        /// Include mounted write-path bottleneck metrics when available
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Manage defaults for `studiofs mount`.
@@ -745,9 +750,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Umount { mount_point } => {
             cli::umount::run(&mount_point)?;
         }
-        Commands::Status { name, cache_dir } => {
+        Commands::Status {
+            name,
+            cache_dir,
+            verbose,
+        } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::status::run(&name, &meta_dir, cache_dir.as_deref())?;
+            cli::status::run(&name, &meta_dir, cache_dir.as_deref(), verbose)?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
@@ -1169,9 +1178,31 @@ mod tests {
     fn status_parses_cache_dir() {
         let cli = parse(&["status", "vol", "--cache-dir", "D:\\cache\\studiofs"]).unwrap();
         match cli.command {
-            Commands::Status { name, cache_dir } => {
+            Commands::Status {
+                name,
+                cache_dir,
+                verbose,
+            } => {
                 assert_eq!(name, "vol");
                 assert_eq!(cache_dir.unwrap(), PathBuf::from("D:\\cache\\studiofs"));
+                assert!(!verbose);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_parses_verbose_flag() {
+        let cli = parse(&["status", "vol", "--verbose"]).unwrap();
+        match cli.command {
+            Commands::Status {
+                name,
+                cache_dir,
+                verbose,
+            } => {
+                assert_eq!(name, "vol");
+                assert!(cache_dir.is_none());
+                assert!(verbose);
             }
             other => panic!("expected Status, got {other:?}"),
         }

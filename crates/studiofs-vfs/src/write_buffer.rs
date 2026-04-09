@@ -1258,6 +1258,10 @@ impl StudioVfs {
     }
 
     pub(super) async fn flush_ordered(&self, ino: Ino) -> VfsResult<()> {
+        self.state
+            .metrics
+            .flush_ordered_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());

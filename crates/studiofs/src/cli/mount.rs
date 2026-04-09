@@ -3,6 +3,9 @@
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use studiofs_cache::LocalBackendSelectionMode;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
 use studiofs_cache::v3::CacheV3Layout;
@@ -11,7 +14,93 @@ use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
 use studiofs_vfs::{StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
+const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
+
+struct WritePathObservabilityPublisher {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl WritePathObservabilityPublisher {
+    fn new(vfs: Arc<StudioVfs>, output_path: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let output_path_for_thread = output_path.clone();
+        let handle = std::thread::Builder::new()
+            .name("studiofs-write-path-observability".to_string())
+            .spawn(move || {
+                loop {
+                    if let Err(error) =
+                        persist_write_path_observability_snapshot(&vfs, &output_path_for_thread)
+                    {
+                        warn!(
+                            path = %output_path_for_thread.display(),
+                            error = %error,
+                            "failed to persist write-path observability snapshot"
+                        );
+                    }
+
+                    if stop_for_thread.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(WRITE_PATH_OBSERVABILITY_INTERVAL);
+                }
+            });
+
+        match handle {
+            Ok(handle) => Self {
+                stop,
+                handle: Some(handle),
+            },
+            Err(error) => {
+                warn!(
+                    path = %output_path.display(),
+                    error = %error,
+                    "failed to spawn write-path observability publisher thread"
+                );
+                Self { stop, handle: None }
+            }
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            warn!("write-path observability publisher thread panicked");
+        }
+    }
+}
+
+impl Drop for WritePathObservabilityPublisher {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn persist_write_path_observability_snapshot(
+    vfs: &StudioVfs,
+    output_path: &Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    let payload = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| std::io::Error::other(format!("serialize metrics failed: {error}")))?;
+    let tmp_path = output_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, payload)?;
+    if output_path.exists() {
+        let _ = std::fs::remove_file(output_path);
+    }
+    std::fs::rename(tmp_path, output_path)?;
+    Ok(())
+}
 
 /// Initial local-cache budget used to size the mount-time cache directory.
 /// Capped at 25 % of total RAM so low-memory machines don't overshoot.
@@ -589,6 +678,10 @@ pub fn run(
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
     vfs.start()
         .map_err(|e| anyhow::anyhow!("failed to start vfs background workers: {e}"))?;
+    let mut write_path_observability_publisher = WritePathObservabilityPublisher::new(
+        vfs.clone(),
+        cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
+    );
 
     println!(
         "✓ Volume '{}' ready to mount at '{}'",
@@ -621,7 +714,7 @@ pub fn run(
         // Named event for external graceful shutdown (used by `studiofs umount`).
         let event_name = super::utils::shutdown_event_name(&actual_mount_path);
         info!("starting WinFSP mount at {actual_mount_path}");
-        studiofs_winfsp::mount_and_serve(
+        let mount_result = studiofs_winfsp::mount_and_serve(
             vfs,
             rt,
             &actual_mount_path,
@@ -630,8 +723,9 @@ pub fn run(
             read_only_mount,
             Some(&event_name),
             profiling,
-        )
-        .map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
+        );
+        write_path_observability_publisher.stop_and_join();
+        mount_result.map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
 
         // WinFSP returns normally — clean up PID file
         let _ = super::utils::remove_pid_file(&actual_mount_path);
@@ -640,7 +734,7 @@ pub fn run(
     #[cfg(unix)]
     {
         info!("starting FUSE mount at {actual_mount_path}");
-        studiofs_fuse::mount_and_serve(
+        let mount_result = studiofs_fuse::mount_and_serve(
             vfs,
             rt,
             &actual_mount_path,
@@ -648,8 +742,9 @@ pub fn run(
             run_in_foreground,
             read_only_mount,
             profiling,
-        )
-        .map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
+        );
+        write_path_observability_publisher.stop_and_join();
+        mount_result.map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
         // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
         // PID file is cleaned up by the umount command or overwritten on next mount.
     }

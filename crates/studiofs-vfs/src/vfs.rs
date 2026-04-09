@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
-use studiofs_cache::metrics::MaterializeBatchStats;
+use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::LocalBlockBackend;
 use studiofs_cache::v3::{CacheBackendKind, cache_v3_default_gate_status};
@@ -223,6 +223,56 @@ pub struct VfsIngressStats {
     pub checkpoint_active_segment_lag: u64,
     /// Number of distinct segment ids still referenced by the live ingress index.
     pub checkpoint_live_segments: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathLatencyQuantilesMs {
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsLatencyHistogramSnapshot {
+    pub bucket_upper_bounds_ns: Vec<u64>,
+    pub bucket_counts: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathSyncDataStats {
+    pub calls: u64,
+    pub calls_per_sec: f64,
+    pub total_ms: f64,
+    pub avg_ms: f64,
+    pub max_ms: f64,
+    pub latency_quantiles_ms: VfsWritePathLatencyQuantilesMs,
+    pub latency_histogram: VfsLatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathWinfspCallbackStats {
+    pub write: u64,
+    pub flush: u64,
+    pub cleanup_flush_fh: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathBackpressureStats {
+    pub events: u64,
+    pub wait_total_ms: u64,
+    pub stall_max_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathObservabilitySnapshot {
+    pub generated_unix_ms: u64,
+    pub uptime_secs: f64,
+    pub backend_tag: String,
+    pub flush_ordered_calls: u64,
+    pub flush_ordered_calls_per_sec: f64,
+    pub block_store_sync_data: VfsWritePathSyncDataStats,
+    pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
+    pub write_backpressure: VfsWritePathBackpressureStats,
 }
 
 /// Compatibility-shaped acceptance decision for a prospective write batch.
@@ -3387,6 +3437,14 @@ struct MetricsState {
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
+    flush_ordered_calls: AtomicU64,
+    block_store_sync_data_calls: AtomicU64,
+    block_store_sync_data_total_ns: AtomicU64,
+    block_store_sync_data_max_ns: AtomicU64,
+    block_store_sync_data_histogram: LatencyHistogram,
+    winfsp_write_callbacks: AtomicU64,
+    winfsp_flush_callbacks: AtomicU64,
+    winfsp_cleanup_flush_fh_callbacks: AtomicU64,
 }
 
 impl MetricsState {
@@ -3396,6 +3454,14 @@ impl MetricsState {
             ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
+            flush_ordered_calls: AtomicU64::new(0),
+            block_store_sync_data_calls: AtomicU64::new(0),
+            block_store_sync_data_total_ns: AtomicU64::new(0),
+            block_store_sync_data_max_ns: AtomicU64::new(0),
+            block_store_sync_data_histogram: LatencyHistogram::default(),
+            winfsp_write_callbacks: AtomicU64::new(0),
+            winfsp_flush_callbacks: AtomicU64::new(0),
+            winfsp_cleanup_flush_fh_callbacks: AtomicU64::new(0),
         }
     }
 }
@@ -3656,6 +3722,8 @@ pub struct StudioVfs {
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
+    write_path_backend_tag: String,
+    write_path_started_at: Instant,
 }
 
 struct ForegroundReadScope<'a> {
@@ -4996,6 +5064,8 @@ impl StudioVfs {
                 fetch_scheduler: fetch_scheduler.clone(),
                 distributed_flock,
                 kernel_invalidator: RwLock::new(None),
+                write_path_backend_tag: selected_backend.as_str().to_string(),
+                write_path_started_at: Instant::now(),
             });
 
             let pending_uploads = vfs.block_cache.snapshot_pending_uploads();
@@ -7031,12 +7101,31 @@ impl StudioVfs {
 
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || {
+        let started = Instant::now();
+        let result = run_blocking(move || {
             block_store.sync_data().map_err(|error| {
                 VfsError::Other(format!("block backend sync_data failed: {error}"))
             })
         })
-        .await
+        .await;
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.state
+            .metrics
+            .block_store_sync_data_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .metrics
+            .block_store_sync_data_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.state
+            .metrics
+            .block_store_sync_data_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.state
+            .metrics
+            .block_store_sync_data_histogram
+            .observe_ns(elapsed_ns);
+        result
     }
 
     async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
@@ -7784,6 +7873,157 @@ impl StudioVfs {
             checkpoint_pending_mutations: 0,
             checkpoint_active_segment_lag: 0,
             checkpoint_live_segments: 0,
+        }
+    }
+
+    fn per_second(total: u64, elapsed: Duration) -> f64 {
+        let secs = elapsed.as_secs_f64();
+        if secs <= f64::EPSILON {
+            0.0
+        } else {
+            total as f64 / secs
+        }
+    }
+
+    fn histogram_percentile_ns(snapshot: &LatencyHistogramSnapshot, percentile: f64) -> u64 {
+        if snapshot.bucket_counts.is_empty() {
+            return 0;
+        }
+        let total: u64 = snapshot.bucket_counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let clamped = percentile.clamp(0.0, 1.0);
+        let target = ((total as f64) * clamped).ceil() as u64;
+        let mut cumulative = 0u64;
+        for (idx, count) in snapshot.bucket_counts.iter().copied().enumerate() {
+            cumulative = cumulative.saturating_add(count);
+            if cumulative >= target.max(1) {
+                return snapshot
+                    .bucket_upper_bounds_ns
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        snapshot.bucket_upper_bounds_ns.last().copied().unwrap_or(0)
+                    });
+            }
+        }
+        snapshot.bucket_upper_bounds_ns.last().copied().unwrap_or(0)
+    }
+
+    pub fn note_winfsp_write_callback(&self) {
+        self.state
+            .metrics
+            .winfsp_write_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_winfsp_flush_callback(&self) {
+        self.state
+            .metrics
+            .winfsp_flush_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_winfsp_cleanup_flush_fh_callback(&self) {
+        self.state
+            .metrics
+            .winfsp_cleanup_flush_fh_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
+        let elapsed = self.write_path_started_at.elapsed();
+        let flush_ordered_calls = self
+            .state
+            .metrics
+            .flush_ordered_calls
+            .load(Ordering::Relaxed);
+        let sync_calls = self
+            .state
+            .metrics
+            .block_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let sync_total_ns = self
+            .state
+            .metrics
+            .block_store_sync_data_total_ns
+            .load(Ordering::Relaxed);
+        let sync_max_ns = self
+            .state
+            .metrics
+            .block_store_sync_data_max_ns
+            .load(Ordering::Relaxed);
+        let sync_histogram = self
+            .state
+            .metrics
+            .block_store_sync_data_histogram
+            .snapshot();
+
+        let p50_ns = Self::histogram_percentile_ns(&sync_histogram, 0.50);
+        let p95_ns = Self::histogram_percentile_ns(&sync_histogram, 0.95);
+        let p99_ns = Self::histogram_percentile_ns(&sync_histogram, 0.99);
+
+        VfsWritePathObservabilitySnapshot {
+            generated_unix_ms: Self::now_unix_millis(),
+            uptime_secs: elapsed.as_secs_f64(),
+            backend_tag: self.write_path_backend_tag.clone(),
+            flush_ordered_calls,
+            flush_ordered_calls_per_sec: Self::per_second(flush_ordered_calls, elapsed),
+            block_store_sync_data: VfsWritePathSyncDataStats {
+                calls: sync_calls,
+                calls_per_sec: Self::per_second(sync_calls, elapsed),
+                total_ms: sync_total_ns as f64 / 1_000_000.0,
+                avg_ms: if sync_calls == 0 {
+                    0.0
+                } else {
+                    (sync_total_ns as f64 / sync_calls as f64) / 1_000_000.0
+                },
+                max_ms: sync_max_ns as f64 / 1_000_000.0,
+                latency_quantiles_ms: VfsWritePathLatencyQuantilesMs {
+                    p50: p50_ns as f64 / 1_000_000.0,
+                    p95: p95_ns as f64 / 1_000_000.0,
+                    p99: p99_ns as f64 / 1_000_000.0,
+                },
+                latency_histogram: VfsLatencyHistogramSnapshot {
+                    bucket_upper_bounds_ns: sync_histogram.bucket_upper_bounds_ns.clone(),
+                    bucket_counts: sync_histogram.bucket_counts.clone(),
+                },
+            },
+            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
+                write: self
+                    .state
+                    .metrics
+                    .winfsp_write_callbacks
+                    .load(Ordering::Relaxed),
+                flush: self
+                    .state
+                    .metrics
+                    .winfsp_flush_callbacks
+                    .load(Ordering::Relaxed),
+                cleanup_flush_fh: self
+                    .state
+                    .metrics
+                    .winfsp_cleanup_flush_fh_callbacks
+                    .load(Ordering::Relaxed),
+            },
+            write_backpressure: VfsWritePathBackpressureStats {
+                events: self
+                    .state
+                    .write_buffer
+                    .write_backpressure_events
+                    .load(Ordering::Relaxed),
+                wait_total_ms: self
+                    .state
+                    .write_buffer
+                    .write_backpressure_wait_ms
+                    .load(Ordering::Relaxed),
+                stall_max_ms: self
+                    .state
+                    .write_buffer
+                    .fast_backpressure_stall_max_ms
+                    .load(Ordering::Relaxed),
+            },
         }
     }
 
