@@ -10,10 +10,10 @@ There are two generations of the cache implementation:
 |------------|--------|--------|
 | **Legacy pre-SFS-143 stack** | `l1_mem`, `l2_disk`, `lru_tracker`, `runtime`, direct-I/O helpers | **Retired in SFS-143** |
 | **v2 (active path)** | `v2::raw_block_file_backend`, `v2::local_block_backend`, `v2::platform` | Active local block backend and shared helpers |
-| **v3 (contract freeze)** | `v3::layout`, `v3::detect_cache_backends` | Contract-only in SFS-173; runtime backend not enabled |
+| **v3 (opt-in path)** | `v3::layout`, `v3::detect_cache_backends`, `v3::reconcile`, `v3::cache_index`, `v3::file_payload_store` | Opt-in backend with startup reconciliation; default remains guarded off |
 
-Cache 3.0 rollout contract, acceptance gates, and guardrails are documented in
-[Cache 3.0 Contract Freeze](./cache-v3-contract.md).
+Cache 3.0 rollout contract, migration flow, acceptance gates, and guardrails
+are documented in [Cache 3.0 Contract and Migration Safety](./cache-v3-contract.md).
 ---
 
 ## Cache v2 Compatibility Shim
@@ -365,3 +365,14 @@ On startup:
 5. Run best-effort compaction when dead records accumulate.
 6. Re-queue dirty object ids from the reconstructed lifecycle state through metadata mapping.
 7. Resume normal operation.
+
+### Cache 3.0 Startup Recovery
+
+When Cache 3.0 is selected, startup reconciliation runs before serving reads:
+
+1. Remove orphan temp files in `v3/tmp/**` and `v3/payload/blocks/**`.
+2. Remove stale redb index rows pointing to missing payload files.
+3. Remove orphan payload files with no index row.
+
+This recovery path never mutates legacy `blocks.raw`. Dual-layout coexistence is
+supported for migration and fallback.

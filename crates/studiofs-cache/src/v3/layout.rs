@@ -18,6 +18,8 @@ pub const CACHE_V3_TMP_DIR: &str = "tmp";
 pub const CACHE_V3_PAYLOAD_DIR: &str = "payload";
 /// Nested tree under `payload/` holding block files.
 pub const CACHE_V3_PAYLOAD_BLOCKS_DIR: &str = "blocks";
+/// Extension used by committed Cache 3.0 payload files.
+pub const CACHE_V3_PAYLOAD_BLOCK_FILE_EXTENSION: &str = "block";
 /// Number of shard directories in the payload block tree.
 pub const CACHE_V3_PAYLOAD_SHARD_COUNT: usize = 256 * 256;
 /// Root directory for metadata/index files.
@@ -76,13 +78,29 @@ impl CacheV3Layout {
 
     /// Resolve the canonical payload block path relative to `v3_root`.
     pub fn payload_block_relative_path(&self, object_id: u64) -> PathBuf {
-        let hex = format!("{object_id:016x}");
         let [shard_0, shard_1] = Self::payload_shard(object_id);
         PathBuf::from(CACHE_V3_PAYLOAD_DIR)
             .join(CACHE_V3_PAYLOAD_BLOCKS_DIR)
             .join(format!("{shard_0:02x}"))
             .join(format!("{shard_1:02x}"))
-            .join(format!("{hex}.block"))
+            .join(Self::payload_block_file_name(object_id))
+    }
+
+    /// Canonical payload filename for an object id.
+    pub fn payload_block_file_name(object_id: u64) -> String {
+        format!("{object_id:016x}.{CACHE_V3_PAYLOAD_BLOCK_FILE_EXTENSION}")
+    }
+
+    /// Parse an object id from a canonical payload filename.
+    pub fn parse_payload_block_file_name(file_name: &str) -> Option<u64> {
+        let (hex, ext) = file_name.rsplit_once('.')?;
+        if ext != CACHE_V3_PAYLOAD_BLOCK_FILE_EXTENSION || hex.len() != 16 {
+            return None;
+        }
+        if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok()
     }
 }
 
@@ -153,5 +171,32 @@ mod tests {
         assert_eq!(shard_1, CacheV3Layout::payload_shard(1));
         assert_eq!(shard_2, CacheV3Layout::payload_shard(2));
         assert_eq!(shard_257, CacheV3Layout::payload_shard(257));
+    }
+
+    #[test]
+    fn parse_payload_block_file_name_accepts_canonical_shape() {
+        let object_id = 0xABCD_EF12_0000_0042;
+        let file_name = CacheV3Layout::payload_block_file_name(object_id);
+        assert_eq!(
+            CacheV3Layout::parse_payload_block_file_name(&file_name),
+            Some(object_id)
+        );
+    }
+
+    #[test]
+    fn parse_payload_block_file_name_rejects_noncanonical_names() {
+        assert_eq!(CacheV3Layout::parse_payload_block_file_name(""), None);
+        assert_eq!(
+            CacheV3Layout::parse_payload_block_file_name("0000000000000001"),
+            None
+        );
+        assert_eq!(
+            CacheV3Layout::parse_payload_block_file_name("xyz.block"),
+            None
+        );
+        assert_eq!(
+            CacheV3Layout::parse_payload_block_file_name("0000000000000001.tmp"),
+            None
+        );
     }
 }
