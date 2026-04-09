@@ -52,7 +52,7 @@ use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::MaterializeBatchStats;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::LocalBlockBackend;
-use studiofs_cache::v3::CacheBackendKind;
+use studiofs_cache::v3::{CacheBackendKind, cache_v3_default_gate_status};
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend_with_budget};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -4661,22 +4661,46 @@ impl StudioVfs {
             )
             .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
             let cache_backend_detection = opened_local_backend.detection;
+            let default_gate = cache_v3_default_gate_status();
             if cache_backend_detection.has_dual_layout() {
-                info!(
-                    cache_root = %cache_backend_detection.layout.cache_root.display(),
-                    legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
-                    cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                    "cache root contains legacy raw and cache-v3 contract state; mounting with legacy raw backend during rollout"
-                );
+                if default_gate.ready {
+                    info!(
+                        cache_root = %cache_backend_detection.layout.cache_root.display(),
+                        legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
+                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                        "cache root contains legacy raw and cache-v3 contract state; default cutover gate passed so cache-v3 is selected"
+                    );
+                } else {
+                    let gate_blocker = default_gate
+                        .blocker
+                        .map(|blocker| blocker.as_str())
+                        .unwrap_or("unknown blocker");
+                    info!(
+                        cache_root = %cache_backend_detection.layout.cache_root.display(),
+                        legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
+                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                        gate_blocker,
+                        "cache root contains legacy raw and cache-v3 contract state; mounting with legacy raw backend while default cutover gate is blocked"
+                    );
+                }
             }
             let selected_backend = opened_local_backend.backend_kind;
             if matches!(selected_backend, CacheBackendKind::CacheV3) {
-                warn!(
-                    cache_root = %cache_backend_detection.layout.cache_root.display(),
-                    layout_marker = %cache_backend_detection.layout.layout_marker.display(),
-                    cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
-                    "cache-v3 contract selected; using file-per-block local backend under the v3 subtree"
-                );
+                if cache_backend_detection.has_dual_layout() {
+                    info!(
+                        cache_root = %cache_backend_detection.layout.cache_root.display(),
+                        legacy_raw = %cache_backend_detection.legacy_raw_data_path.display(),
+                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                        "cache-v3 selected as the dual-layout default after validation gate pass"
+                    );
+                } else {
+                    warn!(
+                        cache_root = %cache_backend_detection.layout.cache_root.display(),
+                        layout_marker = %cache_backend_detection.layout.layout_marker.display(),
+                        cache_v3_root = %cache_backend_detection.layout.v3_root.display(),
+                        "cache-v3 contract selected; using file-per-block local backend under the v3 subtree"
+                    );
+                }
             }
             let block_store = opened_local_backend.backend;
 

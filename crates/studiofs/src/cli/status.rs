@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use studiofs_cache::v2::{LocalBlockBackend, open_legacy_local_block_backend};
 use studiofs_cache::v3::{
-    CACHE_V3_DEFAULT_ALLOWED, CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE,
-    CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
+    CACHE_V3_DEFAULT_GUARDRAIL, CACHE_V3_FINAL_VALIDATION_ISSUE, CACHE_V3_MIN_TARGET_RATIO,
+    CACHE_V3_STRETCH_TARGET_RATIO, CACHE_V3_VALIDATION_EVIDENCE, CacheBackendDetection,
+    CacheBackendKind, CacheIndex, CacheV3DefaultGateBlocker, cache_v3_default_gate_status,
+    detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_meta::counters;
@@ -98,6 +100,28 @@ fn detect_cache_backends_with_fallback(
 
 fn detect_cache_backends_for_status(cache_path: &Path) -> Option<CacheBackendDetection> {
     detect_cache_backends_with_fallback(cache_path, detect_cache_backends)
+}
+
+fn format_ratio(value: f64) -> String {
+    format!("{value:.2}x")
+}
+
+fn format_optional_ratio(value: Option<f64>) -> String {
+    value.map(format_ratio).unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_validation_blockers(blockers: &[&str]) -> String {
+    if blockers.is_empty() {
+        "none".to_string()
+    } else {
+        blockers.join("; ")
+    }
+}
+
+fn describe_gate_blocker(blocker: Option<CacheV3DefaultGateBlocker>) -> &'static str {
+    blocker
+        .map(CacheV3DefaultGateBlocker::as_str)
+        .unwrap_or("none")
 }
 
 fn map_status_open_local_backend_error(
@@ -470,6 +494,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
         .as_ref()
         .map(CacheBackendDetection::selected_mount_backend)
         .unwrap_or(CacheBackendKind::LegacyRawV2);
+    let default_gate = cache_v3_default_gate_status();
     if matches!(selected_mount_backend, CacheBackendKind::LegacyRawV2) {
         warn_large_legacy_status_scan(&cache_path.join("blocks.raw"));
     }
@@ -652,7 +677,7 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     }
     println!(
         "  Cache v3 default:    {}",
-        if CACHE_V3_DEFAULT_ALLOWED {
+        if default_gate.ready {
             "enabled"
         } else {
             "blocked"
@@ -660,6 +685,80 @@ pub fn run(name: &str, meta_dir: &Path, cache_dir: Option<&Path>) -> anyhow::Res
     );
     let final_validation_issue = CACHE_V3_FINAL_VALIDATION_ISSUE.unwrap_or("UNASSIGNED");
     println!("  Final validation:    {}", final_validation_issue);
+    println!(
+        "  Gate status:         {}",
+        if default_gate.ready {
+            "passed"
+        } else {
+            "blocked"
+        }
+    );
+    println!(
+        "  Gate blocker:        {}",
+        describe_gate_blocker(default_gate.blocker)
+    );
+    println!(
+        "  Validation target:   min {} / stretch {}",
+        format_ratio(CACHE_V3_MIN_TARGET_RATIO),
+        format_ratio(CACHE_V3_STRETCH_TARGET_RATIO)
+    );
+    if let Some(evidence) = CACHE_V3_VALIDATION_EVIDENCE {
+        println!("  Evidence issue:      {}", evidence.issue);
+        println!(
+            "  Matrix complete:     {}",
+            if evidence.matrix_executed {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  Real-path baseline:  {}",
+            if evidence.compared_against_current_backend {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  NVMe read ratio:     {}",
+            format_ratio(evidence.local_nvme_read_ratio)
+        );
+        println!(
+            "  NVMe write ratio:    {}",
+            format_ratio(evidence.local_nvme_write_ratio)
+        );
+        println!(
+            "  USB NVMe available:  {}",
+            if evidence.usb_nvme_available {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  USB read ratio:      {}",
+            format_optional_ratio(evidence.usb_nvme_read_ratio)
+        );
+        println!(
+            "  USB write ratio:     {}",
+            format_optional_ratio(evidence.usb_nvme_write_ratio)
+        );
+        println!(
+            "  Stretch realistic:   {}",
+            if evidence.stretch_target_realistic {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  Validation blockers: {}",
+            format_validation_blockers(evidence.blockers)
+        );
+    } else {
+        println!("  Validation evidence: missing");
+    }
     println!("  Guardrail:           {}", CACHE_V3_DEFAULT_GUARDRAIL);
 
     println!("\nLocal Ingress");
@@ -798,5 +897,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let detection = detect_cache_backends_for_status(tmp.path());
         assert!(detection.is_some());
+    }
+
+    #[test]
+    fn format_optional_ratio_handles_missing_values() {
+        assert_eq!(format_optional_ratio(None), "n/a");
+        assert_eq!(format_optional_ratio(Some(3.125)), "3.12x");
+    }
+
+    #[test]
+    fn format_validation_blockers_joins_items() {
+        assert_eq!(format_validation_blockers(&[]), "none");
+        assert_eq!(
+            format_validation_blockers(&["missing usb evidence", "p95 regression"]),
+            "missing usb evidence; p95 regression"
+        );
+    }
+
+    #[test]
+    fn describe_gate_blocker_defaults_to_none() {
+        assert_eq!(describe_gate_blocker(None), "none");
+        assert_eq!(
+            describe_gate_blocker(Some(CacheV3DefaultGateBlocker::MatrixIncomplete)),
+            "comparison matrix is not marked complete"
+        );
     }
 }
