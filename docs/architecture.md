@@ -11,7 +11,7 @@ Core principles:
 - File payloads live in immutable blocks addressed by chunk-relative slices; each 16 MiB chunk currently fans out into four 4 MiB block objects.
 - Runtime file visibility is split into local-visible overlay state and remote-visible base state.
 - Regular files now use chunk-local overlay/base slice graphs in metadata, not a flat block table.
-- `RawBlockFileBackend` is the active local data store; the remaining cache helpers are only a narrow compatibility shim around upload orchestration.
+- Cache 3.0 (`studiofs-cache::v3`) is the active local data store; remaining cache helpers are a narrow compatibility shim around upload orchestration.
 - The canonical chunk/slice/block vocabulary for follow-up work is frozen in
   [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
 - The execution guardrails and implementation order for the data plane redesign are

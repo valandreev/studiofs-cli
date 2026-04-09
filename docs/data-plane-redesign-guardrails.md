@@ -51,7 +51,7 @@ A PR is out of scope for the redesign if it does any of the following:
   layer
 - adds a second cache tier, queue, or scheduler just to preserve transitional
   behavior
-- introduces new public knobs for legacy cache sizing, direct I/O tuning, or
+- introduces new public knobs for retired cache-generation sizing, direct I/O tuning, or
   fixed upload/fetch limits
 - expands compatibility shims into permanent product surface
 - relies on writer-local recovery state for remote-visible correctness (see [docs/architecture.md](./architecture.md) for the remote-visible/local-visible contract)
