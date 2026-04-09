@@ -53,7 +53,10 @@ use studiofs_cache::metrics::MaterializeBatchStats;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::LocalBlockBackend;
 use studiofs_cache::v3::{CacheBackendKind, cache_v3_default_gate_status};
-use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend_with_budget};
+use studiofs_cache::{
+    LocalBackendSelectionMode, OpenLocalBlockBackendError,
+    open_local_block_backend_with_budget_and_mode,
+};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -4523,6 +4526,27 @@ impl StudioVfs {
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>> {
+        Self::new_with_backend_selection(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            block_cache_l1_limit,
+            config,
+            LocalBackendSelectionMode::Auto,
+        )
+    }
+
+    /// Create a new VFS instance with explicit local backend selection mode.
+    pub fn new_with_backend_selection(
+        meta: Arc<dyn MetaEngine>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: VfsConfigValidated,
+        local_backend_selection_mode: LocalBackendSelectionMode,
+    ) -> VfsResult<Arc<Self>> {
         Self::new_impl(
             meta,
             data_config,
@@ -4530,6 +4554,7 @@ impl StudioVfs {
             cache_size,
             block_cache_l1_limit,
             config,
+            local_backend_selection_mode,
         )
     }
 
@@ -4540,6 +4565,7 @@ impl StudioVfs {
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
+        local_backend_selection_mode: LocalBackendSelectionMode,
     ) -> VfsResult<Arc<Self>> {
         {
             let meta_async: Arc<dyn AsyncMetaEngine> =
@@ -4654,10 +4680,11 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let opened_local_backend = open_local_block_backend_with_budget(
+            let opened_local_backend = open_local_block_backend_with_budget_and_mode(
                 Path::new(cache_dir),
                 &format_info.uuid,
                 cache_size,
+                local_backend_selection_mode,
             )
             .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
             let cache_backend_detection = opened_local_backend.detection;
@@ -12221,6 +12248,45 @@ mod tests {
                 .as_any()
                 .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
             "v3-only layout should select the cache-v3 placeholder backend"
+        );
+    }
+
+    #[test]
+    fn studio_vfs_new_with_force_cache3_selects_cache_v3_on_dual_layout() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info("cache-v3-force");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(&cache_dir);
+        std::fs::create_dir_all(&layout.v3_root).expect("create v3 root");
+        std::fs::write(&layout.layout_marker, b"v1").expect("create v3 marker");
+        std::fs::write(cache_dir.join("blocks.raw"), b"legacy").expect("create legacy raw");
+
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new_with_backend_selection(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+            LocalBackendSelectionMode::ForceCacheV3,
+        )
+        .expect("create vfs");
+
+        assert!(
+            vfs.local_block_backend()
+                .as_any()
+                .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
+            "forced cache-v3 mode should select cache-v3 backend on dual layout"
         );
     }
 

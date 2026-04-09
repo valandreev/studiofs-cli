@@ -3,7 +3,9 @@
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use studiofs_cache::LocalBackendSelectionMode;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
+use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
@@ -74,6 +76,17 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+}
+
+fn ensure_cache3_layout(cache_root: &Path) -> anyhow::Result<()> {
+    let layout = CacheV3Layout::from_cache_root(cache_root);
+    std::fs::create_dir_all(&layout.tmp_dir)?;
+    std::fs::create_dir_all(&layout.payload_blocks_dir)?;
+    std::fs::create_dir_all(&layout.index_dir)?;
+    if !layout.layout_marker.exists() {
+        std::fs::write(&layout.layout_marker, b"v1")?;
+    }
+    Ok(())
 }
 
 fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
@@ -277,6 +290,7 @@ pub fn run(
     cache_size: Option<&str>,
     principal: Option<&str>,
     block_backend: Option<super::mount_block_backend_types::MountBlockBackendMode>,
+    cache3: bool,
     foreground: bool,
     detach: bool,
     profile: Option<super::mount_profile_types::MountProfileMode>,
@@ -297,7 +311,16 @@ pub fn run(
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
-    let _ = block_backend;
+    let local_backend_selection_mode = if cache3 {
+        LocalBackendSelectionMode::ForceCacheV3
+    } else if matches!(
+        block_backend,
+        Some(super::mount_block_backend_types::MountBlockBackendMode::RawFile)
+    ) {
+        LocalBackendSelectionMode::ForceLegacyRawV2
+    } else {
+        LocalBackendSelectionMode::Auto
+    };
 
     // Validate endpoint override before any mount operations (SFS-95)
     if let Some(ep) = endpoint {
@@ -517,6 +540,12 @@ pub fn run(
 
     // Cache state for this volume (local backend + cache metadata) lives in this UUID dir.
     let cache_path = base_cache_path.join(&format_info.uuid);
+    if matches!(
+        local_backend_selection_mode,
+        LocalBackendSelectionMode::ForceCacheV3
+    ) {
+        ensure_cache3_layout(&cache_path)?;
+    }
 
     let cache_path_str = cache_path
         .to_str()
@@ -548,13 +577,14 @@ pub fn run(
     let _guard = rt.enter();
 
     // Create VFS.
-    let vfs = StudioVfs::new(
+    let vfs = StudioVfs::new_with_backend_selection(
         meta.clone(),
         &data_config,
         cache_path_str,
         cache_size_bytes,
         block_cache_l1_limit,
         vfs_config,
+        local_backend_selection_mode,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
     vfs.start()
@@ -729,6 +759,17 @@ fn sanitize_log_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_cache3_layout_creates_contract_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_cache3_layout(temp.path()).expect("create cache3 layout");
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        assert!(layout.layout_marker.exists());
+        assert!(layout.tmp_dir.exists());
+        assert!(layout.payload_blocks_dir.exists());
+        assert!(layout.index_dir.exists());
+    }
 
     #[test]
     fn test_parse_positive_size_arg() {
