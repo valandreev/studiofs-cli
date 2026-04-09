@@ -5036,6 +5036,7 @@ impl StudioVfs {
             let upload_worker_count = config.upload_worker_count;
             let publish_visibility_timeout =
                 Duration::from_secs(config.publish_visibility_timeout_secs);
+            let local_sync_group_max_delay_ms = local_sync_group_max_delay.as_millis() as u64;
             debug!(
                 writeback = true,
                 cache_size_bytes = cache_size,
@@ -5059,7 +5060,7 @@ impl StudioVfs {
                 max_dirty_bytes,
                 write_eager_flush_batch_bytes,
                 local_sync_group_min_bytes,
-                local_sync_group_max_delay_ms = local_sync_group_max_delay.as_millis() as u64,
+                local_sync_group_max_delay_ms,
                 max_xattr_bytes,
                 dentry_cache_capacity,
                 dentry_cache_bytes,
