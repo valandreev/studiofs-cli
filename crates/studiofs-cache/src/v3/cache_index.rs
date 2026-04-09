@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use parking_lot::Mutex;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Error as RedbError, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::v2::LocalBlockLifecycleState;
 
@@ -53,11 +53,17 @@ pub enum CacheIndexError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("index storage error: {0}")]
-    Storage(String),
+    Storage(#[source] RedbError),
     #[error("index corruption: {0}")]
     Corruption(String),
     #[error("unsupported cache index format: expected {expected}, found {found}")]
     UnsupportedFormat { expected: u64, found: u64 },
+}
+
+impl CacheIndexError {
+    pub(crate) fn is_database_lock_conflict(&self) -> bool {
+        matches!(self, Self::Storage(RedbError::DatabaseAlreadyOpen))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1150,8 +1156,8 @@ fn decode_lifecycle(raw: u8) -> Option<LocalBlockLifecycleState> {
     }
 }
 
-fn storage_error<E: std::fmt::Display>(error: E) -> CacheIndexError {
-    CacheIndexError::Storage(error.to_string())
+fn storage_error<E: Into<RedbError>>(error: E) -> CacheIndexError {
+    CacheIndexError::Storage(error.into())
 }
 
 fn touch_access_lru_capacity() -> NonZeroUsize {
@@ -1170,6 +1176,15 @@ mod tests {
 
     fn open_index(path: &Path) -> CacheIndex {
         CacheIndex::open(path).expect("open cache index")
+    }
+
+    #[test]
+    fn storage_error_detects_redb_lock_conflict_variant() {
+        let error = CacheIndexError::Storage(RedbError::DatabaseAlreadyOpen);
+        assert!(error.is_database_lock_conflict());
+
+        let other = CacheIndexError::Storage(RedbError::DatabaseClosed);
+        assert!(!other.is_database_lock_conflict());
     }
 
     fn upsert_dirty(index: &CacheIndex, object_id: u64, payload_len: u64) {

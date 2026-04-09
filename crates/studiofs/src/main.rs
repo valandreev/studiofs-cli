@@ -355,12 +355,6 @@ EXAMPLES:
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
 
-  Select the raw backend explicitly:
-    studiofs mount myvolume Z: --block-backend raw-file
-
-  Force Cache 3.0 backend (1 block = 1 file):
-    studiofs mount myvolume Z: --cache3
-
 PYROSCOPE PROFILING:
   studiofs mount myvolume /mnt/studio --profile
   studiofs mount myvolume /mnt/studio --profile=off
@@ -403,17 +397,6 @@ ACL PRINCIPAL:
         /// Principal identity used for ACL checks in this mount instance.
         #[arg(long)]
         principal: Option<String>,
-
-        /// Select the local block backend for this mount (only `raw-file` is supported).
-        #[arg(long, value_enum)]
-        block_backend: Option<cli::mount_block_backend_types::MountBlockBackendMode>,
-
-        /// Force Cache 3.0 local backend (file-per-block payload store).
-        ///
-        /// This creates/uses the `v3/` contract under the cache root and selects
-        /// cache-v3 for this mount even when legacy `blocks.raw` is present.
-        #[arg(long, conflicts_with = "block_backend")]
-        cache3: bool,
 
         /// Run in foreground (keep terminal attached, default behavior)
         #[arg(long, conflicts_with = "detach")]
@@ -716,8 +699,6 @@ fn main() -> anyhow::Result<()> {
             cache_dir,
             cache_size,
             principal,
-            block_backend,
-            cache3,
             foreground,
             detach,
             profile,
@@ -735,8 +716,6 @@ fn main() -> anyhow::Result<()> {
                 cache_dir.as_deref(),
                 cache_size.as_deref(),
                 principal.as_deref(),
-                block_backend,
-                cache3,
                 foreground,
                 detach,
                 profile,
@@ -954,18 +933,6 @@ mod tests {
     }
 
     #[test]
-    fn mount_block_backend_parses_raw_file() {
-        let cli = parse(&["mount", "vol", "Z:", "--block-backend", "raw-file"]).unwrap();
-        match cli.command {
-            Commands::Mount { block_backend, .. } => assert!(matches!(
-                block_backend,
-                Some(cli::mount_block_backend_types::MountBlockBackendMode::RawFile)
-            )),
-            other => panic!("expected Mount, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn mount_block_cache_alias_is_rejected() {
         let err = match parse(&["mount", "vol", "Z:", "--block-cache", "raw-file"]) {
             Ok(_) => panic!("expected alias to be rejected"),
@@ -976,31 +943,23 @@ mod tests {
     }
 
     #[test]
-    fn mount_cache3_flag_parses() {
-        let cli = parse(&["mount", "vol", "Z:", "--cache3"]).unwrap();
-        match cli.command {
-            Commands::Mount { cache3, .. } => assert!(cache3),
-            other => panic!("expected Mount, got {other:?}"),
-        }
+    fn mount_block_backend_is_rejected() {
+        let err = match parse(&["mount", "vol", "Z:", "--block-backend", "raw-file"]) {
+            Ok(_) => panic!("expected unknown argument error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--block-backend"));
     }
 
     #[test]
-    fn mount_cache3_conflicts_with_block_backend() {
-        let err = match parse(&[
-            "mount",
-            "vol",
-            "Z:",
-            "--cache3",
-            "--block-backend",
-            "raw-file",
-        ]) {
-            Ok(_) => panic!("expected clap conflict error"),
+    fn mount_cache3_flag_is_rejected() {
+        let err = match parse(&["mount", "vol", "Z:", "--cache3"]) {
+            Ok(_) => panic!("expected unknown argument error"),
             Err(err) => err,
         };
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
-        let rendered = err.to_string();
-        assert!(rendered.contains("--cache3"));
-        assert!(rendered.contains("--block-backend"));
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--cache3"));
     }
 
     #[test]
