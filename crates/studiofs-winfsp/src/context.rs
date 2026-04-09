@@ -502,6 +502,24 @@ pub struct StudioFsContext {
     flush_gates: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+struct FlushGateRelease<'a> {
+    ctx: &'a StudioFsContext,
+    ino: Ino,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> FlushGateRelease<'a> {
+    fn new(ctx: &'a StudioFsContext, ino: Ino, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self { ctx, ino, gate }
+    }
+}
+
+impl Drop for FlushGateRelease<'_> {
+    fn drop(&mut self) {
+        self.ctx.maybe_release_flush_gate(self.ino, &self.gate);
+    }
+}
+
 impl StudioFsContext {
     pub fn new(
         vfs: Arc<StudioVfs>,
@@ -541,10 +559,16 @@ impl StudioFsContext {
         ino: Ino,
         fh: Option<u64>,
     ) -> studiofs_vfs::VfsResult<bool> {
+        // Fast path: avoid `spawn_wait` entirely when there is clearly no local
+        // dirty state for this inode.
+        if !self.vfs.inode_has_local_dirty_state(ino) {
+            return Ok(false);
+        }
         let gate = self.flush_gate_for_inode(ino);
+        let _gate_release = FlushGateRelease::new(self, ino, gate.clone());
         let gate_task = gate.clone();
         let vfs = self.vfs.clone();
-        let result = self.spawn_wait(async move {
+        self.spawn_wait(async move {
             let _flush_guard = gate_task.lock().await;
             if !vfs.inode_has_local_dirty_state(ino) {
                 return Ok(false);
@@ -555,9 +579,7 @@ impl StudioFsContext {
                 vfs.flush(ino).await?;
             }
             Ok(true)
-        });
-        self.maybe_release_flush_gate(ino, &gate);
-        result
+        })
     }
 
     /// Copy the cached security descriptor into the provided buffer.
@@ -1172,7 +1194,7 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<()> {
         self.vfs.note_winfsp_flush_callback();
         if let Some(ctx) = context {
-            self.flush_callback_path_if_dirty(ctx.ino, None)
+            self.flush_callback_path_if_dirty(ctx.ino, Some(ctx.fh))
                 .map_err(vfs_to_winfsp_err)?;
 
             let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
@@ -1485,6 +1507,42 @@ mod tests {
         assert_eq!(
             after, before,
             "cleanup should skip redundant synchronous flush when inode is clean"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn clean_inode_fast_path_does_not_allocate_flush_gate() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_fast_path_gate");
+        let attr = vfs
+            .create(ROOT_INO, b"clean-fast-path.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("pre-clean flush");
+
+        assert!(
+            ctx.flush_gates.lock().is_empty(),
+            "test setup should not have lingering gates"
+        );
+        let flushed = ctx
+            .flush_callback_path_if_dirty(attr.ino, Some(fh))
+            .expect("callback flush guard");
+        assert!(!flushed, "clean inode should skip flush");
+        assert!(
+            ctx.flush_gates.lock().is_empty(),
+            "fast path should not allocate per-inode flush gates"
         );
 
         ctx.spawn_wait({
