@@ -466,37 +466,35 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
         );
         assert!(
             flush_snapshot_after.winfsp_foreground_flushes.flush
-                >= flush_snapshot_before.winfsp_foreground_flushes.flush + 1,
+                > flush_snapshot_before.winfsp_foreground_flushes.flush,
             "the first sync_all should attribute a foreground barrier to the flush callback path"
         );
         assert!(
             flush_snapshot_after
                 .winfsp_foreground_flushes
                 .flush_skipped_clean
-                >= flush_snapshot_before
+                > flush_snapshot_before
                     .winfsp_foreground_flushes
-                    .flush_skipped_clean
-                    + 1,
+                    .flush_skipped_clean,
             "the second sync_all should show a clean-skip flush callback instead of another barrier"
         );
         assert!(
             flush_snapshot_after.winfsp_callbacks.cleanup
-                >= flush_snapshot_before.winfsp_callbacks.cleanup + 1,
+                > flush_snapshot_before.winfsp_callbacks.cleanup,
             "closing the clean handle should still surface a cleanup callback"
         );
         assert!(
             flush_snapshot_after
                 .winfsp_foreground_flushes
                 .cleanup_skipped_clean
-                >= flush_snapshot_before
+                > flush_snapshot_before
                     .winfsp_foreground_flushes
-                    .cleanup_skipped_clean
-                    + 1,
+                    .cleanup_skipped_clean,
             "cleanup after explicit sync_all should be attributed as a clean skip"
         );
         assert!(
             flush_snapshot_after.winfsp_callbacks.close
-                >= flush_snapshot_before.winfsp_callbacks.close + 1,
+                > flush_snapshot_before.winfsp_callbacks.close,
             "closing the repeated-flush handle should surface a close callback"
         );
 
@@ -517,27 +515,26 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
         let close_snapshot_after = vfs_observer.write_path_observability_snapshot();
         assert!(
             close_snapshot_after.winfsp_callbacks.cleanup
-                >= close_snapshot_before.winfsp_callbacks.cleanup + 1,
+                > close_snapshot_before.winfsp_callbacks.cleanup,
             "dropping a dirty writer should surface a cleanup callback"
         );
         assert!(
             close_snapshot_after.winfsp_foreground_flushes.cleanup
-                >= close_snapshot_before.winfsp_foreground_flushes.cleanup + 1,
+                > close_snapshot_before.winfsp_foreground_flushes.cleanup,
             "dirty-handle close should attribute its barrier to cleanup"
         );
         assert!(
             close_snapshot_after.winfsp_callbacks.close
-                >= close_snapshot_before.winfsp_callbacks.close + 1,
+                > close_snapshot_before.winfsp_callbacks.close,
             "dropping a dirty writer should still surface a close callback"
         );
         assert!(
             close_snapshot_after
                 .winfsp_foreground_flushes
                 .close_skipped_clean
-                >= close_snapshot_before
+                > close_snapshot_before
                     .winfsp_foreground_flushes
-                    .close_skipped_clean
-                    + 1,
+                    .close_skipped_clean,
             "close should see the inode as clean after cleanup already drained the dirty state"
         );
     });
