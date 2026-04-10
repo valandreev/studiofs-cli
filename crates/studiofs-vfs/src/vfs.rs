@@ -7182,6 +7182,9 @@ impl StudioVfs {
         let block_store = self.local_block_backend.clone();
         let out_len = out.len();
         let (result, timing) = run_local_cache_io_blocking(move || {
+            if !block_store.contains(object_id) {
+                return Ok((Vec::new(), None));
+            }
             let mut scratch = vec![0_u8; out_len];
             let read = block_store.read_into(object_id, data_offset, &mut scratch);
             Ok((scratch, read))
@@ -10783,6 +10786,7 @@ impl StudioVfs {
                                     read,
                                     "assemble_read_plan: short local backend read for committed block; evicting and refetching"
                                 );
+                                dst.fill(0);
                                 if let Err(evict_error) =
                                     self.block_store_remove_async(block.object_id).await
                                 {
