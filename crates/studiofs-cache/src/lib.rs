@@ -59,7 +59,13 @@ fn open_cache_v3_backend(
     cache_root_display: &str,
     volume_uuid: &str,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    open_cache_v3_backend_with_budget(cache_root, cache_root_display, volume_uuid, None)
+    open_cache_v3_backend_with_budget(
+        cache_root,
+        cache_root_display,
+        volume_uuid,
+        None,
+        v3::CacheV3PayloadSyncMode::Durable,
+    )
 }
 
 fn open_cache_v3_backend_with_budget(
@@ -67,6 +73,7 @@ fn open_cache_v3_backend_with_budget(
     cache_root_display: &str,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
+    payload_sync_mode: v3::CacheV3PayloadSyncMode,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
     let config = v3::CacheV3LocalBlockBackendConfig {
         cache_root: cache_root.to_path_buf(),
@@ -74,7 +81,11 @@ fn open_cache_v3_backend_with_budget(
     };
 
     for attempt in 0..=CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS {
-        match v3::CacheV3LocalBlockBackend::open_with_budget(config.clone(), cache_budget_bytes) {
+        match v3::CacheV3LocalBlockBackend::open_with_budget_and_sync_mode(
+            config.clone(),
+            cache_budget_bytes,
+            payload_sync_mode,
+        ) {
             Ok(backend) => return Ok(Arc::new(backend) as Arc<dyn v2::LocalBlockBackend>),
             Err(source)
                 if source.is_transient_open_lock_conflict()
@@ -118,7 +129,12 @@ pub fn open_local_block_backend(
     cache_root: impl AsRef<Path>,
     volume_uuid: &str,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
-    open_local_block_backend_with_budget_impl(cache_root.as_ref(), volume_uuid, None)
+    open_local_block_backend_with_budget_impl(
+        cache_root.as_ref(),
+        volume_uuid,
+        None,
+        v3::CacheV3PayloadSyncMode::Durable,
+    )
 }
 
 /// Open the selected local backend with an explicit Cache 3.0 budget.
@@ -127,10 +143,27 @@ pub fn open_local_block_backend_with_budget(
     volume_uuid: &str,
     cache_budget_bytes: u64,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
+    open_local_block_backend_with_budget_and_sync_mode(
+        cache_root,
+        volume_uuid,
+        cache_budget_bytes,
+        v3::CacheV3PayloadSyncMode::Durable,
+    )
+}
+
+/// Open the selected local backend with an explicit Cache 3.0 budget and
+/// payload-store sync policy.
+pub fn open_local_block_backend_with_budget_and_sync_mode(
+    cache_root: impl AsRef<Path>,
+    volume_uuid: &str,
+    cache_budget_bytes: u64,
+    payload_sync_mode: v3::CacheV3PayloadSyncMode,
+) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     open_local_block_backend_with_budget_impl(
         cache_root.as_ref(),
         volume_uuid,
         Some(cache_budget_bytes),
+        payload_sync_mode,
     )
 }
 
@@ -138,6 +171,7 @@ fn open_local_block_backend_with_budget_impl(
     cache_root: &Path,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
+    payload_sync_mode: v3::CacheV3PayloadSyncMode,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     let cache_root_display = cache_root.display().to_string();
 
@@ -173,6 +207,7 @@ fn open_local_block_backend_with_budget_impl(
             &cache_root_display,
             volume_uuid,
             Some(cache_budget_bytes),
+            payload_sync_mode,
         )?,
         None => open_cache_v3_backend(cache_root, &cache_root_display, volume_uuid)?,
     };

@@ -1,6 +1,7 @@
 //! Cache 3.0 file-per-block payload storage.
 
 use std::array;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::num::NonZeroUsize;
@@ -14,6 +15,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::warn;
 
+use super::CacheV3PayloadSyncMode;
 use super::layout::CacheV3Layout;
 use super::platform;
 
@@ -40,15 +42,26 @@ pub enum FilePayloadStoreError {
 #[derive(Debug, Clone)]
 pub struct FilePayloadStore {
     layout: CacheV3Layout,
+    sync_mode: CacheV3PayloadSyncMode,
     read_handles: Arc<ReadHandleCache>,
+    pending_grouped_sync: Arc<PendingGroupedSync>,
+    barrier_counters: Arc<SyncBarrierCounters>,
 }
 
 impl FilePayloadStore {
     pub fn open(layout: CacheV3Layout) -> Result<Self, FilePayloadStoreError> {
+        Self::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Durable)
+    }
+
+    pub fn open_with_sync_mode(
+        layout: CacheV3Layout,
+        sync_mode: CacheV3PayloadSyncMode,
+    ) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_blocks_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
         Ok(Self {
             layout,
+            sync_mode,
             read_handles: Arc::new(ReadHandleCache {
                 shards: array::from_fn(|_| {
                     Mutex::new(LruCache::new(read_fd_cache_shard_capacity()))
@@ -57,6 +70,8 @@ impl FilePayloadStore {
                 misses: AtomicU64::new(0),
                 evictions: AtomicU64::new(0),
             }),
+            pending_grouped_sync: Arc::new(PendingGroupedSync::default()),
+            barrier_counters: Arc::new(SyncBarrierCounters::default()),
         })
     }
 
@@ -166,15 +181,24 @@ impl FilePayloadStore {
         })?;
         std::fs::create_dir_all(payload_dir)?;
 
-        let temp_path = self.write_temp_payload_file(&self.layout.tmp_dir, object_id, data)?;
+        let temp_path = self.write_temp_payload_file(
+            &self.layout.tmp_dir,
+            object_id,
+            data,
+            matches!(self.sync_mode, CacheV3PayloadSyncMode::Durable),
+        )?;
         match platform::rename_atomic(&temp_path, &payload_path) {
             Ok(()) => {}
             Err(error) if platform::is_cross_device_link_error(&error) => {
                 let _ = std::fs::remove_file(&temp_path);
                 // Keep rename atomic even with unusual split-mount layouts by
                 // staging in the destination directory.
-                let payload_local_temp =
-                    self.write_temp_payload_file(payload_dir, object_id, data)?;
+                let payload_local_temp = self.write_temp_payload_file(
+                    payload_dir,
+                    object_id,
+                    data,
+                    matches!(self.sync_mode, CacheV3PayloadSyncMode::Durable),
+                )?;
                 if let Err(rename_error) =
                     platform::rename_atomic(&payload_local_temp, &payload_path)
                 {
@@ -188,13 +212,21 @@ impl FilePayloadStore {
             }
         }
         self.invalidate_cached_read_handle(object_id);
-        platform::sync_directory(&self.layout.tmp_dir)?;
-        platform::sync_directory(payload_dir)?;
+        if matches!(self.sync_mode, CacheV3PayloadSyncMode::Durable) {
+            self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
+            self.sync_directory_put_barrier(payload_dir)?;
+        } else {
+            self.record_grouped_sync_targets(object_id, payload_dir);
+        }
         Ok(())
     }
 
     pub fn remove(&self, object_id: u64) {
         self.invalidate_cached_read_handle(object_id);
+        self.pending_grouped_sync
+            .object_ids
+            .lock()
+            .remove(&object_id);
         let payload_path = self.layout.payload_block_path(object_id);
         if let Err(error) = std::fs::remove_file(&payload_path)
             && error.kind() != io::ErrorKind::NotFound
@@ -215,17 +247,23 @@ impl FilePayloadStore {
     }
 
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
+        if matches!(self.sync_mode, CacheV3PayloadSyncMode::Fast) {
+            let (pending_object_ids, pending_dirs) = self.take_grouped_sync_targets();
+            for object_id in pending_object_ids {
+                self.sync_payload_file_grouped_barrier(object_id)?;
+            }
+            for dir in pending_dirs {
+                self.sync_directory_grouped_barrier(&dir)?;
+            }
+            return Ok(());
+        }
+
         for dir in [
             self.layout.payload_blocks_dir.as_path(),
             self.layout.payload_root.as_path(),
             self.layout.v3_root.as_path(),
         ] {
-            if let Err(error) = platform::sync_directory(dir) {
-                if error.kind() == io::ErrorKind::NotFound {
-                    continue;
-                }
-                return Err(error.into());
-            }
+            self.sync_directory_grouped_barrier(dir)?;
         }
         Ok(())
     }
@@ -235,12 +273,41 @@ impl FilePayloadStore {
         temp_dir: &Path,
         object_id: u64,
         data: &[u8],
+        sync_file_data: bool,
     ) -> Result<PathBuf, FilePayloadStoreError> {
         let (mut temp_file, temp_path) = self.create_temp_file(temp_dir, object_id)?;
         platform::write_all(&mut temp_file, data)?;
-        platform::sync_data(&temp_file)?;
+        if sync_file_data {
+            platform::sync_data(&temp_file)?;
+            self.barrier_counters
+                .per_put_file_sync_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
         drop(temp_file);
         Ok(temp_path)
+    }
+
+    pub fn sync_barrier_snapshot(&self) -> SyncBarrierSnapshot {
+        SyncBarrierSnapshot {
+            per_put_file_sync_calls: self
+                .barrier_counters
+                .per_put_file_sync_calls
+                .load(Ordering::Relaxed),
+            per_put_dir_sync_calls: self
+                .barrier_counters
+                .per_put_dir_sync_calls
+                .load(Ordering::Relaxed),
+            grouped_file_sync_calls: self
+                .barrier_counters
+                .grouped_file_sync_calls
+                .load(Ordering::Relaxed),
+            grouped_dir_sync_calls: self
+                .barrier_counters
+                .grouped_dir_sync_calls
+                .load(Ordering::Relaxed),
+            pending_grouped_file_syncs: self.pending_grouped_sync.object_ids.lock().len(),
+            pending_grouped_dir_syncs: self.pending_grouped_sync.directories.lock().len(),
+        }
     }
 
     fn create_temp_file(
@@ -319,6 +386,76 @@ impl FilePayloadStore {
             .pop(&object_id);
     }
 
+    fn record_grouped_sync_targets(&self, object_id: u64, payload_dir: &Path) {
+        let mut object_ids = self.pending_grouped_sync.object_ids.lock();
+        object_ids.insert(object_id);
+        drop(object_ids);
+
+        let mut directories = self.pending_grouped_sync.directories.lock();
+        directories.insert(self.layout.tmp_dir.clone());
+        directories.insert(payload_dir.to_path_buf());
+        directories.insert(self.layout.payload_blocks_dir.clone());
+        directories.insert(self.layout.payload_root.clone());
+        directories.insert(self.layout.v3_root.clone());
+    }
+
+    fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
+        let object_ids = {
+            let mut object_ids = self.pending_grouped_sync.object_ids.lock();
+            object_ids.drain().collect()
+        };
+        let directories = {
+            let mut directories = self.pending_grouped_sync.directories.lock();
+            directories.drain().collect()
+        };
+        (object_ids, directories)
+    }
+
+    fn sync_payload_file_grouped_barrier(
+        &self,
+        object_id: u64,
+    ) -> Result<(), FilePayloadStoreError> {
+        let path = self.layout.payload_block_path(object_id);
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                match OpenOptions::new().read(true).open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        platform::sync_data(&file)?;
+        self.barrier_counters
+            .grouped_file_sync_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn sync_directory_put_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
+        platform::sync_directory(dir)?;
+        self.barrier_counters
+            .per_put_dir_sync_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn sync_directory_grouped_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
+        match platform::sync_directory(dir) {
+            Ok(()) => {
+                self.barrier_counters
+                    .grouped_dir_sync_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[cfg(test)]
     fn read_handle_stats(&self) -> ReadHandleStats {
         ReadHandleStats {
@@ -341,6 +478,30 @@ struct ReadHandleCache {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct PendingGroupedSync {
+    object_ids: Mutex<HashSet<u64>>,
+    directories: Mutex<HashSet<PathBuf>>,
+}
+
+#[derive(Debug, Default)]
+struct SyncBarrierCounters {
+    per_put_file_sync_calls: AtomicU64,
+    per_put_dir_sync_calls: AtomicU64,
+    grouped_file_sync_calls: AtomicU64,
+    grouped_dir_sync_calls: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncBarrierSnapshot {
+    pub per_put_file_sync_calls: u64,
+    pub per_put_dir_sync_calls: u64,
+    pub grouped_file_sync_calls: u64,
+    pub grouped_dir_sync_calls: u64,
+    pub pending_grouped_file_syncs: usize,
+    pub pending_grouped_dir_syncs: usize,
 }
 
 #[cfg(test)]
@@ -470,5 +631,61 @@ mod tests {
         let stats = store.read_handle_stats();
         assert_eq!(stats.cached, READ_FD_CACHE_CAPACITY);
         assert!(stats.evictions >= 1);
+    }
+
+    #[test]
+    fn durable_mode_keeps_per_put_sync_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Durable).unwrap();
+        store.put(7001, b"payload").unwrap();
+
+        let stats = store.sync_barrier_snapshot();
+        assert!(
+            stats.per_put_file_sync_calls >= 1,
+            "durable mode should sync temp payload bytes before rename"
+        );
+        assert!(
+            stats.per_put_dir_sync_calls >= 2,
+            "durable mode should sync tmp + payload directories per put"
+        );
+        assert_eq!(stats.pending_grouped_file_syncs, 0);
+        assert_eq!(stats.pending_grouped_dir_syncs, 0);
+    }
+
+    #[test]
+    fn fast_mode_defers_put_barriers_until_grouped_sync_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Fast).unwrap();
+        store.put(8001, b"one").unwrap();
+        store.put(8002, b"two").unwrap();
+
+        let before_sync = store.sync_barrier_snapshot();
+        assert_eq!(before_sync.per_put_file_sync_calls, 0);
+        assert_eq!(before_sync.per_put_dir_sync_calls, 0);
+        assert!(
+            before_sync.pending_grouped_file_syncs >= 2,
+            "fast mode should queue payload files for grouped sync_data barriers"
+        );
+        assert!(
+            before_sync.pending_grouped_dir_syncs >= 1,
+            "fast mode should queue directories for grouped sync_data barriers"
+        );
+
+        store.sync_data().unwrap();
+        let after_sync = store.sync_barrier_snapshot();
+        assert_eq!(after_sync.pending_grouped_file_syncs, 0);
+        assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
+        assert!(
+            after_sync.grouped_file_sync_calls >= 2,
+            "grouped sync_data should sync queued payload files"
+        );
+        assert!(
+            after_sync.grouped_dir_sync_calls >= 1,
+            "grouped sync_data should sync queued directories"
+        );
     }
 }

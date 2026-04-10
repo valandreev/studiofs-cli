@@ -30,7 +30,7 @@ pub use cache_index::{
     DirtyReplayEntry, EvictionCandidateEntry,
 };
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
-pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError};
+pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, SyncBarrierSnapshot};
 pub use layout::{
     CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
     CACHE_V3_REDB_INDEX_FILE, CACHE_V3_SUBTREE, CacheV3Layout,
@@ -114,6 +114,16 @@ pub struct CacheV3LocalBlockBackendConfig {
     pub volume_uuid: [u8; 16],
 }
 
+/// Payload-store sync cadence policy for Cache 3.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheV3PayloadSyncMode {
+    /// Keep per-write file+directory barriers at payload commit time.
+    #[default]
+    Durable,
+    /// Defer payload-store barriers to grouped `sync_data()` calls.
+    Fast,
+}
+
 /// Errors returned while opening the Cache 3.0 local backend.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheV3LocalBlockBackendError {
@@ -187,12 +197,24 @@ impl CacheV3LocalBlockBackend {
     pub fn open(
         config: CacheV3LocalBlockBackendConfig,
     ) -> Result<Self, CacheV3LocalBlockBackendError> {
-        Self::open_with_budget(config, None)
+        Self::open_with_budget_and_sync_mode(config, None, CacheV3PayloadSyncMode::Durable)
     }
 
     pub fn open_with_budget(
         config: CacheV3LocalBlockBackendConfig,
         cache_budget_bytes: Option<u64>,
+    ) -> Result<Self, CacheV3LocalBlockBackendError> {
+        Self::open_with_budget_and_sync_mode(
+            config,
+            cache_budget_bytes,
+            CacheV3PayloadSyncMode::Durable,
+        )
+    }
+
+    pub fn open_with_budget_and_sync_mode(
+        config: CacheV3LocalBlockBackendConfig,
+        cache_budget_bytes: Option<u64>,
+        payload_sync_mode: CacheV3PayloadSyncMode,
     ) -> Result<Self, CacheV3LocalBlockBackendError> {
         let layout = CacheV3Layout::from_cache_root(&config.cache_root);
         if !layout.layout_marker.try_exists()? {
@@ -208,12 +230,13 @@ impl CacheV3LocalBlockBackend {
             }
         })?;
 
-        let payload_store = FilePayloadStore::open(layout.clone()).map_err(|source| {
-            CacheV3LocalBlockBackendError::OpenPayloadStore {
-                cache_root: layout.v3_root.clone(),
-                source,
-            }
-        })?;
+        let payload_store =
+            FilePayloadStore::open_with_sync_mode(layout.clone(), payload_sync_mode).map_err(
+                |source| CacheV3LocalBlockBackendError::OpenPayloadStore {
+                    cache_root: layout.v3_root.clone(),
+                    source,
+                },
+            )?;
 
         let startup_reconcile_mode = CacheV3StartupReconcileMode::from_env();
         let startup_reconcile_report =
@@ -968,6 +991,38 @@ mod tests {
         assert_eq!(backend.get_for_upload(42).unwrap().as_ref(), b"payload");
         assert_eq!(backend.lifecycle_state(42), LocalBlockLifecycleState::Dirty);
         assert_eq!(backend.dirty_object_ids(), vec![42]);
+    }
+
+    #[test]
+    fn cache_v3_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open_with_budget_and_sync_mode(
+            CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0xCE; 16],
+            },
+            None,
+            CacheV3PayloadSyncMode::Fast,
+        )
+        .unwrap();
+        backend.put(101, b"one", false).unwrap();
+        backend.put(102, b"two", false).unwrap();
+
+        let before_sync = backend.payload_store.sync_barrier_snapshot();
+        assert_eq!(before_sync.per_put_file_sync_calls, 0);
+        assert_eq!(before_sync.per_put_dir_sync_calls, 0);
+        assert!(before_sync.pending_grouped_file_syncs >= 2);
+        assert!(before_sync.pending_grouped_dir_syncs >= 1);
+
+        backend.sync_data().unwrap();
+        let after_sync = backend.payload_store.sync_barrier_snapshot();
+        assert_eq!(after_sync.pending_grouped_file_syncs, 0);
+        assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
+        assert!(after_sync.grouped_file_sync_calls >= 2);
+        assert!(after_sync.grouped_dir_sync_calls >= 1);
     }
 
     #[test]

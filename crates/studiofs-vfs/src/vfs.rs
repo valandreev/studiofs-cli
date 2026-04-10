@@ -56,9 +56,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
-use studiofs_cache::open_local_block_backend_with_budget;
+use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v2::LocalBlockBackend;
+use studiofs_cache::v3::CacheV3PayloadSyncMode;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -5004,10 +5005,16 @@ impl StudioVfs {
             let initial_checkpoint_meta =
                 init_ingress_recovery_state(cache_safety_mode, &ingress_wal)?;
 
-            let opened_local_backend = open_local_block_backend_with_budget(
+            let payload_sync_mode = if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
+                CacheV3PayloadSyncMode::Durable
+            } else {
+                CacheV3PayloadSyncMode::Fast
+            };
+            let opened_local_backend = open_local_block_backend_with_budget_and_sync_mode(
                 Path::new(cache_dir),
                 &format_info.uuid,
                 local_backend_budget_bytes,
+                payload_sync_mode,
             )
             .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
             let cache_backend_detection = opened_local_backend.detection;
