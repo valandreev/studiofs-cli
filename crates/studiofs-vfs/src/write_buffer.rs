@@ -670,9 +670,11 @@ impl StudioVfs {
             assign_reserved_object_ids(&mut pending, ino, &mut persisted_blocks, &fresh_object_ids);
         }
 
-        // Data hits the local backend before metadata so a successful flush/fsync only
-        // returns after local bytes are durable. The canonical retry source for any
-        // failure remains the WriteBuffer snapshot guarded by `reserved_object_id`.
+        // Data hits the local backend before metadata. In durable mode this keeps
+        // payload barriers on the foreground put path; in fast mode barriers are
+        // intentionally grouped behind `sync_data()` cadence. In both modes, the
+        // canonical retry source for failure remains the WriteBuffer snapshot
+        // guarded by `reserved_object_id`.
 
         // === Phase 1: Payload Persistence ===
         // Write each block payload to the local block store and perform grouped
