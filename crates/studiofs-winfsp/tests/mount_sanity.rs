@@ -72,6 +72,74 @@ fn test_online_endpoint() -> String {
     )
 }
 
+const DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 8;
+const MAX_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 128;
+const MAX_AJA_SEQUENTIAL_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+
+fn test_mount_usize_env_var(key: &str, default: usize) -> usize {
+    load_test_env();
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn aja_sequential_chunk_bytes() -> usize {
+    test_mount_usize_env_var(
+        "STUDIOFS_WINFSP_AJA_CHUNK_BYTES",
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
+    )
+}
+
+fn aja_sequential_chunk_count() -> usize {
+    test_mount_usize_env_var(
+        "STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+    )
+}
+
+fn validate_aja_sequential_workload(
+    chunk_bytes: usize,
+    chunk_count: usize,
+) -> Result<(usize, usize), String> {
+    if chunk_bytes == 0 {
+        return Err("STUDIOFS_WINFSP_AJA_CHUNK_BYTES must be greater than 0".to_string());
+    }
+    if chunk_bytes > MAX_AJA_SEQUENTIAL_CHUNK_BYTES {
+        return Err(format!(
+            "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={} exceeds the supported max {}; reduce the chunk size for the mounted AJA-style smoke test",
+            chunk_bytes, MAX_AJA_SEQUENTIAL_CHUNK_BYTES
+        ));
+    }
+    if chunk_count == 0 {
+        return Err("STUDIOFS_WINFSP_AJA_CHUNK_COUNT must be greater than 0".to_string());
+    }
+    if chunk_count > MAX_AJA_SEQUENTIAL_CHUNK_COUNT {
+        return Err(format!(
+            "STUDIOFS_WINFSP_AJA_CHUNK_COUNT={} exceeds the supported max {}; reduce the chunk count for the mounted AJA-style smoke test",
+            chunk_count, MAX_AJA_SEQUENTIAL_CHUNK_COUNT
+        ));
+    }
+    let total_bytes = chunk_bytes.checked_mul(chunk_count).ok_or_else(|| {
+        "AJA-style mounted smoke workload overflowed chunk_bytes * chunk_count".to_string()
+    })?;
+    if total_bytes > MAX_AJA_SEQUENTIAL_TOTAL_BYTES {
+        return Err(format!(
+            "AJA-style mounted smoke workload would write {} bytes, exceeding the supported max {}; lower STUDIOFS_WINFSP_AJA_CHUNK_BYTES or STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
+            total_bytes, MAX_AJA_SEQUENTIAL_TOTAL_BYTES
+        ));
+    }
+
+    Ok((chunk_bytes, chunk_count))
+}
+
+fn aja_sequential_workload() -> Result<(usize, usize), String> {
+    validate_aja_sequential_workload(aja_sequential_chunk_bytes(), aja_sequential_chunk_count())
+}
+
 fn endpoint_authority(endpoint: &str) -> Option<String> {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
@@ -411,6 +479,42 @@ fn winfsp_mount_write_read_unmount_smoke() {
 }
 
 #[test]
+fn validate_aja_sequential_workload_accepts_defaults() {
+    let workload = validate_aja_sequential_workload(
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+    )
+    .expect("default workload should be accepted");
+    assert_eq!(
+        workload,
+        (
+            DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
+            DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT
+        )
+    );
+}
+
+#[test]
+fn validate_aja_sequential_workload_rejects_oversized_chunk_bytes() {
+    let err = validate_aja_sequential_workload(MAX_AJA_SEQUENTIAL_CHUNK_BYTES + 1, 1)
+        .expect_err("oversized chunk bytes should be rejected");
+    assert!(
+        err.contains("STUDIOFS_WINFSP_AJA_CHUNK_BYTES"),
+        "error should point at the chunk-bytes env var: {err}"
+    );
+}
+
+#[test]
+fn validate_aja_sequential_workload_rejects_excessive_total_bytes() {
+    let err = validate_aja_sequential_workload(MAX_AJA_SEQUENTIAL_CHUNK_BYTES, 16)
+        .expect_err("oversized total workload should be rejected");
+    assert!(
+        err.contains("lower STUDIOFS_WINFSP_AJA_CHUNK_BYTES or STUDIOFS_WINFSP_AJA_CHUNK_COUNT"),
+        "error should explain how to lower the mounted workload: {err}"
+    );
+}
+
+#[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
@@ -484,18 +588,32 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
             "closing the clean handle should still surface a cleanup callback"
         );
         assert!(
+            flush_snapshot_after.winfsp_foreground_flushes.cleanup
+                == flush_snapshot_before.winfsp_foreground_flushes.cleanup,
+            "non-delete cleanup should remain observational even after explicit sync_all"
+        );
+        assert!(
             flush_snapshot_after
                 .winfsp_foreground_flushes
                 .cleanup_skipped_clean
-                > flush_snapshot_before
+                == flush_snapshot_before
                     .winfsp_foreground_flushes
                     .cleanup_skipped_clean,
-            "cleanup after explicit sync_all should be attributed as a clean skip"
+            "non-delete cleanup should not be attributed as a clean-skip barrier"
         );
         assert!(
             flush_snapshot_after.winfsp_callbacks.close
                 > flush_snapshot_before.winfsp_callbacks.close,
             "closing the repeated-flush handle should surface a close callback"
+        );
+        assert!(
+            flush_snapshot_after
+                .winfsp_foreground_flushes
+                .close_skipped_clean
+                > flush_snapshot_before
+                    .winfsp_foreground_flushes
+                    .close_skipped_clean,
+            "closing a clean handle should still be attributed as a clean close path"
         );
 
         let close_snapshot_before = vfs_observer.write_path_observability_snapshot();
@@ -520,8 +638,8 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
         );
         assert!(
             close_snapshot_after.winfsp_foreground_flushes.cleanup
-                > close_snapshot_before.winfsp_foreground_flushes.cleanup,
-            "dirty-handle close should attribute its barrier to cleanup"
+                == close_snapshot_before.winfsp_foreground_flushes.cleanup,
+            "dirty-handle cleanup should not reclaim foreground barrier ownership"
         );
         assert!(
             close_snapshot_after.winfsp_callbacks.close
@@ -529,13 +647,135 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
             "dropping a dirty writer should still surface a close callback"
         );
         assert!(
+            close_snapshot_after.winfsp_foreground_flushes.close
+                > close_snapshot_before.winfsp_foreground_flushes.close,
+            "dirty-handle close should attribute the fallback barrier to close/release_fh"
+        );
+        assert!(
             close_snapshot_after
                 .winfsp_foreground_flushes
                 .close_skipped_clean
-                > close_snapshot_before
+                == close_snapshot_before
                     .winfsp_foreground_flushes
                     .close_skipped_clean,
-            "close should see the inode as clean after cleanup already drained the dirty state"
+            "dirty close should not look like a clean release path"
+        );
+        assert!(
+            close_snapshot_after.winfsp_callbacks.cleanup_flush_fh
+                == close_snapshot_before.winfsp_callbacks.cleanup_flush_fh,
+            "dirty-handle close should not route non-delete cleanup through flush_fh"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP AJA-style sequential writer smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "aja_style_sequential_writer", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsAjaSequentialWriterSmoke-{}",
+        std::process::id()
+    );
+    let (chunk_bytes, chunk_count) = match aja_sequential_workload() {
+        Ok(workload) => workload,
+        Err(reason) => {
+            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
+            return;
+        }
+    };
+
+    with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
+        // Approximate a media-style single-handle sequential writer: large
+        // contiguous writes without explicit sync_all between chunks, then a
+        // dirty handle close.
+        let snapshot_before = vfs_observer.write_path_observability_snapshot();
+        let sequential_file = std::path::PathBuf::from(drive_root).join("aja-sequential.bin");
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&sequential_file)
+            .expect("open aja-style sequential writer file through WinFSP mount");
+        use std::io::Write;
+        let mut chunk = Vec::new();
+        if let Err(err) = chunk.try_reserve_exact(chunk_bytes) {
+            eprintln!(
+                "Skipping WinFSP AJA-style sequential writer smoke test: failed to reserve {} bytes for the sequential chunk buffer: {err}",
+                chunk_bytes
+            );
+            return;
+        }
+        chunk.resize(chunk_bytes, 0u8);
+        for chunk_index in 0..chunk_count {
+            let fill = b'A' + (chunk_index % 26) as u8;
+            chunk.fill(fill);
+            writer
+                .write_all(&chunk)
+                .expect("write sequential chunk through WinFSP mount");
+        }
+        drop(writer);
+
+        let snapshot_after = vfs_observer.write_path_observability_snapshot();
+        assert!(
+            snapshot_after.winfsp_callbacks.write > snapshot_before.winfsp_callbacks.write,
+            "large sequential mounted writes should surface WinFSP write callbacks"
+        );
+        assert!(
+            snapshot_after.winfsp_callbacks.cleanup > snapshot_before.winfsp_callbacks.cleanup,
+            "dirty sequential writer close should still surface cleanup callbacks"
+        );
+        assert!(
+            snapshot_after.winfsp_callbacks.close > snapshot_before.winfsp_callbacks.close,
+            "dirty sequential writer close should still surface close callbacks"
+        );
+        assert_eq!(
+            snapshot_after.winfsp_foreground_flushes.cleanup,
+            snapshot_before.winfsp_foreground_flushes.cleanup,
+            "AJA-style sequential writer should not reintroduce non-delete cleanup barriers"
+        );
+        assert_eq!(
+            snapshot_after
+                .winfsp_foreground_flushes
+                .cleanup_skipped_clean,
+            snapshot_before
+                .winfsp_foreground_flushes
+                .cleanup_skipped_clean,
+            "AJA-style sequential writer should not attribute cleanup as a clean-skip barrier"
+        );
+        assert_eq!(
+            snapshot_after.winfsp_callbacks.cleanup_flush_fh,
+            snapshot_before.winfsp_callbacks.cleanup_flush_fh,
+            "AJA-style sequential writer should not route cleanup through flush_fh"
+        );
+        assert!(
+            snapshot_after.winfsp_foreground_flushes.close
+                > snapshot_before.winfsp_foreground_flushes.close,
+            "dirty sequential writer should attribute the fallback barrier to close/release_fh"
+        );
+        assert_eq!(
+            snapshot_after.winfsp_foreground_flushes.close_skipped_clean,
+            snapshot_before
+                .winfsp_foreground_flushes
+                .close_skipped_clean,
+            "dirty sequential writer should not look like a clean close"
         );
     });
 }
