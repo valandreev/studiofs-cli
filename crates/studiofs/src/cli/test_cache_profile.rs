@@ -364,6 +364,18 @@ fn gzip_bytes(input: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
+fn winfsp_cleanup_validation_state(snapshot: &VfsWritePathObservabilitySnapshot) -> &'static str {
+    if snapshot.winfsp_foreground_flushes.cleanup > 0
+        || snapshot.winfsp_callbacks.cleanup_flush_fh > 0
+    {
+        "cleanup-follow-up"
+    } else if snapshot.winfsp_callbacks.cleanup > 0 {
+        "cleanup-deferred"
+    } else {
+        "not-observed"
+    }
+}
+
 fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
     let snapshot: VfsWritePathObservabilitySnapshot =
         serde_json::from_slice(bytes).context("parse write-path observability snapshot")?;
@@ -418,10 +430,11 @@ fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.block_store_sync_data.calls_per_gib
     ));
     out.push_str(&format!(
-        "winfsp_callbacks: write={} overwrite={} cleanup={} flush={} close={}\n",
+        "winfsp_callbacks: write={} overwrite={} cleanup={} cleanup_flush_fh={} flush={} close={}\n",
         snapshot.winfsp_callbacks.write,
         snapshot.winfsp_callbacks.overwrite,
         snapshot.winfsp_callbacks.cleanup,
+        snapshot.winfsp_callbacks.cleanup_flush_fh,
         snapshot.winfsp_callbacks.flush,
         snapshot.winfsp_callbacks.close
     ));
@@ -434,6 +447,26 @@ fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.winfsp_foreground_flushes.close,
         snapshot.winfsp_foreground_flushes.close_skipped_clean
     ));
+    out.push_str(&format!(
+        "winfsp_validation: cleanup_non_delete={} cleanup_non_delete_barriers={} cleanup_flush_fh={} flush_barriers={} close_barriers={}\n",
+        winfsp_cleanup_validation_state(&snapshot),
+        snapshot.winfsp_foreground_flushes.cleanup,
+        snapshot.winfsp_callbacks.cleanup_flush_fh,
+        snapshot.winfsp_foreground_flushes.flush,
+        snapshot.winfsp_foreground_flushes.close,
+    ));
+    if snapshot.winfsp_foreground_flushes.cleanup > 0 {
+        out.push_str(&format!(
+            "winfsp_follow_up: non-delete cleanup still owns {} foreground barrier(s); feed this run into SFS-192 before closing bridge validation\n",
+            snapshot.winfsp_foreground_flushes.cleanup
+        ));
+    }
+    if snapshot.winfsp_callbacks.cleanup_flush_fh > 0 {
+        out.push_str(&format!(
+            "winfsp_follow_up: cleanup routed through flush_fh {} time(s); inspect WinFSP callback sequencing before closing SFS-192\n",
+            snapshot.winfsp_callbacks.cleanup_flush_fh
+        ));
+    }
     Ok(out)
 }
 
@@ -529,17 +562,18 @@ mod tests {
                 write: 11,
                 overwrite: 2,
                 cleanup: 7,
+                cleanup_flush_fh: 0,
                 flush: 5,
                 close: 7,
                 ..Default::default()
             },
             winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
-                cleanup: 3,
+                cleanup: 0,
                 flush: 2,
-                close: 0,
-                cleanup_skipped_clean: 4,
+                close: 3,
+                cleanup_skipped_clean: 0,
                 flush_skipped_clean: 3,
-                close_skipped_clean: 7,
+                close_skipped_clean: 4,
             },
             ..Default::default()
         };
@@ -548,14 +582,71 @@ mod tests {
         let summary = render_write_path_summary(&bytes).expect("render summary");
 
         assert!(
-            summary.contains("winfsp_callbacks: write=11 overwrite=2 cleanup=7 flush=5 close=7"),
+            summary.contains(
+                "winfsp_callbacks: write=11 overwrite=2 cleanup=7 cleanup_flush_fh=0 flush=5 close=7"
+            ),
             "summary should include the WinFSP callback counts: {summary}"
         );
         assert!(
             summary.contains(
-                "winfsp_foreground_flushes: cleanup=3 cleanup_skipped_clean=4 flush=2 flush_skipped_clean=3 close=0 close_skipped_clean=7"
+                "winfsp_foreground_flushes: cleanup=0 cleanup_skipped_clean=0 flush=2 flush_skipped_clean=3 close=3 close_skipped_clean=4"
             ),
             "summary should include the WinFSP foreground flush attribution: {summary}"
+        );
+        assert!(
+            summary.contains(
+                "winfsp_validation: cleanup_non_delete=cleanup-deferred cleanup_non_delete_barriers=0 cleanup_flush_fh=0 flush_barriers=2 close_barriers=3"
+            ),
+            "summary should describe the WinFSP validation posture: {summary}"
+        );
+    }
+
+    #[test]
+    fn render_write_path_summary_emits_follow_up_for_cleanup_barrier_regressions() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            backend_tag: "cache-v3".to_string(),
+            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
+                cleanup: 5,
+                ..Default::default()
+            },
+            winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
+                cleanup: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let summary = render_write_path_summary(&bytes).expect("render summary");
+
+        assert!(
+            summary.contains(
+                "winfsp_follow_up: non-delete cleanup still owns 2 foreground barrier(s); feed this run into SFS-192 before closing bridge validation"
+            ),
+            "summary should flag unexpected cleanup-owned barriers as follow-up evidence: {summary}"
+        );
+    }
+
+    #[test]
+    fn render_write_path_summary_emits_follow_up_for_cleanup_flush_fh_callbacks() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            backend_tag: "cache-v3".to_string(),
+            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
+                cleanup: 4,
+                cleanup_flush_fh: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let summary = render_write_path_summary(&bytes).expect("render summary");
+
+        assert!(
+            summary.contains(
+                "winfsp_follow_up: cleanup routed through flush_fh 2 time(s); inspect WinFSP callback sequencing before closing SFS-192"
+            ),
+            "summary should flag unexpected cleanup_flush_fh callbacks as follow-up evidence: {summary}"
         );
     }
 }

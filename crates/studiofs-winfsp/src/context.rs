@@ -1904,6 +1904,73 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_flush_callbacks_coalesce_to_one_barrier_and_clean_skips() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("flush_callback_concurrent");
+        let attr = vfs
+            .create(ROOT_INO, b"flush-callback-concurrent.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
+        let ctx = Arc::new(ctx);
+        let start = Arc::new(Barrier::new(4));
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let ctx = Arc::clone(&ctx);
+            let start = Arc::clone(&start);
+            let ino = attr.ino;
+            joins.push(std::thread::spawn(move || {
+                start.wait();
+                ctx.run_flush_callback(ino, fh)
+                    .expect("concurrent flush callback");
+            }));
+        }
+        for join in joins {
+            join.join().expect("flush thread join");
+        }
+
+        let callbacks_after = winfsp_callbacks(&vfs);
+        let barriers_after = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after = flush_ordered_calls(&vfs);
+        assert_eq!(
+            callbacks_after.flush,
+            callbacks_before.flush + 4,
+            "all concurrent flush callbacks should still be observable"
+        );
+        assert_eq!(
+            barriers_after.flush,
+            barriers_before.flush + 1,
+            "the per-inode gate should collapse concurrent dirty flush callbacks into one barrier"
+        );
+        assert_eq!(
+            barriers_after.flush_skipped_clean,
+            barriers_before.flush_skipped_clean + 3,
+            "duplicate concurrent flush callbacks should turn into clean skips once the gate owner drains the inode"
+        );
+        assert_eq!(
+            flush_calls_after,
+            flush_calls_before + 1,
+            "concurrent explicit flush callbacks should trigger one ordered flush"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
     fn explicit_flush_callback_clears_deferred_cleanup_hint() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_hint_cleared_by_flush");
         let attr = vfs
