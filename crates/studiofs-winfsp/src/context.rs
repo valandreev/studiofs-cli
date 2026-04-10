@@ -1905,6 +1905,7 @@ mod tests {
 
     #[test]
     fn concurrent_flush_callbacks_coalesce_to_one_barrier_and_clean_skips() {
+        const CONCURRENT_FLUSH_CALLBACKS: usize = 4;
         let (_tmp, vfs, ctx, _queue) = make_test_context("flush_callback_concurrent");
         let attr = vfs
             .create(ROOT_INO, b"flush-callback-concurrent.txt", 0, 0, 0o644)
@@ -1923,9 +1924,11 @@ mod tests {
         let barriers_before = winfsp_foreground_flushes(&vfs);
         let flush_calls_before = flush_ordered_calls(&vfs);
         let ctx = Arc::new(ctx);
-        let start = Arc::new(Barrier::new(4));
+        // Keep the fanout intentionally small so constrained Windows runners
+        // still exercise the coalescing path without oversubscribing threads.
+        let start = Arc::new(Barrier::new(CONCURRENT_FLUSH_CALLBACKS));
         let mut joins = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..CONCURRENT_FLUSH_CALLBACKS {
             let ctx = Arc::clone(&ctx);
             let start = Arc::clone(&start);
             let ino = attr.ino;
@@ -1944,7 +1947,7 @@ mod tests {
         let flush_calls_after = flush_ordered_calls(&vfs);
         assert_eq!(
             callbacks_after.flush,
-            callbacks_before.flush + 4,
+            callbacks_before.flush + CONCURRENT_FLUSH_CALLBACKS as u64,
             "all concurrent flush callbacks should still be observable"
         );
         assert_eq!(
@@ -1954,7 +1957,7 @@ mod tests {
         );
         assert_eq!(
             barriers_after.flush_skipped_clean,
-            barriers_before.flush_skipped_clean + 3,
+            barriers_before.flush_skipped_clean + (CONCURRENT_FLUSH_CALLBACKS - 1) as u64,
             "duplicate concurrent flush callbacks should turn into clean skips once the gate owner drains the inode"
         );
         assert_eq!(

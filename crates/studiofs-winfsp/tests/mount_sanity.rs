@@ -623,9 +623,10 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
             .open(&sequential_file)
             .expect("open aja-style sequential writer file through WinFSP mount");
         use std::io::Write;
+        let mut chunk = vec![0u8; chunk_bytes];
         for chunk_index in 0..chunk_count {
             let fill = b'A' + (chunk_index % 26) as u8;
-            let chunk = vec![fill; chunk_bytes];
+            chunk.fill(fill);
             writer
                 .write_all(&chunk)
                 .expect("write sequential chunk through WinFSP mount");
