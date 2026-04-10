@@ -1,22 +1,11 @@
 //! `studiofs destroy` — permanently delete a volume.
 
+use crate::cli::cache_layout::describe_cache_layout_state;
 use std::io::Write;
 use std::path::Path;
 use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig};
 use tracing::warn;
-
-fn describe_cache_layout_state(detection: Option<&CacheBackendDetection>) -> &'static str {
-    if let Some(detection) = detection {
-        if detection.has_cache_v3_contract() {
-            "Cache 3.0 ready"
-        } else {
-            "Cache 3.0 not initialized"
-        }
-    } else {
-        "unknown"
-    }
-}
 
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
@@ -274,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn destroy_cleanup_scope_is_generation_aware() {
+    fn destroy_cleanup_scope_is_layout_aware() {
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true))),
             "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its Cache 3.0 subtree"

@@ -1,5 +1,6 @@
 //! `studiofs status` — show filesystem status.
 
+use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -364,15 +365,7 @@ pub fn run(
         .as_ref()
         .and_then(CacheBackendDetection::runtime_backend)
         == Some(CacheBackendKind::CacheV3);
-    let contract_state = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.has_cache_v3_contract() {
-            "Cache 3.0 ready"
-        } else {
-            "Cache 3.0 not initialized"
-        }
-    } else {
-        "unknown"
-    };
+    let contract_state = describe_cache_layout_state(cache_backend_detection.as_ref());
     let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
         if detection.has_cache_v3_contract() {
             "none"
@@ -392,7 +385,7 @@ pub fn run(
         "  Runtime readiness:   {}",
         if runtime_ready { "ready" } else { "blocked" }
     );
-    println!("  Layout state:        {}", contract_state);
+    println!("  Cache layout state:  {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
             "  Cache 3.0 marker:    {} ({})",
