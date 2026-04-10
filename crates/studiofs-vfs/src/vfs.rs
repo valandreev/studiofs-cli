@@ -18,6 +18,7 @@
 //! Read Path:
 //! 1. Check the `WriteBuffer` overlay for newer local bytes
 //! 2. Resolve local metadata refs to committed local extents in the local backend
+//!    (inline on the active runtime worker, no per-op blocking-pool hop)
 //! 3. Fall back to remote fetch
 //! 4. Validate object payload + checksum and assemble response
 
@@ -35,7 +36,10 @@ use crate::incarnation::{
 use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
-use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
+use crate::runtime::{
+    LocalCacheIoTiming, TimeoutOrCancel, local_cache_io_execution_model, run_local_cache_io,
+    run_meta, run_with_timeout_or_cancel,
+};
 use crate::vfs::write_buffer::WriteBufferState;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{FutureExt, future::join_all};
@@ -268,6 +272,20 @@ pub struct VfsWritePathWinfspCallbackStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathLocalCacheIoStats {
+    pub execution_model: String,
+    pub calls: u64,
+    pub handoff_total_ms: f64,
+    pub handoff_avg_ms: f64,
+    pub handoff_max_ms: f64,
+    pub backend_io_total_ms: f64,
+    pub backend_io_avg_ms: f64,
+    pub backend_io_max_ms: f64,
+    pub handoff_histogram: VfsLatencyHistogramSnapshot,
+    pub backend_io_histogram: VfsLatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathBackpressureStats {
     pub events: u64,
     pub wait_total_ms: u64,
@@ -282,6 +300,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub flush_ordered_calls: u64,
     pub flush_ordered_calls_per_sec: f64,
     pub block_store_sync_data: VfsWritePathSyncDataStats,
+    #[serde(default)]
+    pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
     pub write_backpressure: VfsWritePathBackpressureStats,
 }
@@ -3517,6 +3537,13 @@ struct MetricsState {
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
     flush_ordered_calls: AtomicU64,
+    local_cache_io_calls: AtomicU64,
+    local_cache_io_handoff_total_ns: AtomicU64,
+    local_cache_io_handoff_max_ns: AtomicU64,
+    local_cache_io_handoff_histogram: LatencyHistogram,
+    local_cache_io_backend_total_ns: AtomicU64,
+    local_cache_io_backend_max_ns: AtomicU64,
+    local_cache_io_backend_histogram: LatencyHistogram,
     block_store_sync_data_calls: AtomicU64,
     block_store_sync_data_deferred_calls: AtomicU64,
     block_store_sync_data_synced_bytes: AtomicU64,
@@ -3536,6 +3563,13 @@ impl MetricsState {
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
             flush_ordered_calls: AtomicU64::new(0),
+            local_cache_io_calls: AtomicU64::new(0),
+            local_cache_io_handoff_total_ns: AtomicU64::new(0),
+            local_cache_io_handoff_max_ns: AtomicU64::new(0),
+            local_cache_io_handoff_histogram: LatencyHistogram::default(),
+            local_cache_io_backend_total_ns: AtomicU64::new(0),
+            local_cache_io_backend_max_ns: AtomicU64::new(0),
+            local_cache_io_backend_histogram: LatencyHistogram::default(),
             block_store_sync_data_calls: AtomicU64::new(0),
             block_store_sync_data_deferred_calls: AtomicU64::new(0),
             block_store_sync_data_synced_bytes: AtomicU64::new(0),
@@ -7126,27 +7160,34 @@ impl StudioVfs {
     }
 
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
-        self.local_block_backend.get(object_id)
+        let (cached, timing) = run_local_cache_io(|| self.local_block_backend.get(object_id));
+        self.record_local_cache_io_timing(timing);
+        cached
     }
 
     async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || Ok(block_store.get(object_id))).await
+        let (result, timing) = run_local_cache_io(|| block_store.get(object_id));
+        self.record_local_cache_io_timing(timing);
+        Ok(result)
     }
 
     async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || Ok(block_store.get_for_upload(object_id))).await
+        let (result, timing) = run_local_cache_io(|| block_store.get_for_upload(object_id));
+        self.record_local_cache_io_timing(timing);
+        Ok(result)
     }
 
     async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || {
+        let (result, timing) = run_local_cache_io(|| {
             block_store.run_pressure_maintenance().map_err(|error| {
                 VfsError::Other(format!("block backend maintenance failed: {error}"))
             })
-        })
-        .await
+        });
+        self.record_local_cache_io_timing(timing);
+        result
     }
 
     async fn block_store_put_async(
@@ -7156,12 +7197,13 @@ impl StudioVfs {
         evictable: bool,
     ) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || {
+        let (result, timing) = run_local_cache_io(|| {
             block_store
                 .put(object_id, data.as_ref(), evictable)
                 .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
-        })
-        .await
+        });
+        self.record_local_cache_io_timing(timing);
+        result
     }
 
     async fn maybe_block_store_sync_data_async(
@@ -7251,12 +7293,12 @@ impl StudioVfs {
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
         let started = Instant::now();
-        let result = run_blocking(move || {
+        let (result, timing) = run_local_cache_io(|| {
             block_store.sync_data().map_err(|error| {
                 VfsError::Other(format!("block backend sync_data failed: {error}"))
             })
-        })
-        .await;
+        });
+        self.record_local_cache_io_timing(timing);
         let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.state
             .metrics
@@ -7279,29 +7321,32 @@ impl StudioVfs {
 
     async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || {
+        let (result, timing) = run_local_cache_io(|| {
             block_store.mark_uploaded(object_id);
             Ok(())
-        })
-        .await
+        });
+        self.record_local_cache_io_timing(timing);
+        result
     }
 
     async fn block_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || {
+        let (result, timing) = run_local_cache_io(|| {
             block_store.remove(object_id);
             Ok(())
-        })
-        .await
+        });
+        self.record_local_cache_io_timing(timing);
+        result
     }
 
     async fn block_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        run_blocking(move || {
+        let (result, timing) = run_local_cache_io(|| {
             block_store.remove_batch(&object_ids);
             Ok(())
-        })
-        .await
+        });
+        self.record_local_cache_io_timing(timing);
+        result
     }
 
     fn transition_upload_state_for_local_mutation(attr: &mut InodeAttr) {
@@ -8068,6 +8113,37 @@ impl StudioVfs {
         )
     }
 
+    fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
+        self.state
+            .metrics
+            .local_cache_io_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .metrics
+            .local_cache_io_handoff_total_ns
+            .fetch_add(timing.handoff_ns, Ordering::Relaxed);
+        self.state
+            .metrics
+            .local_cache_io_handoff_max_ns
+            .fetch_max(timing.handoff_ns, Ordering::Relaxed);
+        self.state
+            .metrics
+            .local_cache_io_handoff_histogram
+            .observe_ns(timing.handoff_ns);
+        self.state
+            .metrics
+            .local_cache_io_backend_total_ns
+            .fetch_add(timing.backend_io_ns, Ordering::Relaxed);
+        self.state
+            .metrics
+            .local_cache_io_backend_max_ns
+            .fetch_max(timing.backend_io_ns, Ordering::Relaxed);
+        self.state
+            .metrics
+            .local_cache_io_backend_histogram
+            .observe_ns(timing.backend_io_ns);
+    }
+
     pub fn note_winfsp_write_callback(&self) {
         self.state
             .metrics
@@ -8103,6 +8179,41 @@ impl StudioVfs {
             .metrics
             .flush_ordered_calls
             .load(Ordering::Relaxed);
+        let local_cache_io_calls = self
+            .state
+            .metrics
+            .local_cache_io_calls
+            .load(Ordering::Relaxed);
+        let local_cache_handoff_total_ns = self
+            .state
+            .metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
+        let local_cache_handoff_max_ns = self
+            .state
+            .metrics
+            .local_cache_io_handoff_max_ns
+            .load(Ordering::Relaxed);
+        let local_cache_handoff_histogram = self
+            .state
+            .metrics
+            .local_cache_io_handoff_histogram
+            .snapshot();
+        let local_cache_backend_total_ns = self
+            .state
+            .metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+        let local_cache_backend_max_ns = self
+            .state
+            .metrics
+            .local_cache_io_backend_max_ns
+            .load(Ordering::Relaxed);
+        let local_cache_backend_histogram = self
+            .state
+            .metrics
+            .local_cache_io_backend_histogram
+            .snapshot();
         let sync_calls = self
             .state
             .metrics
@@ -8177,6 +8288,38 @@ impl StudioVfs {
                 latency_histogram: VfsLatencyHistogramSnapshot {
                     bucket_upper_bounds_ns: sync_histogram.bucket_upper_bounds_ns.clone(),
                     bucket_counts: sync_histogram.bucket_counts.clone(),
+                },
+            },
+            local_cache_io: VfsWritePathLocalCacheIoStats {
+                execution_model: local_cache_io_execution_model().as_str().to_string(),
+                calls: local_cache_io_calls,
+                handoff_total_ms: local_cache_handoff_total_ns as f64 / 1_000_000.0,
+                handoff_avg_ms: if local_cache_io_calls == 0 {
+                    0.0
+                } else {
+                    (local_cache_handoff_total_ns as f64 / local_cache_io_calls as f64)
+                        / 1_000_000.0
+                },
+                handoff_max_ms: local_cache_handoff_max_ns as f64 / 1_000_000.0,
+                backend_io_total_ms: local_cache_backend_total_ns as f64 / 1_000_000.0,
+                backend_io_avg_ms: if local_cache_io_calls == 0 {
+                    0.0
+                } else {
+                    (local_cache_backend_total_ns as f64 / local_cache_io_calls as f64)
+                        / 1_000_000.0
+                },
+                backend_io_max_ms: local_cache_backend_max_ns as f64 / 1_000_000.0,
+                handoff_histogram: VfsLatencyHistogramSnapshot {
+                    bucket_upper_bounds_ns: local_cache_handoff_histogram
+                        .bucket_upper_bounds_ns
+                        .clone(),
+                    bucket_counts: local_cache_handoff_histogram.bucket_counts.clone(),
+                },
+                backend_io_histogram: VfsLatencyHistogramSnapshot {
+                    bucket_upper_bounds_ns: local_cache_backend_histogram
+                        .bucket_upper_bounds_ns
+                        .clone(),
+                    bucket_counts: local_cache_backend_histogram.bucket_counts.clone(),
                 },
             },
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
@@ -14385,6 +14528,74 @@ mod tests {
         assert!(
             deferred_after > deferred_before,
             "opportunistic defer should be tracked"
+        );
+    }
+
+    #[test]
+    fn local_cache_io_stats_track_handoff_and_backend_time_separately() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-io-stats");
+        let calls_before = vfs
+            .state
+            .metrics
+            .local_cache_io_calls
+            .load(Ordering::Relaxed);
+        let handoff_before = vfs
+            .state
+            .metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
+        let backend_before = vfs
+            .state
+            .metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+
+        rt.block_on(async {
+            vfs.block_store_put_async(0xAA55, Bytes::from_static(b"payload"), false)
+                .await
+                .expect("block store put");
+            let payload = vfs
+                .block_store_get_async(0xAA55)
+                .await
+                .expect("block store get")
+                .expect("cached payload");
+            assert_eq!(payload.as_ref(), b"payload");
+        });
+
+        let calls_after = vfs
+            .state
+            .metrics
+            .local_cache_io_calls
+            .load(Ordering::Relaxed);
+        let handoff_after = vfs
+            .state
+            .metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
+        let backend_after = vfs
+            .state
+            .metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+
+        assert!(
+            calls_after >= calls_before + 2,
+            "put + get should record at least two local-cache I/O calls"
+        );
+        assert_eq!(
+            handoff_after, handoff_before,
+            "inline model should not accrue scheduler handoff time"
+        );
+        assert!(
+            backend_after >= backend_before,
+            "backend execution time should be tracked independently"
+        );
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            snapshot.local_cache_io.execution_model,
+            "inline-runtime-worker"
         );
     }
 

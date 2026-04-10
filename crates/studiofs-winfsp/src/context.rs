@@ -605,6 +605,8 @@ impl StudioFsContext {
     /// This is important because WinFSP uses IOCP with a limited concurrency.
     /// `block_on` makes the current thread drive the future, which can interact
     /// poorly with the tokio IO reactor when called from non-runtime threads.
+    /// Local cache I/O runs inline once inside this runtime boundary, so we
+    /// avoid per-operation blocking-pool hops in the hot read/write path.
     /// Expected operational failures must be propagated as `Result`, not panics.
     fn spawn_wait<F, T>(&self, f: F) -> T
     where

@@ -8,9 +8,12 @@
 //!    tokio broadcast), so only one S3 GET is issued per block.
 //! 3. Applies its own retry with exponential backoff per fetch, independent of
 //!    OpenDAL's internal `RetryLayer`.
+//! 4. Executes local cache get/put inline on the active runtime worker to avoid
+//!    per-operation blocking-pool handoffs on hot cache hits.
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
 use crate::qos::{QosController, TransitMemoryBudget};
+use crate::runtime::{LocalCacheIoTiming, run_local_cache_io};
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -82,6 +85,11 @@ pub struct FetchMetrics {
     pub retries: AtomicU64,
     pub bytes_downloaded: AtomicU64,
     pub prefetch_skips: AtomicU64,
+    pub local_cache_io_calls: AtomicU64,
+    pub local_cache_io_handoff_total_ns: AtomicU64,
+    pub local_cache_io_handoff_max_ns: AtomicU64,
+    pub local_cache_io_backend_total_ns: AtomicU64,
+    pub local_cache_io_backend_max_ns: AtomicU64,
 }
 
 impl FetchMetrics {
@@ -94,6 +102,11 @@ impl FetchMetrics {
             retries: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
             prefetch_skips: AtomicU64::new(0),
+            local_cache_io_calls: AtomicU64::new(0),
+            local_cache_io_handoff_total_ns: AtomicU64::new(0),
+            local_cache_io_handoff_max_ns: AtomicU64::new(0),
+            local_cache_io_backend_total_ns: AtomicU64::new(0),
+            local_cache_io_backend_max_ns: AtomicU64::new(0),
         }
     }
 }
@@ -102,7 +115,7 @@ impl std::fmt::Display for FetchMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={}",
+            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3}",
             self.cache_hits.load(Ordering::Relaxed),
             self.s3_fetches.load(Ordering::Relaxed),
             self.s3_errors.load(Ordering::Relaxed),
@@ -110,6 +123,9 @@ impl std::fmt::Display for FetchMetrics {
             self.retries.load(Ordering::Relaxed),
             self.bytes_downloaded.load(Ordering::Relaxed),
             self.prefetch_skips.load(Ordering::Relaxed),
+            self.local_cache_io_calls.load(Ordering::Relaxed),
+            self.local_cache_io_handoff_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.local_cache_io_backend_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         )
     }
 }
@@ -158,6 +174,24 @@ pub struct FetchScheduler {
 }
 
 impl FetchScheduler {
+    fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
+        self.metrics
+            .local_cache_io_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_handoff_total_ns
+            .fetch_add(timing.handoff_ns, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_handoff_max_ns
+            .fetch_max(timing.handoff_ns, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_backend_total_ns
+            .fetch_add(timing.backend_io_ns, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_backend_max_ns
+            .fetch_max(timing.backend_io_ns, Ordering::Relaxed);
+    }
+
     /// Create a new fetch scheduler.
     ///
     /// # Arguments
@@ -523,11 +557,9 @@ impl FetchScheduler {
 
     async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
         let block_store = self.local_block_backend.clone();
-        tokio::task::spawn_blocking(move || block_store.get(object_id))
-            .await
-            .map_err(|error| {
-                FetchError::CacheAccess(format!("block store get task failed: {error}"))
-            })
+        let (result, timing) = run_local_cache_io(|| block_store.get(object_id));
+        self.record_local_cache_io_timing(timing);
+        Ok(result)
     }
 
     async fn block_store_put_async(
@@ -537,12 +569,10 @@ impl FetchScheduler {
         evictable: bool,
     ) -> Result<(), FetchError> {
         let block_store = self.local_block_backend.clone();
-        tokio::task::spawn_blocking(move || block_store.put(object_id, payload.as_ref(), evictable))
-            .await
-            .map_err(|error| {
-                FetchError::CacheAccess(format!("block store put task failed: {error}"))
-            })?
-            .map_err(|error| FetchError::CacheAccess(error.to_string()))
+        let (result, timing) =
+            run_local_cache_io(|| block_store.put(object_id, payload.as_ref(), evictable));
+        self.record_local_cache_io_timing(timing);
+        result.map_err(|error| FetchError::CacheAccess(error.to_string()))
     }
 
     /// Perform S3 GET for one fragment with retries + AIMD.
