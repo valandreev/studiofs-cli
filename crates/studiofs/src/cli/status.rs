@@ -749,6 +749,7 @@ mod tests {
             block_store_sync_data: Default::default(),
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
+            winfsp_foreground_flushes: Default::default(),
             write_backpressure: Default::default(),
             payload_burst: Default::default(),
             payload_persist: Default::default(),
