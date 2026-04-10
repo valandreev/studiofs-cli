@@ -1,7 +1,7 @@
 //! StudioFS Cache Layer.
 //!
-//! `block_cache` remains as a compatibility shim for upload-queue and
-//! pending-upload tracking at the write-path boundary.
+//! `block_cache` provides upload-queue and pending-upload tracking at the
+//! write-path boundary.
 //! `v3` provides contract detection plus the file-per-block local backend.
 
 use std::path::Path;

@@ -1,32 +1,21 @@
 //! `studiofs destroy` — permanently delete a volume.
 
+use crate::cli::cache_layout::describe_cache_layout_state;
 use std::io::Write;
 use std::path::Path;
 use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig};
 use tracing::warn;
 
-fn describe_cache_generation_state(detection: Option<&CacheBackendDetection>) -> &'static str {
-    if let Some(detection) = detection {
-        if detection.has_cache_v3_contract() {
-            "cache-v3 only"
-        } else {
-            "empty/undetected"
-        }
-    } else {
-        "unknown"
-    }
-}
-
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
         if detection.has_cache_v3_contract() {
-            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its cache-v3 subtree"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its Cache 3.0 subtree"
         } else {
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         }
     } else {
-        "local cleanup removes the entire metadata directory (`meta_dir`); default cache generation could not be inspected"
+        "local cleanup removes the entire metadata directory (`meta_dir`); Cache 3.0 layout state could not be inspected"
     }
 }
 
@@ -50,7 +39,7 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
         Ok(detection) => Some(detection),
         Err(error) => {
             println!(
-                "Warning: Failed to inspect default cache generations at '{}': {error}",
+                "Warning: Failed to inspect Cache 3.0 layout state at '{}': {error}",
                 default_cache_root.display()
             );
             None
@@ -103,12 +92,12 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     }
     println!("  Default cache root: {}", default_cache_root.display());
     println!(
-        "  Cache generation state: {}",
-        describe_cache_generation_state(cache_backend_detection.as_ref())
+        "  Cache layout state: {}",
+        describe_cache_layout_state(cache_backend_detection.as_ref())
     );
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Cache-v3 marker: {} ({})",
+            "  Cache 3.0 marker: {} ({})",
             detection.layout.layout_marker.display(),
             if detection.has_cache_v3_contract() {
                 "present"
@@ -117,7 +106,7 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
             }
         );
         println!(
-            "  Cache-v3 index: {} ({})",
+            "  Cache 3.0 index: {} ({})",
             detection.layout.redb_index_path.display(),
             if detection.v3_index_exists {
                 "present"
@@ -261,23 +250,23 @@ mod tests {
     }
 
     #[test]
-    fn destroy_generation_state_labels_cover_layouts() {
-        assert_eq!(describe_cache_generation_state(None), "unknown");
+    fn destroy_cache_layout_state_labels_cover_layouts() {
+        assert_eq!(describe_cache_layout_state(None), "unknown");
         assert_eq!(
-            describe_cache_generation_state(Some(&detection(false))),
-            "empty/undetected"
+            describe_cache_layout_state(Some(&detection(false))),
+            "Cache 3.0 not initialized"
         );
         assert_eq!(
-            describe_cache_generation_state(Some(&detection(true))),
-            "cache-v3 only"
+            describe_cache_layout_state(Some(&detection(true))),
+            "Cache 3.0 ready"
         );
     }
 
     #[test]
-    fn destroy_cleanup_scope_is_generation_aware() {
+    fn destroy_cleanup_scope_is_layout_aware() {
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true))),
-            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its cache-v3 subtree"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its Cache 3.0 subtree"
         );
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(false))),
@@ -285,7 +274,7 @@ mod tests {
         );
         assert_eq!(
             describe_destroy_cache_scope(None),
-            "local cleanup removes the entire metadata directory (`meta_dir`); default cache generation could not be inspected"
+            "local cleanup removes the entire metadata directory (`meta_dir`); Cache 3.0 layout state could not be inspected"
         );
     }
 }

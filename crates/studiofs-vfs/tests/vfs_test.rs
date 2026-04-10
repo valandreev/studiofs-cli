@@ -2296,7 +2296,7 @@ fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
             );
             assert_ne!(
                 after[0].1.object_id, baseline_object_id,
-                "local flush should advance metadata to the newly committed cache-v2 object"
+                "local flush should advance metadata to the newly committed local cache object"
             );
             assert!(
                 vfs.pending_uploads_for_inode(ino).len() == 1,
@@ -7606,19 +7606,24 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
                 &cache_dir_str,
                 1024 * 1024 * 1024,
                 512 * 1024 * 1024,
-                vfs_config.validate().expect("test VFS config should validate"),
+                vfs_config
+                    .validate()
+                    .expect("test VFS config should validate"),
             )
             .unwrap();
-            vfs.start().expect("failed to start StudioVfs background workers");
-            let data =
-                tokio::time::timeout(Duration::from_secs(20), vfs.read(ino, 0, payload.len() as u32))
-                    .await
-                    .expect("read timed out in crash-recovery regression")
-                    .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+            let data = tokio::time::timeout(
+                Duration::from_secs(20),
+                vfs.read(ino, 0, payload.len() as u32),
+            )
+            .await
+            .expect("read timed out in crash-recovery regression")
+            .unwrap();
             assert_eq!(
                 data.as_ref(),
                 payload.as_slice(),
-                "segment replay should recover accepted staged data even if legacy spill files are gone"
+                "segment replay should recover accepted staged data even if spill files are gone"
             );
         });
         rt.shutdown_background();

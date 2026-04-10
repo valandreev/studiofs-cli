@@ -207,10 +207,10 @@ Recent notes:
   This documents the buffered-first local overlay model, the foreground-vs-background
   fetch priority split, and the current observability counters.
 - Finalized the committed read path (SFS-139): foreground reads, readahead,
-  and upload cache rereads now use the raw local block backend as the primary
+  and upload cache rereads now use the Cache 3.0 local block backend as the primary
   committed cache, while async VFS workers route blocking local cache mutations
   through Tokio's blocking pool.
-- Reduced Windows cache-v2 growth stalls (SFS-146): the data file is marked
+- Reduced Windows local-cache growth stalls (SFS-146): the data file is marked
   sparse on Windows when possible, physical growth is serialized separately
   from allocator bookkeeping, and `set_len()` no longer holds the allocator
   lock while NTFS extends the file.

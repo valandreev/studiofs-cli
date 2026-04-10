@@ -1,5 +1,6 @@
 //! CLI command modules.
 
+pub mod cache_layout;
 pub mod destroy;
 pub mod discovery;
 pub mod dump_load;

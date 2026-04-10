@@ -11,7 +11,7 @@ Core principles:
 - File payloads live in immutable blocks addressed by chunk-relative slices; each 16 MiB chunk currently fans out into four 4 MiB block objects.
 - Runtime file visibility is split into local-visible overlay state and remote-visible base state.
 - Regular files now use chunk-local overlay/base slice graphs in metadata, not a flat block table.
-- Cache 3.0 (`studiofs-cache::v3`) is the active local data store; remaining cache helpers are a narrow compatibility shim around upload orchestration.
+- Cache 3.0 (`studiofs-cache::v3`) is the active local data store; remaining cache helpers are a narrow upload-orchestration layer.
 - The canonical chunk/slice/block vocabulary for follow-up work is frozen in
   [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
 - The execution guardrails and implementation order for the data plane redesign are
@@ -28,7 +28,7 @@ Core principles:
 studiofs (CLI)
   ├── studiofs-meta       local metadata + PostgreSQL delta sync
   ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      local block backend + upload queue compatibility shim
+  ├── studiofs-cache      local block backend + upload queue orchestration
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   └── studiofs-winfsp     Windows bridge

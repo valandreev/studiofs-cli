@@ -3,8 +3,8 @@
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
 This document uses the frozen chunk/slice/block vocabulary for the active data
-path. Where the compatibility shim still exposes historical names, those are
-called out explicitly.
+path. Where upload-orchestration helpers still expose historical names, those
+are called out explicitly.
 
 
 - `flush()`/`fsync()` and the local `WriteBuffer -> local block backend -> sync_data() -> metadata`
@@ -20,9 +20,9 @@ Holds all runtime state:
 |-------|------|---------|
 | `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
-| `block_store` | `Arc<dyn LocalBlockBackend>` | Cache-v2 local data store for committed extents and upload rereads |
+| `block_store` | `Arc<dyn LocalBlockBackend>` | Cache 3.0 local data store for committed extents and upload rereads |
 | `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides backend-specific internals |
-| `block_cache` | `Arc<BlockCache>` | Narrow compatibility shim for upload-queue orchestration and pending-upload pinning |
+| `block_cache` | `Arc<BlockCache>` | Narrow upload-orchestration layer for pending-upload pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `ReadAheadTracker` | Sequential prefetch |
 | `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |
@@ -345,7 +345,7 @@ Adaptive S3 block fetcher with deduplication and congestion control.
 ```
 fetch_block(object_id)
   │
-  ├─ Fast path: check local data store + compatibility shim → hit? return
+  ├─ Fast path: check local data store + upload-orchestration layer → hit? return
   │
   ├─ Singleflight check: join existing in-flight fetch? → wait + return
   │
@@ -355,7 +355,7 @@ fetch_block(object_id)
   ├─ S3 GET with configurable timeout (default 45s)
   ├─ Decode object from `opendal::Buffer` + verify checksum incrementally
   ├─ Return zero-copy payload when a single payload chunk is available
-  ├─ Populate local data store + compatibility shim
+  ├─ Populate local data store + upload-orchestration layer
   ├─ Resolve AIMD permit (success/failure)
   │
   ├─ Broadcast result to singleflight waiters
@@ -373,7 +373,7 @@ Prefetch reads use `fetch_block_prefetch()`:
 
 | Metric | Meaning |
 |--------|---------|
-| `cache_hits` | Served from the local data store / compatibility shim |
+| `cache_hits` | Served from the local data store / upload-orchestration layer |
 | `s3_fetches` | Downloads from S3 |
 | `s3_errors` | Failed S3 requests |
 | `singleflight_joins` | Deduplicated requests |
