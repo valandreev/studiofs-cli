@@ -705,7 +705,13 @@ impl StudioVfs {
     async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
         let started = Instant::now();
         let _ = self
-            .flush_dirty_full_write_buffer_blocks(ino, 1, None, LocalSyncPolicy::Opportunistic)
+            .flush_dirty_full_write_buffer_blocks(
+                ino,
+                1,
+                false,
+                None,
+                LocalSyncPolicy::Opportunistic,
+            )
             .await?;
         if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
             self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
@@ -944,20 +950,20 @@ impl StudioVfs {
         &self,
         ino: Ino,
         minimum_batch_bytes: usize,
+        track_eager_flush_outcomes: bool,
         fallback_content_epoch: Option<u64>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        let track_eager_flush = minimum_batch_bytes > 1;
         let (full_blocks, full_block_batch_bytes) =
             self.snapshot_dirty_full_write_buffer_blocks(ino);
         if full_blocks.is_empty() {
-            if track_eager_flush {
+            if track_eager_flush_outcomes {
                 self.note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
             }
             return Ok(false);
         }
         if full_block_batch_bytes < minimum_batch_bytes {
-            if track_eager_flush {
+            if track_eager_flush_outcomes {
                 self.note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
             }
             return Ok(false);
@@ -987,7 +993,7 @@ impl StudioVfs {
         if let Some(attr) = attr_to_clear.as_ref() {
             self.clear_matching_dirty_attr_if_committed(ino, attr);
         }
-        if track_eager_flush && !persisted_blocks.is_empty() {
+        if track_eager_flush_outcomes && !persisted_blocks.is_empty() {
             self.note_eager_flush_outcome(EagerFlushOutcome::Triggered);
         }
         Ok(!persisted_blocks.is_empty())
@@ -1291,6 +1297,7 @@ impl StudioVfs {
                 .flush_dirty_full_write_buffer_blocks(
                     ino,
                     self.write_eager_flush_batch_bytes,
+                    true,
                     Some(base_attr.content_epoch),
                     LocalSyncPolicy::Opportunistic,
                 )

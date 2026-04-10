@@ -1,5 +1,6 @@
 //! `studiofs status` — show filesystem status.
 
+use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
 use serde_json::Value;
@@ -19,7 +20,6 @@ const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
 const INGRESS_RECORD_PUT: u8 = 1;
 const INGRESS_RECORD_INVALIDATE: u8 = 2;
 const INGRESS_RECORD_HEADER_LEN: usize = 37;
-const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
 
 #[derive(Debug, Default)]

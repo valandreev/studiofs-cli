@@ -8512,203 +8512,83 @@ impl StudioVfs {
 
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
-        let flush_ordered_calls = self
-            .state
-            .metrics
-            .flush_ordered_calls
-            .load(Ordering::Relaxed);
-        let local_cache_io_calls = self
-            .state
-            .metrics
-            .local_cache_io_calls
-            .load(Ordering::Relaxed);
-        let local_cache_handoff_total_ns = self
-            .state
-            .metrics
-            .local_cache_io_handoff_total_ns
-            .load(Ordering::Relaxed);
-        let local_cache_handoff_max_ns = self
-            .state
-            .metrics
-            .local_cache_io_handoff_max_ns
-            .load(Ordering::Relaxed);
+        macro_rules! load_metric {
+            ($field:ident) => {
+                self.state.metrics.$field.load(Ordering::Relaxed)
+            };
+        }
+        macro_rules! load_metrics {
+            ($($name:ident : $field:ident),+ $(,)?) => {
+                $(let $name = load_metric!($field);)+
+            };
+        }
+        load_metrics!(
+            flush_ordered_calls: flush_ordered_calls,
+            local_cache_io_calls: local_cache_io_calls,
+            local_cache_handoff_total_ns: local_cache_io_handoff_total_ns,
+            local_cache_handoff_max_ns: local_cache_io_handoff_max_ns,
+            local_cache_backend_total_ns: local_cache_io_backend_total_ns,
+            local_cache_backend_max_ns: local_cache_io_backend_max_ns,
+            sync_calls: block_store_sync_data_calls,
+            sync_deferred_calls: block_store_sync_data_deferred_calls,
+            sync_bytes: block_store_sync_data_synced_bytes,
+            sync_total_ns: block_store_sync_data_total_ns,
+            sync_max_ns: block_store_sync_data_max_ns,
+            sync_queue_wait_calls: block_store_sync_data_queue_wait_calls,
+            sync_queue_wait_total_ns: block_store_sync_data_queue_wait_total_ns,
+            sync_queue_wait_max_ns: block_store_sync_data_queue_wait_max_ns,
+            sync_interval_total_ns: block_store_sync_data_interval_total_ns,
+            sync_interval_max_ns: block_store_sync_data_interval_max_ns,
+            payload_persist_calls: payload_persist_calls,
+            payload_persist_total_ns: payload_persist_total_ns,
+            payload_persist_max_ns: payload_persist_max_ns,
+            payload_burst_count: payload_burst_count,
+            payload_burst_total_blocks: payload_burst_total_blocks,
+            payload_burst_total_bytes: payload_burst_total_bytes,
+            payload_burst_max_blocks: payload_burst_max_blocks,
+            payload_burst_max_bytes: payload_burst_max_bytes,
+            payload_burst_interval_total_ns: payload_burst_interval_total_ns,
+            payload_burst_interval_max_ns: payload_burst_interval_max_ns,
+            metadata_commit_calls: metadata_commit_calls,
+            metadata_commit_total_ns: metadata_commit_total_ns,
+            metadata_commit_max_ns: metadata_commit_max_ns,
+            eager_flush_checks: eager_flush_checks,
+            eager_flush_triggered: eager_flush_triggered,
+            eager_flush_skipped_empty: eager_flush_skipped_empty,
+            eager_flush_skipped_below_threshold: eager_flush_skipped_below_threshold,
+        );
         let local_cache_handoff_histogram = self
             .state
             .metrics
             .local_cache_io_handoff_histogram
             .snapshot();
-        let local_cache_backend_total_ns = self
-            .state
-            .metrics
-            .local_cache_io_backend_total_ns
-            .load(Ordering::Relaxed);
-        let local_cache_backend_max_ns = self
-            .state
-            .metrics
-            .local_cache_io_backend_max_ns
-            .load(Ordering::Relaxed);
         let local_cache_backend_histogram = self
             .state
             .metrics
             .local_cache_io_backend_histogram
             .snapshot();
-        let sync_calls = self
-            .state
-            .metrics
-            .block_store_sync_data_calls
-            .load(Ordering::Relaxed);
-        let sync_deferred_calls = self
-            .state
-            .metrics
-            .block_store_sync_data_deferred_calls
-            .load(Ordering::Relaxed);
-        let sync_bytes = self
-            .state
-            .metrics
-            .block_store_sync_data_synced_bytes
-            .load(Ordering::Relaxed);
-        let sync_total_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_total_ns
-            .load(Ordering::Relaxed);
-        let sync_max_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_max_ns
-            .load(Ordering::Relaxed);
         let sync_histogram = self
             .state
             .metrics
             .block_store_sync_data_histogram
             .snapshot();
-        let sync_queue_wait_calls = self
-            .state
-            .metrics
-            .block_store_sync_data_queue_wait_calls
-            .load(Ordering::Relaxed);
-        let sync_queue_wait_total_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_queue_wait_total_ns
-            .load(Ordering::Relaxed);
-        let sync_queue_wait_max_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_queue_wait_max_ns
-            .load(Ordering::Relaxed);
         let sync_queue_wait_histogram = self
             .state
             .metrics
             .block_store_sync_data_queue_wait_histogram
             .snapshot();
-        let sync_interval_total_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_interval_total_ns
-            .load(Ordering::Relaxed);
-        let sync_interval_max_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_interval_max_ns
-            .load(Ordering::Relaxed);
         let sync_interval_histogram = self
             .state
             .metrics
             .block_store_sync_data_interval_histogram
             .snapshot();
-        let payload_persist_calls = self
-            .state
-            .metrics
-            .payload_persist_calls
-            .load(Ordering::Relaxed);
-        let payload_persist_total_ns = self
-            .state
-            .metrics
-            .payload_persist_total_ns
-            .load(Ordering::Relaxed);
-        let payload_persist_max_ns = self
-            .state
-            .metrics
-            .payload_persist_max_ns
-            .load(Ordering::Relaxed);
         let payload_persist_histogram = self.state.metrics.payload_persist_histogram.snapshot();
-        let payload_burst_count = self
-            .state
-            .metrics
-            .payload_burst_count
-            .load(Ordering::Relaxed);
-        let payload_burst_total_blocks = self
-            .state
-            .metrics
-            .payload_burst_total_blocks
-            .load(Ordering::Relaxed);
-        let payload_burst_total_bytes = self
-            .state
-            .metrics
-            .payload_burst_total_bytes
-            .load(Ordering::Relaxed);
-        let payload_burst_max_blocks = self
-            .state
-            .metrics
-            .payload_burst_max_blocks
-            .load(Ordering::Relaxed);
-        let payload_burst_max_bytes = self
-            .state
-            .metrics
-            .payload_burst_max_bytes
-            .load(Ordering::Relaxed);
-        let payload_burst_interval_total_ns = self
-            .state
-            .metrics
-            .payload_burst_interval_total_ns
-            .load(Ordering::Relaxed);
-        let payload_burst_interval_max_ns = self
-            .state
-            .metrics
-            .payload_burst_interval_max_ns
-            .load(Ordering::Relaxed);
         let payload_burst_interval_histogram = self
             .state
             .metrics
             .payload_burst_interval_histogram
             .snapshot();
-        let metadata_commit_calls = self
-            .state
-            .metrics
-            .metadata_commit_calls
-            .load(Ordering::Relaxed);
-        let metadata_commit_total_ns = self
-            .state
-            .metrics
-            .metadata_commit_total_ns
-            .load(Ordering::Relaxed);
-        let metadata_commit_max_ns = self
-            .state
-            .metrics
-            .metadata_commit_max_ns
-            .load(Ordering::Relaxed);
         let metadata_commit_histogram = self.state.metrics.metadata_commit_histogram.snapshot();
-        let eager_flush_checks = self
-            .state
-            .metrics
-            .eager_flush_checks
-            .load(Ordering::Relaxed);
-        let eager_flush_triggered = self
-            .state
-            .metrics
-            .eager_flush_triggered
-            .load(Ordering::Relaxed);
-        let eager_flush_skipped_empty = self
-            .state
-            .metrics
-            .eager_flush_skipped_empty
-            .load(Ordering::Relaxed);
-        let eager_flush_skipped_below_threshold = self
-            .state
-            .metrics
-            .eager_flush_skipped_below_threshold
-            .load(Ordering::Relaxed);
 
         let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.50);
         let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.95);
