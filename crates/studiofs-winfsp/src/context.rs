@@ -584,6 +584,44 @@ impl StudioFsContext {
         })
     }
 
+    fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
+        self.vfs.note_winfsp_cleanup_callback();
+        if fh != 0 {
+            self.vfs.note_winfsp_cleanup_flush_fh_callback();
+            let flushed = self.flush_callback_path_if_dirty(ino, Some(fh))?;
+            self.vfs.note_winfsp_cleanup_barrier_outcome(flushed);
+        } else {
+            let flushed = self.flush_callback_path_if_dirty(ino, None)?;
+            self.vfs.note_winfsp_cleanup_barrier_outcome(flushed);
+        }
+        Ok(())
+    }
+
+    fn run_flush_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
+        self.vfs.note_winfsp_flush_callback();
+        let flushed = self.flush_callback_path_if_dirty(ino, Some(fh))?;
+        self.vfs.note_winfsp_flush_barrier_outcome(flushed);
+        Ok(())
+    }
+
+    fn run_close_callback(&self, ino: Ino, fh: u64) {
+        self.vfs.note_winfsp_close_callback();
+        let close_can_attribute_barrier = fh != 0 && self.vfs.open_count(ino) <= 1;
+        let close_sees_dirty_inode =
+            close_can_attribute_barrier && self.vfs.inode_has_local_dirty_state(ino);
+        if fh != 0 {
+            let vfs = self.vfs.clone();
+            let release_result = self.spawn_wait(async move { vfs.release_fh(fh).await });
+            if close_can_attribute_barrier {
+                self.vfs
+                    .note_winfsp_close_barrier_outcome(close_sees_dirty_inode);
+            }
+            if let Err(e) = release_result {
+                error!(ino, fh, "release_fh failed: {:?}", e);
+            }
+        }
+    }
+
     /// Copy the cached security descriptor into the provided buffer.
     /// Returns the full SD length (even if the buffer was smaller).
     fn copy_sd_to_buffer(&self, buf: Option<&mut [c_void]>) -> u64 {
@@ -691,23 +729,7 @@ impl FileSystemContext for StudioFsContext {
 
     fn close(&self, context: Self::FileContext) {
         debug!(ino = context.ino, fh = context.fh, "close");
-        self.vfs.note_winfsp_close_callback();
-        let close_can_attribute_barrier = context.fh != 0 && self.vfs.open_count(context.ino) <= 1;
-        let close_sees_dirty_inode =
-            close_can_attribute_barrier && self.vfs.inode_has_local_dirty_state(context.ino);
-        if context.fh != 0 {
-            let vfs = self.vfs.clone();
-            let fh = context.fh;
-            let ino = context.ino;
-            let release_result = self.spawn_wait(async move { vfs.release_fh(fh).await });
-            if close_can_attribute_barrier {
-                self.vfs
-                    .note_winfsp_close_barrier_outcome(close_sees_dirty_inode);
-            }
-            if let Err(e) = release_result {
-                error!(ino, fh, "release_fh failed: {:?}", e);
-            }
-        }
+        self.run_close_callback(context.ino, context.fh);
         drop(context);
     }
 
@@ -1001,9 +1023,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        self.vfs.note_winfsp_cleanup_callback();
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
+            self.vfs.note_winfsp_cleanup_callback();
             if let Some(fname) = file_name {
                 match resolve_parent(&self.vfs, fname) {
                     Ok((parent_ino, name)) => {
@@ -1048,24 +1070,11 @@ impl FileSystemContext for StudioFsContext {
             // observe a clean inode and only release the handle.
             let ino = context.ino;
             let fh = context.fh;
-            if fh != 0 {
-                self.vfs.note_winfsp_cleanup_flush_fh_callback();
-                match self.flush_callback_path_if_dirty(ino, Some(fh)) {
-                    Ok(flushed) => {
-                        self.vfs.note_winfsp_cleanup_barrier_outcome(flushed);
-                    }
-                    Err(e) => {
-                        error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
-                    }
-                }
-            } else {
-                match self.flush_callback_path_if_dirty(ino, None) {
-                    Ok(flushed) => {
-                        self.vfs.note_winfsp_cleanup_barrier_outcome(flushed);
-                    }
-                    Err(e) => {
-                        error!(ino, "cleanup flush failed: {:?}", e);
-                    }
+            if let Err(e) = self.run_cleanup_non_delete_callback(ino, fh) {
+                if fh != 0 {
+                    error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
+                } else {
+                    error!(ino, "cleanup flush failed: {:?}", e);
                 }
             }
         }
@@ -1215,12 +1224,9 @@ impl FileSystemContext for StudioFsContext {
         context: Option<&Self::FileContext>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        self.vfs.note_winfsp_flush_callback();
         if let Some(ctx) = context {
-            let flushed = self
-                .flush_callback_path_if_dirty(ctx.ino, Some(ctx.fh))
+            self.run_flush_callback(ctx.ino, ctx.fh)
                 .map_err(vfs_to_winfsp_err)?;
-            self.vfs.note_winfsp_flush_barrier_outcome(flushed);
 
             let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
             *file_info = attr_to_file_info(&attr);
@@ -1347,8 +1353,8 @@ mod tests {
         FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
         FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, StudioFileHandle, StudioFsContext,
-        WinfspKernelInvalidator, build_notify_info, ino_to_windows_path, notify_filter_for_kind,
+        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator,
+        build_notify_info, ino_to_windows_path, notify_filter_for_kind,
         open_flags_from_create_options, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
@@ -1363,7 +1369,6 @@ mod tests {
     use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs, VfsConfig};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
-    use winfsp::filesystem::{FileInfo, FileSystemContext};
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("winfsp-test-{volume_suffix}-{}", std::process::id());
@@ -1711,7 +1716,6 @@ mod tests {
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
             .expect("open_file");
-        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
 
         ctx.spawn_wait({
             let vfs = vfs.clone();
@@ -1721,9 +1725,8 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let mut file_info = FileInfo::default();
 
-        <StudioFsContext as FileSystemContext>::flush(&ctx, Some(&handle), &mut file_info)
+        ctx.run_flush_callback(attr.ino, fh)
             .expect("first flush callback");
         let after_first_callbacks = winfsp_callbacks(&vfs);
         let after_first_barriers = winfsp_foreground_flushes(&vfs);
@@ -1742,7 +1745,7 @@ mod tests {
             "first dirty flush should not look like a clean skip"
         );
 
-        <StudioFsContext as FileSystemContext>::flush(&ctx, Some(&handle), &mut file_info)
+        ctx.run_flush_callback(attr.ino, fh)
             .expect("second flush callback");
         let after_second_callbacks = winfsp_callbacks(&vfs);
         let after_second_barriers = winfsp_foreground_flushes(&vfs);
@@ -1777,7 +1780,6 @@ mod tests {
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
             .expect("open_file");
-        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
 
         ctx.spawn_wait({
             let vfs = vfs.clone();
@@ -1788,7 +1790,8 @@ mod tests {
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
 
-        <StudioFsContext as FileSystemContext>::cleanup(&ctx, &handle, None, 0);
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("first cleanup callback");
         let after_first_callbacks = winfsp_callbacks(&vfs);
         let after_first_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
@@ -1806,7 +1809,8 @@ mod tests {
             "first dirty cleanup should not look like a clean skip"
         );
 
-        <StudioFsContext as FileSystemContext>::cleanup(&ctx, &handle, None, 0);
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("second cleanup callback");
         let after_second_callbacks = winfsp_callbacks(&vfs);
         let after_second_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
@@ -1840,7 +1844,6 @@ mod tests {
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
             .expect("open_file");
-        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
 
         ctx.spawn_wait({
             let vfs = vfs.clone();
@@ -1851,7 +1854,8 @@ mod tests {
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
 
-        <StudioFsContext as FileSystemContext>::cleanup(&ctx, &handle, None, 0);
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("cleanup callback");
         let after_cleanup_callbacks = winfsp_callbacks(&vfs);
         let after_cleanup_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
@@ -1865,7 +1869,7 @@ mod tests {
             "dirty-handle lifecycle should attribute the foreground barrier to cleanup"
         );
 
-        <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+        ctx.run_close_callback(attr.ino, fh);
         let after_close_callbacks = winfsp_callbacks(&vfs);
         let after_close_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
