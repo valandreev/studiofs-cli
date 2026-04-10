@@ -36,4 +36,5 @@ pub use vfs::{
     VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathWinfspForegroundFlushStats,
 };

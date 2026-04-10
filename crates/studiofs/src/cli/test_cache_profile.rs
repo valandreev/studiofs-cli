@@ -417,6 +417,23 @@ fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         "sync_data_calls_per_gib: {:.2}\n",
         snapshot.block_store_sync_data.calls_per_gib
     ));
+    out.push_str(&format!(
+        "winfsp_callbacks: write={} overwrite={} cleanup={} flush={} close={}\n",
+        snapshot.winfsp_callbacks.write,
+        snapshot.winfsp_callbacks.overwrite,
+        snapshot.winfsp_callbacks.cleanup,
+        snapshot.winfsp_callbacks.flush,
+        snapshot.winfsp_callbacks.close
+    ));
+    out.push_str(&format!(
+        "winfsp_foreground_flushes: cleanup={} cleanup_skipped_clean={} flush={} flush_skipped_clean={} close={} close_skipped_clean={}\n",
+        snapshot.winfsp_foreground_flushes.cleanup,
+        snapshot.winfsp_foreground_flushes.cleanup_skipped_clean,
+        snapshot.winfsp_foreground_flushes.flush,
+        snapshot.winfsp_foreground_flushes.flush_skipped_clean,
+        snapshot.winfsp_foreground_flushes.close,
+        snapshot.winfsp_foreground_flushes.close_skipped_clean
+    ));
     Ok(out)
 }
 
@@ -494,4 +511,51 @@ fn send_profile(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_write_path_summary;
+    use studiofs_vfs::{
+        VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
+        VfsWritePathWinfspForegroundFlushStats,
+    };
+
+    #[test]
+    fn render_write_path_summary_includes_winfsp_callback_breakdown() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            backend_tag: "cache-v3".to_string(),
+            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
+                write: 11,
+                overwrite: 2,
+                cleanup: 7,
+                flush: 5,
+                close: 7,
+                ..Default::default()
+            },
+            winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
+                cleanup: 3,
+                flush: 2,
+                close: 0,
+                cleanup_skipped_clean: 4,
+                flush_skipped_clean: 3,
+                close_skipped_clean: 7,
+            },
+            ..Default::default()
+        };
+
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let summary = render_write_path_summary(&bytes).expect("render summary");
+
+        assert!(
+            summary.contains("winfsp_callbacks: write=11 overwrite=2 cleanup=7 flush=5 close=7"),
+            "summary should include the WinFSP callback counts: {summary}"
+        );
+        assert!(
+            summary.contains(
+                "winfsp_foreground_flushes: cleanup=3 cleanup_skipped_clean=4 flush=2 flush_skipped_clean=3 close=0 close_skipped_clean=7"
+            ),
+            "summary should include the WinFSP foreground flush attribution: {summary}"
+        );
+    }
 }

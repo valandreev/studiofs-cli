@@ -290,8 +290,28 @@ pub struct VfsWritePathSyncDataStats {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathWinfspCallbackStats {
     pub write: u64,
+    #[serde(default)]
+    pub overwrite: u64,
+    #[serde(default)]
+    pub cleanup: u64,
     pub flush: u64,
+    #[serde(default)]
+    pub close: u64,
+    #[serde(default)]
     pub cleanup_flush_fh: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathWinfspForegroundFlushStats {
+    pub cleanup: u64,
+    pub flush: u64,
+    pub close: u64,
+    #[serde(default)]
+    pub cleanup_skipped_clean: u64,
+    #[serde(default)]
+    pub flush_skipped_clean: u64,
+    #[serde(default)]
+    pub close_skipped_clean: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -382,6 +402,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
+    #[serde(default)]
+    pub winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats,
     pub write_backpressure: VfsWritePathBackpressureStats,
     #[serde(default)]
     pub payload_burst: VfsWritePathBurstStats,
@@ -395,6 +417,13 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub eager_flush: VfsWritePathEagerFlushStats,
     #[serde(default)]
     pub tuning: VfsWritePathTuningStats,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WinfspBarrierType {
+    Cleanup,
+    Flush,
+    Close,
 }
 
 /// Compatibility-shaped acceptance decision for a prospective write batch.
@@ -3710,8 +3739,17 @@ struct MetricsState {
     eager_flush_skipped_empty: AtomicU64,
     eager_flush_skipped_below_threshold: AtomicU64,
     winfsp_write_callbacks: AtomicU64,
+    winfsp_overwrite_callbacks: AtomicU64,
+    winfsp_cleanup_callbacks: AtomicU64,
     winfsp_flush_callbacks: AtomicU64,
+    winfsp_close_callbacks: AtomicU64,
     winfsp_cleanup_flush_fh_callbacks: AtomicU64,
+    winfsp_cleanup_barrier_calls: AtomicU64,
+    winfsp_flush_barrier_calls: AtomicU64,
+    winfsp_close_barrier_calls: AtomicU64,
+    winfsp_cleanup_barrier_skipped_clean: AtomicU64,
+    winfsp_flush_barrier_skipped_clean: AtomicU64,
+    winfsp_close_barrier_skipped_clean: AtomicU64,
 }
 
 impl MetricsState {
@@ -3770,8 +3808,17 @@ impl MetricsState {
             eager_flush_skipped_empty: AtomicU64::new(0),
             eager_flush_skipped_below_threshold: AtomicU64::new(0),
             winfsp_write_callbacks: AtomicU64::new(0),
+            winfsp_overwrite_callbacks: AtomicU64::new(0),
+            winfsp_cleanup_callbacks: AtomicU64::new(0),
             winfsp_flush_callbacks: AtomicU64::new(0),
+            winfsp_close_callbacks: AtomicU64::new(0),
             winfsp_cleanup_flush_fh_callbacks: AtomicU64::new(0),
+            winfsp_cleanup_barrier_calls: AtomicU64::new(0),
+            winfsp_flush_barrier_calls: AtomicU64::new(0),
+            winfsp_close_barrier_calls: AtomicU64::new(0),
+            winfsp_cleanup_barrier_skipped_clean: AtomicU64::new(0),
+            winfsp_flush_barrier_skipped_clean: AtomicU64::new(0),
+            winfsp_close_barrier_skipped_clean: AtomicU64::new(0),
         }
     }
 }
@@ -8627,10 +8674,31 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn note_winfsp_overwrite_callback(&self) {
+        self.state
+            .metrics
+            .winfsp_overwrite_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_winfsp_cleanup_callback(&self) {
+        self.state
+            .metrics
+            .winfsp_cleanup_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn note_winfsp_flush_callback(&self) {
         self.state
             .metrics
             .winfsp_flush_callbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_winfsp_close_callback(&self) {
+        self.state
+            .metrics
+            .winfsp_close_callbacks
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -8639,6 +8707,42 @@ impl StudioVfs {
             .metrics
             .winfsp_cleanup_flush_fh_callbacks
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_winfsp_barrier_outcome(&self, barrier_type: WinfspBarrierType, flushed: bool) {
+        let metrics = &self.state.metrics;
+        let (calls, skipped_clean) = match barrier_type {
+            WinfspBarrierType::Cleanup => (
+                &metrics.winfsp_cleanup_barrier_calls,
+                &metrics.winfsp_cleanup_barrier_skipped_clean,
+            ),
+            WinfspBarrierType::Flush => (
+                &metrics.winfsp_flush_barrier_calls,
+                &metrics.winfsp_flush_barrier_skipped_clean,
+            ),
+            WinfspBarrierType::Close => (
+                &metrics.winfsp_close_barrier_calls,
+                &metrics.winfsp_close_barrier_skipped_clean,
+            ),
+        };
+
+        if flushed {
+            calls.fetch_add(1, Ordering::Relaxed);
+        } else {
+            skipped_clean.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn note_winfsp_cleanup_barrier_outcome(&self, flushed: bool) {
+        self.note_winfsp_barrier_outcome(WinfspBarrierType::Cleanup, flushed);
+    }
+
+    pub fn note_winfsp_flush_barrier_outcome(&self, flushed: bool) {
+        self.note_winfsp_barrier_outcome(WinfspBarrierType::Flush, flushed);
+    }
+
+    pub fn note_winfsp_close_barrier_outcome(&self, flushed: bool) {
+        self.note_winfsp_barrier_outcome(WinfspBarrierType::Close, flushed);
     }
 
     /// Returns true when the inode still has local dirty state that requires a
@@ -8877,15 +8981,62 @@ impl StudioVfs {
                     .metrics
                     .winfsp_write_callbacks
                     .load(Ordering::Relaxed),
+                overwrite: self
+                    .state
+                    .metrics
+                    .winfsp_overwrite_callbacks
+                    .load(Ordering::Relaxed),
+                cleanup: self
+                    .state
+                    .metrics
+                    .winfsp_cleanup_callbacks
+                    .load(Ordering::Relaxed),
                 flush: self
                     .state
                     .metrics
                     .winfsp_flush_callbacks
                     .load(Ordering::Relaxed),
+                close: self
+                    .state
+                    .metrics
+                    .winfsp_close_callbacks
+                    .load(Ordering::Relaxed),
                 cleanup_flush_fh: self
                     .state
                     .metrics
                     .winfsp_cleanup_flush_fh_callbacks
+                    .load(Ordering::Relaxed),
+            },
+            winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
+                cleanup: self
+                    .state
+                    .metrics
+                    .winfsp_cleanup_barrier_calls
+                    .load(Ordering::Relaxed),
+                flush: self
+                    .state
+                    .metrics
+                    .winfsp_flush_barrier_calls
+                    .load(Ordering::Relaxed),
+                close: self
+                    .state
+                    .metrics
+                    .winfsp_close_barrier_calls
+                    .load(Ordering::Relaxed),
+                cleanup_skipped_clean: self
+                    .state
+                    .metrics
+                    .winfsp_cleanup_barrier_skipped_clean
+                    .load(Ordering::Relaxed),
+                flush_skipped_clean: self
+                    .state
+                    .metrics
+                    .winfsp_flush_barrier_skipped_clean
+                    .load(Ordering::Relaxed),
+                close_skipped_clean: self
+                    .state
+                    .metrics
+                    .winfsp_close_barrier_skipped_clean
                     .load(Ordering::Relaxed),
             },
             write_backpressure: VfsWritePathBackpressureStats {
@@ -15340,6 +15491,38 @@ mod tests {
             vfs.local_sync_group_max_delay.as_millis() as u64,
             "observability should report the active sync-data delay cap"
         );
+    }
+
+    #[test]
+    fn winfsp_observability_snapshot_tracks_callback_and_barrier_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "winfsp-observability-snapshot");
+
+        vfs.note_winfsp_write_callback();
+        vfs.note_winfsp_overwrite_callback();
+        vfs.note_winfsp_cleanup_callback();
+        vfs.note_winfsp_cleanup_flush_fh_callback();
+        vfs.note_winfsp_flush_callback();
+        vfs.note_winfsp_close_callback();
+        vfs.note_winfsp_cleanup_barrier_outcome(true);
+        vfs.note_winfsp_cleanup_barrier_outcome(false);
+        vfs.note_winfsp_flush_barrier_outcome(true);
+        vfs.note_winfsp_flush_barrier_outcome(false);
+        vfs.note_winfsp_close_barrier_outcome(false);
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(snapshot.winfsp_callbacks.write, 1);
+        assert_eq!(snapshot.winfsp_callbacks.overwrite, 1);
+        assert_eq!(snapshot.winfsp_callbacks.cleanup, 1);
+        assert_eq!(snapshot.winfsp_callbacks.cleanup_flush_fh, 1);
+        assert_eq!(snapshot.winfsp_callbacks.flush, 1);
+        assert_eq!(snapshot.winfsp_callbacks.close, 1);
+        assert_eq!(snapshot.winfsp_foreground_flushes.cleanup, 1);
+        assert_eq!(snapshot.winfsp_foreground_flushes.cleanup_skipped_clean, 1);
+        assert_eq!(snapshot.winfsp_foreground_flushes.flush, 1);
+        assert_eq!(snapshot.winfsp_foreground_flushes.flush_skipped_clean, 1);
+        assert_eq!(snapshot.winfsp_foreground_flushes.close, 0);
+        assert_eq!(snapshot.winfsp_foreground_flushes.close_skipped_clean, 1);
     }
 
     #[test]

@@ -412,6 +412,136 @@ fn winfsp_mount_write_read_unmount_smoke() {
 
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP callback observability smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "callback_observability_smoke", &rt);
+    let vfs_observer = vfs.clone();
+    let event_name = format!(
+        "Local\\StudioFsCallbackObservabilitySmoke-{}",
+        std::process::id()
+    );
+
+    with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
+        let flush_snapshot_before = vfs_observer.write_path_observability_snapshot();
+        let repeated_flush_file = std::path::PathBuf::from(drive_root).join("repeated-flush.bin");
+        let mut repeated = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&repeated_flush_file)
+            .expect("open repeated-flush file through WinFSP mount");
+        use std::io::Write;
+        repeated
+            .write_all(b"callback flush observability payload")
+            .expect("write repeated-flush payload through WinFSP mount");
+        repeated
+            .sync_all()
+            .expect("first sync_all through WinFSP mount");
+        repeated
+            .sync_all()
+            .expect("second sync_all through WinFSP mount");
+        drop(repeated);
+
+        let flush_snapshot_after = vfs_observer.write_path_observability_snapshot();
+        assert!(
+            flush_snapshot_after.winfsp_callbacks.flush
+                >= flush_snapshot_before.winfsp_callbacks.flush + 2,
+            "two sync_all calls should surface at least two WinFSP flush callbacks"
+        );
+        assert!(
+            flush_snapshot_after.winfsp_foreground_flushes.flush
+                > flush_snapshot_before.winfsp_foreground_flushes.flush,
+            "the first sync_all should attribute a foreground barrier to the flush callback path"
+        );
+        assert!(
+            flush_snapshot_after
+                .winfsp_foreground_flushes
+                .flush_skipped_clean
+                > flush_snapshot_before
+                    .winfsp_foreground_flushes
+                    .flush_skipped_clean,
+            "the second sync_all should show a clean-skip flush callback instead of another barrier"
+        );
+        assert!(
+            flush_snapshot_after.winfsp_callbacks.cleanup
+                > flush_snapshot_before.winfsp_callbacks.cleanup,
+            "closing the clean handle should still surface a cleanup callback"
+        );
+        assert!(
+            flush_snapshot_after
+                .winfsp_foreground_flushes
+                .cleanup_skipped_clean
+                > flush_snapshot_before
+                    .winfsp_foreground_flushes
+                    .cleanup_skipped_clean,
+            "cleanup after explicit sync_all should be attributed as a clean skip"
+        );
+        assert!(
+            flush_snapshot_after.winfsp_callbacks.close
+                > flush_snapshot_before.winfsp_callbacks.close,
+            "closing the repeated-flush handle should surface a close callback"
+        );
+
+        let close_snapshot_before = vfs_observer.write_path_observability_snapshot();
+        let dirty_close_file = std::path::PathBuf::from(drive_root).join("dirty-close.bin");
+        let mut dirty = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&dirty_close_file)
+            .expect("open dirty-close file through WinFSP mount");
+        dirty
+            .write_all(b"dirty close payload")
+            .expect("write dirty-close payload through WinFSP mount");
+        drop(dirty);
+
+        let close_snapshot_after = vfs_observer.write_path_observability_snapshot();
+        assert!(
+            close_snapshot_after.winfsp_callbacks.cleanup
+                > close_snapshot_before.winfsp_callbacks.cleanup,
+            "dropping a dirty writer should surface a cleanup callback"
+        );
+        assert!(
+            close_snapshot_after.winfsp_foreground_flushes.cleanup
+                > close_snapshot_before.winfsp_foreground_flushes.cleanup,
+            "dirty-handle close should attribute its barrier to cleanup"
+        );
+        assert!(
+            close_snapshot_after.winfsp_callbacks.close
+                > close_snapshot_before.winfsp_callbacks.close,
+            "dropping a dirty writer should still surface a close callback"
+        );
+        assert!(
+            close_snapshot_after
+                .winfsp_foreground_flushes
+                .close_skipped_clean
+                > close_snapshot_before
+                    .winfsp_foreground_flushes
+                    .close_skipped_clean,
+            "close should see the inode as clean after cleanup already drained the dirty state"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_reopen_read_after_upload_finalize_smoke() {
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
