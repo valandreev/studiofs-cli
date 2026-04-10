@@ -419,6 +419,13 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub tuning: VfsWritePathTuningStats,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WinfspBarrierType {
+    Cleanup,
+    Flush,
+    Close,
+}
+
 /// Compatibility-shaped acceptance decision for a prospective write batch.
 /// The active Cache 3.0 foreground path uses `DirtyMem` and `Backpressure`;
 /// `Spill` remains as a compatibility lane for ingress observability.
@@ -8702,43 +8709,40 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn note_winfsp_cleanup_barrier_outcome(&self, flushed: bool) {
+    fn note_winfsp_barrier_outcome(&self, barrier_type: WinfspBarrierType, flushed: bool) {
         let metrics = &self.state.metrics;
+        let (calls, skipped_clean) = match barrier_type {
+            WinfspBarrierType::Cleanup => (
+                &metrics.winfsp_cleanup_barrier_calls,
+                &metrics.winfsp_cleanup_barrier_skipped_clean,
+            ),
+            WinfspBarrierType::Flush => (
+                &metrics.winfsp_flush_barrier_calls,
+                &metrics.winfsp_flush_barrier_skipped_clean,
+            ),
+            WinfspBarrierType::Close => (
+                &metrics.winfsp_close_barrier_calls,
+                &metrics.winfsp_close_barrier_skipped_clean,
+            ),
+        };
+
         if flushed {
-            metrics
-                .winfsp_cleanup_barrier_calls
-                .fetch_add(1, Ordering::Relaxed);
+            calls.fetch_add(1, Ordering::Relaxed);
         } else {
-            metrics
-                .winfsp_cleanup_barrier_skipped_clean
-                .fetch_add(1, Ordering::Relaxed);
+            skipped_clean.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn note_winfsp_cleanup_barrier_outcome(&self, flushed: bool) {
+        self.note_winfsp_barrier_outcome(WinfspBarrierType::Cleanup, flushed);
     }
 
     pub fn note_winfsp_flush_barrier_outcome(&self, flushed: bool) {
-        let metrics = &self.state.metrics;
-        if flushed {
-            metrics
-                .winfsp_flush_barrier_calls
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            metrics
-                .winfsp_flush_barrier_skipped_clean
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.note_winfsp_barrier_outcome(WinfspBarrierType::Flush, flushed);
     }
 
     pub fn note_winfsp_close_barrier_outcome(&self, flushed: bool) {
-        let metrics = &self.state.metrics;
-        if flushed {
-            metrics
-                .winfsp_close_barrier_calls
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            metrics
-                .winfsp_close_barrier_skipped_clean
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.note_winfsp_barrier_outcome(WinfspBarrierType::Close, flushed);
     }
 
     /// Returns true when the inode still has local dirty state that requires a

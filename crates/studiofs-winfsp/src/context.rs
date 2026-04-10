@@ -1236,6 +1236,8 @@ impl FileSystemContext for StudioFsContext {
             let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
             *file_info = attr_to_file_info(&attr);
             debug!(ino = ctx.ino, "flush");
+        } else {
+            self.vfs.note_winfsp_flush_callback();
         }
         Ok(())
     }
