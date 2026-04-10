@@ -208,8 +208,8 @@ CACHE 3.0 OPERATOR MODEL:
     --cache-dir
     --cache-size
   Internal cache thresholds are derived automatically at mount time.
-  Use `studiofs status <name>` to inspect runtime usage/dirty/evictable bytes
-  and migration/reconciliation signals.
+  Use `studiofs status <name>` to inspect runtime usage/dirty/evictable bytes,
+  layout readiness, and reconcile signals.
 
   Enable debug logging:
     studiofs --log-level debug mount myvolume Z:
@@ -284,7 +284,7 @@ RUNTIME POLICY:
         #[arg(long, default_value = "")]
         region: String,
 
-        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        /// Deprecated option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_endpoint: Option<String>,
 
@@ -292,19 +292,19 @@ RUNTIME POLICY:
         #[arg(long = "meta", required = true)]
         meta: Option<String>,
 
-        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        /// Deprecated option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_bucket: Option<String>,
 
-        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        /// Deprecated option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_access_key: Option<String>,
 
-        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        /// Deprecated option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_secret_key: Option<String>,
 
-        /// Deprecated legacy option. Metadata is PostgreSQL-only now.
+        /// Deprecated option. Metadata is PostgreSQL-only now.
         #[arg(long, hide = true)]
         metadata_region: Option<String>,
     },

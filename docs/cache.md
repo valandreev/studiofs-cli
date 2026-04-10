@@ -1,7 +1,7 @@
 # Cache System
 
 The cache subsystem (`studiofs-cache`) is now a Cache 3.0-first local data
-plane with a narrow compatibility shim for upload orchestration.
+plane with a narrow upload orchestration layer.
 
 ## Runtime Scope
 
@@ -11,16 +11,16 @@ Current runtime components:
 |---|---|---|
 | Cache 3.0 local backend | `v3::layout`, `v3::cache_index`, `v3::file_payload_store`, `v3::reconcile` | Persistent local payloads + lifecycle/index state |
 | Local-backend contract | `v2::local_block_backend` | Backend-agnostic trait used by VFS/read/write/upload paths |
-| Compatibility shim | `block_cache`, `upload_queue` | Pending-upload orchestration and compatibility telemetry |
+| Upload orchestration layer | `block_cache`, `upload_queue` | Pending-upload orchestration and local pipeline telemetry |
 
-Legacy cache-v2 storage implementation code has been removed.
+Cache-v2 storage implementation code has been removed.
 
 ## Architecture
 
 ```
                 ┌────────────────────────────┐
                 │       BlockCache           │
-                │   (compatibility shim)     │
+                │ (upload orchestration)     │
                 └───────────┬────────────────┘
                             │
           ┌─────────────────┴──────────────────┐
@@ -60,13 +60,13 @@ On backend startup, reconciliation runs before serving reads/writes:
 Reconciliation is scoped to `v3/**` and does not mutate unrelated files under
 `<cache-root>`.
 
-## Compatibility Shim Responsibilities
+## Upload Orchestration Responsibilities
 
 `BlockCache` remains intentionally small and focused on:
 
 - buffering/pinning payloads near upload boundaries
 - pending-upload queue bookkeeping
-- compatibility metrics used by `status` and benchmark tooling
+- runtime metrics used by `status` and benchmark tooling
 
 It is not the source of truth for durable local payload state.
 
@@ -77,4 +77,4 @@ It is not the source of truth for durable local payload state.
 - Upload workers reread committed payloads from the local backend
   (`get_for_upload()`), not from transient staging buffers.
 - `studiofs status` reports Cache 3.0 contract/index/payload health and does not
-  depend on retired cache-v2 storage formats.
+  depend on retired storage formats.

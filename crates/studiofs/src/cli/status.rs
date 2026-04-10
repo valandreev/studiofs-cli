@@ -366,9 +366,9 @@ pub fn run(
         == Some(CacheBackendKind::CacheV3);
     let contract_state = if let Some(detection) = cache_backend_detection.as_ref() {
         if detection.has_cache_v3_contract() {
-            "cache-v3 only"
+            "Cache 3.0 ready"
         } else {
-            "no local cache layout detected"
+            "Cache 3.0 not initialized"
         }
     } else {
         "unknown"
@@ -392,10 +392,10 @@ pub fn run(
         "  Runtime readiness:   {}",
         if runtime_ready { "ready" } else { "blocked" }
     );
-    println!("  Contract state:      {}", contract_state);
+    println!("  Layout state:        {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Cache-v3 marker:     {} ({})",
+            "  Cache 3.0 marker:    {} ({})",
             detection.layout.layout_marker.display(),
             if detection.has_cache_v3_contract() {
                 "present"
@@ -404,7 +404,7 @@ pub fn run(
             }
         );
         println!(
-            "  Cache-v3 index:      {} ({})",
+            "  Cache 3.0 index:     {} ({})",
             detection.layout.redb_index_path.display(),
             if detection.v3_index_exists {
                 "present"
@@ -413,7 +413,7 @@ pub fn run(
             }
         );
         println!(
-            "  Cache-v3 payload:    {} ({})",
+            "  Cache 3.0 payload:   {} ({})",
             detection.layout.payload_blocks_dir.display(),
             if detection.v3_payload_blocks_dir_exists {
                 "present"
@@ -422,7 +422,7 @@ pub fn run(
             }
         );
     }
-    println!("  Remediation:         {}", remediation);
+    println!("  Init guidance:       {}", remediation);
     println!(
         "  Reconcile needed:    {}",
         if reconcile_needed { "yes" } else { "no" }

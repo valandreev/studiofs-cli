@@ -10,7 +10,7 @@
 //! Write Path:
 //! 1. Split data into blocks
 //! 2. Merge dirty bytes into the per-file `WriteBuffer`
-//! 3. Persist full dirty blocks locally via the raw backend `put(...)`
+//! 3. Persist full dirty blocks locally via the Cache 3.0 backend `put(...)`
 //! 4. Apply local `sync_data()` barriers (strict for fsync / durable mode,
 //!    grouped in fast mode) and persist extent metadata / attrs
 //! 5. Queue committed extents for async upload + remote publish
@@ -156,21 +156,21 @@ pub struct StatFs {
     pub frsize: u32,
 }
 
-/// Snapshot of local write-buffer / legacy-ingress state used for observability
+/// Snapshot of local write-buffer / ingress state used for observability
 /// and backpressure diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct VfsIngressStats {
     /// Accepted bytes currently buffered in RAM by the active `WriteBuffer`
-    /// path (legacy field name retained for compatibility).
+    /// path (field name retained for compatibility).
     pub dirty_mem_bytes: usize,
     /// Accepted block count currently buffered in RAM by the active
-    /// `WriteBuffer` path (legacy field name retained for compatibility).
+    /// `WriteBuffer` path (field name retained for compatibility).
     pub dirty_mem_blocks: usize,
-    /// Legacy ingress spill bytes currently present on local NVMe.
-    /// Expected to remain zero on the Cache v2 foreground path.
+    /// Ingress spill bytes currently present on local NVMe.
+    /// Expected to remain zero on the Cache 3.0 foreground path.
     pub spill_bytes: usize,
-    /// Legacy ingress spill records currently present on disk.
-    /// Expected to remain zero on the Cache v2 foreground path.
+    /// Ingress spill records currently present on disk.
+    /// Expected to remain zero on the Cache 3.0 foreground path.
     pub spill_records: usize,
     /// Age of the oldest spill record in milliseconds.
     pub oldest_spill_age_ms: u64,
@@ -185,8 +185,8 @@ pub struct VfsIngressStats {
     pub fast_backpressure_events: u64,
     /// Maximum single fast-mode backpressure stall observed since startup.
     pub fast_backpressure_stall_max_ms: u64,
-    /// Legacy counter for blocks that were forced to spill because RAM
-    /// acceptance was over budget. Expected to remain zero on the Cache v2
+    /// Counter for blocks that were forced to spill because RAM
+    /// acceptance was over budget. Expected to remain zero on the Cache 3.0
     /// foreground path.
     pub forced_spill_blocks: u64,
     /// Total blocks drained from RAM accepted state into committed local
@@ -195,10 +195,10 @@ pub struct VfsIngressStats {
     /// Total bytes drained from RAM accepted state into committed local
     /// metadata / cache state.
     pub drained_mem_bytes: u64,
-    /// Total blocks drained from legacy spill accepted state into committed
+    /// Total blocks drained from spill accepted state into committed
     /// local metadata / cache state.
     pub drained_spill_blocks: u64,
-    /// Total bytes drained from legacy spill accepted state into committed
+    /// Total bytes drained from spill accepted state into committed
     /// local metadata / cache state.
     pub drained_spill_bytes: u64,
     /// Current depth of the prefetch worker's pending queue.
@@ -287,8 +287,8 @@ pub struct VfsWritePathObservabilitySnapshot {
 }
 
 /// Compatibility-shaped acceptance decision for a prospective write batch.
-/// The active Cache v2 foreground path uses `DirtyMem` and `Backpressure`;
-/// `Spill` is retained for legacy observability compatibility.
+/// The active Cache 3.0 foreground path uses `DirtyMem` and `Backpressure`;
+/// `Spill` remains as a compatibility lane for ingress observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsIngressLane {
     DirtyMem,
@@ -12400,9 +12400,9 @@ impl StudioVfs {
     pub async fn persist_cache(&self) {
         self.block_cache.shutdown().await;
         if let Err(error) = self.local_block_backend.sync_data() {
-            warn!(error = %error, "raw backend sync failed during shutdown");
+            warn!(error = %error, "local cache backend sync failed during shutdown");
         } else {
-            tracing::info!("raw backend sync persisted");
+            tracing::info!("local cache backend sync persisted");
         }
         tracing::info!("block cache checkpoint persisted");
     }
@@ -12470,10 +12470,7 @@ impl StudioVfs {
         );
 
         if let Err(e) = reset_ingress_artifacts_for_fast_mode(self.ingress_wal.spill_dir()) {
-            warn!(
-                "VFS shutdown: failed to remove legacy ingress artifacts: {}",
-                e
-            );
+            warn!("VFS shutdown: failed to remove ingress artifacts: {}", e);
         }
 
         // Phase 2: attempt graceful upload drain (bounded by user timeout),

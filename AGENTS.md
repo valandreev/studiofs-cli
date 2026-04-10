@@ -240,9 +240,9 @@ test: add destroy tests fixes
 
 ### Cache Note
 
-- Legacy cache-v2 storage code has been removed from the workspace.
+- Cache-v2 storage code has been removed from the workspace.
 - Cache 3.0 (`v3`) is the only local backend implementation.
-- `BlockCache` remains a compatibility shim (upload queue + lightweight hot payload staging).
+- `BlockCache` remains the upload queue + lightweight hot payload staging layer.
 
 ### Environment Variables
 
@@ -310,9 +310,9 @@ VfsState (composed of 11 subsystems)
 └── metrics: MetricsState             # Runtime metrics and counters
 ```
 
-`DirtyBufferState` is no longer part of active `VfsState`; the legacy tier is
-kept only in the lock-order validator so older ordering assumptions still have a
-stable placeholder.
+`DirtyBufferState` is no longer part of active `VfsState`; the reserved tier is
+kept only in the lock-order validator so historical ordering assumptions still
+have a stable placeholder.
 
 ### Lock Ordering Policy
 
@@ -320,8 +320,8 @@ To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest prior
 
 1. **Tier 1**: `ShutdownState` — shutdown flags are checked before any other operation
 2. **Tier 2**: `WriteBufferState` — pending write blocks
-3. **Tier 3**: reserved legacy `DirtyBufferState` slot — no active subsystem
-4. **Tier 4**: `IngressState` — legacy ingress checkpoint / artifact state
+3. **Tier 3**: reserved `DirtyBufferState` slot — no active subsystem
+4. **Tier 4**: `IngressState` — ingress checkpoint / artifact state
 5. **Tier 5**: `NamespaceState` — dentry/attr caches
 6. **Tier 6**: `IncarnationState` — inode incarnation tracking
 7. **Tier 7**: `UploadState` — upload queue and cancellations
