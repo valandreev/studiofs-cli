@@ -80,7 +80,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `close` | `release()` |
 | `read` | `read_into_fh_sync_cached()` fast path, then `read_into_fh()` fallback |
 | `write` | `write_fh()` |
-| `cleanup` | `flush()` |
+| `cleanup` | observe callback; delete finalizes namespace mutation, non-delete defers barrier to `close` / `release_fh()` |
 | `flush` | `flush()` |
 | `get_file_info` | `getattr()` |
 | `set_basic_info` | `setattr()` |
@@ -95,6 +95,12 @@ I/O buffer behavior on Windows callbacks:
 - `read`: WinFSP first tries VFS synchronous cache-only fast path into caller buffer (`read_into_fh_sync_cached()`), then falls back to async `read_into_fh()` on miss; both paths avoid bridge-layer intermediate buffers/copies.
 - `write`: WinFSP-provided input buffer is forwarded directly to `write_fh()` (no intermediate `to_vec()` copy in `StudioFsContext`).
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
+
+WinFSP callback barrier semantics:
+- Explicit `flush(context=Some(..))` remains a mandatory dirty-inode foreground barrier.
+- `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
+- Non-delete `cleanup` is observational only; it records that the callback happened, but any remaining dirty local state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
+- `overwrite` and EOF-changing `set_file_size` publish the new size before the callback returns; they are not backgroundable flush barriers.
 
 **Attribute mapping:**
 - `InodeAttr.win_attrs` → Win32 `FILE_ATTRIBUTE_*` flags
